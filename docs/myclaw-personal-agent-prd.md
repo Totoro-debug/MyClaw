@@ -326,4 +326,4 @@
 - ADR 0003 记录 Shell 的 Workspace cwd、确认边界及首版不提供 OS 级 sandbox。
 - `docs/myclaw-runtime-contracts.md` 是已接受的首版 schema、Port、事件和错误契约。
 - `CONTEXT.md` 是最终 canonical language；本 PRD 的实现术语应与其保持一致。
-- Issue 暂未发布。
+- GitHub issue：<https://github.com/Totoro-debug/myclaw/issues/1>；本文件仍是需求的本地 canonical source。
