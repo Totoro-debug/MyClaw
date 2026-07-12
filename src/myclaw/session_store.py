@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -38,6 +38,22 @@ from myclaw.contracts import (
 from myclaw.contracts.common import require_session_id
 from myclaw.workspace import Workspace
 
+type AtomicReplaceBytes = Callable[[Path, bytes], None]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionListingReport:
+    sessions: tuple[SessionSummary, ...]
+    skipped_count: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.skipped_count, bool)
+            or not isinstance(self.skipped_count, int)
+            or self.skipped_count < 0
+        ):
+            raise ValueError("skipped_count must be a nonnegative integer")
+
 
 class JsonlSessionStore:
     """Persist complete Session records beneath one Workspace directory."""
@@ -49,11 +65,13 @@ class JsonlSessionStore:
         workspace: Workspace,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
+        replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
     ) -> None:
         self.agent_home = agent_home
         self.workspace = workspace
         self._now = now
         self._new_uuid = new_uuid
+        self._replace_bytes = replace_bytes
         self._prepared: dict[str, SessionMetadata] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -100,16 +118,25 @@ class JsonlSessionStore:
                 atomic_replace_text(io_path, updated.to_json_line() + message.to_json_line())
                 self._prepared[session_id] = updated
                 return
-            records = _read_complete_records(io_path)
+            records, complete_content = _read_recoverable_records(io_path)
             metadata = _parse_metadata(records[0])
             if metadata.id != session_id:
                 msg = "Session metadata ID does not match its file name"
                 raise ValueError(msg)
             updated = _metadata_after_message(metadata, message)
+            if len(complete_content) != io_path.stat().st_size:
+                first_line_end = complete_content.index(b"\n") + 1
+                self._replace_bytes(
+                    io_path,
+                    updated.to_json_line().encode("utf-8")
+                    + complete_content[first_line_end:]
+                    + message.to_json_line().encode("utf-8"),
+                )
+                return
             _append_complete_line(io_path, message.to_json_line())
             content = io_path.read_bytes()
             first_line_end = content.index(b"\n") + 1
-            atomic_replace_bytes(
+            self._replace_bytes(
                 io_path,
                 updated.to_json_line().encode("utf-8") + content[first_line_end:],
             )
@@ -117,7 +144,7 @@ class JsonlSessionStore:
     async def load(self, session_id: str) -> ConversationSession:
         path = self.path_for(session_id)
         async with self._lock_for(session_id):
-            records = _read_complete_records(_io_path(path))
+            records, _ = _read_recoverable_records(_io_path(path))
         metadata = _parse_metadata(records[0])
         if metadata.id != session_id:
             msg = "Session metadata ID does not match its file name"
@@ -135,7 +162,7 @@ class JsonlSessionStore:
                     msg = "Session has not been prepared"
                     raise ValueError(msg)
                 return ConversationSession(metadata=metadata, messages=())
-            records = _read_complete_records(path)
+            records, _ = _read_recoverable_records(path)
         metadata = _parse_metadata(records[0])
         if metadata.id != session_id:
             msg = "Session metadata ID does not match its file name"
@@ -146,8 +173,7 @@ class JsonlSessionStore:
     async def update_metadata(self, session_id: str, update: MetadataUpdate) -> None:
         path = _io_path(self.path_for(session_id))
         async with self._lock_for(session_id):
-            content = path.read_bytes()
-            records = _read_complete_records(path)
+            records, complete_content = _read_recoverable_records(path)
             metadata = _parse_metadata(records[0])
             if metadata.id != session_id:
                 msg = "Session metadata ID does not match its file name"
@@ -179,15 +205,50 @@ class JsonlSessionStore:
             )
             messages = tuple(_parse_message(record) for record in records[1:])
             ConversationSession(metadata=updated, messages=messages)
-            first_line_end = content.index(b"\n") + 1
-            atomic_replace_bytes(
+            first_line_end = complete_content.index(b"\n") + 1
+            self._replace_bytes(
                 path,
-                updated.to_json_line().encode("utf-8") + content[first_line_end:],
+                updated.to_json_line().encode("utf-8") + complete_content[first_line_end:],
             )
             self._prepared[session_id] = updated
 
     async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]:
-        raise NotImplementedError
+        return (await self.scan_for_workspace(workspace)).sessions
+
+    async def scan_for_workspace(self, workspace: Path) -> SessionListingReport:
+        if Workspace.from_path(workspace) != self.workspace or not self.directory.exists():
+            return SessionListingReport(sessions=(), skipped_count=0)
+        summaries: list[SessionSummary] = []
+        skipped_count = 0
+        for path in self.directory.glob("*.jsonl"):
+            try:
+                session = await self.load(path.stem)
+            except (OSError, UnicodeError, ValueError):
+                skipped_count += 1
+                continue
+            summaries.append(
+                SessionSummary(
+                    id=session.metadata.id,
+                    title=session.metadata.title,
+                    created_at=session.metadata.created_at,
+                    updated_at=session.metadata.updated_at,
+                    message_count=len(session.messages),
+                )
+            )
+        return SessionListingReport(
+            sessions=tuple(
+                sorted(
+                    summaries,
+                    key=lambda summary: (
+                        summary.updated_at,
+                        summary.created_at,
+                        summary.id,
+                    ),
+                    reverse=True,
+                )
+            ),
+            skipped_count=skipped_count,
+        )
 
     def _lock_for(self, session_id: str) -> asyncio.Lock:
         return self._locks.setdefault(session_id, asyncio.Lock())
@@ -225,9 +286,23 @@ def _io_path(path: Path) -> Path:
     return Path(f"\\\\?\\{native}")
 
 
-def _read_complete_records(path: Path) -> tuple[dict[str, object], ...]:
+def _read_recoverable_records(
+    path: Path,
+) -> tuple[tuple[dict[str, object], ...], bytes]:
     content = path.read_bytes()
     lines = content.splitlines(keepends=True)
+    if not lines:
+        msg = "Session must contain complete JSONL records"
+        raise ValueError(msg)
+    if not lines[-1].endswith(b"\n"):
+        incomplete_tail = lines.pop()
+        try:
+            json.loads(incomplete_tail.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        else:
+            msg = "Session final JSONL record must end with a newline"
+            raise ValueError(msg)
     if not lines or any(not line.endswith(b"\n") for line in lines):
         msg = "Session must contain complete JSONL records"
         raise ValueError(msg)
@@ -238,10 +313,18 @@ def _read_complete_records(path: Path) -> tuple[dict[str, object], ...]:
             msg = "Session records must be JSON objects"
             raise ValueError(msg)
         records.append(cast(dict[str, object], decoded))
-    return tuple(records)
+    return tuple(records), b"".join(lines)
 
 
 def _parse_metadata(record: dict[str, object]) -> SessionMetadata:
+    schema_version = record.get("schema_version")
+    if (
+        record.get("record_type") != "metadata"
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+    ):
+        msg = "Session metadata record type or schema version is not supported"
+        raise ValueError(msg)
     usage = _object(record, "cumulative_usage")
     return SessionMetadata(
         id=_string(record, "id"),
@@ -259,6 +342,9 @@ def _parse_metadata(record: dict[str, object]) -> SessionMetadata:
 
 
 def _parse_message(record: dict[str, object]) -> SessionMessage:
+    if record.get("record_type") != "message":
+        msg = "Session message record type is not supported"
+        raise ValueError(msg)
     role = record.get("role")
     if role == "user":
         return UserSessionMessage(

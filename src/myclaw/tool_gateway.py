@@ -1,5 +1,7 @@
 """Tool Gateway for declared capabilities and normalized results."""
 
+from jsonschema import Draft202012Validator, FormatChecker
+
 from myclaw.contracts import (
     ErrorCode,
     ErrorInfo,
@@ -19,13 +21,18 @@ from myclaw.file_tools import (
 
 
 class ToolGateway:
-    """Resolve and execute the built-in Tool catalog once per model call."""
+    """Resolve and execute one Tool catalog once per model call."""
 
-    def __init__(self, *, context: ToolExecutionContext) -> None:
+    def __init__(
+        self,
+        *,
+        context: ToolExecutionContext,
+        tools: tuple[Tool, ...] | None = None,
+    ) -> None:
         self._context = context
-        tools: tuple[Tool, ...] = (ReadFileTool(), ListFilesTool(), SearchFilesTool())
-        self._tools = {tool.definition.name: tool for tool in tools}
-        self._definitions = tuple(tool.definition for tool in tools)
+        catalog = (ReadFileTool(), ListFilesTool(), SearchFilesTool()) if tools is None else tools
+        self._tools = {tool.definition.name: tool for tool in catalog}
+        self._definitions = tuple(tool.definition for tool in catalog)
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
@@ -38,6 +45,15 @@ class ToolGateway:
                 tool_call,
                 code="tool_not_found",
                 message="The requested tool is not available.",
+            )
+        if not Draft202012Validator(
+            tool.definition.input_schema,
+            format_checker=FormatChecker(),
+        ).is_valid(tool_call.arguments):
+            return _error_result(
+                tool_call,
+                code="tool_invalid_arguments",
+                message=f"Invalid arguments for {tool_call.name}.",
             )
         try:
             content = await tool.execute(tool_call.arguments, self._context)
@@ -53,7 +69,7 @@ class ToolGateway:
                 code="tool_invalid_arguments",
                 message=f"Invalid arguments for {tool_call.name}.",
             )
-        except (OSError, UnicodeError):
+        except Exception:
             return _error_result(
                 tool_call,
                 code="tool_failed",

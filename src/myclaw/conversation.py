@@ -171,7 +171,7 @@ class StreamingConversationPort:
                                     ToolStartedPayload(
                                         tool_call_id=tool_call.id,
                                         tool_name=tool_call.name,
-                                        summary=f"Running {tool_call.name}",
+                                        summary=_tool_activity_summary("Running", tool_call.name),
                                     ),
                                 )
                                 result = await self._tool_gateway.execute(tool_call)
@@ -202,7 +202,7 @@ class StreamingConversationPort:
                                         tool_call_id=result.tool_call_id,
                                         tool_name=result.name,
                                         status=result.status,
-                                        summary=f"Finished {result.name}",
+                                        summary=_tool_activity_summary("Finished", result.name),
                                     ),
                                 )
                             break
@@ -411,6 +411,10 @@ class StreamingConversationPort:
 def _consume_task_exception(task: asyncio.Future[None]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _tool_activity_summary(action: str, tool_name: str) -> str:
+    return " ".join(f"{action} {tool_name}".split())[:240]
 
 
 def model_message_from_session(

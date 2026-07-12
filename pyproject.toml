@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.104,<0.117",
     "croniter>=6,<7",
+    "jsonschema>=4.23,<5",
     "openai>=2.37,<3",
     "rich>=13.7,<15",
     "tomlkit>=0.13,<0.14",
@@ -24,6 +25,7 @@ dev = [
     "pytest>=8.3,<9",
     "pytest-asyncio>=0.24,<2",
     "ruff>=0.9,<1",
+    "types-jsonschema>=4.23,<5",
 ]
 
 [project.scripts]

@@ -39,6 +39,7 @@ from myclaw.management_commands import ManagementCommandDispatcher
 from myclaw.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
 from myclaw.prompts import chat_system_prompt, runtime_context, session_title_prompt
 from myclaw.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
+from myclaw.session_resume import SwitchableConversationPort
 from myclaw.session_store import JsonlSessionStore
 from myclaw.tool_gateway import ToolGateway
 from myclaw.workspace import Workspace
@@ -63,10 +64,13 @@ def unavailable_provider_factory(configuration: ProviderConfiguration) -> ModelP
 class PreparedReplRuntime:
     """An in-memory Session identity and its injectable REPL composition."""
 
-    conversation: ConversationPort
+    conversation: SwitchableConversationPort
     sessions: JsonlSessionStore
-    session_id: str
     management_dispatcher: ManagementDispatcher
+
+    @property
+    def session_id(self) -> str:
+        return self.conversation.session_id
 
     async def run(
         self,
@@ -217,38 +221,58 @@ def prepare_repl_runtime(
         now=now,
         new_uuid=new_uuid,
     )
+
+    def conversation_for(session_id: str) -> ConversationPort:
+        session_tool_gateway = ToolGateway(
+            context=ToolExecutionContext(
+                lane="foreground",
+                workspace=Path(workspace_identity.path),
+                agent_home=agent_home.path,
+                session_id=session_id,
+            )
+        )
+        return _DeferredConversationPort(
+            provider=router,
+            sessions=sessions,
+            session_id=session_id,
+            settings=settings,
+            now=now,
+            new_uuid=new_uuid,
+            system_prompt=system_prompt,
+            title_prompt=session_title_prompt(),
+            tool_gateway=session_tool_gateway,
+            history_preparer=summary_manager.prepare,
+        )
+
+    conversation = SwitchableConversationPort(
+        session_id=metadata.id,
+        build_conversation=conversation_for,
+    )
     status_service = RuntimeStatusService(
         sessions=sessions,
-        session_id=metadata.id,
+        session_id=lambda: conversation.session_id,
         resolved_chat=lambda: _resolved_chat_status(router),
         next_input=lambda session: _runtime_status_input(
             session,
             system_prompt=system_prompt,
             current_time=now(),
-            session_id=metadata.id,
+            session_id=conversation.session_id,
             tool_definitions=tool_gateway.definitions,
         ),
         monotonic=monotonic_now,
     )
     management_dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(agent_home, status_service=status_service)
-    )
-    conversation = _DeferredConversationPort(
-        provider=router,
-        sessions=sessions,
-        session_id=metadata.id,
-        settings=settings,
-        now=now,
-        new_uuid=new_uuid,
-        system_prompt=system_prompt,
-        title_prompt=session_title_prompt(),
-        tool_gateway=tool_gateway,
-        history_preparer=summary_manager.prepare,
+        ManagementViewService(
+            agent_home,
+            status_service=status_service,
+            sessions=sessions,
+            workspace=Path(workspace_identity.path),
+            switch_session=conversation.switch_session,
+        )
     )
     return PreparedReplRuntime(
         conversation=conversation,
         sessions=sessions,
-        session_id=metadata.id,
         management_dispatcher=management_dispatcher,
     )
 

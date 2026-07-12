@@ -4,8 +4,10 @@ import json
 from dataclasses import dataclass
 from typing import Protocol
 
-from myclaw.contracts.management import ConfigView, RuntimeStatus
+from myclaw.contracts import SessionSummary, format_rfc3339_milliseconds
+from myclaw.contracts.management import ConfigView, ResumeResult, RuntimeStatus
 from myclaw.management import ManagementError
+from myclaw.session_store import SessionListingReport
 
 
 class _ManagementViewPort(Protocol):
@@ -15,6 +17,12 @@ class _ManagementViewPort(Protocol):
 
     async def memory_view(self) -> str: ...
 
+    async def resumable_sessions(self) -> tuple[SessionSummary, ...]: ...
+
+    async def resumable_listing(self) -> SessionListingReport: ...
+
+    async def resume(self, session_id: str) -> ResumeResult: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ManagementCommandResult:
@@ -22,6 +30,7 @@ class ManagementCommandResult:
 
     handled: bool
     output: str | None
+    resume_sessions: tuple[SessionSummary, ...] | None = None
 
 
 class ManagementCommandDispatcher:
@@ -32,6 +41,37 @@ class ManagementCommandDispatcher:
 
     async def dispatch(self, command: str) -> ManagementCommandResult:
         """Return rendered output for a recognized Management Command."""
+        if command == "/resume":
+            try:
+                listing = await self._management.resumable_listing()
+            except ManagementError as management_error:
+                return ManagementCommandResult(
+                    handled=True,
+                    output=f"{management_error.error.code}: {management_error.error.message}",
+                )
+            sessions = listing.sessions
+            lines: list[str] = []
+            if listing.skipped_count:
+                lines.append(
+                    f"Warning: Skipped {listing.skipped_count} corrupt Conversation "
+                    f"{'Session' if listing.skipped_count == 1 else 'Sessions'}."
+                )
+            if not sessions:
+                lines.append("No resumable Conversation Sessions.")
+            else:
+                lines.append("Resumable sessions:")
+                lines.extend(
+                    f"{index}. {session.title} | "
+                    f"{format_rfc3339_milliseconds(session.updated_at)} | "
+                    f"{session.message_count} "
+                    f"{'message' if session.message_count == 1 else 'messages'}"
+                    for index, session in enumerate(sessions, start=1)
+                )
+            return ManagementCommandResult(
+                handled=True,
+                output="\n".join(lines),
+                resume_sessions=sessions,
+            )
         if command == "/status":
             try:
                 status = await self._management.status()
@@ -64,3 +104,12 @@ class ManagementCommandDispatcher:
             handled=True,
             output=f"{prefix}{view.redacted_content}",
         )
+
+    async def resume(self, session_id: str) -> ManagementCommandResult:
+        try:
+            result = await self._management.resume(session_id)
+        except ManagementError as management_error:
+            output = f"{management_error.error.code}: {management_error.error.message}"
+        else:
+            output = f"Resumed session {result.session_id}."
+        return ManagementCommandResult(handled=True, output=output)

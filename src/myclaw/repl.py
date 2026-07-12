@@ -7,7 +7,13 @@ from typing import Protocol
 
 from rich.console import Console
 
-from myclaw.contracts import AgentEvent, ConversationPort, TextDeltaPayload, TurnFailedPayload
+from myclaw.contracts import (
+    AgentEvent,
+    ConversationPort,
+    SessionSummary,
+    TextDeltaPayload,
+    TurnFailedPayload,
+)
 
 
 class ReplInput(Protocol):
@@ -66,9 +72,14 @@ class ManagementDispatchResult(Protocol):
     @property
     def output(self) -> str | None: ...
 
+    @property
+    def resume_sessions(self) -> tuple[SessionSummary, ...] | None: ...
+
 
 class ManagementDispatcher(Protocol):
     async def dispatch(self, command: str) -> ManagementDispatchResult: ...
+
+    async def resume(self, session_id: str) -> ManagementDispatchResult: ...
 
 
 async def run_repl(
@@ -93,6 +104,13 @@ async def run_repl(
             if result.handled:
                 if result.output is not None:
                     await writer.write_line(result.output)
+                if result.resume_sessions:
+                    await _choose_resume_session(
+                        sessions=result.resume_sessions,
+                        input_reader=input_reader,
+                        writer=writer,
+                        management_dispatcher=management_dispatcher,
+                    )
                 continue
         events = conversation.submit(text)
         try:
@@ -103,6 +121,34 @@ async def run_repl(
                 active_task.uncancel()
             await conversation.cancel_active_turn()
             await _render_turn(events, writer)
+
+
+async def _choose_resume_session(
+    *,
+    sessions: tuple[SessionSummary, ...],
+    input_reader: ReplInput,
+    writer: ProgressiveWriter,
+    management_dispatcher: ManagementDispatcher,
+) -> None:
+    while True:
+        selection = await input_reader.read()
+        if selection is None:
+            return
+        normalized = selection.strip()
+        if normalized.casefold() == "cancel":
+            await writer.write_line("Resume cancelled.")
+            return
+        try:
+            index = int(normalized)
+        except ValueError:
+            index = 0
+        if not 1 <= index <= len(sessions):
+            await writer.write_line("Choose a listed session number or enter cancel.")
+            continue
+        result = await management_dispatcher.resume(sessions[index - 1].id)
+        if result.output is not None:
+            await writer.write_line(result.output)
+        return
 
 
 async def _render_turn(
