@@ -61,7 +61,7 @@ Status legend: `TODO` -> `IN_PROGRESS` -> `AGENT_DONE` -> `VERIFIED` -> `CLOSED`
 | #4 | T03 Agent Home and atomic writes | #3 | B03 | Agent Home initializer, atomic file API, Workspace identity | b03_issue_4 | CLOSED | 2865d46 |
 | #5 | T04 Configuration | #4 | B04 | `myclaw`, `myclaw config`, validated/redacted config API | b04_issue_5 | CLOSED | ef73b6a |
 | #6 | T05 First streaming turn | #5 | B05 | Conversation Port through REPL and Session Store reload | b05_issue_6 | CLOSED | e18725d |
-| #7 | T06 Multi-turn Short-term Memory | #6 | B06 | one REPL session across Conversation Port turns | b06_issue_7 | VERIFIED | - |
+| #7 | T06 Multi-turn Short-term Memory | #6 | B06 | one REPL session across Conversation Port turns | b06_issue_7 | CLOSED | 9e95271 |
 | #8 | T07 Model route fallback | #7 | B07 | Model Router route resolution and startup validation | - | TODO | - |
 | #9 | T08 Retry budget | #8 | B08 | Model Router with fake Provider and fake Clock | - | TODO | - |
 | #10 | T09 Failed/cancelled turns | #9 | B09 | Conversation Port terminal events and reloadable Session Store | - | TODO | - |
@@ -115,7 +115,7 @@ Issue #36 additionally requires Windows and POSIX evidence, clean-wheel installa
 | B03 | #4 | 77 pytest + Ruff lint/format + strict mypy + sdist/wheel | 2865d46 | #4 commented and closed | CLOSED |
 | B04 | #5 | 141 pytest + Ruff lint/format + strict mypy + sdist/wheel + installed CLI smoke | ef73b6a | #5 commented and closed | CLOSED |
 | B05 | #6, #13 | 169 pytest + Ruff lint/format + strict mypy + sdist/wheel + combined REPL/management integration | e18725d | #6 and #13 commented and closed | CLOSED |
-| B06 | #7 | 173 pytest + Ruff lint/format + strict mypy + sdist/wheel + independent contract review | - | - | VERIFIED |
+| B06 | #7 | 173 pytest + Ruff lint/format + strict mypy + sdist/wheel + independent contract review | 9e95271 | #7 commented and closed | CLOSED |
 | B07 | #8 | - | - | - | TODO |
 | B08 | #9, #11 | - | - | - | TODO |
 | B09 | #10, #12, #15, #21, #22, #27 | - | - | - | TODO |
