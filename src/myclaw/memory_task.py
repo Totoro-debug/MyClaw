@@ -338,6 +338,16 @@ class MemoryManager:
         finally:
             self._running = False
 
+    async def run_periodic(self) -> MemoryTaskResult | None:
+        if self._running:
+            return None
+        self._running = True
+        self._running_cursor = 0
+        try:
+            return await self._run_once()
+        finally:
+            self._running = False
+
     async def _run_once(self) -> MemoryTaskResult:
         try:
             cursor = await self._memory.read_summary_cursor()

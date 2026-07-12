@@ -87,10 +87,25 @@ class JsonlSessionStore:
         """Prepare a new Session identity without creating its file or directory."""
         created_at = self._now()
         session_id = make_session_id(created_at, self._new_uuid())
+        return self.prepare_with_id(
+            session_id=session_id,
+            title="Untitled session",
+            created_at=created_at,
+        )
+
+    def prepare_with_id(
+        self,
+        *,
+        session_id: str,
+        title: str,
+        created_at: datetime,
+    ) -> SessionMetadata:
+        """Prepare a caller-owned Session identity without materializing its file."""
+        require_session_id(session_id)
         persisted_created_at = created_at.replace(microsecond=created_at.microsecond // 1000 * 1000)
         metadata = SessionMetadata(
             id=session_id,
-            title="Untitled session",
+            title=title,
             created_at=persisted_created_at,
             updated_at=persisted_created_at,
             consolidation_cursor=0,
@@ -101,8 +116,7 @@ class JsonlSessionStore:
                 total_tokens=0,
             ),
         )
-        self._prepared[session_id] = metadata
-        return metadata
+        return self._prepared.setdefault(session_id, metadata)
 
     async def append_message(self, session_id: str, message: SessionMessage) -> None:
         path = self.path_for(session_id)

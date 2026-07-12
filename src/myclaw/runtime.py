@@ -36,11 +36,17 @@ from myclaw.management import (
     RuntimeStatusService,
 )
 from myclaw.management_commands import ManagementCommandDispatcher
+from myclaw.memory_scheduler import (
+    AsyncioMemorySchedulerClock,
+    MemorySchedulerClock,
+    MemoryTaskScheduler,
+)
 from myclaw.memory_task import FileMemoryStore, MemoryManager, MemoryTaskModelSettings
 from myclaw.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
 from myclaw.prompts import chat_system_prompt, runtime_context, session_title_prompt
 from myclaw.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.scheduled_work import CreateScheduledWorkTool, JsonScheduledWorkStore
+from myclaw.scheduled_work_execution import ScheduledWorkModelSettings, ScheduledWorkRunner
 from myclaw.session_resume import SwitchableConversationPort
 from myclaw.session_store import JsonlSessionStore
 from myclaw.shell_process import SubprocessShellBoundary
@@ -71,6 +77,29 @@ def unavailable_provider_factory(configuration: ProviderConfiguration) -> ModelP
     )
 
 
+class _RuntimeMemoryScheduler:
+    """Own one terminal scheduler instance per Runtime run."""
+
+    def __init__(self, factory: Callable[[], MemoryTaskScheduler]) -> None:
+        self._factory = factory
+        self._active: MemoryTaskScheduler | None = None
+
+    def start(self) -> None:
+        scheduler = self._active
+        if scheduler is None:
+            scheduler = self._factory()
+            self._active = scheduler
+        scheduler.start()
+
+    async def close(self) -> None:
+        scheduler = self._active
+        if scheduler is None:
+            return
+        await scheduler.close()
+        if self._active is scheduler:
+            self._active = None
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedReplRuntime:
     """An in-memory Session identity and its injectable REPL composition."""
@@ -78,11 +107,17 @@ class PreparedReplRuntime:
     conversation: SwitchableConversationPort
     sessions: JsonlSessionStore
     management_dispatcher: ManagementDispatcher
+    scheduled_work_runner: ScheduledWorkRunner
+    scheduled_work_store: JsonScheduledWorkStore
     _shell: SubprocessShellBoundary | None
+    _memory_scheduler: _RuntimeMemoryScheduler
 
     @property
     def session_id(self) -> str:
         return self.conversation.session_id
+
+    def start(self) -> None:
+        self._memory_scheduler.start()
 
     async def run(
         self,
@@ -94,6 +129,7 @@ class PreparedReplRuntime:
         dispatcher = (
             self.management_dispatcher if management_dispatcher is None else management_dispatcher
         )
+        self.start()
         try:
             await run_repl(
                 conversation=self.conversation,
@@ -105,6 +141,7 @@ class PreparedReplRuntime:
             await self.close()
 
     async def close(self) -> None:
+        await self._memory_scheduler.close()
         await self.conversation.cancel_active_turn()
         if self._shell is not None:
             await self._shell.close()
@@ -181,6 +218,7 @@ def prepare_repl_runtime(
     new_uuid: Callable[[], UUID],
     retry_clock: RetryClock | None = None,
     retry_jitter: Jitter | None = None,
+    memory_scheduler_clock: MemorySchedulerClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     web_search: WebSearchBoundary | None = None,
     web_fetch: WebFetchBoundary | None = None,
@@ -236,8 +274,9 @@ def prepare_repl_runtime(
     owned_shell = (
         configured_shell if isinstance(configured_shell, SubprocessShellBoundary) else None
     )
+    scheduled_work_store = JsonScheduledWorkStore(agent_home)
     scheduled_work_tool = CreateScheduledWorkTool(
-        store=JsonScheduledWorkStore(agent_home),
+        store=scheduled_work_store,
         now=now,
         new_uuid=new_uuid,
     )
@@ -296,6 +335,51 @@ def prepare_repl_runtime(
             timeout_seconds=resolved_memory.route.timeout,
         ),
         batch_size=configuration.memory.batch_size,
+    )
+    scheduler_clock = (
+        memory_scheduler_clock
+        if memory_scheduler_clock is not None
+        else AsyncioMemorySchedulerClock(now=now)
+    )
+    memory_scheduler = _RuntimeMemoryScheduler(
+        lambda: MemoryTaskScheduler(
+            manager=memory_manager,
+            schedule=configuration.memory.schedule,
+            clock=scheduler_clock,
+        )
+    )
+
+    def scheduled_work_gateway_for(session_id: str) -> ToolGateway:
+        return ToolGateway(
+            context=ToolExecutionContext(
+                lane="scheduled_work",
+                workspace=Path(workspace_identity.path),
+                agent_home=agent_home.path,
+                session_id=session_id,
+            ),
+            max_tool_result_chars=configuration.runtime.max_tool_result_chars,
+            web_search=configured_web_search,
+            web_fetch=configured_web_fetch,
+            shell=configured_shell,
+            scheduled_work=scheduled_work_tool,
+        )
+
+    resolved_cron = configuration.resolve_route("cron")
+    scheduled_work_runner = ScheduledWorkRunner(
+        provider=router,
+        sessions=sessions,
+        workspace=Path(workspace_identity.path),
+        long_term_memory=long_term_memory,
+        settings=ScheduledWorkModelSettings(
+            model=resolved_cron.route.model,
+            max_output=resolved_cron.route.max_output,
+            temperature=resolved_cron.route.temperature,
+            reasoning_effort=resolved_cron.route.reasoning_effort,
+            timeout_seconds=resolved_cron.route.timeout,
+        ),
+        now=now,
+        new_uuid=new_uuid,
+        tool_gateway_for=scheduled_work_gateway_for,
     )
 
     def conversation_for(session_id: str) -> ConversationPort:
@@ -357,7 +441,10 @@ def prepare_repl_runtime(
         conversation=conversation,
         sessions=sessions,
         management_dispatcher=management_dispatcher,
+        scheduled_work_runner=scheduled_work_runner,
+        scheduled_work_store=scheduled_work_store,
         _shell=owned_shell,
+        _memory_scheduler=memory_scheduler,
     )
 
 
