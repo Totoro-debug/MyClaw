@@ -26,6 +26,9 @@ _CHAT_SYSTEM_PROMPT = """{identity}
 <tool_guidance>
 {tool_guidance}</tool_guidance>"""
 
+_SESSION_TITLE_PROMPT = """Generate a concise title for this Conversation Session.
+Return only the title. Do not call tools or add commentary."""
+
 
 def current_user_input(*, content: str, current_time: datetime, session_id: str) -> str:
     """Wrap only the current raw user input with dynamic Runtime Context."""
@@ -51,3 +54,8 @@ def chat_system_prompt(
         long_term_memory=long_term_memory,
         tool_guidance=tool_guidance,
     )
+
+
+def session_title_prompt() -> str:
+    """Return the isolated prompt used for Session title generation."""
+    return _SESSION_TITLE_PROMPT

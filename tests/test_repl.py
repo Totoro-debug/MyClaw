@@ -1,3 +1,4 @@
+import asyncio
 from collections import deque
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
@@ -55,6 +56,18 @@ class RecordingProgressiveWriter:
 
     async def write_line(self, content: str) -> None:
         self.operations.append(("line", content))
+
+
+class CancelOnFirstDeltaWriter(RecordingProgressiveWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancelled = False
+
+    async def write_delta(self, delta: str) -> None:
+        await super().write_delta(delta)
+        if not self._cancelled:
+            self._cancelled = True
+            raise asyncio.CancelledError
 
 
 @pytest.mark.asyncio
@@ -232,6 +245,89 @@ async def test_repl_writes_each_text_delta_progressively_then_finishes_once(
         ("delta", "inspect the files."),
         ("finish", ""),
     ]
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_during_stream_persists_partial_and_repl_runs_the_next_turn(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    second_response = ModelResponse(
+        message=AssistantModelMessage(content="Second turn completed."),
+        usage=ModelUsage(input_tokens=14, output_tokens=4, total_tokens=18),
+        finish_reason="stop",
+    )
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(events=(TextDelta(delta="Partial first turn"),)),
+            StreamScript(
+                events=(
+                    TextDelta(delta="Second turn completed."),
+                    ModelCompleted(response=second_response),
+                )
+            ),
+        )
+    )
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter(
+            (
+                TURN_UUID,
+                USER_UUID,
+                REQUEST_UUID,
+                ASSISTANT_UUID,
+                UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+                UUID("16fd2706-8baf-433b-82eb-8c7fada847da"),
+                UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e"),
+                UUID("b3f37212-6f3a-4a1b-8d2e-78ab3f9c4567"),
+            )
+        ).__next__,
+    )
+    writer = CancelOnFirstDeltaWriter()
+
+    await run_repl(
+        conversation=conversation,
+        input_reader=ScriptedReplInput(("First turn.", "Second turn.", None)),
+        writer=writer,
+    )
+
+    assert writer.operations == [
+        ("delta", "Partial first turn"),
+        ("finish", ""),
+        ("delta", "Second turn completed."),
+        ("finish", ""),
+    ]
+    reloaded = await store.load(session.id)
+    assert [
+        (message.role, getattr(message, "status", None), message.content)
+        for message in reloaded.messages
+    ] == [
+        ("user", None, "First turn."),
+        ("assistant", "interrupted", "Partial first turn"),
+        ("user", None, "Second turn."),
+        ("assistant", "completed", "Second turn completed."),
+    ]
+    assert len(provider.stream_requests) == 2
 
 
 @pytest.mark.asyncio

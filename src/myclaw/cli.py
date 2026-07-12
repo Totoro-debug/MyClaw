@@ -11,11 +11,10 @@ from rich.console import Console
 from myclaw.agent_home import AgentHome
 from myclaw.config import ConfigError, ConfigLoader
 from myclaw.contracts.errors import ErrorInfo
+from myclaw.providers import create_provider
 from myclaw.repl import ConsoleProgressiveWriter, ConsoleReplInput
 from myclaw.runtime import (
-    ProviderAdapterUnavailable,
     prepare_repl_runtime,
-    unavailable_provider_factory,
 )
 
 app = typer.Typer(
@@ -63,23 +62,16 @@ def main(context: typer.Context) -> None:
         agent_home=loader.agent_home,
         workspace=Path.cwd(),
         configuration=configuration,
-        provider_factory=unavailable_provider_factory,
+        provider_factory=create_provider,
         now=_local_now,
         new_uuid=uuid4,
     )
-    try:
-        asyncio.run(
-            runtime.run(
-                input_reader=ConsoleReplInput(console),
-                writer=ConsoleProgressiveWriter(console),
-            )
+    asyncio.run(
+        runtime.run(
+            input_reader=ConsoleReplInput(console),
+            writer=ConsoleProgressiveWriter(console),
         )
-    except ProviderAdapterUnavailable as error:
-        _print_error(
-            ErrorInfo("route_unavailable", str(error)),
-            loader.path,
-        )
-        raise typer.Exit(code=1) from None
+    )
 
 
 @app.command("config")

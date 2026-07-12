@@ -2,11 +2,12 @@
 
 import asyncio
 import sys
+from collections.abc import AsyncIterator
 from typing import Protocol
 
 from rich.console import Console
 
-from myclaw.contracts import ConversationPort, TextDeltaPayload
+from myclaw.contracts import AgentEvent, ConversationPort, TextDeltaPayload, TurnFailedPayload
 
 
 class ReplInput(Protocol):
@@ -93,11 +94,31 @@ async def run_repl(
                 if result.output is not None:
                     await writer.write_line(result.output)
                 continue
-        async for event in conversation.submit(text):
-            if event.type == "text_delta":
-                payload = event.payload
-                if not isinstance(payload, TextDeltaPayload):
-                    raise TypeError("text_delta event has an invalid payload")
-                await writer.write_delta(payload.delta)
-            elif event.type == "turn_completed":
-                await writer.finish_turn()
+        events = conversation.submit(text)
+        try:
+            await _render_turn(events, writer)
+        except asyncio.CancelledError:
+            active_task = asyncio.current_task()
+            if active_task is not None and active_task.cancelling():
+                active_task.uncancel()
+            await conversation.cancel_active_turn()
+            await _render_turn(events, writer)
+
+
+async def _render_turn(
+    events: AsyncIterator[AgentEvent],
+    writer: ProgressiveWriter,
+) -> None:
+    async for event in events:
+        if event.type == "text_delta":
+            payload = event.payload
+            if not isinstance(payload, TextDeltaPayload):
+                raise TypeError("text_delta event has an invalid payload")
+            await writer.write_delta(payload.delta)
+        elif event.type in {"turn_completed", "turn_cancelled"}:
+            await writer.finish_turn()
+        elif event.type == "turn_failed":
+            payload = event.payload
+            if not isinstance(payload, TurnFailedPayload):
+                raise TypeError("turn_failed event has an invalid payload")
+            await writer.write_line(payload.error.message)

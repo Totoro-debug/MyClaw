@@ -11,6 +11,7 @@ from myclaw.agent_home import AgentHome
 from myclaw.config import ConfigError, ConfigLoader, ProviderConfiguration
 from myclaw.contracts import (
     AssistantModelMessage,
+    AssistantSessionMessage,
     ErrorInfo,
     ModelCallError,
     ModelCompleted,
@@ -18,7 +19,9 @@ from myclaw.contracts import (
     ModelRequest,
     ModelResponse,
     ModelUsage,
+    SessionError,
     TextDelta,
+    UserSessionMessage,
 )
 from myclaw.runtime import (
     ProviderAdapterUnavailable,
@@ -361,6 +364,140 @@ async def test_prepared_repl_status_reports_the_actual_fallback_route_and_sessio
     assert len(default_provider.stream_requests) == 1
 
 
+@pytest.mark.asyncio
+async def test_runtime_status_estimate_omits_a_pure_error_assistant(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    first = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=unavailable_provider_factory,
+        now=FakeClock(NOW).now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    second = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=unavailable_provider_factory,
+        now=FakeClock(NOW).now,
+        new_uuid=iter((TURN_TWO_UUID,)).__next__,
+    )
+    user = UserSessionMessage(
+        id=str(USER_UUID),
+        created_at=NOW,
+        content="Keep the next context stable.",
+    )
+    await first.sessions.append_message(first.session_id, user)
+    await second.sessions.append_message(second.session_id, user)
+    await second.sessions.append_message(
+        second.session_id,
+        AssistantSessionMessage(
+            id=str(ASSISTANT_UUID),
+            created_at=NOW,
+            content="",
+            tool_calls=(),
+            status="error",
+            error=SessionError(code="model_failed", message="Safe final failure."),
+            usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+        ),
+    )
+    first_writer = RecordingWriter()
+    second_writer = RecordingWriter()
+
+    await first.run(input_reader=ScriptedInput(("/status", None)), writer=first_writer)
+    await second.run(input_reader=ScriptedInput(("/status", None)), writer=second_writer)
+
+    first_status = json.loads(first_writer.operations[0][1])
+    second_status = json.loads(second_writer.operations[0][1])
+    assert first_status["session_message_count"] == 1
+    assert second_status["session_message_count"] == 2
+    assert first_status["estimated_input_tokens"] == second_status["estimated_input_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_status_estimate_includes_the_interrupted_history_marker(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    interrupted = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=unavailable_provider_factory,
+        now=FakeClock(NOW).now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    projected = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=unavailable_provider_factory,
+        now=FakeClock(NOW).now,
+        new_uuid=iter((TURN_TWO_UUID,)).__next__,
+    )
+    user = UserSessionMessage(
+        id=str(USER_UUID),
+        created_at=NOW,
+        content="Keep the interrupted context stable.",
+    )
+    await interrupted.sessions.append_message(interrupted.session_id, user)
+    await projected.sessions.append_message(projected.session_id, user)
+    await interrupted.sessions.append_message(
+        interrupted.session_id,
+        AssistantSessionMessage(
+            id=str(ASSISTANT_UUID),
+            created_at=NOW,
+            content="Partial first turn.",
+            tool_calls=(),
+            status="interrupted",
+            error=SessionError(code="turn_cancelled", message="Turn interrupted by user."),
+            usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+        ),
+    )
+    await projected.sessions.append_message(
+        projected.session_id,
+        AssistantSessionMessage(
+            id=str(ASSISTANT_TWO_UUID),
+            created_at=NOW,
+            content="Partial first turn.\n\n[Turn interrupted by user.]",
+            tool_calls=(),
+            status="completed",
+            error=None,
+            usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+        ),
+    )
+    interrupted_writer = RecordingWriter()
+    projected_writer = RecordingWriter()
+
+    await interrupted.run(
+        input_reader=ScriptedInput(("/status", None)),
+        writer=interrupted_writer,
+    )
+    await projected.run(
+        input_reader=ScriptedInput(("/status", None)),
+        writer=projected_writer,
+    )
+
+    interrupted_status = json.loads(interrupted_writer.operations[0][1])
+    projected_status = json.loads(projected_writer.operations[0][1])
+    assert interrupted_status["session_message_count"] == 2
+    assert projected_status["session_message_count"] == 2
+    assert (
+        interrupted_status["estimated_input_tokens"] == projected_status["estimated_input_tokens"]
+    )
+
+
 def test_prepared_repl_rejects_an_unusable_default_even_when_chat_is_usable(
     agent_home: Path,
     workspace: Path,
@@ -486,7 +623,9 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
     assert "MyClaw Personal Agent" in system_prompt
     assert workspace_identity in system_prompt
     assert memory_block in system_prompt
-    assert "<tool_guidance>\n</tool_guidance>" in system_prompt
+    assert "<tool_guidance>\n- read_file:" in system_prompt
+    assert "- list_files:" in system_prompt
+    assert "- search_files:" in system_prompt
     assert system_prompt.index(workspace_identity) < system_prompt.index(memory_block)
     assert system_prompt.index(memory_block) < system_prompt.index("<tool_guidance>")
     assert "Changed after startup" not in system_prompt

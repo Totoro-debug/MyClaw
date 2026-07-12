@@ -1,7 +1,7 @@
 """Composition for one prepared command-line Conversation Session."""
 
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,17 +13,22 @@ from myclaw.agent_home import AgentHome
 from myclaw.config import ProviderConfiguration, UserConfiguration
 from myclaw.contracts import (
     AgentEvent,
-    AssistantModelMessage,
-    AssistantSessionMessage,
     ConversationPort,
     ConversationSession,
     ModelProvider,
-    ToolModelMessage,
-    ToolSessionMessage,
-    UserModelMessage,
-    UserSessionMessage,
+    ToolDefinition,
+    ToolExecutionContext,
 )
-from myclaw.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.conversation import (
+    ChatModelSettings,
+    StreamingConversationPort,
+    model_message_from_session,
+)
+from myclaw.conversation_summary import (
+    ConversationSummaryManager,
+    JsonlSummaryStore,
+    SummaryModelSettings,
+)
 from myclaw.management import (
     ManagementViewService,
     ResolvedChatStatus,
@@ -32,9 +37,10 @@ from myclaw.management import (
 )
 from myclaw.management_commands import ManagementCommandDispatcher
 from myclaw.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
-from myclaw.prompts import chat_system_prompt, runtime_context
+from myclaw.prompts import chat_system_prompt, runtime_context, session_title_prompt
 from myclaw.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.session_store import JsonlSessionStore
+from myclaw.tool_gateway import ToolGateway
 from myclaw.workspace import Workspace
 
 
@@ -91,6 +97,9 @@ class _DeferredConversationPort:
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
         system_prompt: str,
+        title_prompt: str,
+        tool_gateway: ToolGateway,
+        history_preparer: Callable[[ConversationSession], Awaitable[ConversationSession]],
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -99,6 +108,9 @@ class _DeferredConversationPort:
         self._now = now
         self._new_uuid = new_uuid
         self._system_prompt = system_prompt
+        self._title_prompt = title_prompt
+        self._tool_gateway = tool_gateway
+        self._history_preparer = history_preparer
         self._delegate: ConversationPort | None = None
 
     async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
@@ -114,6 +126,9 @@ class _DeferredConversationPort:
                 now=self._now,
                 new_uuid=self._new_uuid,
                 system_prompt=self._system_prompt,
+                title_prompt=self._title_prompt,
+                tool_gateway=self._tool_gateway,
+                history_preparer=self._history_preparer,
             )
             self._delegate = delegate
         async for event in delegate.submit(text):
@@ -144,10 +159,7 @@ def prepare_repl_runtime(
     """Prepare a Session and defer provider construction until conversational input."""
     configuration.resolve_route("default")
     workspace_identity = Workspace.from_path(workspace)
-    system_prompt = chat_system_prompt(
-        workspace=workspace_identity.path,
-        long_term_memory=(agent_home.path / "memory" / "memory.md").read_text(encoding="utf-8"),
-    )
+    long_term_memory = (agent_home.path / "memory" / "memory.md").read_text(encoding="utf-8")
     sessions = JsonlSessionStore(
         agent_home=agent_home,
         workspace=workspace_identity,
@@ -169,6 +181,42 @@ def prepare_repl_runtime(
         clock=retry_clock if retry_clock is not None else AsyncioRetryClock(),
         jitter=retry_jitter,
     )
+    tool_gateway = ToolGateway(
+        context=ToolExecutionContext(
+            lane="foreground",
+            workspace=Path(workspace_identity.path),
+            agent_home=agent_home.path,
+            session_id=metadata.id,
+        )
+    )
+    system_prompt = chat_system_prompt(
+        workspace=workspace_identity.path,
+        long_term_memory=long_term_memory,
+        tool_guidance="\n".join(
+            f"- {definition.name}: {definition.description}"
+            for definition in tool_gateway.definitions
+        ),
+    )
+    resolved_memory = configuration.resolve_route("memory")
+    summary_manager = ConversationSummaryManager(
+        provider=router,
+        sessions=sessions,
+        summaries=JsonlSummaryStore(agent_home),
+        settings=SummaryModelSettings(
+            model=resolved_memory.route.model,
+            max_output=resolved_memory.route.max_output,
+            temperature=resolved_memory.route.temperature,
+            reasoning_effort=resolved_memory.route.reasoning_effort,
+            timeout_seconds=resolved_memory.route.timeout,
+        ),
+        chat_context_window=resolved.route.context_window,
+        chat_max_output=resolved.route.max_output,
+        consolidation_message_threshold=(configuration.memory.consolidation_message_threshold),
+        chat_system_prompt=system_prompt,
+        tools=tool_gateway.definitions,
+        now=now,
+        new_uuid=new_uuid,
+    )
     status_service = RuntimeStatusService(
         sessions=sessions,
         session_id=metadata.id,
@@ -178,6 +226,7 @@ def prepare_repl_runtime(
             system_prompt=system_prompt,
             current_time=now(),
             session_id=metadata.id,
+            tool_definitions=tool_gateway.definitions,
         ),
         monotonic=monotonic_now,
     )
@@ -192,6 +241,9 @@ def prepare_repl_runtime(
         now=now,
         new_uuid=new_uuid,
         system_prompt=system_prompt,
+        title_prompt=session_title_prompt(),
+        tool_gateway=tool_gateway,
+        history_preparer=summary_manager.prepare,
     )
     return PreparedReplRuntime(
         conversation=conversation,
@@ -216,35 +268,30 @@ def _runtime_status_input(
     system_prompt: str,
     current_time: datetime,
     session_id: str,
+    tool_definitions: tuple[ToolDefinition, ...],
 ) -> RuntimeStatusInput:
     retained_messages = tuple(
         json.dumps(
-            _model_message_for_status(message).to_dict(),
+            model_message.to_dict(),
             ensure_ascii=False,
             separators=(",", ":"),
         )
         for message in session.short_term_messages
+        if (model_message := model_message_from_session(message)) is not None
     )
     return RuntimeStatusInput(
         system_prompt=system_prompt,
         retained_messages=retained_messages,
-        tool_definitions=(),
+        tool_definitions=tuple(
+            json.dumps(
+                definition.to_dict(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            for definition in tool_definitions
+        ),
         runtime_context=runtime_context(
             current_time=current_time,
             session_id=session_id,
         ),
-    )
-
-
-def _model_message_for_status(
-    message: UserSessionMessage | AssistantSessionMessage | ToolSessionMessage,
-) -> UserModelMessage | AssistantModelMessage | ToolModelMessage:
-    if isinstance(message, UserSessionMessage):
-        return UserModelMessage(content=message.content)
-    if isinstance(message, AssistantSessionMessage):
-        return AssistantModelMessage(content=message.content, tool_calls=message.tool_calls)
-    return ToolModelMessage(
-        tool_call_id=message.tool_call_id,
-        name=message.name,
-        content=message.content,
     )

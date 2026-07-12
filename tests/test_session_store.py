@@ -12,6 +12,7 @@ from myclaw.contracts import (
     CumulativeUsage,
     MetadataUpdate,
     ModelUsage,
+    SessionError,
     SessionMetadata,
     SessionStore,
     UserSessionMessage,
@@ -148,6 +149,52 @@ async def test_completed_assistant_is_one_complete_record_and_reloads(
         ),
         messages=(user_message, assistant_message),
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_and_interrupted_assistants_reload_with_safe_error_details(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=FakeClock(CREATED_AT).now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    metadata = store.prepare()
+    user_message = UserSessionMessage(
+        id=str(USER_UUID),
+        created_at=metadata.created_at,
+        content="Keep the terminal outcome.",
+    )
+    failed_message = AssistantSessionMessage(
+        id=str(ASSISTANT_UUID),
+        created_at=metadata.created_at + timedelta(seconds=1),
+        content="",
+        tool_calls=(),
+        status="error",
+        error=SessionError(code="provider_timeout", message="The model timed out."),
+        usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+    )
+    interrupted_message = AssistantSessionMessage(
+        id="a3bb189e-8bf9-4c4b-ae4a-c6699f6f7e34",
+        created_at=metadata.created_at + timedelta(seconds=2),
+        content="Partial answer",
+        tool_calls=(),
+        status="interrupted",
+        error=SessionError(code="turn_cancelled", message="Turn interrupted by user."),
+        usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+    )
+
+    await store.append_message(metadata.id, user_message)
+    await store.append_message(metadata.id, failed_message)
+    await store.append_message(metadata.id, interrupted_message)
+
+    reloaded = await store.load(metadata.id)
+    assert reloaded.messages == (user_message, failed_message, interrupted_message)
 
 
 @pytest.mark.asyncio

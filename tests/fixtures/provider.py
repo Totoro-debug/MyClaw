@@ -4,7 +4,14 @@ from collections import deque
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
-from myclaw.contracts import ModelResponse, ModelStreamEvent
+from myclaw.contracts import (
+    ErrorInfo,
+    ModelCallError,
+    ModelRequest,
+    ModelResponse,
+    ModelStreamEvent,
+)
+from myclaw.prompts import session_title_prompt
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,10 +34,16 @@ class ScriptedFakeProvider:
         self._streams = deque(streams)
         self._completions = deque(completions)
         self.stream_requests: list[object] = []
+        self.unscripted_title_requests: list[ModelRequest] = []
         self.complete_requests: list[object] = []
         self.closed = False
 
     async def stream(self, request: object) -> AsyncIterator[ModelStreamEvent]:
+        if isinstance(request, ModelRequest) and request.system_prompt == session_title_prompt():
+            self.unscripted_title_requests.append(request)
+            raise ModelCallError(
+                ErrorInfo(code="model_failed", message="No title response was scripted.")
+            )
         self.stream_requests.append(request)
         if not self._streams:
             msg = "No scripted stream remains"

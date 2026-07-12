@@ -258,6 +258,7 @@ class MetadataUpdate:
     updated_at: datetime | None = None
     consolidation_cursor: int | None = None
     cumulative_usage: CumulativeUsage | None = None
+    usage_delta: ModelUsage | None = None
 
     def __post_init__(self) -> None:
         if self.title is not None:
@@ -266,6 +267,9 @@ class MetadataUpdate:
             require_aware_datetime(self.updated_at, field="updated_at")
         if self.consolidation_cursor is not None:
             require_nonnegative_int(self.consolidation_cursor, field="consolidation_cursor")
+        if self.cumulative_usage is not None and self.usage_delta is not None:
+            msg = "cumulative_usage and usage_delta are mutually exclusive"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
