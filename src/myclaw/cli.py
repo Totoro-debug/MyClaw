@@ -11,8 +11,6 @@ from rich.console import Console
 from myclaw.agent_home import AgentHome
 from myclaw.config import ConfigError, ConfigLoader
 from myclaw.contracts.errors import ErrorInfo
-from myclaw.management import ManagementViewService
-from myclaw.management_commands import ManagementCommandDispatcher
 from myclaw.repl import ConsoleProgressiveWriter, ConsoleReplInput
 from myclaw.runtime import (
     ProviderAdapterUnavailable,
@@ -74,9 +72,6 @@ def main(context: typer.Context) -> None:
             runtime.run(
                 input_reader=ConsoleReplInput(console),
                 writer=ConsoleProgressiveWriter(console),
-                management_dispatcher=ManagementCommandDispatcher(
-                    ManagementViewService(loader.agent_home)
-                ),
             )
         )
     except ProviderAdapterUnavailable as error:

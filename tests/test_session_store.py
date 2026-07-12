@@ -9,7 +9,10 @@ from myclaw.agent_home import AgentHome
 from myclaw.contracts import (
     AssistantSessionMessage,
     ConversationSession,
+    CumulativeUsage,
+    MetadataUpdate,
     ModelUsage,
+    SessionMetadata,
     SessionStore,
     UserSessionMessage,
 )
@@ -130,6 +133,202 @@ async def test_completed_assistant_is_one_complete_record_and_reloads(
         b'"usage":{"input_tokens":120,"output_tokens":24,"total_tokens":144}}\n'
     )
     assert await store.load(SESSION_ID) == ConversationSession(
-        metadata=metadata,
+        metadata=SessionMetadata(
+            id=metadata.id,
+            title=metadata.title,
+            created_at=metadata.created_at,
+            updated_at=assistant_message.created_at,
+            consolidation_cursor=0,
+            cumulative_usage=CumulativeUsage(
+                model_calls=1,
+                input_tokens=120,
+                output_tokens=24,
+                total_tokens=144,
+            ),
+        ),
         messages=(user_message, assistant_message),
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_materialized_message_updates_time_without_estimated_usage(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=FakeClock(CREATED_AT).now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    metadata = store.prepare()
+    first_message_at = metadata.created_at + timedelta(seconds=3)
+    await store.append_message(
+        metadata.id,
+        UserSessionMessage(
+            id=str(USER_UUID),
+            created_at=first_message_at,
+            content="First message.",
+        ),
+    )
+
+    materialized = await store.load(metadata.id)
+
+    assert (
+        materialized.metadata.updated_at,
+        materialized.metadata.cumulative_usage,
+    ) == (
+        first_message_at,
+        CumulativeUsage(model_calls=0, input_tokens=0, output_tokens=0, total_tokens=0),
+    )
+
+
+@pytest.mark.asyncio
+async def test_appended_messages_update_session_time_and_actual_cumulative_usage(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(CREATED_AT)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    metadata = store.prepare()
+    user_message = UserSessionMessage(
+        id=str(USER_UUID),
+        created_at=metadata.created_at,
+        content="Track this session.",
+    )
+    await store.append_message(SESSION_ID, user_message)
+    clock.advance(5)
+    updated_at = clock.now().replace(microsecond=123_000)
+    assistant_message = AssistantSessionMessage(
+        id=str(ASSISTANT_UUID),
+        created_at=updated_at,
+        content="Tracked.",
+        tool_calls=(),
+        status="completed",
+        error=None,
+        usage=ModelUsage(input_tokens=7, output_tokens=2, total_tokens=9),
+    )
+
+    await store.append_message(SESSION_ID, assistant_message)
+
+    session = await store.load(SESSION_ID)
+    assert (
+        len(session.messages),
+        session.metadata.updated_at,
+        session.metadata.cumulative_usage,
+    ) == (
+        2,
+        updated_at,
+        CumulativeUsage(model_calls=1, input_tokens=7, output_tokens=2, total_tokens=9),
+    )
+
+
+@pytest.mark.asyncio
+async def test_metadata_update_preserves_message_bytes_and_sets_exact_session_state(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=FakeClock(CREATED_AT).now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    metadata = store.prepare()
+    user_message = UserSessionMessage(
+        id=str(USER_UUID),
+        created_at=metadata.created_at,
+        content="Keep my exact UTF-8 history: \u4f60\u597d.",
+    )
+    await store.append_message(SESSION_ID, user_message)
+    session_path = store.path_for(SESSION_ID)
+    original_messages = read_bytes(session_path).partition(b"\n")[2]
+    updated_at = datetime(2026, 7, 11, 16, 0, 0, 456000, tzinfo=LOCAL_OFFSET)
+    expected_usage = CumulativeUsage(
+        model_calls=2,
+        input_tokens=21,
+        output_tokens=5,
+        total_tokens=26,
+    )
+
+    await store.update_metadata(
+        SESSION_ID,
+        MetadataUpdate(
+            title="Tracked session",
+            updated_at=updated_at,
+            consolidation_cursor=1,
+            cumulative_usage=expected_usage,
+        ),
+    )
+
+    reloaded = await store.load(SESSION_ID)
+    assert (
+        reloaded.metadata.title,
+        reloaded.metadata.updated_at,
+        reloaded.metadata.consolidation_cursor,
+        reloaded.metadata.cumulative_usage,
+        read_bytes(session_path).partition(b"\n")[2],
+    ) == (
+        "Tracked session",
+        updated_at,
+        1,
+        expected_usage,
+        original_messages,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ordinary_append_remains_complete_when_metadata_rewrite_fails(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=FakeClock(CREATED_AT).now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    metadata = store.prepare()
+    user_message = UserSessionMessage(
+        id=str(USER_UUID),
+        created_at=metadata.created_at,
+        content="First record.",
+    )
+    await store.append_message(SESSION_ID, user_message)
+    assistant_message = AssistantSessionMessage(
+        id=str(ASSISTANT_UUID),
+        created_at=datetime(2026, 7, 11, 15, 31, tzinfo=LOCAL_OFFSET),
+        content="Second record.",
+        tool_calls=(),
+        status="completed",
+        error=None,
+        usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
+    )
+
+    def fail_metadata_replace(_source: str | bytes, _target: str | bytes) -> None:
+        raise OSError("simulated metadata replacement failure")
+
+    monkeypatch.setattr(os, "replace", fail_metadata_replace)
+
+    with pytest.raises(OSError, match="simulated metadata replacement failure"):
+        await store.append_message(SESSION_ID, assistant_message)
+
+    reloaded = await store.load(SESSION_ID)
+    assert (reloaded.messages, reloaded.metadata) == (
+        (user_message, assistant_message),
+        metadata,
     )

@@ -1,9 +1,102 @@
 """Concrete read-only views exposed through the Management Port."""
 
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Protocol
+
+from myclaw import __version__
 from myclaw.agent_home import AgentHome
 from myclaw.config import ConfigLoader
+from myclaw.contracts import ConversationSession, RuntimeStatus
 from myclaw.contracts.errors import ErrorInfo
 from myclaw.contracts.management import ConfigView
+
+
+class _CurrentSessionStore(Protocol):
+    async def current_session(self, session_id: str) -> ConversationSession: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedChatStatus:
+    """The actual provider/model identity and context window used for chat."""
+
+    provider_id: str
+    model: str
+    context_window: int
+
+    def __post_init__(self) -> None:
+        if not self.provider_id or not self.model:
+            msg = "provider_id and model must not be empty"
+            raise ValueError(msg)
+        if self.context_window <= 0:
+            msg = "context_window must be positive"
+            raise ValueError(msg)
+
+    @property
+    def chat_model(self) -> str:
+        return f"{self.provider_id}/{self.model}"
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeStatusInput:
+    """Exact next-request text fragments included in the token estimate."""
+
+    system_prompt: str
+    retained_messages: tuple[str, ...]
+    tool_definitions: tuple[str, ...]
+    runtime_context: str
+
+
+def estimate_input_tokens(status_input: RuntimeStatusInput) -> int:
+    """Estimate tokens as ceil(total UTF-8 bytes / 4)."""
+    components = (
+        status_input.system_prompt,
+        *status_input.retained_messages,
+        *status_input.tool_definitions,
+        status_input.runtime_context,
+    )
+    byte_count = sum(len(component.encode("utf-8")) for component in components)
+    return (byte_count + 3) // 4
+
+
+class RuntimeStatusService:
+    """Build one Management Port status snapshot from injectable runtime state."""
+
+    def __init__(
+        self,
+        *,
+        sessions: _CurrentSessionStore,
+        session_id: str,
+        resolved_chat: Callable[[], ResolvedChatStatus],
+        next_input: Callable[[ConversationSession], RuntimeStatusInput],
+        monotonic: Callable[[], float],
+        version: str = __version__,
+    ) -> None:
+        self._sessions = sessions
+        self._session_id = session_id
+        self._resolved_chat = resolved_chat
+        self._next_input = next_input
+        self._monotonic = monotonic
+        self._started_at = monotonic()
+        self._version = version
+
+    async def status(self) -> RuntimeStatus:
+        """Return all required runtime and current-session status fields."""
+        session = await self._sessions.current_session(self._session_id)
+        resolved = self._resolved_chat()
+        estimated = estimate_input_tokens(self._next_input(session))
+        uptime = max(0, int(self._monotonic() - self._started_at))
+        return RuntimeStatus(
+            version=self._version,
+            chat_model=resolved.chat_model,
+            uptime_seconds=uptime,
+            estimated_input_tokens=estimated,
+            context_window=resolved.context_window,
+            context_used_percent=estimated / resolved.context_window * 100,
+            session_message_count=len(session.messages),
+            consolidation_cursor=session.metadata.consolidation_cursor,
+            cumulative_usage=session.metadata.cumulative_usage,
+        )
 
 
 class ManagementError(Exception):
@@ -17,9 +110,15 @@ class ManagementError(Exception):
 class ManagementViewService:
     """Read configuration and Long-term Memory from Agent Home."""
 
-    def __init__(self, agent_home: AgentHome) -> None:
+    def __init__(
+        self,
+        agent_home: AgentHome,
+        *,
+        status_service: RuntimeStatusService | None = None,
+    ) -> None:
         self._config = ConfigLoader(agent_home)
         self._long_term_memory = agent_home.path / "memory" / "memory.md"
+        self._status_service = status_service
 
     async def config_view(self) -> ConfigView:
         """Return complete redacted User Configuration content."""
@@ -42,3 +141,9 @@ class ManagementViewService:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Long-term Memory could not be read.")
             ) from None
+
+    async def status(self) -> RuntimeStatus:
+        """Return the injected Runtime status snapshot."""
+        if self._status_service is None:
+            raise ManagementError(ErrorInfo("route_unavailable", "Runtime status is unavailable."))
+        return await self._status_service.status()

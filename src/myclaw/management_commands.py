@@ -1,14 +1,17 @@
 """Standalone dispatch for read-only Management Commands."""
 
+import json
 from dataclasses import dataclass
 from typing import Protocol
 
-from myclaw.contracts.management import ConfigView
+from myclaw.contracts.management import ConfigView, RuntimeStatus
 from myclaw.management import ManagementError
 
 
 class _ManagementViewPort(Protocol):
     async def config_view(self) -> ConfigView: ...
+
+    async def status(self) -> RuntimeStatus: ...
 
     async def memory_view(self) -> str: ...
 
@@ -29,6 +32,13 @@ class ManagementCommandDispatcher:
 
     async def dispatch(self, command: str) -> ManagementCommandResult:
         """Return rendered output for a recognized Management Command."""
+        if command == "/status":
+            try:
+                status = await self._management.status()
+                output = json.dumps(status.to_dict(), ensure_ascii=False, indent=2)
+            except ManagementError as management_error:
+                output = f"{management_error.error.code}: {management_error.error.message}"
+            return ManagementCommandResult(handled=True, output=output)
         if command == "/memory":
             try:
                 output = await self._management.memory_view()

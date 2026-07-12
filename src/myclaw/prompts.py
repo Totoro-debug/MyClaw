@@ -5,12 +5,12 @@ from pathlib import PurePath
 
 from myclaw.contracts import format_rfc3339_milliseconds
 
-_CURRENT_USER_INPUT = """<runtime_context>
+_RUNTIME_CONTEXT = """<runtime_context>
 current_time: {current_time}
 session_id: {session_id}
-</runtime_context>
+</runtime_context>"""
 
-<user_input>
+_USER_INPUT = """<user_input>
 {content}
 </user_input>"""
 
@@ -29,10 +29,16 @@ _CHAT_SYSTEM_PROMPT = """{identity}
 
 def current_user_input(*, content: str, current_time: datetime, session_id: str) -> str:
     """Wrap only the current raw user input with dynamic Runtime Context."""
-    return _CURRENT_USER_INPUT.format(
+    return f"{runtime_context(current_time=current_time, session_id=session_id)}\n\n" + (
+        _USER_INPUT.format(content=content)
+    )
+
+
+def runtime_context(*, current_time: datetime, session_id: str) -> str:
+    """Render the per-turn metadata included in the next model request."""
+    return _RUNTIME_CONTEXT.format(
         current_time=format_rfc3339_milliseconds(current_time),
         session_id=session_id,
-        content=content,
     )
 
 

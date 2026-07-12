@@ -1,3 +1,4 @@
+import json
 from collections import deque
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,8 @@ from myclaw.agent_home import AgentHome
 from myclaw.config import ConfigError, ConfigLoader, ProviderConfiguration
 from myclaw.contracts import (
     AssistantModelMessage,
+    ErrorInfo,
+    ModelCallError,
     ModelCompleted,
     ModelProvider,
     ModelRequest,
@@ -213,6 +216,149 @@ async def test_prepared_repl_uses_the_chat_model_route(
         request.reasoning_effort,
         request.timeout_seconds,
     ) == ("chat", "chat-model", 4096, 0.1, "high", 90)
+
+
+@pytest.mark.asyncio
+async def test_prepared_repl_routes_transient_provider_failures_through_one_retry_budget(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    clock = FakeClock(NOW)
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(),
+                error=ModelCallError(
+                    ErrorInfo(
+                        code="provider_timeout",
+                        message="The provider timed out.",
+                        retryable=True,
+                    )
+                ),
+            ),
+            StreamScript(
+                events=(
+                    TextDelta(delta="Recovered response."),
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Recovered response."),
+                            usage=ModelUsage(input_tokens=5, output_tokens=2, total_tokens=7),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=lambda _: provider,
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        retry_clock=clock,
+    )
+    writer = RecordingWriter()
+
+    await runtime.run(
+        input_reader=ScriptedInput(("Retry this turn.", None)),
+        writer=writer,
+    )
+
+    assert len(provider.stream_requests) == 2
+    assert clock.sleeps == [0.5]
+    assert writer.operations == [("delta", "Recovered response."), ("finish", "")]
+
+
+@pytest.mark.asyncio
+async def test_prepared_repl_status_reports_the_actual_fallback_route_and_session(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(CHAT_ROUTE_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    clock = FakeClock(NOW)
+    chat_provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(),
+                error=ModelCallError(
+                    ErrorInfo(
+                        code="provider_auth_error",
+                        message="The configured chat provider rejected authentication.",
+                        retryable=False,
+                    )
+                ),
+            ),
+        )
+    )
+    fallback_usage = ModelUsage(input_tokens=9, output_tokens=3, total_tokens=12)
+    default_provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    TextDelta(delta="Fallback response."),
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Fallback response."),
+                            usage=fallback_usage,
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    factory_calls: list[str] = []
+
+    def provider_factory(configuration: ProviderConfiguration) -> ModelProvider:
+        factory_calls.append(configuration.provider_id)
+        if configuration.provider_id == "chat-provider":
+            return chat_provider
+        return default_provider
+
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=provider_factory,
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        retry_clock=clock,
+    )
+    writer = RecordingWriter()
+
+    await runtime.run(
+        input_reader=ScriptedInput(("Use fallback.", "/status", None)),
+        writer=writer,
+    )
+
+    assert factory_calls == ["chat-provider", "anthropic-default"]
+    assert writer.operations[:2] == [("delta", "Fallback response."), ("finish", "")]
+    operation, rendered_status = writer.operations[2]
+    assert operation == "line"
+    status = json.loads(rendered_status)
+    assert status["version"] == "0.1.0"
+    assert status["chat_model"] == "anthropic-default/claude-model"
+    assert status["context_window"] == 200000
+    assert status["session_message_count"] == 2
+    assert status["consolidation_cursor"] == 0
+    assert status["cumulative_usage"] == {
+        "model_calls": 1,
+        "input_tokens": 9,
+        "output_tokens": 3,
+        "total_tokens": 12,
+    }
+    assert status["estimated_input_tokens"] > 0
+    assert isinstance(status["uptime_seconds"], int)
+    assert len(default_provider.stream_requests) == 1
 
 
 def test_prepared_repl_rejects_an_unusable_default_even_when_chat_is_usable(

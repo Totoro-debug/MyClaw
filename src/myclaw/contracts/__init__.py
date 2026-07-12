@@ -1,7 +1,7 @@
 """Executable public contracts shared across MyClaw runtime boundaries."""
 
 from myclaw.contracts.common import format_rfc3339_milliseconds, make_session_id
-from myclaw.contracts.errors import STABLE_ERROR_CODES, ErrorCode, ErrorInfo
+from myclaw.contracts.errors import STABLE_ERROR_CODES, ErrorCode, ErrorInfo, ModelCallError
 from myclaw.contracts.events import (
     AgentEvent,
     AgentEventPayload,
@@ -95,6 +95,7 @@ __all__ = [
     "MemoryStore",
     "MemoryTaskResult",
     "MetadataUpdate",
+    "ModelCallError",
     "ModelCompleted",
     "ModelMessage",
     "ModelProvider",

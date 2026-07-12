@@ -1,10 +1,21 @@
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
 from myclaw.agent_home import AgentHome
-from myclaw.management import ManagementViewService
+from myclaw.contracts import AssistantSessionMessage, MetadataUpdate, ModelUsage, UserSessionMessage
+from myclaw.management import (
+    ManagementViewService,
+    ResolvedChatStatus,
+    RuntimeStatusInput,
+    RuntimeStatusService,
+)
 from myclaw.management_commands import ManagementCommandDispatcher
+from myclaw.session_store import JsonlSessionStore
+from myclaw.workspace import Workspace
 
 CONFIG_CONTENT = """[models.providers.primary]
 protocol = "anthropic"
@@ -108,6 +119,12 @@ base_url = ""
 api_key = ""
 models = []
 """
+
+LOCAL_OFFSET = timezone(timedelta(hours=8))
+STATUS_CREATED_AT = datetime(2026, 7, 11, 15, 30, tzinfo=LOCAL_OFFSET)
+STATUS_SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
+STATUS_USER_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
+STATUS_ASSISTANT_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 
 
 class ConversationProviderSpy:
@@ -239,6 +256,81 @@ async def test_memory_command_renders_safe_persistence_failure(agent_home: Path)
         True,
         "persistence_error: Long-term Memory could not be read.",
     )
+
+
+@pytest.mark.asyncio
+async def test_status_command_renders_actual_runtime_and_session_state(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: STATUS_CREATED_AT,
+        new_uuid=iter((STATUS_SESSION_UUID,)).__next__,
+    )
+    metadata = sessions.prepare()
+    user_message = UserSessionMessage(
+        id=str(STATUS_USER_UUID),
+        created_at=metadata.created_at,
+        content="Session state.",
+    )
+    assistant_message = AssistantSessionMessage(
+        id=str(STATUS_ASSISTANT_UUID),
+        created_at=STATUS_CREATED_AT + timedelta(seconds=2),
+        content="Visible.",
+        tool_calls=(),
+        status="completed",
+        error=None,
+        usage=ModelUsage(input_tokens=10, output_tokens=3, total_tokens=13),
+    )
+    await sessions.append_message(metadata.id, user_message)
+    await sessions.append_message(metadata.id, assistant_message)
+    await sessions.update_metadata(
+        metadata.id,
+        MetadataUpdate(consolidation_cursor=1),
+    )
+    status_service = RuntimeStatusService(
+        sessions=sessions,
+        session_id=metadata.id,
+        resolved_chat=lambda: ResolvedChatStatus(
+            provider_id="fallback",
+            model="chat-model",
+            context_window=8,
+        ),
+        next_input=lambda _session: RuntimeStatusInput(
+            system_prompt="abcd",
+            retained_messages=(),
+            tool_definitions=(),
+            runtime_context="",
+        ),
+        monotonic=iter((10.0, 75.8)).__next__,
+    )
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(home, status_service=status_service)
+    )
+
+    result = await dispatcher.dispatch("/status")
+
+    assert result.handled is True
+    assert json.loads(result.output or "") == {
+        "version": "0.1.0",
+        "chat_model": "fallback/chat-model",
+        "uptime_seconds": 65,
+        "estimated_input_tokens": 1,
+        "context_window": 8,
+        "context_used_percent": 12.5,
+        "session_message_count": 2,
+        "consolidation_cursor": 1,
+        "cumulative_usage": {
+            "model_calls": 1,
+            "input_tokens": 10,
+            "output_tokens": 3,
+            "total_tokens": 13,
+        },
+    }
 
 
 @pytest.mark.asyncio

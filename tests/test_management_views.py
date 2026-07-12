@@ -1,9 +1,20 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
 from myclaw.agent_home import AgentHome
-from myclaw.management import ManagementError, ManagementViewService
+from myclaw.contracts import CumulativeUsage, RuntimeStatus
+from myclaw.management import (
+    ManagementError,
+    ManagementViewService,
+    ResolvedChatStatus,
+    RuntimeStatusInput,
+    RuntimeStatusService,
+)
+from myclaw.session_store import JsonlSessionStore
+from myclaw.workspace import Workspace
 
 CONFIG_WITH_PLAINTEXT_KEYS = """# User Configuration remains source-preserved.
 [models.providers.primary]
@@ -48,6 +59,10 @@ max_output = 512
 temperature = 0
 timeout = 60
 """
+
+LOCAL_OFFSET = timezone(timedelta(hours=8))
+CREATED_AT = datetime(2026, 7, 11, 15, 30, 12, 123456, tzinfo=LOCAL_OFFSET)
+SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 
 
 @pytest.mark.asyncio
@@ -140,4 +155,57 @@ async def test_memory_view_converts_read_failure_to_safe_persistence_error(
     assert (raised.value.error.code, raised.value.error.message) == (
         "persistence_error",
         "Long-term Memory could not be read.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: CREATED_AT,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    metadata = sessions.prepare()
+    monotonic = iter((100.0, 112.9)).__next__
+    status_service = RuntimeStatusService(
+        sessions=sessions,
+        session_id=metadata.id,
+        resolved_chat=lambda: ResolvedChatStatus(
+            provider_id="primary",
+            model="model-id",
+            context_window=10,
+        ),
+        next_input=lambda _session: RuntimeStatusInput(
+            system_prompt="abcd",
+            retained_messages=("\u00e9",),
+            tool_definitions=("tool",),
+            runtime_context="\u4f60",
+        ),
+        monotonic=monotonic,
+    )
+    management = ManagementViewService(home, status_service=status_service)
+
+    status = await management.status()
+
+    assert status == RuntimeStatus(
+        version="0.1.0",
+        chat_model="primary/model-id",
+        uptime_seconds=12,
+        estimated_input_tokens=4,
+        context_window=10,
+        context_used_percent=40.0,
+        session_message_count=0,
+        consolidation_cursor=0,
+        cumulative_usage=CumulativeUsage(
+            model_calls=0,
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+        ),
     )
