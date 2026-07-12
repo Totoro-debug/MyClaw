@@ -9,6 +9,7 @@ from rich.console import Console
 
 from myclaw.contracts import (
     AgentEvent,
+    BackgroundCompletedPayload,
     ConversationPort,
     PermissionRequestedPayload,
     SessionSummary,
@@ -42,6 +43,12 @@ class ProgressiveWriter(Protocol):
     async def finish_turn(self) -> None: ...
 
     async def write_line(self, content: str) -> None: ...
+
+
+class BackgroundEventSource(Protocol):
+    async def next_background_event(self) -> AgentEvent: ...
+
+    def next_background_event_nowait(self) -> AgentEvent | None: ...
 
 
 class ConsoleProgressiveWriter:
@@ -89,49 +96,97 @@ async def run_repl(
     input_reader: ReplInput,
     writer: ProgressiveWriter,
     management_dispatcher: ManagementDispatcher | None = None,
+    background_events: BackgroundEventSource | None = None,
 ) -> None:
     """Read interactive input until EOF while preserving an unmaterialized empty Session."""
-    while True:
-        text = await input_reader.read()
-        if text is None:
-            return
-        stripped = text.strip()
-        if not stripped:
-            continue
-        if stripped.casefold() in {"exit", "quit"}:
-            return
-        if management_dispatcher is not None:
-            result = await management_dispatcher.dispatch(text)
-            if result.handled:
-                if result.output is not None:
-                    await writer.write_line(result.output)
-                if result.resume_sessions:
-                    await _choose_resume_session(
-                        sessions=result.resume_sessions,
-                        input_reader=input_reader,
-                        writer=writer,
-                        management_dispatcher=management_dispatcher,
-                    )
+    input_task: asyncio.Task[str | None] | None = None
+    background_task: asyncio.Task[AgentEvent] | None = None
+    try:
+        while True:
+            if background_events is not None and input_task is None:
+                queued_event = background_events.next_background_event_nowait()
+                if queued_event is not None:
+                    await _render_background_event(queued_event, writer)
+                    continue
+            if input_task is None:
+                input_task = asyncio.create_task(input_reader.read())
+            if background_events is None:
+                text = await input_task
+                input_task = None
+            else:
+                background_task = asyncio.create_task(background_events.next_background_event())
+                completed, _ = await asyncio.wait(
+                    (input_task, background_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if background_task in completed:
+                    event = background_task.result()
+                    background_task = None
+                    await _render_background_event(event, writer)
+                    continue
+                background_task.cancel()
+                await asyncio.gather(background_task, return_exceptions=True)
+                background_task = None
+                text = input_task.result()
+                input_task = None
+            if text is None:
+                return
+            stripped = text.strip()
+            if not stripped:
                 continue
-        events = conversation.submit(text)
-        try:
-            await _render_turn(
-                events,
-                writer,
-                conversation=conversation,
-                input_reader=input_reader,
-            )
-        except asyncio.CancelledError:
-            active_task = asyncio.current_task()
-            if active_task is not None and active_task.cancelling():
-                active_task.uncancel()
-            await conversation.cancel_active_turn()
-            await _render_turn(
-                events,
-                writer,
-                conversation=conversation,
-                input_reader=input_reader,
-            )
+            if stripped.casefold() in {"exit", "quit"}:
+                return
+            if management_dispatcher is not None:
+                result = await management_dispatcher.dispatch(text)
+                if result.handled:
+                    if result.output is not None:
+                        await writer.write_line(result.output)
+                    if result.resume_sessions:
+                        await _choose_resume_session(
+                            sessions=result.resume_sessions,
+                            input_reader=input_reader,
+                            writer=writer,
+                            management_dispatcher=management_dispatcher,
+                        )
+                    continue
+            events = conversation.submit(text)
+            try:
+                await _render_turn(
+                    events,
+                    writer,
+                    conversation=conversation,
+                    input_reader=input_reader,
+                )
+            except asyncio.CancelledError:
+                active_task = asyncio.current_task()
+                if active_task is not None and active_task.cancelling():
+                    active_task.uncancel()
+                await conversation.cancel_active_turn()
+                await _render_turn(
+                    events,
+                    writer,
+                    conversation=conversation,
+                    input_reader=input_reader,
+                )
+    finally:
+        pending = tuple(
+            task for task in (input_task, background_task) if task is not None and not task.done()
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _render_background_event(event: AgentEvent, writer: ProgressiveWriter) -> None:
+    if event.type != "background_completed":
+        raise TypeError("background event source yielded a non-background event")
+    payload = event.payload
+    if not isinstance(payload, BackgroundCompletedPayload):
+        raise TypeError("background_completed event has an invalid payload")
+    await writer.write_line(
+        f"[Scheduled Work] {payload.title} ({payload.status}): {payload.summary}"
+    )
 
 
 async def _choose_resume_session(

@@ -45,8 +45,8 @@ class ScheduledWork:
             msg = "cron must be a valid 5-field expression"
             raise ValueError(msg)
         require_aware_datetime(self.created_at, field="created_at")
-        if self.enabled is not True:
-            msg = "enabled must be true when Scheduled Work is created"
+        if not isinstance(self.enabled, bool):
+            msg = "enabled must be a boolean"
             raise ValueError(msg)
         require_session_id(self.session_id)
 

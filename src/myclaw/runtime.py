@@ -10,6 +10,13 @@ from typing import Protocol
 from uuid import UUID
 
 from myclaw.agent_home import AgentHome
+from myclaw.background_coordination import (
+    AsyncioScheduledWorkSchedulerClock,
+    RuntimeEventBroker,
+    ScheduledWorkCoordinator,
+    ScheduledWorkScheduler,
+    ScheduledWorkSchedulerClock,
+)
 from myclaw.config import ProviderConfiguration, UserConfiguration
 from myclaw.contracts import (
     AgentEvent,
@@ -100,6 +107,29 @@ class _RuntimeMemoryScheduler:
             self._active = None
 
 
+class _RuntimeScheduledWorkScheduler:
+    """Own one terminal Scheduled Work scheduler per Runtime run."""
+
+    def __init__(self, factory: Callable[[], ScheduledWorkScheduler]) -> None:
+        self._factory = factory
+        self._active: ScheduledWorkScheduler | None = None
+
+    def start(self) -> None:
+        scheduler = self._active
+        if scheduler is None:
+            scheduler = self._factory()
+            self._active = scheduler
+        scheduler.start()
+
+    async def close(self) -> None:
+        scheduler = self._active
+        if scheduler is None:
+            return
+        await scheduler.close()
+        if self._active is scheduler:
+            self._active = None
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedReplRuntime:
     """An in-memory Session identity and its injectable REPL composition."""
@@ -111,6 +141,8 @@ class PreparedReplRuntime:
     scheduled_work_store: JsonScheduledWorkStore
     _shell: SubprocessShellBoundary | None
     _memory_scheduler: _RuntimeMemoryScheduler
+    _scheduled_work_scheduler: _RuntimeScheduledWorkScheduler
+    _background_events: RuntimeEventBroker
 
     @property
     def session_id(self) -> str:
@@ -118,6 +150,7 @@ class PreparedReplRuntime:
 
     def start(self) -> None:
         self._memory_scheduler.start()
+        self._scheduled_work_scheduler.start()
 
     async def run(
         self,
@@ -136,11 +169,13 @@ class PreparedReplRuntime:
                 input_reader=input_reader,
                 writer=writer,
                 management_dispatcher=dispatcher,
+                background_events=self._background_events,
             )
         finally:
             await self.close()
 
     async def close(self) -> None:
+        await self._scheduled_work_scheduler.close()
         await self._memory_scheduler.close()
         await self.conversation.cancel_active_turn()
         if self._shell is not None:
@@ -162,6 +197,7 @@ class _DeferredConversationPort:
         tool_gateway: ToolGateway,
         history_preparer: Callable[[ConversationSession], Awaitable[ConversationSession]],
         before_submit: Callable[[], Awaitable[None]],
+        on_foreground_terminal: Callable[[], None],
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -174,6 +210,7 @@ class _DeferredConversationPort:
         self._tool_gateway = tool_gateway
         self._history_preparer = history_preparer
         self._before_submit = before_submit
+        self._on_foreground_terminal = on_foreground_terminal
         self._delegate: ConversationPort | None = None
 
     async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
@@ -196,6 +233,8 @@ class _DeferredConversationPort:
             )
             self._delegate = delegate
         async for event in delegate.submit(text):
+            if event.type in {"turn_completed", "turn_failed", "turn_cancelled"}:
+                self._on_foreground_terminal()
             yield event
 
     async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
@@ -219,6 +258,7 @@ def prepare_repl_runtime(
     retry_clock: RetryClock | None = None,
     retry_jitter: Jitter | None = None,
     memory_scheduler_clock: MemorySchedulerClock | None = None,
+    scheduled_work_scheduler_clock: ScheduledWorkSchedulerClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     web_search: WebSearchBoundary | None = None,
     web_fetch: WebFetchBoundary | None = None,
@@ -381,6 +421,37 @@ def prepare_repl_runtime(
         new_uuid=new_uuid,
         tool_gateway_for=scheduled_work_gateway_for,
     )
+    background_events = RuntimeEventBroker()
+    scheduled_work_coordinator = ScheduledWorkCoordinator(
+        runner=scheduled_work_runner,
+        events=background_events,
+        now=now,
+        new_uuid=new_uuid,
+    )
+    scheduled_scheduler_clock = (
+        scheduled_work_scheduler_clock
+        if scheduled_work_scheduler_clock is not None
+        else AsyncioScheduledWorkSchedulerClock(now=now)
+    )
+    scheduled_work_scheduler = _RuntimeScheduledWorkScheduler(
+        lambda: ScheduledWorkScheduler(
+            store=scheduled_work_store,
+            coordinator=scheduled_work_coordinator,
+            clock=scheduled_scheduler_clock,
+        )
+    )
+    foreground_chat_status: ResolvedChatStatus | None = None
+
+    def capture_foreground_chat_status() -> None:
+        nonlocal foreground_chat_status
+        foreground_chat_status = _resolved_chat_status(router)
+
+    def current_foreground_chat_status() -> ResolvedChatStatus:
+        return (
+            _resolved_chat_status(router)
+            if foreground_chat_status is None
+            else foreground_chat_status
+        )
 
     def conversation_for(session_id: str) -> ConversationPort:
         session_tool_gateway = ToolGateway(
@@ -408,16 +479,18 @@ def prepare_repl_runtime(
             tool_gateway=session_tool_gateway,
             history_preparer=summary_manager.prepare,
             before_submit=summary_manager.recover_pending,
+            on_foreground_terminal=capture_foreground_chat_status,
         )
 
     conversation = SwitchableConversationPort(
         session_id=metadata.id,
         build_conversation=conversation_for,
+        event_sequencer=background_events,
     )
     status_service = RuntimeStatusService(
         sessions=sessions,
         session_id=lambda: conversation.session_id,
-        resolved_chat=lambda: _resolved_chat_status(router),
+        resolved_chat=current_foreground_chat_status,
         next_input=lambda session: _runtime_status_input(
             session,
             system_prompt=system_prompt,
@@ -445,6 +518,8 @@ def prepare_repl_runtime(
         scheduled_work_store=scheduled_work_store,
         _shell=owned_shell,
         _memory_scheduler=memory_scheduler,
+        _scheduled_work_scheduler=scheduled_work_scheduler,
+        _background_events=background_events,
     )
 
 

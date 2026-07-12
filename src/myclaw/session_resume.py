@@ -1,9 +1,14 @@
 """Runtime-owned Conversation Session selection without changing Port callers."""
 
 from collections.abc import AsyncIterator, Callable
+from typing import Protocol
 from uuid import UUID
 
 from myclaw.contracts import AgentEvent, ConversationPort
+
+
+class AgentEventSequencer(Protocol):
+    def sequence_foreground(self, event: AgentEvent) -> AgentEvent: ...
 
 
 class SwitchableConversationPort:
@@ -14,11 +19,13 @@ class SwitchableConversationPort:
         *,
         session_id: str,
         build_conversation: Callable[[str], ConversationPort],
+        event_sequencer: AgentEventSequencer | None = None,
     ) -> None:
         self._session_id = session_id
         self._build_conversation = build_conversation
         self._delegate: ConversationPort | None = None
         self._active_delegate: ConversationPort | None = None
+        self._event_sequencer = event_sequencer
 
     @property
     def session_id(self) -> str:
@@ -42,7 +49,8 @@ class SwitchableConversationPort:
         self._active_delegate = delegate
         try:
             async for event in delegate.submit(text):
-                yield event
+                sequencer = self._event_sequencer
+                yield event if sequencer is None else sequencer.sequence_foreground(event)
         finally:
             if self._active_delegate is delegate:
                 self._active_delegate = None

@@ -297,7 +297,7 @@ async def test_invalid_existing_record_returns_persistence_error_without_rewrite
                 "cron": "0 9 * * 1",
                 "prompt": "This existing record is disabled.",
                 "created_at": "2026-07-12T20:00:00.123+08:00",
-                "enabled": False,
+                "enabled": "false",
                 "session_id": ("20260712-200000-123456_0f8fad5b-d9cb-469f-a165-70867728950e"),
             }
         ],

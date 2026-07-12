@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 import pytest
 
@@ -81,8 +82,10 @@ def test_scheduled_work_rejects_values_outside_the_record_contract() -> None:
         replace(valid, prompt="x" * 20001)
     with pytest.raises(ValueError, match="5-field"):
         replace(valid, cron="0 0 9 * * 1")
-    with pytest.raises(ValueError, match="enabled"):
-        replace(valid, enabled=False)
+    assert replace(valid, enabled=False).enabled is False
+    for invalid_enabled in (cast(bool, 0), cast(bool, "false")):
+        with pytest.raises(ValueError, match="enabled"):
+            replace(valid, enabled=invalid_enabled)
     with pytest.raises(ValueError, match="Session ID"):
         replace(
             valid,
