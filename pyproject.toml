@@ -9,6 +9,7 @@ description = "Local-first Personal Agent runtime"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "croniter>=6,<7",
     "rich>=13.7,<15",
     "typer>=0.12,<1",
 ]

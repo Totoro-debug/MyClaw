@@ -4,12 +4,14 @@ from collections import deque
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
+from myclaw.contracts import ModelResponse, ModelStreamEvent
+
 
 @dataclass(frozen=True, slots=True)
 class StreamScript:
     """Events yielded by one provider stream call."""
 
-    events: tuple[object, ...]
+    events: tuple[ModelStreamEvent, ...]
     error: BaseException | None = None
 
 
@@ -20,7 +22,7 @@ class ScriptedFakeProvider:
         self,
         *,
         streams: Iterable[StreamScript] = (),
-        completions: Iterable[object] = (),
+        completions: Iterable[ModelResponse | BaseException] = (),
     ) -> None:
         self._streams = deque(streams)
         self._completions = deque(completions)
@@ -28,7 +30,7 @@ class ScriptedFakeProvider:
         self.complete_requests: list[object] = []
         self.closed = False
 
-    async def stream(self, request: object) -> AsyncIterator[object]:
+    async def stream(self, request: object) -> AsyncIterator[ModelStreamEvent]:
         self.stream_requests.append(request)
         if not self._streams:
             msg = "No scripted stream remains"
@@ -39,7 +41,7 @@ class ScriptedFakeProvider:
         if script.error is not None:
             raise script.error
 
-    async def complete(self, request: object) -> object:
+    async def complete(self, request: object) -> ModelResponse:
         self.complete_requests.append(request)
         if not self._completions:
             msg = "No scripted completion remains"

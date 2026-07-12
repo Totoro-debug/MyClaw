@@ -375,7 +375,7 @@ runtime 启动时先恢复所有 journal，再接受新 chat turn。journal 是 
     "prompt": "Review the current project and summarize open risks.",
     "created_at": "2026-07-11T16:00:00.000+08:00",
     "enabled": true,
-    "session_id": "20260711-160000-000000_123e4567-e89b-12d3-a456-426614174000"
+    "session_id": "20260711-160000-000000_550e8400-e29b-41d4-a716-446655440000"
   }
 ]
 ```

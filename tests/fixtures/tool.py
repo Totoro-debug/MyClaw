@@ -4,6 +4,8 @@ from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
+from myclaw.contracts import ToolDefinition
+
 
 @dataclass(frozen=True, slots=True)
 class FakeToolCall:
@@ -19,7 +21,7 @@ class FakeTool:
     def __init__(
         self,
         *,
-        definition: object,
+        definition: ToolDefinition,
         outcomes: Iterable[str | BaseException],
     ) -> None:
         self._definition = definition
@@ -27,7 +29,7 @@ class FakeTool:
         self.calls: list[FakeToolCall] = []
 
     @property
-    def definition(self) -> object:
+    def definition(self) -> ToolDefinition:
         return self._definition
 
     async def execute(self, arguments: Mapping[str, object], context: object) -> str:

@@ -3,6 +3,14 @@ from collections.abc import AsyncIterator
 
 import pytest
 
+from myclaw.contracts import (
+    AssistantModelMessage,
+    ModelCompleted,
+    ModelResponse,
+    ModelToolCall,
+    ModelUsage,
+    TextDelta,
+)
 from tests.fixtures.provider import ScriptedFakeProvider, StreamScript
 
 
@@ -12,10 +20,19 @@ async def collect(stream: AsyncIterator[object]) -> list[object]:
 
 @pytest.mark.asyncio
 async def test_scripted_fake_provider_replays_stream_events_in_order() -> None:
-    events: tuple[object, ...] = (
-        {"type": "text_delta", "delta": "Hello"},
-        {"type": "tool_call", "name": "read_file"},
-        {"type": "usage", "total_tokens": 12},
+    response = ModelResponse(
+        message=AssistantModelMessage(
+            content="Hello",
+            tool_calls=(
+                ModelToolCall(id="call_123", name="read_file", arguments={"path": "CONTEXT.md"}),
+            ),
+        ),
+        usage=ModelUsage(input_tokens=10, output_tokens=2, total_tokens=12),
+        finish_reason="tool_calls",
+    )
+    events = (
+        TextDelta(delta="Hello"),
+        ModelCompleted(response=response),
     )
     provider = ScriptedFakeProvider(streams=[StreamScript(events=events)])
     request = {"route": "chat"}
@@ -28,7 +45,11 @@ async def test_scripted_fake_provider_replays_stream_events_in_order() -> None:
 
 @pytest.mark.asyncio
 async def test_scripted_fake_provider_returns_complete_responses_in_order() -> None:
-    response = {"content": "summary", "usage": {"total_tokens": 8}}
+    response = ModelResponse(
+        message=AssistantModelMessage(content="summary", tool_calls=()),
+        usage=ModelUsage(input_tokens=6, output_tokens=2, total_tokens=8),
+        finish_reason="stop",
+    )
     provider = ScriptedFakeProvider(completions=[response])
     request = {"route": "memory"}
 
