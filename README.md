@@ -140,9 +140,8 @@ The full acceptance record and additional security limits are in
 
 ## License
 
-No software license is currently declared. The repository and built distributions
-do not grant use or redistribution rights beyond applicable law. A project-owner
-license decision is required before publishing v0.1.
+MyClaw is licensed under the Apache License, Version 2.0. See
+[LICENSE](LICENSE) for the full terms.
 
 ## Development
 
@@ -155,7 +154,7 @@ pytest
 ruff check .
 ruff format --check .
 mypy src tests
-python -m build --no-isolation
+python -m build
 ```
 
 The automated tests use scripted boundary fakes and temporary filesystem paths. They do
