@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from myclaw.contracts import SessionSummary, format_rfc3339_milliseconds
-from myclaw.contracts.management import ConfigView, ResumeResult, RuntimeStatus
+from myclaw.contracts.management import (
+    ConfigView,
+    MemoryTaskResult,
+    ResumeResult,
+    RuntimeStatus,
+)
 from myclaw.management import ManagementError
 from myclaw.session_store import SessionListingReport
 
@@ -16,6 +21,8 @@ class _ManagementViewPort(Protocol):
     async def status(self) -> RuntimeStatus: ...
 
     async def memory_view(self) -> str: ...
+
+    async def dream(self) -> MemoryTaskResult: ...
 
     async def resumable_sessions(self) -> tuple[SessionSummary, ...]: ...
 
@@ -88,6 +95,27 @@ class ManagementCommandDispatcher:
                 handled=True,
                 output=output,
             )
+        if command == "/dream":
+            try:
+                result = await self._management.dream()
+            except ManagementError as management_error:
+                output = f"{management_error.error.code}: {management_error.error.message}"
+            else:
+                if result.error is None and result.status == "No pending summaries":
+                    output = result.status
+                else:
+                    headline = (
+                        result.status
+                        if result.error is None
+                        else f"{result.error.code}: {result.error.message}"
+                    )
+                    output = (
+                        f"{headline}\n"
+                        f"processed_count: {result.processed_count}\n"
+                        f"memory_updated: {str(result.memory_updated).lower()}\n"
+                        f"cursor: {result.cursor}"
+                    )
+            return ManagementCommandResult(handled=True, output=output)
         if command != "/config":
             return ManagementCommandResult(handled=False, output=None)
         try:

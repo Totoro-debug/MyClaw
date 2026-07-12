@@ -10,6 +10,7 @@ from myclaw.agent_home import AgentHome
 from myclaw.config import ConfigLoader
 from myclaw.contracts import (
     ConversationSession,
+    MemoryTaskResult,
     ResumeResult,
     RuntimeStatus,
     SessionSummary,
@@ -21,6 +22,10 @@ from myclaw.session_store import SessionListingReport
 
 class _CurrentSessionStore(Protocol):
     async def current_session(self, session_id: str) -> ConversationSession: ...
+
+
+class _ManualMemoryManager(Protocol):
+    async def run_manual(self) -> MemoryTaskResult: ...
 
 
 class _ResumableSessionStore(_CurrentSessionStore, Protocol):
@@ -135,6 +140,7 @@ class ManagementViewService:
         sessions: _ResumableSessionStore | None = None,
         workspace: Path | None = None,
         switch_session: Callable[[str], None] | None = None,
+        memory_manager: _ManualMemoryManager | None = None,
     ) -> None:
         self._config = ConfigLoader(agent_home)
         self._long_term_memory = agent_home.path / "memory" / "memory.md"
@@ -142,6 +148,7 @@ class ManagementViewService:
         self._sessions = sessions
         self._workspace = workspace
         self._switch_session = switch_session
+        self._memory_manager = memory_manager
 
     async def config_view(self) -> ConfigView:
         """Return complete redacted User Configuration content."""
@@ -164,6 +171,12 @@ class ManagementViewService:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Long-term Memory could not be read.")
             ) from None
+
+    async def dream(self) -> MemoryTaskResult:
+        """Run one foreground Memory Task and return its safe summary."""
+        if self._memory_manager is None:
+            raise ManagementError(ErrorInfo("route_unavailable", "Memory Task is unavailable."))
+        return await self._memory_manager.run_manual()
 
     async def status(self) -> RuntimeStatus:
         """Return the injected Runtime status snapshot."""

@@ -178,7 +178,8 @@ class JsonlSummaryStore:
             return entry
 
     async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]:
-        raise NotImplementedError
+        async with self._lock:
+            return self._entries()[cursor : cursor + limit]
 
     async def commit_consolidation(
         self,

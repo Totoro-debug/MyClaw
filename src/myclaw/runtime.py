@@ -36,13 +36,15 @@ from myclaw.management import (
     RuntimeStatusService,
 )
 from myclaw.management_commands import ManagementCommandDispatcher
+from myclaw.memory_task import FileMemoryStore, MemoryManager, MemoryTaskModelSettings
 from myclaw.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
 from myclaw.prompts import chat_system_prompt, runtime_context, session_title_prompt
 from myclaw.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.scheduled_work import CreateScheduledWorkTool, JsonScheduledWorkStore
 from myclaw.session_resume import SwitchableConversationPort
 from myclaw.session_store import JsonlSessionStore
-from myclaw.shell_tool import ShellBoundary, UnavailableShellBoundary
+from myclaw.shell_process import SubprocessShellBoundary
+from myclaw.shell_tool import ShellBoundary
 from myclaw.tool_gateway import ToolGateway
 from myclaw.web_fetch import (
     AioHttpWebFetchClient,
@@ -76,6 +78,7 @@ class PreparedReplRuntime:
     conversation: SwitchableConversationPort
     sessions: JsonlSessionStore
     management_dispatcher: ManagementDispatcher
+    _shell: SubprocessShellBoundary | None
 
     @property
     def session_id(self) -> str:
@@ -91,12 +94,20 @@ class PreparedReplRuntime:
         dispatcher = (
             self.management_dispatcher if management_dispatcher is None else management_dispatcher
         )
-        await run_repl(
-            conversation=self.conversation,
-            input_reader=input_reader,
-            writer=writer,
-            management_dispatcher=dispatcher,
-        )
+        try:
+            await run_repl(
+                conversation=self.conversation,
+                input_reader=input_reader,
+                writer=writer,
+                management_dispatcher=dispatcher,
+            )
+        finally:
+            await self.close()
+
+    async def close(self) -> None:
+        await self.conversation.cancel_active_turn()
+        if self._shell is not None:
+            await self._shell.close()
 
 
 class _DeferredConversationPort:
@@ -218,9 +229,12 @@ def prepare_repl_runtime(
         else None
     )
     configured_shell = (
-        (shell if shell is not None else UnavailableShellBoundary())
+        (shell if shell is not None else SubprocessShellBoundary())
         if configuration.tools.shell.enabled
         else None
+    )
+    owned_shell = (
+        configured_shell if isinstance(configured_shell, SubprocessShellBoundary) else None
     )
     scheduled_work_tool = CreateScheduledWorkTool(
         store=JsonScheduledWorkStore(agent_home),
@@ -268,6 +282,20 @@ def prepare_repl_runtime(
         tools=tool_gateway.definitions,
         now=now,
         new_uuid=new_uuid,
+    )
+    memory_manager = MemoryManager(
+        provider=router,
+        summaries=summaries,
+        memory=FileMemoryStore(agent_home),
+        long_term_path=agent_home.path / "memory" / "memory.md",
+        settings=MemoryTaskModelSettings(
+            model=resolved_memory.route.model,
+            max_output=resolved_memory.route.max_output,
+            temperature=resolved_memory.route.temperature,
+            reasoning_effort=resolved_memory.route.reasoning_effort,
+            timeout_seconds=resolved_memory.route.timeout,
+        ),
+        batch_size=configuration.memory.batch_size,
     )
 
     def conversation_for(session_id: str) -> ConversationPort:
@@ -322,12 +350,14 @@ def prepare_repl_runtime(
             sessions=sessions,
             workspace=Path(workspace_identity.path),
             switch_session=conversation.switch_session,
+            memory_manager=memory_manager,
         )
     )
     return PreparedReplRuntime(
         conversation=conversation,
         sessions=sessions,
         management_dispatcher=management_dispatcher,
+        _shell=owned_shell,
     )
 
 

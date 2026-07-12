@@ -3,7 +3,7 @@
 from datetime import datetime
 from pathlib import PurePath
 
-from myclaw.contracts import format_rfc3339_milliseconds
+from myclaw.contracts import SummaryEntry, format_rfc3339_milliseconds
 
 _RUNTIME_CONTEXT = """<runtime_context>
 current_time: {current_time}
@@ -28,6 +28,13 @@ _CHAT_SYSTEM_PROMPT = """{identity}
 
 _SESSION_TITLE_PROMPT = """Generate a concise title for this Conversation Session.
 Return only the title. Do not call tools or add commentary."""
+
+_MEMORY_TASK_PROMPT = """Maintain the MyClaw Long-term Memory from new Conversation Summaries.
+Use read_file to inspect exactly {long_term_path}.
+Use edit_file only when stable information should be retained, and edit exactly that file.
+Keep the four sections: User Info, User Preference, Project Fact, and Lesson.
+Do not store transient activity, raw summaries, or duplicate facts.
+If no durable update is needed, do not call edit_file."""
 
 
 def current_user_input(*, content: str, current_time: datetime, session_id: str) -> str:
@@ -59,3 +66,17 @@ def chat_system_prompt(
 def session_title_prompt() -> str:
     """Return the isolated prompt used for Session title generation."""
     return _SESSION_TITLE_PROMPT
+
+
+def memory_task_prompt(*, long_term_path: PurePath) -> str:
+    """Return the restricted four-section Long-term Memory maintenance prompt."""
+    return _MEMORY_TASK_PROMPT.format(long_term_path=long_term_path)
+
+
+def memory_task_input(*, cursor: int, summaries: tuple[SummaryEntry, ...]) -> str:
+    """Render only the pending ordered Conversation Summary batch."""
+    records = "\n".join(entry.to_json_line().rstrip("\n") for entry in summaries)
+    return (
+        f"<summary_cursor>{cursor}</summary_cursor>\n"
+        f"<conversation_summaries>\n{records}\n</conversation_summaries>"
+    )
