@@ -58,7 +58,7 @@ Status legend: `TODO` -> `IN_PROGRESS` -> `AGENT_DONE` -> `VERIFIED` -> `CLOSED`
 |---|---|---|---|---|---|---|---|
 | #2 | T01 Installable Python project | None | B01 | installed `myclaw` CLI and reusable public test fixtures | b01_issue_2 | CLOSED | 7b73e26 |
 | #3 | T02 Runtime Contracts | #2 | B02 | frozen schemas and Port/Store/Provider/Tool protocols | b02_issue_3 | CLOSED | f32893f |
-| #4 | T03 Agent Home and atomic writes | #3 | B03 | Agent Home initializer, atomic file API, Workspace identity | b03_issue_4 | VERIFIED | pending batch commit |
+| #4 | T03 Agent Home and atomic writes | #3 | B03 | Agent Home initializer, atomic file API, Workspace identity | b03_issue_4 | CLOSED | 2865d46 |
 | #5 | T04 Configuration | #4 | B04 | `myclaw`, `myclaw config`, validated/redacted config API | - | TODO | - |
 | #6 | T05 First streaming turn | #5 | B05 | Conversation Port through REPL and Session Store reload | - | TODO | - |
 | #7 | T06 Multi-turn Short-term Memory | #6 | B06 | one REPL session across Conversation Port turns | - | TODO | - |
@@ -112,7 +112,7 @@ Issue #36 additionally requires Windows and POSIX evidence, clean-wheel installa
 |---|---|---|---|---|---|
 | B01 | #2 | 11 pytest + Ruff lint/format + strict mypy + sdist/wheel + CLI smoke | 7b73e26 | #2 commented and closed | CLOSED |
 | B02 | #3 | 66 pytest + Ruff lint/format + strict mypy + sdist/wheel | f32893f | #3 commented and closed | CLOSED |
-| B03 | #4 | 77 pytest + Ruff lint/format + strict mypy + sdist/wheel | pending | pending | VERIFIED |
+| B03 | #4 | 77 pytest + Ruff lint/format + strict mypy + sdist/wheel | 2865d46 | #4 commented and closed | CLOSED |
 | B04 | #5 | - | - | - | TODO |
 | B05 | #6, #13 | - | - | - | TODO |
 | B06 | #7 | - | - | - | TODO |
