@@ -46,6 +46,7 @@ class DelayedTitleProvider:
     ) -> None:
         self.title_content = title_content
         self.title_started = asyncio.Event()
+        self.title_stopped = asyncio.Event()
         self.release_title = asyncio.Event()
         self.requests: list[ModelRequest] = []
 
@@ -53,14 +54,17 @@ class DelayedTitleProvider:
         self.requests.append(request)
         if request.system_prompt == TITLE_PROMPT:
             self.title_started.set()
-            await self.release_title.wait()
-            yield ModelCompleted(
-                response=ModelResponse(
-                    message=AssistantModelMessage(content=self.title_content),
-                    usage=ModelUsage(input_tokens=8, output_tokens=2, total_tokens=10),
-                    finish_reason="stop",
+            try:
+                await self.release_title.wait()
+                yield ModelCompleted(
+                    response=ModelResponse(
+                        message=AssistantModelMessage(content=self.title_content),
+                        usage=ModelUsage(input_tokens=8, output_tokens=2, total_tokens=10),
+                        finish_reason="stop",
+                    )
                 )
-            )
+            finally:
+                self.title_stopped.set()
             return
 
         await self.title_started.wait()
@@ -229,6 +233,46 @@ async def test_first_turn_finishes_while_title_updates_only_session_metadata_lat
         total_tokens=25,
     )
     assert after_title.messages == before_title.messages
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_the_detached_title_task_to_stop(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    provider = DelayedTitleProvider()
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=lambda: REQUEST_UUID,
+        system_prompt="chat system prompt",
+        title_prompt=TITLE_PROMPT,
+    )
+    await _collect_events(conversation, "Start a title that will still be running.")
+    await provider.title_started.wait()
+
+    await conversation.close()
+
+    assert provider.title_stopped.is_set()
 
 
 @pytest.mark.asyncio

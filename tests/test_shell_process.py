@@ -10,6 +10,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -27,10 +28,17 @@ from myclaw.contracts import (
 )
 from myclaw.runtime import prepare_repl_runtime
 from myclaw.shell_policy import ShellRequest
-from myclaw.shell_process import ShellProcess, SubprocessShellBoundary
+from myclaw.shell_process import (
+    AsyncioShellProcessSpawner,
+    ShellProcess,
+    SubprocessShellBoundary,
+)
 from myclaw.tool_gateway import ToolGateway
+from myclaw.windows_job import WindowsJob
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 from tests.test_config import VALID_CONFIG
+
+WINDOWS_NEW_GROUP_NO_WINDOW = 0x08000200
 
 
 def _platform_shell_command(arguments: list[str]) -> str:
@@ -43,6 +51,57 @@ def _python_shell_command(script: str) -> str:
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     loader = f"import base64; exec(base64.b64decode({encoded!r}))"
     return _platform_shell_command([sys.executable, "-c", loader])
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows process flags only")
+async def test_windows_shell_bootstrap_isolated_from_foreground_interrupts(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    options: dict[str, object] = {}
+
+    class FakeStdin:
+        def write(self, data: bytes) -> None:
+            assert data == b"1"
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    class FakeProcess:
+        pid = 123
+        returncode = 0
+        stdin = FakeStdin()
+
+    class FakeJob:
+        def __init__(self) -> None:
+            self.assigned: list[int] = []
+
+        def assign(self, pid: int) -> None:
+            self.assigned.append(pid)
+
+        def close(self) -> None:
+            return None
+
+    async def create_process(*command: str, **kwargs: object) -> asyncio.subprocess.Process:
+        del command
+        options.update(kwargs)
+        return cast(asyncio.subprocess.Process, FakeProcess())
+
+    job = FakeJob()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(WindowsJob, "create", staticmethod(lambda: job))
+
+    await AsyncioShellProcessSpawner().spawn("echo isolated", cwd=workspace)
+
+    assert options["creationflags"] == WINDOWS_NEW_GROUP_NO_WINDOW
+    assert job.assigned == [123]
 
 
 def _process_exists(pid: int) -> bool:
@@ -183,6 +242,19 @@ class SequenceProcessSpawner:
     async def spawn(self, command: str, *, cwd: Path) -> ShellProcess:
         del command, cwd
         return next(self._processes)
+
+
+class DelayedProcessSpawner:
+    def __init__(self, process: ShellProcess) -> None:
+        self._process = process
+        self.created = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def spawn(self, command: str, *, cwd: Path) -> ShellProcess:
+        del command, cwd
+        self.created.set()
+        await self.release.wait()
+        return self._process
 
 
 class BlockingFakeShellProcess:
@@ -482,6 +554,37 @@ async def test_shell_cancellation_terminates_and_awaits_the_child_process(
         await execution
     assert process.terminated is True
     assert process.reaped is True
+
+
+@pytest.mark.asyncio
+async def test_shell_cancellation_joins_spawn_before_terminating_the_created_process(
+    workspace: Path,
+) -> None:
+    process = BlockingFakeShellProcess()
+    spawner = DelayedProcessSpawner(process)
+    shell = SubprocessShellBoundary(spawner=spawner)
+    execution = asyncio.create_task(
+        shell.execute(ShellRequest(command="starting", cwd=workspace.resolve(), timeout=60))
+    )
+    await spawner.created.wait()
+
+    execution.cancel()
+    execution.cancel()
+    await asyncio.sleep(0)
+    try:
+        assert not execution.done()
+    finally:
+        spawner.release.set()
+        if execution.done():
+            await process.terminate()
+            await process.wait()
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await execution
+        await shell.close()
+
+    assert process.terminated
+    assert process.reaped
 
 
 @pytest.mark.asyncio

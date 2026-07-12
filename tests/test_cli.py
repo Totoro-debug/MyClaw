@@ -1,10 +1,16 @@
+import asyncio
 import os
 import shutil
 import subprocess
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
+import typer
 
+import myclaw.cli as cli
 from tests.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,
@@ -34,6 +40,87 @@ def run_installed_myclaw(agent_home: Path, *arguments: str) -> subprocess.Comple
 def assert_plaintext_absent(output: str, *plaintext_values: str) -> None:
     if any(value in output for value in plaintext_values):
         pytest.fail("CLI output leaked a plaintext provider API key", pytrace=False)
+
+
+def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeLoader:
+        def __init__(self, agent_home: object) -> None:
+            self.agent_home = agent_home
+            self.path = Path("config.toml")
+
+        def load_for_startup(self) -> object:
+            return object()
+
+    class FakeConversation:
+        async def cancel_active_turn(self) -> None:
+            return None
+
+    class FailingRuntime:
+        conversation = FakeConversation()
+
+        async def run(self, *, input_reader: object, writer: object) -> None:
+            del input_reader, writer
+            events.append("runtime")
+            raise LookupError("runtime failed")
+
+    class FailingInterruptController:
+        def __init__(
+            self,
+            *,
+            loop: asyncio.AbstractEventLoop,
+            cancel_foreground: Callable[[], Awaitable[None]],
+        ) -> None:
+            del loop, cancel_foreground
+            self.installed = False
+
+        def install(self) -> None:
+            self.installed = True
+            events.append("install")
+
+        async def close(self) -> None:
+            events.append("interrupt-close")
+            if not self.installed:
+                raise AssertionError("SIGINT handler restored before interrupt drain")
+            raise RuntimeError("interrupt cleanup failed")
+
+        def restore(self) -> None:
+            self.installed = False
+            events.append("restore")
+
+    class RecordingRunner:
+        def __init__(self) -> None:
+            self._loop = asyncio.new_event_loop()
+
+        def __enter__(self) -> "RecordingRunner":
+            return self
+
+        def __exit__(self, *errors: object) -> None:
+            del errors
+            self._loop.close()
+
+        def get_loop(self) -> asyncio.AbstractEventLoop:
+            return self._loop
+
+        def run(self, awaitable: Coroutine[object, object, object]) -> object:
+            return self._loop.run_until_complete(awaitable)
+
+    runtime = FailingRuntime()
+    monkeypatch.setattr(cli, "ConfigLoader", FakeLoader)
+    monkeypatch.setattr(cli, "prepare_repl_runtime", lambda **_kwargs: runtime)
+    monkeypatch.setattr(cli, "ForegroundInterruptController", FailingInterruptController)
+    monkeypatch.setattr(asyncio, "Runner", RecordingRunner)
+    context = cast(typer.Context, SimpleNamespace(invoked_subcommand=None))
+
+    with pytest.raises(LookupError, match="runtime failed") as raised:
+        cli.main(context)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "interrupt cleanup failed"
+    assert events == ["install", "runtime", "interrupt-close", "restore"]
 
 
 def test_installed_myclaw_console_entry_starts() -> None:

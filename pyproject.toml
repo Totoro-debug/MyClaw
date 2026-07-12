@@ -15,6 +15,7 @@ dependencies = [
     "ddgs>=9,<10",
     "jsonschema>=4.23,<5",
     "openai>=2.37,<3",
+    "prompt-toolkit>=3.0.52,<4",
     "rich>=13.7,<15",
     "tomlkit>=0.13,<0.14",
     "typer>=0.12,<1",

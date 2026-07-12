@@ -10,6 +10,13 @@ from typing import Final, Protocol
 
 from myclaw.shell_policy import ShellRequest
 
+if sys.platform == "win32":
+    from subprocess import CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW
+
+    _WINDOWS_SHELL_CREATION_FLAGS: Final = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+else:
+    _WINDOWS_SHELL_CREATION_FLAGS = 0
+
 _HARDENED_GIT_COMMANDS: Final = {
     "git status": "git --no-pager status",
     "git status --short": "git --no-pager status --short",
@@ -113,6 +120,7 @@ class AsyncioShellProcessSpawner:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                creationflags=_WINDOWS_SHELL_CREATION_FLAGS,
             )
             job.assign(process.pid)
             if process.stdin is None:
@@ -179,7 +187,24 @@ class SubprocessShellBoundary:
         async with self._lock:
             if self._closed:
                 raise RuntimeError("Shell process boundary is closed")
-            process = await self._spawner.spawn(command, cwd=request.cwd)
+            spawn = asyncio.create_task(self._spawner.spawn(command, cwd=request.cwd))
+            try:
+                process = await asyncio.shield(spawn)
+            except BaseException as primary_error:
+                try:
+                    process = await _join_spawn(spawn)
+                except BaseException as cleanup_error:
+                    if cleanup_error is primary_error:
+                        raise primary_error from None
+                    raise primary_error from cleanup_error
+                output = asyncio.create_task(process.communicate())
+                active = _ActiveProcess(process=process, output=output)
+                stop = asyncio.create_task(self._stop(active))
+                try:
+                    await _await_stop(stop)
+                except BaseException as cleanup_error:
+                    raise primary_error from cleanup_error
+                raise primary_error
             output = asyncio.create_task(process.communicate())
             active = _ActiveProcess(process=process, output=output)
             self._active[id(process)] = active
@@ -220,24 +245,7 @@ class SubprocessShellBoundary:
             if active.stop is None:
                 active.stop = asyncio.create_task(self._stop(active))
             stop = active.stop
-        cancellation: asyncio.CancelledError | None = None
-        while not stop.done():
-            try:
-                await asyncio.shield(stop)
-            except asyncio.CancelledError as error:
-                if stop.cancelled():
-                    raise
-                cancellation = error
-            except BaseException:
-                break
-        try:
-            stop.result()
-        except BaseException as cleanup_error:
-            if cancellation is not None:
-                raise cancellation from cleanup_error
-            raise
-        if cancellation is not None:
-            raise cancellation
+        await _await_stop(stop)
 
     @staticmethod
     async def _stop(active: _ActiveProcess) -> None:
@@ -259,3 +267,36 @@ class SubprocessShellBoundary:
             pass
         if cleanup_error is not None:
             raise cleanup_error
+
+
+async def _join_spawn(task: asyncio.Task[ShellProcess]) -> ShellProcess:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                break
+        except BaseException:
+            break
+    return task.result()
+
+
+async def _await_stop(stop: asyncio.Task[None]) -> None:
+    cancellation: asyncio.CancelledError | None = None
+    while not stop.done():
+        try:
+            await asyncio.shield(stop)
+        except asyncio.CancelledError as error:
+            if stop.cancelled():
+                raise
+            cancellation = error
+        except BaseException:
+            break
+    try:
+        stop.result()
+    except BaseException as cleanup_error:
+        if cancellation is not None:
+            raise cancellation from cleanup_error
+        raise
+    if cancellation is not None:
+        raise cancellation

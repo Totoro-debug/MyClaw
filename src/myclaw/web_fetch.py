@@ -3,6 +3,7 @@
 import asyncio
 import socket
 from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from email.message import Message
 from html.parser import HTMLParser
 from ipaddress import IPv6Address, ip_address
@@ -191,8 +192,19 @@ class _AioHttpResponse:
             yield chunk
 
     async def close(self) -> None:
-        self._response.close()
-        await self._session.close()
+        failures: list[BaseException] = []
+        try:
+            self._response.close()
+        except BaseException as error:
+            failures.append(error)
+        try:
+            await self._session.close()
+        except BaseException as error:
+            failures.append(error)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("HTTP response shutdown failed", failures)
 
 
 class AioHttpWebFetchClient:
@@ -223,8 +235,11 @@ class AioHttpWebFetchClient:
         )
         try:
             response = await session.get(url, allow_redirects=False)
-        except BaseException:
-            await session.close()
+        except BaseException as primary_error:
+            try:
+                await _close_session(session)
+            except BaseException as cleanup_error:
+                raise primary_error from cleanup_error
             raise
         return _AioHttpResponse(
             session=session,
@@ -326,7 +341,7 @@ class PublicWebFetchBoundary:
                 connect_timeout_seconds=CONNECT_TIMEOUT_SECONDS,
                 total_timeout_seconds=self._total_timeout_seconds,
             )
-            try:
+            async with _closing_response(response):
                 if response.peer_ip is None:
                     raise WebFetchRejected("WebFetch could not verify the connected peer")
                 try:
@@ -372,8 +387,54 @@ class PublicWebFetchBoundary:
                 if media_type in _HTML_MEDIA_TYPES:
                     return _readable_html(text)
                 return text
-            finally:
-                await response.close()
+
+
+@asynccontextmanager
+async def _closing_response(
+    response: HTTPResponseBoundary,
+) -> AsyncIterator[HTTPResponseBoundary]:
+    try:
+        yield response
+    except BaseException as primary_error:
+        try:
+            await _close_response(response)
+        except BaseException as cleanup_error:
+            raise primary_error from cleanup_error
+        raise
+    else:
+        await _close_response(response)
+
+
+async def _close_response(response: HTTPResponseBoundary) -> None:
+    close_task = asyncio.create_task(response.close())
+    await _await_cleanup(close_task)
+
+
+async def _close_session(session: ClientSession) -> None:
+    close_task = asyncio.create_task(session.close())
+    await _await_cleanup(close_task)
+
+
+async def _await_cleanup(task: asyncio.Task[None]) -> None:
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                break
+            if cancellation is None:
+                cancellation = error
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as cleanup_error:
+        if cancellation is not None:
+            raise cancellation from cleanup_error
+        raise
+    if cancellation is not None:
+        raise cancellation
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:

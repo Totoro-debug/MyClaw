@@ -1,4 +1,5 @@
 import asyncio
+import gc
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -43,7 +44,7 @@ from myclaw.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.conversation_summary import JsonlSummaryStore
 from myclaw.memory_task import FileMemoryStore
 from myclaw.repl import run_repl
-from myclaw.runtime import prepare_repl_runtime
+from myclaw.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.scheduled_work import JsonScheduledWorkStore, ScheduledWorkPersistenceError
 from myclaw.scheduled_work_execution import ScheduledWorkModelSettings, ScheduledWorkRunner
 from myclaw.session_resume import SwitchableConversationPort
@@ -1324,6 +1325,98 @@ async def test_background_completion_wins_when_it_arrives_with_eof() -> None:
 
 
 @pytest.mark.asyncio
+async def test_explicit_exit_wins_when_background_completion_arrives_in_the_same_tick() -> None:
+    events = RuntimeEventBroker()
+    conversation = SwitchableConversationPort(
+        session_id=TASK_SESSION_ID,
+        build_conversation=_unused_conversation,
+    )
+    input_reader = WaitingExitInput()
+    writer = RecordingWriter()
+    repl = asyncio.create_task(
+        run_repl(
+            conversation=conversation,
+            input_reader=input_reader,
+            writer=writer,
+            background_events=events,
+        )
+    )
+    await asyncio.wait_for(input_reader.started.wait(), timeout=1)
+
+    input_reader.release.set()
+    await events.publish_background(
+        turn_id=RUN_UUID,
+        created_at=NOW,
+        payload=BackgroundCompletedPayload(
+            kind="scheduled_work",
+            title="Weekly project review",
+            session_id=TASK_SESSION_ID,
+            status="completed",
+            summary="Must be cancelled by explicit exit.",
+        ),
+    )
+    await repl
+
+    assert writer.operations == []
+
+
+@pytest.mark.asyncio
+async def test_repl_retrieves_a_done_input_failure_when_background_rendering_fails() -> None:
+    class FailingInput:
+        async def read(self) -> str | None:
+            await asyncio.sleep(0)
+            raise LookupError("input failed concurrently")
+
+    class ImmediateBackground:
+        async def next_background_event(self) -> AgentEvent:
+            await asyncio.sleep(0)
+            return AgentEvent(
+                type="background_completed",
+                event_id=0,
+                turn_id=RUN_UUID,
+                created_at=NOW,
+                payload=BackgroundCompletedPayload(
+                    kind="scheduled_work",
+                    title="Concurrent failure",
+                    session_id=TASK_SESSION_ID,
+                    status="failed",
+                    summary="Rendering will fail.",
+                ),
+            )
+
+        def next_background_event_nowait(self) -> AgentEvent | None:
+            return None
+
+    class FailingWriter(RecordingWriter):
+        async def write_line(self, content: str) -> None:
+            del content
+            raise ValueError("background rendering failed")
+
+    conversation = SwitchableConversationPort(
+        session_id=TASK_SESSION_ID,
+        build_conversation=_unused_conversation,
+    )
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    diagnostics: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
+    try:
+        with pytest.raises(ValueError, match="background rendering failed"):
+            await run_repl(
+                conversation=conversation,
+                input_reader=FailingInput(),
+                writer=FailingWriter(),
+                background_events=ImmediateBackground(),
+            )
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert diagnostics == []
+
+
+@pytest.mark.asyncio
 async def test_closing_event_broker_wakes_waiter_and_rejects_new_events() -> None:
     events = RuntimeEventBroker()
     waiter = asyncio.create_task(events.next_background_event())
@@ -1728,7 +1821,7 @@ async def test_runtime_event_ids_remain_global_after_switching_sessions(
 
 
 @pytest.mark.asyncio
-async def test_prepared_runtime_runs_scheduled_work_and_can_be_run_again(
+async def test_fresh_prepared_runtimes_each_run_scheduled_work(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -1744,33 +1837,35 @@ async def test_prepared_runtime_runs_scheduled_work_and_can_be_run_again(
     )
     scheduled_clock = ControlledSchedulerClock(clock_now)
     memory_clock = ControlledSchedulerClock(clock_now)
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="First runtime schedule."),
-                usage=_usage(),
-                finish_reason="stop",
-            ),
-            ModelResponse(
-                message=AssistantModelMessage(content="Second runtime schedule."),
-                usage=_usage(),
-                finish_reason="stop",
-            ),
-        )
-    )
-    runtime = prepare_repl_runtime(
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _configuration: provider,
-        now=scheduled_clock.now,
-        new_uuid=uuid4,
-        memory_scheduler_clock=memory_clock,
-        scheduled_work_scheduler_clock=scheduled_clock,
-    )
-    await runtime.scheduled_work_store.append(replace(_task(), cron="* * * * *"))
+    contents = iter(("First runtime schedule.", "Second runtime schedule."))
+    providers: list[ScriptedFakeProvider] = []
 
-    async def run_once() -> list[tuple[str, str]]:
+    def prepare_runtime() -> PreparedReplRuntime:
+        provider = ScriptedFakeProvider(
+            completions=(
+                ModelResponse(
+                    message=AssistantModelMessage(content=next(contents)),
+                    usage=_usage(),
+                    finish_reason="stop",
+                ),
+            )
+        )
+        providers.append(provider)
+        return prepare_repl_runtime(
+            agent_home=home,
+            workspace=workspace,
+            configuration=ConfigLoader(home).load(),
+            provider_factory=lambda _configuration: provider,
+            now=scheduled_clock.now,
+            new_uuid=uuid4,
+            memory_scheduler_clock=memory_clock,
+            scheduled_work_scheduler_clock=scheduled_clock,
+        )
+
+    first_runtime = prepare_runtime()
+    await first_runtime.scheduled_work_store.append(replace(_task(), cron="* * * * *"))
+
+    async def run_once(runtime: PreparedReplRuntime) -> list[tuple[str, str]]:
         sleep_count = len(scheduled_clock.sleeps)
         input_reader = WaitingExitInput()
         writer = RecordingWriter()
@@ -1783,8 +1878,8 @@ async def test_prepared_runtime_runs_scheduled_work_and_can_be_run_again(
         await execution
         return writer.operations
 
-    first = await run_once()
-    second = await run_once()
+    first = await run_once(first_runtime)
+    second = await run_once(prepare_runtime())
 
     assert first == [
         (
@@ -1798,7 +1893,7 @@ async def test_prepared_runtime_runs_scheduled_work_and_can_be_run_again(
             "[Scheduled Work] Weekly project review (completed): Second runtime schedule.",
         )
     ]
-    assert len(provider.complete_requests) == 2
+    assert [len(provider.complete_requests) for provider in providers] == [1, 1]
 
 
 @pytest.mark.asyncio

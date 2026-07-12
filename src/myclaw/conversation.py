@@ -91,16 +91,22 @@ class StreamingConversationPort:
         self._next_event_id = 0
         self._foreground_active = False
         self._active_task: asyncio.Task[object] | None = None
+        self._active_turn_done: asyncio.Event | None = None
         self._cancel_requested = False
         self._permission_waits: dict[UUID, asyncio.Future[bool]] = {}
+        self._close_task: asyncio.Task[None] | None = None
 
     async def submit(self, text: str) -> AsyncGenerator[AgentEvent, None]:
+        if self._close_task is not None:
+            raise RuntimeError("Conversation Port is closed")
         if not text.strip():
             return
         if self._foreground_active:
             raise RuntimeError("A foreground turn is already active")
         self._foreground_active = True
         self._active_task = asyncio.current_task()
+        turn_done = asyncio.Event()
+        self._active_turn_done = turn_done
         self._cancel_requested = False
         turn = self._submit_turn(text)
         try:
@@ -111,6 +117,9 @@ class StreamingConversationPort:
                 await turn.aclose()
             finally:
                 self._active_task = None
+                turn_done.set()
+                if self._active_turn_done is turn_done:
+                    self._active_turn_done = None
                 self._cancel_requested = False
                 self._foreground_active = False
 
@@ -422,6 +431,8 @@ class StreamingConversationPort:
         wait.set_result(approved)
 
     async def cancel_active_turn(self) -> None:
+        if self._cancel_requested:
+            return
         for wait in tuple(self._permission_waits.values()):
             if not wait.done():
                 wait.cancel()
@@ -431,6 +442,26 @@ class StreamingConversationPort:
         self._cancel_requested = True
         if task is not asyncio.current_task():
             task.cancel()
+
+    async def close(self) -> None:
+        task = self._close_task
+        if task is None:
+            task = asyncio.create_task(self._close_active_turn())
+            self._close_task = task
+        await asyncio.shield(task)
+
+    async def _close_active_turn(self) -> None:
+        turn_done = self._active_turn_done
+        await self.cancel_active_turn()
+        try:
+            if turn_done is not None:
+                await turn_done.wait()
+        finally:
+            title = self._title_task
+            if title is not None and not title.done():
+                title.cancel()
+            if title is not None:
+                await asyncio.gather(title, return_exceptions=True)
 
     async def _cancelled_event(
         self,

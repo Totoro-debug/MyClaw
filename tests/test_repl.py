@@ -1,6 +1,8 @@
 import asyncio
+import subprocess
+import sys
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -15,6 +17,7 @@ from myclaw.contracts import (
     ModelCompleted,
     ModelRequest,
     ModelResponse,
+    ModelStreamEvent,
     ModelUsage,
     TextDelta,
 )
@@ -90,6 +93,87 @@ async def test_console_repl_input_returns_eof_without_prompting_when_noninteract
 
     assert await input_reader.read() is None
     assert output.getvalue() == ""
+
+
+@pytest.mark.asyncio
+async def test_console_repl_input_cancellation_stops_async_prompt_without_a_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TerminalInput:
+        def isatty(self) -> bool:
+            return True
+
+    class BlockingPromptSession:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.handle_sigint: bool | None = None
+
+        async def prompt_async(self, message: str, *, handle_sigint: bool) -> str:
+            assert message == "You: "
+            self.handle_sigint = handle_sigint
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    monkeypatch.setattr("myclaw.repl.sys.stdin", TerminalInput())
+    prompt = BlockingPromptSession()
+    input_reader = ConsoleReplInput(
+        Console(force_terminal=True),
+        prompt_session=prompt,
+    )
+    reading = asyncio.create_task(input_reader.read())
+    await prompt.started.wait()
+
+    reading.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+
+    assert prompt.handle_sigint is False
+
+
+def test_cancelled_console_prompt_does_not_delay_process_exit() -> None:
+    script = """
+import asyncio
+from prompt_toolkit import PromptSession
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
+from rich.console import Console
+import myclaw.repl as repl_module
+from myclaw.repl import ConsoleReplInput
+
+class TerminalInput:
+    def isatty(self):
+        return True
+
+async def main():
+    repl_module.sys.stdin = TerminalInput()
+    with create_pipe_input() as pipe:
+        reader = ConsoleReplInput(
+            Console(force_terminal=True),
+            prompt_session=PromptSession(input=pipe, output=DummyOutput()),
+        )
+        reading = asyncio.create_task(reader.read())
+        await asyncio.sleep(0.05)
+        reading.cancel()
+        try:
+            await reading
+        except asyncio.CancelledError:
+            print("prompt-cancelled", flush=True)
+
+asyncio.run(main())
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "prompt-cancelled" in completed.stdout
 
 
 @pytest.mark.asyncio
@@ -328,6 +412,86 @@ async def test_ctrl_c_during_stream_persists_partial_and_repl_runs_the_next_turn
         ("assistant", "completed", "Second turn completed."),
     ]
     assert len(provider.stream_requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_task_cancellation_during_foreground_is_cleared_before_next_input(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    class BlockingProvider:
+        def __init__(self) -> None:
+            self.waiting = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            yield TextDelta(delta="Partial foreground")
+            self.waiting.set()
+            await asyncio.Event().wait()
+
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            raise AssertionError(f"Unexpected completion: {request!r}")
+
+        async def close(self) -> None:
+            return None
+
+    class FirstThenExitInput:
+        def __init__(self) -> None:
+            self._calls = 0
+            self.waiting_for_exit = asyncio.Event()
+            self.release_exit = asyncio.Event()
+
+        async def read(self) -> str:
+            self._calls += 1
+            if self._calls == 1:
+                return "Start foreground."
+            self.waiting_for_exit.set()
+            await self.release_exit.wait()
+            return "exit"
+
+    home = AgentHome(agent_home)
+    home.initialize()
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    provider = BlockingProvider()
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+    )
+    input_reader = FirstThenExitInput()
+    running = asyncio.create_task(
+        run_repl(
+            conversation=conversation,
+            input_reader=input_reader,
+            writer=RecordingProgressiveWriter(),
+        )
+    )
+    await provider.waiting.wait()
+
+    running.cancel()
+    await input_reader.waiting_for_exit.wait()
+
+    try:
+        assert not running.done()
+        assert running.cancelling() == 0
+    finally:
+        input_reader.release_exit.set()
+        await asyncio.gather(running, return_exceptions=True)
 
 
 @pytest.mark.asyncio

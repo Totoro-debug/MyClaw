@@ -23,7 +23,7 @@ from myclaw.contracts import (
 from myclaw.conversation_summary import JsonlSummaryStore
 from myclaw.memory_scheduler import AsyncioMemorySchedulerClock, MemoryTaskScheduler
 from myclaw.memory_task import FileMemoryStore, MemoryManager, MemoryTaskModelSettings
-from myclaw.runtime import prepare_repl_runtime
+from myclaw.runtime import PreparedReplRuntime, prepare_repl_runtime
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 from tests.test_config import VALID_CONFIG
 
@@ -282,7 +282,7 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
         memory_scheduler_clock=clock,
     )
 
-    runtime.start()
+    await runtime.start()
     await _wait_until(lambda: clock.sleeps == [5 * 60])
     clock.advance(5 * 60)
     await _wait_until(lambda: len(provider.complete_requests) == 1)
@@ -292,7 +292,7 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
 
 
 @pytest.mark.asyncio
-async def test_prepared_runtime_can_run_again_with_a_fresh_memory_scheduler(
+async def test_each_prepared_runtime_starts_a_fresh_memory_scheduler(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -306,15 +306,17 @@ async def test_prepared_runtime_can_run_again_with_a_fresh_memory_scheduler(
         encoding="utf-8",
     )
     clock = ControlledClock(NOW)
-    runtime = prepare_repl_runtime(
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _configuration: ScriptedFakeProvider(),
-        now=clock.now,
-        new_uuid=uuid4,
-        memory_scheduler_clock=clock,
-    )
+
+    def prepare_runtime() -> PreparedReplRuntime:
+        return prepare_repl_runtime(
+            agent_home=home,
+            workspace=workspace,
+            configuration=ConfigLoader(home).load(),
+            provider_factory=lambda _configuration: ScriptedFakeProvider(),
+            now=clock.now,
+            new_uuid=uuid4,
+            memory_scheduler_clock=clock,
+        )
 
     class ExitInput:
         async def read(self) -> str:
@@ -331,8 +333,8 @@ async def test_prepared_runtime_can_run_again_with_a_fresh_memory_scheduler(
         async def write_line(self, content: str) -> None:
             del content
 
-    await runtime.run(input_reader=ExitInput(), writer=SilentWriter())
-    await runtime.run(input_reader=ExitInput(), writer=SilentWriter())
+    await prepare_runtime().run(input_reader=ExitInput(), writer=SilentWriter())
+    await prepare_runtime().run(input_reader=ExitInput(), writer=SilentWriter())
 
     assert clock.sleeps == [5 * 60, 5 * 60]
 
@@ -470,7 +472,7 @@ async def test_periodic_memory_edit_is_visible_on_disk_but_chat_uses_the_startup
         memory_scheduler_clock=clock,
     )
 
-    runtime.start()
+    await runtime.start()
     await _wait_until(lambda: clock.sleeps == [5 * 60])
     clock.advance(5 * 60)
     await _wait_until(lambda: len(provider.complete_requests) == 2)

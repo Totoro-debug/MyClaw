@@ -23,6 +23,7 @@ from myclaw.contracts import (
 from myclaw.runtime import prepare_repl_runtime
 from myclaw.tool_gateway import ToolGateway
 from myclaw.web_fetch import (
+    AioHttpWebFetchClient,
     HTTPResponseBoundary,
     PublicWebFetchBoundary,
     WebFetchRejected,
@@ -108,7 +109,7 @@ class FakeHTTPResponse:
 
 
 class FakeHTTPClient:
-    def __init__(self, responses: tuple[FakeHTTPResponse, ...]) -> None:
+    def __init__(self, responses: tuple[HTTPResponseBoundary, ...]) -> None:
         self._responses = iter(responses)
         self.calls: list[tuple[str, frozenset[str], float, float]] = []
 
@@ -119,7 +120,7 @@ class FakeHTTPClient:
         allowed_ips: frozenset[str],
         connect_timeout_seconds: float,
         total_timeout_seconds: float,
-    ) -> FakeHTTPResponse:
+    ) -> HTTPResponseBoundary:
         self.calls.append((url, allowed_ips, connect_timeout_seconds, total_timeout_seconds))
         return next(self._responses)
 
@@ -140,6 +141,29 @@ class HangingHTTPClient:
         self.started = True
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
+
+
+class CancellationResistantCloseResponse:
+    status_code = 200
+    headers: Mapping[str, str] = {"content-type": "text/plain"}
+    peer_ip: str | None = "93.184.216.34"
+
+    def __init__(self) -> None:
+        self.body_started = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+        self.closed = False
+
+    async def iter_bytes(self) -> AsyncIterator[bytes]:
+        self.body_started.set()
+        await asyncio.Event().wait()
+        if False:
+            yield b""
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await self.release_close.wait()
+        self.closed = True
 
 
 class FakeWebFetchBoundary:
@@ -195,6 +219,76 @@ async def test_web_fetch_rejects_when_any_dns_answer_is_not_public(
 
     assert resolver.calls == [("public.example", 443)]
     assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_waits_for_response_close_before_propagating() -> None:
+    response = CancellationResistantCloseResponse()
+    fetcher = PublicWebFetchBoundary(
+        resolver=FakeDNSResolver(("93.184.216.34",)),
+        http_client=FakeHTTPClient((response,)),
+    )
+    fetch = asyncio.create_task(fetcher.fetch("https://public.example/page"))
+    await response.body_started.wait()
+
+    fetch.cancel()
+    await response.close_started.wait()
+    fetch.cancel()
+    await asyncio.sleep(0)
+
+    assert not fetch.done()
+    response.release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await fetch
+    assert response.closed
+
+
+@pytest.mark.asyncio
+async def test_http_client_cancellation_waits_for_pre_response_session_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingSession:
+        def __init__(self, **options: object) -> None:
+            del options
+            self.get_started = asyncio.Event()
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+            self.closed = False
+
+        async def get(self, url: str, *, allow_redirects: bool) -> object:
+            del url, allow_redirects
+            self.get_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            self.closed = True
+
+    session = BlockingSession()
+    monkeypatch.setattr("myclaw.web_fetch.ClientSession", lambda **_options: session)
+    client = AioHttpWebFetchClient()
+    request = asyncio.create_task(
+        client.get(
+            "https://public.example/page",
+            allowed_ips=frozenset({"93.184.216.34"}),
+            connect_timeout_seconds=1,
+            total_timeout_seconds=2,
+        )
+    )
+    await session.get_started.wait()
+
+    request.cancel()
+    await session.close_started.wait()
+    request.cancel()
+    await asyncio.sleep(0)
+
+    assert not request.done()
+    session.release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert session.closed
 
 
 @pytest.mark.asyncio

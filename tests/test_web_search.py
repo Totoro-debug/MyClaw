@@ -1,6 +1,11 @@
+import asyncio
+import io
 import json
+import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from uuid import UUID
 
 import pytest
@@ -21,7 +26,13 @@ from myclaw.contracts import (
 )
 from myclaw.runtime import prepare_repl_runtime
 from myclaw.tool_gateway import ToolGateway
-from myclaw.web_search import DuckDuckGoSearchBoundary, WebSearchResult, WebSearchTool
+from myclaw.web_search import (
+    AsyncioDuckDuckGoSearchProcessSpawner,
+    DuckDuckGoSearchBoundary,
+    WebSearchResult,
+    WebSearchTool,
+)
+from myclaw.web_search_worker import main as run_web_search_worker
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 from tests.test_config import VALID_CONFIG
 
@@ -36,6 +47,7 @@ SESSION_UUIDS = (
     "886313e1-3b8a-4a2d-9f7f-77611a4b6f4e",
 )
 NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
+WINDOWS_NEW_GROUP_NO_WINDOW = 0x08000200
 
 
 class FakeWebSearchBoundary:
@@ -58,6 +70,37 @@ class FailingWebSearchBoundary:
         raise ConnectionError(self._detail)
 
 
+class ByteOutput:
+    def __init__(self) -> None:
+        self.buffer = io.BytesIO()
+
+
+class CompletedSearchProcess:
+    returncode = 0
+
+    def __init__(self, records: list[dict[str, object]]) -> None:
+        self._stdout = json.dumps(records, ensure_ascii=False).encode("utf-8")
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._stdout, b""
+
+    def terminate(self) -> None:
+        raise AssertionError("completed search process must not be terminated")
+
+    async def wait(self) -> int:
+        return self.returncode
+
+
+class RecordingSearchProcessSpawner:
+    def __init__(self, records: list[dict[str, object]]) -> None:
+        self._records = records
+        self.calls: list[tuple[str, int]] = []
+
+    async def spawn(self, query: str, max_results: int) -> CompletedSearchProcess:
+        self.calls.append((query, max_results))
+        return CompletedSearchProcess(self._records)
+
+
 def gateway_context(agent_home: Path, workspace: Path) -> ToolExecutionContext:
     return ToolExecutionContext(
         lane="foreground",
@@ -65,6 +108,76 @@ def gateway_context(agent_home: Path, workspace: Path) -> ToolExecutionContext:
         agent_home=agent_home,
         session_id="20260712-120000-000000_550e8400-e29b-41d4-a716-446655440000",
     )
+
+
+def test_duckduckgo_worker_writes_non_ascii_results_as_utf8_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeDuckDuckGo:
+        def __enter__(self) -> "FakeDuckDuckGo":
+            return self
+
+        def __exit__(self, *errors: object) -> None:
+            del errors
+
+        def text(
+            self,
+            query: str,
+            *,
+            max_results: int,
+            backend: str,
+        ) -> list[dict[str, object]]:
+            assert (query, max_results, backend) == ("运行时资源", 1, "duckduckgo")
+            return [
+                {
+                    "title": "运行时关闭",
+                    "href": "https://example.com/runtime",
+                    "body": "取消后等待资源释放。",
+                }
+            ]
+
+    output = ByteOutput()
+    monkeypatch.setattr("myclaw.web_search.DDGS", FakeDuckDuckGo)
+    monkeypatch.setattr("myclaw.web_search_worker.sys.stdout", output)
+
+    assert run_web_search_worker(["运行时资源", "1"]) == 0
+    assert json.loads(output.buffer.getvalue().decode("utf-8")) == [
+        {
+            "title": "运行时关闭",
+            "href": "https://example.com/runtime",
+            "body": "取消后等待资源释放。",
+        }
+    ]
+
+
+def test_duckduckgo_boundary_rejects_synchronous_sdk_execution() -> None:
+    constructor: Callable[..., DuckDuckGoSearchBoundary] = DuckDuckGoSearchBoundary
+
+    with pytest.raises(TypeError, match="text_search"):
+        constructor(text_search=lambda _query, *, max_results: [])
+
+
+@pytest.mark.asyncio
+async def test_default_duckduckgo_process_isolated_from_foreground_interrupts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options: dict[str, object] = {}
+
+    async def create_process(*command: str, **kwargs: object) -> asyncio.subprocess.Process:
+        del command
+        options.update(kwargs)
+        return cast(asyncio.subprocess.Process, object())
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    await AsyncioDuckDuckGoSearchProcessSpawner().spawn("runtime shutdown", 3)
+
+    if os.name == "nt":
+        assert options["start_new_session"] is False
+        assert options["creationflags"] == WINDOWS_NEW_GROUP_NO_WINDOW
+    else:
+        assert options["start_new_session"] is True
+        assert options["creationflags"] == 0
 
 
 @pytest.mark.asyncio
@@ -121,22 +234,19 @@ async def test_duckduckgo_boundary_maps_sdk_fields_before_the_gateway_returns_th
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    calls: list[tuple[str, int]] = []
-
-    def text_search(query: str, *, max_results: int) -> list[dict[str, object]]:
-        calls.append((query, max_results))
-        return [
+    spawner = RecordingSearchProcessSpawner(
+        [
             {
-                "title": "DuckDuckGo result",
+                "title": "DuckDuckGo 运行时结果",
                 "href": "https://example.com/result",
-                "body": "Provider-shaped result body.",
+                "body": "进程返回的结果摘要。",
                 "provider_metadata": "must not escape",
             }
         ]
-
+    )
     gateway = ToolGateway(
         context=gateway_context(agent_home, workspace),
-        tools=(WebSearchTool(DuckDuckGoSearchBoundary(text_search=text_search)),),
+        tools=(WebSearchTool(DuckDuckGoSearchBoundary(process_spawner=spawner)),),
     )
 
     result = await gateway.execute(
@@ -150,12 +260,171 @@ async def test_duckduckgo_boundary_maps_sdk_fields_before_the_gateway_returns_th
     assert result.status == "success"
     assert json.loads(result.content) == [
         {
-            "title": "DuckDuckGo result",
+            "title": "DuckDuckGo 运行时结果",
             "url": "https://example.com/result",
-            "snippet": "Provider-shaped result body.",
+            "snippet": "进程返回的结果摘要。",
         }
     ]
-    assert calls == [("provider mapping", 1)]
+    assert spawner.calls == [("provider mapping", 1)]
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_cancellation_terminates_and_waits_for_its_process() -> None:
+    class BlockingSearchProcess:
+        def __init__(self) -> None:
+            self.communicate_started = asyncio.Event()
+            self._stopped = asyncio.Event()
+            self.terminated = False
+            self.waited = False
+            self.returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            self.communicate_started.set()
+            await self._stopped.wait()
+            return b"[]", b""
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -1
+            self._stopped.set()
+
+        async def wait(self) -> int:
+            self.waited = True
+            await self._stopped.wait()
+            return -1
+
+    class OneProcessSpawner:
+        def __init__(self, process: BlockingSearchProcess) -> None:
+            self._process = process
+
+        async def spawn(self, query: str, max_results: int) -> BlockingSearchProcess:
+            assert (query, max_results) == ("blocking search", 3)
+            return self._process
+
+    process = BlockingSearchProcess()
+    search = DuckDuckGoSearchBoundary(process_spawner=OneProcessSpawner(process))
+    searching = asyncio.create_task(search.search("blocking search", 3))
+    await process.communicate_started.wait()
+
+    searching.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await searching
+
+    assert process.terminated
+    assert process.waited
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_cancellation_joins_spawn_before_reaping_process() -> None:
+    class CreatedSearchProcess:
+        def __init__(self) -> None:
+            self.terminated = False
+            self.waited = False
+            self.returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            raise AssertionError("communication must not start after cancelled spawn")
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -1
+
+        async def wait(self) -> int:
+            self.waited = True
+            return -1
+
+    class DelayedSpawner:
+        def __init__(self, process: CreatedSearchProcess) -> None:
+            self._process = process
+            self.created = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def spawn(self, query: str, max_results: int) -> CreatedSearchProcess:
+            del query, max_results
+            self.created.set()
+            await self.release.wait()
+            return self._process
+
+    process = CreatedSearchProcess()
+    spawner = DelayedSpawner(process)
+    search = DuckDuckGoSearchBoundary(process_spawner=spawner)
+    searching = asyncio.create_task(search.search("cancel during spawn", 2))
+    await spawner.created.wait()
+
+    searching.cancel()
+    searching.cancel()
+    await asyncio.sleep(0)
+    try:
+        assert not searching.done()
+    finally:
+        spawner.release.set()
+        if searching.done():
+            process.terminate()
+            await process.wait()
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await searching
+
+    assert process.terminated
+    assert process.waited
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_cancellation_reaps_a_same_tick_spawn() -> None:
+    class CreatedSearchProcess:
+        def __init__(self) -> None:
+            self.terminated = False
+            self.waited = False
+            self.returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            raise AssertionError("communication must not start after cancelled spawn")
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -1
+
+        async def wait(self) -> int:
+            self.waited = True
+            return -1
+
+    class SameTickSpawner:
+        def __init__(self, process: CreatedSearchProcess) -> None:
+            self._process = process
+            self.created = asyncio.Event()
+
+        async def spawn(self, query: str, max_results: int) -> CreatedSearchProcess:
+            assert (query, max_results) == ("same tick cancellation", 1)
+            self.created.set()
+            return self._process
+
+    process = CreatedSearchProcess()
+    spawner = SameTickSpawner(process)
+    search = DuckDuckGoSearchBoundary(process_spawner=spawner)
+    searching = asyncio.create_task(search.search("same tick cancellation", 1))
+    await spawner.created.wait()
+
+    searching.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await searching
+
+    assert process.terminated
+    assert process.waited
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_preserves_a_process_spawn_failure() -> None:
+    class FailingSpawner:
+        async def spawn(self, query: str, max_results: int) -> CompletedSearchProcess:
+            assert (query, max_results) == ("spawn failure", 2)
+            raise LookupError("search process could not start")
+
+    search = DuckDuckGoSearchBoundary(process_spawner=FailingSpawner())
+
+    with pytest.raises(LookupError, match="search process could not start") as raised:
+        await search.search("spawn failure", 2)
+
+    assert raised.value.__cause__ is None
 
 
 @pytest.mark.asyncio
@@ -286,11 +555,8 @@ async def test_conversation_receives_only_provider_neutral_web_search_results(
         VALID_CONFIG.replace("[tools.web]\nenabled = false", "[tools.web]\nenabled = true"),
         encoding="utf-8",
     )
-    calls: list[tuple[str, int]] = []
-
-    def text_search(query: str, *, max_results: int) -> list[dict[str, object]]:
-        calls.append((query, max_results))
-        return [
+    spawner = RecordingSearchProcessSpawner(
+        [
             {
                 "title": "MyClaw reference",
                 "href": "https://example.com/reference",
@@ -298,7 +564,7 @@ async def test_conversation_receives_only_provider_neutral_web_search_results(
                 "provider_metadata": "must not reach the conversation",
             }
         ]
-
+    )
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -341,13 +607,13 @@ async def test_conversation_receives_only_provider_neutral_web_search_results(
         provider_factory=lambda _: provider,
         now=FakeClock(NOW).now,
         new_uuid=iter(map(UUID, SESSION_UUIDS)).__next__,
-        web_search=DuckDuckGoSearchBoundary(text_search=text_search),
+        web_search=DuckDuckGoSearchBoundary(process_spawner=spawner),
     )
 
     events = [event async for event in runtime.conversation.submit("Find the docs.")]
 
     assert events[-1].type == "turn_completed"
-    assert calls == [("MyClaw docs", 1)]
+    assert spawner.calls == [("MyClaw docs", 1)]
     second_request = provider.stream_requests[1]
     assert isinstance(second_request, ModelRequest)
     tool_message = second_request.messages[-1]

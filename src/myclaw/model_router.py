@@ -64,6 +64,7 @@ class ModelRouter:
         self._jitter = jitter
         self._providers: dict[str, ModelProvider] = {}
         self._route_statuses: dict[ModelRoute, ModelRouteStatus] = {}
+        self._close_task: asyncio.Task[None] | None = None
 
     def route_status(self, requested_route: ModelRoute) -> ModelRouteStatus:
         """Return the current concrete route identity without provider credentials."""
@@ -121,15 +122,32 @@ class ModelRouter:
         raise AssertionError("Provider attempt budget exhausted without a terminal result")
 
     async def close(self) -> None:
+        task = self._close_task
+        if task is None:
+            task = asyncio.create_task(self._close_providers())
+            self._close_task = task
+        await asyncio.shield(task)
+
+    async def _close_providers(self) -> None:
         providers = tuple(self._providers.values())
         self._providers.clear()
         closed: set[int] = set()
+        unique: list[ModelProvider] = []
         for provider in providers:
             identity = id(provider)
             if identity in closed:
                 continue
             closed.add(identity)
-            await provider.close()
+            unique.append(provider)
+        results = await asyncio.gather(
+            *(provider.close() for provider in unique),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Model Provider shutdown failed", failures)
 
     def _retry_delay(self, attempt: int, failure: ModelCallError) -> float:
         backoff = min(30.0, 0.5 * 2.0 ** (attempt - 1))
@@ -139,6 +157,8 @@ class ModelRouter:
         return min(60.0, max(backoff, retry_after))
 
     def _provider(self, configuration: ProviderConfiguration) -> ModelProvider:
+        if self._close_task is not None:
+            raise RuntimeError("Model Router is closed")
         provider = self._providers.get(configuration.provider_id)
         if provider is None:
             provider = self._provider_factory(configuration)

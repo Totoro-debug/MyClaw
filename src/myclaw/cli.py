@@ -11,6 +11,7 @@ from rich.console import Console
 from myclaw.agent_home import AgentHome
 from myclaw.config import ConfigError, ConfigLoader
 from myclaw.contracts.errors import ErrorInfo
+from myclaw.interrupts import ForegroundInterruptController
 from myclaw.providers import create_provider
 from myclaw.repl import ConsoleProgressiveWriter, ConsoleReplInput
 from myclaw.runtime import (
@@ -66,12 +67,30 @@ def main(context: typer.Context) -> None:
         now=_local_now,
         new_uuid=uuid4,
     )
-    asyncio.run(
-        runtime.run(
-            input_reader=ConsoleReplInput(console),
-            writer=ConsoleProgressiveWriter(console),
+    with asyncio.Runner() as runner:
+        interrupts = ForegroundInterruptController(
+            loop=runner.get_loop(),
+            cancel_foreground=runtime.conversation.cancel_active_turn,
         )
-    )
+        interrupts.install()
+        try:
+            try:
+                runner.run(
+                    runtime.run(
+                        input_reader=ConsoleReplInput(console),
+                        writer=ConsoleProgressiveWriter(console),
+                    )
+                )
+            except BaseException as primary_error:
+                try:
+                    runner.run(interrupts.close())
+                except BaseException as cleanup_error:
+                    raise primary_error from cleanup_error
+                raise
+            else:
+                runner.run(interrupts.close())
+        finally:
+            interrupts.restore()
 
 
 @app.command("config")

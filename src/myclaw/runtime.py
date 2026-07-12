@@ -1,8 +1,9 @@
 """Composition for one prepared command-line Conversation Session."""
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
@@ -130,6 +131,20 @@ class _RuntimeScheduledWorkScheduler:
             self._active = None
 
 
+@dataclass(slots=True)
+class _RuntimeLifetime:
+    started: bool = False
+    close_task: asyncio.Task[None] | None = None
+    shutdown_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    run_task: asyncio.Task[object] | None = None
+    run_done: asyncio.Event | None = None
+
+    def begin(self) -> None:
+        if self.started:
+            raise RuntimeError("Prepared Runtime is closed")
+        self.started = True
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedReplRuntime:
     """An in-memory Session identity and its injectable REPL composition."""
@@ -143,12 +158,25 @@ class PreparedReplRuntime:
     _memory_scheduler: _RuntimeMemoryScheduler
     _scheduled_work_scheduler: _RuntimeScheduledWorkScheduler
     _background_events: RuntimeEventBroker
+    _router: ModelRouter
+    _lifetime: _RuntimeLifetime
 
     @property
     def session_id(self) -> str:
         return self.conversation.session_id
 
-    def start(self) -> None:
+    async def start(self) -> None:
+        self._lifetime.begin()
+        try:
+            self._start_schedulers()
+        except BaseException as primary_error:
+            try:
+                await self.close()
+            except BaseException as cleanup_error:
+                raise primary_error from cleanup_error
+            raise
+
+    def _start_schedulers(self) -> None:
         self._memory_scheduler.start()
         self._scheduled_work_scheduler.start()
 
@@ -162,24 +190,83 @@ class PreparedReplRuntime:
         dispatcher = (
             self.management_dispatcher if management_dispatcher is None else management_dispatcher
         )
-        self.start()
+        self._lifetime.begin()
+        running = asyncio.current_task()
+        if running is None:
+            raise RuntimeError("Prepared Runtime requires an asyncio Task")
+        run_done = asyncio.Event()
+        self._lifetime.run_task = running
+        self._lifetime.run_done = run_done
         try:
-            await run_repl(
-                conversation=self.conversation,
-                input_reader=input_reader,
-                writer=writer,
-                management_dispatcher=dispatcher,
-                background_events=self._background_events,
-            )
+            try:
+                self._start_schedulers()
+                await run_repl(
+                    conversation=self.conversation,
+                    input_reader=input_reader,
+                    writer=writer,
+                    management_dispatcher=dispatcher,
+                    background_events=self._background_events,
+                    shutdown_requested=self._lifetime.shutdown_requested,
+                )
+            except BaseException as primary_error:
+                if self._lifetime.close_task is None:
+                    try:
+                        await self.close()
+                    except BaseException as cleanup_error:
+                        raise primary_error from cleanup_error
+                raise
+            else:
+                if self._lifetime.close_task is None:
+                    await self.close()
         finally:
-            await self.close()
+            run_done.set()
 
     async def close(self) -> None:
-        await self._scheduled_work_scheduler.close()
-        await self._memory_scheduler.close()
-        await self.conversation.cancel_active_turn()
+        task = self._lifetime.close_task
+        if task is None:
+            self._lifetime.started = True
+            self._lifetime.shutdown_requested.set()
+            running = self._lifetime.run_task
+            current = asyncio.current_task()
+            wait_for_run = (
+                self._lifetime.run_done
+                if running is not None and running is not current and not running.done()
+                else None
+            )
+            task = asyncio.create_task(self._close_owned_resources(wait_for_run))
+            self._lifetime.close_task = task
+            if running is not None and running is not current and not running.done():
+                running.cancel()
+        await _await_shared_shutdown(task)
+
+    async def _close_owned_resources(self, run_done: asyncio.Event | None) -> None:
+        failures: list[BaseException] = []
+        try:
+            self._background_events.close()
+        except BaseException as error:
+            failures.append(error)
+
+        shutdowns: list[Awaitable[object]] = [
+            self._scheduled_work_scheduler.close(),
+            self._memory_scheduler.close(),
+            self.conversation.close(),
+        ]
         if self._shell is not None:
-            await self._shell.close()
+            shutdowns.append(self._shell.close())
+        if run_done is not None:
+            shutdowns.append(run_done.wait())
+        results = await asyncio.gather(*shutdowns, return_exceptions=True)
+        failures.extend(result for result in results if isinstance(result, BaseException))
+
+        try:
+            await self._router.close()
+        except BaseException as error:
+            failures.append(error)
+
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Runtime shutdown failed", failures)
 
 
 class _DeferredConversationPort:
@@ -212,30 +299,52 @@ class _DeferredConversationPort:
         self._before_submit = before_submit
         self._on_foreground_terminal = on_foreground_terminal
         self._delegate: ConversationPort | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._active_task: asyncio.Task[object] | None = None
+        self._active_done: asyncio.Event | None = None
 
     async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        if self._close_task is not None:
+            raise RuntimeError("Conversation Port is closed")
         if not text.strip():
             return
-        await self._before_submit()
-        delegate = self._delegate
-        if delegate is None:
-            delegate = StreamingConversationPort(
-                provider=self._provider,
-                sessions=self._sessions,
-                session_id=self._session_id,
-                settings=self._settings,
-                now=self._now,
-                new_uuid=self._new_uuid,
-                system_prompt=self._system_prompt,
-                title_prompt=self._title_prompt,
-                tool_gateway=self._tool_gateway,
-                history_preparer=self._history_preparer,
-            )
-            self._delegate = delegate
-        async for event in delegate.submit(text):
-            if event.type in {"turn_completed", "turn_failed", "turn_cancelled"}:
-                self._on_foreground_terminal()
-            yield event
+        if self._active_task is not None:
+            raise RuntimeError("A foreground turn is already active")
+        active = asyncio.current_task()
+        if active is None:
+            raise RuntimeError("Conversation Port requires an asyncio Task")
+        active_done = asyncio.Event()
+        self._active_task = active
+        self._active_done = active_done
+        try:
+            await self._before_submit()
+            if self._close_task is not None:
+                raise RuntimeError("Conversation Port is closed")
+            delegate = self._delegate
+            if delegate is None:
+                delegate = StreamingConversationPort(
+                    provider=self._provider,
+                    sessions=self._sessions,
+                    session_id=self._session_id,
+                    settings=self._settings,
+                    now=self._now,
+                    new_uuid=self._new_uuid,
+                    system_prompt=self._system_prompt,
+                    title_prompt=self._title_prompt,
+                    tool_gateway=self._tool_gateway,
+                    history_preparer=self._history_preparer,
+                )
+                self._delegate = delegate
+            async for event in delegate.submit(text):
+                if event.type in {"turn_completed", "turn_failed", "turn_cancelled"}:
+                    self._on_foreground_terminal()
+                yield event
+        finally:
+            if self._active_task is active:
+                self._active_task = None
+            active_done.set()
+            if self._active_done is active_done:
+                self._active_done = None
 
     async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
         if self._delegate is None:
@@ -243,8 +352,41 @@ class _DeferredConversationPort:
         await self._delegate.resolve_permission(request_id, approved)
 
     async def cancel_active_turn(self) -> None:
-        if self._delegate is not None:
-            await self._delegate.cancel_active_turn()
+        delegate = self._delegate
+        if delegate is not None:
+            await delegate.cancel_active_turn()
+        active = self._active_task
+        if (
+            active is None
+            or active is asyncio.current_task()
+            or active.done()
+            or active.cancelling()
+        ):
+            return
+        active.cancel()
+
+    async def close(self) -> None:
+        task = self._close_task
+        if task is None:
+            task = asyncio.create_task(self._close_delegate())
+            self._close_task = task
+        await asyncio.shield(task)
+
+    async def _close_delegate(self) -> None:
+        active = self._active_task
+        active_done = self._active_done
+        if active is not None and active is not asyncio.current_task() and not active.done():
+            active.cancel()
+        if active_done is not None:
+            await active_done.wait()
+        delegate = self._delegate
+        if delegate is None:
+            return
+        close = getattr(delegate, "close", None)
+        if close is None:
+            await delegate.cancel_active_turn()
+        else:
+            await close()
 
 
 def prepare_repl_runtime(
@@ -520,6 +662,8 @@ def prepare_repl_runtime(
         _memory_scheduler=memory_scheduler,
         _scheduled_work_scheduler=scheduled_work_scheduler,
         _background_events=background_events,
+        _router=router,
+        _lifetime=_RuntimeLifetime(),
     )
 
 
@@ -565,3 +709,25 @@ def _runtime_status_input(
             session_id=session_id,
         ),
     )
+
+
+async def _await_shared_shutdown(task: asyncio.Task[None]) -> None:
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                break
+            if cancellation is None:
+                cancellation = error
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as cleanup_error:
+        if cancellation is not None:
+            raise cancellation from cleanup_error
+        raise
+    if cancellation is not None:
+        raise cancellation

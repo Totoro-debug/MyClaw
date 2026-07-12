@@ -3,8 +3,9 @@
 import asyncio
 import sys
 from collections.abc import AsyncIterator
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
+from prompt_toolkit import PromptSession
 from rich.console import Console
 
 from myclaw.contracts import (
@@ -22,17 +23,31 @@ class ReplInput(Protocol):
     async def read(self) -> str | None: ...
 
 
+class PromptSessionBoundary(Protocol):
+    async def prompt_async(self, message: str, *, handle_sigint: bool) -> str: ...
+
+
 class ConsoleReplInput:
     """Read terminal input asynchronously and treat noninteractive streams as EOF."""
 
-    def __init__(self, console: Console) -> None:
+    def __init__(
+        self,
+        console: Console,
+        *,
+        prompt_session: PromptSessionBoundary | None = None,
+    ) -> None:
         self._console = console
+        self._prompt_session = prompt_session
 
     async def read(self) -> str | None:
         if not self._console.is_terminal or not sys.stdin.isatty():
             return None
+        prompt_session = self._prompt_session
+        if prompt_session is None:
+            prompt_session = PromptSession()
+            self._prompt_session = prompt_session
         try:
-            return await asyncio.to_thread(self._console.input, "You: ", markup=False)
+            return await prompt_session.prompt_async("You: ", handle_sigint=False)
         except EOFError:
             return None
 
@@ -49,6 +64,11 @@ class BackgroundEventSource(Protocol):
     async def next_background_event(self) -> AgentEvent: ...
 
     def next_background_event_nowait(self) -> AgentEvent | None: ...
+
+
+@runtime_checkable
+class _ClosableEventStream(Protocol):
+    async def aclose(self) -> None: ...
 
 
 class ConsoleProgressiveWriter:
@@ -97,12 +117,15 @@ async def run_repl(
     writer: ProgressiveWriter,
     management_dispatcher: ManagementDispatcher | None = None,
     background_events: BackgroundEventSource | None = None,
+    shutdown_requested: asyncio.Event | None = None,
 ) -> None:
     """Read interactive input until EOF while preserving an unmaterialized empty Session."""
     input_task: asyncio.Task[str | None] | None = None
     background_task: asyncio.Task[AgentEvent] | None = None
     try:
         while True:
+            if shutdown_requested is not None and shutdown_requested.is_set():
+                return
             if background_events is not None and input_task is None:
                 queued_event = background_events.next_background_event_nowait()
                 if queued_event is not None:
@@ -119,6 +142,22 @@ async def run_repl(
                     (input_task, background_task),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                if input_task in completed and not input_task.cancelled():
+                    try:
+                        completed_text = input_task.result()
+                    except BaseException:
+                        pass
+                    else:
+                        if completed_text is not None and completed_text.strip().casefold() in {
+                            "exit",
+                            "quit",
+                        }:
+                            input_task = None
+                            if not background_task.done():
+                                background_task.cancel()
+                            await asyncio.gather(background_task, return_exceptions=True)
+                            background_task = None
+                            return
                 if background_task in completed:
                     event = background_task.result()
                     background_task = None
@@ -151,31 +190,41 @@ async def run_repl(
                     continue
             events = conversation.submit(text)
             try:
-                await _render_turn(
-                    events,
-                    writer,
-                    conversation=conversation,
-                    input_reader=input_reader,
-                )
-            except asyncio.CancelledError:
-                active_task = asyncio.current_task()
-                if active_task is not None and active_task.cancelling():
-                    active_task.uncancel()
-                await conversation.cancel_active_turn()
-                await _render_turn(
-                    events,
-                    writer,
-                    conversation=conversation,
-                    input_reader=input_reader,
-                )
+                try:
+                    await _render_turn(
+                        events,
+                        writer,
+                        conversation=conversation,
+                        input_reader=input_reader,
+                    )
+                except asyncio.CancelledError:
+                    if shutdown_requested is not None and shutdown_requested.is_set():
+                        raise
+                    _clear_current_task_cancellation()
+                    await conversation.cancel_active_turn()
+                    await _render_turn(
+                        events,
+                        writer,
+                        conversation=conversation,
+                        input_reader=input_reader,
+                    )
+            except BaseException as primary_error:
+                try:
+                    await _close_event_stream(events)
+                except BaseException as cleanup_error:
+                    raise primary_error from cleanup_error
+                raise
+            else:
+                await _close_event_stream(events)
+                if shutdown_requested is None or not shutdown_requested.is_set():
+                    _clear_current_task_cancellation()
     finally:
-        pending = tuple(
-            task for task in (input_task, background_task) if task is not None and not task.done()
-        )
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        children = tuple(task for task in (input_task, background_task) if task is not None)
+        for task in children:
+            if not task.done():
+                task.cancel()
+        if children:
+            await asyncio.gather(*children, return_exceptions=True)
 
 
 async def _render_background_event(event: AgentEvent, writer: ProgressiveWriter) -> None:
@@ -187,6 +236,19 @@ async def _render_background_event(event: AgentEvent, writer: ProgressiveWriter)
     await writer.write_line(
         f"[Scheduled Work] {payload.title} ({payload.status}): {payload.summary}"
     )
+
+
+async def _close_event_stream(events: AsyncIterator[AgentEvent]) -> None:
+    if isinstance(events, _ClosableEventStream):
+        await events.aclose()
+
+
+def _clear_current_task_cancellation() -> None:
+    task = asyncio.current_task()
+    if task is None:
+        return
+    while task.cancelling():
+        task.uncancel()
 
 
 async def _choose_resume_session(

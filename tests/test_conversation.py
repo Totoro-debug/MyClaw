@@ -29,6 +29,7 @@ from myclaw.contracts import (
     validate_agent_event_sequence,
 )
 from myclaw.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.repl import run_repl
 from myclaw.session_store import JsonlSessionStore
 from myclaw.workspace import Workspace
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
@@ -724,6 +725,226 @@ async def test_cancel_active_turn_persists_partial_then_releases_next_foreground
             ),
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_the_active_foreground_turn_to_finish_cancelling(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    provider = CancellableThenSuccessfulProvider(
+        ModelResponse(
+            message=AssistantModelMessage(content="unused"),
+            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            finish_reason="stop",
+        )
+    )
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+    )
+    turn = asyncio.create_task(_collect_events(conversation.submit("Stop and persist this turn.")))
+    await provider.first_stream_waiting.wait()
+
+    await conversation.close()
+
+    assert turn.done()
+    assert [event.type for event in await turn] == [
+        "turn_started",
+        "text_delta",
+        "turn_cancelled",
+    ]
+    interrupted = (await store.load(session.id)).messages[-1]
+    assert isinstance(interrupted, AssistantSessionMessage)
+    assert interrupted.status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_turn_cleanup_without_waiting_for_unrelated_caller_work(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    provider = CancellableThenSuccessfulProvider(
+        ModelResponse(
+            message=AssistantModelMessage(content="unused"),
+            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            finish_reason="stop",
+        )
+    )
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+    )
+    unrelated_work = asyncio.Event()
+    turn_finished = asyncio.Event()
+
+    async def caller() -> None:
+        await _collect_events(conversation.submit("Close only this turn."))
+        turn_finished.set()
+        await unrelated_work.wait()
+
+    caller_task = asyncio.create_task(caller())
+    await provider.first_stream_waiting.wait()
+    try:
+        await asyncio.wait_for(conversation.close(), timeout=0.5)
+
+        assert turn_finished.is_set()
+        assert not caller_task.done()
+    finally:
+        unrelated_work.set()
+        await caller_task
+
+
+@pytest.mark.asyncio
+async def test_submit_is_rejected_after_conversation_close(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    provider = ScriptedFakeProvider()
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=lambda: TURN_UUID,
+    )
+    await conversation.close()
+
+    events = conversation.submit("This turn must not start.")
+    with pytest.raises(RuntimeError, match="Conversation Port is closed"):
+        await anext(events)
+
+    assert provider.stream_requests == []
+
+
+@pytest.mark.asyncio
+async def test_repl_writer_failure_closes_the_active_turn_iterator(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    class OneInput:
+        async def read(self) -> str | None:
+            return "Start the failing render."
+
+    class FailingWriter:
+        async def write_delta(self, delta: str) -> None:
+            del delta
+            raise OSError("writer failed")
+
+        async def finish_turn(self) -> None:
+            return None
+
+        async def write_line(self, content: str) -> None:
+            del content
+
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    provider = CancellableThenSuccessfulProvider(
+        ModelResponse(
+            message=AssistantModelMessage(content="A clean second answer."),
+            usage=ModelUsage(input_tokens=3, output_tokens=2, total_tokens=5),
+            finish_reason="stop",
+        )
+    )
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter(
+            (
+                TURN_UUID,
+                USER_UUID,
+                REQUEST_UUID,
+                TURN_TWO_UUID,
+                USER_TWO_UUID,
+                REQUEST_TWO_UUID,
+                ASSISTANT_TWO_UUID,
+            )
+        ).__next__,
+    )
+
+    with pytest.raises(OSError, match="writer failed"):
+        await run_repl(
+            conversation=conversation,
+            input_reader=OneInput(),
+            writer=FailingWriter(),
+        )
+
+    second = [event async for event in conversation.submit("Start a clean next turn.")]
+    assert [event.type for event in second] == ["turn_started", "turn_completed"]
 
 
 @pytest.mark.asyncio

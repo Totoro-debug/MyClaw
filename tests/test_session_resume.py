@@ -11,6 +11,7 @@ import pytest
 from myclaw.agent_home import AgentHome
 from myclaw.config import ConfigLoader, ProviderConfiguration
 from myclaw.contracts import (
+    AgentEvent,
     AssistantModelMessage,
     AssistantSessionMessage,
     ConversationSession,
@@ -283,20 +284,24 @@ class DelayedResumeTitleProvider:
         self.title_started = asyncio.Event()
         self.release_title = asyncio.Event()
         self.title_request_count = 0
+        self.title_stopped_count = 0
         self._chat_contents = iter(("First answer.", "Target answer."))
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         if request.system_prompt == session_title_prompt():
             self.title_request_count += 1
             self.title_started.set()
-            await self.release_title.wait()
-            yield ModelCompleted(
-                response=ModelResponse(
-                    message=AssistantModelMessage(content="Late original title"),
-                    usage=ModelUsage(input_tokens=5, output_tokens=3, total_tokens=8),
-                    finish_reason="stop",
+            try:
+                await self.release_title.wait()
+                yield ModelCompleted(
+                    response=ModelResponse(
+                        message=AssistantModelMessage(content="Late original title"),
+                        usage=ModelUsage(input_tokens=5, output_tokens=3, total_tokens=8),
+                        finish_reason="stop",
+                    )
                 )
-            )
+            finally:
+                self.title_stopped_count += 1
             return
         content = next(self._chat_contents)
         yield TextDelta(delta=content)
@@ -360,6 +365,99 @@ class CoordinatedListingStore:
             self.current_listing_ready.set()
             await self.release_current_listing.wait()
         return listing
+
+
+@pytest.mark.asyncio
+async def test_switchable_conversation_close_stops_delegates_from_every_selected_session(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=iter((OLDER_SESSION_UUID, NEWER_SESSION_UUID)).__next__,
+    )
+    first = sessions.prepare()
+    second = sessions.prepare()
+    provider = DelayedResumeTitleProvider()
+
+    def conversation_for(session_id: str) -> StreamingConversationPort:
+        return StreamingConversationPort(
+            provider=provider,
+            sessions=sessions,
+            session_id=session_id,
+            settings=ChatModelSettings(
+                model="test-model",
+                max_output=1024,
+                temperature=0.2,
+                reasoning_effort=None,
+                timeout_seconds=30,
+            ),
+            now=lambda: NOW,
+            new_uuid=lambda: REQUEST_UUID,
+            title_prompt=session_title_prompt(),
+        )
+
+    conversation = SwitchableConversationPort(
+        session_id=first.id,
+        build_conversation=conversation_for,
+    )
+    _ = [event async for event in conversation.submit("Start the first title.")]
+    conversation.switch_session(second.id)
+    _ = [event async for event in conversation.submit("Start the second title.")]
+    for _ in range(100):
+        if provider.title_request_count == 2:
+            break
+        await asyncio.sleep(0)
+
+    await conversation.close()
+
+    assert provider.title_stopped_count == 2
+
+
+@pytest.mark.asyncio
+async def test_switchable_conversation_close_settles_every_selected_adapter() -> None:
+    class ClosingConversation:
+        def __init__(self, *, fail: bool = False) -> None:
+            self._fail = fail
+            self.closed = False
+
+        async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+            del text
+            events: tuple[AgentEvent, ...] = ()
+            for event in events:
+                yield event
+
+        async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
+            del request_id, approved
+
+        async def cancel_active_turn(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            self.closed = True
+            if self._fail:
+                raise RuntimeError("first adapter close failed")
+
+    first = ClosingConversation(fail=True)
+    second = ClosingConversation()
+    delegates = {"first": first, "second": second}
+    conversation = SwitchableConversationPort(
+        session_id="first",
+        build_conversation=delegates.__getitem__,
+    )
+    _ = [event async for event in conversation.submit("first")]
+    conversation.switch_session("second")
+    _ = [event async for event in conversation.submit("second")]
+
+    with pytest.raises(RuntimeError, match="first adapter close failed"):
+        await conversation.close()
+
+    assert first.closed
+    assert second.closed
 
 
 @pytest.mark.asyncio
@@ -800,10 +898,7 @@ async def test_late_title_stays_with_original_and_resumed_session_is_not_retitle
     )
     original_session_id = runtime.session_id
 
-    await runtime.run(
-        input_reader=ScriptedInput(("Create the original title.", None)),
-        writer=RecordingWriter(),
-    )
+    _ = [event async for event in runtime.conversation.submit("Create the original title.")]
     await asyncio.wait_for(provider.title_started.wait(), timeout=1)
 
     resume_result = await runtime.management_dispatcher.resume(target.id)
@@ -814,10 +909,7 @@ async def test_late_title_stays_with_original_and_resumed_session_is_not_retitle
             break
         await asyncio.sleep(0)
 
-    await runtime.run(
-        input_reader=ScriptedInput(("Continue the existing target.", None)),
-        writer=RecordingWriter(),
-    )
+    _ = [event async for event in runtime.conversation.submit("Continue the existing target.")]
 
     resumed = await runtime.sessions.load(target.id)
     assert resume_result.output == f"Resumed session {target.id}."
@@ -829,6 +921,7 @@ async def test_late_title_stays_with_original_and_resumed_session_is_not_retitle
         ("user", "Continue the existing target."),
         ("assistant", "Target answer."),
     ]
+    await runtime.close()
 
 
 @pytest.mark.asyncio

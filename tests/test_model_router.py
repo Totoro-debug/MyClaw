@@ -183,6 +183,199 @@ def permanent_failure(
 
 
 @pytest.mark.asyncio
+async def test_router_close_settles_every_cached_provider_when_one_close_fails() -> None:
+    close_order: list[str] = []
+
+    class CloseTrackingProvider(ScriptedFakeProvider):
+        def __init__(self, name: str, *, fail_close: bool = False) -> None:
+            super().__init__(completions=(response(name),))
+            self._name = name
+            self._fail_close = fail_close
+
+        async def close(self) -> None:
+            close_order.append(self._name)
+            if self._fail_close:
+                raise RuntimeError(f"{self._name} close failed")
+
+    providers = {
+        "default-provider": CloseTrackingProvider("default", fail_close=True),
+        "memory-provider": CloseTrackingProvider("memory"),
+    }
+    router = ModelRouter(
+        configuration=memory_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+    )
+    await router.complete(request(route="default", stream=False))
+    await router.complete(request(route="memory", stream=False))
+
+    with pytest.raises(RuntimeError, match="default close failed"):
+        await router.close()
+
+    assert close_order == ["default", "memory"]
+
+
+@pytest.mark.asyncio
+async def test_router_close_settles_every_provider_when_one_close_is_cancelled() -> None:
+    close_order: list[str] = []
+
+    class CloseTrackingProvider(ScriptedFakeProvider):
+        def __init__(self, name: str, *, cancel_close: bool = False) -> None:
+            super().__init__(completions=(response(name),))
+            self._name = name
+            self._cancel_close = cancel_close
+
+        async def close(self) -> None:
+            close_order.append(self._name)
+            if self._cancel_close:
+                raise asyncio.CancelledError
+
+    providers = {
+        "default-provider": CloseTrackingProvider("default", cancel_close=True),
+        "memory-provider": CloseTrackingProvider("memory"),
+    }
+    router = ModelRouter(
+        configuration=memory_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+    )
+    await router.complete(request(route="default", stream=False))
+    await router.complete(request(route="memory", stream=False))
+
+    with pytest.raises(asyncio.CancelledError):
+        await router.close()
+
+    assert close_order == ["default", "memory"]
+
+
+@pytest.mark.asyncio
+async def test_router_starts_every_provider_close_before_waiting_for_one_to_finish() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+
+    class FirstProvider(ScriptedFakeProvider):
+        async def close(self) -> None:
+            first_started.set()
+            await release_first.wait()
+
+    class SecondProvider(ScriptedFakeProvider):
+        async def close(self) -> None:
+            second_started.set()
+
+    providers: dict[str, ScriptedFakeProvider] = {
+        "default-provider": FirstProvider(completions=(response("default"),)),
+        "memory-provider": SecondProvider(completions=(response("memory"),)),
+    }
+    router = ModelRouter(
+        configuration=memory_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+    )
+    await router.complete(request(route="default", stream=False))
+    await router.complete(request(route="memory", stream=False))
+    closing = asyncio.create_task(router.close())
+    await first_started.wait()
+    try:
+        await asyncio.sleep(0)
+        assert second_started.is_set()
+    finally:
+        release_first.set()
+        await closing
+
+
+@pytest.mark.asyncio
+async def test_concurrent_router_close_waits_for_the_same_provider_shutdown() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    close_calls = 0
+
+    class BlockingCloseProvider(ScriptedFakeProvider):
+        async def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            started.set()
+            await release.wait()
+
+    provider = BlockingCloseProvider(completions=(response(),))
+    router = ModelRouter(
+        configuration=configuration(),
+        provider_factory=lambda _configuration: provider,
+        clock=FakeClock(NOW),
+    )
+    await router.complete(request(stream=False))
+
+    first = asyncio.create_task(router.close())
+    await started.wait()
+    second = asyncio.create_task(router.close())
+    await asyncio.sleep(0)
+    try:
+        assert not second.done()
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
+
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelling_one_router_close_caller_does_not_cancel_provider_shutdown() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    class BlockingCloseProvider(ScriptedFakeProvider):
+        async def close(self) -> None:
+            started.set()
+            await release.wait()
+            finished.set()
+
+    provider = BlockingCloseProvider(completions=(response(),))
+    router = ModelRouter(
+        configuration=configuration(),
+        provider_factory=lambda _configuration: provider,
+        clock=FakeClock(NOW),
+    )
+    await router.complete(request(stream=False))
+
+    caller = asyncio.create_task(router.close())
+    await started.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    assert not finished.is_set()
+    release.set()
+    await router.close()
+
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_router_cannot_create_a_new_provider_after_close() -> None:
+    provider = ScriptedFakeProvider(completions=(response(),))
+    factory_calls = 0
+
+    def provider_factory(_configuration: ProviderConfiguration) -> ScriptedFakeProvider:
+        nonlocal factory_calls
+        factory_calls += 1
+        return provider
+
+    router = ModelRouter(
+        configuration=configuration(),
+        provider_factory=provider_factory,
+        clock=FakeClock(NOW),
+    )
+    await router.complete(request(stream=False))
+    await router.close()
+
+    with pytest.raises(RuntimeError, match="Model Router is closed"):
+        await router.complete(request(stream=False))
+
+    assert factory_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_model_router_caps_one_logical_stream_at_five_provider_attempts() -> None:
     failure = retryable_timeout()
     provider = ScriptedFakeProvider(
