@@ -1,0 +1,84 @@
+name: Release validation
+
+on:
+  push:
+    branches:
+      - codex/b18-posix-validation
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  posix:
+    name: POSIX release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Record platform
+        run: |
+          uname -a
+          cat /etc/os-release
+          python --version
+          python -m pip --version
+
+      - name: Install release test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run offline test suite
+        run: python -m pytest -q -ra
+
+      - name: Run POSIX process regressions
+        run: >-
+          python -m pytest -q -ra
+          tests/test_shell_process.py
+          tests/test_web_search.py
+          tests/test_runtime_shutdown.py
+          tests/test_security_shell.py
+
+      - name: Run lint and format gates
+        run: |
+          python -m ruff check src tests
+          python -m ruff format --check src tests
+
+      - name: Run strict type gate
+        run: python -m mypy src tests
+
+      - name: Build source and wheel distributions
+        run: python -m build
+
+      - name: Install wheel in a clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/myclaw-clean"
+          "$RUNNER_TEMP/myclaw-clean/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/myclaw-clean/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/myclaw-clean/bin/python" -m pip check
+
+      - name: Smoke test installed CLI from a Unicode workspace
+        run: |
+          mkdir -p "$RUNNER_TEMP/home" "$RUNNER_TEMP/workspace-验收"
+          cd "$RUNNER_TEMP/workspace-验收"
+          set +e
+          HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/myclaw-clean/bin/myclaw" \
+            > "$RUNNER_TEMP/myclaw-first-start.txt" 2>&1
+          first_exit=$?
+          set -e
+          test "$first_exit" -ne 0
+          test -f "$RUNNER_TEMP/home/.myclaw/config.toml"
+          HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/myclaw-clean/bin/myclaw" config \
+            > "$RUNNER_TEMP/myclaw-config.txt"
+          grep -q '\[runtime\]' "$RUNNER_TEMP/myclaw-config.txt"
+          "$RUNNER_TEMP/myclaw-clean/bin/python" -c \
+            "import myclaw; print('WHEEL_IMPORT_OK', myclaw.__version__)"

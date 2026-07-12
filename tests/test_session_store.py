@@ -1,7 +1,8 @@
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -148,6 +149,60 @@ async def test_completed_assistant_is_one_complete_record_and_reloads(
             ),
         ),
         messages=(user_message, assistant_message),
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_runtime_concurrent_session_writes_preserve_every_record_and_usage(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(CREATED_AT)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    metadata = store.prepare()
+    user_message = UserSessionMessage(
+        id=str(USER_UUID),
+        created_at=metadata.created_at,
+        content="Run concurrent Session writes.",
+    )
+    await store.append_message(metadata.id, user_message)
+    assistants = tuple(
+        AssistantSessionMessage(
+            id=str(uuid4()),
+            created_at=metadata.created_at + timedelta(seconds=index + 1),
+            content=f"Concurrent response {index}",
+            tool_calls=(),
+            status="completed",
+            error=None,
+            usage=ModelUsage(
+                input_tokens=index + 1,
+                output_tokens=1,
+                total_tokens=index + 2,
+            ),
+        )
+        for index in range(12)
+    )
+
+    await asyncio.gather(*(store.append_message(metadata.id, message) for message in assistants))
+
+    persisted = await store.load(metadata.id)
+    assert persisted.messages[0] == user_message
+    assert {message.id for message in persisted.messages[1:]} == {
+        message.id for message in assistants
+    }
+    assert len(persisted.messages) == 13
+    assert persisted.metadata.cumulative_usage == CumulativeUsage(
+        model_calls=12,
+        input_tokens=78,
+        output_tokens=12,
+        total_tokens=90,
     )
 
 
