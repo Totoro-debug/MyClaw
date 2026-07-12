@@ -1,11 +1,24 @@
 """Command-line entry point for MyClaw."""
 
+import asyncio
+from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
+
 import typer
 from rich.console import Console
 
 from myclaw.agent_home import AgentHome
 from myclaw.config import ConfigError, ConfigLoader
 from myclaw.contracts.errors import ErrorInfo
+from myclaw.management import ManagementViewService
+from myclaw.management_commands import ManagementCommandDispatcher
+from myclaw.repl import ConsoleProgressiveWriter, ConsoleReplInput
+from myclaw.runtime import (
+    ProviderAdapterUnavailable,
+    prepare_repl_runtime,
+    unavailable_provider_factory,
+)
 
 app = typer.Typer(
     add_completion=False,
@@ -13,6 +26,10 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 console = Console()
+
+
+def _local_now() -> datetime:
+    return datetime.now().astimezone()
 
 
 def _print_error(error: ErrorInfo, path: object) -> None:
@@ -32,7 +49,7 @@ def main(context: typer.Context) -> None:
         return
     loader = ConfigLoader(AgentHome.production())
     try:
-        loader.load_for_startup()
+        configuration = loader.load_for_startup()
     except ConfigError as config_error:
         _print_error(config_error.error, loader.path)
         exit_code = 1 if config_error.error.code == "persistence_error" else 2
@@ -44,6 +61,30 @@ def main(context: typer.Context) -> None:
         )
         raise typer.Exit(code=1) from None
     console.print("MyClaw Personal Agent configuration gate passed.")
+    runtime = prepare_repl_runtime(
+        agent_home=loader.agent_home,
+        workspace=Path.cwd(),
+        configuration=configuration,
+        provider_factory=unavailable_provider_factory,
+        now=_local_now,
+        new_uuid=uuid4,
+    )
+    try:
+        asyncio.run(
+            runtime.run(
+                input_reader=ConsoleReplInput(console),
+                writer=ConsoleProgressiveWriter(console),
+                management_dispatcher=ManagementCommandDispatcher(
+                    ManagementViewService(loader.agent_home)
+                ),
+            )
+        )
+    except ProviderAdapterUnavailable as error:
+        _print_error(
+            ErrorInfo("route_unavailable", str(error)),
+            loader.path,
+        )
+        raise typer.Exit(code=1) from None
 
 
 @app.command("config")

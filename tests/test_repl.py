@@ -1,0 +1,255 @@
+from collections import deque
+from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
+from io import StringIO
+from pathlib import Path
+from uuid import UUID
+
+import pytest
+from rich.console import Console
+
+from myclaw.agent_home import AgentHome
+from myclaw.contracts import (
+    AssistantModelMessage,
+    ModelCompleted,
+    ModelRequest,
+    ModelResponse,
+    ModelUsage,
+    TextDelta,
+)
+from myclaw.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.management import ManagementViewService
+from myclaw.management_commands import ManagementCommandDispatcher
+from myclaw.repl import ConsoleProgressiveWriter, ConsoleReplInput, run_repl
+from myclaw.session_store import JsonlSessionStore
+from myclaw.workspace import Workspace
+from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+
+LOCAL_OFFSET = timezone(timedelta(hours=8))
+NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
+SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
+TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
+USER_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
+REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
+ASSISTANT_UUID = UUID("a3bb189e-8bf9-4c4b-ae4a-c6699f6f7e34")
+
+
+class ScriptedReplInput:
+    def __init__(self, values: Iterable[str | None]) -> None:
+        self._values = deque(values)
+
+    async def read(self) -> str | None:
+        return self._values.popleft()
+
+
+class RecordingProgressiveWriter:
+    def __init__(self) -> None:
+        self.operations: list[tuple[str, str]] = []
+
+    async def write_delta(self, delta: str) -> None:
+        self.operations.append(("delta", delta))
+
+    async def finish_turn(self) -> None:
+        self.operations.append(("finish", ""))
+
+    async def write_line(self, content: str) -> None:
+        self.operations.append(("line", content))
+
+
+@pytest.mark.asyncio
+async def test_console_progressive_writer_writes_chunks_then_one_complete_line() -> None:
+    output = StringIO()
+    writer = ConsoleProgressiveWriter(Console(file=output, force_terminal=False, color_system=None))
+
+    await writer.write_delta("Hello ")
+    await writer.write_delta("world")
+    await writer.finish_turn()
+    await writer.write_line("Management output\n")
+
+    assert output.getvalue() == "Hello world\nManagement output\n"
+
+
+@pytest.mark.asyncio
+async def test_console_repl_input_returns_eof_without_prompting_when_noninteractive() -> None:
+    output = StringIO()
+    input_reader = ConsoleReplInput(Console(file=output, force_terminal=False, color_system=None))
+
+    assert await input_reader.read() is None
+    assert output.getvalue() == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inputs", [(None,), ("   ", "\t", None)])
+async def test_repl_without_nonblank_user_input_leaves_prepared_session_in_memory(
+    inputs: tuple[str | None, ...],
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    provider = ScriptedFakeProvider()
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter(()).__next__,
+    )
+    writer = RecordingProgressiveWriter()
+
+    await run_repl(
+        conversation=conversation,
+        input_reader=ScriptedReplInput(inputs),
+        writer=writer,
+    )
+
+    assert not store.path_for(session.id).parent.exists()
+    assert provider.stream_requests == []
+    assert provider.complete_requests == []
+    assert writer.operations == []
+
+
+@pytest.mark.asyncio
+async def test_repl_writes_each_text_delta_progressively_then_finishes_once(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    response = ModelResponse(
+        message=AssistantModelMessage(content="I will inspect the files."),
+        usage=ModelUsage(input_tokens=120, output_tokens=24, total_tokens=144),
+        finish_reason="stop",
+    )
+    provider = ScriptedFakeProvider(
+        streams=[
+            StreamScript(
+                events=(
+                    TextDelta(delta="I will "),
+                    TextDelta(delta="inspect the files."),
+                    ModelCompleted(response=response),
+                )
+            )
+        ]
+    )
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+    )
+    writer = RecordingProgressiveWriter()
+
+    await run_repl(
+        conversation=conversation,
+        input_reader=ScriptedReplInput(("Help me inspect this project.", None)),
+        writer=writer,
+    )
+
+    assert writer.operations == [
+        ("delta", "I will "),
+        ("delta", "inspect the files."),
+        ("finish", ""),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repl_dispatches_handled_management_output_and_converses_on_unknown_slash(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    response = ModelResponse(
+        message=AssistantModelMessage(content="Ordinary slash input received."),
+        usage=ModelUsage(input_tokens=5, output_tokens=4, total_tokens=9),
+        finish_reason="stop",
+    )
+    provider = ScriptedFakeProvider(
+        streams=[
+            StreamScript(
+                events=(
+                    TextDelta(delta="Ordinary slash input received."),
+                    ModelCompleted(response=response),
+                )
+            )
+        ]
+    )
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+    )
+    dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    writer = RecordingProgressiveWriter()
+
+    await run_repl(
+        conversation=conversation,
+        input_reader=ScriptedReplInput(("/memory", "/unknown", None)),
+        writer=writer,
+        management_dispatcher=dispatcher,
+    )
+
+    assert writer.operations == [
+        (
+            "line",
+            "# Long-term Memory\n\n## User Info\n\n## User Preference\n\n"
+            "## Project Fact\n\n## Lesson\n",
+        ),
+        ("delta", "Ordinary slash input received."),
+        ("finish", ""),
+    ]
+    assert len(provider.stream_requests) == 1
+    request = provider.stream_requests[0]
+    assert isinstance(request, ModelRequest)
+    assert [message.to_dict() for message in request.messages] == [
+        {"role": "user", "content": "/unknown"}
+    ]
