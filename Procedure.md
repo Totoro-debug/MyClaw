@@ -62,7 +62,7 @@ Status legend: `TODO` -> `IN_PROGRESS` -> `AGENT_DONE` -> `VERIFIED` -> `CLOSED`
 | #5 | T04 Configuration | #4 | B04 | `myclaw`, `myclaw config`, validated/redacted config API | b04_issue_5 | CLOSED | ef73b6a |
 | #6 | T05 First streaming turn | #5 | B05 | Conversation Port through REPL and Session Store reload | b05_issue_6 | CLOSED | e18725d |
 | #7 | T06 Multi-turn Short-term Memory | #6 | B06 | one REPL session across Conversation Port turns | b06_issue_7 | CLOSED | 9e95271 |
-| #8 | T07 Model route fallback | #7 | B07 | Model Router route resolution and startup validation | b07_issue_8 | VERIFIED | - |
+| #8 | T07 Model route fallback | #7 | B07 | Model Router route resolution and startup validation | b07_issue_8 | CLOSED | 4941765 |
 | #9 | T08 Retry budget | #8 | B08 | Model Router with fake Provider and fake Clock | - | TODO | - |
 | #10 | T09 Failed/cancelled turns | #9 | B09 | Conversation Port terminal events and reloadable Session Store | - | TODO | - |
 | #11 | T10 Session metadata/status | #8 | B08 | Session Store metadata and Management Port `/status` | - | TODO | - |
@@ -116,7 +116,7 @@ Issue #36 additionally requires Windows and POSIX evidence, clean-wheel installa
 | B04 | #5 | 141 pytest + Ruff lint/format + strict mypy + sdist/wheel + installed CLI smoke | ef73b6a | #5 commented and closed | CLOSED |
 | B05 | #6, #13 | 169 pytest + Ruff lint/format + strict mypy + sdist/wheel + combined REPL/management integration | e18725d | #6 and #13 commented and closed | CLOSED |
 | B06 | #7 | 173 pytest + Ruff lint/format + strict mypy + sdist/wheel + independent contract review | 9e95271 | #7 commented and closed | CLOSED |
-| B07 | #8 | 175 pytest + Ruff lint/format + strict mypy + sdist/wheel + Config/Runtime route regression | - | - | VERIFIED |
+| B07 | #8 | 175 pytest + Ruff lint/format + strict mypy + sdist/wheel + Config/Runtime route regression | 4941765 | #8 commented and closed | CLOSED |
 | B08 | #9, #11 | - | - | - | TODO |
 | B09 | #10, #12, #15, #21, #22, #27 | - | - | - | TODO |
 | B10 | #14, #16 | - | - | - | TODO |
