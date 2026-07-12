@@ -17,10 +17,12 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
           cache: pip
@@ -75,7 +77,9 @@ jobs:
             > "$RUNNER_TEMP/myclaw-first-start.txt" 2>&1
           first_exit=$?
           set -e
-          test "$first_exit" -ne 0
+          test "$first_exit" -eq 2
+          grep -q 'config_missing' "$RUNNER_TEMP/myclaw-first-start.txt"
+          ! grep -q 'Traceback' "$RUNNER_TEMP/myclaw-first-start.txt"
           test -f "$RUNNER_TEMP/home/.myclaw/config.toml"
           HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/myclaw-clean/bin/myclaw" config \
             > "$RUNNER_TEMP/myclaw-config.txt"

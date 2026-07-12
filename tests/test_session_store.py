@@ -193,11 +193,7 @@ async def test_same_runtime_concurrent_session_writes_preserve_every_record_and_
     await asyncio.gather(*(store.append_message(metadata.id, message) for message in assistants))
 
     persisted = await store.load(metadata.id)
-    assert persisted.messages[0] == user_message
-    assert {message.id for message in persisted.messages[1:]} == {
-        message.id for message in assistants
-    }
-    assert len(persisted.messages) == 13
+    assert persisted.messages == (user_message, *assistants)
     assert persisted.metadata.cumulative_usage == CumulativeUsage(
         model_calls=12,
         input_tokens=78,

@@ -20,7 +20,7 @@ Evidence is separated deliberately:
 | Environment | Evidence | Status in this synthesis |
 | --- | --- | --- |
 | Windows | [Windows validation](release/windows-validation.md) | **PASS:** 651 offline tests; Ruff lint/format; strict Mypy; wheel/sdist build; clean-wheel install; Unicode `myclaw`/`myclaw config` and redaction smoke. |
-| POSIX | [POSIX validation](release/posix-validation.md) | **PENDING AUTHORITATIVE RUN:** local WSL registration points to a missing filesystem; the permanent `ubuntu-latest` workflow is the accepted authority. |
+| POSIX | [POSIX validation](release/posix-validation.md) | **PASS:** authoritative `ubuntu-latest` run [29211127742](https://github.com/Totoro-debug/MyClaw/actions/runs/29211127742) at SHA `10b92e68eb64ffc6b23d1cda099f8095ea1135ac`; 644 offline tests passed with 8 expected Windows-only skips, the focused POSIX process suite passed 74 with 3 Windows-only skips, and Ruff, Mypy, build, clean-wheel install, Unicode CLI, and import gates passed. |
 
 The security/fault baseline immediately before B18 is recorded in
 [Security and Fault Review](security-fault-review.md): 651 tests passed on the
@@ -109,7 +109,7 @@ merge or omit the requirement.
 | RT-S03 | Empty REPL does not persist a Session. | [test_repl.py](../tests/test_repl.py). |
 | RT-S04 | `/resume` lists only current-Workspace Sessions and switches correctly. | [test_session_resume.py](../tests/test_session_resume.py). |
 | RT-S05 | Ordinary messages append as one line; metadata rewrites atomically. | [test_session_store.py](../tests/test_session_store.py), [test_atomic_files.py](../tests/test_atomic_files.py). |
-| RT-S06 | Same-Runtime writes to one Session are serialized. | **PASS:** `test_same_runtime_concurrent_session_writes_preserve_every_record_and_usage` in [test_session_store.py](../tests/test_session_store.py) races 12 assistant appends after one user record, then proves all 13 unique records and exact cumulative usage reload without loss or duplication. |
+| RT-S06 | Same-Runtime writes to one Session are serialized. | **PASS:** `test_same_runtime_concurrent_session_writes_preserve_every_record_and_usage` in [test_session_store.py](../tests/test_session_store.py) submits 12 concurrent assistant appends after one user record, then proves all 13 records reload in submission order without loss or duplication and with exact cumulative usage. |
 | RT-S07 | Title generation is asynchronous, has fallback, counts usage, and shares the Session write lock. | [test_session_title.py](../tests/test_session_title.py), [test_runtime_session_title.py](../tests/test_runtime_session_title.py). |
 | RT-S08 | Completed stream, interrupted partial, model failure, and Tool failure persistence rules. | [test_conversation.py](../tests/test_conversation.py), [test_repl.py](../tests/test_repl.py), [test_interrupted_tool_repair.py](../tests/test_interrupted_tool_repair.py), [test_security_fault_injection.py](../tests/test_security_fault_injection.py). |
 | RT-T01 | File defaults, internal-file write protection, and out-of-scope denial. | [test_readonly_tool_loop.py](../tests/test_readonly_tool_loop.py), [test_workspace_write_tools.py](../tests/test_workspace_write_tools.py), [test_security_filesystem.py](../tests/test_security_filesystem.py). |
@@ -138,7 +138,7 @@ to this report, not automated substitutes.
 | Check | Status | Evidence / reason |
 | --- | --- | --- |
 | Install the built wheel into a clean Windows environment; run `myclaw` and `myclaw config`. | PASS | [Windows validation](release/windows-validation.md) records an isolated venv outside the checkout, `pip check`, first-start config generation, Unicode paths, `myclaw config`, and secret redaction. |
-| Install the built wheel into a clean POSIX environment; run the offline gates and CLI smoke. | BLOCKED | Local WSL registration points to a missing filesystem and no container/VM alternative was available. The authoritative `ubuntu-latest` run is pending in [POSIX validation](release/posix-validation.md). |
+| Install the built wheel into a clean POSIX environment; run the offline gates and CLI smoke. | PASS | [POSIX validation](release/posix-validation.md) records authoritative run `29211127742`: clean-wheel install and `pip check`, checkout-independent import, first-start configuration generation, and `myclaw config` from a Unicode Workspace all passed on Ubuntu 24.04.4/Python 3.12.13. |
 | Start `myclaw` with a dedicated real Provider configuration and complete a streamed multi-turn conversation. | NOT RUN | No dedicated release Provider credential/endpoint was supplied; local potential secrets were not inspected or used. |
 | Verify automatic title generation, exit, restart, `/resume`, picker title/time, and resumed history with a real Provider. | NOT RUN | Depends on the dedicated real-Provider setup above. Automated coverage is listed under US-07 through US-10. |
 | Exercise `/config`, `/status`, `/memory`, and `/dream` interactively against a release Agent Home. | NOT RUN | No dedicated manual release Agent Home/provider session was provisioned. |
@@ -189,10 +189,10 @@ availability, every proxy/DNS environment, or a live POSIX network path.
 
 ## Release Decision Inputs
 
-Issue #36 can be closed only after the coordinator confirms that both platform
-reports satisfy the offline test/lint/format/type/package gates, the wheel clean
-install and CLI smoke criteria are evidenced, this document still contains
-exactly 48 User Story rows and all 35 Required test rows, and every external/manual
-status remains truthful. A real paid Provider PASS is not fabricated; its
-explicit `NOT RUN` status and credential limitation are part of the acceptance
-record.
+The platform closure inputs are satisfied: both linked reports are `PASS` and
+record offline test/lint/format/type/package gates plus clean-wheel installation
+and CLI smoke. The coordinator still owns final issue closure after confirming
+this document contains exactly 48 User Story rows and all 35 Required test rows,
+and that every external/manual status remains truthful. A real paid Provider PASS
+is not fabricated; its explicit `NOT RUN` status and credential limitation are
+part of the acceptance record.

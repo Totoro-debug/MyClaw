@@ -1,6 +1,6 @@
 # POSIX Validation
 
-Status: **PENDING AUTHORITATIVE RUN**
+Status: **PASS**
 
 The authoritative POSIX result is produced by the repository's permanent
 [release validation workflow](../../.github/workflows/release-validation.yml) on
@@ -12,28 +12,28 @@ an unavailable WSL registration is not accepted as POSIX execution evidence.
 | Field | Evidence |
 | --- | --- |
 | Branch | `codex/b18-posix-validation` |
-| Commit SHA | PENDING |
-| Workflow run | PENDING |
-| Runner image | PENDING from Actions log |
-| Distribution | PENDING from `/etc/os-release` |
-| Kernel | PENDING from `uname -a` |
-| Python | PENDING from `python --version` |
-| pip | PENDING from `python -m pip --version` |
+| Commit SHA | `10b92e68eb64ffc6b23d1cda099f8095ea1135ac` |
+| Workflow run | [29211127742](https://github.com/Totoro-debug/MyClaw/actions/runs/29211127742), job [86698888449](https://github.com/Totoro-debug/MyClaw/actions/runs/29211127742/job/86698888449), `success` in 1m27s |
+| Runner image | GitHub-hosted `ubuntu-24.04`, image release `20260705.232` |
+| Distribution | Ubuntu 24.04.4 LTS (Noble Numbat) |
+| Kernel | Linux `6.17.0-1018-azure`, x86_64 |
+| Python | CPython `3.12.13` |
+| pip | `26.1.2` for Python 3.12 |
 
 ## Required Gates
 
 | Gate | Command / public seam | Required result | Current result |
 | --- | --- | --- | --- |
-| Offline tests | `python -m pytest -q` | All non-platform tests pass; no external Provider or network call | PENDING |
-| POSIX process behavior | `python -m pytest -q tests/test_shell_process.py tests/test_web_search.py tests/test_runtime_shutdown.py tests/test_security_shell.py` | Real Shell process, process-group descendant cleanup, timeout, cancellation, WebSearch subprocess ownership, and Runtime shutdown tests pass | PENDING |
-| Lint | `python -m ruff check src tests` | Pass | PENDING |
-| Format | `python -m ruff format --check src tests` | Pass | PENDING |
-| Strict types | `python -m mypy src tests` | Pass under the repository's strict configuration | PENDING |
-| Package | `python -m build` | sdist and wheel build successfully | PENDING |
-| Clean wheel install | Create a fresh venv and install `dist/*.whl` | Install succeeds without importing from the checkout | PENDING |
-| CLI first start | Run installed `myclaw` with an empty temporary `HOME` | Nonzero configuration-gate exit and default `~/.myclaw/config.toml` creation | PENDING |
-| CLI config | Run installed `myclaw config` from `workspace-验收` | Exit zero and rendered output contains `[runtime]` | PENDING |
-| Wheel import | Import from the clean venv outside the checkout | Prints `WHEEL_IMPORT_OK 0.1.0` | PENDING |
+| Offline tests | `python -m pytest -q -ra` | All non-platform tests pass; no external Provider or network call | PASS: `644 passed, 8 skipped in 24.19s` |
+| POSIX process behavior | `python -m pytest -q -ra tests/test_shell_process.py tests/test_web_search.py tests/test_runtime_shutdown.py tests/test_security_shell.py` | Real Shell process, process-group descendant cleanup, timeout, cancellation, WebSearch subprocess ownership, and Runtime shutdown tests pass | PASS: `74 passed, 3 skipped in 1.85s` |
+| Lint | `python -m ruff check src tests` | Pass | PASS: `All checks passed!` |
+| Format | `python -m ruff format --check src tests` | Pass | PASS: `111 files already formatted` |
+| Strict types | `python -m mypy src tests` | Pass under the repository's strict configuration | PASS: `Success: no issues found in 111 source files` |
+| Package | `python -m build` | sdist and wheel build successfully | PASS: built `myclaw-0.1.0.tar.gz` and `myclaw-0.1.0-py3-none-any.whl` |
+| Clean wheel install | Create a fresh venv, install `dist/*.whl`, and run `pip check` | Install succeeds without importing from the checkout and dependencies are consistent | PASS: wheel and dependencies installed; `No broken requirements found.` |
+| CLI first start | Run installed `myclaw` with an empty temporary `HOME` | Nonzero configuration-gate exit and default `~/.myclaw/config.toml` creation | PASS: both shell assertions succeeded |
+| CLI config | Run installed `myclaw config` from `workspace-验收` | Exit zero and rendered output contains `[runtime]` | PASS: command and exact grep assertion succeeded |
+| Wheel import | Import from the clean venv outside the checkout | Prints `WHEEL_IMPORT_OK 0.1.0` | PASS: exact output observed |
 
 Dependency bootstrap and clean-wheel dependency installation may use the package
 index. The pytest commands themselves are the offline gates: their model, HTTP/DNS,
@@ -51,11 +51,13 @@ are seven statically Windows-only cases plus the Windows junction-only Memory te
 - Windows `NUL` device-name behavior: 1.
 - Windows directory-junction-only Memory case: 1.
 
-Expected full-suite total: **8 skipped**. POSIX symlink, hard-link, real Shell,
-process-group descendant, timeout, and cancellation tests must not be counted as
-skipped. The focused process command is expected to skip only its three explicitly
-Windows-only cases; a Windows-only skip is recorded as coverage separation, never as
-evidence that the corresponding POSIX behavior passed.
+Expected and observed full-suite total: **8 skipped**. The raw log listed exactly the
+eight cases above. POSIX symlink, hard-link, real Shell, process-group descendant,
+timeout, and cancellation tests were not counted as skipped. The focused process
+command skipped only its three explicitly Windows-only cases and passed its other 74
+tests; this proves the real POSIX Shell descendant, timeout, and cancellation nodes
+executed. A Windows-only skip remains coverage separation, never evidence that the
+corresponding POSIX behavior passed.
 
 ## Local Host Diagnosis
 
@@ -92,9 +94,13 @@ Ubuntu runner is therefore the sole POSIX authority for this release candidate.
 - The clean-wheel smoke proves packaging, import, first-start gating, configuration
   inspection, and a Unicode Workspace path. It does not enter a paid Provider-backed
   conversation.
+- The only Actions annotation was the runner's Node.js 20 deprecation notice for
+  `actions/checkout@v4` and `actions/setup-python@v5`; the runner forced those actions
+  to Node.js 24. It did not affect checkout, Python setup, or any project gate.
 
 ## Final Decision
 
-PENDING. This report becomes `PASS` only after the workflow run URL and exact commit
-SHA are recorded above and every required gate and skip count is confirmed from the
-Actions log.
+**PASS.** Run `29211127742` checked out the exact recorded SHA, every required step
+completed successfully, the full and focused skip lists matched the platform policy,
+and the clean-wheel/Unicode CLI assertions passed. This is the authoritative POSIX
+evidence for the B18 release candidate.
