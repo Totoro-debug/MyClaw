@@ -42,6 +42,7 @@ from myclaw.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_
 from myclaw.session_resume import SwitchableConversationPort
 from myclaw.session_store import JsonlSessionStore
 from myclaw.tool_gateway import ToolGateway
+from myclaw.web_search import DuckDuckGoSearchBoundary, WebSearchBoundary
 from myclaw.workspace import Workspace
 
 
@@ -104,6 +105,7 @@ class _DeferredConversationPort:
         title_prompt: str,
         tool_gateway: ToolGateway,
         history_preparer: Callable[[ConversationSession], Awaitable[ConversationSession]],
+        before_submit: Callable[[], Awaitable[None]],
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -115,11 +117,13 @@ class _DeferredConversationPort:
         self._title_prompt = title_prompt
         self._tool_gateway = tool_gateway
         self._history_preparer = history_preparer
+        self._before_submit = before_submit
         self._delegate: ConversationPort | None = None
 
     async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
         if not text.strip():
             return
+        await self._before_submit()
         delegate = self._delegate
         if delegate is None:
             delegate = StreamingConversationPort(
@@ -159,6 +163,7 @@ def prepare_repl_runtime(
     retry_clock: RetryClock | None = None,
     retry_jitter: Jitter | None = None,
     monotonic_now: Callable[[], float] = monotonic,
+    web_search: WebSearchBoundary | None = None,
 ) -> PreparedReplRuntime:
     """Prepare a Session and defer provider construction until conversational input."""
     configuration.resolve_route("default")
@@ -185,13 +190,20 @@ def prepare_repl_runtime(
         clock=retry_clock if retry_clock is not None else AsyncioRetryClock(),
         jitter=retry_jitter,
     )
+    configured_web_search = (
+        (web_search if web_search is not None else DuckDuckGoSearchBoundary())
+        if configuration.tools.web.enabled
+        else None
+    )
     tool_gateway = ToolGateway(
         context=ToolExecutionContext(
             lane="foreground",
             workspace=Path(workspace_identity.path),
             agent_home=agent_home.path,
             session_id=metadata.id,
-        )
+        ),
+        max_tool_result_chars=configuration.runtime.max_tool_result_chars,
+        web_search=configured_web_search,
     )
     system_prompt = chat_system_prompt(
         workspace=workspace_identity.path,
@@ -202,10 +214,11 @@ def prepare_repl_runtime(
         ),
     )
     resolved_memory = configuration.resolve_route("memory")
+    summaries = JsonlSummaryStore(agent_home)
     summary_manager = ConversationSummaryManager(
         provider=router,
         sessions=sessions,
-        summaries=JsonlSummaryStore(agent_home),
+        summaries=summaries,
         settings=SummaryModelSettings(
             model=resolved_memory.route.model,
             max_output=resolved_memory.route.max_output,
@@ -229,7 +242,9 @@ def prepare_repl_runtime(
                 workspace=Path(workspace_identity.path),
                 agent_home=agent_home.path,
                 session_id=session_id,
-            )
+            ),
+            max_tool_result_chars=configuration.runtime.max_tool_result_chars,
+            web_search=configured_web_search,
         )
         return _DeferredConversationPort(
             provider=router,
@@ -242,6 +257,7 @@ def prepare_repl_runtime(
             title_prompt=session_title_prompt(),
             tool_gateway=session_tool_gateway,
             history_preparer=summary_manager.prepare,
+            before_submit=summary_manager.recover_pending,
         )
 
     conversation = SwitchableConversationPort(

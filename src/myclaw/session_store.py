@@ -212,6 +212,38 @@ class JsonlSessionStore:
             )
             self._prepared[session_id] = updated
 
+    async def recover_consolidation_cursor(
+        self,
+        session_id: str,
+        *,
+        old_cursor: int,
+        new_cursor: int,
+    ) -> None:
+        """Idempotently advance a journaled Session cursor anywhere in Agent Home."""
+        require_session_id(session_id)
+        matches = list((self.agent_home.path / "sessions").glob(f"*/{session_id}.jsonl"))
+        if len(matches) != 1:
+            raise ValueError("journal session must resolve to exactly one Session file")
+        path = _io_path(matches[0])
+        async with self._lock_for(session_id):
+            records, complete_content = _read_recoverable_records(path)
+            metadata = _parse_metadata(records[0])
+            if metadata.id != session_id:
+                raise ValueError("Session metadata ID does not match its file name")
+            if metadata.consolidation_cursor == new_cursor:
+                return
+            if metadata.consolidation_cursor != old_cursor:
+                raise ValueError("session consolidation cursor conflicts with journal")
+            updated = replace(metadata, consolidation_cursor=new_cursor)
+            messages = tuple(_parse_message(record) for record in records[1:])
+            ConversationSession(metadata=updated, messages=messages)
+            first_line_end = complete_content.index(b"\n") + 1
+            self._replace_bytes(
+                path,
+                updated.to_json_line().encode("utf-8") + complete_content[first_line_end:],
+            )
+            self._prepared[session_id] = updated
+
     async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]:
         return (await self.scan_for_workspace(workspace)).sessions
 

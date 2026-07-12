@@ -1,7 +1,7 @@
 """Conversation Port implementation for the first successful streaming turn."""
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -21,6 +21,7 @@ from myclaw.contracts import (
     ModelProvider,
     ModelRequest,
     ModelUsage,
+    PermissionRequestedPayload,
     ReasoningEffort,
     SessionError,
     SessionMessage,
@@ -90,8 +91,9 @@ class StreamingConversationPort:
         self._foreground_active = False
         self._active_task: asyncio.Task[object] | None = None
         self._cancel_requested = False
+        self._permission_waits: dict[UUID, asyncio.Future[bool]] = {}
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def submit(self, text: str) -> AsyncGenerator[AgentEvent, None]:
         if not text.strip():
             return
         if self._foreground_active:
@@ -99,15 +101,19 @@ class StreamingConversationPort:
         self._foreground_active = True
         self._active_task = asyncio.current_task()
         self._cancel_requested = False
+        turn = self._submit_turn(text)
         try:
-            async for event in self._submit_turn(text):
+            async for event in turn:
                 yield event
         finally:
-            self._active_task = None
-            self._cancel_requested = False
-            self._foreground_active = False
+            try:
+                await turn.aclose()
+            finally:
+                self._active_task = None
+                self._cancel_requested = False
+                self._foreground_active = False
 
-    async def _submit_turn(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def _submit_turn(self, text: str) -> AsyncGenerator[AgentEvent, None]:
         turn_id = self._new_uuid()
         yield self._event(turn_id, "turn_started", TurnStartedPayload())
 
@@ -174,7 +180,34 @@ class StreamingConversationPort:
                                         summary=_tool_activity_summary("Running", tool_call.name),
                                     ),
                                 )
-                                result = await self._tool_gateway.execute(tool_call)
+                                approved: bool | None = None
+                                permission = self._tool_gateway.permission_request(tool_call)
+                                if permission is not None:
+                                    request_id = self._new_uuid()
+                                    wait = asyncio.get_running_loop().create_future()
+                                    self._permission_waits[request_id] = wait
+                                    try:
+                                        yield self._event(
+                                            turn_id,
+                                            "permission_requested",
+                                            PermissionRequestedPayload(
+                                                request_id=request_id,
+                                                tool_call_id=tool_call.id,
+                                                tool_name=tool_call.name,
+                                                action=permission.action,
+                                                resource=permission.resource,
+                                                risk_summary=permission.risk_summary,
+                                            ),
+                                        )
+                                        approved = await wait
+                                    finally:
+                                        self._permission_waits.pop(request_id, None)
+                                        if not wait.done():
+                                            wait.cancel()
+                                result = await self._tool_gateway.execute(
+                                    tool_call,
+                                    approved=approved,
+                                )
                                 await self._sessions.append_message(
                                     self._session_id,
                                     ToolSessionMessage(
@@ -349,9 +382,17 @@ class StreamingConversationPort:
         )
 
     async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
-        raise NotImplementedError
+        if not isinstance(approved, bool):
+            raise TypeError("approved must be a boolean")
+        wait = self._permission_waits.get(request_id)
+        if wait is None or wait.done():
+            raise RuntimeError("Permission request is not pending")
+        wait.set_result(approved)
 
     async def cancel_active_turn(self) -> None:
+        for wait in tuple(self._permission_waits.values()):
+            if not wait.done():
+                wait.cancel()
         task = self._active_task
         if task is None or task.done():
             return

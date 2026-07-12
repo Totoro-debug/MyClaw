@@ -45,7 +45,7 @@
 - Session ID 使用 `<local_timestamp>_<uuid4>`：`YYYYMMDD-HHMMSS-ffffff_550e8400-e29b-41d4-a716-446655440000`。
 - Scheduled Work ID、turn ID、message ID 和 permission request ID 使用 UUID4。
 - provider 返回的 tool call ID 原样保存在 message 中，不在业务层重新命名。
-- Tool Artifact 文件名使用 tool call ID 的 UTF-8 percent-encoding，`safe="-_."`，避免 `/`、`\\`、`:` 等字符越过目录边界；逻辑路径仍对应原 tool call ID。
+- Tool Artifact 文件名使用 tool call ID 的 UTF-8 percent-encoding，通常为 `safe="-_."`；Windows 保留 basename（`CON`、`PRN`、`AUX`、`NUL`、`COM1`-`COM9`、`LPT1`-`LPT9`）全量编码，避免保留名以及 `/`、`\\`、`:` 等字符破坏路径；逻辑路径仍对应原 tool call ID。
 
 ## 2. Phase 0 已接受决策表
 

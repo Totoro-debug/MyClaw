@@ -6,6 +6,7 @@ from myclaw.contracts import (
     ErrorCode,
     ErrorInfo,
     ModelToolCall,
+    PermissionDecision,
     Tool,
     ToolDefinition,
     ToolExecutionContext,
@@ -18,6 +19,13 @@ from myclaw.file_tools import (
     ReadFileTool,
     SearchFilesTool,
 )
+from myclaw.permission_policy import PermissionAssessment, assess_permission
+from myclaw.tool_artifacts import (
+    ArtifactWriteError,
+    ArtifactWriter,
+    ToolArtifactExternalizer,
+)
+from myclaw.web_search import WebSearchBoundary, WebSearchTool
 
 
 class ToolGateway:
@@ -28,17 +36,49 @@ class ToolGateway:
         *,
         context: ToolExecutionContext,
         tools: tuple[Tool, ...] | None = None,
+        web_search: WebSearchBoundary | None = None,
+        max_tool_result_chars: int = 50_000,
+        artifact_writer: ArtifactWriter | None = None,
     ) -> None:
         self._context = context
-        catalog = (ReadFileTool(), ListFilesTool(), SearchFilesTool()) if tools is None else tools
+        catalog: tuple[Tool, ...]
+        if tools is None:
+            catalog = (ReadFileTool(), ListFilesTool(), SearchFilesTool())
+            if web_search is not None:
+                catalog += (WebSearchTool(web_search),)
+        else:
+            catalog = tools
         self._tools = {tool.definition.name: tool for tool in catalog}
         self._definitions = tuple(tool.definition for tool in catalog)
+        self._artifacts = ToolArtifactExternalizer(
+            context=context,
+            max_tool_result_chars=max_tool_result_chars,
+            write_text=artifact_writer,
+        )
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
         return self._definitions
 
-    async def execute(self, tool_call: ModelToolCall) -> ToolResult:
+    def permission_request(self, tool_call: ModelToolCall) -> PermissionAssessment | None:
+        """Return an already validated foreground confirmation request, if required."""
+        tool = self._tools.get(tool_call.name)
+        if tool is None or not Draft202012Validator(
+            tool.definition.input_schema,
+            format_checker=FormatChecker(),
+        ).is_valid(tool_call.arguments):
+            return None
+        assessment = assess_permission(tool_call, self._context)
+        if assessment.decision is PermissionDecision.ASK and self._context.lane == "foreground":
+            return assessment
+        return None
+
+    async def execute(
+        self,
+        tool_call: ModelToolCall,
+        *,
+        approved: bool | None = None,
+    ) -> ToolResult:
         tool = self._tools.get(tool_call.name)
         if tool is None:
             return _error_result(
@@ -55,6 +95,24 @@ class ToolGateway:
                 code="tool_invalid_arguments",
                 message=f"Invalid arguments for {tool_call.name}.",
             )
+        assessment = assess_permission(tool_call, self._context)
+        if assessment.decision is PermissionDecision.DENY:
+            return _error_result(
+                tool_call,
+                code="tool_denied",
+                message="The requested operation is not permitted.",
+            )
+        if assessment.decision is PermissionDecision.ASK:
+            if self._context.lane != "foreground":
+                return _refused_result(
+                    tool_call,
+                    message="Permission confirmation is unavailable in background work.",
+                )
+            if approved is not True:
+                return _refused_result(
+                    tool_call,
+                    message="Permission denied by user.",
+                )
         try:
             content = await tool.execute(tool_call.arguments, self._context)
         except FileToolAccessDenied:
@@ -75,7 +133,7 @@ class ToolGateway:
                 code="tool_failed",
                 message=f"{tool_call.name} could not complete the request.",
             )
-        return ToolResult(
+        result = ToolResult(
             tool_call_id=tool_call.id,
             name=tool_call.name,
             status="success",
@@ -83,6 +141,14 @@ class ToolGateway:
             error=None,
             artifact=None,
         )
+        try:
+            return self._artifacts.externalize(result)
+        except ArtifactWriteError:
+            return _error_result(
+                tool_call,
+                code="tool_failed",
+                message=f"{tool_call.name} result could not be stored.",
+            )
 
 
 def _error_result(
@@ -98,5 +164,16 @@ def _error_result(
         status="error",
         content=message,
         error=error,
+        artifact=None,
+    )
+
+
+def _refused_result(tool_call: ModelToolCall, *, message: str) -> ToolResult:
+    return ToolResult(
+        tool_call_id=tool_call.id,
+        name=tool_call.name,
+        status="refused",
+        content=message,
+        error=ErrorInfo(code="tool_refused", message=message),
         artifact=None,
     )

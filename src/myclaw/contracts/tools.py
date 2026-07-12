@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 from urllib.parse import quote, unquote
 
 from myclaw.contracts.common import require_nonnegative_int, require_session_id
@@ -12,6 +12,20 @@ from myclaw.contracts.json_types import JsonObject
 
 type ToolResultStatus = Literal["success", "error", "refused"]
 type ToolExecutionLane = Literal["foreground", "scheduled_work", "memory_task"]
+
+_WINDOWS_RESERVED_BASENAMES: Final = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+
+
+def encode_artifact_tool_call_id(tool_call_id: str) -> str:
+    """Return the canonical cross-platform filename component for a Tool call ID."""
+    basename = tool_call_id.split(".", maxsplit=1)[0].upper()
+    if basename in _WINDOWS_RESERVED_BASENAMES:
+        return "".join(f"%{byte:02X}" for byte in tool_call_id.encode("utf-8"))
+    return quote(tool_call_id, safe="-_.", encoding="utf-8", errors="strict")
 
 
 class PermissionDecision(StrEnum):
@@ -65,7 +79,7 @@ class ArtifactReference:
         except UnicodeDecodeError as exc:
             msg = "artifact filename must use valid UTF-8 percent-encoding"
             raise ValueError(msg) from exc
-        if quote(tool_call_id, safe="-_.") != encoded_tool_call_id:
+        if encode_artifact_tool_call_id(tool_call_id) != encoded_tool_call_id:
             msg = "artifact filename must use canonical UTF-8 percent-encoding"
             raise ValueError(msg)
         require_nonnegative_int(self.total_chars, field="total_chars")

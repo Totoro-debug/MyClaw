@@ -114,3 +114,19 @@ def test_tool_records_reject_values_outside_the_normalized_contract() -> None:
 def test_artifact_reference_rejects_paths_outside_the_exact_persisted_shape(path: str) -> None:
     with pytest.raises(ValueError):
         ArtifactReference(path=path, total_chars=10, preview_chars=10)
+
+
+def test_artifact_reference_requires_safe_canonical_windows_device_encoding() -> None:
+    reference = ArtifactReference(
+        path=f"artifacts/{SESSION_ID}/%43%4F%4E.txt",
+        total_chars=10,
+        preview_chars=10,
+    )
+
+    assert reference.path.endswith("/%43%4F%4E.txt")
+    with pytest.raises(ValueError, match="canonical"):
+        ArtifactReference(
+            path=f"artifacts/{SESSION_ID}/CON.txt",
+            total_chars=10,
+            preview_chars=10,
+        )
