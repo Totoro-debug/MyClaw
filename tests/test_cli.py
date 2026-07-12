@@ -1,5 +1,39 @@
+import os
 import shutil
 import subprocess
+from pathlib import Path
+
+import pytest
+
+from tests.test_config import (
+    EXPECTED_DEFAULT_CONFIG,
+    EXPECTED_REDACTED_CONFIG,
+    EXPECTED_REDACTED_MALFORMED_CONFIG,
+    MALFORMED_CONFIG,
+    REDACTION_CONFIG,
+    VALID_CONFIG,
+)
+
+
+def run_installed_myclaw(agent_home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    executable = shutil.which("myclaw")
+    assert executable is not None
+    environment = os.environ.copy()
+    environment["HOME"] = str(agent_home.parent)
+    environment["USERPROFILE"] = str(agent_home.parent)
+    return subprocess.run(
+        [executable, *arguments],
+        capture_output=True,
+        check=False,
+        cwd=agent_home.parent,
+        env=environment,
+        text=True,
+    )
+
+
+def assert_plaintext_absent(output: str, *plaintext_values: str) -> None:
+    if any(value in output for value in plaintext_values):
+        pytest.fail("CLI output leaked a plaintext provider API key", pytrace=False)
 
 
 def test_installed_myclaw_console_entry_starts() -> None:
@@ -15,3 +49,126 @@ def test_installed_myclaw_console_entry_starts() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "MyClaw Personal Agent" in result.stdout
+
+
+def test_installed_myclaw_generates_missing_configuration_and_stops(agent_home: Path) -> None:
+    result = run_installed_myclaw(agent_home)
+
+    assert result.returncode == 2
+    assert (agent_home / "config.toml").read_text(encoding="utf-8") == EXPECTED_DEFAULT_CONFIG
+    assert "config_missing" in result.stdout
+    assert str(agent_home / "config.toml") in result.stdout
+    assert "edit" in result.stdout.lower()
+    assert "configuration gate passed" not in result.stdout
+
+
+def test_installed_config_command_generates_and_displays_missing_configuration(
+    agent_home: Path,
+) -> None:
+    result = run_installed_myclaw(agent_home, "config")
+
+    assert result.returncode == 0, result.stderr
+    assert f"Path: {agent_home / 'config.toml'}" in result.stdout
+    assert EXPECTED_DEFAULT_CONFIG in result.stdout
+    assert "configuration gate passed" not in result.stdout
+
+
+def test_installed_config_command_redacts_valid_configuration(agent_home: Path) -> None:
+    agent_home.mkdir(parents=True)
+    (agent_home / "config.toml").write_text(REDACTION_CONFIG, encoding="utf-8")
+
+    result = run_installed_myclaw(agent_home, "config")
+
+    assert result.returncode == 0, result.stderr
+    assert EXPECTED_REDACTED_CONFIG in result.stdout
+    assert f"Path: {agent_home / 'config.toml'}" in result.stdout
+    assert_plaintext_absent(result.stdout + result.stderr, "plaintext-primary-key")
+
+
+def test_installed_config_command_shows_safe_malformed_configuration(
+    agent_home: Path,
+) -> None:
+    agent_home.mkdir(parents=True)
+    (agent_home / "config.toml").write_text(MALFORMED_CONFIG, encoding="utf-8")
+
+    result = run_installed_myclaw(agent_home, "config")
+
+    assert result.returncode == 2
+    assert "config_parse_error" in result.stdout
+    assert f"Path: {agent_home / 'config.toml'}" in result.stdout
+    assert EXPECTED_REDACTED_MALFORMED_CONFIG in result.stdout
+    assert_plaintext_absent(
+        result.stdout + result.stderr,
+        "first-plaintext-key",
+        "second-plaintext-key",
+    )
+
+
+def test_installed_config_command_keeps_schema_invalid_content_inspectable(
+    agent_home: Path,
+) -> None:
+    agent_home.mkdir(parents=True)
+    content = REDACTION_CONFIG.replace(
+        "max_tool_result_chars = 50000",
+        "max_tool_result_chars = 50000\nmisspelled_setting = true",
+    )
+    (agent_home / "config.toml").write_text(content, encoding="utf-8")
+
+    result = run_installed_myclaw(agent_home, "config")
+
+    assert result.returncode == 2
+    assert "config_invalid" in result.stdout
+    assert "runtime.misspelled_setting" in result.stdout
+    assert "misspelled_setting = true" in result.stdout
+    assert_plaintext_absent(result.stdout + result.stderr, "plaintext-primary-key")
+
+
+def test_installed_myclaw_passes_valid_configuration_gate(agent_home: Path) -> None:
+    agent_home.mkdir(parents=True)
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+
+    result = run_installed_myclaw(agent_home)
+
+    assert result.returncode == 0, result.stderr
+    assert "configuration gate passed" in result.stdout
+    assert_plaintext_absent(result.stdout + result.stderr, "sk-ant-secret")
+
+
+def test_installed_myclaw_stops_on_parse_schema_and_default_failures(agent_home: Path) -> None:
+    agent_home.mkdir(parents=True)
+    config_path = agent_home / "config.toml"
+
+    config_path.write_text(MALFORMED_CONFIG, encoding="utf-8")
+    parse_result = run_installed_myclaw(agent_home)
+
+    schema_content = REDACTION_CONFIG.replace(
+        "max_tool_result_chars = 50000",
+        "max_tool_result_chars = 50000\nmisspelled_setting = true",
+    )
+    config_path.write_text(schema_content, encoding="utf-8")
+    schema_result = run_installed_myclaw(agent_home)
+
+    config_path.write_text(EXPECTED_DEFAULT_CONFIG, encoding="utf-8")
+    default_result = run_installed_myclaw(agent_home)
+
+    assert (parse_result.returncode, schema_result.returncode, default_result.returncode) == (
+        2,
+        2,
+        2,
+    )
+    assert "config_parse_error" in parse_result.stdout
+    assert "config_invalid" in schema_result.stdout
+    assert "route_unavailable" in default_result.stdout
+    assert all(
+        "configuration gate passed" not in result.stdout
+        for result in (parse_result, schema_result, default_result)
+    )
+    combined_output = "".join(
+        result.stdout + result.stderr for result in (parse_result, schema_result, default_result)
+    )
+    assert_plaintext_absent(
+        combined_output,
+        "first-plaintext-key",
+        "second-plaintext-key",
+        "plaintext-primary-key",
+    )

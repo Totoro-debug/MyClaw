@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "croniter>=6,<7",
     "rich>=13.7,<15",
+    "tomlkit>=0.13,<0.14",
     "typer>=0.12,<1",
 ]
 

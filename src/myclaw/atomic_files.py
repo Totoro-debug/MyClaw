@@ -22,6 +22,43 @@ def atomic_replace_text(target: Path, content: str) -> None:
     atomic_replace_bytes(target, content.encode("utf-8"))
 
 
+def atomic_create_text(target: Path, content: str) -> bool:
+    """Atomically create *target* without replacing an existing file."""
+    return atomic_create_bytes(target, content.encode("utf-8"))
+
+
+def atomic_create_bytes(target: Path, content: bytes) -> bool:
+    """Atomically create *target* with complete content, or preserve its current value."""
+    target = Path(target)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+
+    try:
+        stream = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with stream:
+            written = stream.write(content)
+            if written != len(content):
+                raise OSError("atomic creation did not write the complete content")
+            stream.flush()
+            _fsync_file(stream.fileno())
+
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            return False
+        _fsync_parent_best_effort(target.parent)
+        return True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
 def atomic_replace_bytes(target: Path, content: bytes) -> None:
     """Replace *target* atomically with complete byte content."""
     target = Path(target)
