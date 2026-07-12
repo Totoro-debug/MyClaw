@@ -60,14 +60,14 @@ Status legend: `TODO` -> `IN_PROGRESS` -> `AGENT_DONE` -> `VERIFIED` -> `CLOSED`
 | #3 | T02 Runtime Contracts | #2 | B02 | frozen schemas and Port/Store/Provider/Tool protocols | b02_issue_3 | CLOSED | f32893f |
 | #4 | T03 Agent Home and atomic writes | #3 | B03 | Agent Home initializer, atomic file API, Workspace identity | b03_issue_4 | CLOSED | 2865d46 |
 | #5 | T04 Configuration | #4 | B04 | `myclaw`, `myclaw config`, validated/redacted config API | b04_issue_5 | CLOSED | ef73b6a |
-| #6 | T05 First streaming turn | #5 | B05 | Conversation Port through REPL and Session Store reload | b05_issue_6 | VERIFIED | pending batch commit |
+| #6 | T05 First streaming turn | #5 | B05 | Conversation Port through REPL and Session Store reload | b05_issue_6 | CLOSED | e18725d |
 | #7 | T06 Multi-turn Short-term Memory | #6 | B06 | one REPL session across Conversation Port turns | - | TODO | - |
 | #8 | T07 Model route fallback | #7 | B07 | Model Router route resolution and startup validation | - | TODO | - |
 | #9 | T08 Retry budget | #8 | B08 | Model Router with fake Provider and fake Clock | - | TODO | - |
 | #10 | T09 Failed/cancelled turns | #9 | B09 | Conversation Port terminal events and reloadable Session Store | - | TODO | - |
 | #11 | T10 Session metadata/status | #8 | B08 | Session Store metadata and Management Port `/status` | - | TODO | - |
 | #12 | T11 Async session title | #9, #11 | B09 | Conversation Port latency/history plus Session Store metadata | - | TODO | - |
-| #13 | T12 Config/memory views | #5 | B05 | Management Port `/config` and `/memory` | b05_issue_13 | VERIFIED | pending batch commit |
+| #13 | T12 Config/memory views | #5 | B05 | Management Port `/config` and `/memory` | b05_issue_13 | CLOSED | e18725d |
 | #14 | T13 Resume session | #12 | B10 | Management Port `/resume` and Session Store recovery | - | TODO | - |
 | #15 | T14 Read-only file tool loop | #9 | B09 | Tool Gateway through full Conversation Port model loop | - | TODO | - |
 | #16 | T15 Tool result/failure semantics | #15 | B10 | Tool Gateway normalization and Agent Events | - | TODO | - |
@@ -114,7 +114,7 @@ Issue #36 additionally requires Windows and POSIX evidence, clean-wheel installa
 | B02 | #3 | 66 pytest + Ruff lint/format + strict mypy + sdist/wheel | f32893f | #3 commented and closed | CLOSED |
 | B03 | #4 | 77 pytest + Ruff lint/format + strict mypy + sdist/wheel | 2865d46 | #4 commented and closed | CLOSED |
 | B04 | #5 | 141 pytest + Ruff lint/format + strict mypy + sdist/wheel + installed CLI smoke | ef73b6a | #5 commented and closed | CLOSED |
-| B05 | #6, #13 | 169 pytest + Ruff lint/format + strict mypy + sdist/wheel + combined REPL/management integration | pending | pending | VERIFIED |
+| B05 | #6, #13 | 169 pytest + Ruff lint/format + strict mypy + sdist/wheel + combined REPL/management integration | e18725d | #6 and #13 commented and closed | CLOSED |
 | B06 | #7 | - | - | - | TODO |
 | B07 | #8 | - | - | - | TODO |
 | B08 | #9, #11 | - | - | - | TODO |
