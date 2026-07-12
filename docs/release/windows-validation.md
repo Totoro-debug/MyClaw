@@ -10,7 +10,8 @@ GitHub issue #36. The POSIX authority is tracked separately in
 
 | Field | Evidence |
 | --- | --- |
-| Commit SHA | `71cc244845e687458131a5c454411b3ddda41e5d` |
+| Product/package candidate SHA | `71cc244845e687458131a5c454411b3ddda41e5d` |
+| Hardened B18 evidence SHA | `5d90603136a26a656d4007446c6803abdbbc7810` |
 | Operating system | Windows 11 Pro, version `10.0.26200`, build `26200`, 64-bit, x64 |
 | PowerShell | `7.6.3` |
 | Build/test Python | CPython `3.12.13` |
@@ -22,11 +23,18 @@ GitHub issue #36. The POSIX authority is tracked separately in
 No Anthropic or OpenAI API key was present during the validation. Tests and the
 package build did not call a live Provider or public-network service.
 
+The hardened B18 commit adds only CI, documentation, and the RT-S06 regression;
+`src/`, `pyproject.toml`, and the runtime package inputs are unchanged from the
+product/package candidate. An independent reviewer reran the current Windows tree
+at `5d90603`: the full suite passed `652` tests in 48.88s, and Ruff lint/format,
+strict Mypy over 111 files, and `git diff --check` also passed. The clean-wheel
+artifact hashes below continue to identify the unchanged product/package candidate.
+
 ## Windows Gates
 
 | Gate | Command | Result |
 | --- | --- | --- |
-| Full offline test suite | `python -m pytest -q` | PASS: `651 passed in 58.12s` |
+| Full offline test suite | `python -m pytest -q` | PASS: `651 passed in 58.12s` on the package candidate; `652 passed in 48.88s` on hardened B18 after adding RT-S06 |
 | Lint | `python -m ruff check .` | PASS: `All checks passed!` |
 | Format | `python -m ruff format --check .` | PASS: `111 files already formatted` |
 | Strict types | `python -m mypy src tests` | PASS: `Success: no issues found in 111 source files` |

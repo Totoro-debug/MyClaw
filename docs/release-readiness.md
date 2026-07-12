@@ -19,8 +19,8 @@ Evidence is separated deliberately:
 
 | Environment | Evidence | Status in this synthesis |
 | --- | --- | --- |
-| Windows | [Windows validation](release/windows-validation.md) | **PASS:** 651 offline tests; Ruff lint/format; strict Mypy; wheel/sdist build; clean-wheel install; Unicode `myclaw`/`myclaw config` and redaction smoke. |
-| POSIX | [POSIX validation](release/posix-validation.md) | **PASS:** authoritative `ubuntu-latest` run [29211127742](https://github.com/Totoro-debug/MyClaw/actions/runs/29211127742) at SHA `10b92e68eb64ffc6b23d1cda099f8095ea1135ac`; 644 offline tests passed with 8 expected Windows-only skips, the focused POSIX process suite passed 74 with 3 Windows-only skips, and Ruff, Mypy, build, clean-wheel install, Unicode CLI, and import gates passed. |
+| Windows | [Windows validation](release/windows-validation.md) | **PASS:** 652 offline tests on the hardened B18 tree; Ruff lint/format; strict Mypy; wheel/sdist build; clean-wheel install; Unicode `myclaw`/`myclaw config` and redaction smoke. |
+| POSIX | [POSIX validation](release/posix-validation.md) | **PASS:** hardened `ubuntu-latest` run [29211545085](https://github.com/Totoro-debug/MyClaw/actions/runs/29211545085) at SHA `5d90603136a26a656d4007446c6803abdbbc7810`; 644 offline tests passed with 8 expected Windows-only skips, the focused POSIX process suite passed 74 with 3 Windows-only skips, and Ruff, Mypy, build, clean-wheel install, strict first-start/Unicode CLI, and import gates passed. |
 
 The security/fault baseline immediately before B18 is recorded in
 [Security and Fault Review](security-fault-review.md): 651 tests passed on the
@@ -138,8 +138,9 @@ to this report, not automated substitutes.
 | Check | Status | Evidence / reason |
 | --- | --- | --- |
 | Install the built wheel into a clean Windows environment; run `myclaw` and `myclaw config`. | PASS | [Windows validation](release/windows-validation.md) records an isolated venv outside the checkout, `pip check`, first-start config generation, Unicode paths, `myclaw config`, and secret redaction. |
-| Install the built wheel into a clean POSIX environment; run the offline gates and CLI smoke. | PASS | [POSIX validation](release/posix-validation.md) records authoritative run `29211127742`: clean-wheel install and `pip check`, checkout-independent import, first-start configuration generation, and `myclaw config` from a Unicode Workspace all passed on Ubuntu 24.04.4/Python 3.12.13. |
+| Install the built wheel into a clean POSIX environment; run the offline gates and CLI smoke. | PASS | [POSIX validation](release/posix-validation.md) records hardened run `29211545085`: clean-wheel install and `pip check`, checkout-independent import, exact first-start exit/configuration assertions, and `myclaw config` from a Unicode Workspace all passed on Ubuntu 24.04.4/Python 3.12.13. |
 | Start `myclaw` with a dedicated real Provider configuration and complete a streamed multi-turn conversation. | NOT RUN | No dedicated release Provider credential/endpoint was supplied; local potential secrets were not inspected or used. |
+| Drive a long real-Provider conversation past the threshold and inspect automatic consolidation, preserved original messages, and continued context. | NOT RUN | No dedicated real-Provider release session was provisioned. Automated threshold, cutoff, cursor, recovery, and message-preservation evidence is mapped under US-22/US-23 and RT-M01 through RT-M06, but is not presented as manual acceptance. |
 | Verify automatic title generation, exit, restart, `/resume`, picker title/time, and resumed history with a real Provider. | NOT RUN | Depends on the dedicated real-Provider setup above. Automated coverage is listed under US-07 through US-10. |
 | Exercise `/config`, `/status`, `/memory`, and `/dream` interactively against a release Agent Home. | NOT RUN | No dedicated manual release Agent Home/provider session was provisioned. |
 | Approve and refuse Workspace file changes; confirm Agent Home and traversal denial. | NOT RUN | No separate manual destructive-safety Workspace was provisioned. Automated coverage is listed under US-25/US-26 and the [security review](security-fault-review.md). |
@@ -164,6 +165,9 @@ availability, every proxy/DNS environment, or a live POSIX network path.
 
 ## Known Risks
 
+- Provider API keys are stored as plaintext in the user-owned `config.toml`.
+  Management and CLI views redact them, but MyClaw does not provide an encrypted
+  credential store; host account and filesystem access remain the protection boundary.
 - Real Anthropic and OpenAI-compatible API smoke is `NOT RUN`. Adapter contracts,
   routing, retry, streaming, and Tool calls are tested with injected official SDK
   clients and fake Providers, but credentials, remote account policy, model
@@ -179,6 +183,10 @@ availability, every proxy/DNS environment, or a live POSIX network path.
 - Indeterminate unreadable/conflicting publication preserves a Tool Artifact and
   releases rollback ownership rather than risk deleting a durable reference. It
   can conservatively retain an unreferenced artifact.
+- Long-term Memory has no configured size cap, so repeated accepted updates can
+  increase prompt and disk cost until the user edits or replaces the file.
+- Tool Artifacts have no automatic retention or garbage-collection policy. Normal
+  durable results can accumulate on disk and require user-managed cleanup.
 - Live WebSearch depends on a third-party backend, and public network/DNS/proxy
   behavior varies by environment. WebFetch SSRF tests are injected and exhaustive
   at the boundary, while the live smoke intentionally contacted only a public URL.
@@ -189,10 +197,16 @@ availability, every proxy/DNS environment, or a live POSIX network path.
 
 ## Release Decision Inputs
 
-The platform closure inputs are satisfied: both linked reports are `PASS` and
-record offline test/lint/format/type/package gates plus clean-wheel installation
-and CLI smoke. The coordinator still owns final issue closure after confirming
-this document contains exactly 48 User Story rows and all 35 Required test rows,
-and that every external/manual status remains truthful. A real paid Provider PASS
-is not fabricated; its explicit `NOT RUN` status and credential limitation are
-part of the acceptance record.
+**Current decision: BLOCKED on project-owner license selection.** The repository has
+no `LICENSE`/`COPYING` file, `pyproject.toml` declares no license metadata, and the
+built wheel therefore grants no explicit use or redistribution license. Runtime,
+test, platform, and documentation gates cannot decide whether v0.1 should use an
+open-source license or remain proprietary/non-distributed.
+
+The platform closure inputs are satisfied: both linked reports are `PASS` and record
+offline test/lint/format/type/package gates plus clean-wheel installation and CLI
+smoke. Issue #36 can close after the owner-selected license is represented by a
+matching license file and package metadata, this document still contains exactly 48
+User Story rows and all 35 Required test rows, and every external/manual status
+remains truthful. A real paid Provider PASS is not fabricated; its explicit `NOT RUN`
+status and credential limitation are part of the acceptance record.

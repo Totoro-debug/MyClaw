@@ -12,8 +12,8 @@ an unavailable WSL registration is not accepted as POSIX execution evidence.
 | Field | Evidence |
 | --- | --- |
 | Branch | `codex/b18-posix-validation` |
-| Commit SHA | `10b92e68eb64ffc6b23d1cda099f8095ea1135ac` |
-| Workflow run | [29211127742](https://github.com/Totoro-debug/MyClaw/actions/runs/29211127742), job [86698888449](https://github.com/Totoro-debug/MyClaw/actions/runs/29211127742/job/86698888449), `success` in 1m27s |
+| Commit SHA | `5d90603136a26a656d4007446c6803abdbbc7810` |
+| Workflow run | [29211545085](https://github.com/Totoro-debug/MyClaw/actions/runs/29211545085), job [86700011240](https://github.com/Totoro-debug/MyClaw/actions/runs/29211545085/job/86700011240), `success` in 1m24s |
 | Runner image | GitHub-hosted `ubuntu-24.04`, image release `20260705.232` |
 | Distribution | Ubuntu 24.04.4 LTS (Noble Numbat) |
 | Kernel | Linux `6.17.0-1018-azure`, x86_64 |
@@ -24,14 +24,14 @@ an unavailable WSL registration is not accepted as POSIX execution evidence.
 
 | Gate | Command / public seam | Required result | Current result |
 | --- | --- | --- | --- |
-| Offline tests | `python -m pytest -q -ra` | All non-platform tests pass; no external Provider or network call | PASS: `644 passed, 8 skipped in 24.19s` |
-| POSIX process behavior | `python -m pytest -q -ra tests/test_shell_process.py tests/test_web_search.py tests/test_runtime_shutdown.py tests/test_security_shell.py` | Real Shell process, process-group descendant cleanup, timeout, cancellation, WebSearch subprocess ownership, and Runtime shutdown tests pass | PASS: `74 passed, 3 skipped in 1.85s` |
+| Offline tests | `python -m pytest -q -ra` | All non-platform tests pass; no external Provider or network call | PASS: `644 passed, 8 skipped in 22.88s` |
+| POSIX process behavior | `python -m pytest -q -ra tests/test_shell_process.py tests/test_web_search.py tests/test_runtime_shutdown.py tests/test_security_shell.py` | Real Shell process, process-group descendant cleanup, timeout, cancellation, WebSearch subprocess ownership, and Runtime shutdown tests pass | PASS: `74 passed, 3 skipped in 1.86s` |
 | Lint | `python -m ruff check src tests` | Pass | PASS: `All checks passed!` |
 | Format | `python -m ruff format --check src tests` | Pass | PASS: `111 files already formatted` |
 | Strict types | `python -m mypy src tests` | Pass under the repository's strict configuration | PASS: `Success: no issues found in 111 source files` |
 | Package | `python -m build` | sdist and wheel build successfully | PASS: built `myclaw-0.1.0.tar.gz` and `myclaw-0.1.0-py3-none-any.whl` |
 | Clean wheel install | Create a fresh venv, install `dist/*.whl`, and run `pip check` | Install succeeds without importing from the checkout and dependencies are consistent | PASS: wheel and dependencies installed; `No broken requirements found.` |
-| CLI first start | Run installed `myclaw` with an empty temporary `HOME` | Nonzero configuration-gate exit and default `~/.myclaw/config.toml` creation | PASS: both shell assertions succeeded |
+| CLI first start | Run installed `myclaw` with an empty temporary `HOME` | Exact configuration-gate exit, safe diagnostic, no traceback, and default `~/.myclaw/config.toml` creation | PASS: exit `2`, `config_missing`, no `Traceback`, and file assertions succeeded |
 | CLI config | Run installed `myclaw config` from `workspace-验收` | Exit zero and rendered output contains `[runtime]` | PASS: command and exact grep assertion succeeded |
 | Wheel import | Import from the clean venv outside the checkout | Prints `WHEEL_IMPORT_OK 0.1.0` | PASS: exact output observed |
 
@@ -94,13 +94,13 @@ Ubuntu runner is therefore the sole POSIX authority for this release candidate.
 - The clean-wheel smoke proves packaging, import, first-start gating, configuration
   inspection, and a Unicode Workspace path. It does not enter a paid Provider-backed
   conversation.
-- The only Actions annotation was the runner's Node.js 20 deprecation notice for
-  `actions/checkout@v4` and `actions/setup-python@v5`; the runner forced those actions
-  to Node.js 24. It did not affect checkout, Python setup, or any project gate.
+- The hardened workflow pins `actions/checkout` v7.0.0 and `actions/setup-python`
+  v6.3.0 to full commit SHAs and disables persisted checkout credentials. The
+  authoritative run completed without the earlier Node.js 20 deprecation annotation.
 
 ## Final Decision
 
-**PASS.** Run `29211127742` checked out the exact recorded SHA, every required step
+**PASS.** Run `29211545085` checked out the exact recorded SHA, every required step
 completed successfully, the full and focused skip lists matched the platform policy,
 and the clean-wheel/Unicode CLI assertions passed. This is the authoritative POSIX
 evidence for the B18 release candidate.
