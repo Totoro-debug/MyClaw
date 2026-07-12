@@ -82,8 +82,11 @@ async def run_repl(
         text = await input_reader.read()
         if text is None:
             return
-        if not text.strip():
+        stripped = text.strip()
+        if not stripped:
             continue
+        if stripped.casefold() in {"exit", "quit"}:
+            return
         if management_dispatcher is not None:
             result = await management_dispatcher.dispatch(text)
             if result.handled:

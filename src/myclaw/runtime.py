@@ -11,6 +11,7 @@ from myclaw.agent_home import AgentHome
 from myclaw.config import ProviderConfiguration, UserConfiguration
 from myclaw.contracts import AgentEvent, ConversationPort, ModelProvider
 from myclaw.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.prompts import chat_system_prompt
 from myclaw.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.session_store import JsonlSessionStore
 from myclaw.workspace import Workspace
@@ -65,6 +66,7 @@ class _DeferredConversationPort:
         settings: ChatModelSettings,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
+        system_prompt: str,
     ) -> None:
         self._provider_configuration = provider_configuration
         self._provider_factory = provider_factory
@@ -73,6 +75,7 @@ class _DeferredConversationPort:
         self._settings = settings
         self._now = now
         self._new_uuid = new_uuid
+        self._system_prompt = system_prompt
         self._delegate: ConversationPort | None = None
 
     async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
@@ -87,6 +90,7 @@ class _DeferredConversationPort:
                 settings=self._settings,
                 now=self._now,
                 new_uuid=self._new_uuid,
+                system_prompt=self._system_prompt,
             )
             self._delegate = delegate
         async for event in delegate.submit(text):
@@ -112,9 +116,14 @@ def prepare_repl_runtime(
     new_uuid: Callable[[], UUID],
 ) -> PreparedReplRuntime:
     """Prepare a Session and defer provider construction until conversational input."""
+    workspace_identity = Workspace.from_path(workspace)
+    system_prompt = chat_system_prompt(
+        workspace=workspace_identity.path,
+        long_term_memory=(agent_home.path / "memory" / "memory.md").read_text(encoding="utf-8"),
+    )
     sessions = JsonlSessionStore(
         agent_home=agent_home,
-        workspace=Workspace.from_path(workspace),
+        workspace=workspace_identity,
         now=now,
         new_uuid=new_uuid,
     )
@@ -135,6 +144,7 @@ def prepare_repl_runtime(
         settings=settings,
         now=now,
         new_uuid=new_uuid,
+        system_prompt=system_prompt,
     )
     return PreparedReplRuntime(
         conversation=conversation,

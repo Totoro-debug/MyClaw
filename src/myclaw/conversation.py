@@ -9,11 +9,13 @@ from myclaw.contracts import (
     AgentEvent,
     AgentEventPayload,
     AgentEventType,
+    AssistantModelMessage,
     AssistantSessionMessage,
     ModelCompleted,
     ModelProvider,
     ModelRequest,
     ReasoningEffort,
+    SessionMessage,
     SessionStore,
     TextDelta,
     TextDeltaPayload,
@@ -22,6 +24,7 @@ from myclaw.contracts import (
     UserModelMessage,
     UserSessionMessage,
 )
+from myclaw.prompts import current_user_input
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +50,7 @@ class StreamingConversationPort:
         settings: ChatModelSettings,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
+        system_prompt: str = "",
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -54,26 +58,51 @@ class StreamingConversationPort:
         self._settings = settings
         self._now = now
         self._new_uuid = new_uuid
+        self._system_prompt = system_prompt
         self._next_event_id = 0
+        self._foreground_active = False
 
     async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
         if not text.strip():
             return
+        if self._foreground_active:
+            raise RuntimeError("A foreground turn is already active")
+        self._foreground_active = True
+        try:
+            async for event in self._submit_turn(text):
+                yield event
+        finally:
+            self._foreground_active = False
 
+    async def _submit_turn(self, text: str) -> AsyncIterator[AgentEvent]:
         turn_id = self._new_uuid()
         yield self._event(turn_id, "turn_started", TurnStartedPayload())
 
+        user_created_at = self._persisted_now()
         user_message = UserSessionMessage(
             id=str(self._new_uuid()),
-            created_at=self._persisted_now(),
+            created_at=user_created_at,
             content=text,
         )
         await self._sessions.append_message(self._session_id, user_message)
+        session = await self._sessions.load(self._session_id)
+        history = tuple(
+            _session_message_for_model(message) for message in session.short_term_messages[:-1]
+        )
         request = ModelRequest(
             request_id=self._new_uuid(),
             route="chat",
-            system_prompt="",
-            messages=(UserModelMessage(content=text),),
+            system_prompt=self._system_prompt,
+            messages=(
+                *history,
+                UserModelMessage(
+                    content=current_user_input(
+                        content=text,
+                        current_time=user_created_at,
+                        session_id=self._session_id,
+                    )
+                ),
+            ),
             tools=(),
             stream=True,
             model=self._settings.model,
@@ -141,3 +170,13 @@ class StreamingConversationPort:
     def _persisted_now(self) -> datetime:
         value = self._now()
         return value.replace(microsecond=value.microsecond // 1000 * 1000)
+
+
+def _session_message_for_model(
+    message: SessionMessage,
+) -> UserModelMessage | AssistantModelMessage:
+    if isinstance(message, UserSessionMessage):
+        return UserModelMessage(content=message.content)
+    if isinstance(message, AssistantSessionMessage):
+        return AssistantModelMessage(content=message.content, tool_calls=message.tool_calls)
+    raise TypeError("Unsupported Short-term Memory message")

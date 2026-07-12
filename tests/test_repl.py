@@ -32,6 +32,7 @@ TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
 USER_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
 ASSISTANT_UUID = UUID("a3bb189e-8bf9-4c4b-ae4a-c6699f6f7e34")
+SECOND_SESSION_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
 
 
 class ScriptedReplInput:
@@ -122,6 +123,55 @@ async def test_repl_without_nonblank_user_input_leaves_prepared_session_in_memor
     assert provider.stream_requests == []
     assert provider.complete_requests == []
     assert writer.operations == []
+
+
+@pytest.mark.asyncio
+async def test_repl_exit_and_quit_ignore_case_and_whitespace_without_materializing_messages(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+
+    for command, session_uuid in (
+        ("  ExIt  ", SESSION_UUID),
+        ("\tQuIt\n", SECOND_SESSION_UUID),
+    ):
+        clock = FakeClock(NOW)
+        store = JsonlSessionStore(
+            agent_home=home,
+            workspace=Workspace.from_path(workspace),
+            now=clock.now,
+            new_uuid=iter((session_uuid,)).__next__,
+        )
+        session = store.prepare()
+        provider = ScriptedFakeProvider()
+        conversation = StreamingConversationPort(
+            provider=provider,
+            sessions=store,
+            session_id=session.id,
+            settings=ChatModelSettings(
+                model="test-model",
+                max_output=1024,
+                temperature=0.2,
+                reasoning_effort=None,
+                timeout_seconds=30,
+            ),
+            now=clock.now,
+            new_uuid=iter(()).__next__,
+        )
+        writer = RecordingProgressiveWriter()
+
+        await run_repl(
+            conversation=conversation,
+            input_reader=ScriptedReplInput((command, "/after-exit", None)),
+            writer=writer,
+        )
+
+        assert provider.stream_requests == []
+        assert provider.complete_requests == []
+        assert not store.path_for(session.id).exists()
+        assert writer.operations == []
 
 
 @pytest.mark.asyncio
@@ -251,5 +301,21 @@ async def test_repl_dispatches_handled_management_output_and_converses_on_unknow
     request = provider.stream_requests[0]
     assert isinstance(request, ModelRequest)
     assert [message.to_dict() for message in request.messages] == [
-        {"role": "user", "content": "/unknown"}
+        {
+            "role": "user",
+            "content": (
+                "<runtime_context>\n"
+                "current_time: 2026-07-11T15:30:12.123+08:00\n"
+                f"session_id: {session.id}\n"
+                "</runtime_context>\n\n"
+                "<user_input>\n"
+                "/unknown\n"
+                "</user_input>"
+            ),
+        }
+    ]
+    reloaded = await store.load(session.id)
+    assert [(message.role, message.content) for message in reloaded.messages] == [
+        ("user", "/unknown"),
+        ("assistant", "Ordinary slash input received."),
     ]

@@ -31,6 +31,10 @@ TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
 USER_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
 ASSISTANT_UUID = UUID("a3bb189e-8bf9-4c4b-ae4a-c6699f6f7e34")
+TURN_TWO_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
+USER_TWO_UUID = UUID("16fd2706-8baf-433b-82eb-8c7fada847da")
+REQUEST_TWO_UUID = UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e")
+ASSISTANT_TWO_UUID = UUID("b3f37212-6f3a-4a1b-8d2e-78ab3f9c4567")
 
 
 @pytest.mark.asyncio
@@ -138,6 +142,233 @@ async def test_nonblank_turn_streams_ordered_deltas_then_persists_one_completed_
     assert request.stream is True
     assert request.model == "test-model"
     assert [message.to_dict() for message in request.messages] == [
-        {"role": "user", "content": "Help me inspect this project."}
+        {
+            "role": "user",
+            "content": (
+                "<runtime_context>\n"
+                "current_time: 2026-07-11T15:30:12.123+08:00\n"
+                f"session_id: {session.id}\n"
+                "</runtime_context>\n\n"
+                "<user_input>\n"
+                "Help me inspect this project.\n"
+                "</user_input>"
+            ),
+        }
     ]
     assert provider.complete_requests == []
+
+
+@pytest.mark.asyncio
+async def test_consecutive_turns_send_raw_short_term_memory_and_wrap_only_current_input(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    first_usage = ModelUsage(input_tokens=12, output_tokens=3, total_tokens=15)
+    second_usage = ModelUsage(input_tokens=19, output_tokens=4, total_tokens=23)
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    TextDelta(delta="First answer."),
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="First answer."),
+                            usage=first_usage,
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+            StreamScript(
+                events=(
+                    TextDelta(delta="Second answer."),
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Second answer."),
+                            usage=second_usage,
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    conversation: ConversationPort = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter(
+            (
+                TURN_UUID,
+                USER_UUID,
+                REQUEST_UUID,
+                ASSISTANT_UUID,
+                TURN_TWO_UUID,
+                USER_TWO_UUID,
+                REQUEST_TWO_UUID,
+                ASSISTANT_TWO_UUID,
+            )
+        ).__next__,
+    )
+
+    first_events = [event async for event in conversation.submit("First raw input.")]
+    clock.advance(65.333)
+    second_events = [event async for event in conversation.submit("Second raw input.")]
+
+    assert [event.type for event in first_events] == [
+        "turn_started",
+        "text_delta",
+        "turn_completed",
+    ]
+    assert [event.type for event in second_events] == [
+        "turn_started",
+        "text_delta",
+        "turn_completed",
+    ]
+    assert [
+        [message.to_dict() for message in request.messages]
+        for request in provider.stream_requests
+        if isinstance(request, ModelRequest)
+    ] == [
+        [
+            {
+                "role": "user",
+                "content": (
+                    "<runtime_context>\n"
+                    "current_time: 2026-07-11T15:30:12.123+08:00\n"
+                    f"session_id: {session.id}\n"
+                    "</runtime_context>\n\n"
+                    "<user_input>\n"
+                    "First raw input.\n"
+                    "</user_input>"
+                ),
+            }
+        ],
+        [
+            {"role": "user", "content": "First raw input."},
+            {"role": "assistant", "content": "First answer.", "tool_calls": []},
+            {
+                "role": "user",
+                "content": (
+                    "<runtime_context>\n"
+                    "current_time: 2026-07-11T15:31:17.456+08:00\n"
+                    f"session_id: {session.id}\n"
+                    "</runtime_context>\n\n"
+                    "<user_input>\n"
+                    "Second raw input.\n"
+                    "</user_input>"
+                ),
+            },
+        ],
+    ]
+    reloaded = await store.load(session.id)
+    assert reloaded.metadata.id == session.id
+    assert reloaded.messages == (
+        UserSessionMessage(
+            id=str(USER_UUID),
+            created_at=NOW,
+            content="First raw input.",
+        ),
+        AssistantSessionMessage(
+            id=str(ASSISTANT_UUID),
+            created_at=NOW,
+            content="First answer.",
+            tool_calls=(),
+            status="completed",
+            error=None,
+            usage=first_usage,
+        ),
+        UserSessionMessage(
+            id=str(USER_TWO_UUID),
+            created_at=datetime(2026, 7, 11, 15, 31, 17, 456000, tzinfo=LOCAL_OFFSET),
+            content="Second raw input.",
+        ),
+        AssistantSessionMessage(
+            id=str(ASSISTANT_TWO_UUID),
+            created_at=datetime(2026, 7, 11, 15, 31, 17, 456000, tzinfo=LOCAL_OFFSET),
+            content="Second answer.",
+            tool_calls=(),
+            status="completed",
+            error=None,
+            usage=second_usage,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_conversation_port_rejects_an_overlapping_foreground_submit(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    TextDelta(delta="First answer."),
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="First answer."),
+                            usage=ModelUsage(input_tokens=8, output_tokens=3, total_tokens=11),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    conversation: ConversationPort = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+    )
+    first_turn = conversation.submit("First foreground input.")
+    overlapping_turn = conversation.submit("Overlapping input.")
+
+    assert (await anext(first_turn)).type == "turn_started"
+    with pytest.raises(RuntimeError, match="foreground turn is already active"):
+        await anext(overlapping_turn)
+    remaining_events = [event async for event in first_turn]
+
+    assert [event.type for event in remaining_events] == ["text_delta", "turn_completed"]
+    assert len(provider.stream_requests) == 1
+    assert [message.role for message in (await store.load(session.id)).messages] == [
+        "user",
+        "assistant",
+    ]
