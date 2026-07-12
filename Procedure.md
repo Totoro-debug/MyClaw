@@ -1,0 +1,138 @@
+# MyClaw Issue #2-#36 Delivery Procedure
+
+Last updated: 2026-07-12 (Asia/Shanghai)
+
+## Objective
+
+Complete GitHub issues #2 through #36 with test-driven vertical slices, parallel execution on every independent frontier, batch-level verification and commits, and immediate GitHub issue updates.
+
+This file is the delivery ledger. It was created before any implementation file. Every sub-agent must update its own issue row and append an Agent Log entry before reporting completion. The coordinating agent owns batch verification, commits, and GitHub comments/closure.
+
+## TDD Contract
+
+The public seams are already agreed by the user through issue #1, each child issue's acceptance criteria, and the canonical testing decisions in `docs/myclaw-runtime-contracts.md` and `docs/myclaw-personal-agent-prd.md`.
+
+- Test only observable behavior at these public seams: CLI/REPL, Conversation Port, Management Port, Runtime Core, Memory Manager, Tool Gateway, Session Store, Model Router, and Provider Adapter.
+- Work one vertical slice at a time: add one behavior test, run it and capture the expected failure (RED), add only enough implementation for that behavior, then run it to green (GREEN).
+- Prefer real in-process integration through public interfaces. Mock only system boundaries such as provider SDKs, HTTP/DNS, clocks, subprocesses, and fault-injected filesystems.
+- Do not test private methods, internal call counts, or implementation layout. Expected values must be literals or contract examples rather than recomputing the implementation.
+- Each Agent Log entry must record the RED command/failure, GREEN command/result, changed files, and any residual risk.
+
+## Status Protocol
+
+1. Before editing code, the assigned agent changes only its row from `TODO` to `IN_PROGRESS` and adds its agent name.
+2. The agent performs strict red-green cycles and runs the narrow issue suite.
+3. Before returning, the agent changes its row to `AGENT_DONE` and appends an Agent Log entry with TDD evidence. Sub-agents do not commit or mutate GitHub issues.
+4. The coordinator reviews the diff, runs the batch's narrow tests plus the full quality gate, and changes rows to `VERIFIED`.
+5. The coordinator creates one batch commit, records its SHA below, comments on each completed issue with tests and commit evidence, then closes it and changes the row to `CLOSED`.
+6. A dependent batch cannot start until every dependency row is `CLOSED`. Independent issues on an open frontier are dispatched to separate agents concurrently, subject only to the four-agent runtime limit; overflow starts immediately in the next parallel wave.
+
+Status legend: `TODO` -> `IN_PROGRESS` -> `AGENT_DONE` -> `VERIFIED` -> `CLOSED`; use `BLOCKED` only with a concrete blocker in the Agent Log.
+
+## Dependency Batches
+
+| Batch | Parallel frontier | Gate |
+|---|---|---|
+| B01 | #2 | None |
+| B02 | #3 | #2 |
+| B03 | #4 | #3 |
+| B04 | #5 | #4 |
+| B05 | #6, #13 | #5 |
+| B06 | #7 | #6 |
+| B07 | #8 | #7 |
+| B08 | #9, #11 | #8 |
+| B09 | #10, #12, #15, #21, #22, #27 | #9 and/or #11 as listed below |
+| B10 | #14, #16 | #12 / #15 |
+| B11 | #17, #20, #25, #28 | #16 / #14 + #27 |
+| B12 | #18, #19, #23, #26, #31 | #17 and issue-specific gates |
+| B13 | #24, #29 | #23 / #13 + #18 + #28 |
+| B14 | #30, #32 | #29 / #11 + #18 + #24 + #26 + #31 |
+| B15 | #33 | #30 + #32 |
+| B16 | #34 | #19 + #21 + #22 + #33 |
+| B17 | #35 | #20 + #34 |
+| B18 | #36 | #35 |
+
+## Issue Ledger
+
+| Issue | Ticket | Depends on | Batch | Public test seam | Agent | Status | Commit |
+|---|---|---|---|---|---|---|---|
+| #2 | T01 Installable Python project | None | B01 | installed `myclaw` CLI and reusable public test fixtures | b01_issue_2 | VERIFIED | pending batch commit |
+| #3 | T02 Runtime Contracts | #2 | B02 | frozen schemas and Port/Store/Provider/Tool protocols | - | TODO | - |
+| #4 | T03 Agent Home and atomic writes | #3 | B03 | Agent Home initializer, atomic file API, Workspace identity | - | TODO | - |
+| #5 | T04 Configuration | #4 | B04 | `myclaw`, `myclaw config`, validated/redacted config API | - | TODO | - |
+| #6 | T05 First streaming turn | #5 | B05 | Conversation Port through REPL and Session Store reload | - | TODO | - |
+| #7 | T06 Multi-turn Short-term Memory | #6 | B06 | one REPL session across Conversation Port turns | - | TODO | - |
+| #8 | T07 Model route fallback | #7 | B07 | Model Router route resolution and startup validation | - | TODO | - |
+| #9 | T08 Retry budget | #8 | B08 | Model Router with fake Provider and fake Clock | - | TODO | - |
+| #10 | T09 Failed/cancelled turns | #9 | B09 | Conversation Port terminal events and reloadable Session Store | - | TODO | - |
+| #11 | T10 Session metadata/status | #8 | B08 | Session Store metadata and Management Port `/status` | - | TODO | - |
+| #12 | T11 Async session title | #9, #11 | B09 | Conversation Port latency/history plus Session Store metadata | - | TODO | - |
+| #13 | T12 Config/memory views | #5 | B05 | Management Port `/config` and `/memory` | - | TODO | - |
+| #14 | T13 Resume session | #12 | B10 | Management Port `/resume` and Session Store recovery | - | TODO | - |
+| #15 | T14 Read-only file tool loop | #9 | B09 | Tool Gateway through full Conversation Port model loop | - | TODO | - |
+| #16 | T15 Tool result/failure semantics | #15 | B10 | Tool Gateway normalization and Agent Events | - | TODO | - |
+| #17 | T16 Permission request loop | #16 | B11 | Conversation Port permission response and Tool Gateway | - | TODO | - |
+| #18 | T17 Safe Workspace writes | #17 | B12 | Tool Gateway write/edit behavior at filesystem boundary | - | TODO | - |
+| #19 | T18 Interrupted tool-call repair | #10, #17 | B12 | cancelled Conversation Port turn and reloaded Session Store | - | TODO | - |
+| #20 | T19 Tool Artifacts | #16 | B11 | Tool Gateway result plus Session Store/artifact files | - | TODO | - |
+| #21 | T20 Anthropic Provider | #9 | B09 | Provider Adapter with fake official SDK | - | TODO | - |
+| #22 | T21 OpenAI-compatible Provider | #9 | B09 | Provider Adapter with fake official SDK | - | TODO | - |
+| #23 | T22 Shell permission policy | #17 | B12 | Tool Gateway Shell policy/catalog | - | TODO | - |
+| #24 | T23 Shell process lifecycle | #23 | B13 | Shell tool subprocess boundary | - | TODO | - |
+| #25 | T24 WebSearch | #16 | B11 | Tool Gateway WebSearch with fake search boundary | - | TODO | - |
+| #26 | T25 SSRF-resistant WebFetch | #25 | B12 | WebFetch HTTP/DNS/peer boundary through Tool Gateway | - | TODO | - |
+| #27 | T26 Conversation Summary | #9, #11 | B09 | Runtime Core/Memory Manager with fake Provider | - | TODO | - |
+| #28 | T27 Consolidation recovery | #14, #27 | B11 | Session Store/summary journal fault-injection API | - | TODO | - |
+| #29 | T28 Dream memory update | #13, #18, #28 | B13 | Management Port `/dream` and restricted Memory Manager | - | TODO | - |
+| #30 | T29 Periodic Memory Task | #29 | B14 | Memory scheduler with fake Clock and Management Port | - | TODO | - |
+| #31 | T30 Scheduled Work persistence | #17 | B12 | Tool Gateway permission plus Scheduled Work Store | - | TODO | - |
+| #32 | T31 Scheduled Work execution | #11, #18, #24, #26, #31 | B14 | scheduler through Runtime Core and dedicated Session Store | - | TODO | - |
+| #33 | T32 Background coordination | #30, #32 | B15 | Runtime event ordering with foreground/background tasks | - | TODO | - |
+| #34 | T33 Runtime shutdown | #19, #21, #22, #33 | B16 | REPL/Runtime lifetime and owned resource boundaries | - | TODO | - |
+| #35 | T34 Security/fault review | #20, #34 | B17 | end-to-end public seams with boundary fault injection | - | TODO | - |
+| #36 | T35 Cross-platform release | #35 | B18 | built wheel, clean installs, CLI smoke, release evidence | - | TODO | - |
+
+## Quality Gate
+
+Every batch must pass the commands established by #2. Until #2 freezes exact commands, the intended gate is:
+
+```text
+pytest
+ruff check .
+ruff format --check .
+mypy src tests
+python -m build
+```
+
+Issue #36 additionally requires Windows and POSIX evidence, clean-wheel installation, `myclaw`/`myclaw config` smoke tests, traceability for all 48 user stories and required tests, manual acceptance status, real-provider smoke status, and known risks.
+
+## Batch Commit And Issue Log
+
+| Batch | Issues | Verification | Commit | GitHub update | Status |
+|---|---|---|---|---|---|
+| B01 | #2 | 11 pytest + Ruff lint/format + strict mypy + sdist/wheel + CLI smoke | pending | pending | VERIFIED |
+| B02 | #3 | - | - | - | TODO |
+| B03 | #4 | - | - | - | TODO |
+| B04 | #5 | - | - | - | TODO |
+| B05 | #6, #13 | - | - | - | TODO |
+| B06 | #7 | - | - | - | TODO |
+| B07 | #8 | - | - | - | TODO |
+| B08 | #9, #11 | - | - | - | TODO |
+| B09 | #10, #12, #15, #21, #22, #27 | - | - | - | TODO |
+| B10 | #14, #16 | - | - | - | TODO |
+| B11 | #17, #20, #25, #28 | - | - | - | TODO |
+| B12 | #18, #19, #23, #26, #31 | - | - | - | TODO |
+| B13 | #24, #29 | - | - | - | TODO |
+| B14 | #30, #32 | - | - | - | TODO |
+| B15 | #33 | - | - | - | TODO |
+| B16 | #34 | - | - | - | TODO |
+| B17 | #35 | - | - | - | TODO |
+| B18 | #36 | - | - | - | TODO |
+
+## Agent Log
+
+Append one row per completed or blocked assignment. Keep evidence concise but reproducible.
+
+| Timestamp | Agent | Issue | RED evidence | GREEN evidence | Files / notes |
+|---|---|---|---|---|---|
+| 2026-07-12 09:16 +08:00 | b01_issue_2 | #2 | `python -m pytest tests/test_package.py -q` -> `ModuleNotFoundError: myclaw`; `python -m pytest tests/test_cli.py -q` -> console executable absent; fixture slices failed first with missing modules/fixtures, missing provider complete/close, and Tool failure not raised; `ruff format --check .` -> 1 file and `python -m mypy src tests` -> 2 errors. | Offline editable install succeeded; `pytest` -> 11 passed; `ruff check .` -> passed; `ruff format --check .` -> 15 files formatted; `mypy src tests` -> 15 files clean; `python -m build --no-isolation` -> wheel + sdist; offline wheel install and `myclaw --help` -> exit 0. | `.gitignore`, `README.md`, `pyproject.toml`, `src/myclaw/`, `tests/`; residual: host setuptools emits an unrelated deprecated `upload_docs` entry-point warning during no-isolation builds, but artifacts build successfully. |
