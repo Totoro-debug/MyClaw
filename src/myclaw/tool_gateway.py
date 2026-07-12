@@ -20,12 +20,17 @@ from myclaw.file_tools import (
     SearchFilesTool,
 )
 from myclaw.permission_policy import PermissionAssessment, assess_permission
+from myclaw.scheduled_work import ScheduledWorkInvalidError, ScheduledWorkPersistenceError
+from myclaw.shell_policy import ShellPolicyDenied
+from myclaw.shell_tool import ShellBoundary, ShellTool
 from myclaw.tool_artifacts import (
     ArtifactWriteError,
     ArtifactWriter,
     ToolArtifactExternalizer,
 )
+from myclaw.web_fetch import WebFetchBoundary, WebFetchTool
 from myclaw.web_search import WebSearchBoundary, WebSearchTool
+from myclaw.workspace_write_tools import EditFileTool, WriteFileTool
 
 
 class ToolGateway:
@@ -37,15 +42,30 @@ class ToolGateway:
         context: ToolExecutionContext,
         tools: tuple[Tool, ...] | None = None,
         web_search: WebSearchBoundary | None = None,
+        web_fetch: WebFetchBoundary | None = None,
+        shell: ShellBoundary | None = None,
+        scheduled_work: Tool | None = None,
         max_tool_result_chars: int = 50_000,
         artifact_writer: ArtifactWriter | None = None,
     ) -> None:
         self._context = context
         catalog: tuple[Tool, ...]
         if tools is None:
-            catalog = (ReadFileTool(), ListFilesTool(), SearchFilesTool())
+            catalog = (
+                ReadFileTool(),
+                ListFilesTool(),
+                SearchFilesTool(),
+                WriteFileTool(),
+                EditFileTool(),
+            )
             if web_search is not None:
                 catalog += (WebSearchTool(web_search),)
+            if web_fetch is not None:
+                catalog += (WebFetchTool(web_fetch),)
+            if shell is not None:
+                catalog += (ShellTool(shell),)
+            if scheduled_work is not None:
+                catalog += (scheduled_work,)
         else:
             catalog = tools
         self._tools = {tool.definition.name: tool for tool in catalog}
@@ -115,7 +135,7 @@ class ToolGateway:
                 )
         try:
             content = await tool.execute(tool_call.arguments, self._context)
-        except FileToolAccessDenied:
+        except (FileToolAccessDenied, ShellPolicyDenied):
             return _error_result(
                 tool_call,
                 code="tool_denied",
@@ -126,6 +146,18 @@ class ToolGateway:
                 tool_call,
                 code="tool_invalid_arguments",
                 message=f"Invalid arguments for {tool_call.name}.",
+            )
+        except ScheduledWorkInvalidError:
+            return _error_result(
+                tool_call,
+                code="scheduled_work_invalid",
+                message="The Scheduled Work definition is invalid.",
+            )
+        except ScheduledWorkPersistenceError:
+            return _error_result(
+                tool_call,
+                code="persistence_error",
+                message="Scheduled Work could not be read or written.",
             )
         except Exception:
             return _error_result(

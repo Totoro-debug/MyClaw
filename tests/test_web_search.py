@@ -173,6 +173,8 @@ async def test_tool_gateway_returns_an_empty_array_when_web_search_finds_nothing
         "read_file",
         "list_files",
         "search_files",
+        "write_file",
+        "edit_file",
         "web_search",
     ]
 
@@ -408,6 +410,10 @@ async def test_conversation_catalog_omits_web_search_when_web_tools_are_disabled
         "read_file",
         "list_files",
         "search_files",
+        "write_file",
+        "edit_file",
+        "shell",
+        "create_scheduled_work",
     ]
     assert search.calls == []
 
@@ -456,5 +462,10 @@ async def test_conversation_catalog_includes_builtin_web_search_when_enabled(
         "read_file",
         "list_files",
         "search_files",
+        "write_file",
+        "edit_file",
         "web_search",
+        "web_fetch",
+        "shell",
+        "create_scheduled_work",
     ]

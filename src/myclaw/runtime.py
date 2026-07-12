@@ -39,9 +39,17 @@ from myclaw.management_commands import ManagementCommandDispatcher
 from myclaw.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
 from myclaw.prompts import chat_system_prompt, runtime_context, session_title_prompt
 from myclaw.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
+from myclaw.scheduled_work import CreateScheduledWorkTool, JsonScheduledWorkStore
 from myclaw.session_resume import SwitchableConversationPort
 from myclaw.session_store import JsonlSessionStore
+from myclaw.shell_tool import ShellBoundary, UnavailableShellBoundary
 from myclaw.tool_gateway import ToolGateway
+from myclaw.web_fetch import (
+    AioHttpWebFetchClient,
+    PublicWebFetchBoundary,
+    SocketDNSResolver,
+    WebFetchBoundary,
+)
 from myclaw.web_search import DuckDuckGoSearchBoundary, WebSearchBoundary
 from myclaw.workspace import Workspace
 
@@ -164,6 +172,8 @@ def prepare_repl_runtime(
     retry_jitter: Jitter | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     web_search: WebSearchBoundary | None = None,
+    web_fetch: WebFetchBoundary | None = None,
+    shell: ShellBoundary | None = None,
 ) -> PreparedReplRuntime:
     """Prepare a Session and defer provider construction until conversational input."""
     configuration.resolve_route("default")
@@ -195,6 +205,28 @@ def prepare_repl_runtime(
         if configuration.tools.web.enabled
         else None
     )
+    configured_web_fetch = (
+        (
+            web_fetch
+            if web_fetch is not None
+            else PublicWebFetchBoundary(
+                resolver=SocketDNSResolver(),
+                http_client=AioHttpWebFetchClient(),
+            )
+        )
+        if configuration.tools.web.enabled
+        else None
+    )
+    configured_shell = (
+        (shell if shell is not None else UnavailableShellBoundary())
+        if configuration.tools.shell.enabled
+        else None
+    )
+    scheduled_work_tool = CreateScheduledWorkTool(
+        store=JsonScheduledWorkStore(agent_home),
+        now=now,
+        new_uuid=new_uuid,
+    )
     tool_gateway = ToolGateway(
         context=ToolExecutionContext(
             lane="foreground",
@@ -204,6 +236,9 @@ def prepare_repl_runtime(
         ),
         max_tool_result_chars=configuration.runtime.max_tool_result_chars,
         web_search=configured_web_search,
+        web_fetch=configured_web_fetch,
+        shell=configured_shell,
+        scheduled_work=scheduled_work_tool,
     )
     system_prompt = chat_system_prompt(
         workspace=workspace_identity.path,
@@ -245,6 +280,9 @@ def prepare_repl_runtime(
             ),
             max_tool_result_chars=configuration.runtime.max_tool_result_chars,
             web_search=configured_web_search,
+            web_fetch=configured_web_fetch,
+            shell=configured_shell,
+            scheduled_work=scheduled_work_tool,
         )
         return _DeferredConversationPort(
             provider=router,

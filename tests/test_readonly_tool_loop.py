@@ -190,6 +190,8 @@ async def test_list_files_tool_result_continues_the_model_loop_with_linked_histo
         "read_file",
         "list_files",
         "search_files",
+        "write_file",
+        "edit_file",
     ]
     assert [message.to_dict() for message in second_request.messages[-2:]] == [
         {
@@ -545,6 +547,13 @@ async def test_production_conversation_denies_parent_escape_without_reading_the_
         "- read_file: Read UTF-8 text lines from a file within the current Workspace.",
         "- list_files: List files and directories within the current Workspace.",
         "- search_files: Search UTF-8 text files within the current Workspace.",
+        "- write_file: Write UTF-8 text to a file within the current Workspace.",
+        "- edit_file: Replace exact UTF-8 text in a file within the current Workspace.",
+        (
+            "- shell: Run a command from a Workspace directory; approved commands are not OS "
+            "filesystem or network sandboxed."
+        ),
+        "- create_scheduled_work: Create recurring work with a five-field cron schedule.",
     ]
     assert "input_schema" not in tool_guidance
     assert "properties" not in tool_guidance

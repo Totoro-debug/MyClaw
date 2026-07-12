@@ -19,6 +19,7 @@ from myclaw.contracts import (
     ToolDefinition,
     ToolExecutionContext,
     ToolModelMessage,
+    ToolSessionMessage,
 )
 from myclaw.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.repl import run_repl
@@ -465,7 +466,14 @@ async def test_cancelling_the_active_turn_releases_its_permission_wait(
         ),
         now=clock.now,
         new_uuid=iter(
-            (TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID, PERMISSION_UUID)
+            (
+                TURN_UUID,
+                USER_UUID,
+                REQUEST_UUID,
+                ASSISTANT_UUID,
+                PERMISSION_UUID,
+                TOOL_UUID,
+            )
         ).__next__,
         tool_gateway=ToolGateway(
             context=ToolExecutionContext(
@@ -563,7 +571,14 @@ async def test_closing_turn_iterator_releases_its_permission_wait(
         ),
         now=clock.now,
         new_uuid=iter(
-            (TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID, PERMISSION_UUID)
+            (
+                TURN_UUID,
+                USER_UUID,
+                REQUEST_UUID,
+                ASSISTANT_UUID,
+                PERMISSION_UUID,
+                TOOL_UUID,
+            )
         ).__next__,
         tool_gateway=ToolGateway(
             context=ToolExecutionContext(
@@ -587,6 +602,14 @@ async def test_closing_turn_iterator_releases_its_permission_wait(
     with pytest.raises(RuntimeError, match="not pending"):
         await conversation.resolve_permission(payload.request_id, approved=True)
     assert tool.calls == []
+    reloaded = await store.load(session.id)
+    assert [message.role for message in reloaded.messages] == ["user", "assistant", "tool"]
+    repaired = reloaded.messages[-1]
+    assert isinstance(repaired, ToolSessionMessage)
+    assert repaired.tool_call_id == tool_call.id
+    assert repaired.status == "error"
+    assert repaired.error is not None
+    assert repaired.error.code == "turn_cancelled"
 
 
 @pytest.mark.asyncio

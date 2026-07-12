@@ -20,6 +20,7 @@ from myclaw.contracts import (
     ModelMessage,
     ModelProvider,
     ModelRequest,
+    ModelToolCall,
     ModelUsage,
     PermissionRequestedPayload,
     ReasoningEffort,
@@ -136,6 +137,7 @@ class StreamingConversationPort:
             title_task.add_done_callback(_consume_task_exception)
             self._title_task = title_task
         partial_content: list[str] = []
+        pending_tool_calls: list[ModelToolCall] = []
         try:
             while True:
                 partial_content = []
@@ -152,7 +154,11 @@ class StreamingConversationPort:
                             TextDeltaPayload(delta=model_event.delta),
                         )
                         if self._cancel_requested:
-                            yield await self._cancelled_event(turn_id, partial_content)
+                            yield await self._cancelled_event(
+                                turn_id,
+                                partial_content,
+                                pending_tool_calls,
+                            )
                             return
                         continue
                     if isinstance(model_event, ModelCompleted):
@@ -170,6 +176,7 @@ class StreamingConversationPort:
                             ),
                         )
                         if response.message.tool_calls and self._tool_gateway is not None:
+                            pending_tool_calls = list(response.message.tool_calls)
                             for tool_call in response.message.tool_calls:
                                 yield self._event(
                                     turn_id,
@@ -180,6 +187,13 @@ class StreamingConversationPort:
                                         summary=_tool_activity_summary("Running", tool_call.name),
                                     ),
                                 )
+                                if self._cancel_requested:
+                                    yield await self._cancelled_event(
+                                        turn_id,
+                                        partial_content,
+                                        pending_tool_calls,
+                                    )
+                                    return
                                 approved: bool | None = None
                                 permission = self._tool_gateway.permission_request(tool_call)
                                 if permission is not None:
@@ -228,6 +242,7 @@ class StreamingConversationPort:
                                         artifact=result.artifact,
                                     ),
                                 )
+                                pending_tool_calls.pop(0)
                                 yield self._event(
                                     turn_id,
                                     "tool_completed",
@@ -238,6 +253,13 @@ class StreamingConversationPort:
                                         summary=_tool_activity_summary("Finished", result.name),
                                     ),
                                 )
+                                if self._cancel_requested:
+                                    yield await self._cancelled_event(
+                                        turn_id,
+                                        partial_content,
+                                        pending_tool_calls,
+                                    )
+                                    return
                             break
                         yield self._event(
                             turn_id,
@@ -258,7 +280,11 @@ class StreamingConversationPort:
                     )
         except ModelCallError as failure:
             if failure.error.code == "turn_cancelled":
-                yield await self._cancelled_event(turn_id, partial_content)
+                yield await self._cancelled_event(
+                    turn_id,
+                    partial_content,
+                    pending_tool_calls,
+                )
                 return
             await self._sessions.append_message(
                 self._session_id,
@@ -282,8 +308,14 @@ class StreamingConversationPort:
             )
             return
         except asyncio.CancelledError:
-            yield await self._cancelled_event(turn_id, partial_content)
+            yield await self._cancelled_event(
+                turn_id,
+                partial_content,
+                pending_tool_calls,
+            )
             return
+        finally:
+            await self._repair_unfinished_tool_calls(pending_tool_calls)
 
     async def _generate_title_for_first_user(
         self,
@@ -404,6 +436,7 @@ class StreamingConversationPort:
         self,
         turn_id: UUID,
         partial_chunks: list[str],
+        pending_tool_calls: list[ModelToolCall],
     ) -> AgentEvent:
         partial_content = "".join(partial_chunks)
         if partial_content:
@@ -422,11 +455,34 @@ class StreamingConversationPort:
                     usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
                 ),
             )
+        await self._repair_unfinished_tool_calls(pending_tool_calls)
         return self._event(
             turn_id,
             "turn_cancelled",
             TurnCancelledPayload(partial_content=partial_content),
         )
+
+    async def _repair_unfinished_tool_calls(
+        self,
+        pending_tool_calls: list[ModelToolCall],
+    ) -> None:
+        while pending_tool_calls:
+            tool_call = pending_tool_calls[0]
+            message = "Tool call interrupted because the turn was cancelled."
+            await self._sessions.append_message(
+                self._session_id,
+                ToolSessionMessage(
+                    id=str(self._new_uuid()),
+                    created_at=self._persisted_now(),
+                    tool_call_id=tool_call.id,
+                    name=tool_call.name,
+                    content=message,
+                    status="error",
+                    error=SessionError(code="turn_cancelled", message=message),
+                    artifact=None,
+                ),
+            )
+            pending_tool_calls.pop(0)
 
     def _event(
         self,
