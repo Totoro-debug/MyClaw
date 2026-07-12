@@ -7,7 +7,7 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent_home import AgentHome
-from myclaw.config import ConfigLoader, ProviderConfiguration
+from myclaw.config import ConfigError, ConfigLoader, ProviderConfiguration
 from myclaw.contracts import (
     AssistantModelMessage,
     ModelCompleted,
@@ -36,6 +36,27 @@ TURN_TWO_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
 USER_TWO_UUID = UUID("16fd2706-8baf-433b-82eb-8c7fada847da")
 REQUEST_TWO_UUID = UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e")
 ASSISTANT_TWO_UUID = UUID("b3f37212-6f3a-4a1b-8d2e-78ab3f9c4567")
+
+CHAT_ROUTE_CONFIG = (
+    VALID_CONFIG
+    + """
+
+[models.providers.chat-provider]
+protocol = "openai-compatible"
+base_url = "https://chat.example/v1"
+api_key = "chat-secret"
+models = ["chat-model"]
+
+[models.routes.chat]
+provider_id = "chat-provider"
+model = "chat-model"
+context_window = 100000
+max_output = 4096
+temperature = 0.1
+reasoning_effort = "high"
+timeout = 90
+"""
+)
 
 
 class ScriptedInput:
@@ -135,6 +156,91 @@ async def test_prepared_repl_defers_injected_provider_factory_until_first_nonbla
         "user",
         "assistant",
     ]
+
+
+@pytest.mark.asyncio
+async def test_prepared_repl_uses_the_chat_model_route(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(CHAT_ROUTE_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Routed response."),
+                            usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    factory_calls: list[ProviderConfiguration] = []
+
+    def provider_factory(configuration: ProviderConfiguration) -> ModelProvider:
+        factory_calls.append(configuration)
+        return provider
+
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=provider_factory,
+        now=FakeClock(NOW).now,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+    )
+
+    await runtime.run(
+        input_reader=ScriptedInput(("Use the chat route.", None)),
+        writer=RecordingWriter(),
+    )
+
+    assert [call.provider_id for call in factory_calls] == ["chat-provider"]
+    request = provider.stream_requests[0]
+    assert isinstance(request, ModelRequest)
+    assert (
+        request.route,
+        request.model,
+        request.max_output,
+        request.temperature,
+        request.reasoning_effort,
+        request.timeout_seconds,
+    ) == ("chat", "chat-model", 4096, 0.1, "high", 90)
+
+
+def test_prepared_repl_rejects_an_unusable_default_even_when_chat_is_usable(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    content = CHAT_ROUTE_CONFIG.replace(
+        'protocol = "anthropic"',
+        'protocol = "future-protocol"',
+        1,
+    )
+    (agent_home / "config.toml").write_text(content, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+
+    with pytest.raises(ConfigError) as raised:
+        prepare_repl_runtime(
+            agent_home=home,
+            workspace=workspace,
+            configuration=configuration,
+            provider_factory=unavailable_provider_factory,
+            now=FakeClock(NOW).now,
+            new_uuid=iter((SESSION_UUID,)).__next__,
+        )
+
+    assert raised.value.error.code == "route_unavailable"
+    assert "chat-secret" not in str(raised.value)
 
 
 @pytest.mark.asyncio

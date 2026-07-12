@@ -116,6 +116,7 @@ def prepare_repl_runtime(
     new_uuid: Callable[[], UUID],
 ) -> PreparedReplRuntime:
     """Prepare a Session and defer provider construction until conversational input."""
+    configuration.resolve_route("default")
     workspace_identity = Workspace.from_path(workspace)
     system_prompt = chat_system_prompt(
         workspace=workspace_identity.path,
@@ -128,7 +129,7 @@ def prepare_repl_runtime(
         new_uuid=new_uuid,
     )
     metadata = sessions.prepare()
-    resolved = configuration.resolve_route("default")
+    resolved = configuration.resolve_route("chat")
     settings = ChatModelSettings(
         model=resolved.route.model,
         max_output=resolved.route.max_output,
