@@ -100,7 +100,7 @@ def config_command() -> None:
     try:
         loader.ensure_default()
         view = loader.view()
-    except OSError:
+    except (OSError, UnicodeError):
         _print_error(
             ErrorInfo("persistence_error", "User Configuration could not be read or written."),
             loader.path,

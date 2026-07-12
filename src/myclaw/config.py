@@ -2,7 +2,7 @@
 
 import re
 import tomllib
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping, MutableSequence
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -49,11 +49,53 @@ type ReasoningEffort = Literal["low", "medium", "high"]
 
 _PROVIDER_ID_PATTERN: Final = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _ROUTE_NAMES: Final = frozenset({"default", "chat", "memory", "cron"})
+_API_KEY_FIELD_PATTERN: Final = re.compile(r"api[-_]?key", flags=re.IGNORECASE)
+_TOML_KEY_SEGMENT_PATTERN: Final = r"""(?:[a-z0-9_-]+|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*')"""
+
+
+def _toml_basic_key_character_pattern(character: str) -> str:
+    codepoints = sorted({ord(character.lower()), ord(character.upper())})
+    escaped = "|".join(rf"\\(?:u{codepoint:04x}|U{codepoint:08x})" for codepoint in codepoints)
+    return rf"(?:{re.escape(character)}|{escaped})"
+
+
+_TOML_BASIC_API_KEY_NAME_PATTERN: Final = (
+    _toml_basic_key_character_pattern("a")
+    + _toml_basic_key_character_pattern("p")
+    + _toml_basic_key_character_pattern("i")
+    + rf"(?:{_toml_basic_key_character_pattern('-')}|"
+    + rf"{_toml_basic_key_character_pattern('_')})?"
+    + _toml_basic_key_character_pattern("k")
+    + _toml_basic_key_character_pattern("e")
+    + _toml_basic_key_character_pattern("y")
+)
+_API_KEY_NAME_PATTERN: Final = (
+    rf"""(?:api[-_]?key|"{_TOML_BASIC_API_KEY_NAME_PATTERN}"|'api[-_]?key')"""
+)
+_API_KEY_ASSIGNMENT_PREFIX_PATTERN: Final = (
+    rf"\s*(?:{_TOML_KEY_SEGMENT_PATTERN}\s*\.\s*)*{_API_KEY_NAME_PATTERN}\s*=\s*"
+)
 _API_KEY_LINE_PATTERN: Final = re.compile(
-    r"^(?P<prefix>\s*api[-_]?key\s*=\s*)(?P<value>.*)$",
+    rf"^(?P<prefix>{_API_KEY_ASSIGNMENT_PREFIX_PATTERN})(?P<value>.*)$",
     flags=re.IGNORECASE | re.MULTILINE,
 )
+_API_KEY_MULTILINE_PATTERN: Final = re.compile(
+    rf"(?P<prefix>(?<![a-z0-9_-]){_API_KEY_NAME_PATTERN}\s*=\s*)"
+    r"(?P<quote>\"{3}|'{3}).*?(?:(?P=quote)|\Z)",
+    flags=re.DOTALL | re.IGNORECASE | re.MULTILINE,
+)
+_API_KEY_STRING_ASSIGNMENT_PATTERN: Final = re.compile(
+    rf"(?P<prefix>(?<![a-z0-9_-]){_API_KEY_NAME_PATTERN}\s*=\s*)"
+    r"(?:\"(?!\"\")(?:[^\"\\\r\n]|\\.)*\"|'(?!'')[^'\r\n]*')",
+    flags=re.IGNORECASE,
+)
 _REDACTED_API_KEY: Final = "***REDACTED***"
+_API_KEY_UNSAFE_REMAINDER_PATTERN: Final = re.compile(
+    rf"(?P<prefix>(?<![a-z0-9_-]){_API_KEY_NAME_PATTERN}\s*=)"
+    rf"(?!\s*[\"']{re.escape(_REDACTED_API_KEY)}[\"'])"
+    r"(?P<spacing>\s*).*\Z",
+    flags=re.DOTALL | re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,26 +279,41 @@ def _usable_route(
 
 def _redact_parsed_content(content: str) -> str:
     source_document = tomlkit.parse(content)
-    models = source_document.get("models")
-    if not isinstance(models, MutableMapping):
-        return content
-    providers = models.get("providers")
-    if not isinstance(providers, MutableMapping):
-        return content
-    for provider in providers.values():
-        if not isinstance(provider, MutableMapping):
-            continue
-        api_key = provider.get("api_key")
-        if isinstance(api_key, str) and api_key:
-            provider["api_key"] = _REDACTED_API_KEY
+    _redact_api_key_fields(source_document)
     return tomlkit.dumps(source_document)
+
+
+def _redact_api_key_fields(value: object) -> None:
+    if isinstance(value, MutableSequence):
+        for item in value:
+            _redact_api_key_fields(item)
+        return
+    if not isinstance(value, MutableMapping):
+        return
+    for field, item in value.items():
+        if isinstance(field, str) and _API_KEY_FIELD_PATTERN.fullmatch(field) and item != "":
+            value[field] = _REDACTED_API_KEY
+            continue
+        _redact_api_key_fields(item)
 
 
 def _redact_unparsed_content(content: str) -> str:
     def redact_line(match: re.Match[str]) -> str:
         return f'{match.group("prefix")}"{_REDACTED_API_KEY}"'
 
-    return _API_KEY_LINE_PATTERN.sub(redact_line, content)
+    def redact_remainder(match: re.Match[str]) -> str:
+        return f'{match.group("prefix")}{match.group("spacing")}"{_REDACTED_API_KEY}"'
+
+    without_multiline_keys = _API_KEY_MULTILINE_PATTERN.sub(redact_line, content)
+    without_string_keys = _API_KEY_STRING_ASSIGNMENT_PATTERN.sub(
+        redact_line,
+        without_multiline_keys,
+    )
+    without_unsafe_remainder = _API_KEY_UNSAFE_REMAINDER_PATTERN.sub(
+        redact_remainder,
+        without_string_keys,
+    )
+    return _API_KEY_LINE_PATTERN.sub(redact_line, without_unsafe_remainder)
 
 
 def _parse_runtime(document: Mapping[str, object]) -> RuntimeConfiguration:

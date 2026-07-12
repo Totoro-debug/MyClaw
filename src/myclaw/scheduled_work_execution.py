@@ -21,6 +21,7 @@ from myclaw.contracts import (
     SessionError,
     SessionMetadata,
     SessionStore,
+    ToolResult,
     ToolSessionMessage,
     UserModelMessage,
     UserSessionMessage,
@@ -28,6 +29,7 @@ from myclaw.contracts import (
 from myclaw.conversation import model_message_from_session
 from myclaw.prompts import chat_system_prompt, current_user_input
 from myclaw.session_titles import normalize_session_title
+from myclaw.tool_artifacts import ArtifactDiscardError
 from myclaw.tool_gateway import ToolGateway
 from myclaw.workspace import Workspace
 
@@ -265,11 +267,50 @@ class ScheduledWorkRunner:
                 try:
                     await self._sessions.append_message(task.session_id, tool_message)
                 except (OSError, UnicodeError, ValueError):
+                    await self._reconcile_tool_artifact(
+                        session_id=task.session_id,
+                        gateway=gateway,
+                        result=result,
+                        tool_message=tool_message,
+                    )
                     return ScheduledWorkRunResult(
                         status="failed",
                         content="",
                         error=_SESSION_FAILURE,
                     )
+                except BaseException:
+                    await self._reconcile_tool_artifact(
+                        session_id=task.session_id,
+                        gateway=gateway,
+                        result=result,
+                        tool_message=tool_message,
+                    )
+                    raise
+                gateway.commit_artifact(result)
+
+    async def _reconcile_tool_artifact(
+        self,
+        *,
+        session_id: str,
+        gateway: ToolGateway,
+        result: ToolResult,
+        tool_message: ToolSessionMessage,
+    ) -> None:
+        try:
+            reloaded = await self._sessions.load(session_id)
+        except BaseException:
+            gateway.commit_artifact(result)
+            return
+        if tool_message in reloaded.messages:
+            gateway.commit_artifact(result)
+            return
+        if any(message.id == tool_message.id for message in reloaded.messages):
+            gateway.commit_artifact(result)
+            return
+        try:
+            gateway.discard_artifact(result)
+        except ArtifactDiscardError:
+            pass
 
     def _persisted_now(self) -> datetime:
         value = self._now()

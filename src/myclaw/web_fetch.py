@@ -327,7 +327,11 @@ class PublicWebFetchBoundary:
                 requested_port = parsed.port
             except ValueError as exc:
                 raise WebFetchRejected("WebFetch URL could not be verified") from exc
-            port = requested_port or (443 if scheme == "https" else 80)
+            if requested_port == 0:
+                raise WebFetchRejected("WebFetch URL could not be verified")
+            port = (
+                requested_port if requested_port is not None else (443 if scheme == "https" else 80)
+            )
             answers = await self._resolver.resolve(hostname, port)
             if not answers:
                 raise WebFetchRejected("WebFetch could not verify a public target")
@@ -459,6 +463,7 @@ def _normalize_public_ip(value: str) -> str:
         or address.is_unspecified
         or address.is_multicast
         or address.is_reserved
+        or (isinstance(address, IPv6Address) and address.is_site_local)
     ):
         raise ValueError("address is not globally routable")
     return str(address)
@@ -485,6 +490,7 @@ class _ReadableHTMLParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._parts: list[str] = []
+        self._ignored_element: str | None = None
         self._ignored_depth = 0
 
     def handle_starttag(
@@ -494,16 +500,23 @@ class _ReadableHTMLParser(HTMLParser):
     ) -> None:
         del attrs
         normalized = tag.lower()
+        if self._ignored_element is not None:
+            if normalized == self._ignored_element:
+                self._ignored_depth += 1
+            return
         if normalized in _HTML_IGNORED_ELEMENTS:
+            self._ignored_element = normalized
             self._ignored_depth += 1
-        elif self._ignored_depth == 0 and normalized in _HTML_BLOCK_ELEMENTS:
+        elif normalized in _HTML_BLOCK_ELEMENTS:
             self._parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         normalized = tag.lower()
-        if self._ignored_depth:
-            if normalized in _HTML_IGNORED_ELEMENTS:
+        if self._ignored_element is not None:
+            if normalized == self._ignored_element:
                 self._ignored_depth -= 1
+                if self._ignored_depth == 0:
+                    self._ignored_element = None
             return
         if normalized in _HTML_BLOCK_ELEMENTS:
             self._parts.append("\n")

@@ -3,6 +3,7 @@ import base64
 import ctypes
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -377,6 +378,33 @@ class FaultingTerminateProcess:
         self.waited = True
 
 
+class TransientCleanupFailureProcess:
+    def __init__(self) -> None:
+        self._released = asyncio.Event()
+        self.communicate_started = asyncio.Event()
+        self.terminate_calls = 0
+        self.wait_calls = 0
+        self.reaped = False
+
+    async def communicate(self) -> tuple[bytes, bytes | None]:
+        self.communicate_started.set()
+        await self._released.wait()
+        return b"stopped", None
+
+    async def terminate(self) -> None:
+        self.terminate_calls += 1
+        if self.terminate_calls == 1:
+            raise OSError("transient terminate failure")
+        self._released.set()
+
+    async def wait(self) -> None:
+        self.wait_calls += 1
+        if self.wait_calls == 1:
+            raise OSError("transient wait failure")
+        await self._released.wait()
+        self.reaped = True
+
+
 class ImmediateTimeoutWaiter:
     def __init__(self) -> None:
         self.timeouts: list[int] = []
@@ -484,26 +512,51 @@ async def test_repeated_successful_commands_do_not_accumulate_windows_handles(
 
 
 @pytest.mark.parametrize(
-    ("requested", "executed"),
+    ("requested", "arguments"),
     (
-        ("git status", "git --no-pager status"),
-        ("git status --short", "git --no-pager status --short"),
+        (
+            "git status",
+            ("-c", "core.fsmonitor=false", "--no-pager", "status"),
+        ),
+        (
+            "git status --short",
+            ("-c", "core.fsmonitor=false", "--no-pager", "status", "--short"),
+        ),
         (
             "git diff --stat",
-            "git --no-pager diff --no-ext-diff --no-textconv --stat",
+            (
+                "-c",
+                "core.fsmonitor=false",
+                "--no-pager",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--stat",
+            ),
         ),
         (
             "git diff --name-only",
-            "git --no-pager diff --no-ext-diff --no-textconv --name-only",
+            (
+                "-c",
+                "core.fsmonitor=false",
+                "--no-pager",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--name-only",
+            ),
         ),
     ),
 )
 @pytest.mark.asyncio
 async def test_allowlisted_git_commands_disable_pager_external_diff_and_textconv(
     requested: str,
-    executed: str,
+    arguments: tuple[str, ...],
     workspace: Path,
 ) -> None:
+    discovered_git = shutil.which("git")
+    assert discovered_git is not None
+    executed = _platform_shell_command([str(Path(discovered_git).resolve(strict=True)), *arguments])
     spawner = FakeProcessSpawner(FakeShellProcess(b"git output\n"))
     shell = SubprocessShellBoundary(spawner=spawner)
 
@@ -763,6 +816,61 @@ async def test_cleanup_failure_does_not_replace_cancellation_or_timeout(
 
     assert process.communicate_finished or process.communicate_cancelled
     assert process.waited is True
+
+
+@pytest.mark.asyncio
+async def test_close_retries_transient_failed_cleanup_and_reaps_the_process(
+    workspace: Path,
+) -> None:
+    process = TransientCleanupFailureProcess()
+    shell = SubprocessShellBoundary(
+        spawner=FakeProcessSpawner(process),
+        waiter=ImmediateTimeoutWaiter(),
+    )
+
+    with pytest.raises(TimeoutError) as raised:
+        await shell.execute(ShellRequest(command="timed-out", cwd=workspace.resolve(), timeout=60))
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert process.terminate_calls == 1
+    assert process.wait_calls == 1
+    assert process.reaped is False
+
+    await shell.close()
+    await shell.close()
+
+    assert process.terminate_calls == 2
+    assert process.wait_calls == 2
+    assert process.reaped is True
+
+
+@pytest.mark.asyncio
+async def test_close_retries_cleanup_failed_after_cancellation_during_spawn(
+    workspace: Path,
+) -> None:
+    process = TransientCleanupFailureProcess()
+    spawner = DelayedProcessSpawner(process)
+    shell = SubprocessShellBoundary(spawner=spawner)
+    execution = asyncio.create_task(
+        shell.execute(ShellRequest(command="starting", cwd=workspace.resolve(), timeout=60))
+    )
+    await spawner.created.wait()
+
+    execution.cancel()
+    spawner.release.set()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await execution
+    assert isinstance(raised.value.__cause__, OSError)
+    assert process.terminate_calls == 1
+    assert process.wait_calls == 1
+    assert process.reaped is False
+
+    await shell.close()
+
+    assert process.terminate_calls == 2
+    assert process.wait_calls == 2
+    assert process.reaped is True
 
 
 @pytest.mark.asyncio

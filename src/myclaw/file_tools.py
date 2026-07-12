@@ -1,8 +1,46 @@
 """Workspace-bounded built-in file tools."""
 
+import os
+from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 
 from myclaw.contracts import JsonObject, ToolDefinition, ToolExecutionContext
+from myclaw.workspace import Workspace
+
+_WINDOWS_RESERVED_BASENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadRoots:
+    workspace: Path
+    agent_home: Path
+    long_term_memory: Path
+    artifact_directory: Path
+    session_id: str
+
+    def scope(self, target: Path) -> str | None:
+        if target == self.agent_home or target.is_relative_to(self.agent_home):
+            if target == self.long_term_memory:
+                return "memory"
+            if target == self.artifact_directory or target.is_relative_to(self.artifact_directory):
+                return "artifact"
+            return None
+        if target.is_relative_to(self.workspace):
+            return "workspace"
+        return None
+
+    def reported_path(self, target: Path, scope: str) -> str:
+        if scope == "memory":
+            return "memory/memory.md"
+        if scope == "artifact":
+            suffix = target.relative_to(self.artifact_directory)
+            return (Path("artifacts") / self.session_id / suffix).as_posix()
+        return target.relative_to(self.workspace).as_posix()
 
 
 class FileToolArgumentsError(ValueError):
@@ -51,9 +89,12 @@ class ReadFileTool:
             minimum=1,
             maximum=10000,
         )
-        target = _workspace_path(context.workspace.resolve(strict=True), path)
-        if not target.is_file():
+        target = _workspace_path(context, path)
+        status = target.lstat()
+        if not S_ISREG(status.st_mode):
             raise FileToolArgumentsError("path must identify a regular file")
+        if status.st_nlink != 1:
+            raise FileToolAccessDenied("path must identify an unaliased regular file")
         raw_content = target.read_bytes()
         if b"\x00" in raw_content:
             raise UnicodeError("file contains binary NUL bytes")
@@ -98,8 +139,8 @@ class ListFilesTool:
             minimum=1,
             maximum=10000,
         )
-        workspace = context.workspace.resolve(strict=True)
-        target = _workspace_path(workspace, path)
+        roots = _read_roots(context)
+        target = _workspace_path(context, path, roots=roots)
         if not target.is_dir():
             raise FileToolArgumentsError("path must identify a directory")
 
@@ -110,12 +151,21 @@ class ListFilesTool:
                 resolved = candidate.resolve(strict=True)
             except OSError:
                 continue
-            if not resolved.is_relative_to(workspace):
+            scope = roots.scope(resolved)
+            if scope is None:
                 continue
-            if not (resolved.is_file() or resolved.is_dir()):
+            is_file = resolved.is_file()
+            is_directory = resolved.is_dir()
+            if not (is_file or is_directory):
                 continue
-            relative = candidate.relative_to(workspace).as_posix()
-            if resolved.is_dir():
+            if is_file:
+                try:
+                    if resolved.lstat().st_nlink != 1:
+                        continue
+                except OSError:
+                    continue
+            relative = roots.reported_path(resolved, scope)
+            if is_directory:
                 relative += "/"
             entries.append(relative)
         return "\n".join(sorted(entries)[:max_entries])
@@ -161,8 +211,8 @@ class SearchFilesTool:
             minimum=1,
             maximum=1000,
         )
-        workspace = context.workspace.resolve(strict=True)
-        target = _workspace_path(workspace, path)
+        roots = _read_roots(context)
+        target = _workspace_path(context, path, roots=roots)
         if target.is_file():
             candidates = [target]
         elif target.is_dir():
@@ -176,9 +226,15 @@ class SearchFilesTool:
                 resolved = candidate.resolve(strict=True)
             except OSError:
                 continue
-            if not resolved.is_relative_to(workspace) or not resolved.is_file():
+            scope = roots.scope(resolved)
+            if scope is None or not resolved.is_file():
                 continue
-            relative = candidate.relative_to(workspace).as_posix()
+            try:
+                if resolved.lstat().st_nlink != 1:
+                    continue
+            except OSError:
+                continue
+            relative = roots.reported_path(resolved, scope)
             if glob is not None:
                 try:
                     if not Path(relative).match(glob):
@@ -205,17 +261,75 @@ class SearchFilesTool:
         return "\n".join(matches)
 
 
-def _workspace_path(workspace: Path, requested: str) -> Path:
+def _workspace_path(
+    context: ToolExecutionContext,
+    requested: str,
+    *,
+    roots: _ReadRoots | None = None,
+) -> Path:
+    roots = _read_roots(context) if roots is None else roots
     candidate = Path(requested)
+    if os.name == "nt" and any(_is_windows_reserved(part) for part in candidate.parts):
+        raise FileToolAccessDenied("path identifies a Windows device")
     if not candidate.is_absolute():
-        candidate = workspace / candidate
+        if candidate.parts and candidate.parts[0] == "artifacts":
+            workspace_slug = Workspace.from_path(context.workspace).slug
+            candidate = roots.agent_home / "sessions" / workspace_slug / candidate
+        else:
+            candidate = roots.workspace / candidate
+    else:
+        candidate = _io_path(candidate)
     try:
         resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise FileToolArgumentsError("path does not exist") from exc
-    if not resolved.is_relative_to(workspace):
+    scope = roots.scope(resolved)
+    if scope is None and (
+        resolved == roots.agent_home or resolved.is_relative_to(roots.agent_home)
+    ):
+        raise FileToolAccessDenied("Agent Home internal state is not readable by file tools")
+    if scope is None:
         raise FileToolAccessDenied("path resolves outside the Workspace")
+    relative_parts = (
+        resolved.relative_to(roots.agent_home).parts
+        if scope in {"memory", "artifact"}
+        else resolved.relative_to(roots.workspace).parts
+    )
+    if os.name == "nt" and any(":" in part for part in relative_parts):
+        raise FileToolAccessDenied("path identifies a Windows alternate data stream")
     return resolved
+
+
+def _read_roots(context: ToolExecutionContext) -> _ReadRoots:
+    workspace = _io_path(context.workspace).resolve(strict=True)
+    agent_home = _io_path(context.agent_home).resolve(strict=False)
+    workspace_slug = Workspace.from_path(context.workspace).slug
+    return _ReadRoots(
+        workspace=workspace,
+        agent_home=agent_home,
+        long_term_memory=agent_home / "memory" / "memory.md",
+        artifact_directory=(
+            agent_home / "sessions" / workspace_slug / "artifacts" / context.session_id
+        ),
+        session_id=context.session_id,
+    )
+
+
+def _is_windows_reserved(component: str) -> bool:
+    normalized = component.rstrip(" .")
+    basename = normalized.split(".", maxsplit=1)[0].upper()
+    return basename in _WINDOWS_RESERVED_BASENAMES
+
+
+def _io_path(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    native = str(path.absolute())
+    if native.startswith("\\\\?\\"):
+        return path
+    if native.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{native.lstrip('\\')}")
+    return Path(f"\\\\?\\{native}")
 
 
 def _reject_unknown(arguments: JsonObject, allowed: set[str]) -> None:

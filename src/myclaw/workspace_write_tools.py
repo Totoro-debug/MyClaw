@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from stat import S_ISREG
 
 from myclaw.contracts import JsonObject, ToolDefinition, ToolExecutionContext
 from myclaw.file_tools import FileToolAccessDenied, FileToolArgumentsError
@@ -29,10 +30,14 @@ def resolve_workspace_write_path(context: ToolExecutionContext, requested: str) 
     if target == agent_home or target.is_relative_to(agent_home):
         raise FileToolAccessDenied("Agent Home internal state cannot be changed by file tools")
     relative_parts = target.relative_to(workspace).parts
+    if os.name == "nt" and any(":" in part for part in relative_parts):
+        raise FileToolAccessDenied("path identifies a Windows alternate data stream")
     if os.name == "nt" and any(_is_windows_reserved(part) for part in relative_parts):
         raise FileToolAccessDenied("path identifies a Windows device")
-    if target.exists() and not target.is_file():
-        raise FileToolAccessDenied("path must identify a regular file")
+    if target.exists():
+        status = target.lstat()
+        if not S_ISREG(status.st_mode) or status.st_nlink != 1:
+            raise FileToolAccessDenied("path must identify an unaliased regular file")
     existing_parent = target.parent
     while not existing_parent.exists():
         existing_parent = existing_parent.parent

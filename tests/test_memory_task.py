@@ -412,53 +412,13 @@ async def test_memory_task_denies_an_external_memory_directory_alias(
     except (OSError, subprocess.CalledProcessError) as error:
         pytest.skip(f"directory junctions are unavailable on this host: {error}")
     home = AgentHome(agent_home)
-    home.initialize()
-    summaries = JsonlSummaryStore(home)
-    await summaries.append("A pending summary.", NOW)
-    memory_path = agent_home / "memory" / "memory.md"
-    provider = ScriptedFakeProvider(
-        completions=(
-            _response(
-                "",
-                tool_calls=(
-                    ModelToolCall(
-                        id="read-memory",
-                        name="read_file",
-                        arguments={"path": str(memory_path)},
-                    ),
-                ),
-            ),
-            _response("No update needed."),
-        )
-    )
-    manager = MemoryManager(
-        provider=provider,
-        summaries=summaries,
-        memory=FileMemoryStore(home),
-        long_term_path=memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-        batch_size=10,
-    )
 
-    result = await manager.run_manual()
+    with pytest.raises(
+        PermissionError,
+        match="memory directory must remain inside Agent Home",
+    ):
+        home.initialize()
 
-    assert result.error == ErrorInfo(
-        code="persistence_error",
-        message="Memory Task state could not be read.",
-    )
-    model_requests = [
-        request for request in provider.complete_requests if isinstance(request, ModelRequest)
-    ]
-    assert secret not in json.dumps(
-        [request.to_dict() for request in model_requests], ensure_ascii=False
-    )
-    assert model_requests == []
     assert (outside / "memory.md").read_text(encoding="utf-8") == secret
     assert not (outside / ".cursor").exists()
 

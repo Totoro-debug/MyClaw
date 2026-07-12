@@ -28,7 +28,11 @@ def assess_permission(
             request = parse_shell_request(tool_call.arguments, context.workspace)
         except ShellPolicyDenied:
             return PermissionAssessment(decision=PermissionDecision.DENY)
-        decision = assess_shell_command(request.command)
+        decision = assess_shell_command(
+            request.command,
+            cwd=request.cwd,
+            workspace=request.workspace_root,
+        )
         if decision is PermissionDecision.ASK:
             return PermissionAssessment(
                 decision=decision,

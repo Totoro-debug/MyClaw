@@ -69,6 +69,11 @@ class AssistantModelMessage:
     content: str
     tool_calls: tuple[ModelToolCall, ...] = ()
 
+    def __post_init__(self) -> None:
+        tool_call_ids = [tool_call.id for tool_call in self.tool_calls]
+        if len(set(tool_call_ids)) != len(tool_call_ids):
+            raise ValueError("assistant tool call IDs must be unique")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "role": self.role,

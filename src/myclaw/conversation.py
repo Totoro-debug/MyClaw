@@ -1,7 +1,7 @@
 """Conversation Port implementation for the first successful streaming turn."""
 
 import asyncio
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -20,6 +20,7 @@ from myclaw.contracts import (
     ModelMessage,
     ModelProvider,
     ModelRequest,
+    ModelStreamEvent,
     ModelToolCall,
     ModelUsage,
     PermissionRequestedPayload,
@@ -42,6 +43,7 @@ from myclaw.contracts import (
 )
 from myclaw.prompts import current_user_input
 from myclaw.session_titles import normalize_session_title
+from myclaw.tool_artifacts import ArtifactDiscardError
 from myclaw.tool_gateway import ToolGateway
 
 
@@ -133,7 +135,26 @@ class StreamingConversationPort:
             created_at=user_created_at,
             content=text,
         )
-        await self._sessions.append_message(self._session_id, user_message)
+        try:
+            await self._sessions.append_message(self._session_id, user_message)
+        except asyncio.CancelledError:
+            yield await self._cancelled_event(turn_id, [], [])
+            return
+        except (OSError, UnicodeError, ValueError):
+            yield self._event(
+                turn_id,
+                "turn_failed",
+                TurnFailedPayload(
+                    error=ErrorInfo(
+                        code="persistence_error",
+                        message="Conversation Session could not be updated.",
+                    )
+                ),
+            )
+            return
+        if self._cancel_requested:
+            yield await self._cancelled_event(turn_id, [], [])
+            return
         if self._title_prompt is not None and self._title_task is None:
             title_task = asyncio.create_task(
                 self._generate_title_for_first_user(
@@ -147,14 +168,36 @@ class StreamingConversationPort:
             self._title_task = title_task
         partial_content: list[str] = []
         pending_tool_calls: list[ModelToolCall] = []
+        pending_repair_error: SessionError | None = None
+        provider_stream: AsyncIterator[ModelStreamEvent] | None = None
         try:
             while True:
                 partial_content = []
-                session = await self._sessions.load(self._session_id)
+                try:
+                    session = await self._sessions.load(self._session_id)
+                except (OSError, UnicodeError, ValueError):
+                    yield self._event(
+                        turn_id,
+                        "turn_failed",
+                        TurnFailedPayload(
+                            error=ErrorInfo(
+                                code="persistence_error",
+                                message="Conversation Session could not be read.",
+                            )
+                        ),
+                    )
+                    return
                 if self._history_preparer is not None:
                     session = await self._history_preparer(session)
                 request = self._model_request(session, current_user=user_message)
-                async for model_event in self._provider.stream(request):
+                await self._close_provider_stream(provider_stream)
+                try:
+                    provider_stream = self._provider.stream(request)
+                except ModelCallError:
+                    raise
+                except Exception:
+                    raise _unexpected_provider_failure() from None
+                async for model_event in self._provider_events(provider_stream):
                     if isinstance(model_event, TextDelta):
                         partial_content.append(model_event.delta)
                         yield self._event(
@@ -172,9 +215,8 @@ class StreamingConversationPort:
                         continue
                     if isinstance(model_event, ModelCompleted):
                         response = model_event.response
-                        await self._sessions.append_message(
-                            self._session_id,
-                            AssistantSessionMessage(
+                        try:
+                            assistant_message = AssistantSessionMessage(
                                 id=str(self._new_uuid()),
                                 created_at=self._persisted_now(),
                                 content=response.message.content,
@@ -182,8 +224,47 @@ class StreamingConversationPort:
                                 status="completed",
                                 error=None,
                                 usage=response.usage,
-                            ),
-                        )
+                            )
+                        except ValueError:
+                            raise _unexpected_provider_failure() from None
+                        try:
+                            await self._sessions.append_message(
+                                self._session_id,
+                                assistant_message,
+                            )
+                        except asyncio.CancelledError:
+                            publication = await self._session_message_publication(assistant_message)
+                            if publication is True:
+                                partial_content.clear()
+                                pending_tool_calls = list(assistant_message.tool_calls)
+                            raise
+                        except (OSError, UnicodeError, ValueError):
+                            publication = await self._session_message_publication(assistant_message)
+                            if publication is True:
+                                pending_tool_calls = list(assistant_message.tool_calls)
+                                pending_repair_error = SessionError(
+                                    code="persistence_error",
+                                    message="Assistant response could not be persisted.",
+                                )
+                                try:
+                                    await self._repair_unfinished_tool_calls(
+                                        pending_tool_calls,
+                                        error=pending_repair_error,
+                                    )
+                                except (OSError, UnicodeError, ValueError):
+                                    pass
+                            yield self._event(
+                                turn_id,
+                                "turn_failed",
+                                TurnFailedPayload(
+                                    error=ErrorInfo(
+                                        code="persistence_error",
+                                        message="Conversation Session could not be updated.",
+                                    )
+                                ),
+                            )
+                            return
+                        partial_content = []
                         if response.message.tool_calls and self._tool_gateway is not None:
                             pending_tool_calls = list(response.message.tool_calls)
                             for tool_call in response.message.tool_calls:
@@ -231,26 +312,88 @@ class StreamingConversationPort:
                                     tool_call,
                                     approved=approved,
                                 )
-                                await self._sessions.append_message(
-                                    self._session_id,
-                                    ToolSessionMessage(
-                                        id=str(self._new_uuid()),
-                                        created_at=self._persisted_now(),
-                                        tool_call_id=result.tool_call_id,
-                                        name=result.name,
-                                        content=result.content,
-                                        status=result.status,
-                                        error=(
-                                            None
-                                            if result.error is None
-                                            else SessionError(
-                                                code=result.error.code,
-                                                message=result.error.message,
+                                tool_message = ToolSessionMessage(
+                                    id=str(self._new_uuid()),
+                                    created_at=self._persisted_now(),
+                                    tool_call_id=result.tool_call_id,
+                                    name=result.name,
+                                    content=result.content,
+                                    status=result.status,
+                                    error=(
+                                        None
+                                        if result.error is None
+                                        else SessionError(
+                                            code=result.error.code,
+                                            message=result.error.message,
+                                        )
+                                    ),
+                                    artifact=result.artifact,
+                                )
+                                try:
+                                    await self._sessions.append_message(
+                                        self._session_id,
+                                        tool_message,
+                                    )
+                                except (OSError, UnicodeError, ValueError):
+                                    publication = await self._session_message_publication(
+                                        tool_message
+                                    )
+                                    if publication is False:
+                                        try:
+                                            self._tool_gateway.discard_artifact(result)
+                                        except ArtifactDiscardError:
+                                            pass
+                                    elif publication is True:
+                                        self._tool_gateway.commit_artifact(result)
+                                        pending_tool_calls.pop(0)
+                                    else:
+                                        self._tool_gateway.commit_artifact(result)
+                                    pending_repair_error = SessionError(
+                                        code="persistence_error",
+                                        message="Tool result could not be persisted.",
+                                    )
+                                    try:
+                                        await self._repair_unfinished_tool_calls(
+                                            pending_tool_calls,
+                                            error=pending_repair_error,
+                                        )
+                                    except (OSError, UnicodeError, ValueError):
+                                        pass
+                                    yield self._event(
+                                        turn_id,
+                                        "turn_failed",
+                                        TurnFailedPayload(
+                                            error=ErrorInfo(
+                                                code="persistence_error",
+                                                message=(
+                                                    "Conversation Session could not be updated."
+                                                ),
                                             )
                                         ),
-                                        artifact=result.artifact,
-                                    ),
-                                )
+                                    )
+                                    return
+                                except asyncio.CancelledError:
+                                    publication = await self._session_message_publication(
+                                        tool_message
+                                    )
+                                    if publication is False:
+                                        try:
+                                            self._tool_gateway.discard_artifact(result)
+                                        except ArtifactDiscardError:
+                                            pass
+                                    elif publication is True:
+                                        self._tool_gateway.commit_artifact(result)
+                                        pending_tool_calls.pop(0)
+                                    else:
+                                        self._tool_gateway.commit_artifact(result)
+                                    raise
+                                except BaseException:
+                                    try:
+                                        self._tool_gateway.discard_artifact(result)
+                                    except ArtifactDiscardError:
+                                        pass
+                                    raise
+                                self._tool_gateway.commit_artifact(result)
                                 pending_tool_calls.pop(0)
                                 yield self._event(
                                     turn_id,
@@ -279,7 +422,7 @@ class StreamingConversationPort:
                             ),
                         )
                         return
-                    raise TypeError("Unsupported Model Provider stream event")
+                    raise _unexpected_provider_failure()
                 else:
                     raise ModelCallError(
                         ErrorInfo(
@@ -295,27 +438,47 @@ class StreamingConversationPort:
                     pending_tool_calls,
                 )
                 return
-            await self._sessions.append_message(
-                self._session_id,
-                AssistantSessionMessage(
-                    id=str(self._new_uuid()),
-                    created_at=self._persisted_now(),
-                    content="".join(partial_content),
-                    tool_calls=(),
-                    status="error",
-                    error=SessionError(
-                        code=failure.error.code,
-                        message=failure.error.message,
-                    ),
-                    usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+            terminal_error = failure.error
+            error_message = AssistantSessionMessage(
+                id=str(self._new_uuid()),
+                created_at=self._persisted_now(),
+                content="".join(partial_content),
+                tool_calls=(),
+                status="error",
+                error=SessionError(
+                    code=failure.error.code,
+                    message=failure.error.message,
                 ),
+                usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
             )
+            try:
+                await self._sessions.append_message(
+                    self._session_id,
+                    error_message,
+                )
+            except asyncio.CancelledError:
+                if await self._session_message_publication(error_message) is True:
+                    partial_content.clear()
+                yield await self._cancelled_event(
+                    turn_id,
+                    partial_content,
+                    pending_tool_calls,
+                )
+                return
+            except (OSError, UnicodeError, ValueError):
+                terminal_error = ErrorInfo(
+                    code="persistence_error",
+                    message="Conversation Session could not be updated.",
+                )
             yield self._event(
                 turn_id,
                 "turn_failed",
-                TurnFailedPayload(error=failure.error),
+                TurnFailedPayload(error=terminal_error),
             )
             return
+        except GeneratorExit:
+            await self._persist_cancelled_state(partial_content, pending_tool_calls)
+            raise
         except asyncio.CancelledError:
             yield await self._cancelled_event(
                 turn_id,
@@ -324,7 +487,14 @@ class StreamingConversationPort:
             )
             return
         finally:
-            await self._repair_unfinished_tool_calls(pending_tool_calls)
+            try:
+                await self._repair_unfinished_tool_calls(
+                    pending_tool_calls,
+                    error=pending_repair_error,
+                )
+            except (OSError, UnicodeError, ValueError):
+                pending_tool_calls.clear()
+            await self._close_provider_stream(provider_stream)
 
     async def _generate_title_for_first_user(
         self,
@@ -401,8 +571,10 @@ class StreamingConversationPort:
             reasoning_effort=self._settings.reasoning_effort,
             timeout_seconds=self._settings.timeout_seconds,
         )
+        provider_stream: AsyncIterator[ModelStreamEvent] | None = None
         try:
-            async for model_event in self._provider.stream(request):
+            provider_stream = self._provider.stream(request)
+            async for model_event in provider_stream:
                 if not isinstance(model_event, ModelCompleted):
                     continue
                 if not model_event.response.message.tool_calls:
@@ -413,6 +585,8 @@ class StreamingConversationPort:
                 break
         except Exception:
             pass
+        finally:
+            await self._close_provider_stream(provider_stream)
         await self._sessions.update_metadata(
             session_id,
             MetadataUpdate(
@@ -469,51 +643,127 @@ class StreamingConversationPort:
         partial_chunks: list[str],
         pending_tool_calls: list[ModelToolCall],
     ) -> AgentEvent:
-        partial_content = "".join(partial_chunks)
-        if partial_content:
-            await self._sessions.append_message(
-                self._session_id,
-                AssistantSessionMessage(
-                    id=str(self._new_uuid()),
-                    created_at=self._persisted_now(),
-                    content=partial_content,
-                    tool_calls=(),
-                    status="interrupted",
-                    error=SessionError(
-                        code="turn_cancelled",
-                        message="Turn interrupted by user.",
-                    ),
-                    usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
-                ),
-            )
-        await self._repair_unfinished_tool_calls(pending_tool_calls)
+        await self._persist_cancelled_state(partial_chunks, pending_tool_calls)
         return self._event(
             turn_id,
             "turn_cancelled",
-            TurnCancelledPayload(partial_content=partial_content),
+            TurnCancelledPayload(partial_content="".join(partial_chunks)),
         )
+
+    async def _persist_cancelled_state(
+        self,
+        partial_chunks: list[str],
+        pending_tool_calls: list[ModelToolCall],
+    ) -> None:
+        partial_content = "".join(partial_chunks)
+        if partial_content:
+            try:
+                await self._sessions.append_message(
+                    self._session_id,
+                    AssistantSessionMessage(
+                        id=str(self._new_uuid()),
+                        created_at=self._persisted_now(),
+                        content=partial_content,
+                        tool_calls=(),
+                        status="interrupted",
+                        error=SessionError(
+                            code="turn_cancelled",
+                            message="Turn interrupted by user.",
+                        ),
+                        usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+                    ),
+                )
+            except (OSError, UnicodeError, ValueError):
+                pass
+        try:
+            await self._repair_unfinished_tool_calls(pending_tool_calls)
+        except (OSError, UnicodeError, ValueError):
+            pass
 
     async def _repair_unfinished_tool_calls(
         self,
         pending_tool_calls: list[ModelToolCall],
+        *,
+        error: SessionError | None = None,
     ) -> None:
         while pending_tool_calls:
             tool_call = pending_tool_calls[0]
-            message = "Tool call interrupted because the turn was cancelled."
-            await self._sessions.append_message(
-                self._session_id,
-                ToolSessionMessage(
-                    id=str(self._new_uuid()),
-                    created_at=self._persisted_now(),
-                    tool_call_id=tool_call.id,
-                    name=tool_call.name,
-                    content=message,
-                    status="error",
-                    error=SessionError(code="turn_cancelled", message=message),
-                    artifact=None,
-                ),
+            failure = error or SessionError(
+                code="turn_cancelled",
+                message="Tool call interrupted because the turn was cancelled.",
             )
+            repair_message = ToolSessionMessage(
+                id=str(self._new_uuid()),
+                created_at=self._persisted_now(),
+                tool_call_id=tool_call.id,
+                name=tool_call.name,
+                content=failure.message,
+                status="error",
+                error=failure,
+                artifact=None,
+            )
+            try:
+                await self._sessions.append_message(
+                    self._session_id,
+                    repair_message,
+                )
+            except asyncio.CancelledError:
+                if await self._session_message_publication(repair_message) is True:
+                    pending_tool_calls.pop(0)
+                raise
+            except (OSError, UnicodeError, ValueError):
+                if await self._session_message_publication(repair_message) is True:
+                    pending_tool_calls.pop(0)
+                    continue
+                raise
             pending_tool_calls.pop(0)
+
+    async def _session_message_publication(
+        self,
+        expected: SessionMessage,
+    ) -> bool | None:
+        """Return whether an exact Session message is durable, or None if unknowable."""
+        try:
+            session = await self._sessions.load(self._session_id)
+        except (OSError, UnicodeError, ValueError):
+            return None
+        same_id = tuple(message for message in session.messages if message.id == expected.id)
+        if any(message == expected for message in same_id):
+            return True
+        if same_id:
+            return None
+        return False
+
+    @staticmethod
+    async def _provider_events(
+        stream: AsyncIterator[ModelStreamEvent],
+    ) -> AsyncGenerator[ModelStreamEvent, None]:
+        while True:
+            try:
+                event = await anext(stream)
+            except StopAsyncIteration:
+                return
+            except ModelCallError:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise _unexpected_provider_failure() from None
+            yield event
+
+    @staticmethod
+    async def _close_provider_stream(
+        stream: AsyncIterator[ModelStreamEvent] | None,
+    ) -> None:
+        if stream is None:
+            return
+        close = getattr(stream, "aclose", None)
+        if close is None:
+            return
+        try:
+            await close()
+        except Exception:
+            pass
 
     def _event(
         self,
@@ -543,6 +793,15 @@ def _consume_task_exception(task: asyncio.Future[None]) -> None:
 
 def _tool_activity_summary(action: str, tool_name: str) -> str:
     return " ".join(f"{action} {tool_name}".split())[:240]
+
+
+def _unexpected_provider_failure() -> ModelCallError:
+    return ModelCallError(
+        ErrorInfo(
+            code="model_failed",
+            message="The model request failed.",
+        )
+    )
 
 
 def model_message_from_session(

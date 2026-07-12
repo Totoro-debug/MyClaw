@@ -93,6 +93,14 @@ class ToolGateway:
             return assessment
         return None
 
+    def discard_artifact(self, result: ToolResult) -> bool:
+        """Roll back one artifact created by this Gateway but not persisted to its Session."""
+        return self._artifacts.discard(result)
+
+    def commit_artifact(self, result: ToolResult) -> bool:
+        """Release rollback ownership after the artifact reference is persisted."""
+        return self._artifacts.commit(result)
+
     async def execute(
         self,
         tool_call: ModelToolCall,

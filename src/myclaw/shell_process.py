@@ -2,13 +2,15 @@
 
 import asyncio
 import os
+import shlex
 import signal
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Protocol
 
-from myclaw.shell_policy import ShellRequest
+from myclaw.shell_policy import ShellPolicyDenied, ShellRequest, trusted_git_executable
 
 if sys.platform == "win32":
     from subprocess import CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW
@@ -17,11 +19,33 @@ if sys.platform == "win32":
 else:
     _WINDOWS_SHELL_CREATION_FLAGS = 0
 
-_HARDENED_GIT_COMMANDS: Final = {
-    "git status": "git --no-pager status",
-    "git status --short": "git --no-pager status --short",
-    "git diff --stat": "git --no-pager diff --no-ext-diff --no-textconv --stat",
-    "git diff --name-only": "git --no-pager diff --no-ext-diff --no-textconv --name-only",
+_HARDENED_GIT_ARGUMENTS: Final = {
+    "git status": ("-c", "core.fsmonitor=false", "--no-pager", "status"),
+    "git status --short": (
+        "-c",
+        "core.fsmonitor=false",
+        "--no-pager",
+        "status",
+        "--short",
+    ),
+    "git diff --stat": (
+        "-c",
+        "core.fsmonitor=false",
+        "--no-pager",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--stat",
+    ),
+    "git diff --name-only": (
+        "-c",
+        "core.fsmonitor=false",
+        "--no-pager",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--name-only",
+    ),
 }
 _WINDOWS_SHELL_BOOTSTRAP: Final = (
     "import subprocess, sys; "
@@ -57,7 +81,10 @@ class _AsyncioShellProcess:
         self._tree = tree
 
     async def communicate(self) -> tuple[bytes, bytes | None]:
-        return await self._process.communicate()
+        stdout, stderr = await self._process.communicate()
+        if self._process.returncode != 0:
+            raise RuntimeError("Shell command failed")
+        return stdout, stderr
 
     async def wait(self) -> None:
         await self._process.wait()
@@ -183,7 +210,7 @@ class SubprocessShellBoundary:
         self._closed = False
 
     async def execute(self, request: ShellRequest) -> str:
-        command = _HARDENED_GIT_COMMANDS.get(request.command, request.command)
+        command = _resolved_shell_command(request)
         async with self._lock:
             if self._closed:
                 raise RuntimeError("Shell process boundary is closed")
@@ -199,11 +226,18 @@ class SubprocessShellBoundary:
                     raise primary_error from cleanup_error
                 output = asyncio.create_task(process.communicate())
                 active = _ActiveProcess(process=process, output=output)
-                stop = asyncio.create_task(self._stop(active))
+                active.stop = asyncio.create_task(self._stop(active))
+                stop = active.stop
+                self._active[id(process)] = active
                 try:
                     await _await_stop(stop)
                 except BaseException as cleanup_error:
+                    if _stop_succeeded(stop):
+                        self._active.pop(id(process), None)
+                    else:
+                        active.stop = None
                     raise primary_error from cleanup_error
+                self._active.pop(id(process), None)
                 raise primary_error
             output = asyncio.create_task(process.communicate())
             active = _ActiveProcess(process=process, output=output)
@@ -220,7 +254,7 @@ class SubprocessShellBoundary:
             await self._terminate_and_wait(active)
         finally:
             async with self._lock:
-                if active.stop is not None and active.stop.done():
+                if _stop_succeeded(active.stop):
                     self._active.pop(id(process), None)
         return stdout.decode("utf-8", errors="replace")
 
@@ -234,7 +268,7 @@ class SubprocessShellBoundary:
         )
         async with self._lock:
             for item in active:
-                if item.stop is not None and item.stop.done():
+                if _stop_succeeded(item.stop):
                     self._active.pop(id(item.process), None)
         for result in results:
             if isinstance(result, BaseException):
@@ -245,7 +279,13 @@ class SubprocessShellBoundary:
             if active.stop is None:
                 active.stop = asyncio.create_task(self._stop(active))
             stop = active.stop
-        await _await_stop(stop)
+        try:
+            await _await_stop(stop)
+        except BaseException:
+            async with self._lock:
+                if active.stop is stop and not _stop_succeeded(stop):
+                    active.stop = None
+            raise
 
     @staticmethod
     async def _stop(active: _ActiveProcess) -> None:
@@ -269,6 +309,19 @@ class SubprocessShellBoundary:
             raise cleanup_error
 
 
+def _resolved_shell_command(request: ShellRequest) -> str:
+    arguments = _HARDENED_GIT_ARGUMENTS.get(request.command)
+    if arguments is None:
+        return request.command
+    executable = trusted_git_executable(workspace=request.workspace_root)
+    if executable is None:
+        raise ShellPolicyDenied("trusted Git executable is unavailable")
+    command = (os.fspath(executable), *arguments)
+    if os.name == "nt":
+        return subprocess.list2cmdline(command)
+    return shlex.join(command)
+
+
 async def _join_spawn(task: asyncio.Task[ShellProcess]) -> ShellProcess:
     while not task.done():
         try:
@@ -279,6 +332,10 @@ async def _join_spawn(task: asyncio.Task[ShellProcess]) -> ShellProcess:
         except BaseException:
             break
     return task.result()
+
+
+def _stop_succeeded(stop: asyncio.Task[None] | None) -> bool:
+    return stop is not None and stop.done() and not stop.cancelled() and stop.exception() is None
 
 
 async def _await_stop(stop: asyncio.Task[None]) -> None:

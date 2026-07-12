@@ -24,6 +24,7 @@ from myclaw.contracts import (
     ScheduledWork,
     ToolExecutionContext,
     ToolModelMessage,
+    ToolResult,
     ToolSessionMessage,
     UserSessionMessage,
 )
@@ -88,6 +89,36 @@ class FailingShellBoundary:
         raise OSError("private subprocess failure")
 
 
+class ObservingToolGateway(ToolGateway):
+    def __init__(
+        self,
+        *,
+        context: ToolExecutionContext,
+        max_tool_result_chars: int,
+    ) -> None:
+        super().__init__(
+            context=context,
+            max_tool_result_chars=max_tool_result_chars,
+        )
+        self.results: list[ToolResult] = []
+
+    async def execute(
+        self,
+        tool_call: ModelToolCall,
+        *,
+        approved: bool | None = None,
+    ) -> ToolResult:
+        result = await super().execute(tool_call, approved=approved)
+        self.results.append(result)
+        return result
+
+
+def _long_path(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    return Path(f"\\\\?\\{path.absolute()}")
+
+
 class LoadFailingSessionStore(JsonlSessionStore):
     def __init__(
         self,
@@ -112,6 +143,139 @@ class LoadFailingSessionStore(JsonlSessionStore):
         if self._load_calls == self._fail_on_load:
             raise OSError("private load failure")
         return await super().load(session_id)
+
+
+class ToolAppendFailingSessionStore(JsonlSessionStore):
+    async def append_message(
+        self,
+        session_id: str,
+        message: AssistantSessionMessage | ToolSessionMessage | UserSessionMessage,
+    ) -> None:
+        if isinstance(message, ToolSessionMessage):
+            raise OSError("injected pre-write Tool append failure")
+        await super().append_message(session_id, message)
+
+
+class IndeterminateToolAppendSessionStore(JsonlSessionStore):
+    def __init__(
+        self,
+        *,
+        agent_home: AgentHome,
+        workspace: Workspace,
+        now: Callable[[], datetime],
+        new_uuid: Callable[[], UUID],
+    ) -> None:
+        super().__init__(
+            agent_home=agent_home,
+            workspace=workspace,
+            now=now,
+            new_uuid=new_uuid,
+        )
+        self._fail_reconciliation_load = False
+
+    async def append_message(
+        self,
+        session_id: str,
+        message: AssistantSessionMessage | ToolSessionMessage | UserSessionMessage,
+    ) -> None:
+        if isinstance(message, ToolSessionMessage):
+            self._fail_reconciliation_load = True
+            raise OSError("injected indeterminate Tool append failure")
+        await super().append_message(session_id, message)
+
+    async def load(self, session_id: str) -> ConversationSession:
+        if self._fail_reconciliation_load:
+            self._fail_reconciliation_load = False
+            raise OSError("injected reconciliation load failure")
+        return await super().load(session_id)
+
+
+class BlockingToolAppendSessionStore(JsonlSessionStore):
+    def __init__(
+        self,
+        *,
+        agent_home: AgentHome,
+        workspace: Workspace,
+        now: Callable[[], datetime],
+        new_uuid: Callable[[], UUID],
+    ) -> None:
+        super().__init__(
+            agent_home=agent_home,
+            workspace=workspace,
+            now=now,
+            new_uuid=new_uuid,
+        )
+        self.tool_append_started = asyncio.Event()
+
+    async def append_message(
+        self,
+        session_id: str,
+        message: AssistantSessionMessage | ToolSessionMessage | UserSessionMessage,
+    ) -> None:
+        if isinstance(message, ToolSessionMessage):
+            self.tool_append_started.set()
+            await asyncio.Future()
+        await super().append_message(session_id, message)
+
+
+class EffectThenBlockToolAppendSessionStore(JsonlSessionStore):
+    def __init__(
+        self,
+        *,
+        agent_home: AgentHome,
+        workspace: Workspace,
+        now: Callable[[], datetime],
+        new_uuid: Callable[[], UUID],
+    ) -> None:
+        super().__init__(
+            agent_home=agent_home,
+            workspace=workspace,
+            now=now,
+            new_uuid=new_uuid,
+        )
+        self.tool_message_written = asyncio.Event()
+
+    async def append_message(
+        self,
+        session_id: str,
+        message: AssistantSessionMessage | ToolSessionMessage | UserSessionMessage,
+    ) -> None:
+        await super().append_message(session_id, message)
+        if isinstance(message, ToolSessionMessage):
+            self.tool_message_written.set()
+            await asyncio.Future()
+
+
+class ToolPublicationBaseError(BaseException):
+    pass
+
+
+class EffectThenRaiseToolAppendSessionStore(JsonlSessionStore):
+    def __init__(
+        self,
+        *,
+        failure: BaseException,
+        agent_home: AgentHome,
+        workspace: Workspace,
+        now: Callable[[], datetime],
+        new_uuid: Callable[[], UUID],
+    ) -> None:
+        super().__init__(
+            agent_home=agent_home,
+            workspace=workspace,
+            now=now,
+            new_uuid=new_uuid,
+        )
+        self._failure = failure
+
+    async def append_message(
+        self,
+        session_id: str,
+        message: AssistantSessionMessage | ToolSessionMessage | UserSessionMessage,
+    ) -> None:
+        await super().append_message(session_id, message)
+        if isinstance(message, ToolSessionMessage):
+            raise self._failure
 
 
 @pytest.mark.asyncio
@@ -375,6 +539,96 @@ async def test_scheduled_work_auto_refuses_ask_tools_and_completes_the_agent_tur
     assert isinstance(follow_up_tool, ToolModelMessage)
     assert follow_up_tool.tool_call_id == call.id
     assert follow_up_tool.content == tool_result.content
+
+
+@pytest.mark.asyncio
+async def test_scheduled_work_commits_a_published_oversized_tool_result(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=lambda: USER_UUID,
+    )
+    raw_result = "SCHEDULED OVERSIZED TOOL RESULT"
+    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
+    call = ModelToolCall(
+        id="call_scheduled_artifact",
+        name="read_file",
+        arguments={"path": "large.txt"},
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
+                usage=_usage(),
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspection complete."),
+                usage=_usage(),
+                finish_reason="stop",
+            ),
+        )
+    )
+    gateway = ObservingToolGateway(
+        context=ToolExecutionContext(
+            lane="scheduled_work",
+            workspace=workspace,
+            agent_home=agent_home,
+            session_id=TASK_SESSION_ID,
+        ),
+        max_tool_result_chars=1,
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter(
+            (
+                USER_UUID,
+                REQUEST_UUID,
+                ASSISTANT_UUID,
+                USER_TWO_UUID,
+                REQUEST_TWO_UUID,
+                ASSISTANT_TWO_UUID,
+            )
+        ).__next__,
+        tool_gateway_for=lambda _: gateway,
+    )
+
+    outcome = await runner.run(_task())
+
+    assert outcome.status == "completed"
+    session = await sessions.load(TASK_SESSION_ID)
+    assert [message.role for message in session.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    tool_message = session.messages[2]
+    assert isinstance(tool_message, ToolSessionMessage)
+    assert tool_message.artifact is not None
+    artifact_path = _long_path(
+        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_scheduled_artifact.txt"
+    )
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
+    assert gateway.discard_artifact(gateway.results[0]) is False
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
 
 
 @pytest.mark.asyncio
@@ -724,6 +978,447 @@ async def test_tool_result_publication_failure_is_isolated_from_the_next_task(
         "tool",
     ]
     assert not (workspace / "blocked.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_publication(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    publication_calls = 0
+
+    def fail_tool_metadata_publication(path: Path, content: bytes) -> None:
+        nonlocal publication_calls
+        publication_calls += 1
+        if publication_calls == 2:
+            raise OSError("injected metadata publication failure")
+        atomic_replace_bytes(path, content)
+
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=lambda: USER_UUID,
+        replace_bytes=fail_tool_metadata_publication,
+    )
+    raw_result = "DURABLE SCHEDULED ARTIFACT"
+    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
+    call = ModelToolCall(
+        id="call_effect_then_raise_artifact",
+        name="read_file",
+        arguments={"path": "large.txt"},
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
+                usage=_usage(),
+                finish_reason="tool_calls",
+            ),
+        )
+    )
+    gateway = ObservingToolGateway(
+        context=ToolExecutionContext(
+            lane="scheduled_work",
+            workspace=workspace,
+            agent_home=agent_home,
+            session_id=TASK_SESSION_ID,
+        ),
+        max_tool_result_chars=1,
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
+        tool_gateway_for=lambda _: gateway,
+    )
+
+    outcome = await runner.run(_task())
+
+    assert outcome.status == "failed"
+    assert outcome.error == ErrorInfo(
+        code="persistence_error",
+        message="Scheduled Work Session could not be updated.",
+    )
+    session = await sessions.load(TASK_SESSION_ID)
+    assert [message.role for message in session.messages] == ["user", "assistant", "tool"]
+    tool_message = session.messages[-1]
+    assert isinstance(tool_message, ToolSessionMessage)
+    assert tool_message.id == str(USER_TWO_UUID)
+    assert tool_message.artifact is not None
+    artifact_path = _long_path(
+        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_effect_then_raise_artifact.txt"
+    )
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
+    assert gateway.discard_artifact(gateway.results[0]) is False
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
+
+
+@pytest.mark.asyncio
+async def test_scheduled_work_discards_an_artifact_when_tool_message_was_not_written(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions = ToolAppendFailingSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=lambda: USER_UUID,
+    )
+    raw_result = "UNPUBLISHED SCHEDULED ARTIFACT"
+    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
+    call = ModelToolCall(
+        id="call_unpublished_artifact",
+        name="read_file",
+        arguments={"path": "large.txt"},
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
+                usage=_usage(),
+                finish_reason="tool_calls",
+            ),
+        )
+    )
+    gateway = ObservingToolGateway(
+        context=ToolExecutionContext(
+            lane="scheduled_work",
+            workspace=workspace,
+            agent_home=agent_home,
+            session_id=TASK_SESSION_ID,
+        ),
+        max_tool_result_chars=1,
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
+        tool_gateway_for=lambda _: gateway,
+    )
+
+    outcome = await runner.run(_task())
+
+    assert outcome.status == "failed"
+    assert outcome.error is not None
+    assert outcome.error.code == "persistence_error"
+    session = await sessions.load(TASK_SESSION_ID)
+    assert [message.role for message in session.messages] == ["user", "assistant"]
+    artifact_path = _long_path(
+        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_unpublished_artifact.txt"
+    )
+    assert not artifact_path.exists()
+    assert gateway.discard_artifact(gateway.results[0]) is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_work_preserves_an_artifact_when_publication_is_indeterminate(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions = IndeterminateToolAppendSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=lambda: USER_UUID,
+    )
+    raw_result = "INDETERMINATE SCHEDULED ARTIFACT"
+    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
+    call = ModelToolCall(
+        id="call_indeterminate_artifact",
+        name="read_file",
+        arguments={"path": "large.txt"},
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
+                usage=_usage(),
+                finish_reason="tool_calls",
+            ),
+        )
+    )
+    gateway = ObservingToolGateway(
+        context=ToolExecutionContext(
+            lane="scheduled_work",
+            workspace=workspace,
+            agent_home=agent_home,
+            session_id=TASK_SESSION_ID,
+        ),
+        max_tool_result_chars=1,
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
+        tool_gateway_for=lambda _: gateway,
+    )
+
+    outcome = await runner.run(_task())
+
+    assert outcome.status == "failed"
+    assert outcome.error is not None
+    assert outcome.error.code == "persistence_error"
+    session = await sessions.load(TASK_SESSION_ID)
+    assert [message.role for message in session.messages] == ["user", "assistant"]
+    artifact_path = _long_path(
+        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_indeterminate_artifact.txt"
+    )
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
+    assert gateway.discard_artifact(gateway.results[0]) is False
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
+
+
+@pytest.mark.asyncio
+async def test_cancelling_scheduled_tool_publication_discards_an_unpublished_artifact(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions = BlockingToolAppendSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=lambda: USER_UUID,
+    )
+    raw_result = "CANCELLED SCHEDULED ARTIFACT"
+    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
+    call = ModelToolCall(
+        id="call_cancelled_artifact",
+        name="read_file",
+        arguments={"path": "large.txt"},
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
+                usage=_usage(),
+                finish_reason="tool_calls",
+            ),
+        )
+    )
+    gateway = ObservingToolGateway(
+        context=ToolExecutionContext(
+            lane="scheduled_work",
+            workspace=workspace,
+            agent_home=agent_home,
+            session_id=TASK_SESSION_ID,
+        ),
+        max_tool_result_chars=1,
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
+        tool_gateway_for=lambda _: gateway,
+    )
+    execution = asyncio.create_task(runner.run(_task()))
+    await asyncio.wait_for(sessions.tool_append_started.wait(), timeout=1)
+
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    session = await sessions.load(TASK_SESSION_ID)
+    assert [message.role for message in session.messages] == ["user", "assistant"]
+    artifact_path = _long_path(
+        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_cancelled_artifact.txt"
+    )
+    assert not artifact_path.exists()
+    assert gateway.discard_artifact(gateway.results[0]) is False
+
+
+@pytest.mark.asyncio
+async def test_cancelling_after_scheduled_tool_publication_commits_the_durable_artifact(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions = EffectThenBlockToolAppendSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=lambda: USER_UUID,
+    )
+    raw_result = "DURABLE CANCELLED SCHEDULED ARTIFACT"
+    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
+    call = ModelToolCall(
+        id="call_effect_then_cancel_artifact",
+        name="read_file",
+        arguments={"path": "large.txt"},
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
+                usage=_usage(),
+                finish_reason="tool_calls",
+            ),
+        )
+    )
+    gateway = ObservingToolGateway(
+        context=ToolExecutionContext(
+            lane="scheduled_work",
+            workspace=workspace,
+            agent_home=agent_home,
+            session_id=TASK_SESSION_ID,
+        ),
+        max_tool_result_chars=1,
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
+        tool_gateway_for=lambda _: gateway,
+    )
+    execution = asyncio.create_task(runner.run(_task()))
+    await asyncio.wait_for(sessions.tool_message_written.wait(), timeout=1)
+
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    session = await sessions.load(TASK_SESSION_ID)
+    assert [message.role for message in session.messages] == ["user", "assistant", "tool"]
+    tool_message = session.messages[-1]
+    assert isinstance(tool_message, ToolSessionMessage)
+    assert tool_message.artifact is not None
+    artifact_path = _long_path(
+        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_effect_then_cancel_artifact.txt"
+    )
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
+    assert gateway.discard_artifact(gateway.results[0]) is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_tool_publication_reconciliation_preserves_a_primary_base_exception(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    failure = ToolPublicationBaseError("primary publication failure")
+    sessions = EffectThenRaiseToolAppendSessionStore(
+        failure=failure,
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=lambda: USER_UUID,
+    )
+    raw_result = "DURABLE BASE EXCEPTION ARTIFACT"
+    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
+    call = ModelToolCall(
+        id="call_base_exception_artifact",
+        name="read_file",
+        arguments={"path": "large.txt"},
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
+                usage=_usage(),
+                finish_reason="tool_calls",
+            ),
+        )
+    )
+    gateway = ObservingToolGateway(
+        context=ToolExecutionContext(
+            lane="scheduled_work",
+            workspace=workspace,
+            agent_home=agent_home,
+            session_id=TASK_SESSION_ID,
+        ),
+        max_tool_result_chars=1,
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
+        tool_gateway_for=lambda _: gateway,
+    )
+
+    with pytest.raises(ToolPublicationBaseError) as raised:
+        await runner.run(_task())
+
+    assert raised.value is failure
+    session = await sessions.load(TASK_SESSION_ID)
+    assert [message.role for message in session.messages] == ["user", "assistant", "tool"]
+    tool_message = session.messages[-1]
+    assert isinstance(tool_message, ToolSessionMessage)
+    assert tool_message.artifact is not None
+    artifact_path = _long_path(
+        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_base_exception_artifact.txt"
+    )
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
+    assert gateway.discard_artifact(gateway.results[0]) is False
 
 
 @pytest.mark.asyncio

@@ -928,6 +928,7 @@ async def test_repl_writer_failure_closes_the_active_turn_iterator(
                 TURN_UUID,
                 USER_UUID,
                 REQUEST_UUID,
+                ASSISTANT_UUID,
                 TURN_TWO_UUID,
                 USER_TWO_UUID,
                 REQUEST_TWO_UUID,
