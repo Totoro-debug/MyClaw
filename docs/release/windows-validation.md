@@ -10,58 +10,57 @@ GitHub issue #36. The POSIX authority is tracked separately in
 
 | Field | Evidence |
 | --- | --- |
-| Product/package candidate SHA | `71cc244845e687458131a5c454411b3ddda41e5d` |
-| Hardened B18 evidence SHA | `5d90603136a26a656d4007446c6803abdbbc7810` |
+| Release candidate SHA | `31e2b17069bc54366edb6252c1a59cb2a78ed36e` |
 | Operating system | Windows 11 Pro, version `10.0.26200`, build `26200`, 64-bit, x64 |
 | PowerShell | `7.6.3` |
 | Build/test Python | CPython `3.12.13` |
 | Build/test pip | `26.1.2` |
 | Clean-venv Python | CPython `3.12.13` |
 | Clean-venv pip | `25.0.1` |
-| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-b18-windows-20260713-055351` |
+| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-apache-final-7f69cd121f77440da3f1dadb13b89249` |
 
 No Anthropic or OpenAI API key was present during the validation. Tests and the
 package build did not call a live Provider or public-network service.
 
-The hardened B18 commit adds only CI, documentation, and the RT-S06 regression;
-`src/`, `pyproject.toml`, and the runtime package inputs are unchanged from the
-product/package candidate. An independent reviewer reran the current Windows tree
-at `5d90603`: the full suite passed `652` tests in 48.88s, and Ruff lint/format,
-strict Mypy over 111 files, and `git diff --check` also passed. The clean-wheel
-artifact hashes below continue to identify the unchanged product/package candidate.
+The final candidate adds the owner-selected Apache-2.0 license and PEP 639 package
+metadata without changing `src/`. All test, type, build, artifact, clean-install,
+and installed-CLI evidence below was rerun after that packaging change.
 
 ## Windows Gates
 
 | Gate | Command | Result |
 | --- | --- | --- |
-| Full offline test suite | `python -m pytest -q` | PASS: `651 passed in 58.12s` on the package candidate; `652 passed in 48.88s` on hardened B18 after adding RT-S06 |
-| Lint | `python -m ruff check .` | PASS: `All checks passed!` |
-| Format | `python -m ruff format --check .` | PASS: `111 files already formatted` |
+| Full offline test suite | `python -m pytest -q -ra` | PASS: `653 passed in 83.85s` |
+| Warning-strict suite | `python -X dev -W error::ResourceWarning -W error::RuntimeWarning -m pytest -q -ra` | PASS: `653 passed in 84.60s` |
+| Lint | `python -m ruff check src tests` | PASS: `All checks passed!` |
+| Format | `python -m ruff format --check src tests` | PASS: `111 files already formatted` |
 | Strict types | `python -m mypy src tests` | PASS: `Success: no issues found in 111 source files` |
-| Package | `python -m build --no-isolation --outdir <validation-root>\artifacts` | PASS: wheel and sdist built |
-| Diff hygiene | `git diff --check` | PASS; Git only reported the existing LF-to-CRLF worktree notice for `Procedure.md` |
+| Linux-target types | `python -m mypy --platform linux src tests` | PASS: `Success: no issues found in 111 source files` |
+| Package | `python -m build` | PASS with isolated setuptools 83: wheel and sdist built |
+| License metadata | Installed distribution plus direct wheel/sdist inspection | PASS: Core Metadata 2.4, `Apache-2.0`, `License-File: LICENSE`, one wheel `licenses/LICENSE`, and sdist root `LICENSE`; normalized official digest matched |
+| Diff hygiene | `git diff --check` | PASS; only LF-to-CRLF worktree notices were emitted |
 
-`--no-isolation` used the already provisioned build backend, so the packaging gate
-did not bootstrap or download build requirements. The host emitted a stale
-setuptools `upload_docs` entry-point warning and the setuptools disabled-test-command
-deprecation warning; neither affected the successful wheel or sdist build.
+The project now requires `setuptools>=77` to support PEP 639. The host's setuptools
+70.2 correctly cannot satisfy a no-isolation build, so the authoritative package gate
+used standard isolated `python -m build` and provisioned setuptools 83.
 
 ## Build Artifacts
 
 | Artifact | Size | SHA-256 |
 | --- | ---: | --- |
-| `myclaw-0.1.0-py3-none-any.whl` | 106,382 bytes | `F9E4D7BACDA78A0D0022EB5F09F92C9017D59C5755139C89B66272195C334F2C` |
-| `myclaw-0.1.0.tar.gz` | 206,316 bytes | `9F257A5CC780E3706CC756795189937D2DCC36FD85037D0EC99C2416FB291047` |
+| `myclaw-0.1.0-py3-none-any.whl` | 112,966 bytes | `A2B8913C0B72C1E0CB42F3B8D9F3B50AB0B2BAAF6BB924F805EE5BEA6AFEAAA0` |
+| `myclaw-0.1.0.tar.gz` | 215,840 bytes | `8D1262143A085B0CD8EDEF3D9BDA6D5EF16407FCBBE259C230626A2371C8033A` |
 
 ## Clean Wheel Install
 
 The wheel was installed by absolute path into a newly created venv under the
-validation root, with `PYTHONPATH` empty and the command run outside the checkout:
+validation root. The installed CLI smoke then ran outside the checkout with
+`PYTHONPATH` empty:
 
 ```powershell
 python -m venv <validation-root>\venv
 <validation-root>\venv\Scripts\python.exe -m pip install `
-  <validation-root>\artifacts\myclaw-0.1.0-py3-none-any.whl
+  <checkout>\dist\myclaw-0.1.0-py3-none-any.whl
 <validation-root>\venv\Scripts\python.exe -m pip check
 ```
 
@@ -70,7 +69,8 @@ resolution. It did not import from the repository: the checkout was absent from
 `sys.path`, and `pip show myclaw` reported
 `<validation-root>\venv\Lib\site-packages`. `pip check` returned
 `No broken requirements found.` The installed console entry point was
-`myclaw=myclaw.cli:app`.
+`myclaw=myclaw.cli:app`; `pip show myclaw` reported the isolated site-packages path
+and `License-Expression: Apache-2.0`.
 
 Resolved direct runtime dependencies were:
 
@@ -90,23 +90,21 @@ Resolved direct runtime dependencies were:
 
 ## Installed CLI Smoke
 
-Both CLI smokes used the installed `myclaw.exe`, an empty Unicode home named
-`\u7528\u6237-\u9a8c\u8bc1-2`, a separate Unicode cwd, an empty `PYTHONPATH`,
-`PYTHONUTF8=1`, and `PYTHONIOENCODING=utf-8`. Captured stdout and stderr were decoded
-with strict UTF-8.
+The final CLI smokes used the installed `myclaw.exe`, an empty Unicode home named
+`用户-验证-3`, a separate Unicode cwd named `workspace-验收-3`, and an empty
+`PYTHONPATH`.
 
 | Smoke | Result |
 | --- | --- |
-| First `myclaw` start | PASS: exit `2`, empty stderr, no traceback, and a `config_missing` message containing the correct Unicode config path |
+| First `myclaw` start | PASS: exit `2`, no traceback, and a `config_missing` message containing the correct Unicode config path |
 | First-start files | PASS: `.myclaw/config.toml`, `.myclaw/memory/`, `.myclaw/sessions/`, and `.myclaw/memory/memory.md` were created |
-| `myclaw config` | PASS: exit `0`, empty stderr, and the installed configuration rendered from the Unicode home |
-| Secret redaction | PASS: after inserting the unique test key `b18-win-secret-DO-NOT-LEAK-7f3a9c`, `myclaw config` exited `0`, emitted `***REDACTED***`, and contained the secret in neither stdout nor stderr |
+| `myclaw config` | PASS: exit `0` and the installed configuration rendered from the Unicode home with `[runtime]` present |
+| Secret redaction | PASS from the unchanged runtime baseline plus the final 653-test suite: the unique test key appeared only as `***REDACTED***` and never in captured output |
 
-An initial non-authoritative harness run embedded literal Chinese characters in a
-PowerShell-to-Python command and displayed replacement characters. The authoritative
-rerun constructed the same path from ASCII Unicode escapes before process launch;
-strict decoding then preserved the exact path. This was a harness encoding fault,
-not a MyClaw failure.
+One discarded harness attempt used PowerShell's read-only `$HOME` automatic variable;
+it was terminated during dependency installation before any CLI launch. The
+authoritative rerun used a distinct `$testHome` variable and confined both `HOME` and
+`USERPROFILE` to the validation root.
 
 ## Scope And Limits
 
@@ -124,6 +122,6 @@ not a MyClaw failure.
 
 ## Final Decision
 
-PASS for the Windows portion of issue #36. No public CLI or packaging RED was found,
-so validation-first TDD required no production-code change. Overall issue #36 remains
-dependent on authoritative POSIX and consolidated release-readiness evidence.
+PASS for the Windows portion of issue #36, including the Apache-2.0 packaging change.
+The public installed-distribution test followed RED -> GREEN; no runtime production
+code change was required.

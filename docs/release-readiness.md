@@ -19,8 +19,8 @@ Evidence is separated deliberately:
 
 | Environment | Evidence | Status in this synthesis |
 | --- | --- | --- |
-| Windows | [Windows validation](release/windows-validation.md) | **PASS:** 652 offline tests on the hardened B18 tree; Ruff lint/format; strict Mypy; wheel/sdist build; clean-wheel install; Unicode `myclaw`/`myclaw config` and redaction smoke. |
-| POSIX | [POSIX validation](release/posix-validation.md) | **PASS:** hardened `ubuntu-latest` run [29211545085](https://github.com/Totoro-debug/MyClaw/actions/runs/29211545085) at SHA `5d90603136a26a656d4007446c6803abdbbc7810`; 644 offline tests passed with 8 expected Windows-only skips, the focused POSIX process suite passed 74 with 3 Windows-only skips, and Ruff, Mypy, build, clean-wheel install, strict first-start/Unicode CLI, and import gates passed. |
+| Windows | [Windows validation](release/windows-validation.md) | **PASS:** 653 offline and 653 warning-strict tests on the licensed candidate; Ruff lint/format; native/Linux strict Mypy; isolated wheel/sdist build; Apache-2.0 metadata/artifacts; clean-wheel install; Unicode `myclaw`/`myclaw config` smoke. |
+| POSIX | [POSIX validation](release/posix-validation.md) | **PASS:** final `ubuntu-latest` run [29214379231](https://github.com/Totoro-debug/MyClaw/actions/runs/29214379231) at SHA `31e2b17069bc54366edb6252c1a59cb2a78ed36e`; 645 offline tests passed with 8 expected Windows-only skips, the focused POSIX process suite passed 74 with 3 Windows-only skips, and Ruff, Mypy, licensed build, clean-wheel install, strict first-start/Unicode CLI, and import gates passed. |
 
 The security/fault baseline immediately before B18 is recorded in
 [Security and Fault Review](security-fault-review.md): 651 tests passed on the
@@ -138,7 +138,7 @@ to this report, not automated substitutes.
 | Check | Status | Evidence / reason |
 | --- | --- | --- |
 | Install the built wheel into a clean Windows environment; run `myclaw` and `myclaw config`. | PASS | [Windows validation](release/windows-validation.md) records an isolated venv outside the checkout, `pip check`, first-start config generation, Unicode paths, `myclaw config`, and secret redaction. |
-| Install the built wheel into a clean POSIX environment; run the offline gates and CLI smoke. | PASS | [POSIX validation](release/posix-validation.md) records hardened run `29211545085`: clean-wheel install and `pip check`, checkout-independent import, exact first-start exit/configuration assertions, and `myclaw config` from a Unicode Workspace all passed on Ubuntu 24.04.4/Python 3.12.13. |
+| Install the built wheel into a clean POSIX environment; run the offline gates and CLI smoke. | PASS | [POSIX validation](release/posix-validation.md) records final licensed run `29214379231`: clean-wheel install and `pip check`, checkout-independent import, exact first-start exit/configuration assertions, and `myclaw config` from a Unicode Workspace all passed on Ubuntu 24.04.4/Python 3.12.13. |
 | Start `myclaw` with a dedicated real Provider configuration and complete a streamed multi-turn conversation. | NOT RUN | No dedicated release Provider credential/endpoint was supplied; local potential secrets were not inspected or used. |
 | Drive a long real-Provider conversation past the threshold and inspect automatic consolidation, preserved original messages, and continued context. | NOT RUN | No dedicated real-Provider release session was provisioned. Automated threshold, cutoff, cursor, recovery, and message-preservation evidence is mapped under US-22/US-23 and RT-M01 through RT-M06, but is not presented as manual acceptance. |
 | Verify automatic title generation, exit, restart, `/resume`, picker title/time, and resumed history with a real Provider. | NOT RUN | Depends on the dedicated real-Provider setup above. Automated coverage is listed under US-07 through US-10. |
@@ -197,16 +197,14 @@ availability, every proxy/DNS environment, or a live POSIX network path.
 
 ## Release Decision Inputs
 
-**Current decision: BLOCKED on project-owner license selection.** The repository has
-no `LICENSE`/`COPYING` file, `pyproject.toml` declares no license metadata, and the
-built wheel therefore grants no explicit use or redistribution license. Runtime,
-test, platform, and documentation gates cannot decide whether v0.1 should use an
-open-source license or remain proprietary/non-distributed.
+**Current decision: READY.** The owner selected Apache License 2.0. The repository
+contains the official full `LICENSE`; PEP 639 package metadata declares SPDX
+`Apache-2.0` and `License-File: LICENSE`; installed-distribution, wheel, and sdist
+checks prove the license is bundled with the official normalized digest.
 
 The platform closure inputs are satisfied: both linked reports are `PASS` and record
 offline test/lint/format/type/package gates plus clean-wheel installation and CLI
-smoke. Issue #36 can close after the owner-selected license is represented by a
-matching license file and package metadata, this document still contains exactly 48
-User Story rows and all 35 Required test rows, and every external/manual status
-remains truthful. A real paid Provider PASS is not fabricated; its explicit `NOT RUN`
-status and credential limitation are part of the acceptance record.
+smoke. This document contains exactly 48 User Story rows and all 35 Required test
+rows, and every external/manual status remains truthful. A real paid Provider PASS is
+not fabricated; its explicit `NOT RUN` status and credential limitation are part of
+the acceptance record.
