@@ -13,6 +13,7 @@ from uuid import UUID
 from myclaw.agent.events import AgentEvent
 from myclaw.agent.ports import ConversationPort
 from myclaw.agent.prompts import chat_system_prompt, runtime_context, session_title_prompt
+from myclaw.agent.turn import model_message_from_session
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
@@ -51,7 +52,6 @@ from myclaw.schedule.scheduled_work_execution import (
 from myclaw.session.conversation import (
     ChatModelSettings,
     StreamingConversationPort,
-    model_message_from_session,
 )
 from myclaw.session.records import ConversationSession
 from myclaw.session.session_resume import SwitchableConversationPort

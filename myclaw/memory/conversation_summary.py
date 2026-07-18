@@ -12,6 +12,7 @@ from typing import Protocol
 from uuid import UUID
 
 from myclaw.agent.prompts import current_user_input
+from myclaw.agent.turn import model_message_from_session
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
@@ -20,7 +21,6 @@ from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelRequest, ReasoningEffort, UserModelMessage
 from myclaw.provider.ports import ModelProvider
-from myclaw.session.conversation import model_message_from_session
 from myclaw.session.identifiers import require_session_id
 from myclaw.session.ports import SessionStore
 from myclaw.session.records import (
