@@ -13,7 +13,9 @@ from rich.console import Console
 
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import (
+from myclaw.management.commands import ManagementCommandDispatcher
+from myclaw.management.service import ManagementViewService
+from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelRequest,
@@ -22,8 +24,6 @@ from myclaw.contracts import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.management.commands import ManagementCommandDispatcher
-from myclaw.management.service import ManagementViewService
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import ConsoleProgressiveWriter, ConsoleReplInput, run_repl

@@ -9,7 +9,8 @@ from typing import Protocol, cast
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
 
-from myclaw.contracts import JsonObject, ToolDefinition, ToolExecutionContext
+from myclaw.tools.models import ToolDefinition, ToolExecutionContext
+from myclaw.utils.json_types import JsonObject
 
 if sys.platform == "win32":
     from subprocess import CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW

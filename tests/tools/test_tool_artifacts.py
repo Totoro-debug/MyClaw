@@ -18,20 +18,22 @@ from myclaw.config.config import (
     ToolsConfiguration,
     UserConfiguration,
 )
-from myclaw.contracts import (
+from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelRequest,
     ModelResponse,
-    ModelToolCall,
     ModelUsage,
-    ToolDefinition,
-    ToolExecutionContext,
     ToolModelMessage,
-    ToolSessionMessage,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolDefinition,
+    ToolExecutionContext,
+)
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 

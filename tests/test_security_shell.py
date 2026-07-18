@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.contracts import ModelToolCall, PermissionDecision, ToolExecutionContext
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolExecutionContext,
+)
+from myclaw.tools.permission_policy import PermissionDecision
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_process import SubprocessShellBoundary
 from myclaw.tools.tool_gateway import ToolGateway
@@ -102,8 +106,8 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
         "import asyncio\n"
         "import sys\n"
         "from pathlib import Path\n"
-        "from myclaw.contracts import ModelToolCall, PermissionDecision, "
-        "ToolExecutionContext\n"
+        "from myclaw.tools.models import ModelToolCall, ToolExecutionContext\n"
+        "from myclaw.tools.permission_policy import PermissionDecision\n"
         "from myclaw.tools.tool_gateway import ToolGateway\n"
         "class Shell:\n"
         "    def __init__(self): self.calls = 0\n"

@@ -11,19 +11,21 @@ from uuid import UUID
 import pytest
 
 from myclaw.config.config import ProviderConfiguration
-from myclaw.contracts import (
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
     AssistantModelMessage,
-    ModelCallError,
     ModelCompleted,
     ModelRequest,
     ModelRoute,
-    ModelToolCall,
     TextDelta,
-    ToolDefinition,
     ToolModelMessage,
     UserModelMessage,
 )
 from myclaw.provider.openai_compatible import OpenAICompatibleProvider
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolDefinition,
+)
 
 REQUEST_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 

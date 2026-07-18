@@ -1,14 +1,11 @@
-"""Conversation Summary and Long-term Memory boundary records."""
+"""Conversation Summary persisted records."""
 
 import json
 from dataclasses import dataclass
 from datetime import datetime
 
-from myclaw.contracts.common import (
-    format_rfc3339_milliseconds,
-    require_aware_datetime,
-    require_nonnegative_int,
-)
+from myclaw.utils.time import format_rfc3339_milliseconds
+from myclaw.utils.validation import require_aware_datetime, require_nonnegative_int
 
 
 @dataclass(frozen=True, slots=True)

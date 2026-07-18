@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Final
 from unicodedata import category
 
-from myclaw.contracts import JsonObject, PermissionDecision
+from myclaw.tools.permission_policy import PermissionDecision
+from myclaw.utils.json_types import JsonObject
 
 AUTOMATICALLY_ALLOWED_COMMANDS: Final = frozenset(
     {

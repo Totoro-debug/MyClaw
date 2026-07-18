@@ -36,28 +36,34 @@
 
 ```text
 myclaw/
-  agent/               # Runtime Core、prompt composition、Workspace
-  config/              # Agent Home、TOML、校验、脱敏、route 解析
-  contracts/           # schema、事件、错误、canonical types
-  management/          # Management Port service 与命令分发
-  memory/              # Conversation Summary、Memory Task 与 scheduler
-  provider/            # Model Router 与 Provider adapters
-  schedule/            # Scheduled Work persistence、执行与后台协调
-  session/             # Conversation、Session Store、resume 与 title
+  agent/               # Runtime Core、Agent Event、Conversation Port、prompts、Workspace
+  config/              # Agent Home、TOML、ConfigView、脱敏、route 解析
+  errors.py            # 稳定 ErrorCode 与 ErrorInfo
+  management/          # Management models/Port、service 与命令分发
+  memory/              # Summary records、Memory models/ports、任务与 scheduler
+  provider/            # Model models/Port、Router、errors 与 Provider adapters
+  schedule/            # Scheduled Work records、持久化、执行与后台协调
+  session/             # identifiers、records、models/Port、Conversation、Store 与 resume
   terminal/            # Typer CLI、REPL 与 foreground interrupts
   tools/
+    models.py          # Tool 定义、调用、结果与执行上下文
+    artifacts.py       # ArtifactReference 与文件名编码
+    ports.py           # Tool Protocol
     files/             # Workspace 文件读写工具
     shell/             # Shell policy、process 与 Tool adapter
     web/               # WebSearch 与 WebFetch
-  utils/               # atomic file helpers
+  utils/               # JSON 类型、通用校验、时间格式与 atomic file helpers
 tests/
+  agent/               # Agent Event 约束
+  architecture/        # Protocol 替换性与 AST 模块边界
   configuration/       # 配置行为
-  contract/            # Port、Store、Gateway、Provider adapter 契约
   management/          # Management Port 行为
   memory/              # Conversation Summary 与 Memory Task
+  provider/            # Provider-neutral models
   scheduling/          # Scheduled Work persistence 与执行
   sessions/            # Conversation、Session Store、resume 与 title
   tools/               # files、shell、web 与 artifact 行为
+  utils/               # 时间格式与 Session identifier 行为
   fixtures/            # fake provider、fake tool、clock、Agent Home builders
   test_*.py            # 跨模块、Runtime、CLI 与安全行为
 ```
@@ -93,7 +99,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ## 5. Phase 0：冻结契约并建立工程骨架
 
-阶段状态：D01-D16 已于 2026-07-11 接受，并固化在 `docs/myclaw-runtime-contracts.md`；PRD 与 ADR 已同步。工程骨架和 contract fixtures 尚待实现。
+阶段状态：D01-D16 已于 2026-07-11 接受，并固化在 `docs/myclaw-runtime-contracts.md`；PRD 与 ADR 已同步。工程骨架与 fixtures 已实现；运行时约束已于 2026-07-18 按领域所有权拆分，模块边界由 AST 测试约束。
 
 ### 目标
 

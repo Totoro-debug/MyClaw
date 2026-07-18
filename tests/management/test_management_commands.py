@@ -7,13 +7,18 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import AssistantSessionMessage, MetadataUpdate, ModelUsage, UserSessionMessage
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import (
     ManagementViewService,
     ResolvedChatStatus,
     RuntimeStatusInput,
     RuntimeStatusService,
+)
+from myclaw.provider.models import ModelUsage
+from myclaw.session.records import (
+    AssistantSessionMessage,
+    MetadataUpdate,
+    UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
 

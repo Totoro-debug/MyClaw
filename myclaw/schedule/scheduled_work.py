@@ -9,10 +9,11 @@ from typing import cast
 from uuid import UUID
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import JsonObject, ScheduledWork, ToolDefinition, ToolExecutionContext
-from myclaw.contracts.common import make_session_id
-from myclaw.contracts.scheduling import serialize_scheduled_work
+from myclaw.schedule.records import ScheduledWork, serialize_scheduled_work
+from myclaw.session.identifiers import make_session_id
+from myclaw.tools.models import ToolDefinition, ToolExecutionContext
 from myclaw.utils.atomic_files import atomic_replace_text
+from myclaw.utils.json_types import JsonObject
 
 _RECORD_FIELDS = frozenset({"id", "title", "cron", "prompt", "created_at", "enabled", "session_id"})
 

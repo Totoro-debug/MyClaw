@@ -10,23 +10,22 @@ from math import isfinite
 from typing import Protocol, cast
 
 from myclaw.config.config import ProviderConfiguration
-from myclaw.contracts import (
+from myclaw.errors import ErrorCode, ErrorInfo
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
     AssistantModelMessage,
-    ErrorCode,
-    ErrorInfo,
     FinishReason,
-    JsonObject,
-    ModelCallError,
     ModelCompleted,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
-    ModelToolCall,
     ModelUsage,
     TextDelta,
     ToolModelMessage,
     UserModelMessage,
 )
+from myclaw.tools.models import ModelToolCall
+from myclaw.utils.json_types import JsonObject
 
 
 class _Completions(Protocol):

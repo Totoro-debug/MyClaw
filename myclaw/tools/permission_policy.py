@@ -1,15 +1,19 @@
 """Built-in Permission Policy decisions for Tool calls."""
 
 from dataclasses import dataclass
+from enum import StrEnum
 
-from myclaw.contracts import ModelToolCall, PermissionDecision, ToolExecutionContext
 from myclaw.tools.files.file_tools import FileToolAccessDenied, FileToolArgumentsError
 from myclaw.tools.files.workspace_write_tools import resolve_workspace_write_path
-from myclaw.tools.shell.shell_policy import (
-    ShellPolicyDenied,
-    assess_shell_command,
-    parse_shell_request,
-)
+from myclaw.tools.models import ModelToolCall, ToolExecutionContext
+
+
+class PermissionDecision(StrEnum):
+    """A Permission Policy decision before execution-context conversion."""
+
+    ALLOW = "allow"
+    ASK = "ask"
+    DENY = "deny"
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +31,12 @@ def assess_permission(
     context: ToolExecutionContext,
 ) -> PermissionAssessment:
     """Return the fixed permission decision for the current execution lane."""
+    from myclaw.tools.shell.shell_policy import (
+        ShellPolicyDenied,
+        assess_shell_command,
+        parse_shell_request,
+    )
+
     if tool_call.name == "shell":
         try:
             request = parse_shell_request(tool_call.arguments, context.workspace)

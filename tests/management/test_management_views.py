@@ -6,7 +6,7 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import CumulativeUsage, RuntimeStatus
+from myclaw.management.models import RuntimeStatus
 from myclaw.management.service import (
     ManagementError,
     ManagementViewService,
@@ -14,6 +14,7 @@ from myclaw.management.service import (
     RuntimeStatusInput,
     RuntimeStatusService,
 )
+from myclaw.session.records import CumulativeUsage
 from myclaw.session.session_store import JsonlSessionStore
 
 CONFIG_WITH_PLAINTEXT_KEYS = """# User Configuration remains source-preserved.

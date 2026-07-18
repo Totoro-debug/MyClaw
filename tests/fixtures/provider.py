@@ -5,9 +5,9 @@ from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.contracts import (
-    ErrorInfo,
-    ModelCallError,
+from myclaw.errors import ErrorInfo
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,

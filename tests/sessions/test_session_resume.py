@@ -8,30 +8,32 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.events import AgentEvent
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import prepare_repl_runtime, unavailable_provider_factory
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ProviderConfiguration
-from myclaw.contracts import (
-    AgentEvent,
+from myclaw.management.commands import ManagementCommandDispatcher
+from myclaw.management.service import ManagementViewService
+from myclaw.provider.models import (
     AssistantModelMessage,
-    AssistantSessionMessage,
-    ConversationSession,
-    MetadataUpdate,
     ModelCompleted,
-    ModelProvider,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
-    SessionSummary,
     TextDelta,
+)
+from myclaw.provider.ports import ModelProvider
+from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.records import (
+    AssistantSessionMessage,
+    ConversationSession,
+    MetadataUpdate,
+    SessionSummary,
     UserSessionMessage,
 )
-from myclaw.management.commands import ManagementCommandDispatcher
-from myclaw.management.service import ManagementViewService
-from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore, SessionListingReport
 from tests.configuration.test_config import VALID_CONFIG

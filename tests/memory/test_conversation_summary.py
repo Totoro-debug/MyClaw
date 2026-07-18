@@ -10,22 +10,24 @@ from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.contracts import (
-    AssistantModelMessage,
-    AssistantSessionMessage,
-    MetadataUpdate,
-    ModelCallError,
-    ModelCompleted,
-    ModelProvider,
-    ModelRequest,
-    ModelResponse,
-    ModelUsage,
-    UserSessionMessage,
-)
 from myclaw.memory.conversation_summary import (
     ConversationSummaryManager,
     JsonlSummaryStore,
     SummaryModelSettings,
+)
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
+    AssistantModelMessage,
+    ModelCompleted,
+    ModelRequest,
+    ModelResponse,
+    ModelUsage,
+)
+from myclaw.provider.ports import ModelProvider
+from myclaw.session.records import (
+    AssistantSessionMessage,
+    MetadataUpdate,
+    UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
 from tests.configuration.test_config import VALID_CONFIG

@@ -6,30 +6,34 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.events import (
+    AgentEvent,
+    TextDeltaPayload,
+    TurnCancelledPayload,
+    TurnCompletedPayload,
+    TurnFailedPayload,
+    validate_agent_event_sequence,
+)
+from myclaw.agent.ports import ConversationPort
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import (
-    AgentEvent,
+from myclaw.errors import ErrorInfo
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
     AssistantModelMessage,
-    AssistantSessionMessage,
-    ConversationPort,
-    ErrorInfo,
-    ModelCallError,
     ModelCompleted,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
-    SessionError,
     TextDelta,
-    TextDeltaPayload,
-    TurnCancelledPayload,
-    TurnCompletedPayload,
-    TurnFailedPayload,
-    UserSessionMessage,
-    validate_agent_event_sequence,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.records import (
+    AssistantSessionMessage,
+    SessionError,
+    UserSessionMessage,
+)
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import run_repl
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript

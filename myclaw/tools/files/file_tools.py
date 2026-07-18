@@ -6,7 +6,8 @@ from pathlib import Path
 from stat import S_ISREG
 
 from myclaw.agent.workspace import Workspace
-from myclaw.contracts import JsonObject, ToolDefinition, ToolExecutionContext
+from myclaw.tools.models import ToolDefinition, ToolExecutionContext
+from myclaw.utils.json_types import JsonObject
 
 _WINDOWS_RESERVED_BASENAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}

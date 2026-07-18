@@ -1,6 +1,6 @@
 import pytest
 
-from myclaw.contracts import ToolDefinition
+from myclaw.tools.models import ToolDefinition
 from tests.fixtures.tool import FakeTool, FakeToolCall
 
 

@@ -5,26 +5,30 @@ from uuid import uuid4
 
 import pytest
 
+from myclaw.agent.events import (
+    AgentEvent,
+    PermissionRequestedPayload,
+)
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import (
-    AgentEvent,
+from myclaw.provider.models import (
     AssistantModelMessage,
-    JsonObject,
     ModelCompleted,
     ModelRequest,
     ModelResponse,
-    ModelToolCall,
     ModelUsage,
-    PermissionRequestedPayload,
-    ToolDefinition,
-    ToolExecutionContext,
     ToolModelMessage,
-    ToolSessionMessage,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolDefinition,
+    ToolExecutionContext,
+)
 from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.utils.json_types import JsonObject
 from tests.fixtures import FakeTool, ScriptedFakeProvider, StreamScript
 
 NOW = datetime(2026, 7, 12, 19, 30, tzinfo=timezone(timedelta(hours=8)))

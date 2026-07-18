@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from myclaw.contracts import format_rfc3339_milliseconds, make_session_id
+from myclaw.session.identifiers import make_session_id
+from myclaw.utils.time import format_rfc3339_milliseconds
 
 
 def test_time_and_session_id_use_the_frozen_persisted_formats() -> None:

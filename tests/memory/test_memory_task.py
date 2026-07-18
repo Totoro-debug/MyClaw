@@ -10,17 +10,7 @@ import pytest
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.contracts import (
-    AssistantModelMessage,
-    ErrorInfo,
-    MemoryTaskResult,
-    ModelCallError,
-    ModelRequest,
-    ModelResponse,
-    ModelToolCall,
-    ModelUsage,
-    ToolModelMessage,
-)
+from myclaw.errors import ErrorInfo
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import ManagementViewService
 from myclaw.memory.conversation_summary import JsonlSummaryStore
@@ -29,6 +19,16 @@ from myclaw.memory.memory_task import (
     MemoryManager,
     MemoryTaskModelSettings,
 )
+from myclaw.memory.models import MemoryTaskResult
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
+    AssistantModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ModelUsage,
+    ToolModelMessage,
+)
+from myclaw.tools.models import ModelToolCall
 from myclaw.utils.atomic_files import atomic_replace_text
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider

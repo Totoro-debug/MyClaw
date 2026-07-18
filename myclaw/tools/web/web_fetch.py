@@ -13,7 +13,8 @@ from urllib.parse import urljoin, urlsplit
 from aiohttp import ClientResponse, ClientSession, ClientTimeout, TCPConnector
 from aiohttp.abc import AbstractResolver, ResolveResult
 
-from myclaw.contracts import JsonObject, ToolDefinition, ToolExecutionContext
+from myclaw.tools.models import ToolDefinition, ToolExecutionContext
+from myclaw.utils.json_types import JsonObject
 
 CONNECT_TIMEOUT_SECONDS = 10.0
 TOTAL_TIMEOUT_SECONDS = 30.0

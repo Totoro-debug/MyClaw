@@ -14,8 +14,8 @@ import tomlkit
 from croniter import croniter  # type: ignore[import-untyped]
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts.errors import ErrorInfo
-from myclaw.contracts.management import ConfigView
+from myclaw.config.models import ConfigView
+from myclaw.errors import ErrorInfo
 from myclaw.utils.atomic_files import atomic_create_text
 
 DEFAULT_CONFIG_TEMPLATE: Final = """[runtime]

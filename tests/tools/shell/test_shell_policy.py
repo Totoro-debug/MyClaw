@@ -7,20 +7,22 @@ import pytest
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.contracts import (
+from myclaw.provider.models import (
     AssistantModelMessage,
-    JsonObject,
     ModelCompleted,
     ModelRequest,
     ModelResponse,
-    ModelToolCall,
     ModelUsage,
-    PermissionDecision,
+)
+from myclaw.tools.models import (
+    ModelToolCall,
     ToolExecutionContext,
     ToolExecutionLane,
 )
+from myclaw.tools.permission_policy import PermissionDecision
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.utils.json_types import JsonObject
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 

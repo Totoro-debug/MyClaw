@@ -3,7 +3,8 @@
 from datetime import datetime
 from pathlib import PurePath
 
-from myclaw.contracts import SummaryEntry, format_rfc3339_milliseconds
+from myclaw.memory.records import SummaryEntry
+from myclaw.utils.time import format_rfc3339_milliseconds
 
 _RUNTIME_CONTEXT = """<runtime_context>
 current_time: {current_time}

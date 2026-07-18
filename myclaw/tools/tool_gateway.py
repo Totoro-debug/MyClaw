@@ -2,16 +2,7 @@
 
 from jsonschema import Draft202012Validator, FormatChecker
 
-from myclaw.contracts import (
-    ErrorCode,
-    ErrorInfo,
-    ModelToolCall,
-    PermissionDecision,
-    Tool,
-    ToolDefinition,
-    ToolExecutionContext,
-    ToolResult,
-)
+from myclaw.errors import ErrorCode, ErrorInfo
 from myclaw.schedule.scheduled_work import (
     ScheduledWorkInvalidError,
     ScheduledWorkPersistenceError,
@@ -24,7 +15,13 @@ from myclaw.tools.files.file_tools import (
     SearchFilesTool,
 )
 from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
-from myclaw.tools.permission_policy import PermissionAssessment, assess_permission
+from myclaw.tools.models import ModelToolCall, ToolDefinition, ToolExecutionContext, ToolResult
+from myclaw.tools.permission_policy import (
+    PermissionAssessment,
+    PermissionDecision,
+    assess_permission,
+)
+from myclaw.tools.ports import Tool
 from myclaw.tools.shell.shell_policy import ShellPolicyDenied
 from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool
 from myclaw.tools.tool_artifacts import (

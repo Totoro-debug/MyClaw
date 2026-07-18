@@ -8,15 +8,15 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import (
+from myclaw.provider.models import ModelUsage
+from myclaw.session.ports import SessionStore
+from myclaw.session.records import (
     AssistantSessionMessage,
     ConversationSession,
     CumulativeUsage,
     MetadataUpdate,
-    ModelUsage,
     SessionError,
     SessionMetadata,
-    SessionStore,
     UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore

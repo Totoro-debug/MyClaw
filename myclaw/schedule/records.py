@@ -1,4 +1,4 @@
-"""Scheduled Work persisted record contracts."""
+"""Scheduled Work persisted records."""
 
 import json
 from collections.abc import Iterable
@@ -7,12 +7,9 @@ from datetime import datetime
 
 from croniter import croniter  # type: ignore[import-untyped]
 
-from myclaw.contracts.common import (
-    format_rfc3339_milliseconds,
-    require_aware_datetime,
-    require_session_id,
-    require_uuid4_string,
-)
+from myclaw.session.identifiers import require_session_id
+from myclaw.utils.time import format_rfc3339_milliseconds
+from myclaw.utils.validation import require_aware_datetime, require_uuid4_string
 
 
 @dataclass(frozen=True, slots=True)

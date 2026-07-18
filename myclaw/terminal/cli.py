@@ -13,8 +13,8 @@ from myclaw.agent.runtime import (
 )
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader
-from myclaw.contracts.errors import ErrorInfo
-from myclaw.provider import create_provider
+from myclaw.errors import ErrorInfo
+from myclaw.provider.factory import create_provider
 from myclaw.terminal.interrupts import ForegroundInterruptController
 from myclaw.terminal.repl import ConsoleProgressiveWriter, ConsoleReplInput
 

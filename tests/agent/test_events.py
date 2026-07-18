@@ -4,11 +4,9 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.contracts import (
+from myclaw.agent.events import (
     AgentEvent,
     BackgroundCompletedPayload,
-    ErrorInfo,
-    ModelUsage,
     PermissionRequestedPayload,
     ProgressPayload,
     TextDeltaPayload,
@@ -20,6 +18,8 @@ from myclaw.contracts import (
     TurnStartedPayload,
     validate_agent_event_sequence,
 )
+from myclaw.errors import ErrorInfo
+from myclaw.provider.models import ModelUsage
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 

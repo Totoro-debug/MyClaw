@@ -6,19 +6,21 @@ from uuid import uuid4
 
 import pytest
 
+from myclaw.agent.events import PermissionRequestedPayload
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import (
+from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelResponse,
-    ModelToolCall,
     ModelUsage,
-    PermissionRequestedPayload,
-    ToolExecutionContext,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolExecutionContext,
+)
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 

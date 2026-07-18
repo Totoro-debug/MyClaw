@@ -1,11 +1,9 @@
 import pytest
 
 from myclaw.config.config import ProviderConfiguration
-from myclaw.provider import (
-    AnthropicProvider,
-    OpenAICompatibleProvider,
-    create_provider,
-)
+from myclaw.provider.anthropic import AnthropicProvider
+from myclaw.provider.factory import create_provider
+from myclaw.provider.openai_compatible import OpenAICompatibleProvider
 
 
 @pytest.mark.asyncio

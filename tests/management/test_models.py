@@ -3,7 +3,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from myclaw.contracts import CumulativeUsage, RuntimeStatus, SessionSummary
+from myclaw.management.models import RuntimeStatus
+from myclaw.session.records import (
+    CumulativeUsage,
+    SessionSummary,
+)
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 

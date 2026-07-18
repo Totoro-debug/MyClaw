@@ -1,20 +1,21 @@
-"""Conversation Session persisted record contracts."""
+"""Conversation Session persisted records."""
 
 import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import ClassVar, Literal
 
-from myclaw.contracts.common import (
-    format_rfc3339_milliseconds,
+from myclaw.errors import ErrorCode
+from myclaw.provider.models import ModelUsage
+from myclaw.session.identifiers import require_session_id
+from myclaw.tools.artifacts import ArtifactReference
+from myclaw.tools.models import ModelToolCall, ToolResultStatus
+from myclaw.utils.time import format_rfc3339_milliseconds
+from myclaw.utils.validation import (
     require_aware_datetime,
     require_nonnegative_int,
-    require_session_id,
     require_uuid4_string,
 )
-from myclaw.contracts.errors import ErrorCode
-from myclaw.contracts.models import ModelToolCall, ModelUsage
-from myclaw.contracts.tools import ArtifactReference, ToolResultStatus
 
 type AssistantMessageStatus = Literal["completed", "interrupted", "error"]
 

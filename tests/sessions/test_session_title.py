@@ -6,30 +6,32 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.ports import ConversationPort
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import (
+from myclaw.errors import ErrorInfo
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
     AssistantModelMessage,
-    AssistantSessionMessage,
-    ConversationPort,
-    ConversationSession,
-    CumulativeUsage,
-    ErrorInfo,
-    MetadataUpdate,
-    ModelCallError,
     ModelCompleted,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
-    ModelToolCall,
     ModelUsage,
-    SessionMessage,
-    SessionSummary,
     TextDelta,
-    UserSessionMessage,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.records import (
+    AssistantSessionMessage,
+    ConversationSession,
+    CumulativeUsage,
+    MetadataUpdate,
+    SessionMessage,
+    SessionSummary,
+    UserSessionMessage,
+)
 from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.models import ModelToolCall
 from tests.fixtures import FakeClock
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))

@@ -2,8 +2,9 @@
 
 from typing import Protocol
 
-from myclaw.contracts import JsonObject, ToolDefinition, ToolExecutionContext
+from myclaw.tools.models import ToolDefinition, ToolExecutionContext
 from myclaw.tools.shell.shell_policy import ShellRequest, parse_shell_request
+from myclaw.utils.json_types import JsonObject
 
 
 class ShellBoundary(Protocol):

@@ -14,18 +14,20 @@ from myclaw.agent.runtime import (
 )
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader, ProviderConfiguration
-from myclaw.contracts import (
+from myclaw.errors import ErrorInfo
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
     AssistantModelMessage,
-    AssistantSessionMessage,
-    ErrorInfo,
-    ModelCallError,
     ModelCompleted,
-    ModelProvider,
     ModelRequest,
     ModelResponse,
     ModelUsage,
-    SessionError,
     TextDelta,
+)
+from myclaw.provider.ports import ModelProvider
+from myclaw.session.records import (
+    AssistantSessionMessage,
+    SessionError,
     UserSessionMessage,
 )
 from tests.configuration.test_config import VALID_CONFIG

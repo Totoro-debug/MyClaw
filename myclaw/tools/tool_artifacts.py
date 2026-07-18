@@ -8,8 +8,8 @@ from stat import S_ISREG
 from typing import Final
 
 from myclaw.agent.workspace import Workspace
-from myclaw.contracts import ArtifactReference, ToolExecutionContext, ToolResult
-from myclaw.contracts.tools import encode_artifact_tool_call_id
+from myclaw.tools.artifacts import ArtifactReference, encode_artifact_tool_call_id
+from myclaw.tools.models import ToolExecutionContext, ToolResult
 from myclaw.utils.atomic_files import FileIdentity, atomic_create_text_with_identity, file_identity
 
 type ArtifactWriter = Callable[[Path, str], None]

@@ -4,15 +4,14 @@ import json
 from dataclasses import dataclass
 from typing import Protocol
 
-from myclaw.contracts import SessionSummary, format_rfc3339_milliseconds
-from myclaw.contracts.management import (
-    ConfigView,
-    MemoryTaskResult,
-    ResumeResult,
-    RuntimeStatus,
-)
+from myclaw.config.models import ConfigView
+from myclaw.management.models import RuntimeStatus
 from myclaw.management.service import ManagementError
+from myclaw.memory.models import MemoryTaskResult
+from myclaw.session.models import ResumeResult
+from myclaw.session.records import SessionSummary
 from myclaw.session.session_store import SessionListingReport
+from myclaw.utils.time import format_rfc3339_milliseconds
 
 
 class _ManagementViewPort(Protocol):

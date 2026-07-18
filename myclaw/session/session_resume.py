@@ -5,7 +5,8 @@ from collections.abc import AsyncIterator, Callable
 from typing import Protocol
 from uuid import UUID
 
-from myclaw.contracts import AgentEvent, ConversationPort
+from myclaw.agent.events import AgentEvent
+from myclaw.agent.ports import ConversationPort
 
 
 class AgentEventSequencer(Protocol):

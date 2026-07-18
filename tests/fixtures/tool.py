@@ -4,7 +4,7 @@ from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-from myclaw.contracts import ToolDefinition
+from myclaw.tools.models import ToolDefinition
 
 
 @dataclass(frozen=True, slots=True)

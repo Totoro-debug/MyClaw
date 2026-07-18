@@ -8,33 +8,39 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
-from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import (
+from myclaw.agent.events import (
     AgentEvent,
-    AssistantModelMessage,
-    AssistantSessionMessage,
-    ConversationSession,
-    ErrorInfo,
-    ModelCallError,
-    ModelCompleted,
-    ModelRequest,
-    ModelResponse,
-    ModelStreamEvent,
-    ModelToolCall,
-    ModelUsage,
-    SessionError,
-    SessionMessage,
-    TextDelta,
-    ToolDefinition,
-    ToolExecutionContext,
-    ToolSessionMessage,
     TurnCancelledPayload,
     TurnFailedPayload,
     validate_agent_event_sequence,
 )
+from myclaw.agent.workspace import Workspace
+from myclaw.config.agent_home import AgentHome
+from myclaw.errors import ErrorInfo
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
+    AssistantModelMessage,
+    ModelCompleted,
+    ModelRequest,
+    ModelResponse,
+    ModelStreamEvent,
+    ModelUsage,
+    TextDelta,
+)
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.records import (
+    AssistantSessionMessage,
+    ConversationSession,
+    SessionError,
+    SessionMessage,
+    ToolSessionMessage,
+)
 from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolDefinition,
+    ToolExecutionContext,
+)
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 

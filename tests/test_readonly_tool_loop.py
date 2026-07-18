@@ -6,25 +6,29 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.events import validate_agent_event_sequence
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.contracts import (
+from myclaw.provider.models import (
     AssistantModelMessage,
-    AssistantSessionMessage,
     ModelCompleted,
     ModelRequest,
     ModelResponse,
-    ModelToolCall,
     ModelUsage,
-    ToolExecutionContext,
     ToolModelMessage,
-    ToolSessionMessage,
-    validate_agent_event_sequence,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.records import (
+    AssistantSessionMessage,
+    ToolSessionMessage,
+)
 from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolExecutionContext,
+)
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript

@@ -16,16 +16,18 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from myclaw.agent.events import AgentEvent
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.contracts import (
-    AgentEvent,
+from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelResponse,
-    ModelToolCall,
     ModelUsage,
+)
+from myclaw.tools.models import (
+    ModelToolCall,
     ToolExecutionContext,
 )
 from myclaw.tools.shell.shell_policy import ShellRequest

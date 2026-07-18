@@ -6,14 +6,9 @@ from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from myclaw.config.config import ProviderConfiguration, ResolvedModelRoute, UserConfiguration
-from myclaw.contracts import (
-    ModelCallError,
-    ModelProvider,
-    ModelRequest,
-    ModelResponse,
-    ModelRoute,
-    ModelStreamEvent,
-)
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import ModelRequest, ModelResponse, ModelRoute, ModelStreamEvent
+from myclaw.provider.ports import ModelProvider
 
 _MAX_ATTEMPTS = 5
 _RETRYABLE_CODES = frozenset({"provider_rate_limited", "provider_timeout", "provider_unavailable"})

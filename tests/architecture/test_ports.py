@@ -3,26 +3,28 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from myclaw.contracts import (
-    AgentEvent,
-    ConfigView,
-    ConversationPort,
-    ConversationSession,
-    ManagementPort,
+from myclaw.agent.events import AgentEvent
+from myclaw.agent.ports import ConversationPort
+from myclaw.config.models import ConfigView
+from myclaw.management.models import RuntimeStatus
+from myclaw.management.ports import ManagementPort
+from myclaw.memory.models import MemoryTaskResult
+from myclaw.memory.ports import (
     MemoryStore,
-    MemoryTaskResult,
-    MetadataUpdate,
-    ModelProvider,
-    ResumeResult,
-    RuntimeStatus,
-    SessionMessage,
-    SessionStore,
-    SessionSummary,
-    SummaryEntry,
     SummaryStore,
-    Tool,
-    ToolDefinition,
 )
+from myclaw.memory.records import SummaryEntry
+from myclaw.provider.ports import ModelProvider
+from myclaw.session.models import ResumeResult
+from myclaw.session.ports import SessionStore
+from myclaw.session.records import (
+    ConversationSession,
+    MetadataUpdate,
+    SessionMessage,
+    SessionSummary,
+)
+from myclaw.tools.models import ToolDefinition
+from myclaw.tools.ports import Tool
 from tests.fixtures.provider import ScriptedFakeProvider
 from tests.fixtures.tool import FakeTool
 

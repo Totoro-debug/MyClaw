@@ -4,26 +4,32 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
-from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import (
-    AssistantModelMessage,
-    AssistantSessionMessage,
-    ModelCompleted,
-    ModelRequest,
-    ModelResponse,
-    ModelToolCall,
-    ModelUsage,
+from myclaw.agent.events import (
     ToolCompletedPayload,
-    ToolDefinition,
-    ToolExecutionContext,
-    ToolModelMessage,
-    ToolSessionMessage,
     ToolStartedPayload,
     validate_agent_event_sequence,
 )
+from myclaw.agent.workspace import Workspace
+from myclaw.config.agent_home import AgentHome
+from myclaw.provider.models import (
+    AssistantModelMessage,
+    ModelCompleted,
+    ModelRequest,
+    ModelResponse,
+    ModelUsage,
+    ToolModelMessage,
+)
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.records import (
+    AssistantSessionMessage,
+    ToolSessionMessage,
+)
 from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolDefinition,
+    ToolExecutionContext,
+)
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 

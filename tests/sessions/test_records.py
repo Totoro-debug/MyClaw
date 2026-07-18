@@ -3,20 +3,22 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from myclaw.contracts import (
-    ArtifactReference,
+from myclaw.provider.models import ModelUsage
+from myclaw.session.records import (
     AssistantMessageStatus,
     AssistantSessionMessage,
     ConversationSession,
     CumulativeUsage,
     MetadataUpdate,
-    ModelToolCall,
-    ModelUsage,
     SessionError,
     SessionMetadata,
-    ToolResultStatus,
     ToolSessionMessage,
     UserSessionMessage,
+)
+from myclaw.tools.artifacts import ArtifactReference
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolResultStatus,
 )
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))

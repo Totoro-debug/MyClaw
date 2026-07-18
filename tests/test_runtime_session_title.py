@@ -9,15 +9,15 @@ import pytest
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.contracts import (
+from myclaw.provider.models import (
     AssistantModelMessage,
-    CumulativeUsage,
     ModelCompleted,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
 )
+from myclaw.session.records import CumulativeUsage
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock
 

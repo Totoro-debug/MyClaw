@@ -8,15 +8,15 @@ from typing import Protocol, runtime_checkable
 from prompt_toolkit import PromptSession
 from rich.console import Console
 
-from myclaw.contracts import (
+from myclaw.agent.events import (
     AgentEvent,
     BackgroundCompletedPayload,
-    ConversationPort,
     PermissionRequestedPayload,
-    SessionSummary,
     TextDeltaPayload,
     TurnFailedPayload,
 )
+from myclaw.agent.ports import ConversationPort
+from myclaw.session.records import SessionSummary
 
 
 class ReplInput(Protocol):

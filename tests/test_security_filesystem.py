@@ -6,7 +6,11 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.contracts import AssistantModelMessage, ModelToolCall, ToolExecutionContext
+from myclaw.provider.models import AssistantModelMessage
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolExecutionContext,
+)
 from myclaw.tools.tool_artifacts import ArtifactDiscardError
 from myclaw.tools.tool_gateway import ToolGateway
 

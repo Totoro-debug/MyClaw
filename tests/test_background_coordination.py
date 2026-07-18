@@ -9,41 +9,42 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
-from myclaw.agent.workspace import Workspace
-from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ConfigLoader
-from myclaw.contracts import (
+from myclaw.agent.events import (
     AgentEvent,
-    AssistantModelMessage,
     BackgroundCompletedPayload,
-    ConversationPort,
-    ErrorInfo,
-    ModelCallError,
-    ModelCompleted,
-    ModelRequest,
-    ModelResponse,
-    ModelStreamEvent,
-    ModelUsage,
     PermissionRequestedPayload,
-    ScheduledWork,
-    TextDelta,
     TextDeltaPayload,
     ToolCompletedPayload,
-    ToolExecutionContext,
     ToolStartedPayload,
     TurnCancelledPayload,
     TurnCompletedPayload,
     TurnFailedPayload,
     TurnStartedPayload,
 )
+from myclaw.agent.ports import ConversationPort
+from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
+from myclaw.agent.workspace import Workspace
+from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigLoader
+from myclaw.errors import ErrorInfo
 from myclaw.memory.conversation_summary import JsonlSummaryStore
 from myclaw.memory.memory_task import FileMemoryStore
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
+    AssistantModelMessage,
+    ModelCompleted,
+    ModelRequest,
+    ModelResponse,
+    ModelStreamEvent,
+    ModelUsage,
+    TextDelta,
+)
 from myclaw.schedule.background_coordination import (
     RuntimeEventBroker,
     ScheduledWorkCoordinator,
     ScheduledWorkScheduler,
 )
+from myclaw.schedule.records import ScheduledWork
 from myclaw.schedule.scheduled_work import JsonScheduledWorkStore, ScheduledWorkPersistenceError
 from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkModelSettings,
@@ -53,6 +54,7 @@ from myclaw.session.conversation import ChatModelSettings, StreamingConversation
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import run_repl
+from myclaw.tools.models import ToolExecutionContext
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript

@@ -10,20 +10,20 @@ import myclaw.memory.memory_scheduler as memory_scheduler_module
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.contracts import (
-    AssistantModelMessage,
-    ErrorInfo,
-    MemoryTaskResult,
-    ModelCallError,
-    ModelCompleted,
-    ModelRequest,
-    ModelResponse,
-    ModelToolCall,
-    ModelUsage,
-)
+from myclaw.errors import ErrorInfo
 from myclaw.memory.conversation_summary import JsonlSummaryStore
 from myclaw.memory.memory_scheduler import AsyncioMemorySchedulerClock, MemoryTaskScheduler
 from myclaw.memory.memory_task import FileMemoryStore, MemoryManager, MemoryTaskModelSettings
+from myclaw.memory.models import MemoryTaskResult
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import (
+    AssistantModelMessage,
+    ModelCompleted,
+    ModelRequest,
+    ModelResponse,
+    ModelUsage,
+)
+from myclaw.tools.models import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 

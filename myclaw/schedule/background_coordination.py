@@ -10,12 +10,9 @@ from uuid import UUID
 from croniter import croniter  # type: ignore[import-untyped]
 from tzlocal import get_localzone
 
-from myclaw.contracts import (
-    AgentEvent,
-    BackgroundCompletedPayload,
-    ErrorInfo,
-    ScheduledWork,
-)
+from myclaw.agent.events import AgentEvent, BackgroundCompletedPayload
+from myclaw.errors import ErrorInfo
+from myclaw.schedule.records import ScheduledWork
 from myclaw.schedule.scheduled_work import JsonScheduledWorkStore, ScheduledWorkPersistenceError
 from myclaw.schedule.scheduled_work_execution import ScheduledWorkRunner
 

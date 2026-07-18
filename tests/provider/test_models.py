@@ -2,18 +2,20 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.contracts import (
+from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelRequest,
     ModelResponse,
-    ModelToolCall,
     ModelUsage,
     TextDelta,
-    ToolDefinition,
     ToolModelMessage,
     UserModelMessage,
     validate_model_stream_events,
+)
+from myclaw.tools.models import (
+    ModelToolCall,
+    ToolDefinition,
 )
 
 

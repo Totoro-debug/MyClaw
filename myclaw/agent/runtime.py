@@ -10,18 +10,12 @@ from time import monotonic
 from typing import Protocol
 from uuid import UUID
 
+from myclaw.agent.events import AgentEvent
+from myclaw.agent.ports import ConversationPort
 from myclaw.agent.prompts import chat_system_prompt, runtime_context, session_title_prompt
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
-from myclaw.contracts import (
-    AgentEvent,
-    ConversationPort,
-    ConversationSession,
-    ModelProvider,
-    ToolDefinition,
-    ToolExecutionContext,
-)
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import (
     ManagementViewService,
@@ -41,6 +35,7 @@ from myclaw.memory.memory_scheduler import (
 )
 from myclaw.memory.memory_task import FileMemoryStore, MemoryManager, MemoryTaskModelSettings
 from myclaw.provider.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
+from myclaw.provider.ports import ModelProvider
 from myclaw.schedule.background_coordination import (
     AsyncioScheduledWorkSchedulerClock,
     RuntimeEventBroker,
@@ -58,9 +53,11 @@ from myclaw.session.conversation import (
     StreamingConversationPort,
     model_message_from_session,
 )
+from myclaw.session.records import ConversationSession
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
+from myclaw.tools.models import ToolDefinition, ToolExecutionContext
 from myclaw.tools.shell.shell_process import SubprocessShellBoundary
 from myclaw.tools.shell.shell_tool import ShellBoundary
 from myclaw.tools.tool_gateway import ToolGateway

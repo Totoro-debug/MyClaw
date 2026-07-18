@@ -1,13 +1,12 @@
-"""Provider-neutral model request and response contracts."""
+"""Provider-neutral model request and response values."""
 
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import ClassVar, Literal
 from uuid import UUID
 
-from myclaw.contracts.common import require_nonnegative_int, require_uuid4
-from myclaw.contracts.json_types import JsonObject
-from myclaw.contracts.tools import ToolDefinition
+from myclaw.tools.models import ModelToolCall, ToolDefinition
+from myclaw.utils.validation import require_nonnegative_int, require_uuid4
 
 type ModelRoute = Literal["default", "chat", "memory", "cron"]
 type ReasoningEffort = Literal["low", "medium", "high"]
@@ -36,18 +35,6 @@ class ModelUsage:
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
         }
-
-
-@dataclass(frozen=True, slots=True)
-class ModelToolCall:
-    """A provider tool call with parsed JSON-object arguments."""
-
-    id: str
-    name: str
-    arguments: JsonObject
-
-    def to_dict(self) -> dict[str, object]:
-        return {"id": self.id, "name": self.name, "arguments": self.arguments}
 
 
 @dataclass(frozen=True, slots=True)

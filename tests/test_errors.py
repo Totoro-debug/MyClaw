@@ -2,7 +2,11 @@ from typing import cast
 
 import pytest
 
-from myclaw.contracts import STABLE_ERROR_CODES, ErrorCode, ErrorInfo
+from myclaw.errors import (
+    STABLE_ERROR_CODES,
+    ErrorCode,
+    ErrorInfo,
+)
 
 
 def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:

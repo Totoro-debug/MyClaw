@@ -1,14 +1,8 @@
-"""Shared validation and formatting for runtime contract records."""
+"""Shared validation for runtime values and persisted records."""
 
-import re
 from datetime import datetime
 from math import isfinite
 from uuid import UUID
-
-_SESSION_ID_PATTERN = re.compile(
-    r"(?P<timestamp>\d{8}-\d{6}-\d{6})_"
-    r"(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
-)
 
 
 def require_nonnegative_int(value: int, *, field: str) -> None:
@@ -55,30 +49,3 @@ def require_uuid4_string(value: str, *, field: str) -> None:
     if str(parsed) != value:
         msg = f"{field} must be a canonical UUID4"
         raise ValueError(msg)
-
-
-def require_session_id(value: str, *, field: str = "session_id") -> None:
-    """Validate the complete timestamp-plus-UUID4 Conversation Session ID."""
-    match = _SESSION_ID_PATTERN.fullmatch(value)
-    if match is None:
-        msg = f"{field} must be a valid Session ID"
-        raise ValueError(msg)
-    try:
-        datetime.strptime(match.group("timestamp"), "%Y%m%d-%H%M%S-%f")
-        require_uuid4_string(match.group("uuid"), field=field)
-    except ValueError as exc:
-        msg = f"{field} must be a valid Session ID"
-        raise ValueError(msg) from exc
-
-
-def format_rfc3339_milliseconds(value: datetime) -> str:
-    """Format an aware datetime using the frozen persisted time representation."""
-    require_aware_datetime(value, field="timestamp")
-    return value.isoformat(timespec="milliseconds")
-
-
-def make_session_id(created_at: datetime, session_uuid: UUID) -> str:
-    """Build the frozen local timestamp plus UUID4 Conversation Session ID."""
-    require_aware_datetime(created_at, field="created_at")
-    require_uuid4(session_uuid, field="session_uuid")
-    return f"{created_at:%Y%m%d-%H%M%S-%f}_{session_uuid}"

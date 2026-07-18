@@ -3,14 +3,14 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from myclaw.contracts import (
+from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelResponse,
-    ModelToolCall,
     ModelUsage,
     TextDelta,
 )
+from myclaw.tools.models import ModelToolCall
 from tests.fixtures.provider import ScriptedFakeProvider, StreamScript
 
 

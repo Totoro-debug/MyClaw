@@ -15,11 +15,14 @@ from myclaw.config.config import (
     ToolsConfiguration,
     UserConfiguration,
 )
-from myclaw.contracts import (
-    AssistantModelMessage,
+from myclaw.errors import (
     ErrorCode,
     ErrorInfo,
-    ModelCallError,
+)
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.model_router import ModelRouter, ModelRouteStatus
+from myclaw.provider.models import (
+    AssistantModelMessage,
     ModelCompleted,
     ModelRequest,
     ModelResponse,
@@ -27,7 +30,6 @@ from myclaw.contracts import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.provider.model_router import ModelRouter, ModelRouteStatus
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
