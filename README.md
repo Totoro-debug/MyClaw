@@ -153,7 +153,7 @@ python -m pip install --no-index --no-deps --no-build-isolation -e .
 pytest
 ruff check .
 ruff format --check .
-mypy src tests
+mypy myclaw tests
 python -m build
 ```
 

@@ -73,7 +73,7 @@
 ### Product and runtime
 
 - 产品边界是 local-first、single-user 的 Personal Agent，不是多租户平台。
-- 首版实现语言为 Python 3.12+，采用 `pyproject.toml`、`src/` layout，CLI 使用 Typer + Rich，并以 asyncio 作为并发基础。
+- 首版实现语言为 Python 3.12+，采用 `pyproject.toml` 和仓库根目录下的 `myclaw/` 包布局，CLI 使用 Typer + Rich，并以 asyncio 作为并发基础。
 - 运行 `myclaw` 不带参数直接进入 REPL。
 - 首版没有 one-shot 对话命令、detached daemon、HTTP server 或 IPC server。
 - 每个 REPL invocation 创建一个独立 runtime。

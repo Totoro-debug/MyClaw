@@ -10,7 +10,7 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.config import ProviderConfiguration
+from myclaw.config.config import ProviderConfiguration
 from myclaw.contracts import (
     AssistantModelMessage,
     ModelCallError,
@@ -23,7 +23,7 @@ from myclaw.contracts import (
     ToolModelMessage,
     UserModelMessage,
 )
-from myclaw.providers.openai_compatible import OpenAICompatibleProvider
+from myclaw.provider.openai_compatible import OpenAICompatibleProvider
 
 REQUEST_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.atomic_files import atomic_replace_bytes, atomic_replace_text
+from myclaw.utils.atomic_files import atomic_replace_bytes, atomic_replace_text
 
 
 def test_failed_atomic_bytes_replace_preserves_official_state(

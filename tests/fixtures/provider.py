@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
+from myclaw.agent.prompts import session_title_prompt
 from myclaw.contracts import (
     ErrorInfo,
     ModelCallError,
@@ -11,7 +12,6 @@ from myclaw.contracts import (
     ModelResponse,
     ModelStreamEvent,
 )
-from myclaw.prompts import session_title_prompt
 
 
 @dataclass(frozen=True, slots=True)

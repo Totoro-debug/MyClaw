@@ -6,11 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.agent_home import AgentHome
-from myclaw.config import ConfigLoader
+from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigLoader
 from myclaw.contracts import ModelToolCall, ToolExecutionContext
-from myclaw.tool_gateway import ToolGateway
-from myclaw.web_fetch import HTTPResponseBoundary, PublicWebFetchBoundary, WebFetchRejected
+from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.web.web_fetch import (
+    HTTPResponseBoundary,
+    PublicWebFetchBoundary,
+    WebFetchRejected,
+)
 
 SCHEMA_INVALID_API_KEY_ALIAS_CONFIG = """[models.providers.primary]
 protocol = "anthropic"

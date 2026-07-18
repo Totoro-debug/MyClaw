@@ -51,7 +51,7 @@
 
 | ID | 已接受的决定 | 理由 | 同步文档 |
 | --- | --- | --- | --- |
-| D01 | Python 最低版本为 3.12，采用 `pyproject.toml` + `src/` layout | asyncio、typing 和 timezone 能力成熟，降低兼容分支 | 实施计划 |
+| D01 | Python 最低版本为 3.12，采用 `pyproject.toml` + 根目录 `myclaw/` 包布局 | asyncio、typing 和 timezone 能力成熟，降低兼容分支 | 实施计划 |
 | D02 | 配置 schema 严格校验未知字段；未知 provider protocol 仍按 PRD 忽略 | 尽早暴露拼写错误，同时保留既定 fallback 语义 | PRD 可补充 |
 | D03 | memory message threshold 默认 `40` 条 | 足够早地覆盖长会话，又不会在短对话频繁摘要 | PRD 可补充 |
 | D04 | Scheduled Work 文件名为 `scheduled-work.json` | 与 canonical term 一致，避免含糊的 `tasks.json` | PRD/ADR 0002 |

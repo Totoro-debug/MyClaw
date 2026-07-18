@@ -10,8 +10,8 @@ from typing import cast
 import pytest
 import typer
 
-import myclaw.cli as cli
-from tests.test_config import (
+import myclaw.terminal.cli as cli
+from tests.configuration.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,
     EXPECTED_REDACTED_MALFORMED_CONFIG,

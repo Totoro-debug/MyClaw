@@ -9,13 +9,10 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from myclaw.agent_home import AgentHome
-from myclaw.background_coordination import (
-    RuntimeEventBroker,
-    ScheduledWorkCoordinator,
-    ScheduledWorkScheduler,
-)
-from myclaw.config import ConfigLoader
+from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
+from myclaw.agent.workspace import Workspace
+from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigLoader
 from myclaw.contracts import (
     AgentEvent,
     AssistantModelMessage,
@@ -40,19 +37,25 @@ from myclaw.contracts import (
     TurnFailedPayload,
     TurnStartedPayload,
 )
-from myclaw.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.conversation_summary import JsonlSummaryStore
-from myclaw.memory_task import FileMemoryStore
-from myclaw.repl import run_repl
-from myclaw.runtime import PreparedReplRuntime, prepare_repl_runtime
-from myclaw.scheduled_work import JsonScheduledWorkStore, ScheduledWorkPersistenceError
-from myclaw.scheduled_work_execution import ScheduledWorkModelSettings, ScheduledWorkRunner
-from myclaw.session_resume import SwitchableConversationPort
-from myclaw.session_store import JsonlSessionStore
-from myclaw.tool_gateway import ToolGateway
-from myclaw.workspace import Workspace
+from myclaw.memory.conversation_summary import JsonlSummaryStore
+from myclaw.memory.memory_task import FileMemoryStore
+from myclaw.schedule.background_coordination import (
+    RuntimeEventBroker,
+    ScheduledWorkCoordinator,
+    ScheduledWorkScheduler,
+)
+from myclaw.schedule.scheduled_work import JsonScheduledWorkStore, ScheduledWorkPersistenceError
+from myclaw.schedule.scheduled_work_execution import (
+    ScheduledWorkModelSettings,
+    ScheduledWorkRunner,
+)
+from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.session_resume import SwitchableConversationPort
+from myclaw.session.session_store import JsonlSessionStore
+from myclaw.terminal.repl import run_repl
+from myclaw.tools.tool_gateway import ToolGateway
+from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
-from tests.test_config import VALID_CONFIG
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 13, 0, 30, 0, 123456, tzinfo=LOCAL_TIMEZONE)

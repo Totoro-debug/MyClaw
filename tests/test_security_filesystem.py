@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.agent_home import AgentHome
+from myclaw.agent.workspace import Workspace
+from myclaw.config.agent_home import AgentHome
 from myclaw.contracts import AssistantModelMessage, ModelToolCall, ToolExecutionContext
-from myclaw.tool_artifacts import ArtifactDiscardError
-from myclaw.tool_gateway import ToolGateway
-from myclaw.workspace import Workspace
+from myclaw.tools.tool_artifacts import ArtifactDiscardError
+from myclaw.tools.tool_gateway import ToolGateway
 
 SESSION_ID = "20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"
 OTHER_SESSION_ID = "20260713-050000-000000_550e8400-e29b-41d4-a716-446655440000"

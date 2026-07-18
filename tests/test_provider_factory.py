@@ -1,7 +1,7 @@
 import pytest
 
-from myclaw.config import ProviderConfiguration
-from myclaw.providers import (
+from myclaw.config.config import ProviderConfiguration
+from myclaw.provider import (
     AnthropicProvider,
     OpenAICompatibleProvider,
     create_provider,

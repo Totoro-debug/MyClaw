@@ -7,8 +7,13 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent_home import AgentHome
-from myclaw.config import ConfigError, ConfigLoader, ProviderConfiguration
+from myclaw.agent.runtime import (
+    ProviderAdapterUnavailable,
+    prepare_repl_runtime,
+    unavailable_provider_factory,
+)
+from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigError, ConfigLoader, ProviderConfiguration
 from myclaw.contracts import (
     AssistantModelMessage,
     AssistantSessionMessage,
@@ -23,13 +28,8 @@ from myclaw.contracts import (
     TextDelta,
     UserSessionMessage,
 )
-from myclaw.runtime import (
-    ProviderAdapterUnavailable,
-    prepare_repl_runtime,
-    unavailable_provider_factory,
-)
+from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
-from tests.test_config import VALID_CONFIG
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)

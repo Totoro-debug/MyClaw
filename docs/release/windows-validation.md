@@ -23,7 +23,7 @@ No Anthropic or OpenAI API key was present during the validation. Tests and the
 package build did not call a live Provider or public-network service.
 
 The final candidate adds the owner-selected Apache-2.0 license and PEP 639 package
-metadata without changing `src/`. All test, type, build, artifact, clean-install,
+metadata without changing `myclaw/`. All test, type, build, artifact, clean-install,
 and installed-CLI evidence below was rerun after that packaging change.
 
 ## Windows Gates
@@ -32,10 +32,10 @@ and installed-CLI evidence below was rerun after that packaging change.
 | --- | --- | --- |
 | Full offline test suite | `python -m pytest -q -ra` | PASS: `653 passed in 83.85s` |
 | Warning-strict suite | `python -X dev -W error::ResourceWarning -W error::RuntimeWarning -m pytest -q -ra` | PASS: `653 passed in 84.60s` |
-| Lint | `python -m ruff check src tests` | PASS: `All checks passed!` |
-| Format | `python -m ruff format --check src tests` | PASS: `111 files already formatted` |
-| Strict types | `python -m mypy src tests` | PASS: `Success: no issues found in 111 source files` |
-| Linux-target types | `python -m mypy --platform linux src tests` | PASS: `Success: no issues found in 111 source files` |
+| Lint | `python -m ruff check myclaw tests` | PASS: `All checks passed!` |
+| Format | `python -m ruff format --check myclaw tests` | PASS: `111 files already formatted` |
+| Strict types | `python -m mypy myclaw tests` | PASS: `Success: no issues found in 111 source files` |
+| Linux-target types | `python -m mypy --platform linux myclaw tests` | PASS: `Success: no issues found in 111 source files` |
 | Package | `python -m build` | PASS with isolated setuptools 83: wheel and sdist built |
 | License metadata | Installed distribution plus direct wheel/sdist inspection | PASS: Core Metadata 2.4, `Apache-2.0`, `License-File: LICENSE`, one wheel `licenses/LICENSE`, and sdist root `LICENSE`; normalized official digest matched |
 | Diff hygiene | `git diff --check` | PASS; only LF-to-CRLF worktree notices were emitted |
@@ -69,7 +69,7 @@ resolution. It did not import from the repository: the checkout was absent from
 `sys.path`, and `pip show myclaw` reported
 `<validation-root>\venv\Lib\site-packages`. `pip check` returned
 `No broken requirements found.` The installed console entry point was
-`myclaw=myclaw.cli:app`; `pip show myclaw` reported the isolated site-packages path
+`myclaw=myclaw.terminal.cli:app`; `pip show myclaw` reported the isolated site-packages path
 and `License-Expression: Apache-2.0`.
 
 Resolved direct runtime dependencies were:

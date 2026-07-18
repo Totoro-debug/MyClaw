@@ -11,7 +11,8 @@ from uuid import UUID
 import pytest
 from rich.console import Console
 
-from myclaw.agent_home import AgentHome
+from myclaw.agent.workspace import Workspace
+from myclaw.config.agent_home import AgentHome
 from myclaw.contracts import (
     AssistantModelMessage,
     ModelCompleted,
@@ -21,12 +22,11 @@ from myclaw.contracts import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.management import ManagementViewService
-from myclaw.management_commands import ManagementCommandDispatcher
-from myclaw.repl import ConsoleProgressiveWriter, ConsoleReplInput, run_repl
-from myclaw.session_store import JsonlSessionStore
-from myclaw.workspace import Workspace
+from myclaw.management.commands import ManagementCommandDispatcher
+from myclaw.management.service import ManagementViewService
+from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.session_store import JsonlSessionStore
+from myclaw.terminal.repl import ConsoleProgressiveWriter, ConsoleReplInput, run_repl
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -115,7 +115,7 @@ async def test_console_repl_input_cancellation_stops_async_prompt_without_a_work
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
-    monkeypatch.setattr("myclaw.repl.sys.stdin", TerminalInput())
+    monkeypatch.setattr("myclaw.terminal.repl.sys.stdin", TerminalInput())
     prompt = BlockingPromptSession()
     input_reader = ConsoleReplInput(
         Console(force_terminal=True),
@@ -138,8 +138,8 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
-import myclaw.repl as repl_module
-from myclaw.repl import ConsoleReplInput
+import myclaw.terminal.repl as repl_module
+from myclaw.terminal.repl import ConsoleReplInput
 
 class TerminalInput:
     def isatty(self):

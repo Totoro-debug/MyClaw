@@ -25,10 +25,10 @@ an unavailable WSL registration is not accepted as POSIX execution evidence.
 | Gate | Command / public seam | Required result | Current result |
 | --- | --- | --- | --- |
 | Offline tests | `python -m pytest -q -ra` | All non-platform tests pass; no external Provider or network call | PASS: `645 passed, 8 skipped in 22.07s` |
-| POSIX process behavior | `python -m pytest -q -ra tests/test_shell_process.py tests/test_web_search.py tests/test_runtime_shutdown.py tests/test_security_shell.py` | Real Shell process, process-group descendant cleanup, timeout, cancellation, WebSearch subprocess ownership, and Runtime shutdown tests pass | PASS: `74 passed, 3 skipped in 2.05s` |
-| Lint | `python -m ruff check src tests` | Pass | PASS: `All checks passed!` |
-| Format | `python -m ruff format --check src tests` | Pass | PASS: `111 files already formatted` |
-| Strict types | `python -m mypy src tests` | Pass under the repository's strict configuration | PASS: `Success: no issues found in 111 source files` |
+| POSIX process behavior | `python -m pytest -q -ra tests/tools/shell/test_shell_process.py tests/tools/web/test_web_search.py tests/test_runtime_shutdown.py tests/test_security_shell.py` | Real Shell process, process-group descendant cleanup, timeout, cancellation, WebSearch subprocess ownership, and Runtime shutdown tests pass | PASS: `74 passed, 3 skipped in 2.05s` |
+| Lint | `python -m ruff check myclaw tests` | Pass | PASS: `All checks passed!` |
+| Format | `python -m ruff format --check myclaw tests` | Pass | PASS: `111 files already formatted` |
+| Strict types | `python -m mypy myclaw tests` | Pass under the repository's strict configuration | PASS: `Success: no issues found in 111 source files` |
 | Package | `python -m build` | sdist and wheel build successfully | PASS: built `myclaw-0.1.0.tar.gz` and `myclaw-0.1.0-py3-none-any.whl` |
 | Clean wheel install | Create a fresh venv, install `dist/*.whl`, and run `pip check` | Install succeeds without importing from the checkout and dependencies are consistent | PASS: wheel and dependencies installed; `No broken requirements found.` |
 | CLI first start | Run installed `myclaw` with an empty temporary `HOME` | Exact configuration-gate exit, safe diagnostic, no traceback, and default `~/.myclaw/config.toml` creation | PASS: exit `2`, `config_missing`, no `Traceback`, and file assertions succeeded |

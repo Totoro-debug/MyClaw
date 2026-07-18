@@ -45,18 +45,18 @@ jobs:
       - name: Run POSIX process regressions
         run: >-
           python -m pytest -q -ra
-          tests/test_shell_process.py
-          tests/test_web_search.py
+          tests/tools/shell/test_shell_process.py
+          tests/tools/web/test_web_search.py
           tests/test_runtime_shutdown.py
           tests/test_security_shell.py
 
       - name: Run lint and format gates
         run: |
-          python -m ruff check src tests
-          python -m ruff format --check src tests
+          python -m ruff check myclaw tests
+          python -m ruff format --check myclaw tests
 
       - name: Run strict type gate
-        run: python -m mypy src tests
+        run: python -m mypy myclaw tests
 
       - name: Build source and wheel distributions
         run: python -m build

@@ -2,7 +2,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 
-from myclaw.workspace import Workspace
+from myclaw.agent.workspace import Workspace
 
 
 def test_windows_drive_workspace_has_the_accepted_identity_and_slug() -> None:

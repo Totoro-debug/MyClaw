@@ -8,7 +8,8 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent_home import AgentHome
+from myclaw.agent.workspace import Workspace
+from myclaw.config.agent_home import AgentHome
 from myclaw.contracts import (
     AgentEvent,
     AssistantModelMessage,
@@ -32,10 +33,9 @@ from myclaw.contracts import (
     TurnFailedPayload,
     validate_agent_event_sequence,
 )
-from myclaw.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.session_store import JsonlSessionStore
-from myclaw.tool_gateway import ToolGateway
-from myclaw.workspace import Workspace
+from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))

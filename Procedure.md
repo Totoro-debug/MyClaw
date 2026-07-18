@@ -100,7 +100,7 @@ Every batch must pass the commands established by #2. Until #2 freezes exact com
 pytest
 ruff check .
 ruff format --check .
-mypy src tests
+mypy myclaw tests
 python -m build
 ```
 

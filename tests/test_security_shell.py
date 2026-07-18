@@ -8,9 +8,9 @@ from pathlib import Path
 import pytest
 
 from myclaw.contracts import ModelToolCall, PermissionDecision, ToolExecutionContext
-from myclaw.shell_policy import ShellRequest
-from myclaw.shell_process import SubprocessShellBoundary
-from myclaw.tool_gateway import ToolGateway
+from myclaw.tools.shell.shell_policy import ShellRequest
+from myclaw.tools.shell.shell_process import SubprocessShellBoundary
+from myclaw.tools.tool_gateway import ToolGateway
 
 
 def _platform_shell_command(arguments: list[str]) -> str:
@@ -104,7 +104,7 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
         "from pathlib import Path\n"
         "from myclaw.contracts import ModelToolCall, PermissionDecision, "
         "ToolExecutionContext\n"
-        "from myclaw.tool_gateway import ToolGateway\n"
+        "from myclaw.tools.tool_gateway import ToolGateway\n"
         "class Shell:\n"
         "    def __init__(self): self.calls = 0\n"
         "    async def execute(self, request): self.calls += 1; return 'ran'\n"

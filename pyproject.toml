@@ -35,10 +35,11 @@ dev = [
 ]
 
 [project.scripts]
-myclaw = "myclaw.cli:app"
+myclaw = "myclaw.terminal.cli:app"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["myclaw*"]
 
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers", "-ra"]
@@ -53,6 +54,6 @@ target-version = "py312"
 select = ["B", "E4", "E7", "E9", "F", "I", "RUF", "UP"]
 
 [tool.mypy]
-files = ["src", "tests"]
+files = ["myclaw", "tests"]
 python_version = "3.12"
 strict = true

@@ -7,8 +7,11 @@ from uuid import uuid4
 
 import pytest
 
-from myclaw.agent_home import AgentHome
-from myclaw.config import ConfigLoader
+from myclaw.agent.prompts import session_title_prompt
+from myclaw.agent.runtime import _DeferredConversationPort, prepare_repl_runtime
+from myclaw.agent.workspace import Workspace
+from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigLoader
 from myclaw.contracts import (
     AssistantModelMessage,
     ConversationSession,
@@ -22,17 +25,14 @@ from myclaw.contracts import (
     TextDelta,
     ToolExecutionContext,
 )
-from myclaw.conversation import ChatModelSettings
-from myclaw.prompts import session_title_prompt
-from myclaw.runtime import _DeferredConversationPort, prepare_repl_runtime
-from myclaw.session_store import JsonlSessionStore
-from myclaw.shell_policy import ShellRequest
-from myclaw.shell_process import SubprocessShellBoundary
-from myclaw.tool_gateway import ToolGateway
-from myclaw.web_fetch import PublicWebFetchBoundary
-from myclaw.workspace import Workspace
+from myclaw.session.conversation import ChatModelSettings
+from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.shell.shell_policy import ShellRequest
+from myclaw.tools.shell.shell_process import SubprocessShellBoundary
+from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.web.web_fetch import PublicWebFetchBoundary
+from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
-from tests.test_config import VALID_CONFIG
 
 NOW = datetime(2026, 7, 13, 0, 30, tzinfo=timezone(timedelta(hours=8)))
 
@@ -920,7 +920,7 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
 async def test_interrupt_controller_restores_handler_and_drains_foreground_cancels() -> None:
     from types import FrameType
 
-    from myclaw.interrupts import (
+    from myclaw.terminal.interrupts import (
         ForegroundInterruptController,
         SignalDisposition,
     )
@@ -987,7 +987,7 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    from myclaw.interrupts import (
+    from myclaw.terminal.interrupts import (
         ForegroundInterruptController,
         SignalDisposition,
     )
@@ -1139,7 +1139,7 @@ async def test_runtime_interrupt_keeps_background_work_alive_and_exit_settles_it
 ) -> None:
     from types import FrameType
 
-    from myclaw.interrupts import (
+    from myclaw.terminal.interrupts import (
         ForegroundInterruptController,
         SignalDisposition,
     )

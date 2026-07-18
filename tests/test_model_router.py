@@ -5,7 +5,7 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.config import (
+from myclaw.config.config import (
     MemoryConfiguration,
     ModelsConfiguration,
     ProviderConfiguration,
@@ -27,7 +27,7 @@ from myclaw.contracts import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.model_router import ModelRouter, ModelRouteStatus
+from myclaw.provider.model_router import ModelRouter, ModelRouteStatus
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))

@@ -32,30 +32,34 @@
 
 ## 3. 建议的包与模块边界
 
-以下是实现起点，不是要求每个文件都形成一层抽象。若实际代码更简单，可合并同一边界内的小文件，但不得让 CLI 直接读写 session、memory 或 provider SDK。
+以下是当前模块布局，不是要求每个文件都形成一层抽象。若实际代码更简单，可合并同一边界内的小文件，但不得让 CLI 直接读写 session、memory 或 provider SDK。
 
 ```text
-src/myclaw/
-  cli/                 # Typer 命令、Rich REPL、picker、事件渲染
-  runtime/             # Runtime Core、turn loop、生命周期、上下文组装
-  ports/               # Conversation Port、Management Port 的 Protocol/ABC
-  events/              # typed Agent Events
-  config/              # TOML schema、加载、校验、默认模板、脱敏
-  models/              # route、统一请求/响应、usage、retry
-    providers/         # Anthropic、OpenAI-compatible adapters
-  sessions/            # Workspace、Session Store、schema、title
-  memory/              # consolidation、summary store、cursor、Memory Task
-  tools/               # Tool Gateway、catalog、permission、normalized result
-    builtin/           # file、shell、web、Scheduled Work tools
-  scheduling/          # Memory Task 与 Scheduled Work scheduler
-  persistence/         # Agent Home paths、atomic write、JSONL helpers
-  prompts/             # 内置 identity、summary、memory、title、cron prompts
+myclaw/
+  agent/               # Runtime Core、prompt composition、Workspace
+  config/              # Agent Home、TOML、校验、脱敏、route 解析
+  contracts/           # schema、事件、错误、canonical types
+  management/          # Management Port service 与命令分发
+  memory/              # Conversation Summary、Memory Task 与 scheduler
+  provider/            # Model Router 与 Provider adapters
+  schedule/            # Scheduled Work persistence、执行与后台协调
+  session/             # Conversation、Session Store、resume 与 title
+  terminal/            # Typer CLI、REPL 与 foreground interrupts
+  tools/
+    files/             # Workspace 文件读写工具
+    shell/             # Shell policy、process 与 Tool adapter
+    web/               # WebSearch 与 WebFetch
+  utils/               # atomic file helpers
 tests/
-  unit/                # 纯规则和 schema
+  configuration/       # 配置行为
   contract/            # Port、Store、Gateway、Provider adapter 契约
-  integration/         # 临时目录 + fake provider 的跨模块行为
-  cli/                 # Typer runner/伪终端级行为
+  management/          # Management Port 行为
+  memory/              # Conversation Summary 与 Memory Task
+  scheduling/          # Scheduled Work persistence 与执行
+  sessions/            # Conversation、Session Store、resume 与 title
+  tools/               # files、shell、web 与 artifact 行为
   fixtures/            # fake provider、fake tool、clock、Agent Home builders
+  test_*.py            # 跨模块、Runtime、CLI 与安全行为
 ```
 
 关键依赖方向：

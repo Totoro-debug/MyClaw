@@ -22,7 +22,7 @@ from anthropic import (
 )
 from httpx import Request, Response
 
-from myclaw.config import ProviderConfiguration
+from myclaw.config.config import ProviderConfiguration
 from myclaw.contracts import (
     AssistantModelMessage,
     ModelCallError,
@@ -34,7 +34,7 @@ from myclaw.contracts import (
     ToolModelMessage,
     UserModelMessage,
 )
-from myclaw.providers.anthropic import AnthropicProvider
+from myclaw.provider.anthropic import AnthropicProvider
 
 REQUEST_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 

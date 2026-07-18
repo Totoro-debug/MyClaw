@@ -7,7 +7,8 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent_home import AgentHome
+from myclaw.agent.workspace import Workspace
+from myclaw.config.agent_home import AgentHome
 from myclaw.contracts import (
     AssistantModelMessage,
     ModelCompleted,
@@ -21,11 +22,10 @@ from myclaw.contracts import (
     ToolModelMessage,
     ToolSessionMessage,
 )
-from myclaw.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.repl import run_repl
-from myclaw.session_store import JsonlSessionStore
-from myclaw.tool_gateway import ToolGateway
-from myclaw.workspace import Workspace
+from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.session_store import JsonlSessionStore
+from myclaw.terminal.repl import run_repl
+from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 
 SESSION_ID = "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000"
