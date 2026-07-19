@@ -188,7 +188,7 @@
 - Tool enablement 使用 `[tools.web] enabled = true` 与 `[tools.shell] enabled = true`，两者默认启用。
 - User Configuration 只控制 web/shell enablement；allow/deny/ask Permission Policy 是工具内置规则，不对用户开放。
 - 配置严格拒绝未知顶层 table、未知已知-schema 字段和未知 route；未知 protocol provider 仍按既定规则忽略。
-- 配置缺失时，创建 Anthropic 和 OpenAI-compatible provider 模板：API key 和 model list 为空，不创建 route mappings，然后退出并提示用户编辑。
+- 配置缺失时，只创建一个 ID 为 `openai-local` 的 OpenAI-compatible provider 模板（base URL、API key 和 model list 为空），并为 `default`、`chat`、`memory`、`cron` 创建显式但不可用的 route 待填写段；四个 route 初始都引用 `openai-local`。随后退出并提示用户替换 Provider、model 和模型限制，或删除不需要定制的具体 route 以回退到 default；旧配置完全缺少 default route 时，错误消息必须指出 `[models.routes.default]`。
 - OpenAI-compatible provider 模板的 base_url 为空；所有 provider 的有效配置都要求 base_url。
 - `myclaw config` 在配置缺失时创建默认配置并显示脱敏内容。
 - 配置无法解析、模型配置不完整或 default route 不可用时，`myclaw` 启动 REPL 直接退出并显示用户可见错误。

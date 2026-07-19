@@ -20,17 +20,49 @@ enabled = true
 [tools.shell]
 enabled = true
 
-[models.providers.anthropic-default]
-protocol = "anthropic"
-base_url = "https://api.anthropic.com"
-api_key = ""
-models = []
-
 [models.providers.openai-local]
 protocol = "openai-compatible"
 base_url = ""
 api_key = ""
 models = []
+
+# Replace provider_id, model, and model limits with values supported by your provider.
+# Remove any purpose-specific route to fall back to default.
+[models.routes.default]
+provider_id = "openai-local"
+model = "replace-with-a-model-id"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+reasoning_effort = "medium"
+timeout = 120
+
+[models.routes.chat]
+provider_id = "openai-local"
+model = "replace-with-a-model-id"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+reasoning_effort = "medium"
+timeout = 120
+
+[models.routes.memory]
+provider_id = "openai-local"
+model = "replace-with-a-model-id"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+reasoning_effort = "medium"
+timeout = 120
+
+[models.routes.cron]
+provider_id = "openai-local"
+model = "replace-with-a-model-id"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+reasoning_effort = "medium"
+timeout = 120
 """
 
 VALID_CONFIG = """[runtime]
@@ -235,6 +267,45 @@ def test_missing_configuration_is_created_exactly_once(agent_home: Path) -> None
 
     assert loader.ensure_default() is False
     assert (agent_home / "config.toml").read_bytes() == existing
+
+
+def test_generated_configuration_scaffolds_one_provider_and_all_model_routes(
+    agent_home: Path,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+
+    assert loader.ensure_default() is True
+
+    models = loader.load().models
+    assert set(models.providers) == {"openai-local"}
+    provider = models.providers["openai-local"]
+    assert (provider.protocol, provider.base_url, provider.api_key, provider.models) == (
+        "openai-compatible",
+        "",
+        "",
+        (),
+    )
+
+    routes = models.routes
+    assert set(routes) == {"default", "chat", "memory", "cron"}
+    for route in routes.values():
+        assert (
+            route.provider_id,
+            route.model,
+            route.context_window,
+            route.max_output,
+            route.temperature,
+            route.reasoning_effort,
+            route.timeout,
+        ) == (
+            "openai-local",
+            "replace-with-a-model-id",
+            200000,
+            8192,
+            0.2,
+            "medium",
+            120,
+        )
 
 
 def test_failed_startup_generation_leaves_no_partial_configuration(
@@ -629,3 +700,20 @@ def test_model_route_resolution_uses_only_a_usable_default(
             resolved.route.model,
             resolved.used_default,
         ) == (requested_route, "default", "anthropic-default", "claude-model", True)
+
+
+def test_missing_default_model_route_names_the_required_configuration_table(
+    agent_home: Path,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    content_without_routes = VALID_CONFIG.partition("\n[models.routes.default]")[0] + "\n"
+    loader.path.write_text(content_without_routes, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as raised:
+        loader.load_for_startup()
+
+    assert raised.value.error.code == "route_unavailable"
+    assert raised.value.error.message == (
+        "Default Model Route is missing. Add [models.routes.default] to User Configuration."
+    )

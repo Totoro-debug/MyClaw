@@ -32,17 +32,49 @@ enabled = true
 [tools.shell]
 enabled = true
 
-[models.providers.anthropic-default]
-protocol = "anthropic"
-base_url = "https://api.anthropic.com"
-api_key = ""
-models = []
-
 [models.providers.openai-local]
 protocol = "openai-compatible"
 base_url = ""
 api_key = ""
 models = []
+
+# Replace provider_id, model, and model limits with values supported by your provider.
+# Remove any purpose-specific route to fall back to default.
+[models.routes.default]
+provider_id = "openai-local"
+model = "replace-with-a-model-id"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+reasoning_effort = "medium"
+timeout = 120
+
+[models.routes.chat]
+provider_id = "openai-local"
+model = "replace-with-a-model-id"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+reasoning_effort = "medium"
+timeout = 120
+
+[models.routes.memory]
+provider_id = "openai-local"
+model = "replace-with-a-model-id"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+reasoning_effort = "medium"
+timeout = 120
+
+[models.routes.cron]
+provider_id = "openai-local"
+model = "replace-with-a-model-id"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+reasoning_effort = "medium"
+timeout = 120
 """
 
 type ReasoningEffort = Literal["low", "medium", "high"]
@@ -174,7 +206,13 @@ class UserConfiguration:
             candidate = _usable_route(self.models, "default")
             selected_route = "default"
         if candidate is None:
-            raise ConfigError(ErrorInfo("route_unavailable", "Default Model Route is unavailable."))
+            message = "Default Model Route is unavailable."
+            if "default" not in self.models.routes:
+                message = (
+                    "Default Model Route is missing. "
+                    "Add [models.routes.default] to User Configuration."
+                )
+            raise ConfigError(ErrorInfo("route_unavailable", message))
         provider, route = candidate
         return ResolvedModelRoute(
             requested_route=requested_route,

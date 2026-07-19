@@ -36,19 +36,21 @@ including when the configuration is invalid.
 
 ## Configure
 
-The generated file contains runtime, memory, Tool, and Provider defaults. At least
-one usable `default` model route is required. For example, complete the generated
-Anthropic Provider and add this route using a model available to the account:
+The generated file contains runtime, memory, Tool, and Provider defaults plus editable
+scaffolds for the `default`, `chat`, `memory`, and `cron` Model Routes. It contains one
+`openai-compatible` Provider scaffold. Complete that Provider, then replace the
+generated route values using a supported model. A minimal working configuration can
+keep only the `default` route:
 
 ```toml
-[models.providers.anthropic-default]
-protocol = "anthropic"
-base_url = "https://api.anthropic.com"
+[models.providers.openai-local]
+protocol = "openai-compatible"
+base_url = "https://provider.example/v1"
 api_key = "replace-with-a-dedicated-key"
 models = ["replace-with-a-model-id"]
 
 [models.routes.default]
-provider_id = "anthropic-default"
+provider_id = "openai-local"
 model = "replace-with-a-model-id"
 context_window = 200000
 max_output = 8192
@@ -57,10 +59,11 @@ reasoning_effort = "medium"
 timeout = 120
 ```
 
-Providers use either `anthropic` or `openai-compatible` protocol. Optional `chat`,
-`memory`, and `cron` routes use the same fields and fall back to `default` when not
-configured. Provider model IDs must also appear in that Provider's `models` array.
-The schema is strict: unknown tables or fields are configuration errors.
+Providers use either `anthropic` or `openai-compatible` protocol. The `chat` route is
+used for conversations and Session titles, `memory` for summaries and Memory Tasks,
+and `cron` for Scheduled Work. Remove any purpose-specific route table to fall back to
+`default`; Provider model IDs must also appear in that Provider's `models` array. The
+schema is strict: unknown tables or fields are configuration errors.
 
 `api_key` values are plaintext at rest in `config.toml`. MyClaw redacts keys from
 configuration views and user-visible errors, but v0.1 has no environment-variable

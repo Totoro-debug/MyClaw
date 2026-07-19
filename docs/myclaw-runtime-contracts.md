@@ -183,9 +183,25 @@ context_window = 200000
 max_output = 8192
 temperature = 0.2
 timeout = 120
+
+[models.routes.memory]
+provider_id = "anthropic-default"
+model = "model-id"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+timeout = 120
+
+[models.routes.cron]
+provider_id = "anthropic-default"
+model = "model-id"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+timeout = 120
 ```
 
-`models.routes.memory` 和 `models.routes.cron` 可省略，省略时使用 default。`reasoning_effort` 可省略。
+`models.routes.chat`、`models.routes.memory` 和 `models.routes.cron` 均可省略，省略时使用 default。`reasoning_effort` 可省略。
 
 ### 4.2 字段规则
 
@@ -215,7 +231,7 @@ timeout = 120
 
 ### 4.3 首次生成模板
 
-缺少 `config.toml` 时，生成模板包含 runtime、memory、tools 和两个 provider template，但不生成任何 route mapping。Anthropic template 的 `base_url` 使用官方默认地址；OpenAI-compatible template 的 `base_url` 为空；两者 `api_key` 和 `models` 均为空。生成后 `myclaw` 退出，`myclaw config` 则显示脱敏模板。
+缺少 `config.toml` 时，生成模板包含 runtime、memory、tools、一个 ID 为 `openai-local` 的 OpenAI-compatible provider template，以及 `default`、`chat`、`memory`、`cron` 四个显式但不可用的 route scaffold。Provider 的 `base_url`、`api_key` 和 `models` 均为空。四个 route 初始都指向 `openai-local`，model 使用待替换值，并提供完整的模型限制字段；用户可删除不需要定制的具体 route，使其回退到 default。生成后 `myclaw` 退出，`myclaw config` 则显示脱敏模板；旧配置完全缺少 default route 时，启动错误指出 `[models.routes.default]`。
 
 ### 4.4 脱敏
 
