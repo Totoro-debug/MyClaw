@@ -7,18 +7,10 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import Final, Self
 
+from myclaw.templates import load_template
 from myclaw.utils.atomic_files import atomic_replace_text
 
-_LONG_TERM_MEMORY_TEMPLATE: Final = """# Long-term Memory
-
-## User Info
-
-## User Preference
-
-## Project Fact
-
-## Lesson
-"""
+_LONG_TERM_MEMORY_TEMPLATE: Final = load_template("long-term-memory.md")
 
 
 @dataclass(frozen=True, slots=True)

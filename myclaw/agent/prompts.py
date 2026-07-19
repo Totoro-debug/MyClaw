@@ -1,53 +1,33 @@
-"""Version-tracked prompt fragments shared by runtime orchestration."""
+"""Render version-tracked prompts shared by runtime orchestration."""
 
+from __future__ import annotations
+
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import PurePath
+from typing import TYPE_CHECKING
 
 from myclaw.memory.records import SummaryEntry
+from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
 
-_RUNTIME_CONTEXT = """<runtime_context>
-current_time: {current_time}
-session_id: {session_id}
-</runtime_context>"""
-
-_USER_INPUT = """<user_input>
-{content}
-</user_input>"""
-
-_BUILTIN_IDENTITY = """You are the MyClaw Personal Agent.
-Act within the user's current Workspace.
-Workspace: {workspace}"""
-
-_CHAT_SYSTEM_PROMPT = """{identity}
-
-<long_term_memory>
-{long_term_memory}</long_term_memory>
-
-<tool_guidance>
-{tool_guidance}</tool_guidance>"""
-
-_SESSION_TITLE_PROMPT = """Generate a concise title for this Conversation Session.
-Return only the title. Do not call tools or add commentary."""
-
-_MEMORY_TASK_PROMPT = """Maintain the MyClaw Long-term Memory from new Conversation Summaries.
-Use read_file to inspect exactly {long_term_path}.
-Use edit_file only when stable information should be retained, and edit exactly that file.
-Keep the four sections: User Info, User Preference, Project Fact, and Lesson.
-Do not store transient activity, raw summaries, or duplicate facts.
-If no durable update is needed, do not call edit_file."""
+if TYPE_CHECKING:
+    from myclaw.tools.models import ToolDefinition
 
 
 def current_user_input(*, content: str, current_time: datetime, session_id: str) -> str:
     """Wrap only the current raw user input with dynamic Runtime Context."""
-    return f"{runtime_context(current_time=current_time, session_id=session_id)}\n\n" + (
-        _USER_INPUT.format(content=content)
+    return render_template(
+        "current-user-input.md",
+        runtime_context=runtime_context(current_time=current_time, session_id=session_id),
+        user_input=render_template("user-input.md", content=content),
     )
 
 
 def runtime_context(*, current_time: datetime, session_id: str) -> str:
     """Render the per-turn metadata included in the next model request."""
-    return _RUNTIME_CONTEXT.format(
+    return render_template(
+        "runtime-context.md",
         current_time=format_rfc3339_milliseconds(current_time),
         session_id=session_id,
     )
@@ -57,27 +37,56 @@ def chat_system_prompt(
     *, workspace: PurePath, long_term_memory: str, tool_guidance: str = ""
 ) -> str:
     """Compose chat system context in the accepted fixed order."""
-    return _CHAT_SYSTEM_PROMPT.format(
-        identity=_BUILTIN_IDENTITY.format(workspace=workspace),
+    return render_template(
+        "chat-system-prompt.md",
+        identity=render_template("builtin-identity.md", workspace=workspace),
         long_term_memory=long_term_memory,
         tool_guidance=tool_guidance,
     )
 
 
+def render_tool_guidance(definitions: Iterable[ToolDefinition]) -> str:
+    """Render the model-visible tool catalog in stable definition order."""
+    return "\n".join(
+        render_template(
+            "tool-guidance-entry.md",
+            name=definition.name,
+            description=definition.description,
+        )
+        for definition in definitions
+    )
+
+
 def session_title_prompt() -> str:
     """Return the isolated prompt used for Session title generation."""
-    return _SESSION_TITLE_PROMPT
+    return render_template("session-title-prompt.md")
+
+
+def conversation_summary_prompt() -> str:
+    """Return the isolated prompt used for Conversation Summary generation."""
+    return render_template("conversation-summary-system-prompt.md")
+
+
+def conversation_summary_input(*, messages: str) -> str:
+    """Wrap serialized earlier messages for Conversation Summary generation."""
+    return render_template("conversation-summary-input.md", messages=messages)
 
 
 def memory_task_prompt(*, long_term_path: PurePath) -> str:
     """Return the restricted four-section Long-term Memory maintenance prompt."""
-    return _MEMORY_TASK_PROMPT.format(long_term_path=long_term_path)
+    return render_template("memory-task-prompt.md", long_term_path=long_term_path)
 
 
 def memory_task_input(*, cursor: int, summaries: tuple[SummaryEntry, ...]) -> str:
     """Render only the pending ordered Conversation Summary batch."""
     records = "\n".join(entry.to_json_line().rstrip("\n") for entry in summaries)
-    return (
-        f"<summary_cursor>{cursor}</summary_cursor>\n"
-        f"<conversation_summaries>\n{records}\n</conversation_summaries>"
+    return render_template(
+        "memory-task-input.md",
+        cursor=cursor,
+        records=records,
     )
+
+
+def interrupted_assistant_content(content: str) -> str:
+    """Mark interrupted assistant output when projecting persisted history."""
+    return render_template("interrupted-assistant-content.md", content=content)

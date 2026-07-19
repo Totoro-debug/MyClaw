@@ -41,6 +41,9 @@ myclaw = "myclaw.terminal.cli:app"
 where = ["."]
 include = ["myclaw*"]
 
+[tool.setuptools.package-data]
+"myclaw.templates" = ["*.md"]
+
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers", "-ra"]
 asyncio_mode = "strict"

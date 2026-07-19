@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
-from myclaw.agent.prompts import current_user_input
+from myclaw.agent.prompts import (
+    conversation_summary_input,
+    conversation_summary_prompt,
+    current_user_input,
+)
 from myclaw.agent.turn import model_message_from_session
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
@@ -32,9 +36,6 @@ from myclaw.session.records import (
 from myclaw.tools.models import ToolDefinition
 from myclaw.utils.atomic_files import atomic_replace_bytes
 from myclaw.utils.time import format_rfc3339_milliseconds
-
-_SUMMARY_SYSTEM_PROMPT = """Summarize the provided earlier conversation messages.
-Preserve decisions, user intent, important facts, and unresolved work concisely."""
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 type UnlinkFile = Callable[[Path], None]
@@ -365,7 +366,7 @@ class ConversationSummaryManager:
         request = ModelRequest(
             request_id=self._new_uuid(),
             route="memory",
-            system_prompt=_SUMMARY_SYSTEM_PROMPT,
+            system_prompt=conversation_summary_prompt(),
             messages=(UserModelMessage(content=_summary_input(selected)),),
             tools=(),
             stream=False,
@@ -495,12 +496,10 @@ def _summary_input(messages: tuple[SessionMessage, ...]) -> str:
         for message in messages
         if (model_message := model_message_from_session(message)) is not None
     ]
-    return (
-        "<conversation_messages>\n"
-        + json.dumps(
+    return conversation_summary_input(
+        messages=json.dumps(
             records,
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        + "\n</conversation_messages>"
     )

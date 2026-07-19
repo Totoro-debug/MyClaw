@@ -12,7 +12,12 @@ from uuid import UUID
 
 from myclaw.agent.events import AgentEvent
 from myclaw.agent.ports import ConversationPort
-from myclaw.agent.prompts import chat_system_prompt, runtime_context, session_title_prompt
+from myclaw.agent.prompts import (
+    chat_system_prompt,
+    render_tool_guidance,
+    runtime_context,
+    session_title_prompt,
+)
 from myclaw.agent.turn import model_message_from_session
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
@@ -478,10 +483,7 @@ def prepare_repl_runtime(
     system_prompt = chat_system_prompt(
         workspace=workspace_identity.path,
         long_term_memory=long_term_memory,
-        tool_guidance="\n".join(
-            f"- {definition.name}: {definition.description}"
-            for definition in tool_gateway.definitions
-        ),
+        tool_guidance=render_tool_guidance(tool_gateway.definitions),
     )
     resolved_memory = configuration.resolve_route("memory")
     summaries = JsonlSummaryStore(agent_home)

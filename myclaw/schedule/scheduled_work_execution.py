@@ -8,7 +8,7 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from myclaw.agent.events import TurnCompletedPayload, TurnFailedPayload
-from myclaw.agent.prompts import chat_system_prompt
+from myclaw.agent.prompts import chat_system_prompt, render_tool_guidance
 from myclaw.agent.turn import AgentTurn
 from myclaw.agent.workspace import Workspace
 from myclaw.errors import ErrorInfo
@@ -100,10 +100,7 @@ class ScheduledWorkRunner:
         system_prompt = chat_system_prompt(
             workspace=self._workspace.path,
             long_term_memory=self._long_term_memory,
-            tool_guidance="\n".join(
-                f"- {definition.name}: {definition.description}"
-                for definition in gateway.definitions
-            ),
+            tool_guidance=render_tool_guidance(gateway.definitions),
         )
         turn = AgentTurn(
             lane="scheduled_work",

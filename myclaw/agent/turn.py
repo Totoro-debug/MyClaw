@@ -17,7 +17,7 @@ from myclaw.agent.events import (
     TurnFailedPayload,
     TurnStartedPayload,
 )
-from myclaw.agent.prompts import current_user_input
+from myclaw.agent.prompts import current_user_input, interrupted_assistant_content
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -763,7 +763,7 @@ def model_message_from_session(
             return None
         if message.status == "interrupted":
             return AssistantModelMessage(
-                content=f"{message.content}\n\n[Turn interrupted by user.]",
+                content=interrupted_assistant_content(message.content),
                 tool_calls=message.tool_calls,
             )
         return AssistantModelMessage(content=message.content, tool_calls=message.tool_calls)
