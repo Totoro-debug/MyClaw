@@ -4,13 +4,13 @@ import asyncio
 import json
 import sys
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Annotated, Protocol, cast
 
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
 
-from myclaw.tools.models import ToolDefinition, ToolExecutionContext
-from myclaw.utils.json_types import JsonObject
+from myclaw.tools.base import BaseTool
+from myclaw.tools.schema import ToolParam
 
 if sys.platform == "win32":
     from subprocess import CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW
@@ -237,41 +237,24 @@ async def _await_cleanup(task: asyncio.Task[None]) -> None:
         raise cancellation
 
 
-class WebSearchTool:
+class WebSearchTool(BaseTool):
     """Expose credential-free web search through the Tool protocol."""
 
-    _definition = ToolDefinition(
-        name="web_search",
-        description="Search the public web and return normalized result summaries.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "minLength": 1},
-                "max_results": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 10,
-                    "default": 5,
-                },
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-    )
+    name = "web_search"
+    description = "Search the public web and return normalized result summaries."
+    required = ("query",)
+    max_retries = 2
 
-    def __init__(self, search: WebSearchBoundary) -> None:
+    query: Annotated[str, ToolParam(description="Public web search query.", min_length=1)]
+    max_results: Annotated[
+        int,
+        ToolParam(description="Maximum normalized results.", minimum=1, maximum=10),
+    ] = 5
+
+    def __init__(self, *, search: WebSearchBoundary) -> None:
         self._search = search
 
-    @property
-    def definition(self) -> ToolDefinition:
-        return self._definition
-
-    async def execute(self, arguments: JsonObject, context: ToolExecutionContext) -> str:
-        del context
-        query = arguments["query"]
-        max_results = arguments.get("max_results", 5)
-        if not isinstance(query, str) or not isinstance(max_results, int):
-            raise ValueError("invalid web_search arguments")
+    async def execute(self, *, query: str, max_results: int) -> str:
         results = await self._search.search(query, max_results)
         return json.dumps(
             [result.to_dict() for result in results],

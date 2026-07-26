@@ -62,6 +62,7 @@ from myclaw.session.records import ConversationSession
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
+from myclaw.tools.base import BaseTool
 from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
 from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
 from myclaw.tools.models import ToolExecutionContext, ToolExecutionLane, ToolResult
@@ -76,8 +77,13 @@ from myclaw.tools.web.web_fetch import (
     PublicWebFetchBoundary,
     SocketDNSResolver,
     WebFetchBoundary,
+    WebFetchTool,
 )
-from myclaw.tools.web.web_search import DuckDuckGoSearchBoundary, WebSearchBoundary
+from myclaw.tools.web.web_search import (
+    DuckDuckGoSearchBoundary,
+    WebSearchBoundary,
+    WebSearchTool,
+)
 
 
 class ProviderFactory(Protocol):
@@ -708,15 +714,18 @@ def _build_tool_gateway(
             agent_home.path / "sessions" / workspace.slug / "artifacts" / session_id
         ),
     )
-    gateway.register_tools(
-        (
-            ReadFileTool(security=security),
-            ListFilesTool(security=security),
-            SearchFilesTool(security=security),
-            WriteFileTool(security=security),
-            EditFileTool(security=security),
-        )
-    )
+    tools: list[BaseTool] = [
+        ReadFileTool(security=security),
+        ListFilesTool(security=security),
+        SearchFilesTool(security=security),
+        WriteFileTool(security=security),
+        EditFileTool(security=security),
+    ]
+    if web_search is not None:
+        tools.append(WebSearchTool(search=web_search))
+    if web_fetch is not None:
+        tools.append(WebFetchTool(fetcher=web_fetch))
+    gateway.register_tools(tuple(tools))
     return gateway
 
 

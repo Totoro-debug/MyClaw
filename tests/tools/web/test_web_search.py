@@ -201,16 +201,14 @@ async def test_tool_gateway_returns_provider_neutral_web_search_results(
             ),
         )
     )
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        tools=(WebSearchTool(search),),
-    )
+    gateway = ToolGateway()
+    gateway.register_tools((WebSearchTool(search=search),))
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_search",
             name="web_search",
-            arguments={"query": "MyClaw agent runtime", "max_results": 2},
+            arguments='{"query":"MyClaw agent runtime","max_results":2}',
         )
     )
 
@@ -246,16 +244,16 @@ async def test_duckduckgo_boundary_maps_sdk_fields_before_the_gateway_returns_th
             }
         ]
     )
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        tools=(WebSearchTool(DuckDuckGoSearchBoundary(process_spawner=spawner)),),
+    gateway = ToolGateway()
+    gateway.register_tools(
+        (WebSearchTool(search=DuckDuckGoSearchBoundary(process_spawner=spawner)),)
     )
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_duckduckgo",
             name="web_search",
-            arguments={"query": "provider mapping", "max_results": 1},
+            arguments='{"query":"provider mapping","max_results":1}',
         )
     )
 
@@ -449,11 +447,11 @@ async def test_tool_gateway_returns_an_empty_array_when_web_search_finds_nothing
         "web_search",
     ]
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_empty_search",
             name="web_search",
-            arguments={"query": "no matching page"},
+            arguments='{"query":"no matching page"}',
         )
     )
 
@@ -529,7 +527,7 @@ async def test_conversation_returns_one_safe_tool_error_for_a_web_search_network
     completed = events[2].payload
     assert isinstance(completed, ToolCompletedPayload)
     assert completed.status == "error"
-    assert search.calls == [("MyClaw runtime", 3)]
+    assert search.calls == [("MyClaw runtime", 3)] * 3
     assert "private upstream" not in str([event.to_dict() for event in events])
     assert len(provider.stream_requests) == 2
     first_request = provider.stream_requests[0]

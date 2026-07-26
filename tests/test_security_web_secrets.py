@@ -498,11 +498,11 @@ async def test_web_search_gateway_hides_secret_adapter_failure_and_raw_query(
         web_search=SecretFailingWebSearch(),
     )
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call-secret-search",
             name="web_search",
-            arguments={"query": "sk-raw-query-secret"},
+            arguments='{"query":"sk-raw-query-secret"}',
         )
     )
 
@@ -525,11 +525,11 @@ async def test_web_fetch_gateway_hides_secret_adapter_failure_and_raw_url(
         web_fetch=SecretFailingWebFetch(),
     )
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call-secret-fetch",
             name="web_fetch",
-            arguments={"url": "https://public.example/?api_key=sk-raw-url-secret"},
+            arguments='{"url":"https://public.example/?api_key=sk-raw-url-secret"}',
         )
     )
 

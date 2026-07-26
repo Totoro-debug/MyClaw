@@ -7,14 +7,15 @@ from contextlib import asynccontextmanager
 from email.message import Message
 from html.parser import HTMLParser
 from ipaddress import IPv6Address, ip_address
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 from urllib.parse import urljoin, urlsplit
 
 from aiohttp import ClientResponse, ClientSession, ClientTimeout, TCPConnector
 from aiohttp.abc import AbstractResolver, ResolveResult
 
-from myclaw.tools.models import ToolDefinition, ToolExecutionContext
-from myclaw.utils.json_types import JsonObject
+from myclaw.tools.base import BaseTool
+from myclaw.tools.errors import ToolError
+from myclaw.tools.schema import ToolParam
 
 CONNECT_TIMEOUT_SECONDS = 10.0
 TOTAL_TIMEOUT_SECONDS = 30.0
@@ -249,39 +250,27 @@ class AioHttpWebFetchClient:
         )
 
 
-class WebFetchTool:
+class WebFetchTool(BaseTool):
     """Expose public-only HTTP fetching through the Tool protocol."""
 
-    _definition = ToolDefinition(
-        name="web_fetch",
-        description="Fetch readable text from a public HTTP or HTTPS URL.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "minLength": 1,
-                    "format": "uri",
-                }
-            },
-            "required": ["url"],
-            "additionalProperties": False,
-        },
-    )
+    name = "web_fetch"
+    description = "Fetch readable text from a public HTTP or HTTPS URL."
+    required = ("url",)
+    max_retries = 2
 
-    def __init__(self, fetcher: WebFetchBoundary) -> None:
+    url: Annotated[
+        str,
+        ToolParam(description="Public HTTP or HTTPS URL.", min_length=1, format="uri"),
+    ]
+
+    def __init__(self, *, fetcher: WebFetchBoundary) -> None:
         self._fetcher = fetcher
 
-    @property
-    def definition(self) -> ToolDefinition:
-        return self._definition
-
-    async def execute(self, arguments: JsonObject, context: ToolExecutionContext) -> str:
-        del context
-        url = arguments["url"]
-        if not isinstance(url, str):
-            raise ValueError("invalid web_fetch arguments")
-        return await self._fetcher.fetch(url)
+    async def execute(self, *, url: str) -> str:
+        try:
+            return await self._fetcher.fetch(url)
+        except WebFetchRejected as error:
+            raise ToolError("WebFetch rejected an unsafe or unverifiable request.") from error
 
 
 class PublicWebFetchBoundary:

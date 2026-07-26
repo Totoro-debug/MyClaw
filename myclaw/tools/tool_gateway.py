@@ -80,10 +80,6 @@ class ToolGateway:
             catalog = ()
         elif tools is None:
             catalog = ()
-            if web_search is not None:
-                catalog += (WebSearchTool(web_search),)
-            if web_fetch is not None:
-                catalog += (WebFetchTool(web_fetch),)
             if shell is not None:
                 catalog += (ShellTool(shell),)
             if scheduled_work is not None:
@@ -112,13 +108,17 @@ class ToolGateway:
                     / context.session_id
                 ),
             )
-            migrated_tools = (
+            migrated_tools: list[BaseTool] = [
                 ReadFileTool(security=security),
                 ListFilesTool(security=security),
                 SearchFilesTool(security=security),
                 WriteFileTool(security=security),
                 EditFileTool(security=security),
-            )
+            ]
+            if web_search is not None:
+                migrated_tools.append(WebSearchTool(search=web_search))
+            if web_fetch is not None:
+                migrated_tools.append(WebFetchTool(fetcher=web_fetch))
             migrated_schemas = tuple(tool.to_schema() for tool in migrated_tools)
             self._registered_tools = {tool.name: tool for tool in migrated_tools}
             self._schemas = tuple(deepcopy(schema) for schema in migrated_schemas)

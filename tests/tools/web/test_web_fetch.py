@@ -649,16 +649,14 @@ async def test_tool_gateway_returns_provider_neutral_web_fetch_text(
     workspace: Path,
 ) -> None:
     fetch = FakeWebFetchBoundary("Public page\nReadable content.")
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        tools=(WebFetchTool(fetch),),
-    )
+    gateway = ToolGateway()
+    gateway.register_tools((WebFetchTool(fetcher=fetch),))
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_fetch",
             name="web_fetch",
-            arguments={"url": "https://public.example/page"},
+            arguments='{"url":"https://public.example/page"}',
         )
     )
 
@@ -799,13 +797,13 @@ async def test_conversation_returns_a_safe_error_for_web_fetch_failure(
     completed = events[2].payload
     assert isinstance(completed, ToolCompletedPayload)
     assert completed.status == "error"
-    assert fetch.calls == ["https://public.example/page"]
+    assert fetch.calls == ["https://public.example/page"] * 3
     assert "127.0.0.1" not in str([event.to_dict() for event in events])
     second_request = provider.stream_requests[1]
     assert isinstance(second_request, ModelRequest)
     tool_message = second_request.messages[-1]
     assert isinstance(tool_message, ToolModelMessage)
-    assert tool_message.content == "web_fetch could not complete the request."
+    assert tool_message.content == "WebFetch rejected an unsafe or unverifiable request."
     persisted = (await runtime.sessions.load(runtime.session_id)).messages[2]
     assert isinstance(persisted, ToolSessionMessage)
     assert "private upstream" not in persisted.content
