@@ -31,6 +31,7 @@ class Security:
         # would make a pre-existing symlink or junction target part of the trusted
         # read scope.
         self._artifact_directory = _io_path(artifact_directory).absolute()
+        self._session_id = artifact_directory.name
 
     def resolve_read_path(self, requested: str) -> Path:
         """Resolve one existing readable path or raise a public-safe Tool error."""
@@ -69,6 +70,18 @@ class Security:
         if os.name == "nt" and any(":" in part for part in relative_parts):
             raise ToolError("The requested path identifies a Windows alternate data stream.")
         return resolved
+
+    def reported_read_path(self, target: Path) -> str:
+        """Return one stable model-visible path for a previously resolved target."""
+        scope = self._read_scope(target)
+        if scope == "memory":
+            return "memory/memory.md"
+        if scope == "artifact":
+            suffix = target.relative_to(self._artifact_directory)
+            return (Path("artifacts") / self._session_id / suffix).as_posix()
+        if scope == "workspace":
+            return target.relative_to(self._workspace).as_posix()
+        raise ToolError("The requested path is outside the readable scope.")
 
     def _read_scope(self, target: Path) -> str | None:
         if target == self._agent_home or target.is_relative_to(self._agent_home):

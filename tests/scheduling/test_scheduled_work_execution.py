@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -2045,4 +2045,58 @@ async def test_runtime_scheduled_work_uses_enabled_web_and_disabled_shell_catalo
         "web_search",
         "web_fetch",
         "create_scheduled_work",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_scheduled_work_calls_registered_workspace_inspection_tools(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    (workspace / "alpha.txt").write_text("needle alpha\n", encoding="utf-8")
+    calls = (
+        ModelToolCall(id="call_list", name="list_files", arguments="{}"),
+        ModelToolCall(
+            id="call_search",
+            name="search_files",
+            arguments='{"query":"needle"}',
+        ),
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspecting.", tool_calls=calls),
+                usage=_usage(),
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspection complete."),
+                usage=_usage(),
+                finish_reason="stop",
+            ),
+        )
+    )
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+
+    result = await runtime.scheduled_work_runner.run(_task())
+
+    assert result.status == "completed"
+    follow_up = provider.complete_requests[1]
+    assert isinstance(follow_up, ModelRequest)
+    tool_messages = [
+        message for message in follow_up.messages if isinstance(message, ToolModelMessage)
+    ]
+    assert [(message.name, message.content) for message in tool_messages] == [
+        ("list_files", "alpha.txt"),
+        ("search_files", "alpha.txt:1:needle alpha"),
     ]

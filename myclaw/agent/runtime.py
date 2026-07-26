@@ -62,7 +62,7 @@ from myclaw.session.records import ConversationSession
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
-from myclaw.tools.files.file_tools import ReadFileTool
+from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
 from myclaw.tools.models import ToolExecutionContext, ToolExecutionLane, ToolResult
 from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.tools.security import Security
@@ -707,7 +707,13 @@ def _build_tool_gateway(
             agent_home.path / "sessions" / workspace.slug / "artifacts" / session_id
         ),
     )
-    gateway.register_tools((ReadFileTool(security=security),))
+    gateway.register_tools(
+        (
+            ReadFileTool(security=security),
+            ListFilesTool(security=security),
+            SearchFilesTool(security=security),
+        )
+    )
     return gateway
 
 

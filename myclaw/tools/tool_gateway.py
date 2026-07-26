@@ -80,8 +80,6 @@ class ToolGateway:
             catalog = ()
         elif tools is None:
             catalog = (
-                ListFilesTool(),
-                SearchFilesTool(),
                 WriteFileTool(),
                 EditFileTool(),
             )
@@ -101,29 +99,33 @@ class ToolGateway:
         self._registered_tools: dict[str, BaseTool] = {}
         self._schemas: tuple[OpenAIToolSchema, ...] = ()
         self._parameter_schemas: dict[str, JsonObject] = {}
-        if context is not None and "read_file" not in self._tools:
+        if context is not None and tools is None:
             # Temporary expand-contract support for direct legacy constructors.
             # Production Runtime replaces this catalog through register_tools(); #48
             # removes context construction entirely.
             workspace = Workspace.from_path(context.workspace)
-            read_file = ReadFileTool(
-                security=Security(
-                    workspace=workspace,
-                    agent_home=context.agent_home,
-                    artifact_directory=(
-                        context.agent_home
-                        / "sessions"
-                        / workspace.slug
-                        / "artifacts"
-                        / context.session_id
-                    ),
-                )
+            security = Security(
+                workspace=workspace,
+                agent_home=context.agent_home,
+                artifact_directory=(
+                    context.agent_home
+                    / "sessions"
+                    / workspace.slug
+                    / "artifacts"
+                    / context.session_id
+                ),
             )
-            read_schema = read_file.to_schema()
-            self._registered_tools = {read_file.name: read_file}
-            self._schemas = (deepcopy(read_schema),)
+            migrated_tools = (
+                ReadFileTool(security=security),
+                ListFilesTool(security=security),
+                SearchFilesTool(security=security),
+            )
+            migrated_schemas = tuple(tool.to_schema() for tool in migrated_tools)
+            self._registered_tools = {tool.name: tool for tool in migrated_tools}
+            self._schemas = tuple(deepcopy(schema) for schema in migrated_schemas)
             self._parameter_schemas = {
-                read_file.name: deepcopy(_parameter_schema(read_schema))
+                tool.name: deepcopy(_parameter_schema(schema))
+                for tool, schema in zip(migrated_tools, migrated_schemas, strict=True)
             }
         self._sleep = sleep
 

@@ -8,7 +8,7 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import AssistantModelMessage
-from myclaw.tools.files.file_tools import ReadFileTool
+from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
 from myclaw.tools.models import ModelToolCall, ToolExecutionContext, ToolResult
 from myclaw.tools.security import Security
 from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
@@ -32,7 +32,13 @@ def _read_file_gateway(*, agent_home: Path, workspace: Path) -> ToolGateway:
         ),
     )
     gateway = ToolGateway()
-    gateway.register_tools((ReadFileTool(security=security),))
+    gateway.register_tools(
+        (
+            ReadFileTool(security=security),
+            ListFilesTool(security=security),
+            SearchFilesTool(security=security),
+        )
+    )
     return gateway
 
 
@@ -208,11 +214,11 @@ async def test_search_files_skips_hard_links_to_external_files(
         )
     )
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_search_external_hard_link",
             name="search_files",
-            arguments={"query": secret},
+            arguments=json.dumps({"query": secret}),
         )
     )
 
@@ -242,11 +248,11 @@ async def test_list_files_omits_hard_links_to_external_files(
         )
     )
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_list_external_hard_link",
             name="list_files",
-            arguments={},
+            arguments="{}",
         )
     )
 
@@ -630,11 +636,11 @@ async def test_list_files_filters_nested_agent_home_state_by_read_scope(
         )
     )
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_list_nested_agent_home",
             name="list_files",
-            arguments={"path": ".", "recursive": True},
+            arguments='{"path":".","recursive":true}',
         )
     )
 
@@ -684,11 +690,11 @@ async def test_search_files_filters_nested_agent_home_state_by_read_scope(
         )
     )
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_search_nested_agent_home",
             name="search_files",
-            arguments={"query": "scope needle", "path": "."},
+            arguments='{"query":"scope needle","path":"."}',
         )
     )
 
