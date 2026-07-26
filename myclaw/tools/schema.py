@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 from dataclasses import dataclass
 from types import NoneType, UnionType
-from typing import Annotated, ClassVar, Literal, Union, get_args, get_origin
+from typing import Annotated, ClassVar, Literal, TypedDict, Union, get_args, get_origin
 
 from jsonschema import Draft202012Validator, FormatChecker
 
@@ -14,6 +14,21 @@ from myclaw.utils.json_types import JsonObject, JsonScalar
 _METADATA_NAMES = frozenset({"name", "description", "required", "max_retries"})
 _SUPPORTED_TYPES = frozenset({str, int, bool})
 _CLASS_VAR_ORIGIN: object = ClassVar
+
+
+class OpenAIFunctionSchema(TypedDict):
+    """The function member of an OpenAI Function Calling Tool schema."""
+
+    name: str
+    description: str
+    parameters: JsonObject
+
+
+class OpenAIToolSchema(TypedDict):
+    """A typed OpenAI Function Calling schema snapshot."""
+
+    type: Literal["function"]
+    function: OpenAIFunctionSchema
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +182,7 @@ class ToolSchema:
             parameters=tuple(parameters),
         )
 
-    def to_openai(self) -> JsonObject:
+    def to_openai(self) -> OpenAIToolSchema:
         """Return a detached OpenAI Function Calling schema."""
         properties: JsonObject = {
             parameter.name: parameter.to_json_schema() for parameter in self.parameters

@@ -204,17 +204,7 @@ def _request_arguments(request: ModelRequest, *, stream: bool) -> dict[str, obje
         "stream": stream,
         "temperature": request.temperature,
         "timeout": request.timeout_seconds,
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.input_schema,
-                },
-            }
-            for tool in request.tools
-        ],
+        "tools": list(request.tools),
     }
     if stream:
         arguments["stream_options"] = {"include_usage": True}
@@ -230,7 +220,7 @@ def _model_tool_call(parts: _ToolCallParts) -> ModelToolCall:
     return ModelToolCall(
         id="".join(parts.id),
         name="".join(parts.name),
-        arguments=_parse_arguments("".join(parts.arguments)),
+        arguments="".join(parts.arguments),
     )
 
 
@@ -240,20 +230,8 @@ def _complete_tool_call(tool_call: object) -> ModelToolCall:
     return ModelToolCall(
         id=str(complete_tool_call.id),
         name=str(function.name),
-        arguments=_parse_arguments(str(function.arguments or "")),
+        arguments=str(function.arguments or ""),
     )
-
-
-def _parse_arguments(value: str) -> JsonObject:
-    try:
-        arguments_value = json.loads(value or "{}")
-    except json.JSONDecodeError as exc:
-        msg = "OpenAI-compatible tool arguments must be a JSON object"
-        raise ValueError(msg) from exc
-    if not isinstance(arguments_value, dict):
-        msg = "OpenAI-compatible tool arguments must be a JSON object"
-        raise TypeError(msg)
-    return cast(JsonObject, arguments_value)
 
 
 def _openai_message(
@@ -273,11 +251,7 @@ def _openai_message(
                     "type": "function",
                     "function": {
                         "name": tool_call.name,
-                        "arguments": json.dumps(
-                            tool_call.arguments,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
+                        "arguments": _raw_argument_text(tool_call.arguments),
                     },
                 }
                 for tool_call in message.tool_calls
@@ -288,6 +262,13 @@ def _openai_message(
         "tool_call_id": message.tool_call_id,
         "content": message.content,
     }
+
+
+def _raw_argument_text(arguments: str | JsonObject) -> str:
+    if isinstance(arguments, str):
+        return arguments
+    # Temporary support for pre-migration test fixtures; removed by #48.
+    return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
 
 
 def _finish_reason(value: str) -> FinishReason:

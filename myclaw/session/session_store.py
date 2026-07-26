@@ -33,9 +33,22 @@ from myclaw.session.records import (
 from myclaw.tools.artifacts import ArtifactReference
 from myclaw.tools.models import ModelToolCall, ToolResultStatus
 from myclaw.utils.atomic_files import atomic_replace_bytes, atomic_replace_text
-from myclaw.utils.json_types import JsonObject
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
+
+_TOOL_MESSAGE_FIELDS = frozenset(
+    {
+        "record_type",
+        "id",
+        "created_at",
+        "role",
+        "tool_call_id",
+        "name",
+        "content",
+        "status",
+        "artifact",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +429,9 @@ def _parse_message(record: dict[str, object]) -> SessionMessage:
             ),
         )
     if role == "tool":
+        if set(record) != _TOOL_MESSAGE_FIELDS:
+            msg = "Tool Session message fields do not match the current schema"
+            raise ValueError(msg)
         status_value = record.get("status")
         if status_value not in {"success", "error", "refused"}:
             msg = "Tool status is not supported"
@@ -439,7 +455,6 @@ def _parse_message(record: dict[str, object]) -> SessionMessage:
             name=_string(record, "name"),
             content=_string(record, "content"),
             status=cast(ToolResultStatus, status_value),
-            error=_session_error(record),
             artifact=artifact,
         )
     msg = f"Unsupported Session message role: {role!r}"
@@ -461,7 +476,7 @@ def _model_tool_calls(record: dict[str, object]) -> tuple[ModelToolCall, ...]:
             ModelToolCall(
                 id=_string(tool_call, "id"),
                 name=_string(tool_call, "name"),
-                arguments=cast(JsonObject, _object(tool_call, "arguments")),
+                arguments=_string(tool_call, "arguments"),
             )
         )
     return tuple(calls)

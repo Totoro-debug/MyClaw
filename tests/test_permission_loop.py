@@ -394,8 +394,6 @@ async def test_foreground_permission_refusal_persists_a_refused_tool_result(
     assert refused.tool_call_id == tool_call.id
     assert refused.status == "refused"
     assert refused.content == "Permission denied by user."
-    assert refused.error is not None
-    assert refused.error.code == "tool_refused"
     second_request = provider.stream_requests[1]
     assert isinstance(second_request, ModelRequest)
     second_request_result = second_request.messages[-1]
@@ -610,8 +608,6 @@ async def test_closing_turn_iterator_releases_its_permission_wait(
     assert isinstance(repaired, ToolSessionMessage)
     assert repaired.tool_call_id == tool_call.id
     assert repaired.status == "error"
-    assert repaired.error is not None
-    assert repaired.error.code == "turn_cancelled"
 
 
 @pytest.mark.asyncio

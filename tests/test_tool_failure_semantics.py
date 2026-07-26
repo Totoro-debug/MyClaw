@@ -67,7 +67,7 @@ async def test_unknown_long_tool_is_normalized_and_the_turn_continues_without_ev
     tool_call = ModelToolCall(
         id="call_unknown",
         name=long_unknown_name,
-        arguments={"query": secret_argument},
+        arguments='{"query":"complete-private-argument"}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -165,8 +165,6 @@ async def test_unknown_long_tool_is_normalized_and_the_turn_continues_without_ev
     tool_message = reloaded.messages[2]
     assert isinstance(tool_message, ToolSessionMessage)
     assert tool_message.status == "error"
-    assert tool_message.error is not None
-    assert tool_message.error.code == "tool_not_found"
     assert tool_message.content == "The requested tool is not available."
     second_request = provider.stream_requests[1]
     assert isinstance(second_request, ModelRequest)
@@ -290,8 +288,6 @@ async def test_invalid_arguments_are_rejected_before_the_tool_boundary_and_retur
     tool_message = reloaded.messages[2]
     assert isinstance(tool_message, ToolSessionMessage)
     assert tool_message.status == "error"
-    assert tool_message.error is not None
-    assert tool_message.error.code == "tool_invalid_arguments"
     assert tool_message.content == "Invalid arguments for send_notice."
     second_request = provider.stream_requests[1]
     assert isinstance(second_request, ModelRequest)
@@ -413,8 +409,6 @@ async def test_tool_exception_executes_once_and_becomes_a_safe_result_before_mod
     tool_message = reloaded.messages[2]
     assert isinstance(tool_message, ToolSessionMessage)
     assert tool_message.status == "error"
-    assert tool_message.error is not None
-    assert tool_message.error.code == "tool_failed"
     assert tool_message.content == "send_notice could not complete the request."
     second_request = provider.stream_requests[1]
     assert isinstance(second_request, ModelRequest)
@@ -469,12 +463,12 @@ async def test_multiple_tool_calls_keep_mixed_results_ordered_and_recoverable(
     lookup_call = ModelToolCall(
         id="call_lookup",
         name="lookup_notice",
-        arguments={"notice_id": "private-argument-one"},
+        arguments='{"notice_id":"private-argument-one"}',
     )
     send_call = ModelToolCall(
         id="call_send",
         name="send_notice",
-        arguments={"message": "private-argument-two"},
+        arguments='{"message":"private-argument-two"}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -613,8 +607,7 @@ async def test_multiple_tool_calls_keep_mixed_results_ordered_and_recoverable(
     assert isinstance(second_result, ToolSessionMessage)
     assert first_result.status == "success"
     assert second_result.status == "error"
-    assert second_result.error is not None
-    assert second_result.error.code == "tool_failed"
+    assert second_result.content == "send_notice could not complete the request."
     assert reloaded.metadata.cumulative_usage.to_dict() == {
         "model_calls": 2,
         "input_tokens": 33,
@@ -734,8 +727,6 @@ async def test_json_schema_format_is_enforced_before_tool_boundary_and_turn_cont
     tool_message = reloaded.messages[2]
     assert isinstance(tool_message, ToolSessionMessage)
     assert tool_message.status == "error"
-    assert tool_message.error is not None
-    assert tool_message.error.code == "tool_invalid_arguments"
     assert tool_message.content == "Invalid arguments for send_email."
     second_request = provider.stream_requests[1]
     assert isinstance(second_request, ModelRequest)

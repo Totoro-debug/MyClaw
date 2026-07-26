@@ -1,6 +1,6 @@
 import asyncio
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -40,7 +40,9 @@ from myclaw.tools.models import (
     ModelToolCall,
     ToolDefinition,
     ToolExecutionContext,
+    ToolResult,
 )
+from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 
@@ -66,6 +68,23 @@ def _io_path(path: Path) -> Path:
     if native.startswith("\\\\"):
         return Path(f"\\\\?\\UNC\\{native.lstrip('\\')}")
     return Path(f"\\\\?\\{native}")
+
+
+def _externalizer(
+    *, agent_home: Path, workspace: Path, session_id: str
+) -> Callable[[ToolResult], ToolResult]:
+    workspace_identity = Workspace.from_path(workspace)
+
+    def externalize(result: ToolResult) -> ToolResult:
+        return externalize_tool_result(
+            result,
+            agent_home=agent_home,
+            workspace=workspace_identity,
+            session_id=session_id,
+            max_tool_result_chars=1,
+        )
+
+    return externalize
 
 
 class InitialAppendFailingStore(JsonlSessionStore):
@@ -1327,13 +1346,10 @@ async def test_durable_assistant_publication_error_repairs_its_tool_call(
     assert [message.role for message in persisted.messages] == ["user", "assistant", "tool"]
     repair = persisted.messages[-1]
     assert isinstance(repair, ToolSessionMessage)
-    assert (repair.tool_call_id, repair.status, repair.error) == (
+    assert (repair.tool_call_id, repair.status, repair.content) == (
         tool_call.id,
         "error",
-        SessionError(
-            code="persistence_error",
-            message="Assistant response could not be persisted.",
-        ),
+        "Assistant response could not be persisted.",
     )
     validate_agent_event_sequence(events)
 
@@ -1446,8 +1462,8 @@ async def test_cancellation_after_durable_assistant_does_not_duplicate_streamed_
 @pytest.mark.parametrize(
     ("store_type", "expected_roles", "artifact_persisted", "expected_tool_status"),
     (
-        (ToolAppendFailingStore, ["user", "assistant", "tool"], False, "error"),
-        (ToolAppendAndRepairFailingStore, ["user", "assistant"], False, None),
+        (ToolAppendFailingStore, ["user", "assistant", "tool"], True, "error"),
+        (ToolAppendAndRepairFailingStore, ["user", "assistant"], True, None),
         (ToolAppendThenFailingStore, ["user", "assistant", "tool"], True, "success"),
         (
             ToolAppendAndReconcileLoadFailingStore,
@@ -1548,7 +1564,11 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
                 session_id=session.id,
             ),
             tools=(tool,),
-            max_tool_result_chars=1,
+        ),
+        externalize_result=_externalizer(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session.id,
         ),
     )
 
@@ -1584,12 +1604,7 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
             expected_tool_status,
         )
         if expected_tool_status == "error":
-            assert tool_message.error == SessionError(
-                code="persistence_error",
-                message="Tool result could not be persisted.",
-            )
-        else:
-            assert tool_message.error is None
+            assert tool_message.content == "Tool result could not be persisted."
     assert len(provider.stream_requests) == 1
     validate_agent_event_sequence(events)
 
@@ -1688,15 +1703,9 @@ async def test_repair_publication_fault_does_not_duplicate_or_drop_tool_message(
         message for message in persisted.messages if isinstance(message, ToolSessionMessage)
     ]
     assert [message.tool_call_id for message in tool_messages] == ["call_one", "call_two"]
-    assert [message.error for message in tool_messages] == [
-        SessionError(
-            code="persistence_error",
-            message="Tool result could not be persisted.",
-        ),
-        SessionError(
-            code="persistence_error",
-            message="Tool result could not be persisted.",
-        ),
+    assert [message.content for message in tool_messages] == [
+        "Tool result could not be persisted.",
+        "Tool result could not be persisted.",
     ]
     validate_agent_event_sequence(events)
 
@@ -1767,7 +1776,11 @@ async def test_cancellation_during_tool_reconciliation_is_safely_terminal(
                 session_id=session.id,
             ),
             tools=(tool,),
-            max_tool_result_chars=1,
+        ),
+        externalize_result=_externalizer(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session.id,
         ),
     )
 
@@ -1787,12 +1800,9 @@ async def test_cancellation_during_tool_reconciliation_is_safely_terminal(
     persisted = await sessions.load(session.id)
     repair = persisted.messages[-1]
     assert isinstance(repair, ToolSessionMessage)
-    assert (repair.tool_call_id, repair.error) == (
+    assert (repair.tool_call_id, repair.content) == (
         tool_call.id,
-        SessionError(
-            code="turn_cancelled",
-            message="Tool call interrupted because the turn was cancelled.",
-        ),
+        "Tool call interrupted because the turn was cancelled.",
     )
     artifact_path = (
         sessions.path_for(session.id).parent
@@ -1947,7 +1957,11 @@ async def test_cancellation_after_durable_tool_result_keeps_one_message_and_arti
                 session_id=session.id,
             ),
             tools=(tool,),
-            max_tool_result_chars=1,
+        ),
+        externalize_result=_externalizer(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session.id,
         ),
     )
 
@@ -2072,13 +2086,10 @@ async def test_cancellation_after_durable_repair_does_not_duplicate_tool_message
     tool_messages = [
         message for message in persisted.messages if isinstance(message, ToolSessionMessage)
     ]
-    assert [(message.tool_call_id, message.error) for message in tool_messages] == [
+    assert [(message.tool_call_id, message.content) for message in tool_messages] == [
         (
             tool_call.id,
-            SessionError(
-                code="persistence_error",
-                message="Tool result could not be persisted.",
-            ),
+            "Tool result could not be persisted.",
         )
     ]
     validate_agent_event_sequence(events)
@@ -2178,4 +2189,7 @@ async def test_cancellation_retries_a_transient_second_tool_repair_failure(
         "call_cancel_one",
         "call_cancel_two",
     ]
-    assert all(message.error is not None for message in tool_messages)
+    assert all(
+        message.content == "Tool call interrupted because the turn was cancelled."
+        for message in tool_messages
+    )

@@ -10,6 +10,7 @@ from typing import Protocol, cast
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from myclaw.agent.workspace import Workspace
 from myclaw.errors import ErrorCode, ErrorInfo
 from myclaw.schedule.scheduled_work import (
     ScheduledWorkInvalidError,
@@ -32,13 +33,10 @@ from myclaw.tools.permission_policy import (
     assess_permission,
 )
 from myclaw.tools.ports import Tool
+from myclaw.tools.schema import OpenAIToolSchema
+from myclaw.tools.security import Security
 from myclaw.tools.shell.shell_policy import ShellPolicyDenied
 from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool
-from myclaw.tools.tool_artifacts import (
-    ArtifactWriteError,
-    ArtifactWriter,
-    ToolArtifactExternalizer,
-)
 from myclaw.tools.web.web_fetch import WebFetchBoundary, WebFetchTool
 from myclaw.tools.web.web_search import WebSearchBoundary, WebSearchTool
 from myclaw.utils.json_types import JsonObject, JsonScalar, JsonValue
@@ -64,10 +62,12 @@ class ToolGateway:
         web_fetch: WebFetchBoundary | None = None,
         shell: ShellBoundary | None = None,
         scheduled_work: Tool | None = None,
-        max_tool_result_chars: int = 50_000,
-        artifact_writer: ArtifactWriter | None = None,
+        max_tool_result_chars: int | None = None,
+        artifact_writer: object | None = None,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
+        # Temporary accepted arguments keep legacy constructors running; Gateway ignores them.
+        del max_tool_result_chars, artifact_writer
         self._context = context
         catalog: tuple[Tool, ...]
         if context is None:
@@ -80,7 +80,6 @@ class ToolGateway:
             catalog = ()
         elif tools is None:
             catalog = (
-                ReadFileTool(),
                 ListFilesTool(),
                 SearchFilesTool(),
                 WriteFileTool(),
@@ -98,19 +97,34 @@ class ToolGateway:
             catalog = tools
         self._tools = {tool.definition.name: tool for tool in catalog}
         self._definitions = tuple(tool.definition for tool in catalog)
-        self._artifacts = (
-            None
-            if context is None
-            else ToolArtifactExternalizer(
-                context=context,
-                max_tool_result_chars=max_tool_result_chars,
-                write_text=artifact_writer,
-            )
-        )
         self._registered = False
         self._registered_tools: dict[str, BaseTool] = {}
-        self._schemas: tuple[JsonObject, ...] = ()
+        self._schemas: tuple[OpenAIToolSchema, ...] = ()
         self._parameter_schemas: dict[str, JsonObject] = {}
+        if context is not None and "read_file" not in self._tools:
+            # Temporary expand-contract support for direct legacy constructors.
+            # Production Runtime replaces this catalog through register_tools(); #48
+            # removes context construction entirely.
+            workspace = Workspace.from_path(context.workspace)
+            read_file = ReadFileTool(
+                security=Security(
+                    workspace=workspace,
+                    agent_home=context.agent_home,
+                    artifact_directory=(
+                        context.agent_home
+                        / "sessions"
+                        / workspace.slug
+                        / "artifacts"
+                        / context.session_id
+                    ),
+                )
+            )
+            read_schema = read_file.to_schema()
+            self._registered_tools = {read_file.name: read_file}
+            self._schemas = (deepcopy(read_schema),)
+            self._parameter_schemas = {
+                read_file.name: deepcopy(_parameter_schema(read_schema))
+            }
         self._sleep = sleep
 
     def register_tools(self, tools: tuple[BaseTool, ...]) -> None:
@@ -131,60 +145,63 @@ class ToolGateway:
         self._registered = True
 
     @property
-    def schemas(self) -> tuple[JsonObject, ...]:
+    def schemas(self) -> tuple[OpenAIToolSchema, ...]:
         """Return a defensive snapshot of the registered OpenAI Tool schemas."""
-        return tuple(deepcopy(schema) for schema in self._schemas)
+        registered = tuple(deepcopy(schema) for schema in self._schemas)
+        legacy = tuple(_legacy_schema(definition) for definition in self._definitions)
+        return (*registered, *legacy)
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
-        return self._definitions
+        registered = tuple(_legacy_definition(schema) for schema in self._schemas)
+        return (*registered, *self._definitions)
 
     def permission_request(self, tool_call: ModelToolCall) -> PermissionAssessment | None:
         """Return an already validated foreground confirmation request, if required."""
         context = self._legacy_context()
         tool = self._tools.get(tool_call.name)
-        if tool is None or not Draft202012Validator(
+        arguments = tool_call.arguments
+        if tool is None or not isinstance(arguments, dict) or not Draft202012Validator(
             tool.definition.input_schema,
             format_checker=FormatChecker(),
-        ).is_valid(tool_call.arguments):
+        ).is_valid(arguments):
             return None
-        assessment = assess_permission(tool_call, context)
+        legacy_call = ModelToolCall(id=tool_call.id, name=tool_call.name, arguments=arguments)
+        assessment = assess_permission(legacy_call, context)
         if assessment.decision is PermissionDecision.ASK and context.lane == "foreground":
             return assessment
         return None
 
-    def discard_artifact(self, result: ToolResult) -> bool:
-        """Roll back one artifact created by this Gateway but not persisted to its Session."""
-        return self._legacy_artifacts().discard(result)
-
-    def commit_artifact(self, result: ToolResult) -> bool:
-        """Release rollback ownership after the artifact reference is persisted."""
-        return self._legacy_artifacts().commit(result)
-
     async def call(self, tool_call: ModelToolCall) -> ToolResult:
         """Parse, prepare, refuse, and execute one registered Tool call."""
         raw_arguments = tool_call.arguments
-        if not isinstance(raw_arguments, str):
+        if isinstance(raw_arguments, dict):
+            # Temporary support for directly constructed legacy test calls; removed by #48.
+            parsed = raw_arguments
+        elif not isinstance(raw_arguments, str):
             return _error_result(
                 tool_call,
                 code="tool_invalid_arguments",
                 message="Tool arguments could not be parsed.",
             )
-        try:
-            parsed = json.loads(raw_arguments)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return _error_result(
-                tool_call,
-                code="tool_invalid_arguments",
-                message="Tool arguments could not be parsed.",
-            )
+        else:
+            try:
+                parsed = json.loads(raw_arguments)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return _error_result(
+                    tool_call,
+                    code="tool_invalid_arguments",
+                    message="Tool arguments could not be parsed.",
+                )
         if not isinstance(parsed, dict):
             return _error_result(
                 tool_call,
                 code="tool_invalid_arguments",
                 message="Tool arguments could not be parsed.",
             )
-        arguments = cast(JsonObject, parsed)
+        arguments = parsed
+        if tool_call.name not in self._registered_tools and tool_call.name in self._tools:
+            return await self._call_legacy_during_migration(tool_call, arguments)
         tool, normalized, correct = self._prepare(tool_call.name, arguments)
         if tool is None:
             return _error_result(
@@ -274,36 +291,29 @@ class ToolGateway:
             raise RuntimeError(msg)
         return self._context
 
-    def _legacy_artifacts(self) -> ToolArtifactExternalizer:
-        if self._artifacts is None:
-            msg = "The legacy Tool Gateway path requires artifact ownership"
-            raise RuntimeError(msg)
-        return self._artifacts
-
-    async def execute(
+    async def _call_legacy_during_migration(
         self,
         tool_call: ModelToolCall,
-        *,
-        approved: bool | None = None,
+        arguments: JsonObject,
     ) -> ToolResult:
+        """Run one not-yet-migrated Tool until #48 removes the legacy stack."""
         context = self._legacy_context()
-        tool = self._tools.get(tool_call.name)
-        if tool is None:
-            return _error_result(
-                tool_call,
-                code="tool_not_found",
-                message="The requested tool is not available.",
-            )
+        tool = self._tools[tool_call.name]
         if not Draft202012Validator(
             tool.definition.input_schema,
             format_checker=FormatChecker(),
-        ).is_valid(tool_call.arguments):
+        ).is_valid(arguments):
             return _error_result(
                 tool_call,
                 code="tool_invalid_arguments",
                 message=f"Invalid arguments for {tool_call.name}.",
             )
-        assessment = assess_permission(tool_call, context)
+        legacy_call = ModelToolCall(
+            id=tool_call.id,
+            name=tool_call.name,
+            arguments=arguments,
+        )
+        assessment = assess_permission(legacy_call, context)
         if assessment.decision is PermissionDecision.DENY:
             return _error_result(
                 tool_call,
@@ -311,18 +321,12 @@ class ToolGateway:
                 message="The requested operation is not permitted.",
             )
         if assessment.decision is PermissionDecision.ASK:
-            if context.lane != "foreground":
-                return _refused_result(
-                    tool_call,
-                    message="Permission confirmation is unavailable in background work.",
-                )
-            if approved is not True:
-                return _refused_result(
-                    tool_call,
-                    message="Permission denied by user.",
-                )
+            return _refused_result(
+                tool_call,
+                message="The requested operation requires unavailable user confirmation.",
+            )
         try:
-            content = await tool.execute(tool_call.arguments, context)
+            content = await tool.execute(arguments, context)
         except (FileToolAccessDenied, ShellPolicyDenied):
             return _error_result(
                 tool_call,
@@ -353,22 +357,90 @@ class ToolGateway:
                 code="tool_failed",
                 message=f"{tool_call.name} could not complete the request.",
             )
-        result = ToolResult(
-            tool_call_id=tool_call.id,
-            name=tool_call.name,
-            status="success",
-            content=content,
-            error=None,
-            artifact=None,
-        )
-        try:
-            return self._legacy_artifacts().externalize(result)
-        except ArtifactWriteError:
+        if not isinstance(content, str):
             return _error_result(
                 tool_call,
                 code="tool_failed",
-                message=f"{tool_call.name} result could not be stored.",
+                message=f"{tool_call.name} could not complete the request.",
             )
+        return _success_result(tool_call, content)
+
+    async def execute(
+        self,
+        tool_call: ModelToolCall,
+        *,
+        approved: bool | None = None,
+    ) -> ToolResult:
+        context = self._legacy_context()
+        tool = self._tools.get(tool_call.name)
+        if tool is None:
+            return _error_result(
+                tool_call,
+                code="tool_not_found",
+                message="The requested tool is not available.",
+            )
+        arguments = tool_call.arguments
+        if not isinstance(arguments, dict) or not Draft202012Validator(
+            tool.definition.input_schema,
+            format_checker=FormatChecker(),
+        ).is_valid(arguments):
+            return _error_result(
+                tool_call,
+                code="tool_invalid_arguments",
+                message=f"Invalid arguments for {tool_call.name}.",
+            )
+        legacy_call = ModelToolCall(id=tool_call.id, name=tool_call.name, arguments=arguments)
+        assessment = assess_permission(legacy_call, context)
+        if assessment.decision is PermissionDecision.DENY:
+            return _error_result(
+                tool_call,
+                code="tool_denied",
+                message="The requested operation is not permitted.",
+            )
+        if assessment.decision is PermissionDecision.ASK:
+            if context.lane != "foreground":
+                return _refused_result(
+                    tool_call,
+                    message="Permission confirmation is unavailable in background work.",
+                )
+            if approved is not True:
+                return _refused_result(
+                    tool_call,
+                    message="Permission denied by user.",
+                )
+        try:
+            content = await tool.execute(arguments, context)
+        except (FileToolAccessDenied, ShellPolicyDenied):
+            return _error_result(
+                tool_call,
+                code="tool_denied",
+                message="The requested path is outside the allowed Workspace.",
+            )
+        except FileToolArgumentsError:
+            return _error_result(
+                tool_call,
+                code="tool_invalid_arguments",
+                message=f"Invalid arguments for {tool_call.name}.",
+            )
+        except ScheduledWorkInvalidError:
+            return _error_result(
+                tool_call,
+                code="scheduled_work_invalid",
+                message="The Scheduled Work definition is invalid.",
+            )
+        except ScheduledWorkPersistenceError:
+            return _error_result(
+                tool_call,
+                code="persistence_error",
+                message="Scheduled Work could not be read or written.",
+            )
+        except Exception:
+            return _error_result(
+                tool_call,
+                code="tool_failed",
+                message=f"{tool_call.name} could not complete the request.",
+            )
+        return _success_result(tool_call, content)
 
 
 def _error_result(
@@ -410,14 +482,28 @@ def _refused_result(tool_call: ModelToolCall, *, message: str) -> ToolResult:
     )
 
 
-def _parameter_schema(schema: JsonObject) -> JsonObject:
-    function = schema.get("function")
-    if not isinstance(function, dict):
-        raise AssertionError("generated Tool schema has no function object")
-    parameters = function.get("parameters")
-    if not isinstance(parameters, dict):
-        raise AssertionError("generated Tool schema has no parameter object")
-    return parameters
+def _parameter_schema(schema: OpenAIToolSchema) -> JsonObject:
+    return schema["function"]["parameters"]
+
+
+def _legacy_schema(definition: ToolDefinition) -> OpenAIToolSchema:
+    return {
+        "type": "function",
+        "function": {
+            "name": definition.name,
+            "description": definition.description,
+            "parameters": deepcopy(definition.input_schema),
+        },
+    }
+
+
+def _legacy_definition(schema: OpenAIToolSchema) -> ToolDefinition:
+    function = schema["function"]
+    return ToolDefinition(
+        name=function["name"],
+        description=function["description"],
+        input_schema=deepcopy(function["parameters"]),
+    )
 
 
 def _coerce(value: JsonValue, schema: JsonObject) -> tuple[bool, JsonScalar]:

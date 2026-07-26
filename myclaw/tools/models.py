@@ -1,5 +1,6 @@
 """Tool boundary values."""
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -31,14 +32,20 @@ class ToolDefinition:
 
 @dataclass(frozen=True, slots=True)
 class ModelToolCall:
-    """A provider tool call with parsed JSON-object arguments."""
+    """A provider Tool call preserving its raw JSON argument text."""
 
     id: str
     name: str
-    arguments: JsonObject
+    # JsonObject is temporary expand-contract support for legacy Tool test fixtures.
+    arguments: str | JsonObject
 
     def to_dict(self) -> dict[str, object]:
-        return {"id": self.id, "name": self.name, "arguments": self.arguments}
+        arguments = self.arguments
+        if isinstance(arguments, dict):
+            # Temporary expand-contract normalization for legacy in-process calls.
+            # Provider calls already carry raw JSON; #48 removes the dictionary form.
+            arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        return {"id": self.id, "name": self.name, "arguments": arguments}
 
 
 @dataclass(frozen=True, slots=True)

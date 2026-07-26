@@ -12,7 +12,7 @@ from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 if TYPE_CHECKING:
-    from myclaw.tools.models import ToolDefinition
+    from myclaw.tools.schema import OpenAIToolSchema
 
 
 def current_user_input(*, content: str, current_time: datetime, session_id: str) -> str:
@@ -45,15 +45,15 @@ def chat_system_prompt(
     )
 
 
-def render_tool_guidance(definitions: Iterable[ToolDefinition]) -> str:
+def render_tool_guidance(schemas: Iterable[OpenAIToolSchema]) -> str:
     """Render the model-visible tool catalog in stable definition order."""
     return "\n".join(
         render_template(
             "tool-guidance-entry.md",
-            name=definition.name,
-            description=definition.description,
+            name=schema["function"]["name"],
+            description=schema["function"]["description"],
         )
-        for definition in definitions
+        for schema in schemas
     )
 
 

@@ -43,10 +43,11 @@ from myclaw.session.records import (
     UserSessionMessage,
 )
 from myclaw.tools.models import ModelToolCall, ToolResult
-from myclaw.tools.tool_artifacts import ArtifactDiscardError
+from myclaw.tools.tool_artifacts import ArtifactWriteError
 from myclaw.tools.tool_gateway import ToolGateway
 
 type AgentTurnLane = Literal["foreground", "scheduled_work"]
+type ToolResultExternalizer = Callable[[ToolResult], ToolResult]
 type AgentTurnPayload = (
     TurnStartedPayload
     | TextDeltaPayload
@@ -131,6 +132,7 @@ class AgentTurn:
         ) = None,
         after_user_published: Callable[[UserSessionMessage], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        externalize_result: ToolResultExternalizer | None = None,
     ) -> None:
         self._lane = lane
         self._provider = provider
@@ -144,6 +146,7 @@ class AgentTurn:
         self._history_preparer = history_preparer
         self._after_user_published = after_user_published
         self._cancel_requested = cancel_requested or _never_cancelled
+        self._externalize_result = externalize_result or _inline_tool_result
         self._permission_waits: dict[UUID, asyncio.Future[bool]] = {}
 
     async def run(self, text: str) -> AsyncGenerator[AgentTurnPayload, None]:
@@ -273,37 +276,26 @@ class AgentTurn:
                                     pending_tool_calls,
                                 )
                                 return
-                            approved: bool | None = None
-                            permission = self._tool_gateway.permission_request(tool_call)
-                            if permission is not None:
-                                request_id = self._new_uuid()
-                                wait = asyncio.get_running_loop().create_future()
-                                self._permission_waits[request_id] = wait
-                                try:
-                                    yield PermissionRequestedPayload(
-                                        request_id=request_id,
-                                        tool_call_id=tool_call.id,
-                                        tool_name=tool_call.name,
-                                        action=permission.action,
-                                        resource=permission.resource,
-                                        risk_summary=permission.risk_summary,
-                                    )
-                                    approved = await wait
-                                finally:
-                                    self._permission_waits.pop(request_id, None)
-                                    if not wait.done():
-                                        wait.cancel()
                             try:
-                                result = await self._tool_gateway.execute(
-                                    tool_call,
-                                    approved=approved,
-                                )
+                                raw_result = await self._tool_gateway.call(tool_call)
                             except asyncio.CancelledError:
                                 if self._lane == "scheduled_work":
                                     await self._repair_scheduled_cancellation(
                                         response.message.tool_calls[index:]
                                     )
                                 raise
+                            try:
+                                result = self._externalize_result(raw_result)
+                            except ArtifactWriteError:
+                                message = f"{tool_call.name} result could not be stored."
+                                result = ToolResult(
+                                    tool_call_id=tool_call.id,
+                                    name=tool_call.name,
+                                    status="error",
+                                    content=message,
+                                    error=ErrorInfo(code="tool_failed", message=message),
+                                    artifact=None,
+                                )
 
                             tool_message = _tool_session_message(
                                 result,
@@ -320,7 +312,6 @@ class AgentTurn:
                                     publication = await self._session_message_publication(
                                         tool_message
                                     )
-                                    self._settle_foreground_artifact(result, publication)
                                     if publication is True:
                                         pending_tool_calls.pop(0)
                                     pending_repair_error = SessionError(
@@ -334,11 +325,6 @@ class AgentTurn:
                                         )
                                     except _PERSISTENCE_EXCEPTIONS:
                                         pass
-                                else:
-                                    await self._reconcile_scheduled_tool_artifact(
-                                        result,
-                                        tool_message,
-                                    )
                                 yield TurnFailedPayload(error=self._session_update_failure)
                                 return
                             except asyncio.CancelledError:
@@ -346,25 +332,11 @@ class AgentTurn:
                                     publication = await self._session_message_publication(
                                         tool_message
                                     )
-                                    self._settle_foreground_artifact(result, publication)
                                     if publication is True:
                                         pending_tool_calls.pop(0)
-                                else:
-                                    await self._reconcile_scheduled_tool_artifact(
-                                        result,
-                                        tool_message,
-                                    )
                                 raise
                             except BaseException:
-                                if self._lane == "foreground":
-                                    self._discard_artifact(result)
-                                else:
-                                    await self._reconcile_scheduled_tool_artifact(
-                                        result,
-                                        tool_message,
-                                    )
                                 raise
-                            self._tool_gateway.commit_artifact(result)
                             pending_tool_calls.pop(0)
                             yield ToolCompletedPayload(
                                 tool_call_id=result.tool_call_id,
@@ -493,7 +465,7 @@ class AgentTurn:
             route="chat" if self._lane == "foreground" else "cron",
             system_prompt=self._system_prompt,
             messages=tuple(messages),
-            tools=() if self._tool_gateway is None else self._tool_gateway.definitions,
+            tools=() if self._tool_gateway is None else self._tool_gateway.schemas,
             stream=self._lane == "foreground",
             model=self._settings.model,
             max_output=self._settings.max_output,
@@ -566,7 +538,6 @@ class AgentTurn:
                 name=tool_call.name,
                 content=failure.message,
                 status="error",
-                error=failure,
                 artifact=None,
             )
             try:
@@ -600,10 +571,6 @@ class AgentTurn:
                         name=unfinished.name,
                         content="Scheduled Work tool call cancelled.",
                         status="error",
-                        error=SessionError(
-                            code="turn_cancelled",
-                            message="Scheduled Work tool call cancelled.",
-                        ),
                         artifact=None,
                     ),
                 )
@@ -619,50 +586,11 @@ class AgentTurn:
         except _PERSISTENCE_EXCEPTIONS:
             return None
         same_id = tuple(message for message in session.messages if message.id == expected.id)
-        if any(message == expected for message in same_id):
+        if any(message.to_dict() == expected.to_dict() for message in same_id):
             return True
         if same_id:
             return None
         return False
-
-    async def _reconcile_scheduled_tool_artifact(
-        self,
-        result: ToolResult,
-        tool_message: ToolSessionMessage,
-    ) -> None:
-        try:
-            reloaded = await self._sessions.load(self._session_id)
-        except BaseException:
-            if self._tool_gateway is not None:
-                self._tool_gateway.commit_artifact(result)
-            return
-        if tool_message in reloaded.messages or any(
-            message.id == tool_message.id for message in reloaded.messages
-        ):
-            if self._tool_gateway is not None:
-                self._tool_gateway.commit_artifact(result)
-            return
-        self._discard_artifact(result)
-
-    def _settle_foreground_artifact(
-        self,
-        result: ToolResult,
-        publication: bool | None,
-    ) -> None:
-        if self._tool_gateway is None:
-            return
-        if publication is False:
-            self._discard_artifact(result)
-        else:
-            self._tool_gateway.commit_artifact(result)
-
-    def _discard_artifact(self, result: ToolResult) -> None:
-        if self._tool_gateway is None:
-            return
-        try:
-            self._tool_gateway.discard_artifact(result)
-        except ArtifactDiscardError:
-            pass
 
     @property
     def _session_update_failure(self) -> ErrorInfo:
@@ -694,14 +622,6 @@ def _tool_session_message(
         name=result.name,
         content=result.content,
         status=result.status,
-        error=(
-            None
-            if result.error is None
-            else SessionError(
-                code=result.error.code,
-                message=result.error.message,
-            )
-        ),
         artifact=result.artifact,
     )
 
@@ -750,6 +670,10 @@ def _unexpected_provider_failure() -> ModelCallError:
 
 def _never_cancelled() -> bool:
     return False
+
+
+def _inline_tool_result(result: ToolResult) -> ToolResult:
+    return result
 
 
 def model_message_from_session(

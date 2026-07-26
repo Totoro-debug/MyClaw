@@ -312,7 +312,7 @@ async def test_runtime_shell_enablement_controls_catalog_and_system_guidance(
     assert events[-1].type == "turn_completed"
     request = provider.stream_requests[0]
     assert isinstance(request, ModelRequest)
-    names = [definition.name for definition in request.tools]
+    names = [schema["function"]["name"] for schema in request.tools]
     guidance = request.system_prompt.split("<tool_guidance>\n", 1)[1].split("</tool_guidance>", 1)[
         0
     ]

@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import ClassVar, Literal
 from uuid import UUID
 
-from myclaw.tools.models import ModelToolCall, ToolDefinition
+from myclaw.tools.models import ModelToolCall
+from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.utils.validation import require_nonnegative_int, require_uuid4
 
 type ModelRoute = Literal["default", "chat", "memory", "cron"]
@@ -98,7 +99,7 @@ class ModelRequest:
     route: ModelRoute
     system_prompt: str
     messages: tuple[ModelMessage, ...]
-    tools: tuple[ToolDefinition, ...]
+    tools: tuple[OpenAIToolSchema, ...]
     stream: bool
     model: str
     max_output: int
@@ -118,7 +119,7 @@ class ModelRequest:
             "route": self.route,
             "system_prompt": self.system_prompt,
             "messages": [message.to_dict() for message in self.messages],
-            "tools": [tool.to_dict() for tool in self.tools],
+            "tools": list(self.tools),
             "stream": self.stream,
             "model": self.model,
             "max_output": self.max_output,

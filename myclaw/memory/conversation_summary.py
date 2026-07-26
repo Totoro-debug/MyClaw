@@ -33,7 +33,7 @@ from myclaw.session.records import (
     SessionMessage,
     UserSessionMessage,
 )
-from myclaw.tools.models import ToolDefinition
+from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.utils.atomic_files import atomic_replace_bytes
 from myclaw.utils.time import format_rfc3339_milliseconds
 
@@ -297,7 +297,7 @@ class ConversationSummaryManager:
         chat_max_output: int,
         consolidation_message_threshold: int,
         chat_system_prompt: str,
-        tools: tuple[ToolDefinition, ...],
+        tools: tuple[OpenAIToolSchema, ...],
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
     ) -> None:
@@ -439,7 +439,7 @@ class ConversationSummaryManager:
                 )
             )
         tool_definitions = tuple(
-            json.dumps(tool.to_dict(), ensure_ascii=False, separators=(",", ":"))
+            json.dumps(tool, ensure_ascii=False, separators=(",", ":"))
             for tool in self._tools
         )
         return RuntimeStatusInput(

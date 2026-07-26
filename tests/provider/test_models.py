@@ -13,10 +13,8 @@ from myclaw.provider.models import (
     UserModelMessage,
     validate_model_stream_events,
 )
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolDefinition,
-)
+from myclaw.tools.models import ModelToolCall
+from myclaw.tools.schema import OpenAIToolSchema
 
 
 def test_model_usage_serializes_to_the_exact_contract_shape() -> None:
@@ -47,16 +45,23 @@ def test_model_usage_rejects_values_outside_the_counter_contract(
 
 
 def test_model_provider_transcript_uses_the_frozen_runtime_shapes() -> None:
-    definition = ToolDefinition(
-        name="read_file",
-        description="Read a UTF-8 file.",
-        input_schema={
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"],
+    definition: OpenAIToolSchema = {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a UTF-8 file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
         },
+    }
+    tool_call = ModelToolCall(
+        id="call_123",
+        name="read_file",
+        arguments='{"path":"CONTEXT.md"}',
     )
-    tool_call = ModelToolCall(id="call_123", name="read_file", arguments={"path": "CONTEXT.md"})
     user = UserModelMessage(content="Inspect the project.")
     assistant = AssistantModelMessage(content="I will inspect it.", tool_calls=(tool_call,))
     tool = ToolModelMessage(
@@ -93,7 +98,11 @@ def test_model_provider_transcript_uses_the_frozen_runtime_shapes() -> None:
                 "role": "assistant",
                 "content": "I will inspect it.",
                 "tool_calls": [
-                    {"id": "call_123", "name": "read_file", "arguments": {"path": "CONTEXT.md"}}
+                    {
+                        "id": "call_123",
+                        "name": "read_file",
+                        "arguments": '{"path":"CONTEXT.md"}',
+                    }
                 ],
             },
             {
@@ -105,12 +114,15 @@ def test_model_provider_transcript_uses_the_frozen_runtime_shapes() -> None:
         ],
         "tools": [
             {
-                "name": "read_file",
-                "description": "Read a UTF-8 file.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a UTF-8 file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
                 },
             }
         ],
@@ -126,7 +138,11 @@ def test_model_provider_transcript_uses_the_frozen_runtime_shapes() -> None:
             "role": "assistant",
             "content": "I will inspect it.",
             "tool_calls": [
-                {"id": "call_123", "name": "read_file", "arguments": {"path": "CONTEXT.md"}}
+                {
+                    "id": "call_123",
+                    "name": "read_file",
+                    "arguments": '{"path":"CONTEXT.md"}',
+                }
             ],
         },
         "usage": {"input_tokens": 120, "output_tokens": 24, "total_tokens": 144},

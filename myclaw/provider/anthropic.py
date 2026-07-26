@@ -167,14 +167,16 @@ class AnthropicProvider:
 
 def _request_arguments(request: ModelRequest, *, stream: bool) -> dict[str, object]:
     messages = [_message_argument(message) for message in request.messages]
-    tools = [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.input_schema,
-        }
-        for tool in request.tools
-    ]
+    tools: list[dict[str, object]] = []
+    for tool in request.tools:
+        function = tool["function"]
+        tools.append(
+            {
+                "name": function["name"],
+                "description": function["description"],
+                "input_schema": function["parameters"],
+            }
+        )
     return {
         "max_tokens": request.max_output,
         "messages": messages,
@@ -201,7 +203,7 @@ def _message_argument(
                 "type": "tool_use",
                 "id": tool_call.id,
                 "name": tool_call.name,
-                "input": tool_call.arguments,
+                "input": _argument_object(tool_call.arguments),
             }
             for tool_call in message.tool_calls
         )
@@ -234,7 +236,7 @@ def _response_from_message(message: object) -> ModelResponse:
                     ModelToolCall(
                         id=_string_field(block, "id") or "",
                         name=_string_field(block, "name") or "",
-                        arguments=_json_object(_field(block, "input")),
+                        arguments=_json_text(_field(block, "input")),
                     )
                 )
     usage = _field(message, "usage")
@@ -260,10 +262,30 @@ class _StreamingToolUse:
 
     def to_model_tool_call(self) -> ModelToolCall:
         if self.json_parts:
-            parsed = cast(object, json.loads("".join(self.json_parts)))
+            arguments = "".join(self.json_parts)
+            _argument_object(arguments)
         else:
-            parsed = self.initial_input
-        return ModelToolCall(id=self.id, name=self.name, arguments=_json_object(parsed))
+            arguments = _json_text(self.initial_input)
+        return ModelToolCall(id=self.id, name=self.name, arguments=arguments)
+
+
+def _argument_object(arguments: str | JsonObject) -> JsonObject:
+    if isinstance(arguments, dict):
+        # Temporary support for pre-migration test fixtures; removed by #48.
+        return arguments
+    try:
+        value = cast(object, json.loads(arguments))
+    except json.JSONDecodeError as error:
+        raise ValueError("Anthropic tool arguments must be a JSON object") from error
+    return _json_object(value)
+
+
+def _json_text(value: object) -> str:
+    return json.dumps(
+        _json_object(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _json_object(value: object) -> JsonObject:

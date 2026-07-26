@@ -111,7 +111,7 @@ async def test_list_files_tool_result_continues_the_model_loop_with_linked_histo
     tool_call = ModelToolCall(
         id="call_list",
         name="list_files",
-        arguments={"path": ".", "recursive": True},
+        arguments='{"path":".","recursive":true}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -190,7 +190,7 @@ async def test_list_files_tool_result_continues_the_model_loop_with_linked_histo
     second_request = provider.stream_requests[1]
     assert isinstance(first_request, ModelRequest)
     assert isinstance(second_request, ModelRequest)
-    assert [definition.name for definition in first_request.tools] == [
+    assert [schema["function"]["name"] for schema in first_request.tools] == [
         "read_file",
         "list_files",
         "search_files",
@@ -534,14 +534,12 @@ async def test_production_conversation_denies_parent_escape_without_reading_the_
         "role": "tool",
         "tool_call_id": "call_escape",
         "name": "read_file",
-        "content": "The requested path is outside the allowed Workspace.",
+        "content": "The requested path resolves outside the Workspace.",
     }
     assert "do-not-leak" not in denied_message.content
     persisted = (await runtime.sessions.load(runtime.session_id)).messages[2]
     assert isinstance(persisted, ToolSessionMessage)
     assert persisted.status == "error"
-    assert persisted.error is not None
-    assert persisted.error.code == "tool_denied"
     first_request = provider.stream_requests[0]
     assert isinstance(first_request, ModelRequest)
     tool_guidance = first_request.system_prompt.split("<tool_guidance>\n", 1)[1].split(
@@ -658,13 +656,11 @@ async def test_read_file_normalizes_binary_content_as_an_error_before_continuing
         "role": "tool",
         "tool_call_id": "call_binary",
         "name": "read_file",
-        "content": "read_file could not complete the request.",
+        "content": "The requested file contains binary NUL bytes.",
     }
     persisted = (await store.load(session.id)).messages[2]
     assert isinstance(persisted, ToolSessionMessage)
     assert persisted.status == "error"
-    assert persisted.error is not None
-    assert persisted.error.code == "tool_failed"
 
 
 @pytest.mark.asyncio
@@ -879,6 +875,4 @@ async def test_read_file_denies_a_symlink_that_resolves_outside_workspace(
     persisted = (await store.load(session_id)).messages[2]
     assert isinstance(persisted, ToolSessionMessage)
     assert persisted.status == "error"
-    assert persisted.error is not None
-    assert persisted.error.code == "tool_denied"
     assert "symlink-secret" not in persisted.content

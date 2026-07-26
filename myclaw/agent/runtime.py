@@ -18,7 +18,7 @@ from myclaw.agent.prompts import (
     runtime_context,
     session_title_prompt,
 )
-from myclaw.agent.turn import model_message_from_session
+from myclaw.agent.turn import ToolResultExternalizer, model_message_from_session
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
@@ -62,9 +62,13 @@ from myclaw.session.records import ConversationSession
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
-from myclaw.tools.models import ToolDefinition, ToolExecutionContext
+from myclaw.tools.files.file_tools import ReadFileTool
+from myclaw.tools.models import ToolExecutionContext, ToolExecutionLane, ToolResult
+from myclaw.tools.schema import OpenAIToolSchema
+from myclaw.tools.security import Security
 from myclaw.tools.shell.shell_process import SubprocessShellBoundary
 from myclaw.tools.shell.shell_tool import ShellBoundary
+from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import (
     AioHttpWebFetchClient,
@@ -290,6 +294,7 @@ class _DeferredConversationPort:
         history_preparer: Callable[[ConversationSession], Awaitable[ConversationSession]],
         before_submit: Callable[[], Awaitable[None]],
         on_foreground_terminal: Callable[[], None],
+        externalize_result: ToolResultExternalizer | None = None,
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -303,6 +308,7 @@ class _DeferredConversationPort:
         self._history_preparer = history_preparer
         self._before_submit = before_submit
         self._on_foreground_terminal = on_foreground_terminal
+        self._externalize_result = externalize_result
         self._delegate: ConversationPort | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._active_task: asyncio.Task[object] | None = None
@@ -338,6 +344,7 @@ class _DeferredConversationPort:
                     title_prompt=self._title_prompt,
                     tool_gateway=self._tool_gateway,
                     history_preparer=self._history_preparer,
+                    externalize_result=self._externalize_result,
                 )
                 self._delegate = delegate
             async for event in delegate.submit(text):
@@ -467,14 +474,11 @@ def prepare_repl_runtime(
         now=now,
         new_uuid=new_uuid,
     )
-    tool_gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=Path(workspace_identity.path),
-            agent_home=agent_home.path,
-            session_id=metadata.id,
-        ),
-        max_tool_result_chars=configuration.runtime.max_tool_result_chars,
+    tool_gateway = _build_tool_gateway(
+        lane="foreground",
+        workspace=workspace_identity,
+        agent_home=agent_home,
+        session_id=metadata.id,
         web_search=configured_web_search,
         web_fetch=configured_web_fetch,
         shell=configured_shell,
@@ -483,7 +487,7 @@ def prepare_repl_runtime(
     system_prompt = chat_system_prompt(
         workspace=workspace_identity.path,
         long_term_memory=long_term_memory,
-        tool_guidance=render_tool_guidance(tool_gateway.definitions),
+        tool_guidance=render_tool_guidance(tool_gateway.schemas),
     )
     resolved_memory = configuration.resolve_route("memory")
     summaries = JsonlSummaryStore(agent_home)
@@ -502,7 +506,7 @@ def prepare_repl_runtime(
         chat_max_output=resolved.route.max_output,
         consolidation_message_threshold=(configuration.memory.consolidation_message_threshold),
         chat_system_prompt=system_prompt,
-        tools=tool_gateway.definitions,
+        tools=tool_gateway.schemas,
         now=now,
         new_uuid=new_uuid,
     )
@@ -534,18 +538,23 @@ def prepare_repl_runtime(
     )
 
     def scheduled_work_gateway_for(session_id: str) -> ToolGateway:
-        return ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=Path(workspace_identity.path),
-                agent_home=agent_home.path,
-                session_id=session_id,
-            ),
-            max_tool_result_chars=configuration.runtime.max_tool_result_chars,
+        return _build_tool_gateway(
+            lane="scheduled_work",
+            workspace=workspace_identity,
+            agent_home=agent_home,
+            session_id=session_id,
             web_search=configured_web_search,
             web_fetch=configured_web_fetch,
             shell=configured_shell,
             scheduled_work=scheduled_work_tool,
+        )
+
+    def externalize_result_for(session_id: str) -> ToolResultExternalizer:
+        return _build_tool_result_externalizer(
+            workspace=workspace_identity,
+            agent_home=agent_home,
+            session_id=session_id,
+            max_tool_result_chars=configuration.runtime.max_tool_result_chars,
         )
 
     resolved_cron = configuration.resolve_route("cron")
@@ -564,6 +573,7 @@ def prepare_repl_runtime(
         now=now,
         new_uuid=new_uuid,
         tool_gateway_for=scheduled_work_gateway_for,
+        externalize_result_for=externalize_result_for,
     )
     background_events = RuntimeEventBroker()
     scheduled_work_coordinator = ScheduledWorkCoordinator(
@@ -598,14 +608,11 @@ def prepare_repl_runtime(
         )
 
     def conversation_for(session_id: str) -> ConversationPort:
-        session_tool_gateway = ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=Path(workspace_identity.path),
-                agent_home=agent_home.path,
-                session_id=session_id,
-            ),
-            max_tool_result_chars=configuration.runtime.max_tool_result_chars,
+        session_tool_gateway = _build_tool_gateway(
+            lane="foreground",
+            workspace=workspace_identity,
+            agent_home=agent_home,
+            session_id=session_id,
             web_search=configured_web_search,
             web_fetch=configured_web_fetch,
             shell=configured_shell,
@@ -624,6 +631,7 @@ def prepare_repl_runtime(
             history_preparer=summary_manager.prepare,
             before_submit=summary_manager.recover_pending,
             on_foreground_terminal=capture_foreground_chat_status,
+            externalize_result=externalize_result_for(session_id),
         )
 
     conversation = SwitchableConversationPort(
@@ -640,7 +648,7 @@ def prepare_repl_runtime(
             system_prompt=system_prompt,
             current_time=now(),
             session_id=conversation.session_id,
-            tool_definitions=tool_gateway.definitions,
+            tool_schemas=tool_gateway.schemas,
         ),
         monotonic=monotonic_now,
     )
@@ -669,6 +677,59 @@ def prepare_repl_runtime(
     )
 
 
+def _build_tool_gateway(
+    *,
+    lane: ToolExecutionLane,
+    workspace: Workspace,
+    agent_home: AgentHome,
+    session_id: str,
+    web_search: WebSearchBoundary | None,
+    web_fetch: WebFetchBoundary | None,
+    shell: ShellBoundary | None,
+    scheduled_work: CreateScheduledWorkTool,
+) -> ToolGateway:
+    gateway = ToolGateway(
+        context=ToolExecutionContext(
+            lane=lane,
+            workspace=Path(workspace.path),
+            agent_home=agent_home.path,
+            session_id=session_id,
+        ),
+        web_search=web_search,
+        web_fetch=web_fetch,
+        shell=shell,
+        scheduled_work=scheduled_work,
+    )
+    security = Security(
+        workspace=workspace,
+        agent_home=agent_home.path,
+        artifact_directory=(
+            agent_home.path / "sessions" / workspace.slug / "artifacts" / session_id
+        ),
+    )
+    gateway.register_tools((ReadFileTool(security=security),))
+    return gateway
+
+
+def _build_tool_result_externalizer(
+    *,
+    workspace: Workspace,
+    agent_home: AgentHome,
+    session_id: str,
+    max_tool_result_chars: int,
+) -> ToolResultExternalizer:
+    def externalize(result: ToolResult) -> ToolResult:
+        return externalize_tool_result(
+            result,
+            agent_home=agent_home.path,
+            workspace=workspace,
+            session_id=session_id,
+            max_tool_result_chars=max_tool_result_chars,
+        )
+
+    return externalize
+
+
 def _resolved_chat_status(router: ModelRouter) -> ResolvedChatStatus:
     status = router.route_status("chat")
     return ResolvedChatStatus(
@@ -684,7 +745,7 @@ def _runtime_status_input(
     system_prompt: str,
     current_time: datetime,
     session_id: str,
-    tool_definitions: tuple[ToolDefinition, ...],
+    tool_schemas: tuple[OpenAIToolSchema, ...],
 ) -> RuntimeStatusInput:
     retained_messages = tuple(
         json.dumps(
@@ -700,11 +761,11 @@ def _runtime_status_input(
         retained_messages=retained_messages,
         tool_definitions=tuple(
             json.dumps(
-                definition.to_dict(),
+                definition,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-            for definition in tool_definitions
+            for definition in tool_schemas
         ),
         runtime_context=runtime_context(
             current_time=current_time,

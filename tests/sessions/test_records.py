@@ -161,7 +161,7 @@ def test_assistant_session_message_serializes_as_the_exact_jsonl_record() -> Non
         id="7c9e6679-7425-40de-944b-e07fc1f90ae7",
         created_at=datetime(2026, 7, 11, 15, 30, 13, tzinfo=LOCAL_OFFSET),
         content="I will inspect the files.",
-        tool_calls=(ModelToolCall(id="call_123", name="list_files", arguments={"path": "."}),),
+        tool_calls=(ModelToolCall(id="call_123", name="list_files", arguments='{"path":"."}'),),
         status="completed",
         error=None,
         usage=ModelUsage(input_tokens=120, output_tokens=24, total_tokens=144),
@@ -172,7 +172,7 @@ def test_assistant_session_message_serializes_as_the_exact_jsonl_record() -> Non
         '"created_at":"2026-07-11T15:30:13.000+08:00","role":"assistant",'
         '"content":"I will inspect the files.",'
         '"tool_calls":[{"id":"call_123","name":"list_files",'
-        '"arguments":{"path":"."}}],"status":"completed","error":null,'
+        '"arguments":"{\\"path\\":\\".\\"}"}],"status":"completed","error":null,'
         '"usage":{"input_tokens":120,"output_tokens":24,"total_tokens":144}}\n'
     )
 
@@ -232,7 +232,6 @@ def test_tool_session_message_serializes_as_the_exact_jsonl_record() -> None:
         name="list_files",
         content="CONTEXT.md\ndocs/",
         status="success",
-        error=None,
         artifact=None,
     )
 
@@ -240,7 +239,7 @@ def test_tool_session_message_serializes_as_the_exact_jsonl_record() -> None:
         '{"record_type":"message","id":"9b2c3a42-1d2e-4a1e-a827-61f36dc54713",'
         '"created_at":"2026-07-11T15:30:13.500+08:00","role":"tool",'
         '"tool_call_id":"call_123","name":"list_files",'
-        '"content":"CONTEXT.md\\ndocs/","status":"success","error":null,"artifact":null}\n'
+        '"content":"CONTEXT.md\\ndocs/","status":"success","artifact":null}\n'
     )
 
 
@@ -252,7 +251,6 @@ def test_refused_tool_session_message_persists_the_exact_safe_error() -> None:
         name="write_file",
         content="Permission denied by user.",
         status="refused",
-        error=SessionError(code="tool_refused", message="Permission denied by user."),
         artifact=None,
     )
 
@@ -260,9 +258,7 @@ def test_refused_tool_session_message_persists_the_exact_safe_error() -> None:
         '{"record_type":"message","id":"9b2c3a42-1d2e-4a1e-a827-61f36dc54713",'
         '"created_at":"2026-07-11T15:30:13.500+08:00","role":"tool",'
         '"tool_call_id":"call_123","name":"write_file",'
-        '"content":"Permission denied by user.","status":"refused",'
-        '"error":{"code":"tool_refused","message":"Permission denied by user."},'
-        '"artifact":null}\n'
+        '"content":"Permission denied by user.","status":"refused","artifact":null}\n'
     )
 
 
@@ -278,7 +274,6 @@ def test_tool_artifact_reference_is_preserved_in_the_exact_session_shape() -> No
             "call_123.txt]"
         ),
         status="success",
-        error=None,
         artifact=ArtifactReference(
             path=(
                 "artifacts/20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000/call_123.txt"
@@ -301,7 +296,6 @@ def test_tool_artifact_reference_is_preserved_in_the_exact_session_shape() -> No
             "call_123.txt]"
         ),
         "status": "success",
-        "error": None,
         "artifact": {
             "path": (
                 "artifacts/20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000/call_123.txt"
@@ -312,12 +306,11 @@ def test_tool_artifact_reference_is_preserved_in_the_exact_session_shape() -> No
     }
 
 
-def test_tool_session_message_enforces_identity_time_and_error_coherence() -> None:
+def test_tool_session_message_enforces_identity() -> None:
     def message(
         *,
         id: str,
         status: ToolResultStatus,
-        error: SessionError | None,
     ) -> ToolSessionMessage:
         return ToolSessionMessage(
             id=id,
@@ -326,29 +319,13 @@ def test_tool_session_message_enforces_identity_time_and_error_coherence() -> No
             name="read_file",
             content="result",
             status=status,
-            error=error,
             artifact=None,
         )
-
-    error = SessionError(code="tool_failed", message="Tool failed.")
 
     with pytest.raises(ValueError, match="UUID4"):
         message(
             id="123e4567-e89b-12d3-a456-426614174000",
             status="success",
-            error=None,
-        )
-    with pytest.raises(ValueError, match="success tool message must not have an error"):
-        message(
-            id="9b2c3a42-1d2e-4a1e-a827-61f36dc54713",
-            status="success",
-            error=error,
-        )
-    with pytest.raises(ValueError, match="non-success tool message requires an error"):
-        message(
-            id="9b2c3a42-1d2e-4a1e-a827-61f36dc54713",
-            status="error",
-            error=None,
         )
 
 

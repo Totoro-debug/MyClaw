@@ -9,7 +9,7 @@ import pytest
 from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
 from myclaw.tools.models import ModelToolCall
-from myclaw.tools.schema import ToolParam
+from myclaw.tools.schema import OpenAIToolSchema, ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.json_types import JsonObject
 
@@ -60,7 +60,7 @@ async def test_registered_catalog_preserves_order_and_returns_defensive_schemas(
     schema_calls: list[str] = []
     original = BaseTool.to_schema
 
-    def counted(tool: BaseTool) -> JsonObject:
+    def counted(tool: BaseTool) -> OpenAIToolSchema:
         schema_calls.append(tool.name)
         return original(tool)
 

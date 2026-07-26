@@ -4,9 +4,14 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISREG
+from typing import Annotated
 
 from myclaw.agent.workspace import Workspace
+from myclaw.tools.base import BaseTool
+from myclaw.tools.errors import ToolError
 from myclaw.tools.models import ToolDefinition, ToolExecutionContext
+from myclaw.tools.schema import ToolParam
+from myclaw.tools.security import Security
 from myclaw.utils.json_types import JsonObject
 
 _WINDOWS_RESERVED_BASENAMES = frozenset(
@@ -52,54 +57,43 @@ class FileToolAccessDenied(PermissionError):
     """Raised when a requested path resolves outside the Workspace."""
 
 
-class ReadFileTool:
+class ReadFileTool(BaseTool):
     """Read a stable UTF-8 line window from a Workspace file."""
 
-    _definition = ToolDefinition(
-        name="read_file",
-        description="Read UTF-8 text lines from a file within the current Workspace.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "offset": {"type": "integer", "minimum": 0, "default": 0},
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 10000,
-                    "default": 2000,
-                },
-            },
-            "required": ["path"],
-            "additionalProperties": False,
-        },
-    )
+    name = "read_file"
+    description = "Read UTF-8 text lines from a file within the current Workspace."
+    required = ("path",)
 
-    @property
-    def definition(self) -> ToolDefinition:
-        return self._definition
+    path: Annotated[str, ToolParam(description="Workspace-relative or allowed readable path.")]
+    offset: Annotated[int, ToolParam(description="Zero-based first line.", minimum=0)] = 0
+    limit: Annotated[
+        int,
+        ToolParam(description="Maximum lines to return.", minimum=1, maximum=10000),
+    ] = 2000
 
-    async def execute(self, arguments: JsonObject, context: ToolExecutionContext) -> str:
-        _reject_unknown(arguments, {"path", "offset", "limit"})
-        path = _required_string_argument(arguments, "path")
-        offset = _nonnegative_int_argument(arguments, "offset", default=0)
-        limit = _bounded_int_argument(
-            arguments,
-            "limit",
-            default=2000,
-            minimum=1,
-            maximum=10000,
-        )
-        target = _workspace_path(context, path)
-        status = target.lstat()
+    def __init__(self, *, security: Security) -> None:
+        self._security = security
+
+    async def execute(self, *, path: str, offset: int, limit: int) -> str:
+        target = self._security.resolve_read_path(path)
+        try:
+            status = target.lstat()
+        except OSError as error:
+            raise ToolError("The requested file could not be inspected.") from error
         if not S_ISREG(status.st_mode):
-            raise FileToolArgumentsError("path must identify a regular file")
+            raise ToolError("The requested path must identify a regular file.")
         if status.st_nlink != 1:
-            raise FileToolAccessDenied("path must identify an unaliased regular file")
-        raw_content = target.read_bytes()
+            raise ToolError("The requested path must identify an unaliased regular file.")
+        try:
+            raw_content = target.read_bytes()
+        except OSError as error:
+            raise ToolError("The requested file could not be read.") from error
         if b"\x00" in raw_content:
-            raise UnicodeError("file contains binary NUL bytes")
-        lines = raw_content.decode("utf-8").splitlines()
+            raise ToolError("The requested file contains binary NUL bytes.")
+        try:
+            lines = raw_content.decode("utf-8").splitlines()
+        except UnicodeError as error:
+            raise ToolError("The requested file is not valid UTF-8 text.") from error
         return "\n".join(lines[offset : offset + limit])
 
 

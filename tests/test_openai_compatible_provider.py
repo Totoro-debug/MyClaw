@@ -22,12 +22,18 @@ from myclaw.provider.models import (
     UserModelMessage,
 )
 from myclaw.provider.openai_compatible import OpenAICompatibleProvider
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolDefinition,
-)
+from myclaw.tools.models import ModelToolCall
+from myclaw.tools.schema import OpenAIToolSchema
 
 REQUEST_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+READ_FILE_SCHEMA: OpenAIToolSchema = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "Read a text file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    },
+}
 
 
 class FakeOpenAIStream:
@@ -106,13 +112,7 @@ def request(*, stream: bool = True) -> ModelRequest:
         route="chat" if stream else "memory",
         system_prompt="You are MyClaw.",
         messages=(UserModelMessage(content="Hello"),),
-        tools=(
-            ToolDefinition(
-                name="read_file",
-                description="Read a text file.",
-                input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
-            ),
-        ),
+        tools=(READ_FILE_SCHEMA,),
         stream=stream,
         model="model-test",
         max_output=512,
@@ -294,7 +294,7 @@ async def test_stream_aggregates_fragmented_tool_calls_with_mixed_content() -> N
                 {
                     "id": "call_123",
                     "name": "read_file",
-                    "arguments": {"path": "README.md"},
+                    "arguments": '{"path":"README.md"}',
                 }
             ],
         },
@@ -381,7 +381,7 @@ async def test_complete_translates_tool_history_and_mixed_tool_response() -> Non
                     ModelToolCall(
                         id="call_read",
                         name="read_file",
-                        arguments={"path": "memory.md"},
+                        arguments='{"path":"memory.md"}',
                     ),
                 ),
             ),
@@ -403,7 +403,7 @@ async def test_complete_translates_tool_history_and_mixed_tool_response() -> Non
                 {
                     "id": "call_edit",
                     "name": "edit_file",
-                    "arguments": {"path": "memory.md", "content": "fact"},
+                    "arguments": '{"path":"memory.md","content":"fact"}',
                 }
             ],
         },
@@ -584,7 +584,7 @@ async def test_stream_maps_creation_error_without_retrying() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_normalizes_malformed_tool_arguments_as_model_failure() -> None:
+async def test_stream_preserves_malformed_tool_argument_text_for_the_gateway() -> None:
     stream = FakeOpenAIStream(
         SimpleNamespace(
             choices=[
@@ -614,22 +614,18 @@ async def test_stream_normalizes_malformed_tool_arguments_as_model_failure() -> 
         client_factory=FakeOpenAIClientFactory(client),
     )
 
-    with pytest.raises(ModelCallError) as raised:
-        async for _event in provider.stream(request()):
-            pass
+    events = [event async for event in provider.stream(request())]
 
-    assert raised.value.error.to_dict() == {
-        "code": "model_failed",
-        "message": "OpenAI-compatible provider call failed.",
-        "retryable": False,
-        "retry_after_seconds": None,
-    }
-    assert isinstance(raised.value.__cause__, ValueError)
+    completed = events[-1]
+    assert isinstance(completed, ModelCompleted)
+    assert completed.response.message.tool_calls == (
+        ModelToolCall(id="call_invalid", name="read_file", arguments='{"path":'),
+    )
     assert len(client.chat.completions.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_complete_normalizes_non_object_tool_arguments_as_model_failure() -> None:
+async def test_complete_preserves_non_object_tool_argument_text_for_the_gateway() -> None:
     response = SimpleNamespace(
         choices=[
             SimpleNamespace(
@@ -653,16 +649,11 @@ async def test_complete_normalizes_non_object_tool_arguments_as_model_failure() 
         client_factory=FakeOpenAIClientFactory(client),
     )
 
-    with pytest.raises(ModelCallError) as raised:
-        await provider.complete(completion_request("memory"))
+    observed = await provider.complete(completion_request("memory"))
 
-    assert raised.value.error.to_dict() == {
-        "code": "model_failed",
-        "message": "OpenAI-compatible provider call failed.",
-        "retryable": False,
-        "retry_after_seconds": None,
-    }
-    assert isinstance(raised.value.__cause__, TypeError)
+    assert observed.message.tool_calls == (
+        ModelToolCall(id="call_invalid", name="read_file", arguments="[]"),
+    )
     assert len(client.chat.completions.calls) == 1
 
 

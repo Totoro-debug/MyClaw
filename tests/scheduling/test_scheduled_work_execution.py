@@ -39,6 +39,7 @@ from myclaw.tools.models import (
     ToolResult,
 )
 from myclaw.tools.shell.shell_policy import ShellRequest
+from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.atomic_files import atomic_replace_bytes
 from tests.configuration.test_config import VALID_CONFIG
@@ -71,6 +72,26 @@ def _task() -> ScheduledWork:
 
 def _usage() -> ModelUsage:
     return ModelUsage(input_tokens=12, output_tokens=3, total_tokens=15)
+
+
+def _externalizer_for(
+    *, agent_home: Path, workspace: Path, max_tool_result_chars: int
+) -> Callable[[str], Callable[[ToolResult], ToolResult]]:
+    workspace_identity = Workspace.from_path(workspace)
+
+    def for_session(session_id: str) -> Callable[[ToolResult], ToolResult]:
+        def externalize(result: ToolResult) -> ToolResult:
+            return externalize_tool_result(
+                result,
+                agent_home=agent_home,
+                workspace=workspace_identity,
+                session_id=session_id,
+                max_tool_result_chars=max_tool_result_chars,
+            )
+
+        return externalize
+
+    return for_session
 
 
 class BlockingShellBoundary:
@@ -532,8 +553,6 @@ async def test_scheduled_work_auto_refuses_ask_tools_and_completes_the_agent_tur
     assert isinstance(tool_result, ToolSessionMessage)
     assert tool_result.tool_call_id == call.id
     assert tool_result.status == "refused"
-    assert tool_result.error is not None
-    assert tool_result.error.code == "tool_refused"
     assert len(provider.complete_requests) == 2
     follow_up = provider.complete_requests[1]
     assert isinstance(follow_up, ModelRequest)
@@ -615,6 +634,11 @@ async def test_scheduled_work_commits_a_published_oversized_tool_result(
             )
         ).__next__,
         tool_gateway_for=lambda _: gateway,
+        externalize_result_for=_externalizer_for(
+            agent_home=agent_home,
+            workspace=workspace,
+            max_tool_result_chars=1,
+        ),
     )
 
     outcome = await runner.run(_task())
@@ -634,7 +658,6 @@ async def test_scheduled_work_commits_a_published_oversized_tool_result(
         sessions.directory / "artifacts" / TASK_SESSION_ID / "call_scheduled_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
-    assert gateway.discard_artifact(gateway.results[0]) is False
     assert artifact_path.read_text(encoding="utf-8") == raw_result
 
 
@@ -1050,6 +1073,11 @@ async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_public
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
+        externalize_result_for=_externalizer_for(
+            agent_home=agent_home,
+            workspace=workspace,
+            max_tool_result_chars=1,
+        ),
     )
 
     outcome = await runner.run(_task())
@@ -1069,12 +1097,11 @@ async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_public
         sessions.directory / "artifacts" / TASK_SESSION_ID / "call_effect_then_raise_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
-    assert gateway.discard_artifact(gateway.results[0]) is False
     assert artifact_path.read_text(encoding="utf-8") == raw_result
 
 
 @pytest.mark.asyncio
-async def test_scheduled_work_discards_an_artifact_when_tool_message_was_not_written(
+async def test_scheduled_work_leaves_an_orphan_artifact_when_tool_message_was_not_written(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -1126,6 +1153,11 @@ async def test_scheduled_work_discards_an_artifact_when_tool_message_was_not_wri
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
+        externalize_result_for=_externalizer_for(
+            agent_home=agent_home,
+            workspace=workspace,
+            max_tool_result_chars=1,
+        ),
     )
 
     outcome = await runner.run(_task())
@@ -1138,8 +1170,7 @@ async def test_scheduled_work_discards_an_artifact_when_tool_message_was_not_wri
     artifact_path = _long_path(
         sessions.directory / "artifacts" / TASK_SESSION_ID / "call_unpublished_artifact.txt"
     )
-    assert not artifact_path.exists()
-    assert gateway.discard_artifact(gateway.results[0]) is False
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
 
 
 @pytest.mark.asyncio
@@ -1195,6 +1226,11 @@ async def test_scheduled_work_preserves_an_artifact_when_publication_is_indeterm
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
+        externalize_result_for=_externalizer_for(
+            agent_home=agent_home,
+            workspace=workspace,
+            max_tool_result_chars=1,
+        ),
     )
 
     outcome = await runner.run(_task())
@@ -1202,18 +1238,19 @@ async def test_scheduled_work_preserves_an_artifact_when_publication_is_indeterm
     assert outcome.status == "failed"
     assert outcome.error is not None
     assert outcome.error.code == "persistence_error"
+    with pytest.raises(OSError, match="injected reconciliation load failure"):
+        await sessions.load(TASK_SESSION_ID)
     session = await sessions.load(TASK_SESSION_ID)
     assert [message.role for message in session.messages] == ["user", "assistant"]
     artifact_path = _long_path(
         sessions.directory / "artifacts" / TASK_SESSION_ID / "call_indeterminate_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
-    assert gateway.discard_artifact(gateway.results[0]) is False
     assert artifact_path.read_text(encoding="utf-8") == raw_result
 
 
 @pytest.mark.asyncio
-async def test_cancelling_scheduled_tool_publication_discards_an_unpublished_artifact(
+async def test_cancelling_scheduled_tool_publication_leaves_an_orphan_artifact(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -1265,6 +1302,11 @@ async def test_cancelling_scheduled_tool_publication_discards_an_unpublished_art
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
+        externalize_result_for=_externalizer_for(
+            agent_home=agent_home,
+            workspace=workspace,
+            max_tool_result_chars=1,
+        ),
     )
     execution = asyncio.create_task(runner.run(_task()))
     await asyncio.wait_for(sessions.tool_append_started.wait(), timeout=1)
@@ -1278,8 +1320,7 @@ async def test_cancelling_scheduled_tool_publication_discards_an_unpublished_art
     artifact_path = _long_path(
         sessions.directory / "artifacts" / TASK_SESSION_ID / "call_cancelled_artifact.txt"
     )
-    assert not artifact_path.exists()
-    assert gateway.discard_artifact(gateway.results[0]) is False
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
 
 
 @pytest.mark.asyncio
@@ -1335,6 +1376,11 @@ async def test_cancelling_after_scheduled_tool_publication_commits_the_durable_a
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
+        externalize_result_for=_externalizer_for(
+            agent_home=agent_home,
+            workspace=workspace,
+            max_tool_result_chars=1,
+        ),
     )
     execution = asyncio.create_task(runner.run(_task()))
     await asyncio.wait_for(sessions.tool_message_written.wait(), timeout=1)
@@ -1352,11 +1398,10 @@ async def test_cancelling_after_scheduled_tool_publication_commits_the_durable_a
         sessions.directory / "artifacts" / TASK_SESSION_ID / "call_effect_then_cancel_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
-    assert gateway.discard_artifact(gateway.results[0]) is False
 
 
 @pytest.mark.asyncio
-async def test_scheduled_tool_publication_reconciliation_preserves_a_primary_base_exception(
+async def test_scheduled_tool_publication_preserves_a_primary_base_exception(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -1410,6 +1455,11 @@ async def test_scheduled_tool_publication_reconciliation_preserves_a_primary_bas
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
+        externalize_result_for=_externalizer_for(
+            agent_home=agent_home,
+            workspace=workspace,
+            max_tool_result_chars=1,
+        ),
     )
 
     with pytest.raises(ToolPublicationBaseError) as raised:
@@ -1425,7 +1475,6 @@ async def test_scheduled_tool_publication_reconciliation_preserves_a_primary_bas
         sessions.directory / "artifacts" / TASK_SESSION_ID / "call_base_exception_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
-    assert gateway.discard_artifact(gateway.results[0]) is False
 
 
 @pytest.mark.asyncio
@@ -1687,8 +1736,7 @@ async def test_cancelling_a_running_scheduled_tool_repairs_history_without_closi
     assert isinstance(cancelled_tool, ToolSessionMessage)
     assert cancelled_tool.tool_call_id == call.id
     assert cancelled_tool.status == "error"
-    assert cancelled_tool.error is not None
-    assert cancelled_tool.error.code == "turn_cancelled"
+    assert cancelled_tool.content == "Scheduled Work tool call cancelled."
 
 
 @pytest.mark.asyncio
@@ -1784,7 +1832,7 @@ async def test_runtime_scheduled_work_uses_current_shell_and_web_enablement(
     assert isinstance(request, ModelRequest)
     assert request.route == "cron"
     assert request.model == "claude-model"
-    tool_names = [definition.name for definition in request.tools]
+    tool_names = [schema["function"]["name"] for schema in request.tools]
     assert tool_names == [
         "read_file",
         "list_files",
@@ -1876,8 +1924,6 @@ async def test_scheduled_tool_failure_is_safe_history_and_the_turn_can_finish(
     tool_result = session.messages[2]
     assert isinstance(tool_result, ToolSessionMessage)
     assert tool_result.status == "error"
-    assert tool_result.error is not None
-    assert tool_result.error.code == "tool_failed"
     assert "private subprocess failure" not in tool_result.content
     assert session.messages[-1].content == "The check failed safely."
 
@@ -1947,8 +1993,9 @@ async def test_runtime_scheduled_work_refuses_recursive_task_creation(
     assert isinstance(recursive_result, ToolSessionMessage)
     assert recursive_result.name == "create_scheduled_work"
     assert recursive_result.status == "refused"
-    assert recursive_result.error is not None
-    assert recursive_result.error.code == "tool_refused"
+    assert recursive_result.content == (
+        "The requested operation requires unavailable user confirmation."
+    )
 
 
 @pytest.mark.asyncio
@@ -1989,7 +2036,7 @@ async def test_runtime_scheduled_work_uses_enabled_web_and_disabled_shell_catalo
     assert result.status == "completed"
     request = provider.complete_requests[0]
     assert isinstance(request, ModelRequest)
-    assert [definition.name for definition in request.tools] == [
+    assert [schema["function"]["name"] for schema in request.tools] == [
         "read_file",
         "list_files",
         "search_files",

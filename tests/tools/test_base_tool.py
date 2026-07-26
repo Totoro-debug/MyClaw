@@ -137,7 +137,7 @@ def test_base_tool_rejects_a_schema_override() -> None:
             name = "override"
             description = "Invalid schema override."
 
-            def to_schema(self) -> JsonObject:  # type: ignore[misc]
+            def to_schema(self) -> JsonObject:  # type: ignore[misc, override]
                 return {}
 
             async def execute(self) -> str:

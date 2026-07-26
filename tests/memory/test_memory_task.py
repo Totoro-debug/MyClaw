@@ -179,7 +179,10 @@ async def test_memory_task_without_an_edit_advances_the_summary_cursor(
     assert isinstance(request, ModelRequest)
     assert request.route == "memory"
     assert request.stream is False
-    assert [definition.name for definition in request.tools] == ["read_file", "edit_file"]
+    assert [schema["function"]["name"] for schema in request.tools] == [
+        "read_file",
+        "edit_file",
+    ]
     assert "The user prefers concise status reports." in request.messages[0].content
     for section in ("User Info", "User Preference", "Project Fact", "Lesson"):
         assert section in request.system_prompt

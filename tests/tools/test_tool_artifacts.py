@@ -33,7 +33,9 @@ from myclaw.tools.models import (
     ModelToolCall,
     ToolDefinition,
     ToolExecutionContext,
+    ToolResult,
 )
+from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 
@@ -82,54 +84,62 @@ def _long_path(path: Path) -> Path:
     return Path(f"\\\\?\\{path.absolute()}")
 
 
-@pytest.mark.asyncio
-async def test_tool_gateway_externalizes_only_results_over_the_configured_threshold(
+def test_runtime_externalizes_only_success_results_over_the_configured_threshold(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     AgentHome(agent_home).initialize()
-    artifact_workspace = Path(workspace.anchor) / "artifact-workspace"
     exact_result = "a" * 2000
     expected_preview = "b" * 2000
     oversized_result = expected_preview + "!"
-    tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Return inspection output.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
-        outcomes=(exact_result, oversized_result),
+    exact = ToolResult(
+        tool_call_id="call_exact",
+        name="inspect",
+        status="success",
+        content=exact_result,
+        error=None,
+        artifact=None,
     )
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=artifact_workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        ),
-        tools=(tool,),
+    oversized = ToolResult(
+        tool_call_id="call_over",
+        name="inspect",
+        status="success",
+        content=oversized_result,
+        error=None,
+        artifact=None,
+    )
+
+    exact_projected = externalize_tool_result(
+        exact,
+        agent_home=agent_home,
+        workspace=Workspace.from_path(workspace),
+        session_id=SESSION_ID,
+        max_tool_result_chars=2000,
+    )
+    oversized_projected = externalize_tool_result(
+        oversized,
+        agent_home=agent_home,
+        workspace=Workspace.from_path(workspace),
+        session_id=SESSION_ID,
         max_tool_result_chars=2000,
     )
 
-    exact = await gateway.execute(ModelToolCall(id="call_exact", name="inspect", arguments={}))
-    oversized = await gateway.execute(ModelToolCall(id="call_over", name="inspect", arguments={}))
-
     relative_path = f"artifacts/{SESSION_ID}/call_over.txt"
-    assert exact.content == exact_result
-    assert exact.artifact is None
-    assert oversized.content == (
+    assert exact_projected is exact
+    assert oversized_projected is not oversized
+    assert oversized_projected.content == (
         f"{expected_preview}\n\n...[truncated; full result stored at {relative_path}]"
     )
-    assert oversized.artifact is not None
-    assert oversized.artifact.to_dict() == {
+    assert oversized_projected.artifact is not None
+    assert oversized_projected.artifact.to_dict() == {
         "path": relative_path,
         "total_chars": 2001,
         "preview_chars": 2000,
     }
-    artifact_directory = (
+    artifact_directory = _long_path(
         agent_home
         / "sessions"
-        / Workspace.from_path(artifact_workspace).slug
+        / Workspace.from_path(workspace).slug
         / "artifacts"
         / SESSION_ID
     )
@@ -300,8 +310,14 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
                 session_id=session.id,
             ),
             tools=(tool,),
+        ),
+        externalize_result=lambda result: externalize_tool_result(
+            result,
+            agent_home=agent_home,
+            workspace=Workspace.from_path(workspace),
+            session_id=session.id,
             max_tool_result_chars=2000,
-            artifact_writer=unavailable_artifact_boundary,
+            write_text=unavailable_artifact_boundary,
         ),
     )
 
@@ -318,8 +334,6 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
     assert isinstance(tool_message, ToolSessionMessage)
     assert tool_message.content == "inspect result could not be stored."
     assert tool_message.status == "error"
-    assert tool_message.error is not None
-    assert tool_message.error.code == "tool_failed"
     assert tool_message.artifact is None
     persisted_content = _long_path(store.path_for(session.id)).read_text(encoding="utf-8")
     assert "private-oversized-result" not in persisted_content
@@ -333,72 +347,56 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
     assert list(artifact_directory.iterdir()) == []
 
 
-@pytest.mark.asyncio
-async def test_invalid_empty_tool_call_id_fails_before_writing_an_artifact(
+def test_invalid_empty_tool_call_id_fails_before_writing_an_artifact(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     writes: list[tuple[Path, str]] = []
     raw_result = "private oversized result"
-    tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Return inspection output.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
-        outcomes=(raw_result,),
+    result = ToolResult(
+        tool_call_id="",
+        name="inspect",
+        status="success",
+        content=raw_result,
+        error=None,
+        artifact=None,
     )
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
+
+    with pytest.raises(ArtifactWriteError):
+        externalize_tool_result(
+            result,
             agent_home=agent_home,
+            workspace=Workspace.from_path(workspace),
             session_id=SESSION_ID,
-        ),
-        tools=(tool,),
-        max_tool_result_chars=1,
-        artifact_writer=lambda path, content: writes.append((path, content)),
-    )
+            max_tool_result_chars=1,
+            write_text=lambda path, content: writes.append((path, content)),
+        )
 
-    result = await gateway.execute(ModelToolCall(id="", name="inspect", arguments={}))
-
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_failed"
-    assert result.content == "inspect result could not be stored."
-    assert result.artifact is None
     assert writes == []
-    assert raw_result not in result.content
 
 
-@pytest.mark.asyncio
-async def test_windows_reserved_tool_call_id_uses_canonical_safe_filename(
+def test_windows_reserved_tool_call_id_uses_canonical_safe_filename(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     writes: list[tuple[Path, str]] = []
     raw_result = "oversized result"
-    tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Return inspection output.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
-        outcomes=(raw_result,),
+    original = ToolResult(
+        tool_call_id="CON",
+        name="inspect",
+        status="success",
+        content=raw_result,
+        error=None,
+        artifact=None,
     )
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        ),
-        tools=(tool,),
+    result = externalize_tool_result(
+        original,
+        agent_home=agent_home,
+        workspace=Workspace.from_path(workspace),
+        session_id=SESSION_ID,
         max_tool_result_chars=1,
-        artifact_writer=lambda path, content: writes.append((path, content)),
+        write_text=lambda path, content: writes.append((path, content)),
     )
-
-    result = await gateway.execute(ModelToolCall(id="CON", name="inspect", arguments={}))
 
     expected_path = f"artifacts/{SESSION_ID}/%43%4F%4E.txt"
     assert result.status == "success"

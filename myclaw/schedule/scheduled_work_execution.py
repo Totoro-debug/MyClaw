@@ -9,7 +9,7 @@ from uuid import UUID
 
 from myclaw.agent.events import TurnCompletedPayload, TurnFailedPayload
 from myclaw.agent.prompts import chat_system_prompt, render_tool_guidance
-from myclaw.agent.turn import AgentTurn
+from myclaw.agent.turn import AgentTurn, ToolResultExternalizer
 from myclaw.agent.workspace import Workspace
 from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ReasoningEffort
@@ -72,6 +72,7 @@ class ScheduledWorkRunner:
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
         tool_gateway_for: Callable[[str], ToolGateway],
+        externalize_result_for: Callable[[str], ToolResultExternalizer] | None = None,
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -81,6 +82,7 @@ class ScheduledWorkRunner:
         self._now = now
         self._new_uuid = new_uuid
         self._tool_gateway_for = tool_gateway_for
+        self._externalize_result_for = externalize_result_for
 
     async def run(self, task: ScheduledWork) -> ScheduledWorkRunResult:
         try:
@@ -100,7 +102,7 @@ class ScheduledWorkRunner:
         system_prompt = chat_system_prompt(
             workspace=self._workspace.path,
             long_term_memory=self._long_term_memory,
-            tool_guidance=render_tool_guidance(gateway.definitions),
+            tool_guidance=render_tool_guidance(gateway.schemas),
         )
         turn = AgentTurn(
             lane="scheduled_work",
@@ -112,6 +114,11 @@ class ScheduledWorkRunner:
             new_uuid=self._new_uuid,
             system_prompt=system_prompt,
             tool_gateway=gateway,
+            externalize_result=(
+                None
+                if self._externalize_result_for is None
+                else self._externalize_result_for(task.session_id)
+            ),
         )
         async for payload in turn.run(task.prompt):
             if isinstance(payload, TurnCompletedPayload):

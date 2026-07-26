@@ -200,18 +200,11 @@ class ToolSessionMessage:
     name: str
     content: str
     status: ToolResultStatus
-    error: SessionError | None
     artifact: ArtifactReference | None
 
     def __post_init__(self) -> None:
         require_uuid4_string(self.id, field="id")
         require_aware_datetime(self.created_at, field="created_at")
-        if self.status == "success" and self.error is not None:
-            msg = "success tool message must not have an error"
-            raise ValueError(msg)
-        if self.status != "success" and self.error is None:
-            msg = "non-success tool message requires an error"
-            raise ValueError(msg)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -223,7 +216,6 @@ class ToolSessionMessage:
             "name": self.name,
             "content": self.content,
             "status": self.status,
-            "error": None if self.error is None else self.error.to_dict(),
             "artifact": None if self.artifact is None else self.artifact.to_dict(),
         }
 

@@ -1,6 +1,7 @@
 """Manual Memory Task orchestration and Agent Home persistence."""
 
 import asyncio
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from myclaw.provider.models import (
 )
 from myclaw.provider.ports import ModelProvider
 from myclaw.tools.models import ModelToolCall, ToolDefinition, ToolResult
+from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.utils.atomic_files import atomic_replace_text
 
 _MEMORY_READ_DEFINITION = ToolDefinition(
@@ -79,7 +81,31 @@ class RestrictedMemoryToolGateway:
     def definitions(self) -> tuple[ToolDefinition, ...]:
         return self._definitions
 
+    @property
+    def schemas(self) -> tuple[OpenAIToolSchema, ...]:
+        """Temporary schema projection until #45 migrates Memory Task Tools."""
+        return tuple(
+            {
+                "type": "function",
+                "function": {
+                    "name": definition.name,
+                    "description": definition.description,
+                    "parameters": definition.input_schema,
+                },
+            }
+            for definition in self._definitions
+        )
+
     async def execute(self, tool_call: ModelToolCall) -> ToolResult:
+        raw_arguments = tool_call.arguments
+        if isinstance(raw_arguments, str):
+            try:
+                parsed = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                parsed = None
+            arguments = parsed if isinstance(parsed, dict) else None
+        else:
+            arguments = raw_arguments
         definition = next(
             (item for item in self._definitions if item.name == tool_call.name),
             None,
@@ -90,16 +116,16 @@ class RestrictedMemoryToolGateway:
                 code="tool_not_found",
                 message="The requested tool is not available to Memory Tasks.",
             )
-        if not Draft202012Validator(
+        if arguments is None or not Draft202012Validator(
             definition.input_schema,
             format_checker=FormatChecker(),
-        ).is_valid(tool_call.arguments):
+        ).is_valid(arguments):
             return _tool_error(
                 tool_call,
                 code="tool_invalid_arguments",
                 message=f"Invalid arguments for {tool_call.name}.",
             )
-        requested = tool_call.arguments.get("path")
+        requested = arguments.get("path")
         if not isinstance(requested, str) or Path(requested) != self._long_term_path:
             return _tool_error(
                 tool_call,
@@ -107,12 +133,19 @@ class RestrictedMemoryToolGateway:
                 message="Memory Tasks may access only Long-term Memory.",
             )
         if tool_call.name == "read_file":
-            return await self._read(tool_call)
-        return await self._edit(tool_call)
+            return await self._read(
+                ModelToolCall(id=tool_call.id, name=tool_call.name, arguments=arguments)
+            )
+        return await self._edit(
+            ModelToolCall(id=tool_call.id, name=tool_call.name, arguments=arguments)
+        )
 
     async def _read(self, tool_call: ModelToolCall) -> ToolResult:
-        offset = tool_call.arguments.get("offset", 0)
-        limit = tool_call.arguments.get("limit", 2000)
+        arguments = tool_call.arguments
+        if not isinstance(arguments, dict):
+            raise AssertionError("prepared Memory Tool arguments changed representation")
+        offset = arguments.get("offset", 0)
+        limit = arguments.get("limit", 2000)
         if not isinstance(offset, int) or not isinstance(limit, int):
             raise AssertionError("validated read_file integer arguments changed type")
         try:
@@ -132,9 +165,12 @@ class RestrictedMemoryToolGateway:
         return _tool_success(tool_call, "\n".join(content.splitlines()[offset : offset + limit]))
 
     async def _edit(self, tool_call: ModelToolCall) -> ToolResult:
-        old_text = tool_call.arguments.get("old_text")
-        new_text = tool_call.arguments.get("new_text")
-        replace_all = tool_call.arguments.get("replace_all", False)
+        arguments = tool_call.arguments
+        if not isinstance(arguments, dict):
+            raise AssertionError("prepared Memory Tool arguments changed representation")
+        old_text = arguments.get("old_text")
+        new_text = arguments.get("new_text")
+        replace_all = arguments.get("replace_all", False)
         if (
             not isinstance(old_text, str)
             or not isinstance(new_text, str)
@@ -373,7 +409,7 @@ class MemoryManager:
                 route="memory",
                 system_prompt=memory_task_prompt(long_term_path=self._long_term_path),
                 messages=tuple(messages),
-                tools=self._tools.definitions,
+            tools=self._tools.schemas,
                 stream=False,
                 model=self._settings.model,
                 max_output=self._settings.max_output,

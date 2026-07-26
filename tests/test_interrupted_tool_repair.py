@@ -155,7 +155,8 @@ async def test_same_task_cancellation_after_tool_started_prevents_execution(
         ("call_two", "error"),
     ]
     assert all(
-        message.error is not None and message.error.code == "turn_cancelled" for message in repaired
+        message.content == "Tool call interrupted because the turn was cancelled."
+        for message in repaired
     )
 
 
@@ -375,8 +376,10 @@ async def test_permission_cancellation_materializes_every_unfinished_tool_call(
         ("call_second", "write_file"),
     ]
     assert all(message.status == "error" for message in repaired)
-    assert all(message.error is not None for message in repaired)
-    assert all(message.error.code == "turn_cancelled" for message in repaired if message.error)
+    assert all(
+        message.content == "Tool call interrupted because the turn was cancelled."
+        for message in repaired
+    )
     assert tool.calls == []
 
     next_events = [event async for event in conversation.submit("Continue safely.")]
@@ -480,6 +483,6 @@ async def test_tool_execution_cancellation_keeps_completed_and_repairs_remaining
     ]
     assert tool_messages[0].content == "first complete"
     assert all(
-        message.error is not None and message.error.code == "turn_cancelled"
+        message.content == "Tool call interrupted because the turn was cancelled."
         for message in tool_messages[1:]
     )

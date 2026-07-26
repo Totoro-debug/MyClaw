@@ -729,7 +729,7 @@ async def test_disabled_web_tools_omit_both_search_and_fetch_from_conversation(
     assert events[-1].type == "turn_completed"
     request = provider.stream_requests[0]
     assert isinstance(request, ModelRequest)
-    names = [definition.name for definition in request.tools]
+    names = [schema["function"]["name"] for schema in request.tools]
     assert "web_search" not in names
     assert "web_fetch" not in names
     assert fetch.calls == []
@@ -808,6 +808,4 @@ async def test_conversation_returns_a_safe_error_for_web_fetch_failure(
     assert tool_message.content == "web_fetch could not complete the request."
     persisted = (await runtime.sessions.load(runtime.session_id)).messages[2]
     assert isinstance(persisted, ToolSessionMessage)
-    assert persisted.error is not None
-    assert persisted.error.code == "tool_failed"
     assert "private upstream" not in persisted.content

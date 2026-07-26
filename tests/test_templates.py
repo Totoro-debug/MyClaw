@@ -18,7 +18,7 @@ from myclaw.agent.prompts import (
 )
 from myclaw.memory.records import SummaryEntry
 from myclaw.templates import load_template, render_template
-from myclaw.tools.models import ToolDefinition
+from myclaw.tools.schema import OpenAIToolSchema
 
 TEMPLATE_NAMES = {
     "builtin-identity.md",
@@ -88,11 +88,21 @@ def test_runtime_and_user_input_templates_render_exact_context() -> None:
 
 
 def test_chat_and_tool_templates_render_exact_system_prompt() -> None:
-    definitions = (
-        ToolDefinition(name="read_file", description="Read a file.", input_schema={}),
-        ToolDefinition(name="write_file", description="Write a file.", input_schema={}),
+    schemas: tuple[OpenAIToolSchema, ...] = (
+        {
+            "type": "function",
+            "function": {"name": "read_file", "description": "Read a file.", "parameters": {}},
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write a file.",
+                "parameters": {},
+            },
+        },
     )
-    guidance = render_tool_guidance(definitions)
+    guidance = render_tool_guidance(schemas)
 
     assert guidance == "- read_file: Read a file.\n- write_file: Write a file."
     assert chat_system_prompt(

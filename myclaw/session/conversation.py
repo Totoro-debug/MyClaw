@@ -7,7 +7,12 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from myclaw.agent.events import AgentEvent
-from myclaw.agent.turn import AgentTurn, agent_turn_event_type, model_message_from_session
+from myclaw.agent.turn import (
+    AgentTurn,
+    ToolResultExternalizer,
+    agent_turn_event_type,
+    model_message_from_session,
+)
 from myclaw.provider.models import (
     ModelCompleted,
     ModelRequest,
@@ -55,6 +60,7 @@ class StreamingConversationPort:
         history_preparer: (
             Callable[[ConversationSession], Awaitable[ConversationSession]] | None
         ) = None,
+        externalize_result: ToolResultExternalizer | None = None,
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -84,6 +90,7 @@ class StreamingConversationPort:
             history_preparer=history_preparer,
             after_user_published=self._start_title_for_first_user,
             cancel_requested=lambda: self._cancel_requested,
+            externalize_result=externalize_result,
         )
 
     async def submit(self, text: str) -> AsyncGenerator[AgentEvent, None]:

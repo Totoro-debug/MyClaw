@@ -37,9 +37,13 @@ def assess_permission(
         parse_shell_request,
     )
 
+    arguments = tool_call.arguments
+    if not isinstance(arguments, dict):
+        return PermissionAssessment(decision=PermissionDecision.DENY)
+
     if tool_call.name == "shell":
         try:
-            request = parse_shell_request(tool_call.arguments, context.workspace)
+            request = parse_shell_request(arguments, context.workspace)
         except ShellPolicyDenied:
             return PermissionAssessment(decision=PermissionDecision.DENY)
         decision = assess_shell_command(
@@ -58,7 +62,7 @@ def assess_permission(
             )
         return PermissionAssessment(decision=decision)
     if tool_call.name in {"write_file", "edit_file"}:
-        resource = tool_call.arguments.get("path")
+        resource = arguments.get("path")
         if not isinstance(resource, str):
             return PermissionAssessment(decision=PermissionDecision.DENY)
         try:
@@ -72,8 +76,8 @@ def assess_permission(
             risk_summary="This changes a Workspace file.",
         )
     if tool_call.name == "create_scheduled_work":
-        title = tool_call.arguments.get("title")
-        cron = tool_call.arguments.get("cron")
+        title = arguments.get("title")
+        cron = arguments.get("cron")
         if not isinstance(title, str) or not title or not isinstance(cron, str) or not cron:
             return PermissionAssessment(decision=PermissionDecision.DENY)
         return PermissionAssessment(

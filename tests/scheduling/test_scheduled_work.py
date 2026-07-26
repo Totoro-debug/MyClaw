@@ -2,11 +2,10 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
-from myclaw.agent.events import PermissionRequestedPayload
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
@@ -20,6 +19,7 @@ from myclaw.provider.models import (
 )
 from myclaw.schedule.scheduled_work import CreateScheduledWorkTool, JsonScheduledWorkStore
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.models import (
     ModelToolCall,
@@ -37,7 +37,7 @@ def _usage() -> ModelUsage:
 
 
 @pytest.mark.asyncio
-async def test_foreground_approval_persists_one_complete_scheduled_work_record(
+async def test_foreground_scheduled_work_creation_is_refused_without_confirmation(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -111,47 +111,21 @@ async def test_foreground_approval_persists_one_complete_scheduled_work_record(
         ),
     )
 
-    events = conversation.submit("Schedule the review.")
-    observed = [await anext(events), await anext(events), await anext(events)]
-    permission = observed[-1]
-    assert permission.type == "permission_requested"
-    payload = permission.payload
-    assert isinstance(payload, PermissionRequestedPayload)
-    assert payload.tool_call_id == tool_call.id
-    assert payload.action == "schedule"
-    assert payload.resource == "Weekly project review | 0 9 * * 1"
-    assert prompt not in str(permission.to_dict())
-
-    await conversation.resolve_permission(payload.request_id, approved=True)
-    observed.extend([event async for event in events])
-
+    observed = [event async for event in conversation.submit("Schedule the review.")]
     assert [event.type for event in observed] == [
         "turn_started",
         "tool_started",
-        "permission_requested",
         "tool_completed",
         "turn_completed",
     ]
-    persisted = json.loads((agent_home / "scheduled-work.json").read_text(encoding="utf-8"))
-    assert len(persisted) == 1
-    record = persisted[0]
-    assert set(record) == {
-        "id",
-        "title",
-        "cron",
-        "prompt",
-        "created_at",
-        "enabled",
-        "session_id",
-    }
-    assert UUID(record["id"]).version == 4
-    assert record["title"] == "Weekly project review"
-    assert record["cron"] == "0 9 * * 1"
-    assert record["prompt"] == prompt
-    assert record["created_at"] == "2026-07-12T20:00:00.123+08:00"
-    assert record["enabled"] is True
-    assert record["session_id"] != session_id
-    assert len(await store.load()) == 1
+    assert await store.load() == ()
+    session = await sessions.load(session_id)
+    refused = session.messages[2]
+    assert isinstance(refused, ToolSessionMessage)
+    assert refused.status == "refused"
+    assert refused.content == (
+        "The requested operation requires unavailable user confirmation."
+    )
 
 
 @pytest.mark.asyncio
@@ -191,7 +165,9 @@ async def test_runtime_chat_catalog_exposes_scheduled_work_creation(
     assert events[-1].type == "turn_completed"
     request = provider.stream_requests[0]
     assert isinstance(request, ModelRequest)
-    assert "create_scheduled_work" in {definition.name for definition in request.tools}
+    assert "create_scheduled_work" in {
+        schema["function"]["name"] for schema in request.tools
+    }
 
 
 @pytest.mark.asyncio

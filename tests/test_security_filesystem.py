@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -7,15 +8,32 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import AssistantModelMessage
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolExecutionContext,
-)
-from myclaw.tools.tool_artifacts import ArtifactDiscardError
+from myclaw.tools.files.file_tools import ReadFileTool
+from myclaw.tools.models import ModelToolCall, ToolExecutionContext, ToolResult
+from myclaw.tools.security import Security
+from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 
 SESSION_ID = "20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"
 OTHER_SESSION_ID = "20260713-050000-000000_550e8400-e29b-41d4-a716-446655440000"
+
+
+def _read_file_gateway(*, agent_home: Path, workspace: Path) -> ToolGateway:
+    workspace_identity = Workspace.from_path(workspace)
+    security = Security(
+        workspace=workspace_identity,
+        agent_home=agent_home,
+        artifact_directory=(
+            agent_home
+            / "sessions"
+            / workspace_identity.slug
+            / "artifacts"
+            / SESSION_ID
+        ),
+    )
+    gateway = ToolGateway()
+    gateway.register_tools((ReadFileTool(security=security),))
+    return gateway
 
 
 def _create_directory_alias(alias: Path, target: Path) -> None:
@@ -42,11 +60,15 @@ def _long_path(path: Path) -> Path:
 
 
 def test_assistant_message_rejects_duplicate_tool_call_ids() -> None:
-    first = ModelToolCall(id="duplicate-call", name="read_file", arguments={"path": "a.txt"})
+    first = ModelToolCall(
+        id="duplicate-call",
+        name="read_file",
+        arguments='{"path":"a.txt"}',
+    )
     second = ModelToolCall(
         id="duplicate-call",
         name="read_file",
-        arguments={"path": "b.txt"},
+        arguments='{"path":"b.txt"}',
     )
 
     with pytest.raises(ValueError, match="tool call IDs must be unique"):
@@ -149,26 +171,18 @@ async def test_read_file_denies_a_hard_link_to_an_external_file(
         alias.hardlink_to(outside)
     except OSError as error:
         pytest.skip(f"file hard links are unavailable on this host: {error}")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_read_external_hard_link",
             name="read_file",
-            arguments={"path": alias.name},
+            arguments=json.dumps({"path": alias.name}),
         )
     )
 
     assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_denied"
+    assert result.content == "The requested path must identify an unaliased regular file."
     assert secret not in result.content
 
 
@@ -240,47 +254,40 @@ async def test_list_files_omits_hard_links_to_external_files(
     assert result.content == "local.txt"
 
 
-@pytest.mark.asyncio
-async def test_tool_artifact_publication_denies_an_external_directory_alias(
+def test_tool_artifact_publication_denies_an_external_directory_alias(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     raw_result = "PRIVATE ARTIFACT CONTENT MUST STAY IN AGENT HOME"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
     outside = agent_home.parent / "outside-artifacts"
     outside.mkdir()
     sessions = agent_home / "sessions"
     sessions.rmdir()
     _create_directory_alias(sessions, outside)
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
+    result = ToolResult(
+        tool_call_id="call_external_artifact_alias",
+        name="read_file",
+        status="success",
+        content=raw_result,
+        error=None,
+        artifact=None,
+    )
+
+    with pytest.raises(ArtifactWriteError):
+        externalize_tool_result(
+            result,
             agent_home=agent_home,
+            workspace=Workspace.from_path(workspace),
             session_id=SESSION_ID,
-        ),
-        max_tool_result_chars=1,
-    )
-
-    result = await gateway.execute(
-        ModelToolCall(
-            id="call_external_artifact_alias",
-            name="read_file",
-            arguments={"path": "large.txt"},
+            max_tool_result_chars=1,
         )
-    )
 
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_failed"
-    assert raw_result not in result.content
     assert list(outside.iterdir()) == []
 
 
-@pytest.mark.asyncio
-async def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
+def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -288,36 +295,39 @@ async def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
     home.initialize()
     first_content = "FIRST PRIVATE ARTIFACT"
     second_content = "SECOND PRIVATE ARTIFACT"
-    (workspace / "first.txt").write_text(first_content, encoding="utf-8")
-    (workspace / "second.txt").write_text(second_content, encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        ),
+    first = ToolResult(
+        tool_call_id="reused-call",
+        name="read_file",
+        status="success",
+        content=first_content,
+        error=None,
+        artifact=None,
+    )
+    second = ToolResult(
+        tool_call_id="reused-call",
+        name="read_file",
+        status="success",
+        content=second_content,
+        error=None,
+        artifact=None,
+    )
+
+    externalize_tool_result(
+        first,
+        agent_home=agent_home,
+        workspace=Workspace.from_path(workspace),
+        session_id=SESSION_ID,
         max_tool_result_chars=1,
     )
-    first_call = ModelToolCall(
-        id="reused-call",
-        name="read_file",
-        arguments={"path": "first.txt"},
-    )
-    second_call = ModelToolCall(
-        id="reused-call",
-        name="read_file",
-        arguments={"path": "second.txt"},
-    )
+    with pytest.raises(ArtifactWriteError):
+        externalize_tool_result(
+            second,
+            agent_home=agent_home,
+            workspace=Workspace.from_path(workspace),
+            session_id=SESSION_ID,
+            max_tool_result_chars=1,
+        )
 
-    first = await gateway.execute(first_call)
-    second = await gateway.execute(second_call)
-
-    assert first.status == "success"
-    assert second.status == "error"
-    assert second.error is not None
-    assert second.error.code == "tool_failed"
-    assert gateway.discard_artifact(second) is False
     artifact_path = _long_path(
         agent_home
         / "sessions"
@@ -329,187 +339,42 @@ async def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
     assert artifact_path.read_text(encoding="utf-8") == first_content
 
 
-@pytest.mark.asyncio
-async def test_tool_gateway_discards_an_unpersisted_artifact_it_created(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    AgentHome(agent_home).initialize()
-    raw_result = "UNPERSISTED RAW ARTIFACT"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        ),
-        max_tool_result_chars=1,
-    )
-    result = await gateway.execute(
-        ModelToolCall(
-            id="call_discard_unpersisted",
-            name="read_file",
-            arguments={"path": "large.txt"},
-        )
-    )
-    artifact_path = _long_path(
-        agent_home
-        / "sessions"
-        / Workspace.from_path(workspace).slug
-        / "artifacts"
-        / SESSION_ID
-        / "call_discard_unpersisted.txt"
-    )
-    assert result.artifact is not None
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-
-    discarded = gateway.discard_artifact(result)
-
-    assert discarded is True
-    assert not artifact_path.exists()
-
-
-@pytest.mark.asyncio
-async def test_tool_gateway_commits_a_persisted_artifact_without_deleting_it(
+def test_tool_artifact_externalization_returns_a_new_immutable_result(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     AgentHome(agent_home).initialize()
     raw_result = "PERSISTED RAW ARTIFACT"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        ),
+    original = ToolResult(
+        tool_call_id="call_immutable",
+        name="read_file",
+        status="success",
+        content=raw_result,
+        error=None,
+        artifact=None,
+    )
+
+    projected = externalize_tool_result(
+        original,
+        agent_home=agent_home,
+        workspace=Workspace.from_path(workspace),
+        session_id=SESSION_ID,
         max_tool_result_chars=1,
     )
-    result = await gateway.execute(
-        ModelToolCall(
-            id="call_commit_persisted",
-            name="read_file",
-            arguments={"path": "large.txt"},
-        )
-    )
+
     artifact_path = _long_path(
         agent_home
         / "sessions"
         / Workspace.from_path(workspace).slug
         / "artifacts"
         / SESSION_ID
-        / "call_commit_persisted.txt"
+        / "call_immutable.txt"
     )
-    assert result.artifact is not None
+    assert projected is not original
+    assert original.content == raw_result
+    assert original.artifact is None
+    assert projected.artifact is not None
     assert artifact_path.read_text(encoding="utf-8") == raw_result
-
-    committed = gateway.commit_artifact(result)
-
-    assert committed is True
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-    assert gateway.discard_artifact(result) is False
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-
-
-@pytest.mark.asyncio
-async def test_tool_gateway_never_discards_a_replacement_at_a_tracked_artifact_path(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    AgentHome(agent_home).initialize()
-    raw_result = "ORIGINAL OWNED ARTIFACT"
-    replacement = "UNRELATED REPLACEMENT"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        ),
-        max_tool_result_chars=1,
-    )
-    result = await gateway.execute(
-        ModelToolCall(
-            id="call_replaced_artifact",
-            name="read_file",
-            arguments={"path": "large.txt"},
-        )
-    )
-    artifact_path = _long_path(
-        agent_home
-        / "sessions"
-        / Workspace.from_path(workspace).slug
-        / "artifacts"
-        / SESSION_ID
-        / "call_replaced_artifact.txt"
-    )
-    moved_original = artifact_path.with_name("moved-original.txt")
-    artifact_path.rename(moved_original)
-    artifact_path.write_text(replacement, encoding="utf-8")
-
-    with pytest.raises(ArtifactDiscardError) as raised:
-        gateway.discard_artifact(result)
-
-    assert raw_result not in str(raised.value)
-    assert artifact_path.read_text(encoding="utf-8") == replacement
-    assert moved_original.read_text(encoding="utf-8") == raw_result
-
-
-@pytest.mark.asyncio
-async def test_tool_gateway_removes_a_just_created_artifact_when_tracking_validation_fails(
-    agent_home: Path,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    AgentHome(agent_home).initialize()
-    raw_result = "RAW ARTIFACT MUST BE ROLLED BACK"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        ),
-        max_tool_result_chars=1,
-    )
-    artifact_path = _long_path(
-        agent_home
-        / "sessions"
-        / Workspace.from_path(workspace).slug
-        / "artifacts"
-        / SESSION_ID
-        / "call_tracking_validation_fault.txt"
-    )
-    real_resolve = Path.resolve
-
-    def fail_post_write_artifact_resolution(
-        path: Path,
-        *,
-        strict: bool = False,
-    ) -> Path:
-        if path.name == artifact_path.name and path.exists():
-            raise OSError("injected post-write resolution failure")
-        return real_resolve(path, strict=strict)
-
-    monkeypatch.setattr(Path, "resolve", fail_post_write_artifact_resolution)
-
-    result = await gateway.execute(
-        ModelToolCall(
-            id="call_tracking_validation_fault",
-            name="read_file",
-            arguments={"path": "large.txt"},
-        )
-    )
-
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_failed"
-    assert raw_result not in result.content
-    assert not artifact_path.exists()
 
 
 @pytest.mark.asyncio
@@ -551,26 +416,18 @@ async def test_read_file_denies_a_windows_alternate_data_stream(
     base_file.write_text("public", encoding="utf-8")
     secret = "ALTERNATE STREAM SECRET MUST NOT BE READ"
     (workspace / "notes.txt:private").write_text(secret, encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_read_alternate_stream",
             name="read_file",
-            arguments={"path": "notes.txt:private"},
+            arguments='{"path":"notes.txt:private"}',
         )
     )
 
     assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_denied"
+    assert result.content == "The requested path identifies a Windows alternate data stream."
     assert secret not in result.content
 
 
@@ -580,26 +437,18 @@ async def test_read_file_denies_a_windows_device_path(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_read_windows_device",
             name="read_file",
-            arguments={"path": "NUL"},
+            arguments='{"path":"NUL"}',
         )
     )
 
     assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_denied"
+    assert result.content == "The requested path identifies a Windows device."
 
 
 @pytest.mark.asyncio
@@ -612,26 +461,18 @@ async def test_read_file_prioritizes_agent_home_protection_inside_the_workspace(
     agent_home.mkdir()
     secret = "API_KEY=must-not-leak"
     (agent_home / "config.toml").write_text(secret, encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_read_nested_agent_home_config",
             name="read_file",
-            arguments={"path": ".myclaw/config.toml"},
+            arguments='{"path":".myclaw/config.toml"}',
         )
     )
 
     assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_denied"
+    assert result.content == "Agent Home internal state is not readable by file Tools."
     assert secret not in result.content
 
 
@@ -645,20 +486,13 @@ async def test_read_file_allows_exact_long_term_memory_inside_the_workspace(
     memory = agent_home / "memory" / "memory.md"
     memory.parent.mkdir(parents=True)
     memory.write_text("# Long-term Memory\n", encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_read_long_term_memory",
             name="read_file",
-            arguments={"path": ".myclaw/memory/memory.md"},
+            arguments='{"path":".myclaw/memory/memory.md"}',
         )
     )
 
@@ -677,26 +511,18 @@ async def test_read_file_denies_an_aliased_long_term_memory_location(
     secret = "AGENT HOME INTERNAL SECRET"
     (protected_directory / "memory.md").write_text(secret, encoding="utf-8")
     _create_directory_alias(agent_home / "memory", protected_directory)
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_read_aliased_long_term_memory",
             name="read_file",
-            arguments={"path": str(agent_home / "memory" / "memory.md")},
+            arguments=json.dumps({"path": str(agent_home / "memory" / "memory.md")}),
         )
     )
 
     assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_denied"
+    assert result.content == "Agent Home internal state is not readable by file Tools."
     assert secret not in result.content
 
 
@@ -715,20 +541,15 @@ async def test_read_file_allows_the_current_session_artifact_reference(
     )
     artifact.parent.mkdir(parents=True)
     artifact.write_text("current session artifact", encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_read_current_artifact",
             name="read_file",
-            arguments={"path": f"artifacts/{SESSION_ID}/call_result.txt"},
+            arguments=json.dumps(
+                {"path": f"artifacts/{SESSION_ID}/call_result.txt"}
+            ),
         )
     )
 
@@ -751,26 +572,20 @@ async def test_read_file_denies_an_aliased_current_session_artifact_directory(
     )
     artifact_directory.parent.mkdir(parents=True)
     _create_directory_alias(artifact_directory, _long_path(protected_directory))
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_read_aliased_current_artifact",
             name="read_file",
-            arguments={"path": f"artifacts/{SESSION_ID}/call_result.txt"},
+            arguments=json.dumps(
+                {"path": f"artifacts/{SESSION_ID}/call_result.txt"}
+            ),
         )
     )
 
     assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_denied"
+    assert result.content == "Agent Home internal state is not readable by file Tools."
     assert secret not in result.content
 
 

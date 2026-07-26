@@ -33,12 +33,18 @@ from myclaw.provider.models import (
     ToolModelMessage,
     UserModelMessage,
 )
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolDefinition,
-)
+from myclaw.tools.models import ModelToolCall
+from myclaw.tools.schema import OpenAIToolSchema
 
 REQUEST_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+READ_FILE_SCHEMA: OpenAIToolSchema = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "Read a text file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    },
+}
 
 
 class FakeAnthropicStream:
@@ -106,13 +112,7 @@ def request(*, stream: bool = True) -> ModelRequest:
         route="chat" if stream else "memory",
         system_prompt="You are MyClaw.",
         messages=(UserModelMessage(content="Hello"),),
-        tools=(
-            ToolDefinition(
-                name="read_file",
-                description="Read a text file.",
-                input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
-            ),
-        ),
+        tools=(READ_FILE_SCHEMA,),
         stream=stream,
         model="claude-test",
         max_output=512,
@@ -251,7 +251,7 @@ async def test_stream_aggregates_mixed_text_and_tool_use_content() -> None:
     assert isinstance(completed, ModelCompleted)
     assert completed.response.message.content == "Checking"
     assert completed.response.message.tool_calls == (
-        ModelToolCall(id="toolu_123", name="read_file", arguments={"path": "README.md"}),
+        ModelToolCall(id="toolu_123", name="read_file", arguments='{"path":"README.md"}'),
     )
     assert completed.response.usage.to_dict() == {
         "input_tokens": 11,
@@ -288,7 +288,7 @@ async def test_complete_translates_mixed_history_and_full_message() -> None:
                     ModelToolCall(
                         id="toolu_prior",
                         name="read_file",
-                        arguments={"path": "README.md"},
+                        arguments='{"path":"README.md"}',
                     ),
                 ),
             ),
@@ -310,7 +310,7 @@ async def test_complete_translates_mixed_history_and_full_message() -> None:
                 {
                     "id": "toolu_next",
                     "name": "read_file",
-                    "arguments": {"path": "NEXT.md"},
+                    "arguments": '{"path":"NEXT.md"}',
                 }
             ],
         },

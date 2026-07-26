@@ -26,6 +26,7 @@ from myclaw.session.records import (
 )
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.models import ModelToolCall, ToolDefinition, ToolExecutionContext, ToolResult
+from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeTool, ScriptedFakeProvider, StreamScript
 
@@ -47,31 +48,6 @@ class _ModelSettings:
     temperature: float = 0.2
     reasoning_effort: None = None
     timeout_seconds: int = 30
-
-
-class _ObservingToolGateway(ToolGateway):
-    def __init__(
-        self,
-        *,
-        context: ToolExecutionContext,
-        tool: FakeTool,
-    ) -> None:
-        super().__init__(
-            context=context,
-            tools=(tool,),
-            max_tool_result_chars=4,
-        )
-        self.results: list[ToolResult] = []
-
-    async def execute(
-        self,
-        tool_call: ModelToolCall,
-        *,
-        approved: bool | None = None,
-    ) -> ToolResult:
-        result = await super().execute(tool_call, approved=approved)
-        self.results.append(result)
-        return result
 
 
 class _MissingToolAppendSessionStore(JsonlSessionStore):
@@ -132,11 +108,11 @@ async def _run_artifact_turn(
     agent_home: Path,
     workspace: Path,
     completes: bool,
-) -> tuple[tuple[object, ...], _ObservingToolGateway, Path]:
+) -> tuple[tuple[object, ...], Path]:
     tool_call = ModelToolCall(
         id="call_read",
         name="read_file",
-        arguments={"path": "README.md"},
+        arguments='{"path":"README.md"}',
     )
     first_response = ModelResponse(
         message=AssistantModelMessage(content="Reading.", tool_calls=(tool_call,)),
@@ -166,15 +142,28 @@ async def _run_artifact_turn(
         ),
         outcomes=("oversized artifact contents",),
     )
-    gateway = _ObservingToolGateway(
+    gateway = ToolGateway(
         context=ToolExecutionContext(
             lane=lane,
             workspace=workspace,
             agent_home=agent_home,
             session_id=session_id,
         ),
-        tool=tool,
+        tools=(tool,),
     )
+    externalized: list[ToolResult] = []
+
+    def externalize(result: ToolResult) -> ToolResult:
+        projected = externalize_tool_result(
+            result,
+            agent_home=agent_home,
+            workspace=Workspace.from_path(workspace),
+            session_id=session_id,
+            max_tool_result_chars=4,
+        )
+        externalized.append(projected)
+        return projected
+
     turn = AgentTurn(
         lane=lane,
         provider=provider,
@@ -194,16 +183,17 @@ async def _run_artifact_turn(
         ).__next__,
         system_prompt="Test system prompt.",
         tool_gateway=gateway,
+        externalize_result=externalize,
     )
 
     payloads = await _collect(turn.run("Inspect the project."))
 
-    result = gateway.results[0]
+    result = externalized[0]
     assert result.artifact is not None
     artifact_path = _io_path(
         agent_home / "sessions" / Workspace.from_path(workspace).slug / Path(result.artifact.path)
     )
-    return payloads, gateway, artifact_path
+    return payloads, artifact_path
 
 
 @pytest.mark.asyncio
@@ -225,7 +215,7 @@ async def test_agent_turn_lanes_share_one_persisted_tool_loop(
     tool_call = ModelToolCall(
         id="call_read",
         name="read_file",
-        arguments={"path": "README.md"},
+        arguments='{"path":"README.md"}',
     )
     provider = _provider(
         lane,
@@ -318,7 +308,7 @@ async def test_agent_turn_lanes_share_one_persisted_tool_loop(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lane", ["foreground", "scheduled_work"])
-async def test_agent_turn_lanes_commit_a_published_tool_artifact(
+async def test_agent_turn_lanes_persist_a_published_tool_artifact(
     lane: AgentTurnLane,
     agent_home: Path,
     workspace: Path,
@@ -333,7 +323,7 @@ async def test_agent_turn_lanes_commit_a_published_tool_artifact(
     )
     session = sessions.prepare()
 
-    payloads, gateway, artifact_path = await _run_artifact_turn(
+    payloads, artifact_path = await _run_artifact_turn(
         lane=lane,
         sessions=sessions,
         session_id=session.id,
@@ -344,12 +334,11 @@ async def test_agent_turn_lanes_commit_a_published_tool_artifact(
 
     assert type(payloads[-1]).__name__ == "TurnCompletedPayload"
     assert artifact_path.read_text(encoding="utf-8") == "oversized artifact contents"
-    assert gateway.discard_artifact(gateway.results[0]) is False
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lane", ["foreground", "scheduled_work"])
-async def test_agent_turn_lanes_discard_an_unpublished_tool_artifact(
+async def test_agent_turn_lanes_accept_an_orphan_after_known_session_failure(
     lane: AgentTurnLane,
     agent_home: Path,
     workspace: Path,
@@ -364,7 +353,7 @@ async def test_agent_turn_lanes_discard_an_unpublished_tool_artifact(
     )
     session = sessions.prepare()
 
-    payloads, gateway, artifact_path = await _run_artifact_turn(
+    payloads, artifact_path = await _run_artifact_turn(
         lane=lane,
         sessions=sessions,
         session_id=session.id,
@@ -374,8 +363,7 @@ async def test_agent_turn_lanes_discard_an_unpublished_tool_artifact(
     )
 
     assert type(payloads[-1]).__name__ == "TurnFailedPayload"
-    assert not artifact_path.exists()
-    assert gateway.discard_artifact(gateway.results[0]) is False
+    assert artifact_path.read_text(encoding="utf-8") == "oversized artifact contents"
 
 
 @pytest.mark.asyncio
@@ -395,7 +383,7 @@ async def test_agent_turn_lanes_preserve_an_indeterminate_tool_artifact(
     )
     session = sessions.prepare()
 
-    payloads, gateway, artifact_path = await _run_artifact_turn(
+    payloads, artifact_path = await _run_artifact_turn(
         lane=lane,
         sessions=sessions,
         session_id=session.id,
@@ -406,4 +394,3 @@ async def test_agent_turn_lanes_preserve_an_indeterminate_tool_artifact(
 
     assert type(payloads[-1]).__name__ == "TurnFailedPayload"
     assert artifact_path.read_text(encoding="utf-8") == "oversized artifact contents"
-    assert gateway.discard_artifact(gateway.results[0]) is False

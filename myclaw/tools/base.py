@@ -5,8 +5,7 @@ from __future__ import annotations
 import inspect
 from typing import ClassVar, final, get_type_hints
 
-from myclaw.tools.schema import ToolSchema
-from myclaw.utils.json_types import JsonObject
+from myclaw.tools.schema import OpenAIToolSchema, ToolSchema
 
 
 class BaseTool:
@@ -50,6 +49,6 @@ class BaseTool:
             raise TypeError(msg)
 
     @final
-    def to_schema(self) -> JsonObject:
+    def to_schema(self) -> OpenAIToolSchema:
         """Generate a detached OpenAI Function Calling schema."""
         return ToolSchema.from_tool(type(self)).to_openai()
