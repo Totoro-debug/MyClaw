@@ -1,514 +1,276 @@
 import os
 import subprocess
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 
-from myclaw.agent.events import PermissionRequestedPayload
 from myclaw.agent.workspace import Workspace
-from myclaw.config.agent_home import AgentHome
-from myclaw.provider.models import (
-    AssistantModelMessage,
-    ModelCompleted,
-    ModelResponse,
-    ModelUsage,
-)
-from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.session.session_store import JsonlSessionStore
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolExecutionContext,
-)
+from myclaw.tools.errors import ToolError
+from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
+from myclaw.tools.models import ModelToolCall, ToolExecutionContext, ToolExecutionLane
+from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ToolGateway
-from tests.fixtures import ScriptedFakeProvider, StreamScript
 
-NOW = datetime(2026, 7, 12, 19, 0, tzinfo=timezone(timedelta(hours=8)))
+SESSION_ID = "20260712-190000-000000_550e8400-e29b-41d4-a716-446655440000"
 
 
-def _outside_directory_aliases(workspace: Path, outside: Path) -> tuple[Path, ...]:
-    aliases: list[Path] = []
-    symlink = workspace / "symlink-escape"
+def _security(*, agent_home: Path, workspace: Path) -> Security:
+    identity = Workspace.from_path(workspace)
+    return Security(
+        workspace=identity,
+        agent_home=agent_home,
+        artifact_directory=(
+            agent_home / "sessions" / identity.slug / "artifacts" / SESSION_ID
+        ),
+    )
+
+
+def _tools(*, agent_home: Path, workspace: Path) -> tuple[WriteFileTool, EditFileTool]:
+    security = _security(agent_home=agent_home, workspace=workspace)
+    return WriteFileTool(security=security), EditFileTool(security=security)
+
+
+def _outside_directory_alias(workspace: Path, outside: Path) -> Path:
+    alias = workspace / "alias-escape"
     try:
-        symlink.symlink_to(outside, target_is_directory=True)
-    except OSError as error:
+        alias.symlink_to(outside, target_is_directory=True)
+    except OSError as symlink_error:
         if os.name != "nt":
-            pytest.skip(f"directory symlinks are unavailable on this host: {error}")
-    else:
-        aliases.append(symlink)
-
-    if os.name == "nt":
-        junction = workspace / "junction-escape"
+            pytest.skip(f"directory symlinks are unavailable on this host: {symlink_error}")
         try:
             subprocess.run(
-                ("cmd", "/c", "mklink", "/J", str(junction), str(outside)),
+                ("cmd", "/c", "mklink", "/J", str(alias), str(outside)),
                 check=True,
                 capture_output=True,
                 text=True,
             )
-        except (OSError, subprocess.CalledProcessError) as error:
-            if not aliases:
-                pytest.skip(f"directory links are unavailable on this host: {error}")
-        else:
-            aliases.append(junction)
-    return tuple(aliases)
+        except (OSError, subprocess.CalledProcessError) as junction_error:
+            pytest.skip(f"directory aliases are unavailable on this host: {junction_error}")
+    return alias
 
 
-@pytest.mark.asyncio
-async def test_conversation_approved_write_file_executes_the_same_call_once(
+def test_workspace_mutation_tools_export_exact_schemas_and_zero_retries(
     agent_home: Path,
     workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
-    session = store.prepare()
-    target = workspace / "new" / "notes.txt"
-    tool_call = ModelToolCall(
-        id="call_write_once",
-        name="write_file",
-        arguments={"path": "new/notes.txt", "content": "approved\ncontent\n"},
-    )
-    provider = ScriptedFakeProvider(
-        streams=(
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(content="", tool_calls=(tool_call,)),
-                            usage=ModelUsage(input_tokens=8, output_tokens=2, total_tokens=10),
-                            finish_reason="tool_calls",
-                        )
-                    ),
-                )
-            ),
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(content="Done."),
-                            usage=ModelUsage(input_tokens=12, output_tokens=2, total_tokens=14),
-                            finish_reason="stop",
-                        )
-                    ),
-                )
-            ),
-        )
-    )
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=session.id,
-        )
-    )
-    conversation = StreamingConversationPort(
-        provider=provider,
-        sessions=store,
-        session_id=session.id,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-        now=lambda: NOW,
-        new_uuid=uuid4,
-        tool_gateway=gateway,
-    )
-    real_write_text = Path.write_text
-    written_paths: list[Path] = []
+    write_file, edit_file = _tools(agent_home=agent_home, workspace=workspace)
 
-    def recording_write_text(
-        path: Path,
-        content: str,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-    ) -> int:
-        written_paths.append(path)
-        return real_write_text(
-            path,
-            content,
-            encoding=encoding,
-            errors=errors,
-            newline=newline,
-        )
-
-    monkeypatch.setattr(Path, "write_text", recording_write_text)
-
-    events = conversation.submit("Write my notes.")
-    observed = [await anext(events), await anext(events), await anext(events)]
-
-    permission_event = observed[-1]
-    assert permission_event.type == "permission_requested"
-    permission = permission_event.payload
-    assert isinstance(permission, PermissionRequestedPayload)
-    assert permission.tool_call_id == tool_call.id
-    assert permission.resource == "new/notes.txt"
-    assert not target.exists()
-
-    await conversation.resolve_permission(permission.request_id, approved=True)
-    observed.extend([event async for event in events])
-
-    assert [event.type for event in observed] == [
-        "turn_started",
-        "tool_started",
-        "permission_requested",
-        "tool_completed",
-        "turn_completed",
-    ]
-    assert written_paths == [target.resolve()]
-    assert target.read_bytes() == b"approved\ncontent\n"
-    assert len(provider.stream_requests) == 2
+    assert write_file.to_schema() == {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write UTF-8 text to a file within the current Workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace file path.",
+                        "minLength": 1,
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Complete UTF-8 text content.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    }
+    assert edit_file.to_schema() == {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact UTF-8 text in a file within the current Workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Existing Workspace file path.",
+                        "minLength": 1,
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact text to replace.",
+                        "minLength": 1,
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every exact match.",
+                        "default": False,
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    }
+    assert write_file.max_retries == 0
+    assert edit_file.max_retries == 0
 
 
 @pytest.mark.asyncio
-async def test_gateway_approved_edit_file_replaces_exact_text_once(
+@pytest.mark.parametrize("lane", ("foreground", "scheduled_work"))
+async def test_registered_catalog_refuses_workspace_mutations_before_execution(
     agent_home: Path,
     workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    lane: ToolExecutionLane,
 ) -> None:
     target = workspace / "notes.txt"
-    target.write_text("alpha\nbefore\nomega\n", encoding="utf-8")
+    target.write_text("before", encoding="utf-8")
     gateway = ToolGateway(
         context=ToolExecutionContext(
-            lane="foreground",
+            lane=lane,
             workspace=workspace,
             agent_home=agent_home,
-            session_id="20260712-190000-000000_550e8400-e29b-41d4-a716-446655440000",
+            session_id=SESSION_ID,
         )
     )
-    tool_call = ModelToolCall(
-        id="call_edit_once",
-        name="edit_file",
-        arguments={
-            "path": "notes.txt",
-            "old_text": "before",
-            "new_text": "after",
-        },
-    )
-    real_write_text = Path.write_text
-    written_paths: list[Path] = []
 
-    def recording_write_text(
-        path: Path,
-        content: str,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-    ) -> int:
-        written_paths.append(path)
-        return real_write_text(
-            path,
-            content,
-            encoding=encoding,
-            errors=errors,
-            newline=newline,
+    write_result = await gateway.call(
+        ModelToolCall(
+            id=f"call_write_{lane}",
+            name="write_file",
+            arguments='{"path":"created.txt","content":"must not be written"}',
         )
+    )
+    edit_result = await gateway.call(
+        ModelToolCall(
+            id=f"call_edit_{lane}",
+            name="edit_file",
+            arguments=(
+                '{"path":"notes.txt","old_text":"before","new_text":"after"}'
+            ),
+        )
+    )
 
-    monkeypatch.setattr(Path, "write_text", recording_write_text)
-
-    permission = gateway.permission_request(tool_call)
-    assert permission is not None
-    assert permission.action == "edit"
-    result = await gateway.execute(tool_call, approved=True)
-
-    assert result.status == "success"
-    assert written_paths == [target.resolve()]
-    assert target.read_text(encoding="utf-8") == "alpha\nafter\nomega\n"
+    assert write_result.status == "refused"
+    assert write_result.content == (
+        "Writing Workspace files is unavailable because confirmation is not implemented."
+    )
+    assert write_result.artifact is None
+    assert edit_result.status == "refused"
+    assert edit_result.content == (
+        "Editing Workspace files is unavailable because confirmation is not implemented."
+    )
+    assert edit_result.artifact is None
+    assert not (workspace / "created.txt").exists()
+    assert target.read_text(encoding="utf-8") == "before"
 
 
 @pytest.mark.asyncio
-async def test_edit_file_preserves_unedited_line_endings(
+async def test_write_file_direct_execution_writes_exact_utf8_content(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    write_file, _ = _tools(agent_home=agent_home, workspace=workspace)
+
+    result = await write_file.execute(path="nested/notes.txt", content="alpha\n界\r\n")
+
+    assert result == "Wrote notes.txt."
+    assert (workspace / "nested" / "notes.txt").read_bytes() == "alpha\n界\r\n".encode()
+
+
+@pytest.mark.asyncio
+async def test_edit_file_direct_execution_preserves_unedited_line_endings(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     target = workspace / "mixed-newlines.txt"
     target.write_bytes(b"before\r\nmiddle\nomega\r\n")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id="20260712-190000-000000_550e8400-e29b-41d4-a716-446655440000",
-        )
+    _, edit_file = _tools(agent_home=agent_home, workspace=workspace)
+
+    result = await edit_file.execute(
+        path="mixed-newlines.txt",
+        old_text="middle",
+        new_text="after",
+        replace_all=False,
     )
 
-    result = await gateway.execute(
-        ModelToolCall(
-            id="call_edit_newlines",
-            name="edit_file",
-            arguments={
-                "path": "mixed-newlines.txt",
-                "old_text": "middle",
-                "new_text": "after",
-            },
-        ),
-        approved=True,
-    )
-
-    assert result.status == "success"
+    assert result == "Edited mixed-newlines.txt."
     assert target.read_bytes() == b"before\r\nafter\nomega\r\n"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("initial", "old_text"),
-    (("alpha\nomega\n", "missing"), ("repeat\nrepeat\n", "repeat")),
-)
-async def test_edit_file_requires_one_exact_old_text_match(
-    agent_home: Path,
-    workspace: Path,
-    initial: str,
-    old_text: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    target = workspace / "notes.txt"
-    target.write_text(initial, encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id="20260712-190000-000000_550e8400-e29b-41d4-a716-446655440000",
-        )
-    )
-    tool_call = ModelToolCall(
-        id="call_edit_invalid_match",
-        name="edit_file",
-        arguments={"path": "notes.txt", "old_text": old_text, "new_text": "after"},
-    )
-    write_calls = 0
-    real_write_text = Path.write_text
-
-    def recording_write_text(
-        path: Path,
-        content: str,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-    ) -> int:
-        nonlocal write_calls
-        write_calls += 1
-        return real_write_text(
-            path,
-            content,
-            encoding=encoding,
-            errors=errors,
-            newline=newline,
-        )
-
-    monkeypatch.setattr(Path, "write_text", recording_write_text)
-
-    result = await gateway.execute(tool_call, approved=True)
-
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_invalid_arguments"
-    assert write_calls == 0
-    assert target.read_text(encoding="utf-8") == initial
-
-
-@pytest.mark.asyncio
-async def test_edit_file_replace_all_replaces_every_exact_match(
+async def test_edit_file_direct_execution_requires_exact_match_unless_replace_all(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     target = workspace / "repeated.txt"
-    target.write_bytes(b"before\r\nbefore\nend\r\n")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id="20260712-190000-000000_550e8400-e29b-41d4-a716-446655440000",
+    target.write_text("before\nbefore\n", encoding="utf-8", newline="")
+    _, edit_file = _tools(agent_home=agent_home, workspace=workspace)
+
+    with pytest.raises(ToolError, match="old_text must match exactly once"):
+        await edit_file.execute(
+            path="repeated.txt",
+            old_text="before",
+            new_text="after",
+            replace_all=False,
         )
-    )
-    tool_call = ModelToolCall(
-        id="call_edit_all",
-        name="edit_file",
-        arguments={
-            "path": "repeated.txt",
-            "old_text": "before",
-            "new_text": "after",
-            "replace_all": True,
-        },
-    )
+    assert target.read_text(encoding="utf-8") == "before\nbefore\n"
 
-    assert gateway.permission_request(tool_call) is not None
-    result = await gateway.execute(tool_call, approved=True)
-
-    assert result.status == "success"
-    assert target.read_bytes() == b"after\r\nafter\nend\r\n"
+    await edit_file.execute(
+        path="repeated.txt",
+        old_text="before",
+        new_text="after",
+        replace_all=True,
+    )
+    assert target.read_text(encoding="utf-8") == "after\nafter\n"
 
 
 @pytest.mark.asyncio
-async def test_workspace_write_tools_deny_escape_paths_before_confirmation(
+async def test_edit_file_direct_execution_rejects_non_utf8_without_writing(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    outside = workspace.parent / "outside-write-target"
-    outside.mkdir()
-    secret = outside / "secret.txt"
-    secret.write_text("outside secret", encoding="utf-8")
-    aliases = _outside_directory_aliases(workspace, outside)
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id="20260712-190000-000000_550e8400-e29b-41d4-a716-446655440000",
-        )
-    )
-    calls = [
-        ModelToolCall(
-            id="call_write_traversal",
-            name="write_file",
-            arguments={"path": "../outside-write-target/traversal.txt", "content": "escape"},
-        ),
-        ModelToolCall(
-            id="call_write_absolute",
-            name="write_file",
-            arguments={"path": str(outside / "absolute.txt"), "content": "escape"},
-        ),
-        ModelToolCall(
-            id="call_edit_traversal",
-            name="edit_file",
-            arguments={
-                "path": "../outside-write-target/secret.txt",
-                "old_text": "outside secret",
-                "new_text": "escape",
-            },
-        ),
-    ]
-    for index, alias in enumerate(aliases):
-        calls.extend(
-            (
-                ModelToolCall(
-                    id=f"call_write_alias_{index}",
-                    name="write_file",
-                    arguments={
-                        "path": str(alias / "missing" / "notes.txt"),
-                        "content": "escape",
-                    },
-                ),
-                ModelToolCall(
-                    id=f"call_edit_alias_{index}",
-                    name="edit_file",
-                    arguments={
-                        "path": str(alias / "secret.txt"),
-                        "old_text": "outside secret",
-                        "new_text": "escape",
-                    },
-                ),
-            )
+    target = workspace / "binary.dat"
+    original = b"before\xffafter"
+    target.write_bytes(original)
+    _, edit_file = _tools(agent_home=agent_home, workspace=workspace)
+
+    with pytest.raises(ToolError, match="not valid UTF-8"):
+        await edit_file.execute(
+            path="binary.dat",
+            old_text="before",
+            new_text="changed",
+            replace_all=False,
         )
 
-    for tool_call in calls:
-        assert gateway.permission_request(tool_call) is None
-        result = await gateway.execute(tool_call, approved=True)
-        assert result.status == "error"
-        assert result.error is not None
-        assert result.error.code == "tool_denied"
-
-    assert secret.read_text(encoding="utf-8") == "outside secret"
-    assert not (outside / "traversal.txt").exists()
-    assert not (outside / "absolute.txt").exists()
-    assert not (outside / "missing").exists()
+    assert target.read_bytes() == original
 
 
 @pytest.mark.asyncio
-async def test_workspace_write_tools_always_deny_agent_home_internal_state(
+async def test_direct_mutation_execution_denies_escape_alias_and_agent_home_paths(
     tmp_path: Path,
 ) -> None:
-    workspace = tmp_path / "containing-workspace"
+    workspace = tmp_path / "workspace"
     workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    alias = _outside_directory_alias(workspace, outside)
     agent_home = workspace / ".myclaw"
-    protected_paths = (
-        "config.toml",
-        "sessions/workspace/session.jsonl",
-        "sessions/workspace/artifacts/session/call.txt",
-        "memory/summary.jsonl",
-        "memory/.cursor",
-        "memory/memory.md",
-        "memory/pending-consolidations/session.json",
-        "scheduled-work.json",
-    )
-    for relative in protected_paths:
-        target = agent_home / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("protected", encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id="20260712-190000-000000_550e8400-e29b-41d4-a716-446655440000",
+    protected = agent_home / "config.toml"
+    protected.parent.mkdir()
+    protected.write_text("protected", encoding="utf-8")
+    write_file, edit_file = _tools(agent_home=agent_home, workspace=workspace)
+
+    with pytest.raises(ToolError, match="outside the Workspace"):
+        await write_file.execute(path="../outside/new.txt", content="escape")
+    with pytest.raises(ToolError, match="outside the Workspace"):
+        await edit_file.execute(
+            path=str(alias / "secret.txt"),
+            old_text="secret",
+            new_text="escape",
+            replace_all=False,
         )
-    )
+    with pytest.raises(ToolError, match="Agent Home internal state"):
+        await write_file.execute(path=".myclaw/config.toml", content="escape")
 
-    for index, relative in enumerate(protected_paths):
-        workspace_relative = (Path(".myclaw") / relative).as_posix()
-        if index % 2 == 0:
-            tool_call = ModelToolCall(
-                id=f"call_write_agent_home_{index}",
-                name="write_file",
-                arguments={"path": workspace_relative, "content": "overwritten"},
-            )
-        else:
-            tool_call = ModelToolCall(
-                id=f"call_edit_agent_home_{index}",
-                name="edit_file",
-                arguments={
-                    "path": workspace_relative,
-                    "old_text": "protected",
-                    "new_text": "overwritten",
-                },
-            )
-
-        assert gateway.permission_request(tool_call) is None
-        result = await gateway.execute(tool_call, approved=True)
-        assert result.status == "error"
-        assert result.error is not None
-        assert result.error.code == "tool_denied"
-
-    for relative in protected_paths:
-        assert (agent_home / relative).read_text(encoding="utf-8") == "protected"
-
-
-@pytest.mark.asyncio
-@pytest.mark.skipif(os.name != "nt", reason="NUL is a device name only on Windows")
-async def test_write_file_denies_windows_device_name_before_confirmation(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id="20260712-190000-000000_550e8400-e29b-41d4-a716-446655440000",
-        )
-    )
-    tool_call = ModelToolCall(
-        id="call_write_device",
-        name="write_file",
-        arguments={"path": "NUL", "content": "must not reach the device"},
-    )
-
-    assert gateway.permission_request(tool_call) is None
-    result = await gateway.execute(tool_call, approved=True)
-
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_denied"
+    assert (outside / "secret.txt").read_text(encoding="utf-8") == "secret"
+    assert protected.read_text(encoding="utf-8") == "protected"
+    assert not (outside / "new.txt").exists()

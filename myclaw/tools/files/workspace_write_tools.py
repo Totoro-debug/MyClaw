@@ -1,142 +1,91 @@
 """Workspace-scoped file mutation Tools."""
 
-import os
-from pathlib import Path
-from stat import S_ISREG
+from typing import Annotated
 
-from myclaw.tools.files.file_tools import FileToolAccessDenied, FileToolArgumentsError
-from myclaw.tools.models import ToolDefinition, ToolExecutionContext
-from myclaw.utils.json_types import JsonObject
-
-_WINDOWS_RESERVED_BASENAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{index}" for index in range(1, 10)}
-    | {f"LPT{index}" for index in range(1, 10)}
-)
+from myclaw.tools.base import BaseTool
+from myclaw.tools.errors import ToolError
+from myclaw.tools.schema import ToolParam
+from myclaw.tools.security import Security
 
 
-def resolve_workspace_write_path(context: ToolExecutionContext, requested: str) -> Path:
-    """Resolve an existing target or its nearest existing parent inside the Workspace."""
-    candidate = Path(requested)
-    try:
-        workspace = context.workspace.resolve(strict=True)
-        agent_home = context.agent_home.resolve(strict=False)
-        if not candidate.is_absolute():
-            candidate = workspace / candidate
-        target = candidate.resolve(strict=False)
-    except (OSError, RuntimeError, ValueError) as error:
-        raise FileToolArgumentsError("path cannot be resolved") from error
-    if not target.is_relative_to(workspace):
-        raise FileToolAccessDenied("path resolves outside the Workspace")
-    if target == agent_home or target.is_relative_to(agent_home):
-        raise FileToolAccessDenied("Agent Home internal state cannot be changed by file tools")
-    relative_parts = target.relative_to(workspace).parts
-    if os.name == "nt" and any(":" in part for part in relative_parts):
-        raise FileToolAccessDenied("path identifies a Windows alternate data stream")
-    if os.name == "nt" and any(_is_windows_reserved(part) for part in relative_parts):
-        raise FileToolAccessDenied("path identifies a Windows device")
-    if target.exists():
-        status = target.lstat()
-        if not S_ISREG(status.st_mode) or status.st_nlink != 1:
-            raise FileToolAccessDenied("path must identify an unaliased regular file")
-    existing_parent = target.parent
-    while not existing_parent.exists():
-        existing_parent = existing_parent.parent
-    if not existing_parent.is_dir():
-        raise FileToolAccessDenied("nearest existing parent must be a directory")
-    return target
-
-
-def _is_windows_reserved(component: str) -> bool:
-    normalized = component.rstrip(" .")
-    basename = normalized.split(".", maxsplit=1)[0].upper()
-    return basename in _WINDOWS_RESERVED_BASENAMES
-
-
-class WriteFileTool:
+class WriteFileTool(BaseTool):
     """Write exact UTF-8 text to one Workspace file."""
 
-    _definition = ToolDefinition(
-        name="write_file",
-        description="Write UTF-8 text to a file within the current Workspace.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "minLength": 1},
-                "content": {"type": "string"},
-            },
-            "required": ["path", "content"],
-            "additionalProperties": False,
-        },
-    )
+    name = "write_file"
+    description = "Write UTF-8 text to a file within the current Workspace."
+    required = ("path", "content")
 
-    @property
-    def definition(self) -> ToolDefinition:
-        return self._definition
+    path: Annotated[str, ToolParam(description="Workspace file path.", min_length=1)]
+    content: Annotated[str, ToolParam(description="Complete UTF-8 text content.")]
 
-    async def execute(self, arguments: JsonObject, context: ToolExecutionContext) -> str:
-        requested = arguments.get("path")
-        content = arguments.get("content")
-        if not isinstance(requested, str) or not requested or not isinstance(content, str):
-            raise FileToolArgumentsError("write_file requires a path and content")
+    def __init__(self, *, security: Security) -> None:
+        self._security = security
 
-        target = resolve_workspace_write_path(context, requested)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", newline="")
+    def refusal_reason(self, *, path: str, content: str) -> str:
+        del path, content
+        return "Writing Workspace files is unavailable because confirmation is not implemented."
+
+    async def execute(self, *, path: str, content: str) -> str:
+        target = self._security.resolve_write_path(path)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8", newline="")
+        except OSError as error:
+            raise ToolError("The requested file could not be written.") from error
         return f"Wrote {target.name}."
 
 
-class EditFileTool:
+class EditFileTool(BaseTool):
     """Replace exact UTF-8 text in one Workspace file."""
 
-    _definition = ToolDefinition(
-        name="edit_file",
-        description="Replace exact UTF-8 text in a file within the current Workspace.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "minLength": 1},
-                "old_text": {"type": "string", "minLength": 1},
-                "new_text": {"type": "string"},
-                "replace_all": {"type": "boolean", "default": False},
-            },
-            "required": ["path", "old_text", "new_text"],
-            "additionalProperties": False,
-        },
-    )
+    name = "edit_file"
+    description = "Replace exact UTF-8 text in a file within the current Workspace."
+    required = ("path", "old_text", "new_text")
 
-    @property
-    def definition(self) -> ToolDefinition:
-        return self._definition
+    path: Annotated[str, ToolParam(description="Existing Workspace file path.", min_length=1)]
+    old_text: Annotated[str, ToolParam(description="Exact text to replace.", min_length=1)]
+    new_text: Annotated[str, ToolParam(description="Replacement text.")]
+    replace_all: Annotated[bool, ToolParam(description="Replace every exact match.")] = False
 
-    async def execute(self, arguments: JsonObject, context: ToolExecutionContext) -> str:
-        requested = arguments.get("path")
-        old_text = arguments.get("old_text")
-        new_text = arguments.get("new_text")
-        replace_all = arguments.get("replace_all", False)
-        if (
-            not isinstance(requested, str)
-            or not requested
-            or not isinstance(old_text, str)
-            or not old_text
-            or not isinstance(new_text, str)
-            or not isinstance(replace_all, bool)
-        ):
-            raise FileToolArgumentsError("edit_file requires a path and replacement text")
+    def __init__(self, *, security: Security) -> None:
+        self._security = security
 
-        target = resolve_workspace_write_path(context, requested)
-        content = target.read_bytes().decode("utf-8")
+    def refusal_reason(
+        self,
+        *,
+        path: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool,
+    ) -> str:
+        del path, old_text, new_text, replace_all
+        return "Editing Workspace files is unavailable because confirmation is not implemented."
+
+    async def execute(
+        self,
+        *,
+        path: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool,
+    ) -> str:
+        target = self._security.resolve_write_path(path)
+        try:
+            content = target.read_bytes().decode("utf-8")
+        except OSError as error:
+            raise ToolError("The requested file could not be read for editing.") from error
+        except UnicodeError as error:
+            raise ToolError("The requested file is not valid UTF-8 text.") from error
         match_count = content.count(old_text)
         if match_count == 0 or (not replace_all and match_count != 1):
-            raise FileToolArgumentsError("old_text must match exactly once")
+            raise ToolError("old_text must match exactly once unless replace_all is true.")
         replaced = (
             content.replace(old_text, new_text)
             if replace_all
             else content.replace(old_text, new_text, 1)
         )
-        target.write_text(
-            replaced,
-            encoding="utf-8",
-            newline="",
-        )
+        try:
+            target.write_text(replaced, encoding="utf-8", newline="")
+        except OSError as error:
+            raise ToolError("The requested file could not be edited.") from error
         return f"Edited {target.name}."

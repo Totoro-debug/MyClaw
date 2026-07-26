@@ -79,10 +79,7 @@ class ToolGateway:
                 raise TypeError(msg)
             catalog = ()
         elif tools is None:
-            catalog = (
-                WriteFileTool(),
-                EditFileTool(),
-            )
+            catalog = ()
             if web_search is not None:
                 catalog += (WebSearchTool(web_search),)
             if web_fetch is not None:
@@ -119,6 +116,8 @@ class ToolGateway:
                 ReadFileTool(security=security),
                 ListFilesTool(security=security),
                 SearchFilesTool(security=security),
+                WriteFileTool(security=security),
+                EditFileTool(security=security),
             )
             migrated_schemas = tuple(tool.to_schema() for tool in migrated_tools)
             self._registered_tools = {tool.name: tool for tool in migrated_tools}

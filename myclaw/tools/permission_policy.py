@@ -3,8 +3,6 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
-from myclaw.tools.files.file_tools import FileToolAccessDenied, FileToolArgumentsError
-from myclaw.tools.files.workspace_write_tools import resolve_workspace_write_path
 from myclaw.tools.models import ModelToolCall, ToolExecutionContext
 
 
@@ -61,20 +59,6 @@ def assess_permission(
                 ),
             )
         return PermissionAssessment(decision=decision)
-    if tool_call.name in {"write_file", "edit_file"}:
-        resource = arguments.get("path")
-        if not isinstance(resource, str):
-            return PermissionAssessment(decision=PermissionDecision.DENY)
-        try:
-            resolve_workspace_write_path(context, resource)
-        except (FileToolAccessDenied, FileToolArgumentsError):
-            return PermissionAssessment(decision=PermissionDecision.DENY)
-        return PermissionAssessment(
-            decision=PermissionDecision.ASK,
-            action="write" if tool_call.name == "write_file" else "edit",
-            resource=resource,
-            risk_summary="This changes a Workspace file.",
-        )
     if tool_call.name == "create_scheduled_work":
         title = arguments.get("title")
         cron = arguments.get("cron")

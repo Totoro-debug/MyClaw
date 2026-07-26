@@ -63,6 +63,7 @@ from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
+from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
 from myclaw.tools.models import ToolExecutionContext, ToolExecutionLane, ToolResult
 from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.tools.security import Security
@@ -712,6 +713,8 @@ def _build_tool_gateway(
             ReadFileTool(security=security),
             ListFilesTool(security=security),
             SearchFilesTool(security=security),
+            WriteFileTool(security=security),
+            EditFileTool(security=security),
         )
     )
     return gateway

@@ -5,19 +5,14 @@ from uuid import uuid4
 
 import pytest
 
-from myclaw.agent.events import (
-    AgentEvent,
-    PermissionRequestedPayload,
-)
+from myclaw.agent.events import AgentEvent
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
     ModelResponse,
     ModelUsage,
-    ToolModelMessage,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import ToolSessionMessage
@@ -251,150 +246,6 @@ async def test_same_task_cancellation_after_tool_completed_stops_model_continuat
     assert [(message.tool_call_id, message.status) for message in tool_messages] == [
         ("call_done", "success")
     ]
-
-
-@pytest.mark.asyncio
-async def test_permission_cancellation_materializes_every_unfinished_tool_call(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
-    session_id = sessions.prepare().id
-    calls = (
-        ModelToolCall(
-            id="call_first",
-            name="write_file",
-            arguments={"path": "first.txt", "content": "first"},
-        ),
-        ModelToolCall(
-            id="call_second",
-            name="write_file",
-            arguments={"path": "second.txt", "content": "second"},
-        ),
-    )
-    tool = FakeTool(
-        definition=ToolDefinition(
-            name="write_file",
-            description="Write one Workspace file.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-                "required": ["path", "content"],
-                "additionalProperties": False,
-            },
-        ),
-        outcomes=("must not execute", "must not execute"),
-    )
-    provider = ScriptedFakeProvider(
-        streams=(
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(content="", tool_calls=calls),
-                            usage=_usage(),
-                            finish_reason="tool_calls",
-                        )
-                    ),
-                )
-            ),
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(content="Recovered safely."),
-                            usage=_usage(),
-                            finish_reason="stop",
-                        )
-                    ),
-                )
-            ),
-        )
-    )
-    conversation = StreamingConversationPort(
-        provider=provider,
-        sessions=sessions,
-        session_id=session_id,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-        now=lambda: NOW,
-        new_uuid=uuid4,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            ),
-            tools=(tool,),
-        ),
-    )
-
-    events = conversation.submit("Write both files.")
-    observed = [await anext(events), await anext(events), await anext(events)]
-    permission = observed[-1]
-    assert permission.type == "permission_requested"
-    assert isinstance(permission.payload, PermissionRequestedPayload)
-
-    await conversation.cancel_active_turn()
-    observed.extend([event async for event in events])
-
-    assert [event.type for event in observed] == [
-        "turn_started",
-        "tool_started",
-        "permission_requested",
-        "turn_cancelled",
-    ]
-    reloaded = await sessions.load(session_id)
-    assert [message.role for message in reloaded.messages] == [
-        "user",
-        "assistant",
-        "tool",
-        "tool",
-    ]
-    repaired = tuple(
-        message for message in reloaded.messages[2:] if isinstance(message, ToolSessionMessage)
-    )
-    assert len(repaired) == 2
-    assert [(message.tool_call_id, message.name) for message in repaired] == [
-        ("call_first", "write_file"),
-        ("call_second", "write_file"),
-    ]
-    assert all(message.status == "error" for message in repaired)
-    assert all(
-        message.content == "Tool call interrupted because the turn was cancelled."
-        for message in repaired
-    )
-    assert tool.calls == []
-
-    next_events = [event async for event in conversation.submit("Continue safely.")]
-
-    assert next_events[-1].type == "turn_completed"
-    next_request = provider.stream_requests[1]
-    assert isinstance(next_request, ModelRequest)
-    tool_history = [
-        message for message in next_request.messages if isinstance(message, ToolModelMessage)
-    ]
-    assert [(message.tool_call_id, message.name) for message in tool_history] == [
-        ("call_first", "write_file"),
-        ("call_second", "write_file"),
-    ]
-    assert all("interrupted" in message.content.lower() for message in tool_history)
 
 
 @pytest.mark.asyncio

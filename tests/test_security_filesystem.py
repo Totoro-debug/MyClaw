@@ -8,7 +8,9 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import AssistantModelMessage
+from myclaw.tools.errors import ToolError
 from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
+from myclaw.tools.files.workspace_write_tools import WriteFileTool
 from myclaw.tools.models import ModelToolCall, ToolExecutionContext, ToolResult
 from myclaw.tools.security import Security
 from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
@@ -141,26 +143,20 @@ async def test_write_file_denies_a_hard_link_to_agent_home_state(
         alias.hardlink_to(protected)
     except OSError as error:
         pytest.skip(f"file hard links are unavailable on this host: {error}")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
+    identity = Workspace.from_path(workspace)
+    tool = WriteFileTool(
+        security=Security(
+            workspace=identity,
             agent_home=agent_home,
-            session_id=SESSION_ID,
+            artifact_directory=(
+                agent_home / "sessions" / identity.slug / "artifacts" / SESSION_ID
+            ),
         )
     )
-    tool_call = ModelToolCall(
-        id="call_write_agent_home_hard_link",
-        name="write_file",
-        arguments={"path": alias.name, "content": "overwritten"},
-    )
 
-    assert gateway.permission_request(tool_call) is None
-    result = await gateway.execute(tool_call, approved=True)
+    with pytest.raises(ToolError, match="unalias"):
+        await tool.execute(path=alias.name, content="overwritten")
 
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_denied"
     assert protected.read_bytes() == protected_content
 
 
@@ -389,26 +385,20 @@ async def test_write_file_denies_a_windows_alternate_data_stream(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
+    identity = Workspace.from_path(workspace)
+    tool = WriteFileTool(
+        security=Security(
+            workspace=identity,
             agent_home=agent_home,
-            session_id=SESSION_ID,
+            artifact_directory=(
+                agent_home / "sessions" / identity.slug / "artifacts" / SESSION_ID
+            ),
         )
     )
-    tool_call = ModelToolCall(
-        id="call_write_alternate_stream",
-        name="write_file",
-        arguments={"path": "notes.txt:private", "content": "hidden"},
-    )
 
-    assert gateway.permission_request(tool_call) is None
-    result = await gateway.execute(tool_call, approved=True)
+    with pytest.raises(ToolError, match="alternate data stream"):
+        await tool.execute(path="notes.txt:private", content="hidden")
 
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_denied"
     assert not (workspace / "notes.txt").exists()
 
 
