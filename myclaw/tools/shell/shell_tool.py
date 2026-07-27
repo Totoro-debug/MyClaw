@@ -1,10 +1,17 @@
 """Provider-neutral Shell tool boundary without process lifecycle ownership."""
 
-from typing import Protocol
+from pathlib import Path
+from typing import Annotated, Protocol
 
-from myclaw.tools.models import ToolDefinition, ToolExecutionContext
-from myclaw.tools.shell.shell_policy import ShellRequest, parse_shell_request
-from myclaw.utils.json_types import JsonObject
+from myclaw.tools.base import BaseTool
+from myclaw.tools.errors import ToolError
+from myclaw.tools.schema import ToolParam
+from myclaw.tools.shell.shell_policy import (
+    ShellPolicyDenied,
+    ShellRequest,
+    parse_shell_request,
+    shell_command_is_allowed,
+)
 
 
 class ShellBoundary(Protocol):
@@ -19,34 +26,57 @@ class UnavailableShellBoundary:
         raise RuntimeError("Shell process execution is unavailable.")
 
 
-class ShellTool:
+class ShellTool(BaseTool):
     """Expose Shell requests through the Tool protocol."""
 
-    _definition = ToolDefinition(
-        name="shell",
-        description=(
-            "Run a command from a Workspace directory; approved commands are not OS filesystem "
-            "or network sandboxed."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "minLength": 1},
-                "cwd": {"type": "string", "minLength": 1, "default": "."},
-                "timeout": {"type": "integer", "minimum": 60, "maximum": 600},
-            },
-            "required": ["command", "timeout"],
-            "additionalProperties": False,
-        },
+    name = "shell"
+    description = (
+        "Run one of five exact read-only commands from a Workspace directory; this is not an "
+        "operating-system filesystem or network sandbox."
     )
+    required = ("command", "timeout")
 
-    def __init__(self, boundary: ShellBoundary) -> None:
+    command: Annotated[str, ToolParam(description="Exact Shell command.", min_length=1)]
+    cwd: Annotated[str, ToolParam(description="Workspace-relative working directory.")] = "."
+    timeout: Annotated[
+        int,
+        ToolParam(description="Execution timeout in seconds.", minimum=60, maximum=600),
+    ]
+
+    def __init__(self, *, workspace: Path, boundary: ShellBoundary) -> None:
+        self._workspace = workspace
         self._boundary = boundary
 
-    @property
-    def definition(self) -> ToolDefinition:
-        return self._definition
+    def refusal_reason(self, *, command: str, cwd: str, timeout: int) -> str | None:
+        request = self._request(command=command, cwd=cwd, timeout=timeout)
+        if shell_command_is_allowed(
+            request.command,
+            cwd=request.cwd,
+            workspace=request.workspace_root,
+        ):
+            return None
+        return "Shell command refused because it is not in the safe read-only allowlist."
 
-    async def execute(self, arguments: JsonObject, context: ToolExecutionContext) -> str:
-        request = parse_shell_request(arguments, context.workspace)
-        return await self._boundary.execute(request)
+    async def execute(self, *, command: str, cwd: str, timeout: int) -> str:
+        request = self._request(command=command, cwd=cwd, timeout=timeout)
+        if not shell_command_is_allowed(
+            request.command,
+            cwd=request.cwd,
+            workspace=request.workspace_root,
+        ):
+            raise ToolError("Shell command is not in the safe read-only allowlist.")
+        try:
+            return await self._boundary.execute(request)
+        except ShellPolicyDenied as error:
+            raise ToolError("Shell process execution was rejected by the safety boundary.") from error
+
+    def _request(self, *, command: str, cwd: str, timeout: int) -> ShellRequest:
+        try:
+            return parse_shell_request(
+                command=command,
+                cwd=cwd,
+                timeout=timeout,
+                workspace=self._workspace,
+            )
+        except ShellPolicyDenied as error:
+            raise ToolError("Shell request parameters or Workspace cwd are invalid.") from error

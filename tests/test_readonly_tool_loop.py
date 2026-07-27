@@ -552,8 +552,8 @@ async def test_production_conversation_denies_parent_escape_without_reading_the_
         "- write_file: Write UTF-8 text to a file within the current Workspace.",
         "- edit_file: Replace exact UTF-8 text in a file within the current Workspace.",
         (
-            "- shell: Run a command from a Workspace directory; approved commands are not OS "
-            "filesystem or network sandboxed."
+            "- shell: Run one of five exact read-only commands from a Workspace directory; this "
+            "is not an operating-system filesystem or network sandbox."
         ),
         "- create_scheduled_work: Create recurring work with a five-field cron schedule.",
     ]

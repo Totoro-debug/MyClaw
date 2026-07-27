@@ -11,7 +11,6 @@ from myclaw.tools.models import (
     ModelToolCall,
     ToolExecutionContext,
 )
-from myclaw.tools.permission_policy import PermissionDecision
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_process import SubprocessShellBoundary
 from myclaw.tools.tool_gateway import ToolGateway
@@ -86,12 +85,10 @@ async def test_automatic_git_command_does_not_execute_a_workspace_path_shadow(
     )
 
     try:
-        permission = gateway.permission_request(tool_call)
         result = await gateway.execute(tool_call)
     finally:
         await shell.close()
 
-    assert permission is None
     assert result.status == "success"
     assert not marker.exists()
 
@@ -107,7 +104,6 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
         "import sys\n"
         "from pathlib import Path\n"
         "from myclaw.tools.models import ModelToolCall, ToolExecutionContext\n"
-        "from myclaw.tools.permission_policy import PermissionDecision\n"
         "from myclaw.tools.tool_gateway import ToolGateway\n"
         "class Shell:\n"
         "    def __init__(self): self.calls = 0\n"
@@ -121,9 +117,6 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
         "lane='foreground', workspace=workspace, agent_home=agent_home, "
         "session_id='20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000'), "
         "shell=foreground_shell)\n"
-        "    permission = foreground.permission_request(call)\n"
-        "    assert permission is not None\n"
-        "    assert permission.decision is PermissionDecision.ASK\n"
         "    assert (await foreground.execute(call)).status == 'refused'\n"
         "    assert foreground_shell.calls == 0\n"
         "    background_shell = Shell()\n"
@@ -131,7 +124,6 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
         "lane='scheduled_work', workspace=workspace, agent_home=agent_home, "
         "session_id='20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000'), "
         "shell=background_shell)\n"
-        "    assert background.permission_request(call) is None\n"
         "    assert (await background.execute(call)).status == 'refused'\n"
         "    assert background_shell.calls == 0\n"
         "asyncio.run(main())\n"
@@ -259,10 +251,8 @@ async def test_safe_repository_retains_the_five_automatic_shell_commands(
         arguments={"command": command, "timeout": 60},
     )
 
-    permission = gateway.permission_request(tool_call)
     result = await gateway.execute(tool_call)
 
-    assert permission is None
     assert result.status == "success"
     assert shell.requests == [ShellRequest(command=command, cwd=workspace.resolve(), timeout=60)]
 
@@ -304,10 +294,8 @@ async def test_unselected_git_filter_configuration_remains_automatically_allowed
         arguments={"command": "git status", "timeout": 60},
     )
 
-    permission = gateway.permission_request(tool_call)
     result = await gateway.execute(tool_call)
 
-    assert permission is None
     assert result.status == "success"
     assert len(shell.requests) == 1
 
@@ -332,6 +320,7 @@ async def test_configured_global_attributes_filter_is_not_automatically_allowed(
         encoding="utf-8",
     )
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    shell = RecordingShellBoundary()
     gateway = ToolGateway(
         context=ToolExecutionContext(
             lane="foreground",
@@ -339,7 +328,7 @@ async def test_configured_global_attributes_filter_is_not_automatically_allowed(
             agent_home=agent_home,
             session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
         ),
-        shell=RecordingShellBoundary(),
+        shell=shell,
     )
     tool_call = ModelToolCall(
         id="call_global_attributes_filter",
@@ -347,10 +336,10 @@ async def test_configured_global_attributes_filter_is_not_automatically_allowed(
         arguments={"command": "git status", "timeout": 60},
     )
 
-    permission = gateway.permission_request(tool_call)
+    result = await gateway.execute(tool_call)
 
-    assert permission is not None
-    assert permission.decision is PermissionDecision.ASK
+    assert result.status == "refused"
+    assert shell.requests == []
 
 
 @pytest.mark.asyncio
@@ -395,6 +384,7 @@ async def test_git_attribute_source_environment_is_not_automatically_allowed(
     attributes.unlink()
     (workspace / "payload.txt").write_text("secret\n", encoding="utf-8")
     monkeypatch.setenv("GIT_ATTR_SOURCE", "HEAD")
+    shell = RecordingShellBoundary()
     gateway = ToolGateway(
         context=ToolExecutionContext(
             lane="foreground",
@@ -402,7 +392,7 @@ async def test_git_attribute_source_environment_is_not_automatically_allowed(
             agent_home=agent_home,
             session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
         ),
-        shell=RecordingShellBoundary(),
+        shell=shell,
     )
     tool_call = ModelToolCall(
         id="call_git_attr_source",
@@ -410,14 +400,14 @@ async def test_git_attribute_source_environment_is_not_automatically_allowed(
         arguments={"command": "git status", "timeout": 60},
     )
 
-    permission = gateway.permission_request(tool_call)
+    result = await gateway.execute(tool_call)
 
-    assert permission is not None
-    assert permission.decision is PermissionDecision.ASK
+    assert result.status == "refused"
+    assert shell.requests == []
 
 
 @pytest.mark.asyncio
-async def test_nonzero_shell_exit_returns_one_redacted_tool_error(
+async def test_non_allowlisted_secret_command_is_refused_without_execution(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -449,15 +439,16 @@ async def test_nonzero_shell_exit_returns_one_redacted_tool_error(
                     "timeout": 60,
                 },
             ),
-            approved=True,
         )
     finally:
         await shell.close()
 
-    assert result.status == "error"
+    assert result.status == "refused"
     assert result.error is not None
-    assert result.error.code == "tool_failed"
-    assert result.content == "shell could not complete the request."
+    assert result.error.code == "tool_refused"
+    assert result.content == (
+        "Shell command refused because it is not in the safe read-only allowlist."
+    )
     assert secret not in result.content
     assert "Traceback" not in result.content
 
@@ -503,7 +494,7 @@ async def test_allowlisted_git_status_does_not_run_a_repository_fsmonitor_hook(
 
 
 @pytest.mark.asyncio
-async def test_git_filter_configuration_downgrades_an_allowlisted_command_to_ask(
+async def test_git_filter_configuration_refuses_an_allowlisted_command(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -539,11 +530,8 @@ async def test_git_filter_configuration_downgrades_an_allowlisted_command_to_ask
         arguments={"command": "git status", "timeout": 60},
     )
 
-    permission = gateway.permission_request(tool_call)
     result = await gateway.execute(tool_call)
 
-    assert permission is not None
-    assert permission.decision is PermissionDecision.ASK
     assert result.status == "refused"
     assert shell.requests == []
 
@@ -558,14 +546,13 @@ async def test_git_filter_configuration_downgrades_an_allowlisted_command_to_ask
         shell=background_shell,
     )
 
-    assert background.permission_request(tool_call) is None
     background_result = await background.execute(tool_call)
     assert background_result.status == "refused"
     assert background_shell.requests == []
 
 
 @pytest.mark.asyncio
-async def test_git_info_attributes_filter_downgrades_an_allowlisted_command_to_ask(
+async def test_git_info_attributes_filter_refuses_an_allowlisted_command(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -601,11 +588,8 @@ async def test_git_info_attributes_filter_downgrades_an_allowlisted_command_to_a
         arguments={"command": "git status", "timeout": 60},
     )
 
-    permission = gateway.permission_request(tool_call)
     result = await gateway.execute(tool_call)
 
-    assert permission is not None
-    assert permission.decision is PermissionDecision.ASK
     assert result.status == "refused"
     assert shell.requests == []
 
@@ -627,6 +611,7 @@ async def test_global_git_filter_configuration_is_not_automatically_allowed(
         "*.txt filter=secret\n",
         encoding="utf-8",
     )
+    shell = RecordingShellBoundary()
     gateway = ToolGateway(
         context=ToolExecutionContext(
             lane="foreground",
@@ -634,7 +619,7 @@ async def test_global_git_filter_configuration_is_not_automatically_allowed(
             agent_home=agent_home,
             session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
         ),
-        shell=RecordingShellBoundary(),
+        shell=shell,
     )
     tool_call = ModelToolCall(
         id="call_global_git_filter",
@@ -642,10 +627,10 @@ async def test_global_git_filter_configuration_is_not_automatically_allowed(
         arguments={"command": "git status --short", "timeout": 60},
     )
 
-    permission = gateway.permission_request(tool_call)
+    result = await gateway.execute(tool_call)
 
-    assert permission is not None
-    assert permission.decision is PermissionDecision.ASK
+    assert result.status == "refused"
+    assert shell.requests == []
 
 
 @pytest.mark.asyncio
@@ -679,6 +664,7 @@ async def test_included_git_filter_configuration_is_not_automatically_allowed(
         "*.txt filter=secret\n",
         encoding="utf-8",
     )
+    shell = RecordingShellBoundary()
     gateway = ToolGateway(
         context=ToolExecutionContext(
             lane="foreground",
@@ -686,7 +672,7 @@ async def test_included_git_filter_configuration_is_not_automatically_allowed(
             agent_home=agent_home,
             session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
         ),
-        shell=RecordingShellBoundary(),
+        shell=shell,
     )
     tool_call = ModelToolCall(
         id="call_included_git_filter",
@@ -694,10 +680,10 @@ async def test_included_git_filter_configuration_is_not_automatically_allowed(
         arguments={"command": "git diff --stat", "timeout": 60},
     )
 
-    permission = gateway.permission_request(tool_call)
+    result = await gateway.execute(tool_call)
 
-    assert permission is not None
-    assert permission.decision is PermissionDecision.ASK
+    assert result.status == "refused"
+    assert shell.requests == []
 
 
 @pytest.mark.asyncio
@@ -733,6 +719,7 @@ async def test_worktree_git_filter_configuration_is_not_automatically_allowed(
         "*.txt filter=secret\n",
         encoding="utf-8",
     )
+    shell = RecordingShellBoundary()
     gateway = ToolGateway(
         context=ToolExecutionContext(
             lane="foreground",
@@ -740,7 +727,7 @@ async def test_worktree_git_filter_configuration_is_not_automatically_allowed(
             agent_home=agent_home,
             session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
         ),
-        shell=RecordingShellBoundary(),
+        shell=shell,
     )
     tool_call = ModelToolCall(
         id="call_worktree_git_filter",
@@ -748,7 +735,7 @@ async def test_worktree_git_filter_configuration_is_not_automatically_allowed(
         arguments={"command": "git diff --name-only", "timeout": 60},
     )
 
-    permission = gateway.permission_request(tool_call)
+    result = await gateway.execute(tool_call)
 
-    assert permission is not None
-    assert permission.decision is PermissionDecision.ASK
+    assert result.status == "refused"
+    assert shell.requests == []

@@ -29,36 +29,10 @@ def assess_permission(
     context: ToolExecutionContext,
 ) -> PermissionAssessment:
     """Return the fixed permission decision for the current execution lane."""
-    from myclaw.tools.shell.shell_policy import (
-        ShellPolicyDenied,
-        assess_shell_command,
-        parse_shell_request,
-    )
-
     arguments = tool_call.arguments
     if not isinstance(arguments, dict):
         return PermissionAssessment(decision=PermissionDecision.DENY)
 
-    if tool_call.name == "shell":
-        try:
-            request = parse_shell_request(arguments, context.workspace)
-        except ShellPolicyDenied:
-            return PermissionAssessment(decision=PermissionDecision.DENY)
-        decision = assess_shell_command(
-            request.command,
-            cwd=request.cwd,
-            workspace=request.workspace_root,
-        )
-        if decision is PermissionDecision.ASK:
-            return PermissionAssessment(
-                decision=decision,
-                action="run",
-                resource=request.command,
-                risk_summary=(
-                    "Approved Shell commands may access paths outside the Workspace or the network."
-                ),
-            )
-        return PermissionAssessment(decision=decision)
     if tool_call.name == "create_scheduled_work":
         title = arguments.get("title")
         cron = arguments.get("cron")

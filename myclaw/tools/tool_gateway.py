@@ -80,8 +80,6 @@ class ToolGateway:
             catalog = ()
         elif tools is None:
             catalog = ()
-            if shell is not None:
-                catalog += (ShellTool(shell),)
             if scheduled_work is not None:
                 catalog += (scheduled_work,)
         else:
@@ -119,6 +117,10 @@ class ToolGateway:
                 migrated_tools.append(WebSearchTool(search=web_search))
             if web_fetch is not None:
                 migrated_tools.append(WebFetchTool(fetcher=web_fetch))
+            if shell is not None:
+                migrated_tools.append(
+                    ShellTool(workspace=context.workspace, boundary=shell)
+                )
             migrated_schemas = tuple(tool.to_schema() for tool in migrated_tools)
             self._registered_tools = {tool.name: tool for tool in migrated_tools}
             self._schemas = tuple(deepcopy(schema) for schema in migrated_schemas)
@@ -221,11 +223,16 @@ class ToolGateway:
         if refusal is not None:
             try:
                 reason = cast(Callable[..., str | None], refusal)(**normalized)
-            except Exception:
+            except Exception as error:
+                message = (
+                    error.message
+                    if isinstance(error, ToolError)
+                    else f"{tool_call.name} could not complete the request."
+                )
                 return _error_result(
                     tool_call,
                     code="tool_failed",
-                    message=f"{tool_call.name} could not complete the request.",
+                    message=message,
                 )
             if reason is not None:
                 if not isinstance(reason, str):
@@ -372,6 +379,11 @@ class ToolGateway:
         *,
         approved: bool | None = None,
     ) -> ToolResult:
+        if tool_call.name in self._registered_tools:
+            # Temporary expand-contract forwarding for legacy direct callers. The
+            # approval value is intentionally ignored; #48 removes this method.
+            del approved
+            return await self.call(tool_call)
         context = self._legacy_context()
         tool = self._tools.get(tool_call.name)
         if tool is None:

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -14,15 +15,10 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolExecutionContext,
-    ToolExecutionLane,
-)
-from myclaw.tools.permission_policy import PermissionDecision
+from myclaw.tools.models import ModelToolCall, ToolExecutionContext, ToolExecutionLane
 from myclaw.tools.shell.shell_policy import ShellRequest
+from myclaw.tools.shell.shell_tool import ShellTool
 from myclaw.tools.tool_gateway import ToolGateway
-from myclaw.utils.json_types import JsonObject
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
@@ -47,18 +43,60 @@ class FakeShellBoundary:
         return next(self._outcomes)
 
 
-def gateway_context(
+def _gateway(
+    *,
     agent_home: Path,
     workspace: Path,
-    *,
+    shell: FakeShellBoundary,
     lane: ToolExecutionLane = "foreground",
-) -> ToolExecutionContext:
-    return ToolExecutionContext(
-        lane=lane,
-        workspace=workspace,
-        agent_home=agent_home,
-        session_id=SESSION_ID,
+) -> ToolGateway:
+    return ToolGateway(
+        context=ToolExecutionContext(
+            lane=lane,
+            workspace=workspace,
+            agent_home=agent_home,
+            session_id=SESSION_ID,
+        ),
+        shell=shell,
     )
+
+
+def test_shell_exports_accurate_schema_and_zero_retries(workspace: Path) -> None:
+    tool = ShellTool(workspace=workspace, boundary=FakeShellBoundary(()))
+
+    assert tool.to_schema() == {
+        "type": "function",
+        "function": {
+            "name": "shell",
+            "description": (
+                "Run one of five exact read-only commands from a Workspace directory; this is "
+                "not an operating-system filesystem or network sandbox."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Exact Shell command.",
+                        "minLength": 1,
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Workspace-relative working directory.",
+                        "default": ".",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Execution timeout in seconds.",
+                        "minimum": 60,
+                        "maximum": 600,
+                    },
+                },
+                "required": ["command", "timeout"],
+            },
+        },
+    }
+    assert tool.max_retries == 0
 
 
 @pytest.mark.parametrize(
@@ -72,30 +110,30 @@ def gateway_context(
     ),
 )
 @pytest.mark.asyncio
-async def test_frozen_read_only_shell_commands_execute_without_confirmation(
+async def test_frozen_read_only_shell_commands_execute_through_gateway(
     command: str,
     agent_home: Path,
     workspace: Path,
 ) -> None:
     shell = FakeShellBoundary((f"completed {command}",))
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        shell=shell,
-    )
-    tool_call = ModelToolCall(
-        id="call_shell",
-        name="shell",
-        arguments={"command": command, "timeout": 60},
-    )
+    gateway = _gateway(agent_home=agent_home, workspace=workspace, shell=shell)
 
-    assert gateway.permission_request(tool_call) is None
-    result = await gateway.execute(tool_call)
+    result = await gateway.call(
+        ModelToolCall(
+            id="call_shell",
+            name="shell",
+            arguments=json.dumps({"command": command, "timeout": 60}),
+        )
+    )
 
     assert result.status == "success"
     assert result.content == f"completed {command}"
-    assert shell.requests == [ShellRequest(command=command, cwd=workspace.resolve(), timeout=60)]
+    assert shell.requests == [
+        ShellRequest(command=command, cwd=workspace.resolve(), timeout=60)
+    ]
 
 
+@pytest.mark.parametrize("lane", ("foreground", "scheduled_work"))
 @pytest.mark.parametrize(
     "command",
     (
@@ -108,155 +146,102 @@ async def test_frozen_read_only_shell_commands_execute_without_confirmation(
         "git status &",
         "git status; pwd",
         "git status && pwd",
+        "dir",
     ),
 )
 @pytest.mark.asyncio
-async def test_other_shell_commands_ask_in_foreground_and_are_refused_in_background(
+async def test_every_other_valid_command_is_refused_without_process_execution(
     command: str,
+    lane: ToolExecutionLane,
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    tool_call = ModelToolCall(
-        id="call_shell",
-        name="shell",
-        arguments={"command": command, "timeout": 90},
-    )
-    foreground_shell = FakeShellBoundary(("approved output",))
-    foreground = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        shell=foreground_shell,
+    shell = FakeShellBoundary(("must not execute",))
+    gateway = _gateway(
+        agent_home=agent_home,
+        workspace=workspace,
+        shell=shell,
+        lane=lane,
     )
 
-    permission = foreground.permission_request(tool_call)
-
-    assert permission is not None
-    assert permission.decision is PermissionDecision.ASK
-    refused = await foreground.execute(tool_call)
-    assert refused.status == "refused"
-    assert foreground_shell.requests == []
-
-    approved = await foreground.execute(tool_call, approved=True)
-    assert approved.status == "success"
-    assert foreground_shell.requests == [
-        ShellRequest(command=command, cwd=workspace.resolve(), timeout=90)
-    ]
-
-    background_shell = FakeShellBoundary(("must not execute",))
-    background = ToolGateway(
-        context=gateway_context(agent_home, workspace, lane="scheduled_work"),
-        shell=background_shell,
+    result = await gateway.call(
+        ModelToolCall(
+            id="call_shell_refused",
+            name="shell",
+            arguments=json.dumps({"command": command, "timeout": 90}),
+        )
     )
 
-    assert background.permission_request(tool_call) is None
-    background_result = await background.execute(tool_call)
-    assert background_result.status == "refused"
-    assert background_result.error is not None
-    assert background_result.error.code == "tool_refused"
-    assert background_shell.requests == []
+    assert result.status == "refused"
+    assert result.content == (
+        "Shell command refused because it is not in the safe read-only allowlist."
+    )
+    assert result.artifact is None
+    assert shell.requests == []
 
 
 @pytest.mark.asyncio
-async def test_invalid_shell_command_or_cwd_is_denied_before_confirmation(
+async def test_invalid_shell_command_or_cwd_is_rejected_before_process_execution(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     (workspace / "not-a-directory.txt").write_text("content", encoding="utf-8")
     shell = FakeShellBoundary(("must not execute",))
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        shell=shell,
-    )
-    invalid_arguments: tuple[JsonObject, ...] = (
+    gateway = _gateway(agent_home=agent_home, workspace=workspace, shell=shell)
+    invalid_arguments = (
         {"command": "pwd", "cwd": "..", "timeout": 60},
         {"command": "pwd", "cwd": "not-a-directory.txt", "timeout": 60},
         {"command": "pwd\x00whoami", "timeout": 60},
         {"command": "pwd\nwhoami", "timeout": 60},
         {"command": "pwd\twhoami", "timeout": 60},
+        {"command": "pwd", "timeout": 59},
+        {"command": "pwd", "timeout": 601},
     )
 
     for index, arguments in enumerate(invalid_arguments):
-        tool_call = ModelToolCall(
-            id=f"call_invalid_shell_{index}",
-            name="shell",
-            arguments=arguments,
+        result = await gateway.call(
+            ModelToolCall(
+                id=f"call_invalid_shell_{index}",
+                name="shell",
+                arguments=json.dumps(arguments),
+            )
         )
-
-        assert gateway.permission_request(tool_call) is None
-        result = await gateway.execute(tool_call, approved=True)
-
         assert result.status == "error"
-        assert result.error is not None
-        assert result.error.code == "tool_denied"
 
     assert shell.requests == []
 
 
 @pytest.mark.asyncio
-async def test_shell_timeout_accepts_only_integer_seconds_from_60_through_600(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    shell = FakeShellBoundary(("minimum", "maximum"))
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        shell=shell,
-    )
-
-    for timeout, expected in ((60, "minimum"), (600, "maximum")):
-        result = await gateway.execute(
-            ModelToolCall(
-                id=f"call_timeout_{timeout}",
-                name="shell",
-                arguments={"command": "pwd", "timeout": timeout},
-            )
-        )
-        assert result.status == "success"
-        assert result.content == expected
-
-    for index, invalid_timeout in enumerate((None, 59, 601, True, 60.0)):
-        arguments: JsonObject = {"command": "pwd"}
-        if invalid_timeout is not None:
-            arguments["timeout"] = invalid_timeout
-        result = await gateway.execute(
-            ModelToolCall(
-                id=f"call_invalid_timeout_{index}",
-                name="shell",
-                arguments=arguments,
-            ),
-            approved=True,
-        )
-        assert result.status == "error"
-        assert result.error is not None
-
-    assert shell.requests == [
-        ShellRequest(command="pwd", cwd=workspace.resolve(), timeout=60),
-        ShellRequest(command="pwd", cwd=workspace.resolve(), timeout=600),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_approved_shell_command_receives_resolved_workspace_cwd(
+async def test_shell_accepts_timeout_bounds_and_resolves_nested_workspace_cwd(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     nested = workspace / "src" / "package"
     nested.mkdir(parents=True)
-    shell = FakeShellBoundary(("listed",))
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        shell=shell,
+    shell = FakeShellBoundary(("minimum", "maximum"))
+    gateway = _gateway(agent_home=agent_home, workspace=workspace, shell=shell)
+
+    minimum = await gateway.call(
+        ModelToolCall(
+            id="call_timeout_minimum",
+            name="shell",
+            arguments='{"command":"pwd","cwd":"src/package","timeout":60}',
+        )
     )
-    tool_call = ModelToolCall(
-        id="call_nested_cwd",
-        name="shell",
-        arguments={"command": "dir", "cwd": "src/package", "timeout": 120},
+    maximum = await gateway.call(
+        ModelToolCall(
+            id="call_timeout_maximum",
+            name="shell",
+            arguments='{"command":"pwd","cwd":"src/package","timeout":600}',
+        )
     )
 
-    assert gateway.permission_request(tool_call) is not None
-    result = await gateway.execute(tool_call, approved=True)
-
-    assert result.status == "success"
-    assert shell.requests == [ShellRequest(command="dir", cwd=nested.resolve(), timeout=120)]
+    assert (minimum.status, minimum.content) == ("success", "minimum")
+    assert (maximum.status, maximum.content) == ("success", "maximum")
+    assert shell.requests == [
+        ShellRequest(command="pwd", cwd=nested.resolve(), timeout=60),
+        ShellRequest(command="pwd", cwd=nested.resolve(), timeout=600),
+    ]
 
 
 @pytest.mark.parametrize("enabled", (True, False))
@@ -281,9 +266,7 @@ async def test_runtime_shell_enablement_controls_catalog_and_system_guidance(
                 events=(
                     ModelCompleted(
                         response=ModelResponse(
-                            message=AssistantModelMessage(
-                                content="Catalog inspected.",
-                            ),
+                            message=AssistantModelMessage(content="Catalog inspected."),
                             usage=ModelUsage(
                                 input_tokens=4,
                                 output_tokens=2,
@@ -313,12 +296,12 @@ async def test_runtime_shell_enablement_controls_catalog_and_system_guidance(
     request = provider.stream_requests[0]
     assert isinstance(request, ModelRequest)
     names = [schema["function"]["name"] for schema in request.tools]
-    guidance = request.system_prompt.split("<tool_guidance>\n", 1)[1].split("</tool_guidance>", 1)[
-        0
-    ]
+    guidance = request.system_prompt.split("<tool_guidance>\n", 1)[1].split(
+        "</tool_guidance>", 1
+    )[0]
     assert ("shell" in names) is enabled
     assert ("- shell:" in guidance) is enabled
     if enabled:
-        assert "not OS filesystem or network sandboxed" in guidance
+        assert "not an operating-system filesystem or network sandbox" in guidance
         assert "confined to the Workspace" not in guidance
     assert shell.requests == []

@@ -8,9 +8,6 @@ from pathlib import Path
 from typing import Final
 from unicodedata import category
 
-from myclaw.tools.permission_policy import PermissionDecision
-from myclaw.utils.json_types import JsonObject
-
 AUTOMATICALLY_ALLOWED_COMMANDS: Final = frozenset(
     {
         "pwd",
@@ -65,18 +62,17 @@ class ShellRequest:
     workspace_root: Path | None = field(default=None, repr=False, compare=False)
 
 
-def parse_shell_request(arguments: JsonObject, workspace: Path) -> ShellRequest:
-    """Validate and normalize the Shell arguments covered by the Permission Policy."""
-    command = arguments.get("command")
-    cwd = arguments.get("cwd", ".")
-    timeout = arguments.get("timeout")
+def parse_shell_request(
+    *,
+    command: str,
+    cwd: str,
+    timeout: int,
+    workspace: Path,
+) -> ShellRequest:
+    """Validate and normalize one Shell request within its Workspace cwd boundary."""
     if (
-        not isinstance(command, str)
-        or not command.strip()
-        or not isinstance(cwd, str)
+        not command.strip()
         or not cwd
-        or not isinstance(timeout, int)
-        or isinstance(timeout, bool)
         or not 60 <= timeout <= 600
         or any(category(character) == "Cc" for character in command)
     ):
@@ -104,21 +100,21 @@ def parse_shell_request(arguments: JsonObject, workspace: Path) -> ShellRequest:
     )
 
 
-def assess_shell_command(
+def shell_command_is_allowed(
     command: str,
     *,
     cwd: Path | None = None,
     workspace: Path | None = None,
-) -> PermissionDecision:
-    """Allow only a frozen exact command shape; ask for every other command."""
+) -> bool:
+    """Return whether one command matches the frozen safe read-only policy."""
     if command not in AUTOMATICALLY_ALLOWED_COMMANDS:
-        return PermissionDecision.ASK
+        return False
     if not command.startswith("git ") or cwd is None:
-        return PermissionDecision.ALLOW
+        return True
     git_executable = trusted_git_executable(workspace=workspace)
     if git_executable is None or _git_filters_may_run(cwd, git_executable):
-        return PermissionDecision.ASK
-    return PermissionDecision.ALLOW
+        return False
+    return True
 
 
 def trusted_git_executable(*, workspace: Path | None = None) -> Path | None:

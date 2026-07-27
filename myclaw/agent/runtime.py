@@ -69,7 +69,7 @@ from myclaw.tools.models import ToolExecutionContext, ToolExecutionLane, ToolRes
 from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.tools.security import Security
 from myclaw.tools.shell.shell_process import SubprocessShellBoundary
-from myclaw.tools.shell.shell_tool import ShellBoundary
+from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool
 from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import (
@@ -725,6 +725,8 @@ def _build_tool_gateway(
         tools.append(WebSearchTool(search=web_search))
     if web_fetch is not None:
         tools.append(WebFetchTool(fetcher=web_fetch))
+    if shell is not None:
+        tools.append(ShellTool(workspace=Path(workspace.path), boundary=shell))
     gateway.register_tools(tuple(tools))
     return gateway
 
