@@ -12,12 +12,7 @@ import pytest
 from myclaw.agent.events import (
     AgentEvent,
     BackgroundCompletedPayload,
-    PermissionRequestedPayload,
-    TextDeltaPayload,
-    ToolCompletedPayload,
-    ToolStartedPayload,
     TurnCancelledPayload,
-    TurnCompletedPayload,
     TurnFailedPayload,
     TurnStartedPayload,
 )
@@ -54,7 +49,6 @@ from myclaw.session.conversation import ChatModelSettings, StreamingConversation
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import run_repl
-from myclaw.tools.models import ToolExecutionContext
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
@@ -299,118 +293,6 @@ class OrderingWriter:
         self.background_written.set()
 
 
-class PermissionBlockingInput:
-    def __init__(self, order: list[str]) -> None:
-        self._order = order
-        self._calls = 0
-        self.approval_started = asyncio.Event()
-        self.release_approval = asyncio.Event()
-
-    async def read(self) -> str:
-        self._calls += 1
-        if self._calls == 1:
-            return "Run a tool."
-        if self._calls == 2:
-            self._order.append("input:approval")
-            self.approval_started.set()
-            await self.release_approval.wait()
-            return "yes"
-        self._order.append("input:next")
-        return "exit"
-
-
-class PermissionOrderingWriter:
-    def __init__(self, order: list[str]) -> None:
-        self._order = order
-        self.background_written = asyncio.Event()
-
-    async def write_delta(self, delta: str) -> None:
-        self._order.append(f"delta:{delta}")
-
-    async def finish_turn(self) -> None:
-        self._order.append("finish")
-
-    async def write_line(self, content: str) -> None:
-        self._order.append(f"line:{content}")
-        if content.startswith("[Scheduled Work]"):
-            self.background_written.set()
-
-
-class PermissionConversation:
-    def __init__(self) -> None:
-        self.permission_resolved = asyncio.Event()
-
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
-        assert text == "Run a tool."
-        yield AgentEvent(
-            type="turn_started",
-            event_id=0,
-            turn_id=RUN_UUID,
-            created_at=NOW,
-            payload=TurnStartedPayload(),
-        )
-        yield AgentEvent(
-            type="permission_requested",
-            event_id=1,
-            turn_id=RUN_UUID,
-            created_at=NOW,
-            payload=PermissionRequestedPayload(
-                request_id=REQUEST_UUID,
-                tool_call_id="call-write",
-                tool_name="write_file",
-                action="write",
-                resource="report.txt",
-                risk_summary="Writes one workspace file.",
-            ),
-        )
-        await self.permission_resolved.wait()
-        yield AgentEvent(
-            type="tool_started",
-            event_id=2,
-            turn_id=RUN_UUID,
-            created_at=NOW,
-            payload=ToolStartedPayload(
-                tool_call_id="call-write",
-                tool_name="write_file",
-                summary="Writing report.txt.",
-            ),
-        )
-        yield AgentEvent(
-            type="tool_completed",
-            event_id=3,
-            turn_id=RUN_UUID,
-            created_at=NOW,
-            payload=ToolCompletedPayload(
-                tool_call_id="call-write",
-                tool_name="write_file",
-                status="success",
-                summary="Wrote report.txt.",
-            ),
-        )
-        yield AgentEvent(
-            type="text_delta",
-            event_id=4,
-            turn_id=RUN_UUID,
-            created_at=NOW,
-            payload=TextDeltaPayload(delta="Tool finished."),
-        )
-        yield AgentEvent(
-            type="turn_completed",
-            event_id=5,
-            turn_id=RUN_UUID,
-            created_at=NOW,
-            payload=TurnCompletedPayload(content="Tool finished.", usage=_usage()),
-        )
-
-    async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
-        assert request_id == REQUEST_UUID
-        assert approved is True
-        self.permission_resolved.set()
-
-    async def cancel_active_turn(self) -> None:
-        return None
-
-
 class ForegroundTerminalConversation:
     def __init__(
         self,
@@ -462,9 +344,6 @@ class ForegroundTerminalConversation:
                 created_at=NOW,
                 payload=TurnCancelledPayload(partial_content=""),
             )
-
-    async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
-        raise AssertionError((request_id, approved))
 
     async def cancel_active_turn(self) -> None:
         return None
@@ -551,14 +430,7 @@ async def test_scheduler_refreshes_persisted_work_and_ignores_disabled_records(
         ),
         now=lambda: clock_now,
         new_uuid=uuid4,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
-        ),
+        tool_gateway_for=lambda _session_id: ToolGateway(),
     )
     events = RuntimeEventBroker()
     coordinator = ScheduledWorkCoordinator(
@@ -638,14 +510,7 @@ async def test_scheduler_retries_after_a_store_load_failure(
         ),
         now=lambda: clock_now,
         new_uuid=uuid4,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
-        ),
+        tool_gateway_for=lambda _session_id: ToolGateway(),
     )
     events = RuntimeEventBroker()
     coordinator = ScheduledWorkCoordinator(
@@ -715,14 +580,7 @@ async def test_scheduler_continues_after_one_scheduled_run_fails(
         ),
         now=lambda: clock_now,
         new_uuid=uuid4,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
-        ),
+        tool_gateway_for=lambda _session_id: ToolGateway(),
     )
     events = RuntimeEventBroker()
     coordinator = ScheduledWorkCoordinator(
@@ -789,14 +647,7 @@ async def test_scheduler_close_cancels_and_awaits_running_scheduled_work(
         ),
         now=lambda: clock_now,
         new_uuid=uuid4,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
-        ),
+        tool_gateway_for=lambda _session_id: ToolGateway(),
     )
     events = RuntimeEventBroker()
     clock = ControlledSchedulerClock(clock_now)
@@ -900,14 +751,7 @@ async def test_completed_scheduled_work_publishes_one_background_event(
         ),
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
-        ),
+        tool_gateway_for=lambda _session_id: ToolGateway(),
     )
     events = RuntimeEventBroker()
     coordinator = ScheduledWorkCoordinator(
@@ -980,14 +824,7 @@ async def test_failed_scheduled_work_publishes_safe_event_and_does_not_stop_anot
         ),
         now=lambda: NOW,
         new_uuid=uuid4,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
-        ),
+        tool_gateway_for=lambda _session_id: ToolGateway(),
     )
     events = RuntimeEventBroker()
     coordinator = ScheduledWorkCoordinator(
@@ -1052,14 +889,7 @@ async def test_overlapping_trigger_of_the_same_scheduled_work_is_skipped(
         ),
         now=lambda: NOW,
         new_uuid=uuid4,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
-        ),
+        tool_gateway_for=lambda _session_id: ToolGateway(),
     )
     events = RuntimeEventBroker()
     coordinator = ScheduledWorkCoordinator(
@@ -1124,14 +954,7 @@ async def test_cancelled_scheduled_work_emits_no_event_and_can_be_retriggered(
         ),
         now=lambda: NOW,
         new_uuid=uuid4,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
-        ),
+        tool_gateway_for=lambda _session_id: ToolGateway(),
     )
     events = RuntimeEventBroker()
     coordinator = ScheduledWorkCoordinator(
@@ -1188,14 +1011,7 @@ async def test_different_scheduled_work_runs_concurrently_and_events_follow_comp
         ),
         now=lambda: NOW,
         new_uuid=uuid4,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
-        ),
+        tool_gateway_for=lambda _session_id: ToolGateway(),
     )
     events = RuntimeEventBroker()
     coordinator = ScheduledWorkCoordinator(
@@ -1557,57 +1373,6 @@ async def test_queued_background_is_rendered_before_starting_the_next_input_read
         "background:[Scheduled Work] Weekly project review (completed): "
         "Background finished during streaming.",
         "input:second",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_background_completion_waits_for_permission_turn_terminal() -> None:
-    order: list[str] = []
-    broker = RuntimeEventBroker()
-    delegate = PermissionConversation()
-    conversation = SwitchableConversationPort(
-        session_id=TASK_SESSION_ID,
-        build_conversation=lambda _session_id: delegate,
-        event_sequencer=broker,
-    )
-    input_reader = PermissionBlockingInput(order)
-    writer = PermissionOrderingWriter(order)
-    repl = asyncio.create_task(
-        run_repl(
-            conversation=conversation,
-            input_reader=input_reader,
-            writer=writer,
-            background_events=broker,
-        )
-    )
-    await asyncio.wait_for(input_reader.approval_started.wait(), timeout=1)
-
-    await broker.publish_background(
-        turn_id=RUN_TWO_UUID,
-        created_at=NOW,
-        payload=BackgroundCompletedPayload(
-            kind="scheduled_work",
-            title="Daily status",
-            session_id=TASK_SESSION_ID,
-            status="completed",
-            summary="Completed during approval.",
-        ),
-    )
-    await asyncio.sleep(0)
-    assert all("[Scheduled Work]" not in operation for operation in order)
-
-    input_reader.release_approval.set()
-    await repl
-
-    assert order == [
-        "line:Permission required: write report.txt\n"
-        "Risk: Writes one workspace file.\n"
-        "Approve? [y/N]",
-        "input:approval",
-        "delta:Tool finished.",
-        "finish",
-        "line:[Scheduled Work] Daily status (completed): Completed during approval.",
-        "input:next",
     ]
 
 

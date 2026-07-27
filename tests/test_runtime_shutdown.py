@@ -25,10 +25,7 @@ from myclaw.schedule.records import ScheduledWork
 from myclaw.session.conversation import ChatModelSettings
 from myclaw.session.records import ConversationSession
 from myclaw.session.session_store import JsonlSessionStore
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolExecutionContext,
-)
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_process import SubprocessShellBoundary
 from myclaw.tools.tool_gateway import ToolGateway
@@ -592,7 +589,7 @@ async def test_runtime_close_waits_for_an_active_web_fetch_response_to_close(
                                     ModelToolCall(
                                         id="call-web-fetch",
                                         name="web_fetch",
-                                        arguments={"url": "https://example.com/resource"},
+                                        arguments='{"url":"https://example.com/resource"}',
                                     ),
                                 ),
                             ),
@@ -688,14 +685,7 @@ async def test_deferred_conversation_does_not_construct_after_close_during_pre_s
         new_uuid=uuid4,
         system_prompt="system",
         title_prompt=session_title_prompt(),
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=metadata.id,
-            )
-        ),
+        tool_gateway=ToolGateway(),
         history_preparer=preserve_history,
         before_submit=before_submit,
         on_foreground_terminal=lambda: None,
@@ -777,14 +767,7 @@ async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_p
         new_uuid=uuid4,
         system_prompt="system",
         title_prompt=session_title_prompt(),
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=metadata.id,
-            )
-        ),
+        tool_gateway=ToolGateway(),
         history_preparer=preserve_history,
         before_submit=before_submit,
         on_foreground_terminal=lambda: None,
@@ -883,14 +866,7 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
         new_uuid=uuid4,
         system_prompt="system",
         title_prompt=session_title_prompt(),
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=metadata.id,
-            )
-        ),
+        tool_gateway=ToolGateway(),
         history_preparer=preserve_history,
         before_submit=before_submit,
         on_foreground_terminal=lambda: None,

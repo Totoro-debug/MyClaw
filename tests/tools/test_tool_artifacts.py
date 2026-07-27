@@ -31,8 +31,6 @@ from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.models import (
     ModelToolCall,
-    ToolDefinition,
-    ToolExecutionContext,
     ToolResult,
 )
 from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
@@ -97,7 +95,6 @@ def test_runtime_externalizes_only_success_results_over_the_configured_threshold
         name="inspect",
         status="success",
         content=exact_result,
-        error=None,
         artifact=None,
     )
     oversized = ToolResult(
@@ -105,7 +102,6 @@ def test_runtime_externalizes_only_success_results_over_the_configured_threshold
         name="inspect",
         status="success",
         content=oversized_result,
-        error=None,
         artifact=None,
     )
 
@@ -162,7 +158,7 @@ async def test_runtime_persists_unicode_preview_and_safely_encoded_artifact_refe
     tool_call = ModelToolCall(
         id=unsafe_tool_call_id,
         name="read_file",
-        arguments={"path": "unicode.txt"},
+        arguments='{"path":"unicode.txt"}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -255,14 +251,11 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
         raise RuntimeError(private_write_detail)
 
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Return inspection output.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
+        name="inspect",
+        description="Return inspection output.",
         outcomes=(raw_result,),
     )
-    tool_call = ModelToolCall(id="call_failed_artifact", name="inspect", arguments={})
+    tool_call = ModelToolCall(id="call_failed_artifact", name="inspect", arguments="{}")
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -289,6 +282,8 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
             ),
         )
     )
+    gateway = ToolGateway()
+    gateway.register_tools((tool,))
     conversation = StreamingConversationPort(
         provider=provider,
         sessions=store,
@@ -302,15 +297,7 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
         ),
         now=clock.now,
         new_uuid=uuid4,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=gateway,
         externalize_result=lambda result: externalize_tool_result(
             result,
             agent_home=agent_home,
@@ -358,7 +345,6 @@ def test_invalid_empty_tool_call_id_fails_before_writing_an_artifact(
         name="inspect",
         status="success",
         content=raw_result,
-        error=None,
         artifact=None,
     )
 
@@ -386,7 +372,6 @@ def test_windows_reserved_tool_call_id_uses_canonical_safe_filename(
         name="inspect",
         status="success",
         content=raw_result,
-        error=None,
         artifact=None,
     )
     result = externalize_tool_result(

@@ -36,12 +36,8 @@ from myclaw.session.records import (
     ToolSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolDefinition,
-    ToolExecutionContext,
-    ToolResult,
-)
+from myclaw.tools.base import BaseTool
+from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
@@ -59,6 +55,12 @@ RETRY_REPAIR_UUID = UUID("84f40c92-f82d-4ce8-a57e-7d6f476893ed")
 ERROR_UUID = UUID("3d813cbb-47fb-45df-91b5-0f4b6c7f7648")
 REQUEST_TWO_UUID = UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e")
 ASSISTANT_TWO_UUID = UUID("b3f37212-6f3a-4a1b-8d2e-78ab3f9c4567")
+
+
+def _gateway(*tools: BaseTool) -> ToolGateway:
+    gateway = ToolGateway()
+    gateway.register_tools(tuple(tools))
+    return gateway
 
 
 def _io_path(path: Path) -> Path:
@@ -734,7 +736,7 @@ async def test_tool_stage_cancellation_survives_persistent_repair_failure(
     tool_call = ModelToolCall(
         id="call_cancelled",
         name="inspect",
-        arguments={"query": "private-cancelled-tool-argument"},
+        arguments='{"query":"private-cancelled-tool-argument"}',
     )
     stream_events = (
         *((TextDelta(delta="About to inspect."),) if stream_text else ()),
@@ -757,16 +759,9 @@ async def test_tool_stage_cancellation_survives_persistent_repair_failure(
         )
     )
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Inspect one value.",
-            input_schema={
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-        ),
+        name="inspect",
+        description="Inspect one value.",
+        required=("query",),
         outcomes=("must not execute",),
     )
     conversation = StreamingConversationPort(
@@ -784,15 +779,7 @@ async def test_tool_stage_cancellation_survives_persistent_repair_failure(
         new_uuid=iter(
             (TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID, TOOL_UUID, REPAIR_UUID)
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
     )
     stream = conversation.submit("Cancel before the sensitive tool executes.")
 
@@ -1285,7 +1272,7 @@ async def test_durable_assistant_publication_error_repairs_its_tool_call(
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
     session = sessions.prepare()
-    tool_call = ModelToolCall(id="call_durable", name="inspect", arguments={})
+    tool_call = ModelToolCall(id="call_durable", name="inspect", arguments="{}")
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -1305,11 +1292,8 @@ async def test_durable_assistant_publication_error_repairs_its_tool_call(
         )
     )
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Inspect.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
+        name="inspect",
+        description="Inspect.",
         outcomes=("must-not-run",),
     )
     conversation = StreamingConversationPort(
@@ -1325,15 +1309,7 @@ async def test_durable_assistant_publication_error_repairs_its_tool_call(
         ),
         now=clock.now,
         new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID, REPAIR_UUID)).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
     )
 
     events = [event async for event in conversation.submit("Run one durable tool call.")]
@@ -1370,7 +1346,7 @@ async def test_cancellation_after_durable_assistant_does_not_duplicate_streamed_
     )
     sessions.assistant_append_durable = asyncio.Event()
     session = sessions.prepare()
-    tool_call = ModelToolCall(id="call_after_assistant", name="inspect", arguments={})
+    tool_call = ModelToolCall(id="call_after_assistant", name="inspect", arguments="{}")
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -1391,11 +1367,8 @@ async def test_cancellation_after_durable_assistant_does_not_duplicate_streamed_
         )
     )
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Inspect.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
+        name="inspect",
+        description="Inspect.",
         outcomes=("must-not-run",),
     )
     conversation = StreamingConversationPort(
@@ -1420,15 +1393,7 @@ async def test_cancellation_after_durable_assistant_does_not_duplicate_streamed_
                 REPAIR_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
     )
 
     async def collect() -> list[AgentEvent]:
@@ -1500,7 +1465,7 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
     tool_call = ModelToolCall(
         id="call_sensitive",
         name="inspect",
-        arguments={"query": "private-raw-tool-argument"},
+        arguments='{"query":"private-raw-tool-argument"}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -1521,16 +1486,9 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
         )
     )
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Inspect one value.",
-            input_schema={
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-        ),
+        name="inspect",
+        description="Inspect one value.",
+        required=("query",),
         outcomes=("private-raw-tool-result",),
     )
     conversation = StreamingConversationPort(
@@ -1556,15 +1514,7 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
                 RETRY_REPAIR_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
         externalize_result=_externalizer(
             agent_home=agent_home,
             workspace=workspace,
@@ -1631,8 +1581,8 @@ async def test_repair_publication_fault_does_not_duplicate_or_drop_tool_message(
     )
     session = sessions.prepare()
     tool_calls = (
-        ModelToolCall(id="call_one", name="inspect", arguments={}),
-        ModelToolCall(id="call_two", name="inspect", arguments={}),
+        ModelToolCall(id="call_one", name="inspect", arguments="{}"),
+        ModelToolCall(id="call_two", name="inspect", arguments="{}"),
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -1653,11 +1603,8 @@ async def test_repair_publication_fault_does_not_duplicate_or_drop_tool_message(
         )
     )
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Inspect.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
+        name="inspect",
+        description="Inspect.",
         outcomes=("first-result",),
     )
     conversation = StreamingConversationPort(
@@ -1684,15 +1631,7 @@ async def test_repair_publication_fault_does_not_duplicate_or_drop_tool_message(
                 ERROR_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
     )
 
     events = [event async for event in conversation.submit("Run two calls.")]
@@ -1726,7 +1665,7 @@ async def test_cancellation_during_tool_reconciliation_is_safely_terminal(
     )
     sessions.reconcile_started = asyncio.Event()
     session = sessions.prepare()
-    tool_call = ModelToolCall(id="call_cancel_reconcile", name="inspect", arguments={})
+    tool_call = ModelToolCall(id="call_cancel_reconcile", name="inspect", arguments="{}")
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -1746,11 +1685,8 @@ async def test_cancellation_during_tool_reconciliation_is_safely_terminal(
         )
     )
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Inspect.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
+        name="inspect",
+        description="Inspect.",
         outcomes=("private-oversized-result",),
     )
     conversation = StreamingConversationPort(
@@ -1768,15 +1704,7 @@ async def test_cancellation_during_tool_reconciliation_is_safely_terminal(
         new_uuid=iter(
             (TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID, TOOL_UUID, REPAIR_UUID)
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
         externalize_result=_externalizer(
             agent_home=agent_home,
             workspace=workspace,
@@ -1829,14 +1757,11 @@ async def test_cancellation_while_closing_tool_round_stops_before_next_provider_
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
     session = sessions.prepare()
-    tool_call = ModelToolCall(id="call_before_close", name="inspect", arguments={})
+    tool_call = ModelToolCall(id="call_before_close", name="inspect", arguments="{}")
     provider = BlockingRoundCloseProvider(tool_call)
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Inspect.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
+        name="inspect",
+        description="Inspect.",
         outcomes=("first-result",),
     )
     conversation = StreamingConversationPort(
@@ -1862,15 +1787,7 @@ async def test_cancellation_while_closing_tool_round_stops_before_next_provider_
                 ASSISTANT_TWO_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
     )
 
     async def collect() -> list[AgentEvent]:
@@ -1907,7 +1824,7 @@ async def test_cancellation_after_durable_tool_result_keeps_one_message_and_arti
     )
     sessions.tool_append_durable = asyncio.Event()
     session = sessions.prepare()
-    tool_call = ModelToolCall(id="call_durable_cancel", name="inspect", arguments={})
+    tool_call = ModelToolCall(id="call_durable_cancel", name="inspect", arguments="{}")
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -1927,11 +1844,8 @@ async def test_cancellation_after_durable_tool_result_keeps_one_message_and_arti
         )
     )
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Inspect.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
+        name="inspect",
+        description="Inspect.",
         outcomes=("private-oversized-result",),
     )
     conversation = StreamingConversationPort(
@@ -1949,15 +1863,7 @@ async def test_cancellation_after_durable_tool_result_keeps_one_message_and_arti
         new_uuid=iter(
             (TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID, TOOL_UUID, REPAIR_UUID)
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
         externalize_result=_externalizer(
             agent_home=agent_home,
             workspace=workspace,
@@ -2008,7 +1914,7 @@ async def test_cancellation_after_durable_repair_does_not_duplicate_tool_message
     )
     sessions.repair_append_durable = asyncio.Event()
     session = sessions.prepare()
-    tool_call = ModelToolCall(id="call_repair_cancel", name="inspect", arguments={})
+    tool_call = ModelToolCall(id="call_repair_cancel", name="inspect", arguments="{}")
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -2028,11 +1934,8 @@ async def test_cancellation_after_durable_repair_does_not_duplicate_tool_message
         )
     )
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Inspect.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
+        name="inspect",
+        description="Inspect.",
         outcomes=("first-result",),
     )
     conversation = StreamingConversationPort(
@@ -2058,15 +1961,7 @@ async def test_cancellation_after_durable_repair_does_not_duplicate_tool_message
                 RETRY_REPAIR_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
     )
 
     async def collect() -> list[AgentEvent]:
@@ -2111,8 +2006,8 @@ async def test_cancellation_retries_a_transient_second_tool_repair_failure(
     )
     session = sessions.prepare()
     tool_calls = (
-        ModelToolCall(id="call_cancel_one", name="inspect", arguments={}),
-        ModelToolCall(id="call_cancel_two", name="inspect", arguments={}),
+        ModelToolCall(id="call_cancel_one", name="inspect", arguments="{}"),
+        ModelToolCall(id="call_cancel_two", name="inspect", arguments="{}"),
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -2133,11 +2028,8 @@ async def test_cancellation_retries_a_transient_second_tool_repair_failure(
         )
     )
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="inspect",
-            description="Inspect.",
-            input_schema={"type": "object", "additionalProperties": False},
-        ),
+        name="inspect",
+        description="Inspect.",
         outcomes=("must-not-run",),
     )
     conversation = StreamingConversationPort(
@@ -2163,15 +2055,7 @@ async def test_cancellation_retries_a_transient_second_tool_repair_failure(
                 ERROR_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
     )
     stream = conversation.submit("Cancel two calls.")
 

@@ -11,7 +11,6 @@ from rich.console import Console
 from myclaw.agent.events import (
     AgentEvent,
     BackgroundCompletedPayload,
-    PermissionRequestedPayload,
     TextDeltaPayload,
     TurnFailedPayload,
 )
@@ -191,23 +190,13 @@ async def run_repl(
             events = conversation.submit(text)
             try:
                 try:
-                    await _render_turn(
-                        events,
-                        writer,
-                        conversation=conversation,
-                        input_reader=input_reader,
-                    )
+                    await _render_turn(events, writer)
                 except asyncio.CancelledError:
                     if shutdown_requested is not None and shutdown_requested.is_set():
                         raise
                     _clear_current_task_cancellation()
                     await conversation.cancel_active_turn()
-                    await _render_turn(
-                        events,
-                        writer,
-                        conversation=conversation,
-                        input_reader=input_reader,
-                    )
+                    await _render_turn(events, writer)
             except BaseException as primary_error:
                 try:
                     await _close_event_stream(events)
@@ -282,9 +271,6 @@ async def _choose_resume_session(
 async def _render_turn(
     events: AsyncIterator[AgentEvent],
     writer: ProgressiveWriter,
-    *,
-    conversation: ConversationPort,
-    input_reader: ReplInput,
 ) -> None:
     async for event in events:
         if event.type == "text_delta":
@@ -292,18 +278,6 @@ async def _render_turn(
             if not isinstance(payload, TextDeltaPayload):
                 raise TypeError("text_delta event has an invalid payload")
             await writer.write_delta(payload.delta)
-        elif event.type == "permission_requested":
-            payload = event.payload
-            if not isinstance(payload, PermissionRequestedPayload):
-                raise TypeError("permission_requested event has an invalid payload")
-            await writer.write_line(
-                f"Permission required: {payload.action} {payload.resource}\n"
-                f"Risk: {payload.risk_summary}\n"
-                "Approve? [y/N]"
-            )
-            response = await input_reader.read()
-            approved = response is not None and response.strip().casefold() in {"y", "yes"}
-            await conversation.resolve_permission(payload.request_id, approved)
         elif event.type in {"turn_completed", "turn_cancelled"}:
             await writer.finish_turn()
         elif event.type == "turn_failed":

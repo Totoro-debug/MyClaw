@@ -11,7 +11,7 @@ from myclaw.provider.models import AssistantModelMessage
 from myclaw.tools.errors import ToolError
 from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
 from myclaw.tools.files.workspace_write_tools import WriteFileTool
-from myclaw.tools.models import ModelToolCall, ToolExecutionContext, ToolResult
+from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.security import Security
 from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
@@ -201,14 +201,7 @@ async def test_search_files_skips_hard_links_to_external_files(
         alias.hardlink_to(outside)
     except OSError as error:
         pytest.skip(f"file hard links are unavailable on this host: {error}")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
     result = await gateway.call(
         ModelToolCall(
@@ -235,14 +228,7 @@ async def test_list_files_omits_hard_links_to_external_files(
         alias.hardlink_to(outside)
     except OSError as error:
         pytest.skip(f"file hard links are unavailable on this host: {error}")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
     result = await gateway.call(
         ModelToolCall(
@@ -273,7 +259,6 @@ def test_tool_artifact_publication_denies_an_external_directory_alias(
         name="read_file",
         status="success",
         content=raw_result,
-        error=None,
         artifact=None,
     )
 
@@ -302,7 +287,6 @@ def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
         name="read_file",
         status="success",
         content=first_content,
-        error=None,
         artifact=None,
     )
     second = ToolResult(
@@ -310,7 +294,6 @@ def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
         name="read_file",
         status="success",
         content=second_content,
-        error=None,
         artifact=None,
     )
 
@@ -352,7 +335,6 @@ def test_tool_artifact_externalization_returns_a_new_immutable_result(
         name="read_file",
         status="success",
         content=raw_result,
-        error=None,
         artifact=None,
     )
 
@@ -617,14 +599,7 @@ async def test_list_files_filters_nested_agent_home_state_by_read_scope(
     )
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text("allowed artifact", encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
     result = await gateway.call(
         ModelToolCall(
@@ -671,14 +646,7 @@ async def test_search_files_filters_nested_agent_home_state_by_read_scope(
     )
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text("scope needle current", encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
     result = await gateway.call(
         ModelToolCall(

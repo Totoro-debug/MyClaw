@@ -25,7 +25,7 @@ from myclaw.session.records import (
     UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
-from myclaw.tools.models import ModelToolCall, ToolDefinition, ToolExecutionContext, ToolResult
+from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeTool, ScriptedFakeProvider, StreamScript
@@ -130,27 +130,13 @@ async def _run_artifact_turn(
         )
     provider = _provider(lane, responses)
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="read_file",
-            description="Read a test file.",
-            input_schema={
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-                "additionalProperties": False,
-            },
-        ),
+        name="read_file",
+        description="Read a test file.",
+        required=("path",),
         outcomes=("oversized artifact contents",),
     )
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane=lane,
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=session_id,
-        ),
-        tools=(tool,),
-    )
+    gateway = ToolGateway()
+    gateway.register_tools((tool,))
     externalized: list[ToolResult] = []
 
     def externalize(result: ToolResult) -> ToolResult:
@@ -233,27 +219,13 @@ async def test_agent_turn_lanes_share_one_persisted_tool_loop(
         ),
     )
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="read_file",
-            description="Read a test file.",
-            input_schema={
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-                "additionalProperties": False,
-            },
-        ),
+        name="read_file",
+        description="Read a test file.",
+        required=("path",),
         outcomes=("file contents",),
     )
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane=lane,
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=session.id,
-        ),
-        tools=(tool,),
-    )
+    gateway = ToolGateway()
+    gateway.register_tools((tool,))
     turn = AgentTurn(
         lane=lane,
         provider=provider,

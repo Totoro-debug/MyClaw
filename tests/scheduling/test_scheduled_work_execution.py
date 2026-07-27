@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from collections.abc import Callable
 from dataclasses import replace
@@ -33,12 +34,16 @@ from myclaw.session.records import (
     UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.base import BaseTool
+from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
+from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
 from myclaw.tools.models import (
     ModelToolCall,
-    ToolExecutionContext,
     ToolResult,
 )
+from myclaw.tools.security import Security
 from myclaw.tools.shell.shell_policy import ShellRequest
+from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool
 from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.atomic_files import atomic_replace_bytes
@@ -118,27 +123,48 @@ class FailingShellBoundary:
 
 
 class ObservingToolGateway(ToolGateway):
-    def __init__(
-        self,
-        *,
-        context: ToolExecutionContext,
-        max_tool_result_chars: int,
-    ) -> None:
-        super().__init__(
-            context=context,
-            max_tool_result_chars=max_tool_result_chars,
-        )
+    def __init__(self) -> None:
+        super().__init__()
         self.results: list[ToolResult] = []
 
-    async def execute(
-        self,
-        tool_call: ModelToolCall,
-        *,
-        approved: bool | None = None,
-    ) -> ToolResult:
-        result = await super().execute(tool_call, approved=approved)
+    async def call(self, tool_call: ModelToolCall) -> ToolResult:
+        result = await super().call(tool_call)
         self.results.append(result)
         return result
+
+
+def _tool_gateway(
+    *,
+    agent_home: Path,
+    workspace: Path,
+    session_id: str,
+    shell: ShellBoundary | None = None,
+    gateway: ToolGateway | None = None,
+) -> ToolGateway:
+    workspace_identity = Workspace.from_path(workspace)
+    security = Security(
+        workspace=workspace_identity,
+        agent_home=agent_home,
+        artifact_directory=(
+            agent_home
+            / "sessions"
+            / workspace_identity.slug
+            / "artifacts"
+            / session_id
+        ),
+    )
+    tools: list[BaseTool] = [
+        ReadFileTool(security=security),
+        ListFilesTool(security=security),
+        SearchFilesTool(security=security),
+        WriteFileTool(security=security),
+        EditFileTool(security=security),
+    ]
+    if shell is not None:
+        tools.append(ShellTool(workspace=workspace, boundary=shell))
+    result = ToolGateway() if gateway is None else gateway
+    result.register_tools(tuple(tools))
+    return result
 
 
 def _long_path(path: Path) -> Path:
@@ -345,13 +371,10 @@ async def test_first_scheduled_work_trigger_persists_a_complete_cron_turn(
         ),
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
         ),
     )
     assert not sessions.path_for(task.session_id).exists()
@@ -436,13 +459,10 @@ async def test_repeated_scheduled_work_triggers_reuse_the_task_session_history(
                 ASSISTANT_TWO_UUID,
             )
         ).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
         ),
     )
     task = _task()
@@ -486,7 +506,7 @@ async def test_scheduled_work_auto_refuses_ask_tools_and_completes_the_agent_tur
     call = ModelToolCall(
         id="call_write",
         name="write_file",
-        arguments={"path": "scheduled.txt", "content": "must not be written"},
+        arguments='{"path":"scheduled.txt","content":"must not be written"}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -529,13 +549,10 @@ async def test_scheduled_work_auto_refuses_ask_tools_and_completes_the_agent_tur
                 ASSISTANT_TWO_UUID,
             )
         ).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
         ),
     )
 
@@ -585,7 +602,7 @@ async def test_scheduled_work_commits_a_published_oversized_tool_result(
     call = ModelToolCall(
         id="call_scheduled_artifact",
         name="read_file",
-        arguments={"path": "large.txt"},
+        arguments='{"path":"large.txt"}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -601,14 +618,12 @@ async def test_scheduled_work_commits_a_published_oversized_tool_result(
             ),
         )
     )
-    gateway = ObservingToolGateway(
-        context=ToolExecutionContext(
-            lane="scheduled_work",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=TASK_SESSION_ID,
-        ),
-        max_tool_result_chars=1,
+    gateway = ObservingToolGateway()
+    _tool_gateway(
+        agent_home=agent_home,
+        workspace=workspace,
+        session_id=TASK_SESSION_ID,
+        gateway=gateway,
     )
     runner = ScheduledWorkRunner(
         provider=provider,
@@ -707,13 +722,10 @@ async def test_model_failure_is_persisted_without_stopping_the_next_scheduled_wo
                 ASSISTANT_TWO_UUID,
             )
         ).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
         ),
     )
     failed_task = _task()
@@ -805,13 +817,10 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
                 ASSISTANT_TWO_UUID,
             )
         ).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
         ),
     )
     failed_task = _task()
@@ -879,13 +888,10 @@ async def test_corrupt_task_session_is_isolated_before_the_model_call(
         ),
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, USER_TWO_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
         ),
     )
     completed_task = replace(
@@ -935,7 +941,7 @@ async def test_tool_result_publication_failure_is_isolated_from_the_next_task(
     call = ModelToolCall(
         id="call_refused_write",
         name="write_file",
-        arguments={"path": "blocked.txt", "content": "must not be written"},
+        arguments='{"path":"blocked.txt","content":"must not be written"}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -975,13 +981,10 @@ async def test_tool_result_publication_failure_is_isolated_from_the_next_task(
                 FINAL_RUNTIME_UUID,
             )
         ).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
         ),
     )
     failed_task = _task()
@@ -1038,7 +1041,7 @@ async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_public
     call = ModelToolCall(
         id="call_effect_then_raise_artifact",
         name="read_file",
-        arguments={"path": "large.txt"},
+        arguments='{"path":"large.txt"}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -1049,14 +1052,12 @@ async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_public
             ),
         )
     )
-    gateway = ObservingToolGateway(
-        context=ToolExecutionContext(
-            lane="scheduled_work",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=TASK_SESSION_ID,
-        ),
-        max_tool_result_chars=1,
+    gateway = ObservingToolGateway()
+    _tool_gateway(
+        agent_home=agent_home,
+        workspace=workspace,
+        session_id=TASK_SESSION_ID,
+        gateway=gateway,
     )
     runner = ScheduledWorkRunner(
         provider=provider,
@@ -1118,7 +1119,7 @@ async def test_scheduled_work_leaves_an_orphan_artifact_when_tool_message_was_no
     call = ModelToolCall(
         id="call_unpublished_artifact",
         name="read_file",
-        arguments={"path": "large.txt"},
+        arguments='{"path":"large.txt"}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -1129,14 +1130,12 @@ async def test_scheduled_work_leaves_an_orphan_artifact_when_tool_message_was_no
             ),
         )
     )
-    gateway = ObservingToolGateway(
-        context=ToolExecutionContext(
-            lane="scheduled_work",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=TASK_SESSION_ID,
-        ),
-        max_tool_result_chars=1,
+    gateway = ObservingToolGateway()
+    _tool_gateway(
+        agent_home=agent_home,
+        workspace=workspace,
+        session_id=TASK_SESSION_ID,
+        gateway=gateway,
     )
     runner = ScheduledWorkRunner(
         provider=provider,
@@ -1191,7 +1190,7 @@ async def test_scheduled_work_preserves_an_artifact_when_publication_is_indeterm
     call = ModelToolCall(
         id="call_indeterminate_artifact",
         name="read_file",
-        arguments={"path": "large.txt"},
+        arguments='{"path":"large.txt"}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -1202,14 +1201,12 @@ async def test_scheduled_work_preserves_an_artifact_when_publication_is_indeterm
             ),
         )
     )
-    gateway = ObservingToolGateway(
-        context=ToolExecutionContext(
-            lane="scheduled_work",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=TASK_SESSION_ID,
-        ),
-        max_tool_result_chars=1,
+    gateway = ObservingToolGateway()
+    _tool_gateway(
+        agent_home=agent_home,
+        workspace=workspace,
+        session_id=TASK_SESSION_ID,
+        gateway=gateway,
     )
     runner = ScheduledWorkRunner(
         provider=provider,
@@ -1267,7 +1264,7 @@ async def test_cancelling_scheduled_tool_publication_leaves_an_orphan_artifact(
     call = ModelToolCall(
         id="call_cancelled_artifact",
         name="read_file",
-        arguments={"path": "large.txt"},
+        arguments='{"path":"large.txt"}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -1278,14 +1275,12 @@ async def test_cancelling_scheduled_tool_publication_leaves_an_orphan_artifact(
             ),
         )
     )
-    gateway = ObservingToolGateway(
-        context=ToolExecutionContext(
-            lane="scheduled_work",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=TASK_SESSION_ID,
-        ),
-        max_tool_result_chars=1,
+    gateway = ObservingToolGateway()
+    _tool_gateway(
+        agent_home=agent_home,
+        workspace=workspace,
+        session_id=TASK_SESSION_ID,
+        gateway=gateway,
     )
     runner = ScheduledWorkRunner(
         provider=provider,
@@ -1341,7 +1336,7 @@ async def test_cancelling_after_scheduled_tool_publication_commits_the_durable_a
     call = ModelToolCall(
         id="call_effect_then_cancel_artifact",
         name="read_file",
-        arguments={"path": "large.txt"},
+        arguments='{"path":"large.txt"}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -1352,14 +1347,12 @@ async def test_cancelling_after_scheduled_tool_publication_commits_the_durable_a
             ),
         )
     )
-    gateway = ObservingToolGateway(
-        context=ToolExecutionContext(
-            lane="scheduled_work",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=TASK_SESSION_ID,
-        ),
-        max_tool_result_chars=1,
+    gateway = ObservingToolGateway()
+    _tool_gateway(
+        agent_home=agent_home,
+        workspace=workspace,
+        session_id=TASK_SESSION_ID,
+        gateway=gateway,
     )
     runner = ScheduledWorkRunner(
         provider=provider,
@@ -1420,7 +1413,7 @@ async def test_scheduled_tool_publication_preserves_a_primary_base_exception(
     call = ModelToolCall(
         id="call_base_exception_artifact",
         name="read_file",
-        arguments={"path": "large.txt"},
+        arguments='{"path":"large.txt"}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -1431,14 +1424,12 @@ async def test_scheduled_tool_publication_preserves_a_primary_base_exception(
             ),
         )
     )
-    gateway = ObservingToolGateway(
-        context=ToolExecutionContext(
-            lane="scheduled_work",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=TASK_SESSION_ID,
-        ),
-        max_tool_result_chars=1,
+    gateway = ObservingToolGateway()
+    _tool_gateway(
+        agent_home=agent_home,
+        workspace=workspace,
+        session_id=TASK_SESSION_ID,
+        gateway=gateway,
     )
     runner = ScheduledWorkRunner(
         provider=provider,
@@ -1533,13 +1524,10 @@ async def test_model_error_publication_failure_becomes_a_persistence_outcome(
                 ASSISTANT_TWO_UUID,
             )
         ).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
         ),
     )
     failed_task = _task()
@@ -1596,7 +1584,7 @@ async def test_session_load_failure_is_isolated_at_every_cron_loop_boundary(
     call = ModelToolCall(
         id="call_load_boundary",
         name="write_file",
-        arguments={"path": "blocked.txt", "content": "must not be written"},
+        arguments='{"path":"blocked.txt","content":"must not be written"}',
     )
     first_response = ModelResponse(
         message=AssistantModelMessage(content="Trying a write.", tool_calls=(call,)),
@@ -1635,13 +1623,10 @@ async def test_session_load_failure_is_isolated_at_every_cron_loop_boundary(
                 FINAL_RUNTIME_UUID,
             )
         ).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
         ),
     )
     failed_task = _task()
@@ -1683,7 +1668,7 @@ async def test_cancelling_a_running_scheduled_tool_repairs_history_without_closi
     call = ModelToolCall(
         id="call_pwd",
         name="shell",
-        arguments={"command": "pwd", "timeout": 60},
+        arguments='{"command":"pwd","timeout":60}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -1711,13 +1696,10 @@ async def test_cancelling_a_running_scheduled_tool_repairs_history_without_closi
         ),
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            ),
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
             shell=shell,
         ),
     )
@@ -1777,13 +1759,10 @@ async def test_scheduled_work_uses_a_normalized_task_specific_session_title(
         ),
         now=lambda: NOW,
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            )
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
         ),
     )
 
@@ -1866,7 +1845,7 @@ async def test_scheduled_tool_failure_is_safe_history_and_the_turn_can_finish(
     call = ModelToolCall(
         id="call_pwd_failure",
         name="shell",
-        arguments={"command": "pwd", "timeout": 60},
+        arguments='{"command":"pwd","timeout":60}',
     )
     provider = ScriptedFakeProvider(
         completions=(
@@ -1906,13 +1885,10 @@ async def test_scheduled_tool_failure_is_safe_history_and_the_turn_can_finish(
                 ASSISTANT_TWO_UUID,
             )
         ).__next__,
-        tool_gateway_for=lambda session_id: ToolGateway(
-            context=ToolExecutionContext(
-                lane="scheduled_work",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            ),
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
             shell=FailingShellBoundary(),
         ),
     )
@@ -1939,11 +1915,13 @@ async def test_runtime_scheduled_work_refuses_recursive_task_creation(
     recursive_call = ModelToolCall(
         id="call_recursive_schedule",
         name="create_scheduled_work",
-        arguments={
-            "title": "Recursive task",
-            "cron": "0 10 * * 2",
-            "prompt": "This must be refused in background work.",
-        },
+        arguments=json.dumps(
+            {
+                "title": "Recursive task",
+                "cron": "0 10 * * 2",
+                "prompt": "This must be refused in background work.",
+            }
+        ),
     )
     provider = ScriptedFakeProvider(
         completions=(

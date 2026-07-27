@@ -7,7 +7,6 @@ import pytest
 from myclaw.agent.events import (
     AgentEvent,
     BackgroundCompletedPayload,
-    PermissionRequestedPayload,
     ProgressPayload,
     TextDeltaPayload,
     ToolCompletedPayload,
@@ -36,14 +35,6 @@ def test_all_agent_event_payloads_and_the_envelope_match_the_frozen_shapes() -> 
             tool_name="read_file",
             summary="Reading a file",
         ),
-        PermissionRequestedPayload(
-            request_id=UUID("550e8400-e29b-41d4-a716-446655440000"),
-            tool_call_id="call_124",
-            tool_name="write_file",
-            action="write",
-            resource="README.md",
-            risk_summary="This changes a Workspace file.",
-        ),
         ToolCompletedPayload(
             tool_call_id="call_123",
             tool_name="read_file",
@@ -70,14 +61,6 @@ def test_all_agent_event_payloads_and_the_envelope_match_the_frozen_shapes() -> 
             "tool_call_id": "call_123",
             "tool_name": "read_file",
             "summary": "Reading a file",
-        },
-        {
-            "request_id": "550e8400-e29b-41d4-a716-446655440000",
-            "tool_call_id": "call_124",
-            "tool_name": "write_file",
-            "action": "write",
-            "resource": "README.md",
-            "risk_summary": "This changes a Workspace file.",
         },
         {
             "tool_call_id": "call_123",

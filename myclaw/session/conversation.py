@@ -215,13 +215,9 @@ class StreamingConversationPort:
             ),
         )
 
-    async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
-        await self._turn.resolve_permission(request_id, approved)
-
     async def cancel_active_turn(self) -> None:
         if self._cancel_requested:
             return
-        self._turn.cancel_pending_permissions()
         task = self._active_task
         if task is None or task.done():
             return

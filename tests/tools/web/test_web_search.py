@@ -23,10 +23,7 @@ from myclaw.provider.models import (
     ToolModelMessage,
 )
 from myclaw.session.records import ToolSessionMessage
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolExecutionContext,
-)
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_search import (
     AsyncioDuckDuckGoSearchProcessSpawner,
@@ -101,15 +98,6 @@ class RecordingSearchProcessSpawner:
     async def spawn(self, query: str, max_results: int) -> CompletedSearchProcess:
         self.calls.append((query, max_results))
         return CompletedSearchProcess(self._records)
-
-
-def gateway_context(agent_home: Path, workspace: Path) -> ToolExecutionContext:
-    return ToolExecutionContext(
-        lane="foreground",
-        workspace=workspace,
-        agent_home=agent_home,
-        session_id="20260712-120000-000000_550e8400-e29b-41d4-a716-446655440000",
-    )
 
 
 def test_duckduckgo_worker_writes_non_ascii_results_as_utf8_bytes(
@@ -213,7 +201,6 @@ async def test_tool_gateway_returns_provider_neutral_web_search_results(
     )
 
     assert result.status == "success"
-    assert result.error is None
     assert json.loads(result.content) == [
         {
             "title": "MyClaw runtime",
@@ -433,19 +420,10 @@ async def test_tool_gateway_returns_an_empty_array_when_web_search_finds_nothing
     workspace: Path,
 ) -> None:
     search = FakeWebSearchBoundary(())
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        web_search=search,
-    )
+    gateway = ToolGateway()
+    gateway.register_tools((WebSearchTool(search=search),))
 
-    assert [definition.name for definition in gateway.definitions] == [
-        "read_file",
-        "list_files",
-        "search_files",
-        "write_file",
-        "edit_file",
-        "web_search",
-    ]
+    assert [schema["function"]["name"] for schema in gateway.schemas] == ["web_search"]
 
     result = await gateway.call(
         ModelToolCall(
@@ -475,7 +453,7 @@ async def test_conversation_returns_one_safe_tool_error_for_a_web_search_network
     tool_call = ModelToolCall(
         id="call_web_failure",
         name="web_search",
-        arguments={"query": "MyClaw runtime", "max_results": 3},
+        arguments='{"query":"MyClaw runtime","max_results":3}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -575,7 +553,7 @@ async def test_conversation_receives_only_provider_neutral_web_search_results(
                                     ModelToolCall(
                                         id="call_web_success",
                                         name="web_search",
-                                        arguments={"query": "MyClaw docs", "max_results": 1},
+                                        arguments='{"query":"MyClaw docs","max_results":1}',
                                     ),
                                 ),
                             ),

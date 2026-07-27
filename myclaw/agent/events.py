@@ -19,7 +19,6 @@ type AgentEventType = Literal[
     "text_delta",
     "progress",
     "tool_started",
-    "permission_requested",
     "tool_completed",
     "turn_completed",
     "turn_failed",
@@ -79,30 +78,6 @@ class ToolStartedPayload:
             "tool_call_id": self.tool_call_id,
             "tool_name": self.tool_name,
             "summary": self.summary,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class PermissionRequestedPayload:
-    request_id: UUID
-    tool_call_id: str
-    tool_name: str
-    action: str
-    resource: str
-    risk_summary: str
-
-    def __post_init__(self) -> None:
-        require_uuid4(self.request_id, field="request_id")
-        _require_summary(self.risk_summary, field="risk_summary")
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "request_id": str(self.request_id),
-            "tool_call_id": self.tool_call_id,
-            "tool_name": self.tool_name,
-            "action": self.action,
-            "resource": self.resource,
-            "risk_summary": self.risk_summary,
         }
 
 
@@ -177,7 +152,6 @@ type AgentEventPayload = (
     | TextDeltaPayload
     | ProgressPayload
     | ToolStartedPayload
-    | PermissionRequestedPayload
     | ToolCompletedPayload
     | TurnCompletedPayload
     | TurnFailedPayload
@@ -190,7 +164,6 @@ _EVENT_PAYLOAD_TYPES: dict[AgentEventType, type[object]] = {
     "text_delta": TextDeltaPayload,
     "progress": ProgressPayload,
     "tool_started": ToolStartedPayload,
-    "permission_requested": PermissionRequestedPayload,
     "tool_completed": ToolCompletedPayload,
     "turn_completed": TurnCompletedPayload,
     "turn_failed": TurnFailedPayload,

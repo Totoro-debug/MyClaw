@@ -15,7 +15,7 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
-from myclaw.tools.models import ModelToolCall, ToolExecutionContext, ToolExecutionLane
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_tool import ShellTool
 from myclaw.tools.tool_gateway import ToolGateway
@@ -48,17 +48,11 @@ def _gateway(
     agent_home: Path,
     workspace: Path,
     shell: FakeShellBoundary,
-    lane: ToolExecutionLane = "foreground",
 ) -> ToolGateway:
-    return ToolGateway(
-        context=ToolExecutionContext(
-            lane=lane,
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        ),
-        shell=shell,
-    )
+    del agent_home
+    gateway = ToolGateway()
+    gateway.register_tools((ShellTool(workspace=workspace, boundary=shell),))
+    return gateway
 
 
 def test_shell_exports_accurate_schema_and_zero_retries(workspace: Path) -> None:
@@ -133,7 +127,6 @@ async def test_frozen_read_only_shell_commands_execute_through_gateway(
     ]
 
 
-@pytest.mark.parametrize("lane", ("foreground", "scheduled_work"))
 @pytest.mark.parametrize(
     "command",
     (
@@ -152,7 +145,6 @@ async def test_frozen_read_only_shell_commands_execute_through_gateway(
 @pytest.mark.asyncio
 async def test_every_other_valid_command_is_refused_without_process_execution(
     command: str,
-    lane: ToolExecutionLane,
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -161,7 +153,6 @@ async def test_every_other_valid_command_is_refused_without_process_execution(
         agent_home=agent_home,
         workspace=workspace,
         shell=shell,
-        lane=lane,
     )
 
     result = await gateway.call(

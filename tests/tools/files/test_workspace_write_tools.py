@@ -7,7 +7,7 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.tools.errors import ToolError
 from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
-from myclaw.tools.models import ModelToolCall, ToolExecutionContext, ToolExecutionLane
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ToolGateway
 
@@ -114,33 +114,25 @@ def test_workspace_mutation_tools_export_exact_schemas_and_zero_retries(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("lane", ("foreground", "scheduled_work"))
 async def test_registered_catalog_refuses_workspace_mutations_before_execution(
     agent_home: Path,
     workspace: Path,
-    lane: ToolExecutionLane,
 ) -> None:
     target = workspace / "notes.txt"
     target.write_text("before", encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane=lane,
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=SESSION_ID,
-        )
-    )
+    gateway = ToolGateway()
+    gateway.register_tools(_tools(agent_home=agent_home, workspace=workspace))
 
     write_result = await gateway.call(
         ModelToolCall(
-            id=f"call_write_{lane}",
+            id="call_write",
             name="write_file",
             arguments='{"path":"created.txt","content":"must not be written"}',
         )
     )
     edit_result = await gateway.call(
         ModelToolCall(
-            id=f"call_edit_{lane}",
+            id="call_edit",
             name="edit_file",
             arguments=(
                 '{"path":"notes.txt","old_text":"before","new_text":"after"}'

@@ -1,4 +1,4 @@
-"""Creation and persistence of user-approved Scheduled Work."""
+"""Creation and persistence primitives for Scheduled Work."""
 
 import asyncio
 import json

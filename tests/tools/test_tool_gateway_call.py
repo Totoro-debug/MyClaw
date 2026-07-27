@@ -11,11 +11,10 @@ from myclaw.tools.errors import ToolError
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.schema import OpenAIToolSchema, ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
-from myclaw.utils.json_types import JsonObject
 
 
 def _call(name: str, arguments: str, *, call_id: str = "call_1") -> ModelToolCall:
-    return ModelToolCall(id=call_id, name=name, arguments=cast(JsonObject, arguments))
+    return ModelToolCall(id=call_id, name=name, arguments=arguments)
 
 
 class _PrepareTool(BaseTool):

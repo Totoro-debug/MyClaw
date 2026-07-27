@@ -26,16 +26,14 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolExecutionContext,
-)
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_process import (
     AsyncioShellProcessSpawner,
     ShellProcess,
     SubprocessShellBoundary,
 )
+from myclaw.tools.shell.shell_tool import ShellTool
 from myclaw.tools.shell.windows_job import WindowsJob
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
@@ -1006,21 +1004,14 @@ async def test_tool_gateway_runs_allowlisted_pwd_through_the_platform_shell(
     workspace: Path,
 ) -> None:
     shell = SubprocessShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260712-120000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = ToolGateway()
+    gateway.register_tools((ShellTool(workspace=workspace, boundary=shell),))
     try:
-        result = await gateway.execute(
+        result = await gateway.call(
             ModelToolCall(
                 id="call_pwd",
                 name="shell",
-                arguments={"command": "pwd", "timeout": 60},
+                arguments='{"command":"pwd","timeout":60}',
             )
         )
     finally:
@@ -1083,7 +1074,7 @@ async def test_runtime_shutdown_cancels_a_shell_turn_without_double_termination(
                                     ModelToolCall(
                                         id="call_shell",
                                         name="shell",
-                                        arguments={"command": "pwd", "timeout": 60},
+                                        arguments='{"command":"pwd","timeout":60}',
                                     ),
                                 ),
                             ),

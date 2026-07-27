@@ -1,45 +1,35 @@
 import pytest
 
-from myclaw.tools.models import ToolDefinition
 from tests.fixtures.tool import FakeTool, FakeToolCall
 
 
 @pytest.mark.asyncio
 async def test_fake_tool_returns_a_scripted_result_and_records_the_call() -> None:
-    definition = ToolDefinition(
+    tool = FakeTool(
         name="read_file",
         description="Read a UTF-8 file.",
-        input_schema={"type": "object"},
+        required=("path",),
+        outcomes=["file contents"],
     )
-    context = {"lane": "foreground", "workspace": "workspace"}
     arguments = {"path": "CONTEXT.md"}
-    tool = FakeTool(definition=definition, outcomes=["file contents"])
 
-    result = await tool.execute(arguments, context)
+    result = await tool.execute(path="CONTEXT.md")
 
-    assert tool.definition is definition
     assert result == "file contents"
-    assert tool.calls == [FakeToolCall(arguments=arguments, context=context)]
+    assert tool.calls == [FakeToolCall(arguments=arguments)]
 
 
 @pytest.mark.asyncio
 async def test_fake_tool_raises_a_scripted_failure_after_recording_the_call() -> None:
     failure = OSError("disk unavailable")
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="read_file",
-            description="Read a UTF-8 file.",
-            input_schema={"type": "object"},
-        ),
+        name="read_file",
+        description="Read a UTF-8 file.",
+        required=("path",),
         outcomes=[failure],
     )
 
     with pytest.raises(OSError, match="disk unavailable"):
-        await tool.execute({"path": "missing.txt"}, "foreground context")
+        await tool.execute(path="missing.txt")
 
-    assert tool.calls == [
-        FakeToolCall(
-            arguments={"path": "missing.txt"},
-            context="foreground context",
-        )
-    ]
+    assert tool.calls == [FakeToolCall(arguments={"path": "missing.txt"})]

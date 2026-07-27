@@ -8,7 +8,6 @@ from uuid import UUID
 
 from myclaw.agent.events import (
     AgentEventType,
-    PermissionRequestedPayload,
     TextDeltaPayload,
     ToolCompletedPayload,
     ToolStartedPayload,
@@ -52,7 +51,6 @@ type AgentTurnPayload = (
     TurnStartedPayload
     | TextDeltaPayload
     | ToolStartedPayload
-    | PermissionRequestedPayload
     | ToolCompletedPayload
     | TurnCompletedPayload
     | TurnFailedPayload
@@ -99,8 +97,6 @@ def agent_turn_event_type(payload: AgentTurnPayload) -> AgentEventType:
         return "text_delta"
     if isinstance(payload, ToolStartedPayload):
         return "tool_started"
-    if isinstance(payload, PermissionRequestedPayload):
-        return "permission_requested"
     if isinstance(payload, ToolCompletedPayload):
         return "tool_completed"
     if isinstance(payload, TurnCompletedPayload):
@@ -147,7 +143,6 @@ class AgentTurn:
         self._after_user_published = after_user_published
         self._cancel_requested = cancel_requested or _never_cancelled
         self._externalize_result = externalize_result or _inline_tool_result
-        self._permission_waits: dict[UUID, asyncio.Future[bool]] = {}
 
     async def run(self, text: str) -> AsyncGenerator[AgentTurnPayload, None]:
         yield TurnStartedPayload()
@@ -293,7 +288,6 @@ class AgentTurn:
                                     name=tool_call.name,
                                     status="error",
                                     content=message,
-                                    error=ErrorInfo(code="tool_failed", message=message),
                                     artifact=None,
                                 )
 
@@ -424,19 +418,6 @@ class AgentTurn:
                 except _PERSISTENCE_EXCEPTIONS:
                     pending_tool_calls.clear()
                 await _close_provider_stream(provider_stream)
-
-    async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
-        if not isinstance(approved, bool):
-            raise TypeError("approved must be a boolean")
-        wait = self._permission_waits.get(request_id)
-        if wait is None or wait.done():
-            raise RuntimeError("Permission request is not pending")
-        wait.set_result(approved)
-
-    def cancel_pending_permissions(self) -> None:
-        for wait in tuple(self._permission_waits.values()):
-            if not wait.done():
-                wait.cancel()
 
     def _model_request(
         self,

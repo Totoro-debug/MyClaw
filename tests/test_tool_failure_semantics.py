@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
@@ -25,11 +26,8 @@ from myclaw.session.records import (
     ToolSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolDefinition,
-    ToolExecutionContext,
-)
+from myclaw.tools.base import BaseTool
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 
@@ -45,6 +43,12 @@ TOOL_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
 TOOL_TWO_UUID = UUID("11111111-1111-4111-8111-111111111111")
 FINAL_REQUEST_UUID = UUID("a8098c1a-f86e-4f33-8a28-25f602f8e603")
 FINAL_ASSISTANT_UUID = UUID("67e55044-10b1-426f-9247-bb680e5fe0c8")
+
+
+def _gateway(*tools: BaseTool) -> ToolGateway:
+    gateway = ToolGateway()
+    gateway.register_tools(tuple(tools))
+    return gateway
 
 
 @pytest.mark.asyncio
@@ -123,14 +127,7 @@ async def test_unknown_long_tool_is_normalized_and_the_turn_continues_without_ev
                 FINAL_ASSISTANT_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            )
-        ),
+        tool_gateway=ToolGateway(),
     )
 
     events = [event async for event in conversation.submit("Use the requested capability.")]
@@ -195,23 +192,16 @@ async def test_invalid_arguments_are_rejected_before_the_tool_boundary_and_retur
     )
     session = store.prepare()
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="send_notice",
-            description="Send one notice through an external boundary.",
-            input_schema={
-                "type": "object",
-                "properties": {"message": {"type": "string"}},
-                "required": ["message"],
-                "additionalProperties": False,
-            },
-        ),
+        name="send_notice",
+        description="Send one notice through an external boundary.",
+        required=("message",),
         outcomes=("must not execute",),
     )
     secret_argument = "complete-private-invalid-argument"
     tool_call = ModelToolCall(
         id="call_invalid",
         name="send_notice",
-        arguments={"message": 42, "secret": secret_argument},
+        arguments=json.dumps({"message": 42, "secret": secret_argument}),
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -262,15 +252,7 @@ async def test_invalid_arguments_are_rejected_before_the_tool_boundary_and_retur
                 FINAL_ASSISTANT_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
     )
 
     events = [event async for event in conversation.submit("Send my notice.")]
@@ -313,22 +295,15 @@ async def test_tool_exception_executes_once_and_becomes_a_safe_result_before_mod
     session = store.prepare()
     raw_exception_detail = "private-service-response-body"
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="send_notice",
-            description="Send one notice through an external boundary.",
-            input_schema={
-                "type": "object",
-                "properties": {"message": {"type": "string"}},
-                "required": ["message"],
-                "additionalProperties": False,
-            },
-        ),
+        name="send_notice",
+        description="Send one notice through an external boundary.",
+        required=("message",),
         outcomes=(RuntimeError(raw_exception_detail),),
     )
     tool_call = ModelToolCall(
         id="call_failed",
         name="send_notice",
-        arguments={"message": "hello"},
+        arguments='{"message":"hello"}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -382,15 +357,7 @@ async def test_tool_exception_executes_once_and_becomes_a_safe_result_before_mod
                 FINAL_ASSISTANT_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
     )
 
     events = [event async for event in conversation.submit("Send the notice.")]
@@ -435,29 +402,15 @@ async def test_multiple_tool_calls_keep_mixed_results_ordered_and_recoverable(
     success_result = "private raw success result"
     raw_failure = "private raw failure detail"
     success_tool = FakeTool(
-        definition=ToolDefinition(
-            name="lookup_notice",
-            description="Look up a notice through an external boundary.",
-            input_schema={
-                "type": "object",
-                "properties": {"notice_id": {"type": "string"}},
-                "required": ["notice_id"],
-                "additionalProperties": False,
-            },
-        ),
+        name="lookup_notice",
+        description="Look up a notice through an external boundary.",
+        required=("notice_id",),
         outcomes=(success_result,),
     )
     failed_tool = FakeTool(
-        definition=ToolDefinition(
-            name="send_notice",
-            description="Send one notice through an external boundary.",
-            input_schema={
-                "type": "object",
-                "properties": {"message": {"type": "string"}},
-                "required": ["message"],
-                "additionalProperties": False,
-            },
-        ),
+        name="send_notice",
+        description="Send one notice through an external boundary.",
+        required=("message",),
         outcomes=(RuntimeError(raw_failure),),
     )
     lookup_call = ModelToolCall(
@@ -525,15 +478,7 @@ async def test_multiple_tool_calls_keep_mixed_results_ordered_and_recoverable(
                 FINAL_ASSISTANT_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(success_tool, failed_tool),
-        ),
+        tool_gateway=_gateway(success_tool, failed_tool),
     )
 
     events = [event async for event in conversation.submit("Process both notices.")]
@@ -633,22 +578,15 @@ async def test_json_schema_format_is_enforced_before_tool_boundary_and_turn_cont
     session = store.prepare()
     invalid_email = "not-an-email-private-value"
     tool = FakeTool(
-        definition=ToolDefinition(
-            name="send_email",
-            description="Send an email through an external boundary.",
-            input_schema={
-                "type": "object",
-                "properties": {"recipient": {"type": "string", "format": "email"}},
-                "required": ["recipient"],
-                "additionalProperties": False,
-            },
-        ),
+        name="send_email",
+        description="Send an email through an external boundary.",
+        required=("recipient",),
         outcomes=("must not execute",),
     )
     tool_call = ModelToolCall(
         id="call_invalid_format",
         name="send_email",
-        arguments={"recipient": invalid_email},
+        arguments=json.dumps({"recipient": invalid_email}),
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -701,15 +639,7 @@ async def test_json_schema_format_is_enforced_before_tool_boundary_and_turn_cont
                 FINAL_ASSISTANT_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=_gateway(tool),
     )
 
     events = [event async for event in conversation.submit("Send the email.")]

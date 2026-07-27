@@ -1,7 +1,6 @@
 from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
-from uuid import UUID
 
 from myclaw.agent.events import AgentEvent
 from myclaw.agent.ports import ConversationPort
@@ -23,17 +22,13 @@ from myclaw.session.records import (
     SessionMessage,
     SessionSummary,
 )
-from myclaw.tools.models import ToolDefinition
-from myclaw.tools.ports import Tool
+from myclaw.tools.base import BaseTool
 from tests.fixtures.provider import ScriptedFakeProvider
 from tests.fixtures.tool import FakeTool
 
 
 class _ConversationPortFake:
     def submit(self, text: str) -> AsyncIterator[AgentEvent]:
-        raise NotImplementedError
-
-    async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
         raise NotImplementedError
 
     async def cancel_active_turn(self) -> None:
@@ -103,12 +98,10 @@ def test_runtime_boundaries_are_structurally_substitutable_protocols() -> None:
     summaries: SummaryStore = _SummaryStoreFake()
     memory: MemoryStore = _MemoryStoreFake()
     provider: ModelProvider = ScriptedFakeProvider()
-    tool: Tool = FakeTool(
-        definition=ToolDefinition(
-            name="read_file",
-            description="Read a UTF-8 file.",
-            input_schema={"type": "object"},
-        ),
+    tool = FakeTool(
+        name="read_file",
+        description="Read a UTF-8 file.",
+        required=("path",),
         outcomes=(),
     )
 
@@ -118,4 +111,4 @@ def test_runtime_boundaries_are_structurally_substitutable_protocols() -> None:
     assert isinstance(summaries, SummaryStore)
     assert isinstance(memory, MemoryStore)
     assert isinstance(provider, ModelProvider)
-    assert isinstance(tool, Tool)
+    assert isinstance(tool, BaseTool)

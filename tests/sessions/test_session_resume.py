@@ -433,9 +433,6 @@ async def test_switchable_conversation_close_settles_every_selected_adapter() ->
             for event in events:
                 yield event
 
-        async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
-            del request_id, approved
-
         async def cancel_active_turn(self) -> None:
             return None
 

@@ -25,10 +25,12 @@ from myclaw.session.records import (
     ToolSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
+from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
+from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
 from myclaw.tools.models import (
     ModelToolCall,
-    ToolExecutionContext,
 )
+from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
@@ -48,6 +50,31 @@ EXTRA_ONE_UUID = UUID("11111111-1111-4111-8111-111111111111")
 EXTRA_TWO_UUID = UUID("22222222-2222-4222-8222-222222222222")
 EXTRA_THREE_UUID = UUID("33333333-3333-4333-8333-333333333333")
 EXTRA_FOUR_UUID = UUID("44444444-4444-4444-8444-444444444444")
+
+
+def _file_gateway(
+    *,
+    home: AgentHome,
+    workspace: Path,
+    session_id: str,
+) -> ToolGateway:
+    workspace_identity = Workspace.from_path(workspace)
+    security = Security(
+        workspace=workspace_identity,
+        agent_home=home.path,
+        artifact_directory=(home.path / "sessions" / workspace_identity.slug / "artifacts" / session_id),
+    )
+    gateway = ToolGateway()
+    gateway.register_tools(
+        (
+            ReadFileTool(security=security),
+            ListFilesTool(security=security),
+            SearchFilesTool(security=security),
+            WriteFileTool(security=security),
+            EditFileTool(security=security),
+        )
+    )
+    return gateway
 
 
 def _prepared_tool_conversation(
@@ -78,14 +105,7 @@ def _prepared_tool_conversation(
         ),
         now=clock.now,
         new_uuid=iter(conversation_uuids).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=home.path,
-                session_id=session.id,
-            )
-        ),
+        tool_gateway=_file_gateway(home=home, workspace=workspace, session_id=session.id),
     )
     return conversation, store, session.id
 
@@ -142,14 +162,7 @@ async def test_list_files_tool_result_continues_the_model_loop_with_linked_histo
             ),
         )
     )
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=session.id,
-        )
-    )
+    gateway = _file_gateway(home=home, workspace=workspace, session_id=session.id)
     conversation = StreamingConversationPort(
         provider=provider,
         sessions=store,
@@ -255,7 +268,7 @@ async def test_read_file_returns_the_requested_utf8_line_window_to_the_model(
     tool_call = ModelToolCall(
         id="call_read",
         name="read_file",
-        arguments={"path": "notes.txt", "offset": 1, "limit": 2},
+        arguments='{"path":"notes.txt","offset":1,"limit":2}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -306,14 +319,7 @@ async def test_read_file_returns_the_requested_utf8_line_window_to_the_model(
                 FINAL_ASSISTANT_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            )
-        ),
+        tool_gateway=_file_gateway(home=home, workspace=workspace, session_id=session.id),
     )
 
     events = [event async for event in conversation.submit("Read two lines from my notes.")]
@@ -368,12 +374,7 @@ async def test_search_files_returns_stably_ordered_path_line_previews(
     tool_call = ModelToolCall(
         id="call_search",
         name="search_files",
-        arguments={
-            "query": "needle",
-            "path": ".",
-            "glob": "*.txt",
-            "max_results": 2,
-        },
+        arguments='{"query":"needle","path":".","glob":"*.txt","max_results":2}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -424,14 +425,7 @@ async def test_search_files_returns_stably_ordered_path_line_previews(
                 FINAL_ASSISTANT_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            )
-        ),
+        tool_gateway=_file_gateway(home=home, workspace=workspace, session_id=session.id),
     )
 
     events = [event async for event in conversation.submit("Find needle in text files.")]
@@ -465,7 +459,7 @@ async def test_production_conversation_denies_parent_escape_without_reading_the_
     tool_call = ModelToolCall(
         id="call_escape",
         name="read_file",
-        arguments={"path": "../outside.txt"},
+        arguments='{"path":"../outside.txt"}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -580,7 +574,7 @@ async def test_read_file_normalizes_binary_content_as_an_error_before_continuing
     tool_call = ModelToolCall(
         id="call_binary",
         name="read_file",
-        arguments={"path": "binary.dat"},
+        arguments='{"path":"binary.dat"}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -631,14 +625,7 @@ async def test_read_file_normalizes_binary_content_as_an_error_before_continuing
                 FINAL_ASSISTANT_UUID,
             )
         ).__next__,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session.id,
-            )
-        ),
+        tool_gateway=_file_gateway(home=home, workspace=workspace, session_id=session.id),
     )
 
     events = [event async for event in conversation.submit("Inspect the binary file.")]
@@ -675,17 +662,17 @@ async def test_multiple_calls_and_tool_rounds_persist_in_order_before_one_final_
     list_call = ModelToolCall(
         id="call_list_many",
         name="list_files",
-        arguments={"path": "."},
+        arguments='{"path":"."}',
     )
     read_call = ModelToolCall(
         id="call_read_many",
         name="read_file",
-        arguments={"path": "alpha.txt"},
+        arguments='{"path":"alpha.txt"}',
     )
     search_call = ModelToolCall(
         id="call_search_next",
         name="search_files",
-        arguments={"query": "needle"},
+        arguments='{"query":"needle"}',
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -825,7 +812,7 @@ async def test_read_file_denies_a_symlink_that_resolves_outside_workspace(
     tool_call = ModelToolCall(
         id="call_symlink",
         name="read_file",
-        arguments={"path": "escape/secret.txt"},
+        arguments='{"path":"escape/secret.txt"}',
     )
     provider = ScriptedFakeProvider(
         streams=(

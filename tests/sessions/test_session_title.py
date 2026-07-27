@@ -126,7 +126,7 @@ class InvalidTitleProvider:
                             ModelToolCall(
                                 id="call-title",
                                 name="read_file",
-                                arguments={"path": "README.md"},
+                                arguments='{"path":"README.md"}',
                             ),
                         ),
                     ),

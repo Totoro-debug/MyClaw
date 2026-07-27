@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -17,13 +18,9 @@ from myclaw.provider.models import (
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolDefinition,
-    ToolExecutionContext,
-)
+from myclaw.tools.base import BaseTool
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
-from myclaw.utils.json_types import JsonObject
 from tests.fixtures import FakeTool, ScriptedFakeProvider, StreamScript
 
 NOW = datetime(2026, 7, 12, 19, 30, tzinfo=timezone(timedelta(hours=8)))
@@ -33,34 +30,17 @@ def _usage() -> ModelUsage:
     return ModelUsage(input_tokens=8, output_tokens=2, total_tokens=10)
 
 
-class BlockingAfterFirstTool:
-    _definition = ToolDefinition(
-        name="inspect",
-        description="Inspect one named item.",
-        input_schema={
-            "type": "object",
-            "properties": {"item": {"type": "string"}},
-            "required": ["item"],
-            "additionalProperties": False,
-        },
-    )
+class BlockingAfterFirstTool(BaseTool):
+    name = "inspect"
+    description = "Inspect one named item."
+    required = ("item",)
+    item: str
 
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.blocked = asyncio.Event()
 
-    @property
-    def definition(self) -> ToolDefinition:
-        return self._definition
-
-    async def execute(
-        self,
-        arguments: JsonObject,
-        context: ToolExecutionContext,
-    ) -> str:
-        del context
-        item = arguments["item"]
-        assert isinstance(item, str)
+    async def execute(self, *, item: str) -> str:
         self.calls.append(item)
         if len(self.calls) == 1:
             return "first complete"
@@ -84,11 +64,17 @@ async def test_same_task_cancellation_after_tool_started_prevents_execution(
     )
     session_id = sessions.prepare().id
     calls = tuple(
-        ModelToolCall(id=f"call_{item}", name="inspect", arguments={"item": item})
+        ModelToolCall(
+            id=f"call_{item}",
+            name="inspect",
+            arguments=json.dumps({"item": item}),
+        )
         for item in ("one", "two")
     )
     tool = FakeTool(
-        definition=BlockingAfterFirstTool._definition,
+        name="inspect",
+        description="Inspect one named item.",
+        required=("item",),
         outcomes=("must not execute", "must not execute"),
     )
     provider = ScriptedFakeProvider(
@@ -106,6 +92,8 @@ async def test_same_task_cancellation_after_tool_started_prevents_execution(
             ),
         )
     )
+    gateway = ToolGateway()
+    gateway.register_tools((tool,))
     conversation = StreamingConversationPort(
         provider=provider,
         sessions=sessions,
@@ -119,15 +107,7 @@ async def test_same_task_cancellation_after_tool_started_prevents_execution(
         ),
         now=lambda: NOW,
         new_uuid=uuid4,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=gateway,
     )
 
     events = conversation.submit("Inspect both items.")
@@ -169,8 +149,17 @@ async def test_same_task_cancellation_after_tool_completed_stops_model_continuat
         new_uuid=uuid4,
     )
     session_id = sessions.prepare().id
-    tool_call = ModelToolCall(id="call_done", name="inspect", arguments={"item": "done"})
-    tool = FakeTool(definition=BlockingAfterFirstTool._definition, outcomes=("complete",))
+    tool_call = ModelToolCall(
+        id="call_done",
+        name="inspect",
+        arguments='{"item":"done"}',
+    )
+    tool = FakeTool(
+        name="inspect",
+        description="Inspect one named item.",
+        required=("item",),
+        outcomes=("complete",),
+    )
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -197,6 +186,8 @@ async def test_same_task_cancellation_after_tool_completed_stops_model_continuat
             ),
         )
     )
+    gateway = ToolGateway()
+    gateway.register_tools((tool,))
     conversation = StreamingConversationPort(
         provider=provider,
         sessions=sessions,
@@ -210,15 +201,7 @@ async def test_same_task_cancellation_after_tool_completed_stops_model_continuat
         ),
         now=lambda: NOW,
         new_uuid=uuid4,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=gateway,
     )
 
     events = conversation.submit("Inspect one item.")
@@ -263,7 +246,11 @@ async def test_tool_execution_cancellation_keeps_completed_and_repairs_remaining
     )
     session_id = sessions.prepare().id
     calls = tuple(
-        ModelToolCall(id=f"call_{item}", name="inspect", arguments={"item": item})
+        ModelToolCall(
+            id=f"call_{item}",
+            name="inspect",
+            arguments=json.dumps({"item": item}),
+        )
         for item in ("first", "second", "third")
     )
     tool = BlockingAfterFirstTool()
@@ -282,6 +269,8 @@ async def test_tool_execution_cancellation_keeps_completed_and_repairs_remaining
             ),
         )
     )
+    gateway = ToolGateway()
+    gateway.register_tools((tool,))
     conversation = StreamingConversationPort(
         provider=provider,
         sessions=sessions,
@@ -295,15 +284,7 @@ async def test_tool_execution_cancellation_keeps_completed_and_repairs_remaining
         ),
         now=lambda: NOW,
         new_uuid=uuid4,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            ),
-            tools=(tool,),
-        ),
+        tool_gateway=gateway,
     )
 
     async def collect_events() -> list[AgentEvent]:

@@ -1,14 +1,7 @@
-from pathlib import Path
-
 import pytest
 
-from myclaw.errors import ErrorInfo
 from myclaw.tools.artifacts import ArtifactReference
-from myclaw.tools.models import (
-    ToolExecutionContext,
-    ToolResult,
-)
-from myclaw.tools.permission_policy import PermissionDecision
+from myclaw.tools.models import ModelToolCall, ToolResult
 
 SESSION_ID = "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000"
 
@@ -19,7 +12,6 @@ def test_normalized_tool_result_serializes_the_exact_artifact_shape() -> None:
         name="read_file",
         status="success",
         content="preview",
-        error=None,
         artifact=ArtifactReference(
             path=(
                 "artifacts/20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000/call_123.txt"
@@ -34,7 +26,6 @@ def test_normalized_tool_result_serializes_the_exact_artifact_shape() -> None:
         "name": "read_file",
         "status": "success",
         "content": "preview",
-        "error": None,
         "artifact": {
             "path": (
                 "artifacts/20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000/call_123.txt"
@@ -45,20 +36,16 @@ def test_normalized_tool_result_serializes_the_exact_artifact_shape() -> None:
     }
 
 
-def test_permission_decisions_and_execution_lanes_are_frozen_types() -> None:
-    assert tuple(decision.value for decision in PermissionDecision) == ("allow", "ask", "deny")
+def test_model_tool_call_preserves_raw_json_argument_text() -> None:
+    raw_arguments = '{"path":"CONTEXT.md","offset":1}'
+    call = ModelToolCall(id="call_123", name="read_file", arguments=raw_arguments)
 
-    context = ToolExecutionContext(
-        lane="foreground",
-        workspace=Path("D:/desktop/project"),
-        agent_home=Path("D:/users/user/.myclaw"),
-        session_id="20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000",
-    )
-
-    assert context.lane == "foreground"
-    assert context.workspace == Path("D:/desktop/project")
-    assert context.agent_home == Path("D:/users/user/.myclaw")
-    assert context.session_id == ("20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000")
+    assert call.arguments is raw_arguments
+    assert call.to_dict() == {
+        "id": "call_123",
+        "name": "read_file",
+        "arguments": raw_arguments,
+    }
 
 
 def test_tool_records_reject_values_outside_the_normalized_contract() -> None:
@@ -71,32 +58,20 @@ def test_tool_records_reject_values_outside_the_normalized_contract() -> None:
             preview_chars=11,
         )
 
-    error = ErrorInfo(code="tool_failed", message="Tool failed.")
-    with pytest.raises(ValueError, match="success result must not have an error"):
-        ToolResult(
-            tool_call_id="call_123",
-            name="read_file",
-            status="success",
-            content="",
-            error=error,
-            artifact=None,
-        )
-    with pytest.raises(ValueError, match="non-success result requires an error"):
-        ToolResult(
-            tool_call_id="call_123",
-            name="read_file",
-            status="error",
-            content="Tool failed.",
-            error=None,
-            artifact=None,
-        )
-    with pytest.raises(ValueError, match="Session ID"):
-        ToolExecutionContext(
-            lane="foreground",
-            workspace=Path("D:/desktop/project"),
-            agent_home=Path("D:/users/user/.myclaw"),
-            session_id="20260711-153012-123456_123e4567-e89b-12d3-a456-426614174000",
-        )
+    result = ToolResult(
+        tool_call_id="call_123",
+        name="read_file",
+        status="error",
+        content="Tool failed.",
+        artifact=None,
+    )
+    assert result.to_dict() == {
+        "tool_call_id": "call_123",
+        "name": "read_file",
+        "status": "error",
+        "content": "Tool failed.",
+        "artifact": None,
+    }
 
 
 @pytest.mark.parametrize(

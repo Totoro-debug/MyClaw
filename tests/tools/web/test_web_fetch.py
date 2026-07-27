@@ -19,10 +19,7 @@ from myclaw.provider.models import (
     ToolModelMessage,
 )
 from myclaw.session.records import ToolSessionMessage
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolExecutionContext,
-)
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import (
     AioHttpWebFetchClient,
@@ -31,7 +28,7 @@ from myclaw.tools.web.web_fetch import (
     WebFetchRejected,
     WebFetchTool,
 )
-from myclaw.tools.web.web_search import WebSearchResult
+from myclaw.tools.web.web_search import WebSearchResult, WebSearchTool
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
@@ -196,15 +193,6 @@ class EmptyWebSearchBoundary:
     ) -> tuple[WebSearchResult, ...]:
         del query, max_results
         return ()
-
-
-def gateway_context(agent_home: Path, workspace: Path) -> ToolExecutionContext:
-    return ToolExecutionContext(
-        lane="foreground",
-        workspace=workspace,
-        agent_home=agent_home,
-        session_id="20260712-120000-000000_550e8400-e29b-41d4-a716-446655440000",
-    )
 
 
 @pytest.mark.asyncio
@@ -661,7 +649,6 @@ async def test_tool_gateway_returns_provider_neutral_web_fetch_text(
     )
 
     assert result.status == "success"
-    assert result.error is None
     assert result.content == "Public page\nReadable content."
     assert fetch.calls == ["https://public.example/page"]
 
@@ -670,18 +657,15 @@ def test_tool_gateway_places_web_fetch_next_to_web_search_in_the_catalog(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        web_search=EmptyWebSearchBoundary(),
-        web_fetch=FakeWebFetchBoundary("unused"),
+    gateway = ToolGateway()
+    gateway.register_tools(
+        (
+            WebSearchTool(search=EmptyWebSearchBoundary()),
+            WebFetchTool(fetcher=FakeWebFetchBoundary("unused")),
+        )
     )
 
-    assert [definition.name for definition in gateway.definitions] == [
-        "read_file",
-        "list_files",
-        "search_files",
-        "write_file",
-        "edit_file",
+    assert [schema["function"]["name"] for schema in gateway.schemas] == [
         "web_search",
         "web_fetch",
     ]
@@ -748,7 +732,7 @@ async def test_conversation_returns_a_safe_error_for_web_fetch_failure(
     tool_call = ModelToolCall(
         id="call_fetch_failure",
         name="web_fetch",
-        arguments={"url": "https://public.example/page"},
+        arguments='{"url":"https://public.example/page"}',
     )
     provider = ScriptedFakeProvider(
         streams=(

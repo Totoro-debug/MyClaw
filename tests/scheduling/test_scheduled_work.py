@@ -1,7 +1,6 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
 from uuid import UUID, uuid4
 
 import pytest
@@ -26,10 +25,7 @@ from myclaw.schedule.scheduled_work import (
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolExecutionContext,
-)
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
@@ -101,11 +97,13 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
     tool_call = ModelToolCall(
         id="call_schedule",
         name="create_scheduled_work",
-        arguments={
-            "title": "Weekly project review",
-            "cron": "0 9 * * 1",
-            "prompt": prompt,
-        },
+        arguments=json.dumps(
+            {
+                "title": "Weekly project review",
+                "cron": "0 9 * * 1",
+                "prompt": prompt,
+            }
+        ),
     )
     provider = ScriptedFakeProvider(
         streams=(
@@ -134,6 +132,10 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
         )
     )
     store = JsonScheduledWorkStore(home)
+    gateway = ToolGateway()
+    gateway.register_tools(
+        (CreateScheduledWorkTool(store=store, now=lambda: NOW, new_uuid=uuid4),)
+    )
     conversation = StreamingConversationPort(
         provider=provider,
         sessions=sessions,
@@ -147,19 +149,7 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
         ),
         now=lambda: NOW,
         new_uuid=uuid4,
-        tool_gateway=ToolGateway(
-            context=ToolExecutionContext(
-                lane="foreground",
-                workspace=workspace,
-                agent_home=agent_home,
-                session_id=session_id,
-            ),
-            scheduled_work=CreateScheduledWorkTool(
-                store=store,
-                now=lambda: NOW,
-                new_uuid=uuid4,
-            ),
-        ),
+        tool_gateway=gateway,
     )
 
     observed = [event async for event in conversation.submit("Schedule the review.")]
@@ -247,12 +237,7 @@ async def test_invalid_cron_returns_scheduled_work_error_without_writing(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "lane",
-    ("foreground", "scheduled_work"),
-)
 async def test_refused_scheduled_work_creation_does_not_allocate_a_record(
-    lane: Literal["foreground", "scheduled_work"],
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -274,15 +259,8 @@ async def test_refused_scheduled_work_creation_does_not_allocate_a_record(
         now=fail_now,
         new_uuid=allocate_uuid,
     )
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane=lane,
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id="20260712-200000-123456_550e8400-e29b-41d4-a716-446655440000",
-        ),
-        scheduled_work=tool,
-    )
+    gateway = ToolGateway()
+    gateway.register_tools((tool,))
 
     result = await gateway.call(
         ModelToolCall(
@@ -296,8 +274,6 @@ async def test_refused_scheduled_work_creation_does_not_allocate_a_record(
     )
 
     assert result.status == "refused"
-    assert result.error is not None
-    assert result.error.code == "tool_refused"
     assert result.content == (
         "Scheduled Work creation is unavailable because confirmation is not implemented."
     )

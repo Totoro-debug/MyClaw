@@ -8,16 +8,15 @@ import pytest
 
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolExecutionContext,
-)
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import (
     HTTPResponseBoundary,
     PublicWebFetchBoundary,
     WebFetchRejected,
+    WebFetchTool,
 )
+from myclaw.tools.web.web_search import WebSearchTool
 
 SCHEMA_INVALID_API_KEY_ALIAS_CONFIG = """[models.providers.primary]
 protocol = "anthropic"
@@ -154,15 +153,6 @@ class SecretFailingWebFetch:
     async def fetch(self, url: str) -> str:
         del url
         raise RuntimeError("api_key=sk-fetch-adapter-secret\nTraceback: private response")
-
-
-def gateway_context(agent_home: Path, workspace: Path) -> ToolExecutionContext:
-    return ToolExecutionContext(
-        lane="foreground",
-        workspace=workspace,
-        agent_home=agent_home,
-        session_id="20260712-120000-000000_550e8400-e29b-41d4-a716-446655440000",
-    )
 
 
 def test_schema_invalid_config_view_redacts_api_key_alias(agent_home: Path) -> None:
@@ -493,10 +483,8 @@ async def test_web_search_gateway_hides_secret_adapter_failure_and_raw_query(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        web_search=SecretFailingWebSearch(),
-    )
+    gateway = ToolGateway()
+    gateway.register_tools((WebSearchTool(search=SecretFailingWebSearch()),))
 
     result = await gateway.call(
         ModelToolCall(
@@ -507,8 +495,6 @@ async def test_web_search_gateway_hides_secret_adapter_failure_and_raw_query(
     )
 
     assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_failed"
     assert result.content == "web_search could not complete the request."
     assert "sk-search-adapter-secret" not in result.content
     assert "sk-raw-query-secret" not in result.content
@@ -520,10 +506,8 @@ async def test_web_fetch_gateway_hides_secret_adapter_failure_and_raw_url(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    gateway = ToolGateway(
-        context=gateway_context(agent_home, workspace),
-        web_fetch=SecretFailingWebFetch(),
-    )
+    gateway = ToolGateway()
+    gateway.register_tools((WebFetchTool(fetcher=SecretFailingWebFetch()),))
 
     result = await gateway.call(
         ModelToolCall(
@@ -534,8 +518,6 @@ async def test_web_fetch_gateway_hides_secret_adapter_failure_and_raw_url(
     )
 
     assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "tool_failed"
     assert result.content == "web_fetch could not complete the request."
     assert "sk-fetch-adapter-secret" not in result.content
     assert "sk-raw-url-secret" not in result.content

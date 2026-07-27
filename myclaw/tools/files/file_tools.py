@@ -10,14 +10,6 @@ from myclaw.tools.schema import ToolParam
 from myclaw.tools.security import Security
 
 
-class FileToolArgumentsError(ValueError):
-    """Raised when a file tool receives arguments outside its public schema."""
-
-
-class FileToolAccessDenied(PermissionError):
-    """Raised when a requested path resolves outside the Workspace."""
-
-
 class ReadFileTool(BaseTool):
     """Read a stable UTF-8 line window from a Workspace file."""
 

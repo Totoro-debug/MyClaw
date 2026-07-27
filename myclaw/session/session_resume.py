@@ -3,7 +3,6 @@
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from typing import Protocol
-from uuid import UUID
 
 from myclaw.agent.events import AgentEvent
 from myclaw.agent.ports import ConversationPort
@@ -63,12 +62,6 @@ class SwitchableConversationPort:
         finally:
             if self._active_delegate is delegate:
                 self._active_delegate = None
-
-    async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
-        delegate = self._active_delegate
-        if delegate is None:
-            raise RuntimeError("No foreground turn is active")
-        await delegate.resolve_permission(request_id, approved)
 
     async def cancel_active_turn(self) -> None:
         if self._active_delegate is not None:

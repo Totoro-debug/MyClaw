@@ -1,3 +1,4 @@
+import json
 import os
 import shlex
 import shutil
@@ -7,12 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.tools.models import (
-    ModelToolCall,
-    ToolExecutionContext,
-)
+from myclaw.tools.models import ModelToolCall
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_process import SubprocessShellBoundary
+from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool
 from myclaw.tools.tool_gateway import ToolGateway
 
 
@@ -58,6 +57,12 @@ class RecordingShellBoundary:
         return "must not execute"
 
 
+def _shell_gateway(*, workspace: Path, shell: ShellBoundary) -> ToolGateway:
+    gateway = ToolGateway()
+    gateway.register_tools((ShellTool(workspace=workspace, boundary=shell),))
+    return gateway
+
+
 @pytest.mark.asyncio
 async def test_automatic_git_command_does_not_execute_a_workspace_path_shadow(
     agent_home: Path,
@@ -69,23 +74,15 @@ async def test_automatic_git_command_does_not_execute_a_workspace_path_shadow(
     _write_git_shadow(workspace, marker)
     monkeypatch.setenv("PATH", f"{workspace}{os.pathsep}{os.environ['PATH']}")
     shell = SubprocessShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_git_shadow",
         name="shell",
-        arguments={"command": "git status", "timeout": 60},
+        arguments='{"command":"git status","timeout":60}',
     )
 
     try:
-        result = await gateway.execute(tool_call)
+        result = await gateway.call(tool_call)
     finally:
         await shell.close()
 
@@ -103,28 +100,27 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
         "import asyncio\n"
         "import sys\n"
         "from pathlib import Path\n"
-        "from myclaw.tools.models import ModelToolCall, ToolExecutionContext\n"
+        "from myclaw.tools.models import ModelToolCall\n"
+        "from myclaw.tools.shell.shell_tool import ShellTool\n"
         "from myclaw.tools.tool_gateway import ToolGateway\n"
         "class Shell:\n"
         "    def __init__(self): self.calls = 0\n"
         "    async def execute(self, request): self.calls += 1; return 'ran'\n"
         "async def main():\n"
-        "    workspace, agent_home = map(Path, sys.argv[1:])\n"
+        "    workspace, _agent_home = map(Path, sys.argv[1:])\n"
         "    call = ModelToolCall(id='call_git', name='shell', "
-        "arguments={'command': 'git status', 'timeout': 60})\n"
+        "arguments='{\"command\":\"git status\",\"timeout\":60}')\n"
         "    foreground_shell = Shell()\n"
-        "    foreground = ToolGateway(context=ToolExecutionContext("
-        "lane='foreground', workspace=workspace, agent_home=agent_home, "
-        "session_id='20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000'), "
-        "shell=foreground_shell)\n"
-        "    assert (await foreground.execute(call)).status == 'refused'\n"
+        "    foreground = ToolGateway()\n"
+        "    foreground.register_tools((ShellTool(workspace=workspace, "
+        "boundary=foreground_shell),))\n"
+        "    assert (await foreground.call(call)).status == 'refused'\n"
         "    assert foreground_shell.calls == 0\n"
         "    background_shell = Shell()\n"
-        "    background = ToolGateway(context=ToolExecutionContext("
-        "lane='scheduled_work', workspace=workspace, agent_home=agent_home, "
-        "session_id='20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000'), "
-        "shell=background_shell)\n"
-        "    assert (await background.execute(call)).status == 'refused'\n"
+        "    background = ToolGateway()\n"
+        "    background.register_tools((ShellTool(workspace=workspace, "
+        "boundary=background_shell),))\n"
+        "    assert (await background.call(call)).status == 'refused'\n"
         "    assert background_shell.calls == 0\n"
         "asyncio.run(main())\n"
     )
@@ -155,22 +151,14 @@ async def test_automatic_git_command_does_not_execute_a_workspace_git_exe(
     system_root = Path(os.environ["SystemRoot"])
     shutil.copyfile(system_root / "System32" / "whoami.exe", workspace / "git.exe")
     shell = SubprocessShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
 
     try:
-        result = await gateway.execute(
+        result = await gateway.call(
             ModelToolCall(
                 id="call_git_exe_shadow",
                 name="shell",
-                arguments={"command": "git status", "timeout": 60},
+                arguments='{"command":"git status","timeout":60}',
             )
         )
     finally:
@@ -193,22 +181,14 @@ async def test_automatic_git_command_ignores_a_later_untrusted_path_prefix(
     _write_git_shadow(untrusted_bin, marker)
     monkeypatch.setenv("PATH", f"{untrusted_bin}{os.pathsep}{os.environ['PATH']}")
     shell = SubprocessShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
 
     try:
-        result = await gateway.execute(
+        result = await gateway.call(
             ModelToolCall(
                 id="call_git_path_prefix_shadow",
                 name="shell",
-                arguments={"command": "git status --short", "timeout": 60},
+                arguments='{"command":"git status --short","timeout":60}',
             )
         )
     finally:
@@ -236,22 +216,14 @@ async def test_safe_repository_retains_the_five_automatic_shell_commands(
 ) -> None:
     subprocess.run(["git", "init", "-q", str(workspace)], check=True)
     shell = RecordingShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_safe_automatic_command",
         name="shell",
-        arguments={"command": command, "timeout": 60},
+        arguments=json.dumps({"command": command, "timeout": 60}),
     )
 
-    result = await gateway.execute(tool_call)
+    result = await gateway.call(tool_call)
 
     assert result.status == "success"
     assert shell.requests == [ShellRequest(command=command, cwd=workspace.resolve(), timeout=60)]
@@ -279,22 +251,14 @@ async def test_unselected_git_filter_configuration_remains_automatically_allowed
         encoding="utf-8",
     )
     shell = RecordingShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_unselected_git_filter",
         name="shell",
-        arguments={"command": "git status", "timeout": 60},
+        arguments='{"command":"git status","timeout":60}',
     )
 
-    result = await gateway.execute(tool_call)
+    result = await gateway.call(tool_call)
 
     assert result.status == "success"
     assert len(shell.requests) == 1
@@ -321,22 +285,14 @@ async def test_configured_global_attributes_filter_is_not_automatically_allowed(
     )
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
     shell = RecordingShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_global_attributes_filter",
         name="shell",
-        arguments={"command": "git status", "timeout": 60},
+        arguments='{"command":"git status","timeout":60}',
     )
 
-    result = await gateway.execute(tool_call)
+    result = await gateway.call(tool_call)
 
     assert result.status == "refused"
     assert shell.requests == []
@@ -385,22 +341,14 @@ async def test_git_attribute_source_environment_is_not_automatically_allowed(
     (workspace / "payload.txt").write_text("secret\n", encoding="utf-8")
     monkeypatch.setenv("GIT_ATTR_SOURCE", "HEAD")
     shell = RecordingShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_git_attr_source",
         name="shell",
-        arguments={"command": "git status", "timeout": 60},
+        arguments='{"command":"git status","timeout":60}',
     )
 
-    result = await gateway.execute(tool_call)
+    result = await gateway.call(tool_call)
 
     assert result.status == "refused"
     assert shell.requests == []
@@ -419,33 +367,25 @@ async def test_non_allowlisted_secret_command_is_refused_without_execution(
         "raise SystemExit(7)"
     )
     shell = SubprocessShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
 
     try:
-        result = await gateway.execute(
+        result = await gateway.call(
             ModelToolCall(
                 id="call_secret_failure",
                 name="shell",
-                arguments={
-                    "command": _platform_shell_command([sys.executable, "-c", script]),
-                    "timeout": 60,
-                },
+                arguments=json.dumps(
+                    {
+                        "command": _platform_shell_command([sys.executable, "-c", script]),
+                        "timeout": 60,
+                    }
+                ),
             ),
         )
     finally:
         await shell.close()
 
     assert result.status == "refused"
-    assert result.error is not None
-    assert result.error.code == "tool_refused"
     assert result.content == (
         "Shell command refused because it is not in the safe read-only allowlist."
     )
@@ -468,24 +408,15 @@ async def test_allowlisted_git_status_does_not_run_a_repository_fsmonitor_hook(
         check=True,
     )
     shell = SubprocessShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_git_status",
         name="shell",
-        arguments={"command": "git status", "timeout": 60},
+        arguments='{"command":"git status","timeout":60}',
     )
 
     try:
-        assert gateway.permission_request(tool_call) is None
-        result = await gateway.execute(tool_call)
+        result = await gateway.call(tool_call)
     finally:
         await shell.close()
 
@@ -515,38 +446,22 @@ async def test_git_filter_configuration_refuses_an_allowlisted_command(
         encoding="utf-8",
     )
     shell = RecordingShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_git_status",
         name="shell",
-        arguments={"command": "git status", "timeout": 60},
+        arguments='{"command":"git status","timeout":60}',
     )
 
-    result = await gateway.execute(tool_call)
+    result = await gateway.call(tool_call)
 
     assert result.status == "refused"
     assert shell.requests == []
 
     background_shell = RecordingShellBoundary()
-    background = ToolGateway(
-        context=ToolExecutionContext(
-            lane="scheduled_work",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=background_shell,
-    )
+    background = _shell_gateway(workspace=workspace, shell=background_shell)
 
-    background_result = await background.execute(tool_call)
+    background_result = await background.call(tool_call)
     assert background_result.status == "refused"
     assert background_shell.requests == []
 
@@ -573,22 +488,14 @@ async def test_git_info_attributes_filter_refuses_an_allowlisted_command(
         encoding="utf-8",
     )
     shell = RecordingShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_git_status_info_attributes",
         name="shell",
-        arguments={"command": "git status", "timeout": 60},
+        arguments='{"command":"git status","timeout":60}',
     )
 
-    result = await gateway.execute(tool_call)
+    result = await gateway.call(tool_call)
 
     assert result.status == "refused"
     assert shell.requests == []
@@ -612,22 +519,14 @@ async def test_global_git_filter_configuration_is_not_automatically_allowed(
         encoding="utf-8",
     )
     shell = RecordingShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_global_git_filter",
         name="shell",
-        arguments={"command": "git status --short", "timeout": 60},
+        arguments='{"command":"git status --short","timeout":60}',
     )
 
-    result = await gateway.execute(tool_call)
+    result = await gateway.call(tool_call)
 
     assert result.status == "refused"
     assert shell.requests == []
@@ -665,22 +564,14 @@ async def test_included_git_filter_configuration_is_not_automatically_allowed(
         encoding="utf-8",
     )
     shell = RecordingShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_included_git_filter",
         name="shell",
-        arguments={"command": "git diff --stat", "timeout": 60},
+        arguments='{"command":"git diff --stat","timeout":60}',
     )
 
-    result = await gateway.execute(tool_call)
+    result = await gateway.call(tool_call)
 
     assert result.status == "refused"
     assert shell.requests == []
@@ -720,22 +611,14 @@ async def test_worktree_git_filter_configuration_is_not_automatically_allowed(
         encoding="utf-8",
     )
     shell = RecordingShellBoundary()
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id=("20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"),
-        ),
-        shell=shell,
-    )
+    gateway = _shell_gateway(workspace=workspace, shell=shell)
     tool_call = ModelToolCall(
         id="call_worktree_git_filter",
         name="shell",
-        arguments={"command": "git diff --name-only", "timeout": 60},
+        arguments='{"command":"git diff --name-only","timeout":60}',
     )
 
-    result = await gateway.execute(tool_call)
+    result = await gateway.call(tool_call)
 
     assert result.status == "refused"
     assert shell.requests == []

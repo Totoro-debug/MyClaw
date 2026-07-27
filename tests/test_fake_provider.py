@@ -24,7 +24,11 @@ async def test_scripted_fake_provider_replays_stream_events_in_order() -> None:
         message=AssistantModelMessage(
             content="Hello",
             tool_calls=(
-                ModelToolCall(id="call_123", name="read_file", arguments={"path": "CONTEXT.md"}),
+                ModelToolCall(
+                    id="call_123",
+                    name="read_file",
+                    arguments='{"path":"CONTEXT.md"}',
+                ),
             ),
         ),
         usage=ModelUsage(input_tokens=10, output_tokens=2, total_tokens=12),

@@ -1,4 +1,4 @@
-"""Fixed first-version Permission Policy for Shell commands."""
+"""Fixed first-version safe policy for Shell commands."""
 
 import os
 import shutil
@@ -49,7 +49,7 @@ _TRUSTED_GIT_EXECUTABLE: Final = _capture_git_executable()
 
 
 class ShellPolicyDenied(PermissionError):
-    """Raised when a Shell request cannot enter permission evaluation."""
+    """Raised when a Shell request cannot be normalized safely."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -65,7 +65,7 @@ from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplIn
 from myclaw.tools.base import BaseTool
 from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
 from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
-from myclaw.tools.models import ToolExecutionContext, ToolExecutionLane, ToolResult
+from myclaw.tools.models import ToolResult
 from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.tools.security import Security
 from myclaw.tools.shell.shell_process import SubprocessShellBoundary
@@ -365,11 +365,6 @@ class _DeferredConversationPort:
             if self._active_done is active_done:
                 self._active_done = None
 
-    async def resolve_permission(self, request_id: UUID, approved: bool) -> None:
-        if self._delegate is None:
-            raise RuntimeError("No foreground turn is active")
-        await self._delegate.resolve_permission(request_id, approved)
-
     async def cancel_active_turn(self) -> None:
         delegate = self._delegate
         if delegate is not None:
@@ -482,7 +477,6 @@ def prepare_repl_runtime(
         new_uuid=new_uuid,
     )
     tool_gateway = _build_tool_gateway(
-        lane="foreground",
         workspace=workspace_identity,
         agent_home=agent_home,
         session_id=metadata.id,
@@ -546,7 +540,6 @@ def prepare_repl_runtime(
 
     def scheduled_work_gateway_for(session_id: str) -> ToolGateway:
         return _build_tool_gateway(
-            lane="scheduled_work",
             workspace=workspace_identity,
             agent_home=agent_home,
             session_id=session_id,
@@ -616,7 +609,6 @@ def prepare_repl_runtime(
 
     def conversation_for(session_id: str) -> ConversationPort:
         session_tool_gateway = _build_tool_gateway(
-            lane="foreground",
             workspace=workspace_identity,
             agent_home=agent_home,
             session_id=session_id,
@@ -686,7 +678,6 @@ def prepare_repl_runtime(
 
 def _build_tool_gateway(
     *,
-    lane: ToolExecutionLane,
     workspace: Workspace,
     agent_home: AgentHome,
     session_id: str,
@@ -695,18 +686,7 @@ def _build_tool_gateway(
     shell: ShellBoundary | None,
     scheduled_work: CreateScheduledWorkTool,
 ) -> ToolGateway:
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane=lane,
-            workspace=Path(workspace.path),
-            agent_home=agent_home.path,
-            session_id=session_id,
-        ),
-        web_search=web_search,
-        web_fetch=web_fetch,
-        shell=shell,
-        scheduled_work=scheduled_work,
-    )
+    gateway = ToolGateway()
     security = Security(
         workspace=workspace,
         agent_home=agent_home.path,

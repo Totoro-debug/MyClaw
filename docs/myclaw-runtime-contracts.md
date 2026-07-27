@@ -9,9 +9,9 @@
 - 产品行为来源：`docs/myclaw-personal-agent-prd.md`
 - 实施顺序来源：`docs/myclaw-implementation-plan.md`
 
-本文把已确认的产品行为细化为可直接实现的类型、文件 schema 和代码边界。来自 canonical 文档的行为与 D01-D16 已于 2026-07-11 一并接受；后续变更必须先更新本契约及受影响的 PRD/ADR。
+本文把已确认的产品行为细化为可直接实现的类型、文件 schema 和代码边界。来自 canonical 文档的行为与 D01-D16 已于 2026-07-11 一并接受；Issue #38 于 2026-07-27 收缩了 Tool 契约，本文对应章节以该已批准规格为准。后续变更必须先更新本契约及受影响的 PRD/ADR。
 
-本文不新增 one-shot、daemon、HTTP/IPC、MCP、subagent、跨进程协调、用户可配置 Permission Policy 或用户自定义 identity。
+本文不新增 one-shot、daemon、HTTP/IPC、MCP、subagent、跨进程协调、用户可配置安全策略或用户自定义 identity。
 
 ## 1. 契约通则
 
@@ -43,7 +43,7 @@
 
 - UUID 均使用小写、带连字符的 UUID4。
 - Session ID 使用 `<local_timestamp>_<uuid4>`：`YYYYMMDD-HHMMSS-ffffff_550e8400-e29b-41d4-a716-446655440000`。
-- Scheduled Work ID、turn ID、message ID 和 permission request ID 使用 UUID4。
+- Scheduled Work ID、turn ID 和 message ID 使用 UUID4。
 - provider 返回的 tool call ID 原样保存在 message 中，不在业务层重新命名。
 - Tool Artifact 文件名使用 tool call ID 的 UTF-8 percent-encoding，通常为 `safe="-_."`；Windows 保留 basename（`CON`、`PRN`、`AUX`、`NUL`、`COM1`-`COM9`、`LPT1`-`LPT9`）全量编码，避免保留名以及 `/`、`\\`、`:` 等字符破坏路径；逻辑路径仍对应原 tool call ID。
 
@@ -61,12 +61,12 @@
 | D08 | route fallback 发生在具体 route 缺失、配置不可用或返回永久 route/provider 不可用错误时；同一 route 的临时错误先在 5-attempt budget 内重试 | 避免两个 route 各重试 5 次导致不可控延迟 | PRD |
 | D09 | token estimate 使用 `ceil(UTF-8 byte length / 4)`，展示估算输入 token、context window 和占比 | provider-neutral，明确它只是估算值 | PRD 可补充 |
 | D10 | WebSearch 使用无凭据的内置 adapter，首选 DuckDuckGo；后端不进入持久化配置契约 | 保持 User Configuration 只控制 enablement，adapter 可替换 | PRD |
-| D11 | Shell 自动 allowlist 只包含本文列出的精确只读命令形状；其他语法有效且 cwd 合法的命令一律 ask | 规则可审计，不做不可靠的“只读意图”推断 | PRD |
+| D11 | Shell allowlist 只包含本文列出的精确只读命令形状；Issue #38 期间其他命令一律 refused | 规则可审计，不做不可靠的“只读意图”推断；这是对 ADR-0003 的临时偏离 | PRD/Issue #38 |
 | D12 | session 仅允许恢复单个不完整尾行；中间损坏或完整但非法的尾行视为损坏并拒绝加载 | 兼顾 append 崩溃恢复与不静默跳过历史 | PRD/ADR 0001 可补充 |
 | D13 | 使用 `memory/pending-consolidations/` journal 协调 summary append 与 session cursor 更新 | summary schema 不能保存 source identity，持久化 journal 才能确定性恢复崩溃窗口 | ADR 0001 |
 | D14 | Tool Artifact preview 保留前 `2000` 字符，加固定截断提示和相对路径 | 给模型足够上下文，同时稳定控制 session 大小 | PRD 可补充 |
-| D15 | 配置、持久化、模型、工具、记忆错误使用本文的稳定 error code；终端文案可变 | 测试和上层逻辑不依赖易变文案 | 实施契约 |
-| D16 | 首版 Shell 不宣称提供 OS 级文件系统/网络隔离；强制 Workspace cwd，自动 allow 仅限精确只读命令，其他命令只可由前台用户确认 | 仅校验 cwd 无法约束子进程访问绝对路径，不能制造虚假的 sandbox 保证 | PRD/ADR 0003 |
+| D15 | 配置、持久化、模型与服务级错误使用稳定 error code；`ToolError` 与 Tool Result 仅使用安全 message | Tool 消息与模型消费格式保持扁平，其他上层逻辑仍不依赖易变终端文案 | 实施契约/Issue #38 |
+| D16 | 首版 Shell 不宣称提供 OS 级文件系统/网络隔离；强制 Workspace cwd，执行仅限精确只读命令 | 仅校验 cwd 无法约束子进程访问绝对路径，不能制造虚假的 sandbox 保证 | PRD/ADR 0003/Issue #38 |
 
 D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D13、D16 是已显式接受的产品或风险边界。
 
@@ -269,13 +269,13 @@ timeout = 120
 ### 5.3 Assistant message
 
 ```json
-{"record_type":"message","id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","created_at":"2026-07-11T15:30:13.000+08:00","role":"assistant","content":"I will inspect the files.","tool_calls":[{"id":"call_123","name":"list_files","arguments":{"path":"."}}],"status":"completed","error":null,"usage":{"input_tokens":120,"output_tokens":24,"total_tokens":144}}
+{"record_type":"message","id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","created_at":"2026-07-11T15:30:13.000+08:00","role":"assistant","content":"I will inspect the files.","tool_calls":[{"id":"call_123","name":"list_files","arguments":"{\"path\":\".\"}"}],"status":"completed","error":null,"usage":{"input_tokens":120,"output_tokens":24,"total_tokens":144}}
 ```
 
 字段规则：
 
 - `content` 是 string，可为空；`tool_calls` 是 array，可为空；两者至少一个非空，除非 `status=error`。
-- tool call `arguments` 必须是解析后的 JSON object。adapter 无法解析参数时仍产生 tool call，Runtime Core 为它追加 `tool` error record，不执行工具。
+- tool call `arguments` 必须保留 provider 的原始 JSON string。Tool Gateway 无法解析时追加 flat `tool` error record，不执行具体 Tool。
 - `status` 仅为 `completed`、`interrupted`、`error`。
 - `error` 在 `completed` 时必须为 `null`；其他状态为 `{code, message}`，message 必须可安全展示。
 - streaming 正常完成后才写一条 `completed` assistant record。
@@ -294,13 +294,13 @@ timeout = 120
 普通结果：
 
 ```json
-{"record_type":"message","id":"9b2c3a42-1d2e-4a1e-a827-61f36dc54713","created_at":"2026-07-11T15:30:13.500+08:00","role":"tool","tool_call_id":"call_123","name":"list_files","content":"CONTEXT.md\ndocs/","status":"success","error":null,"artifact":null}
+{"record_type":"message","id":"9b2c3a42-1d2e-4a1e-a827-61f36dc54713","created_at":"2026-07-11T15:30:13.500+08:00","role":"tool","tool_call_id":"call_123","name":"list_files","content":"CONTEXT.md\ndocs/","status":"success","artifact":null}
 ```
 
 拒绝或失败：
 
 ```json
-{"record_type":"message","id":"9b2c3a42-1d2e-4a1e-a827-61f36dc54713","created_at":"2026-07-11T15:30:13.500+08:00","role":"tool","tool_call_id":"call_123","name":"write_file","content":"Permission denied by user.","status":"refused","error":{"code":"tool_refused","message":"Permission denied by user."},"artifact":null}
+{"record_type":"message","id":"9b2c3a42-1d2e-4a1e-a827-61f36dc54713","created_at":"2026-07-11T15:30:13.500+08:00","role":"tool","tool_call_id":"call_123","name":"write_file","content":"Writing Workspace files is unavailable because confirmation is not implemented.","status":"refused","artifact":null}
 ```
 
 字段规则：
@@ -308,7 +308,8 @@ timeout = 120
 - `status` 仅为 `success`、`error`、`refused`。
 - tool 参数校验失败、执行异常和未完成 call 都使用 `error`，不新增 role。
 - tool result 会回传模型，因此 `content` 必须是 normalized、可读的 UTF-8 text，不包含 Python repr 或 traceback。
-- tool call 不自动 retry。
+- Tool Gateway 按具体 Tool 的 `max_retries` 执行有界指数退避；WebSearch/WebFetch 为 2，其余内置 Tool 为 0。
+- 旧的 structured arguments 和 nested Tool error JSONL shape 不兼容且不恢复读取。
 
 ### 5.5 Session title
 
@@ -405,7 +406,7 @@ runtime 启动时先恢复所有 journal，再接受新 chat turn。journal 是 
 - `session_id` 在创建记录时分配；session 文件在首次 trigger 写入 user message 时才创建。
 - store update 在单 runtime lock 内执行整体 JSON array 原子 rewrite。
 - 单条 record 非法使整个文件配置无效，scheduler 不启动；REPL 主对话仍可运行并通过 `/status` 显示 scheduler error。不得静默丢弃非法任务。
-- 创建 Scheduled Work 是 `ask`；拒绝时不分配持久化 record。
+- 当前 Tool contract 固定拒绝创建 Scheduled Work；拒绝时不分配持久化 record。
 - task-specific session 使用普通 session schema；每次 trigger 追加 prompt user message和最终 assistant/tool history。
 
 ## 8. Prompt、Runtime Context 与预算
@@ -418,7 +419,7 @@ chat 和 cron 的 system-level context 按以下固定顺序组装：
 2. 完整的 runtime-startup Long-term Memory snapshot，以明确的 `<long_term_memory>` delimiter 包裹。
 3. 当前 Tool Catalog 的 guidance，以明确的 `<tool_guidance>` delimiter 包裹。
 
-User Configuration 不得插入或替换 identity/system prompt。Tool definitions 通过 provider 的结构化 tools 字段发送，不把 JSON schema 重复拼入自然语言 guidance。
+User Configuration 不得插入或替换 identity/system prompt。缓存的 OpenAI-format Tool schema snapshots 通过 provider 的结构化 tools 字段发送，不把 JSON schema 重复拼入自然语言 guidance。
 
 ### 8.2 当前 user input 的 Runtime Context
 
@@ -492,7 +493,7 @@ ModelRequest(
     route: Literal["default", "chat", "memory", "cron"],
     system_prompt: str,
     messages: tuple[ModelMessage, ...],
-    tools: tuple[ToolDefinition, ...],
+    tools: tuple[OpenAIToolSchema, ...],
     stream: bool,
     model: str,
     max_output: int,
@@ -502,7 +503,7 @@ ModelRequest(
 )
 ```
 
-provider adapter 接收已解析的 concrete route config，不自行 fallback、不读取 User Configuration、不处理 session。
+`OpenAIToolSchema` 是由 Tool Catalog 缓存的 OpenAI Function Calling 格式快照。OpenAI-compatible adapter 直接传递该格式；Anthropic adapter 在内部转换字段。provider adapter 接收已解析的 concrete route config，不自行 fallback、不读取 User Configuration、不处理 session。
 
 ### 9.3 统一响应与 streaming
 
@@ -565,14 +566,13 @@ adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不
 | `text_delta` | `{delta}` | chat streaming 文本 |
 | `progress` | `{status, summary}` | 非敏感进度 |
 | `tool_started` | `{tool_call_id, tool_name, summary}` | 不含完整 arguments |
-| `permission_requested` | `{request_id, tool_call_id, tool_name, action, resource, risk_summary}` | CLI 必须响应或取消 |
 | `tool_completed` | `{tool_call_id, tool_name, status, summary}` | 不含完整 raw result |
 | `turn_completed` | `{content, usage}` | 一个 turn 恰好一个终态 |
 | `turn_failed` | `{error}` | 安全的用户可见错误 |
 | `turn_cancelled` | `{partial_content}` | Ctrl+C 终态 |
 | `background_completed` | `{kind, title, session_id, status, summary}` | Scheduled Work 空闲提示；Memory Task 周期运行不发 |
 
-事件状态 summary 最长 240 字符。tool argument 和 raw result 只能在 permission 所需的最小 `resource` 中展示，不进入普通 tool activity event。
+事件状态 summary 最长 240 字符。tool argument 和 raw result 不进入普通 tool activity event。当前契约没有 permission request event 或等待确认状态。
 
 ### 10.3 Conversation Port
 
@@ -581,12 +581,10 @@ adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不
 ```python
 class ConversationPort(Protocol):
     def submit(self, text: str) -> AsyncIterator[AgentEvent]: ...
-    async def resolve_permission(self, request_id: UUID, approved: bool) -> None: ...
     async def cancel_active_turn(self) -> None: ...
 ```
 
 - 同一 port 同时只允许一个 foreground `submit`；REPL 自身串行化输入。
-- permission request 在被响应前暂停当前 tool call；取消 turn 会解除等待。
 - Conversation Port 不接受 session ID、route、provider 或 tool catalog 参数。
 
 ### 10.4 Management Port
@@ -610,38 +608,37 @@ class ManagementPort(Protocol):
 
 ## 11. Tool Gateway 契约
 
-### 11.1 Tool definition 与调用结果
+### 11.1 Tool schema、调用与结果
 
 ```python
-ToolDefinition(name: str, description: str, input_schema: JsonObject)
+OpenAIToolSchema = {
+    "type": "function",
+    "function": {"name": str, "description": str, "parameters": JsonObject},
+}
+
+ModelToolCall(id: str, name: str, arguments: str)  # arguments 是原始 JSON 文本
 
 ToolResult(
     tool_call_id: str,
     name: str,
     status: Literal["success", "error", "refused"],
     content: str,
-    error: ErrorInfo | None,
     artifact: ArtifactReference | None,
 )
 ```
 
-执行顺序固定为：resolve -> validate arguments -> evaluate enablement -> evaluate path/sandbox -> evaluate permission -> execute once -> normalize -> externalize if needed。
+`BaseTool.to_schema()` 从具体 Tool 类直接声明的公开注解、显式 `required`、默认值和 `ToolParam` 统一生成 schema，具体 Tool 不得覆盖。`ToolGateway.call()` 是唯一公开调用入口，顺序固定为：parse raw JSON -> resolve -> project/convert/validate -> refuse if required -> execute with bounded retry -> normalize。未声明参数被忽略；只允许规格定义的 string-to-integer、integral-float-to-integer 和 string-to-boolean 转换。解析、prepare 和 refusal 不重试，取消继续向上传播。
 
-### 11.2 Execution context
+`max_retries` 必须在 `0..5`，表示首次执行之外的额外次数；重试前依次等待 1、2、4、8、16 秒。WebSearch 和 WebFetch 为 2，其余内置 Tool 为 0。执行阶段的普通异常都可消耗已声明的重试预算，最终 `ToolError` 返回其安全 message，其他异常返回 capability-specific generic message；`CancelledError` 等 `BaseException` 不被捕获。
 
-```python
-ToolExecutionContext(
-    lane: Literal["foreground", "scheduled_work", "memory_task"],
-    workspace: Path,
-    agent_home: Path,
-    session_id: str,
-)
-```
+### 11.2 Catalog 与依赖所有权
 
-- foreground 的 `ask` 产生 permission event。
-- scheduled_work 的 `ask` 自动转为 refused。
-- memory_task 使用独立 restricted catalog，不继承 main Agent write permission。
+- Runtime Core 在启动时构造具体 `BaseTool`，注入 Workspace、`Security`、store、client、clock 等稳定专用依赖，并一次性注册完整 catalog。
+- Tool 调用不接收 session ID、Agent Home、lane、approval flag 或通用 execution context。
+- `Security` 实现公共访问边界，具体 Tool 保留 capability-specific 规则和同步 `refusal_reason()`。
+- Memory Task 使用标准 Tool Gateway 和仅含专用 Long-term Memory read/edit Tool 的 catalog。
 - Tool Gateway 不在前台/后台之间加全局执行锁。
+- Tool Gateway 不设置统一 timeout，不持久化 Tool Result，也不创建 Tool Artifact。
 
 ### 11.3 内置 file tools
 
@@ -652,19 +649,19 @@ ToolExecutionContext(
 | `read_file` | `path: str`, `offset: int = 0`, `limit: int = 2000` | 读取 UTF-8 文本行；二进制/解码失败返回 error |
 | `list_files` | `path: str = "."`, `recursive: bool = false`, `max_entries: int = 1000` | 稳定排序的相对路径列表 |
 | `search_files` | `query: str`, `path: str = "."`, `glob: str | null`, `max_results: int = 200` | 文本搜索，返回 path/line/preview |
-| `write_file` | `path: str`, `content: str` | 创建或整体替换，Workspace 内 ask |
-| `edit_file` | `path: str`, `old_text: str`, `new_text: str`, `replace_all: bool = false` | 精确文本替换，Workspace 内 ask |
+| `write_file` | `path: str`, `content: str` | 当前固定 refused，不执行 Workspace 写入 |
+| `edit_file` | `path: str`, `old_text: str`, `new_text: str`, `replace_all: bool = false` | 当前固定 refused，不执行 Workspace 编辑 |
 
 参数上限：`limit 1..10000`、`max_entries 1..10000`、`max_results 1..1000`。`old_text` 为空无效；`replace_all=false` 时匹配数必须恰好为 1。
 
 主 Agent file access：
 
 - Workspace 内 read/list/search：allow。
-- Workspace 内 write/edit：ask。
-- Agent Home 的 `memory/memory.md`：read allow，write/edit deny。
-- 当前 session 的 artifact directory：read allow，write/edit deny。
-- `config.toml`、session JSONL、summary、cursor、Scheduled Work JSON 和其他 Agent Home 内部路径：file tools read/write/edit 均 deny；这些内容只通过对应 Port/Store 暴露。
-- 其他路径：deny，不升级为 ask。
+- Workspace 内 write/edit：refused。
+- Agent Home 的 `memory/memory.md`：main catalog read allow，write/edit refused；Memory Task 专用 edit Tool 仅允许精确文件。
+- 当前 session 的 artifact directory：read allow，write/edit refused。
+- `config.toml`、session JSONL、summary、cursor、Scheduled Work JSON 和其他 Agent Home 内部路径：main file Tools read/write/edit 均 fail closed；这些内容只通过对应 Port/Store 暴露。
+- 其他路径：fail closed，不升级为 confirmation。
 
 路径检查必须基于解析后的目标和最近存在父目录，防止 `..`、symlink、junction/reparse point 越界。拒绝访问 device file、named pipe 和非普通文件。
 
@@ -684,7 +681,7 @@ ToolExecutionContext(
 - `cwd` 缺省为 Workspace，解析后必须在 Workspace 内。
 - `timeout` 必须在 `60..600` 秒。
 - `tools.shell.enabled=false` 时不进入 catalog。
-- 命令通过当前平台 shell 执行；permission 判定使用原始完整命令的严格解析，不能只检查字符串前缀。
+- 命令通过当前平台 shell 执行；安全策略使用原始完整命令的严格解析，不能只检查字符串前缀。
 - 含管道、重定向、命令替换、后台符号、多命令分隔符或控制字符的命令不可能自动 allow。
 
 自动 allowlist 仅包括以下精确形状：
@@ -697,9 +694,9 @@ git diff --stat
 git diff --name-only
 ```
 
-执行 `git diff` 变体时 adapter 强制禁用 pager、external diff 和 textconv。其他语法有效的命令默认 ask；cwd 越界、timeout 越界或命令包含 NUL/control characters 时 deny。用户不能扩展 allowlist。
+执行 `git diff` 变体时 adapter 强制禁用 pager、external diff 和 textconv。其他命令一律 refused；cwd 越界、timeout 越界或命令包含 NUL/control characters 同样 fail closed。用户不能扩展 allowlist。
 
-重要边界：首版不宣称 Shell 子进程受到 OS 级文件系统或网络 sandbox。Workspace 限制严格作用于 `cwd` 和自动 allowlist；前台用户确认的命令仍可能显式引用 Workspace 外路径。Scheduled Work 无法接受确认，因此只能运行 allowlist 命令。若产品要求“即使用户确认也绝不访问 Workspace 外路径”，必须先选择 Windows/POSIX 对应的进程隔离方案并新增安全 ADR，不能通过字符串扫描命令来伪造该保证。
+重要边界：首版不宣称 Shell 子进程受到 OS 级文件系统或网络 sandbox。Workspace 限制严格作用于 `cwd` 和固定 allowlist。Issue #38 暂时拒绝所有非 allowlist 命令，明确偏离 ADR-0003 要求的前台确认；该偏离不增加 OS 隔离保证。若产品要求“绝不访问 Workspace 外路径”，必须先选择 Windows/POSIX 对应的进程隔离方案并新增安全 ADR，不能通过字符串扫描命令来伪造该保证。
 
 ### 11.5 Web tools
 
@@ -740,16 +737,16 @@ git diff --name-only
 }
 ```
 
-- foreground 固定 ask；scheduled_work/background context 中调用固定 refused，避免任务递归创建持久化任务。
-- 接受后生成 id、created_at、enabled 和 session_id，并原子更新 store。
+- 当前 foreground 与 Scheduled Work catalog 中调用均固定 refused，不分配 ID、不写 store，也不进入重试。
+- 未来确认设计恢复创建能力后，成功执行才生成 id、created_at、enabled 和 session_id，并原子更新 store。
 - 创建时不分析 prompt 未来是否需要 disabled tools。
 
 ### 11.7 Tool Artifact
 
-当 `len(raw_content) > runtime.max_tool_result_chars`：
+Tool Gateway 返回以后，Runtime Core 仅在 `status == "success"` 且 `len(raw_content) > runtime.max_tool_result_chars` 时：
 
 1. 把完整 raw content 原子写入 `artifacts/<session_id>/<encoded_tool_call_id>.txt`。
-2. session/tool result 的 `content` 变为前 2000 字符加：
+2. 以 immutable replacement 创建新的 Tool Result，其 `content` 为前 2000 字符加：
 
 ```text
 
@@ -762,25 +759,25 @@ git diff --name-only
 {"path":"artifacts/<session_id>/<encoded_tool_call_id>.txt","total_chars":73421,"preview_chars":2000}
 ```
 
-Artifact 写失败时整个 tool result 为 `error`，不得把超阈值 raw content 回退写入 session。
+Artifact 写失败时整个 tool result 为 `error`，不得把超阈值 raw content 回退写入 session。Externalization 没有 callback、commit、rollback 或 cleanup 生命周期；文件写成功后若 Session persistence 失败，允许留下 orphan artifact。
 
-## 12. Permission Policy 矩阵
+## 12. Fail-closed capability 矩阵
 
 | Capability | Foreground | Scheduled Work | Memory Task |
 | --- | --- | --- | --- |
 | Workspace read/list/search | allow | allow | 不在 catalog |
-| Workspace write/edit | ask | refused | 不在 catalog |
+| Workspace write/edit | refused | refused | 不在 catalog |
 | Long-term Memory read | allow | allow | allow |
-| Long-term Memory edit | deny | deny | allow，仅精确文件 |
+| Long-term Memory edit | refused | refused | allow，仅精确文件 |
 | Current-session artifact read | allow | allow | 不在 catalog |
-| Agent Home internal state read/write | deny | deny | deny，memory store 自身操作除外 |
+| Agent Home internal state read/write | refused | refused | refused，memory store 自身操作除外 |
 | Shell allowlist | allow | allow | 不在 catalog |
-| 其他合法 Shell | ask | refused | 不在 catalog |
+| 其他 Shell | refused | refused | 不在 catalog |
 | WebSearch/WebFetch | allow if enabled | allow if enabled | 不在 catalog |
-| Create Scheduled Work | ask | refused | 不在 catalog |
-| Workspace/Agent Home 之外 | deny | deny | deny |
+| Create Scheduled Work | refused | refused | 不在 catalog |
+| Workspace/Agent Home 之外 | refused/error | refused/error | refused/error |
 
-`refused` 是需要确认但当前 execution context 无法确认；`deny` 是无论用户确认都不可执行。两者都产生 tool result，但使用不同 error code。
+当前 Tool 契约没有 centralized Permission Policy、`ask`、approval flag 或 execution context。危险 capability 在执行前返回 `refused`；无效参数、越界访问和执行失败返回 message-only `error`。Tool Result 不携带 error code 或嵌套 `ErrorInfo`。
 
 ## 13. Error Contract
 
@@ -795,7 +792,7 @@ ErrorInfo(
 )
 ```
 
-`message` 必须安全、简短、可面向用户；cause、traceback、SDK response body 只存在于瞬时诊断上下文，不写 session 或 Agent Event。首版无持久化 runtime log。
+`ErrorInfo` 仍用于 model、assistant turn 和 service-level error contract，不用于 `ToolError` 或 Tool Result。`ToolError` 只有安全的 message；cause、traceback、SDK response body 只存在于瞬时诊断上下文，不写 Tool message 或 Agent Event。首版无持久化 runtime log。
 
 ### 13.2 稳定 code
 
@@ -818,7 +815,7 @@ ErrorInfo(
 | `tool_not_found` | 未注册工具 | 否 |
 | `tool_invalid_arguments` | JSON/schema 参数无效 | 否 |
 | `tool_denied` | 内置 policy 禁止 | 否 |
-| `tool_refused` | 用户拒绝或后台 ask 自动拒绝 | 否 |
+| `tool_refused` | service-level Tool refusal projection | 否 |
 | `tool_failed` | 工具执行失败 | 否 |
 | `memory_task_running` | Memory Task 不重入 | 否 |
 | `scheduled_work_invalid` | cron/record 无效 | 否 |
@@ -879,13 +876,16 @@ class ModelProvider(Protocol):
     async def complete(self, request: ModelRequest) -> ModelResponse: ...
     async def close(self) -> None: ...
 
-class Tool(Protocol):
-    @property
-    def definition(self) -> ToolDefinition: ...
-    async def execute(self, arguments: JsonObject, context: ToolExecutionContext) -> str: ...
+class ConcreteTool(BaseTool):
+    name = "capability_name"
+    description = "Model-visible capability description."
+    required = ("value",)
+    value: Annotated[str, ToolParam(description="Declared parameter.")]
+
+    async def execute(self, *, value: str) -> str: ...
 ```
 
-Permission、artifact externalization、exception normalization 和 retry 不由具体 Tool 实现；它们属于 Tool Gateway。route resolution 与 retry 不由 ModelProvider 实现；它们属于 Model Router。
+参数解析、结果标准化和 bounded retry 属于 Tool Gateway；公共安全边界属于注入的 `Security`；capability-specific 规则属于具体 Tool；Artifact externalization 属于 Runtime Core。route resolution 与 retry 不由 ModelProvider 实现；它们属于 Model Router。
 
 ## 16. 契约测试清单
 
@@ -893,17 +893,17 @@ Phase 0 应先把以下内容固化为 fixtures/snapshots：
 
 - 默认 config template 与一个完整有效 config。
 - config unknown field、unknown route、unknown protocol 和 redaction cases。
-- 四种 session records：metadata、user、assistant mixed content/tool calls、tool artifact/error。
+- 四种 session records：metadata、user、assistant mixed content/raw tool calls、flat tool artifact/error。
 - 完成、中断、model failure、tool failure 后的完整 session JSONL snapshots。
 - summary schema exact-key assertion、index/cursor 起点和 batch 行为。
 - Scheduled Work JSON exact-key assertion。
 - 全部 Agent Event payload schema 与事件顺序。
 - Model Provider scripted transcript：text deltas、tool call deltas、usage、retry-after、timeout、cancellation。
-- Tool permission 矩阵、file path boundary、Shell exact allowlist 和 WebFetch redirect/IP cases。
+- Tool fail-closed matrix、file path boundary、Shell exact allowlist 和 WebFetch redirect/IP cases。
 - atomic rewrite、incomplete final JSONL line、middle corruption 和 consolidation crash window。
 
 契约测试断言稳定 code、结构和文件内容；终端文案除脱敏与必需信息外不做全文 snapshot，以免实现被展示细节锁死。
 
 ## 17. 确认记录
 
-D01-D16 已于 2026-07-11 全部接受。产品与风险边界同步到 PRD 和 ADR；本文 schema 是 Phase 0 Python 类型、持久化实现与 contract fixtures 的直接输入。
+D01-D16 已于 2026-07-11 全部接受，Tool 契约由 Issue #38 于 2026-07-27 更新。ADR-0001 和 ADR-0002 继续有效；非 allowlist Shell 暂时直接拒绝的行为是对 ADR-0003 前台确认规则的已批准临时偏离。本文 schema 是 Python 类型、持久化实现与 contract fixtures 的直接输入。
