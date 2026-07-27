@@ -727,6 +727,7 @@ def _build_tool_gateway(
         tools.append(WebFetchTool(fetcher=web_fetch))
     if shell is not None:
         tools.append(ShellTool(workspace=Path(workspace.path), boundary=shell))
+    tools.append(scheduled_work)
     gateway.register_tools(tuple(tools))
     return gateway
 

@@ -5,15 +5,15 @@ import json
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Annotated, cast
 from uuid import UUID
 
 from myclaw.config.agent_home import AgentHome
 from myclaw.schedule.records import ScheduledWork, serialize_scheduled_work
 from myclaw.session.identifiers import make_session_id
-from myclaw.tools.models import ToolDefinition, ToolExecutionContext
+from myclaw.tools.base import BaseTool
+from myclaw.tools.schema import ToolParam
 from myclaw.utils.atomic_files import atomic_replace_text
-from myclaw.utils.json_types import JsonObject
 
 _RECORD_FIELDS = frozenset({"id", "title", "cron", "prompt", "created_at", "enabled", "session_id"})
 
@@ -72,23 +72,25 @@ class JsonScheduledWorkStore:
         return tuple(_parse_record(value) for value in document)
 
 
-class CreateScheduledWorkTool:
-    """Create one enabled Scheduled Work record after Gateway approval."""
+class CreateScheduledWorkTool(BaseTool):
+    """Declare and directly persist one enabled Scheduled Work record."""
 
-    _definition = ToolDefinition(
-        name="create_scheduled_work",
-        description="Create recurring work with a five-field cron schedule.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "minLength": 1, "maxLength": 120},
-                "cron": {"type": "string", "minLength": 1},
-                "prompt": {"type": "string", "minLength": 1, "maxLength": 20000},
-            },
-            "required": ["title", "cron", "prompt"],
-            "additionalProperties": False,
-        },
-    )
+    name = "create_scheduled_work"
+    description = "Create recurring work with a five-field cron schedule."
+    required = ("title", "cron", "prompt")
+
+    title: Annotated[
+        str,
+        ToolParam(description="Short task title.", min_length=1, max_length=120),
+    ]
+    cron: Annotated[
+        str,
+        ToolParam(description="Five-field cron schedule.", min_length=1),
+    ]
+    prompt: Annotated[
+        str,
+        ToolParam(description="Task prompt.", min_length=1, max_length=20000),
+    ]
 
     def __init__(
         self,
@@ -101,18 +103,18 @@ class CreateScheduledWorkTool:
         self._now = now
         self._new_uuid = new_uuid
 
-    @property
-    def definition(self) -> ToolDefinition:
-        return self._definition
+    def refusal_reason(self, *, title: str, cron: str, prompt: str) -> str:
+        del title, cron, prompt
+        return "Scheduled Work creation is unavailable because confirmation is not implemented."
 
-    async def execute(self, arguments: JsonObject, context: ToolExecutionContext) -> str:
+    async def execute(self, *, title: str, cron: str, prompt: str) -> str:
         created_at = self._now()
         try:
             record = ScheduledWork(
                 id=str(self._new_uuid()),
-                title=_required_string(arguments, "title"),
-                cron=_required_string(arguments, "cron"),
-                prompt=_required_string(arguments, "prompt"),
+                title=title,
+                cron=cron,
+                prompt=prompt,
                 created_at=created_at,
                 enabled=True,
                 session_id=make_session_id(created_at, self._new_uuid()),

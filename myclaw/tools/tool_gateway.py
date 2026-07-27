@@ -61,7 +61,7 @@ class ToolGateway:
         web_search: WebSearchBoundary | None = None,
         web_fetch: WebFetchBoundary | None = None,
         shell: ShellBoundary | None = None,
-        scheduled_work: Tool | None = None,
+        scheduled_work: Tool | BaseTool | None = None,
         max_tool_result_chars: int | None = None,
         artifact_writer: object | None = None,
         sleep: Sleep = asyncio.sleep,
@@ -80,8 +80,6 @@ class ToolGateway:
             catalog = ()
         elif tools is None:
             catalog = ()
-            if scheduled_work is not None:
-                catalog += (scheduled_work,)
         else:
             catalog = tools
         self._tools = {tool.definition.name: tool for tool in catalog}
@@ -121,6 +119,8 @@ class ToolGateway:
                 migrated_tools.append(
                     ShellTool(workspace=context.workspace, boundary=shell)
                 )
+            if isinstance(scheduled_work, BaseTool):
+                migrated_tools.append(scheduled_work)
             migrated_schemas = tuple(tool.to_schema() for tool in migrated_tools)
             self._registered_tools = {tool.name: tool for tool in migrated_tools}
             self._schemas = tuple(deepcopy(schema) for schema in migrated_schemas)

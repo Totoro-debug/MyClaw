@@ -1994,7 +1994,7 @@ async def test_runtime_scheduled_work_refuses_recursive_task_creation(
     assert recursive_result.name == "create_scheduled_work"
     assert recursive_result.status == "refused"
     assert recursive_result.content == (
-        "The requested operation requires unavailable user confirmation."
+        "Scheduled Work creation is unavailable because confirmation is not implemented."
     )
 
 

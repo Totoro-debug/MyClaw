@@ -33,15 +33,4 @@ def assess_permission(
     if not isinstance(arguments, dict):
         return PermissionAssessment(decision=PermissionDecision.DENY)
 
-    if tool_call.name == "create_scheduled_work":
-        title = arguments.get("title")
-        cron = arguments.get("cron")
-        if not isinstance(title, str) or not title or not isinstance(cron, str) or not cron:
-            return PermissionAssessment(decision=PermissionDecision.DENY)
-        return PermissionAssessment(
-            decision=PermissionDecision.ASK,
-            action="schedule",
-            resource=f"{title} | {cron}",
-            risk_summary="This creates recurring background work.",
-        )
     return PermissionAssessment(decision=PermissionDecision.ALLOW)

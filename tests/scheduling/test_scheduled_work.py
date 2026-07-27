@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -17,7 +17,12 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
-from myclaw.schedule.scheduled_work import CreateScheduledWorkTool, JsonScheduledWorkStore
+from myclaw.schedule.scheduled_work import (
+    CreateScheduledWorkTool,
+    JsonScheduledWorkStore,
+    ScheduledWorkInvalidError,
+    ScheduledWorkPersistenceError,
+)
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
@@ -34,6 +39,48 @@ NOW = datetime(2026, 7, 12, 20, 0, 0, 123456, tzinfo=timezone(timedelta(hours=8)
 
 def _usage() -> ModelUsage:
     return ModelUsage(input_tokens=8, output_tokens=2, total_tokens=10)
+
+
+def test_create_scheduled_work_exports_exact_schema_and_zero_retries(
+    agent_home: Path,
+) -> None:
+    tool = CreateScheduledWorkTool(
+        store=JsonScheduledWorkStore(AgentHome(agent_home)),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+
+    assert tool.to_schema() == {
+        "type": "function",
+        "function": {
+            "name": "create_scheduled_work",
+            "description": "Create recurring work with a five-field cron schedule.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short task title.",
+                        "minLength": 1,
+                        "maxLength": 120,
+                    },
+                    "cron": {
+                        "type": "string",
+                        "description": "Five-field cron schedule.",
+                        "minLength": 1,
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Task prompt.",
+                        "minLength": 1,
+                        "maxLength": 20000,
+                    },
+                },
+                "required": ["title", "cron", "prompt"],
+            },
+        },
+    }
+    assert tool.max_retries == 0
 
 
 @pytest.mark.asyncio
@@ -107,7 +154,11 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
                 agent_home=agent_home,
                 session_id=session_id,
             ),
-            tools=(CreateScheduledWorkTool(store=store, now=lambda: NOW, new_uuid=uuid4),),
+            scheduled_work=CreateScheduledWorkTool(
+                store=store,
+                now=lambda: NOW,
+                new_uuid=uuid4,
+            ),
         ),
     )
 
@@ -124,7 +175,7 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
     assert isinstance(refused, ToolSessionMessage)
     assert refused.status == "refused"
     assert refused.content == (
-        "The requested operation requires unavailable user confirmation."
+        "Scheduled Work creation is unavailable because confirmation is not implemented."
     )
 
 
@@ -178,56 +229,51 @@ async def test_invalid_cron_returns_scheduled_work_error_without_writing(
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonScheduledWorkStore(home)
-    tool_call = ModelToolCall(
-        id="call_invalid_schedule",
-        name="create_scheduled_work",
-        arguments={
-            "title": "Invalid schedule",
-            "cron": "0 9 * * * *",
-            "prompt": "This must never be persisted.",
-        },
-    )
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id="20260712-200000-123456_550e8400-e29b-41d4-a716-446655440000",
-        ),
-        tools=(CreateScheduledWorkTool(store=store, now=lambda: NOW, new_uuid=uuid4),),
+    tool = CreateScheduledWorkTool(
+        store=store,
+        now=lambda: NOW,
+        new_uuid=uuid4,
     )
 
-    result = await gateway.execute(tool_call, approved=True)
+    with pytest.raises(ScheduledWorkInvalidError):
+        await tool.execute(
+            title="Invalid schedule",
+            cron="0 9 * * * *",
+            prompt="This must never be persisted.",
+        )
 
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "scheduled_work_invalid"
     assert not store.path.exists()
     assert await store.load() == ()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("lane", "approved", "expected_message"),
-    [
-        ("foreground", False, "Permission denied by user."),
-        (
-            "scheduled_work",
-            None,
-            "Permission confirmation is unavailable in background work.",
-        ),
-    ],
+    "lane",
+    ("foreground", "scheduled_work"),
 )
 async def test_refused_scheduled_work_creation_does_not_allocate_a_record(
     lane: Literal["foreground", "scheduled_work"],
-    approved: bool | None,
-    expected_message: str,
     agent_home: Path,
     workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonScheduledWorkStore(home)
+    allocated_ids: list[UUID] = []
+
+    def allocate_uuid() -> UUID:
+        value = uuid4()
+        allocated_ids.append(value)
+        return value
+
+    def fail_now() -> datetime:
+        raise AssertionError("now must not be called")
+
+    tool = CreateScheduledWorkTool(
+        store=store,
+        now=fail_now,
+        new_uuid=allocate_uuid,
+    )
     gateway = ToolGateway(
         context=ToolExecutionContext(
             lane=lane,
@@ -235,26 +281,28 @@ async def test_refused_scheduled_work_creation_does_not_allocate_a_record(
             agent_home=agent_home,
             session_id="20260712-200000-123456_550e8400-e29b-41d4-a716-446655440000",
         ),
-        tools=(CreateScheduledWorkTool(store=store, now=lambda: NOW, new_uuid=uuid4),),
+        scheduled_work=tool,
     )
 
-    result = await gateway.execute(
+    result = await gateway.call(
         ModelToolCall(
             id="call_refused_schedule",
             name="create_scheduled_work",
-            arguments={
-                "title": "Do not persist",
-                "cron": "0 9 * * 1",
-                "prompt": "This request was not approved.",
-            },
-        ),
-        approved=approved,
+            arguments=(
+                '{"title":"Do not persist","cron":"0 9 * * 1",'
+                '"prompt":"This request was not approved."}'
+            ),
+        )
     )
 
     assert result.status == "refused"
     assert result.error is not None
     assert result.error.code == "tool_refused"
-    assert result.content == expected_message
+    assert result.content == (
+        "Scheduled Work creation is unavailable because confirmation is not implemented."
+    )
+    assert result.artifact is None
+    assert allocated_ids == []
     assert not store.path.exists()
     assert await store.load() == ()
 
@@ -283,32 +331,19 @@ async def test_invalid_existing_record_returns_persistence_error_without_rewrite
         separators=(",", ":"),
     )
     store.path.write_text(invalid_content, encoding="utf-8")
-    gateway = ToolGateway(
-        context=ToolExecutionContext(
-            lane="foreground",
-            workspace=workspace,
-            agent_home=agent_home,
-            session_id="20260712-200000-123456_7c9e6679-7425-40de-944b-e07fc1f90ae7",
-        ),
-        tools=(CreateScheduledWorkTool(store=store, now=lambda: NOW, new_uuid=uuid4),),
+    tool = CreateScheduledWorkTool(
+        store=store,
+        now=lambda: NOW,
+        new_uuid=uuid4,
     )
 
-    result = await gateway.execute(
-        ModelToolCall(
-            id="call_after_corrupt_store",
-            name="create_scheduled_work",
-            arguments={
-                "title": "New valid task",
-                "cron": "0 10 * * 2",
-                "prompt": "Do not overwrite the invalid existing store.",
-            },
-        ),
-        approved=True,
-    )
+    with pytest.raises(ScheduledWorkPersistenceError):
+        await tool.execute(
+            title="New valid task",
+            cron="0 10 * * 2",
+            prompt="Do not overwrite the invalid existing store.",
+        )
 
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "persistence_error"
     assert store.path.read_text(encoding="utf-8") == invalid_content
 
 
@@ -319,30 +354,14 @@ async def test_atomic_publication_failure_preserves_existing_complete_array(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    session_id = "20260712-200000-123456_550e8400-e29b-41d4-a716-446655440000"
-    context = ToolExecutionContext(
-        lane="foreground",
-        workspace=workspace,
-        agent_home=agent_home,
-        session_id=session_id,
-    )
     store = JsonScheduledWorkStore(home)
-    first = await ToolGateway(
-        context=context,
-        tools=(CreateScheduledWorkTool(store=store, now=lambda: NOW, new_uuid=uuid4),),
-    ).execute(
-        ModelToolCall(
-            id="call_first_schedule",
-            name="create_scheduled_work",
-            arguments={
-                "title": "Existing task",
-                "cron": "0 9 * * 1",
-                "prompt": "Preserve this task.",
-            },
-        ),
-        approved=True,
+    tool = CreateScheduledWorkTool(store=store, now=lambda: NOW, new_uuid=uuid4)
+    first = await tool.execute(
+        title="Existing task",
+        cron="0 9 * * 1",
+        prompt="Preserve this task.",
     )
-    assert first.status == "success"
+    assert first.startswith("Created Scheduled Work ")
     official_bytes = store.path.read_bytes()
     attempted_documents: list[str] = []
 
@@ -352,26 +371,19 @@ async def test_atomic_publication_failure_preserves_existing_complete_array(
         raise OSError("private atomic replacement detail")
 
     failing_store = JsonScheduledWorkStore(home, replace_text=fail_atomic_replace)
-    result = await ToolGateway(
-        context=context,
-        tools=(CreateScheduledWorkTool(store=failing_store, now=lambda: NOW, new_uuid=uuid4),),
-    ).execute(
-        ModelToolCall(
-            id="call_failed_schedule",
-            name="create_scheduled_work",
-            arguments={
-                "title": "Unpublished task",
-                "cron": "0 10 * * 2",
-                "prompt": "This task must not appear in the official file.",
-            },
-        ),
-        approved=True,
+    failing_tool = CreateScheduledWorkTool(
+        store=failing_store,
+        now=lambda: NOW,
+        new_uuid=uuid4,
     )
 
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.error.code == "persistence_error"
-    assert "private atomic replacement detail" not in result.content
+    with pytest.raises(ScheduledWorkPersistenceError):
+        await failing_tool.execute(
+            title="Unpublished task",
+            cron="0 10 * * 2",
+            prompt="This task must not appear in the official file.",
+        )
+
     assert len(attempted_documents) == 1
     assert len(json.loads(attempted_documents[0])) == 2
     assert store.path.read_bytes() == official_bytes
