@@ -16,7 +16,9 @@ from myclaw.management.service import ManagementViewService
 from myclaw.memory.conversation_summary import JsonlSummaryStore
 from myclaw.memory.memory_task import (
     FileMemoryStore,
+    MemoryEditFileTool,
     MemoryManager,
+    MemoryReadFileTool,
     MemoryTaskModelSettings,
 )
 from myclaw.memory.models import MemoryTaskResult
@@ -102,6 +104,78 @@ async def test_memory_store_atomically_replaces_exact_long_term_memory(
 
     assert await FileMemoryStore(home).read_long_term() == replacement
     assert (agent_home / "memory" / "memory.md").read_bytes() == replacement.encode("utf-8")
+
+
+def test_memory_tools_export_common_schemas_with_zero_retries(agent_home: Path) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    memory = FileMemoryStore(home)
+    path = agent_home / "memory" / "memory.md"
+    read_tool = MemoryReadFileTool(memory=memory, long_term_path=path)
+    edit_tool = MemoryEditFileTool(memory=memory, long_term_path=path)
+
+    assert read_tool.to_schema() == {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the current Long-term Memory UTF-8 text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Exact Long-term Memory file path.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based first line.",
+                        "minimum": 0,
+                        "default": 0,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum lines to return.",
+                        "minimum": 1,
+                        "maximum": 10000,
+                        "default": 2000,
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    }
+    assert edit_tool.to_schema() == {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact text only in the current Long-term Memory file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Exact Long-term Memory file path.",
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact text to replace.",
+                        "minLength": 1,
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every exact match.",
+                        "default": False,
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    }
+    assert read_tool.max_retries == edit_tool.max_retries == 0
 
 
 @pytest.mark.asyncio
@@ -207,7 +281,7 @@ async def test_memory_task_exact_edit_updates_long_term_memory_then_advances_cur
                     ModelToolCall(
                         id="read-memory",
                         name="read_file",
-                        arguments={"path": str(memory_path)},
+                        arguments=json.dumps({"path": str(memory_path)}),
                     ),
                 ),
             ),
@@ -217,11 +291,15 @@ async def test_memory_task_exact_edit_updates_long_term_memory_then_advances_cur
                     ModelToolCall(
                         id="edit-memory",
                         name="edit_file",
-                        arguments={
-                            "path": str(memory_path),
-                            "old_text": old_text,
-                            "new_text": new_text,
-                        },
+                        arguments=json.dumps(
+                            {
+                                "path": str(memory_path),
+                                "old_text": old_text,
+                                "new_text": new_text,
+                                "replace_all": "false",
+                                "ignored": "projected away",
+                            }
+                        ),
                     ),
                 ),
             ),
@@ -259,6 +337,67 @@ async def test_memory_task_exact_edit_updates_long_term_memory_then_advances_cur
     assert isinstance(read_result, ToolModelMessage)
     assert read_result.name == "read_file"
     assert "# Long-term Memory" in read_result.content
+    assert list((agent_home / "sessions").rglob("*.jsonl")) == []
+    assert list((agent_home / "sessions").rglob("artifacts")) == []
+
+
+@pytest.mark.asyncio
+async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    summaries = JsonlSummaryStore(home)
+    await summaries.append("A pending summary.", NOW)
+    outside = agent_home.parent / "outside-memory.md"
+    secret = "OUTSIDE MEMORY MUST NOT REACH THE MODEL"
+    outside.write_text(secret, encoding="utf-8")
+    provider = ScriptedFakeProvider(
+        completions=(
+            _response(
+                "",
+                tool_calls=(
+                    ModelToolCall(
+                        id="read-outside",
+                        name="read_file",
+                        arguments=json.dumps({"path": str(outside)}),
+                    ),
+                ),
+            ),
+        )
+    )
+    manager = MemoryManager(
+        provider=provider,
+        summaries=summaries,
+        memory=FileMemoryStore(home),
+        long_term_path=agent_home / "memory" / "memory.md",
+        settings=MemoryTaskModelSettings(
+            model="memory-model",
+            max_output=512,
+            temperature=0.0,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        batch_size=10,
+    )
+
+    result = await manager.run_manual()
+
+    assert result == MemoryTaskResult(
+        status="Memory Task failed.",
+        processed_count=0,
+        memory_updated=False,
+        cursor=0,
+        error=ErrorInfo(
+            code="tool_failed",
+            message="Memory Tasks may access only Long-term Memory.",
+        ),
+    )
+    assert len(provider.complete_requests) == 1
+    request = provider.complete_requests[0]
+    assert isinstance(request, ModelRequest)
+    assert secret not in json.dumps(request.to_dict())
+    assert await FileMemoryStore(home).read_summary_cursor() == 0
 
 
 @pytest.mark.asyncio
@@ -284,11 +423,16 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
                     ModelToolCall(
                         id="edit-memory",
                         name="edit_file",
-                        arguments={
-                            "path": str(memory_path),
-                            "old_text": "## User Preference\n",
-                            "new_text": ("## User Preference\n\nPrefers concise status reports.\n"),
-                        },
+                        arguments=json.dumps(
+                            {
+                                "path": str(memory_path),
+                                "old_text": "## User Preference\n",
+                                "new_text": (
+                                    "## User Preference\n\n"
+                                    "Prefers concise status reports.\n"
+                                ),
+                            }
+                        ),
                     ),
                 ),
             ),
@@ -317,7 +461,7 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
         memory_updated=False,
         cursor=0,
         error=ErrorInfo(
-            code="persistence_error",
+            code="tool_failed",
             message="Long-term Memory could not be updated.",
         ),
     )
@@ -350,7 +494,7 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
                     ModelToolCall(
                         id="read-memory",
                         name="read_file",
-                        arguments={"path": str(memory_path)},
+                        arguments=json.dumps({"path": str(memory_path)}),
                     ),
                 ),
             ),
@@ -380,7 +524,7 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
         memory_updated=False,
         cursor=0,
         error=ErrorInfo(
-            code="tool_denied",
+            code="tool_failed",
             message="Long-term Memory must be a regular Agent Home file.",
         ),
     )

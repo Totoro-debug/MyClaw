@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -449,11 +450,13 @@ async def test_periodic_memory_edit_is_visible_on_disk_but_chat_uses_the_startup
                     ModelToolCall(
                         id="edit-memory",
                         name="edit_file",
-                        arguments={
-                            "path": str(agent_home / "memory" / "memory.md"),
-                            "old_text": startup_memory,
-                            "new_text": updated_memory,
-                        },
+                        arguments=json.dumps(
+                            {
+                                "path": str(agent_home / "memory" / "memory.md"),
+                                "old_text": startup_memory,
+                                "new_text": updated_memory,
+                            }
+                        ),
                     ),
                 ),
             ),

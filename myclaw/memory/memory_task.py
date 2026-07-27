@@ -1,18 +1,16 @@
 """Manual Memory Task orchestration and Agent Home persistence."""
 
 import asyncio
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISREG
+from typing import Annotated
 from uuid import uuid4
-
-from jsonschema import Draft202012Validator, FormatChecker
 
 from myclaw.agent.prompts import memory_task_input, memory_task_prompt
 from myclaw.config.agent_home import AgentHome
-from myclaw.errors import ErrorCode, ErrorInfo
+from myclaw.errors import ErrorInfo
 from myclaw.memory.models import MemoryTaskResult
 from myclaw.memory.ports import MemoryStore, SummaryStore
 from myclaw.provider.errors import ModelCallError
@@ -24,180 +22,80 @@ from myclaw.provider.models import (
     UserModelMessage,
 )
 from myclaw.provider.ports import ModelProvider
-from myclaw.tools.models import ModelToolCall, ToolDefinition, ToolResult
-from myclaw.tools.schema import OpenAIToolSchema
+from myclaw.tools.base import BaseTool
+from myclaw.tools.errors import ToolError
+from myclaw.tools.schema import ToolParam
+from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.atomic_files import atomic_replace_text
-
-_MEMORY_READ_DEFINITION = ToolDefinition(
-    name="read_file",
-    description="Read the current Long-term Memory UTF-8 text.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "minLength": 1},
-            "offset": {"type": "integer", "minimum": 0, "default": 0},
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 10000,
-                "default": 2000,
-            },
-        },
-        "required": ["path"],
-        "additionalProperties": False,
-    },
-)
-
-_MEMORY_EDIT_DEFINITION = ToolDefinition(
-    name="edit_file",
-    description="Replace exact text only in the current Long-term Memory file.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "minLength": 1},
-            "old_text": {"type": "string", "minLength": 1},
-            "new_text": {"type": "string"},
-            "replace_all": {"type": "boolean", "default": False},
-        },
-        "required": ["path", "old_text", "new_text"],
-        "additionalProperties": False,
-    },
-)
 
 
 class MemoryPathDeniedError(PermissionError):
     """Raised when Long-term Memory aliases or identifies another file kind."""
 
 
-class RestrictedMemoryToolGateway:
-    """Expose only exact Long-term Memory reads and edits to a Memory Task."""
+class MemoryReadFileTool(BaseTool):
+    """Read the injected Long-term Memory through its dedicated store."""
+
+    name = "read_file"
+    description = "Read the current Long-term Memory UTF-8 text."
+    required = ("path",)
+
+    path: Annotated[str, ToolParam(description="Exact Long-term Memory file path.")]
+    offset: Annotated[int, ToolParam(description="Zero-based first line.", minimum=0)] = 0
+    limit: Annotated[
+        int,
+        ToolParam(description="Maximum lines to return.", minimum=1, maximum=10000),
+    ] = 2000
 
     def __init__(self, *, memory: MemoryStore, long_term_path: Path) -> None:
         self._memory = memory
         self._long_term_path = long_term_path
-        self._definitions = (_MEMORY_READ_DEFINITION, _MEMORY_EDIT_DEFINITION)
 
-    @property
-    def definitions(self) -> tuple[ToolDefinition, ...]:
-        return self._definitions
-
-    @property
-    def schemas(self) -> tuple[OpenAIToolSchema, ...]:
-        """Temporary schema projection until #45 migrates Memory Task Tools."""
-        return tuple(
-            {
-                "type": "function",
-                "function": {
-                    "name": definition.name,
-                    "description": definition.description,
-                    "parameters": definition.input_schema,
-                },
-            }
-            for definition in self._definitions
-        )
-
-    async def execute(self, tool_call: ModelToolCall) -> ToolResult:
-        raw_arguments = tool_call.arguments
-        if isinstance(raw_arguments, str):
-            try:
-                parsed = json.loads(raw_arguments)
-            except json.JSONDecodeError:
-                parsed = None
-            arguments = parsed if isinstance(parsed, dict) else None
-        else:
-            arguments = raw_arguments
-        definition = next(
-            (item for item in self._definitions if item.name == tool_call.name),
-            None,
-        )
-        if definition is None:
-            return _tool_error(
-                tool_call,
-                code="tool_not_found",
-                message="The requested tool is not available to Memory Tasks.",
-            )
-        if arguments is None or not Draft202012Validator(
-            definition.input_schema,
-            format_checker=FormatChecker(),
-        ).is_valid(arguments):
-            return _tool_error(
-                tool_call,
-                code="tool_invalid_arguments",
-                message=f"Invalid arguments for {tool_call.name}.",
-            )
-        requested = arguments.get("path")
-        if not isinstance(requested, str) or Path(requested) != self._long_term_path:
-            return _tool_error(
-                tool_call,
-                code="tool_denied",
-                message="Memory Tasks may access only Long-term Memory.",
-            )
-        if tool_call.name == "read_file":
-            return await self._read(
-                ModelToolCall(id=tool_call.id, name=tool_call.name, arguments=arguments)
-            )
-        return await self._edit(
-            ModelToolCall(id=tool_call.id, name=tool_call.name, arguments=arguments)
-        )
-
-    async def _read(self, tool_call: ModelToolCall) -> ToolResult:
-        arguments = tool_call.arguments
-        if not isinstance(arguments, dict):
-            raise AssertionError("prepared Memory Tool arguments changed representation")
-        offset = arguments.get("offset", 0)
-        limit = arguments.get("limit", 2000)
-        if not isinstance(offset, int) or not isinstance(limit, int):
-            raise AssertionError("validated read_file integer arguments changed type")
+    async def execute(self, *, path: str, offset: int, limit: int) -> str:
+        _require_long_term_path(path, expected=self._long_term_path)
         try:
             content = await self._memory.read_long_term()
-        except MemoryPathDeniedError:
-            return _tool_error(
-                tool_call,
-                code="tool_denied",
-                message="Long-term Memory must be a regular Agent Home file.",
-            )
-        except (OSError, UnicodeError, ValueError):
-            return _tool_error(
-                tool_call,
-                code="persistence_error",
-                message="Long-term Memory could not be read.",
-            )
-        return _tool_success(tool_call, "\n".join(content.splitlines()[offset : offset + limit]))
+        except MemoryPathDeniedError as error:
+            raise ToolError("Long-term Memory must be a regular Agent Home file.") from error
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ToolError("Long-term Memory could not be read.") from error
+        return "\n".join(content.splitlines()[offset : offset + limit])
 
-    async def _edit(self, tool_call: ModelToolCall) -> ToolResult:
-        arguments = tool_call.arguments
-        if not isinstance(arguments, dict):
-            raise AssertionError("prepared Memory Tool arguments changed representation")
-        old_text = arguments.get("old_text")
-        new_text = arguments.get("new_text")
-        replace_all = arguments.get("replace_all", False)
-        if (
-            not isinstance(old_text, str)
-            or not isinstance(new_text, str)
-            or not isinstance(replace_all, bool)
-        ):
-            raise AssertionError("validated edit_file arguments changed type")
+
+class MemoryEditFileTool(BaseTool):
+    """Edit only the injected Long-term Memory through its dedicated store."""
+
+    name = "edit_file"
+    description = "Replace exact text only in the current Long-term Memory file."
+    required = ("path", "old_text", "new_text")
+
+    path: Annotated[str, ToolParam(description="Exact Long-term Memory file path.")]
+    old_text: Annotated[str, ToolParam(description="Exact text to replace.", min_length=1)]
+    new_text: Annotated[str, ToolParam(description="Replacement text.")]
+    replace_all: Annotated[bool, ToolParam(description="Replace every exact match.")] = False
+
+    def __init__(self, *, memory: MemoryStore, long_term_path: Path) -> None:
+        self._memory = memory
+        self._long_term_path = long_term_path
+
+    async def execute(
+        self,
+        *,
+        path: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool,
+    ) -> str:
+        _require_long_term_path(path, expected=self._long_term_path)
         try:
             content = await self._memory.read_long_term()
-        except MemoryPathDeniedError:
-            return _tool_error(
-                tool_call,
-                code="tool_denied",
-                message="Long-term Memory must be a regular Agent Home file.",
-            )
-        except (OSError, UnicodeError, ValueError):
-            return _tool_error(
-                tool_call,
-                code="persistence_error",
-                message="Long-term Memory could not be read.",
-            )
+        except MemoryPathDeniedError as error:
+            raise ToolError("Long-term Memory must be a regular Agent Home file.") from error
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ToolError("Long-term Memory could not be read.") from error
         match_count = content.count(old_text)
         if match_count == 0 or (not replace_all and match_count != 1):
-            return _tool_error(
-                tool_call,
-                code="tool_invalid_arguments",
-                message="The requested Long-term Memory text did not match precisely.",
-            )
+            raise ToolError("The requested Long-term Memory text did not match precisely.")
         replacement = (
             content.replace(old_text, new_text)
             if replace_all
@@ -205,46 +103,16 @@ class RestrictedMemoryToolGateway:
         )
         try:
             await self._memory.replace_long_term(replacement)
-        except MemoryPathDeniedError:
-            return _tool_error(
-                tool_call,
-                code="tool_denied",
-                message="Long-term Memory must be a regular Agent Home file.",
-            )
-        except (OSError, UnicodeError, ValueError):
-            return _tool_error(
-                tool_call,
-                code="persistence_error",
-                message="Long-term Memory could not be updated.",
-            )
-        return _tool_success(tool_call, "Long-term Memory updated.")
+        except MemoryPathDeniedError as error:
+            raise ToolError("Long-term Memory must be a regular Agent Home file.") from error
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ToolError("Long-term Memory could not be updated.") from error
+        return "Long-term Memory updated."
 
 
-def _tool_success(tool_call: ModelToolCall, content: str) -> ToolResult:
-    return ToolResult(
-        tool_call_id=tool_call.id,
-        name=tool_call.name,
-        status="success",
-        content=content,
-        error=None,
-        artifact=None,
-    )
-
-
-def _tool_error(
-    tool_call: ModelToolCall,
-    *,
-    code: ErrorCode,
-    message: str,
-) -> ToolResult:
-    return ToolResult(
-        tool_call_id=tool_call.id,
-        name=tool_call.name,
-        status="error",
-        content=message,
-        error=ErrorInfo(code=code, message=message),
-        artifact=None,
-    )
+def _require_long_term_path(path: str, *, expected: Path) -> None:
+    if Path(path) != expected:
+        raise ToolError("Memory Tasks may access only Long-term Memory.")
 
 
 class FileMemoryStore:
@@ -344,9 +212,12 @@ class MemoryManager:
         self._long_term_path = long_term_path
         self._settings = settings
         self._batch_size = batch_size
-        self._tools = RestrictedMemoryToolGateway(
-            memory=memory,
-            long_term_path=long_term_path,
+        self._tools = ToolGateway()
+        self._tools.register_tools(
+            (
+                MemoryReadFileTool(memory=memory, long_term_path=long_term_path),
+                MemoryEditFileTool(memory=memory, long_term_path=long_term_path),
+            )
         )
         self._running = False
         self._running_cursor = 0
@@ -409,7 +280,7 @@ class MemoryManager:
                 route="memory",
                 system_prompt=memory_task_prompt(long_term_path=self._long_term_path),
                 messages=tuple(messages),
-            tools=self._tools.schemas,
+                tools=self._tools.schemas,
                 stream=False,
                 model=self._settings.model,
                 max_output=self._settings.max_output,
@@ -431,7 +302,7 @@ class MemoryManager:
             if not response.message.tool_calls:
                 break
             for tool_call in response.message.tool_calls:
-                tool_result = await self._tools.execute(tool_call)
+                tool_result = await self._tools.call(tool_call)
                 messages.append(
                     ToolModelMessage(
                         tool_call_id=tool_call.id,
@@ -445,7 +316,7 @@ class MemoryManager:
                         processed_count=0,
                         memory_updated=memory_updated,
                         cursor=cursor,
-                        error=tool_result.error,
+                        error=ErrorInfo(code="tool_failed", message=tool_result.content),
                     )
                 if tool_call.name == "edit_file":
                     memory_updated = True
