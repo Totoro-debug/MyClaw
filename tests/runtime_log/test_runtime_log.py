@@ -199,6 +199,7 @@ def test_runtime_log_redacts_generic_credentials_and_configured_api_keys(
 def test_runtime_log_submission_drops_the_oldest_of_1024_pending_records(
     agent_home: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     writer_blocked = threading.Event()
     release_writer = threading.Event()
@@ -226,6 +227,7 @@ def test_runtime_log_submission_drops_the_oldest_of_1024_pending_records(
     assert "pending-0001" in content
     assert "pending-1024" in content
     assert content.index("pending-0001") < content.index("pending-1024")
+    assert capsys.readouterr().err == ""
 
 
 def test_runtime_log_first_use_creates_complete_private_state(agent_home: Path) -> None:
@@ -677,4 +679,281 @@ def test_runtime_log_success_resets_the_stderr_failure_period(
     logger.error("second failure period")
     lifetime.close()
 
+    assert capsys.readouterr().err == "Runtime Log failure: PermissionError\n"
+
+
+def test_runtime_log_lock_deadline_falls_back_once_without_rotation(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    (logs / "run.log.0").write_bytes(b"older slot zero\n")
+    prefix = b"x" * (_SLOT_TARGET_BYTES - 1)
+    (logs / "run.log.1").write_bytes(prefix)
+    (logs / "run.log.cursor").write_bytes(b"1\n")
+    (logs / "run.log.lock").write_bytes(b"")
+    elapsed = 0.0
+    attempts = 0
+    released = False
+    synchronized: list[int] = []
+
+    class DeadlineOnlyLock:
+        def try_acquire(self, descriptor: int) -> bool:
+            nonlocal attempts
+            del descriptor
+            attempts += 1
+            return elapsed >= 1.0
+
+        def release(self, descriptor: int) -> None:
+            nonlocal released
+            del descriptor
+            released = True
+
+    def monotonic() -> float:
+        return elapsed
+
+    def sleep(delay: float) -> None:
+        nonlocal elapsed
+        elapsed += delay
+
+    monkeypatch.setattr(os, "fsync", synchronized.append)
+    lifetime = install_runtime_logging(
+        AgentHome(agent_home),
+        lock_system=DeadlineOnlyLock(),
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+    logging.getLogger("myclaw.lock").warning("deadline fallback")
+    lifetime.close()
+
+    assert elapsed == pytest.approx(1.0)
+    assert attempts > 1
+    assert released is False
+    assert len(synchronized) == 1
+    assert (logs / "run.log.0").read_bytes() == b"older slot zero\n"
+    slot_one = (logs / "run.log.1").read_bytes()
+    assert slot_one.startswith(prefix)
+    assert slot_one.endswith(b"myclaw.lock: deadline fallback\n")
+    assert len(slot_one) > _SLOT_TARGET_BYTES
+    assert (logs / "run.log.cursor").read_bytes() == b"1\n"
+    assert capsys.readouterr().err == "Runtime Log failure: TimeoutError\n"
+
+
+def test_runtime_log_reselects_the_cursor_and_completes_rotation_under_one_lock(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    (logs / "run.log.0").write_bytes(b"old slot zero\n")
+    prefix = b"x" * (_SLOT_TARGET_BYTES - 1)
+    (logs / "run.log.1").write_bytes(prefix)
+    cursor = logs / "run.log.cursor"
+    cursor.write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+    held = False
+    replacements: list[tuple[Path, bytes]] = []
+    synchronized = 0
+
+    class TrackingLock:
+        def try_acquire(self, descriptor: int) -> bool:
+            nonlocal held
+            del descriptor
+            cursor.write_bytes(b"1\n")
+            held = True
+            return True
+
+        def release(self, descriptor: int) -> None:
+            nonlocal held
+            del descriptor
+            assert held
+            held = False
+
+    def replace_while_locked(path: Path, content: bytes) -> None:
+        assert held
+        replacements.append((path, content))
+        atomic_replace_bytes(path, content)
+
+    def fsync_while_locked(descriptor: int) -> None:
+        nonlocal synchronized
+        del descriptor
+        assert held
+        synchronized += 1
+
+    monkeypatch.setattr(os, "fsync", fsync_while_locked)
+    lifetime = install_runtime_logging(
+        AgentHome(agent_home),
+        replace_bytes=replace_while_locked,
+        lock_system=TrackingLock(),
+    )
+    logging.getLogger("myclaw.lock").warning("locked rotation")
+    lifetime.close()
+
+    assert held is False
+    assert synchronized == 3
+    assert replacements == [
+        (logs / "run.log.0", b""),
+        (logs / "run.log.cursor", b"0\n"),
+    ]
+    slot_one = (logs / "run.log.1").read_bytes()
+    assert slot_one.startswith(prefix)
+    assert slot_one.endswith(b"myclaw.lock: locked rotation\n")
+    assert (logs / "run.log.0").read_bytes() == b""
+    assert cursor.read_bytes() == b"0\n"
+
+
+def test_runtime_log_unreadable_prelock_cursor_falls_back_to_the_initial_slot(
+    agent_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    (logs / "run.log.0").write_bytes(b"")
+    (logs / "run.log.1").write_bytes(b"older slot one\n")
+    invalid_cursor = b"not-a-canonical-cursor\n"
+    (logs / "run.log.cursor").write_bytes(invalid_cursor)
+    (logs / "run.log.lock").write_bytes(b"")
+    elapsed = 0.0
+
+    class UnavailableLock:
+        def try_acquire(self, descriptor: int) -> bool:
+            del descriptor
+            return False
+
+        def release(self, descriptor: int) -> None:
+            del descriptor
+            pytest.fail("an unavailable lock must not be released")
+
+    def monotonic() -> float:
+        return elapsed
+
+    def sleep(delay: float) -> None:
+        nonlocal elapsed
+        elapsed += delay
+
+    lifetime = install_runtime_logging(
+        AgentHome(agent_home),
+        lock_system=UnavailableLock(),
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+    logging.getLogger("myclaw.lock").error("invalid cursor fallback")
+    lifetime.close()
+
+    assert "invalid cursor fallback" in (logs / "run.log.0").read_text(encoding="utf-8")
+    assert (logs / "run.log.1").read_bytes() == b"older slot one\n"
+    assert (logs / "run.log.cursor").read_bytes() == invalid_cursor
+    assert capsys.readouterr().err == "Runtime Log failure: TimeoutError\n"
+
+
+def test_runtime_log_lock_failures_follow_stderr_failure_periods(
+    agent_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    (logs / "run.log.0").write_bytes(b"")
+    (logs / "run.log.1").write_bytes(b"")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+    outcomes: list[Exception | bool] = [
+        OSError("first lock failure"),
+        OSError("same failure period"),
+        True,
+        OSError("second lock failure period"),
+    ]
+
+    class SequencedLock:
+        def try_acquire(self, descriptor: int) -> bool:
+            del descriptor
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        def release(self, descriptor: int) -> None:
+            del descriptor
+
+    lifetime = install_runtime_logging(AgentHome(agent_home), lock_system=SequencedLock())
+    logger = logging.getLogger("myclaw.lock")
+    logger.error("first fallback")
+    logger.error("second fallback")
+    logger.warning("locked success")
+    logger.error("third fallback")
+    lifetime.close()
+
+    content = (logs / "run.log.0").read_text(encoding="utf-8")
+    assert all(
+        marker in content
+        for marker in ("first fallback", "second fallback", "locked success", "third fallback")
+    )
+    assert capsys.readouterr().err == (
+        "Runtime Log failure: OSError\nRuntime Log failure: OSError\n"
+    )
+
+
+def test_runtime_log_fallback_failures_are_isolated_and_reported_once(
+    agent_home: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    outside = tmp_path / "outside.log"
+    outside.write_bytes(b"outside remains unchanged\n")
+    os.link(outside, logs / "run.log.0")
+    (logs / "run.log.1").write_bytes(b"")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+
+    class FailingLock:
+        def try_acquire(self, descriptor: int) -> bool:
+            del descriptor
+            raise OSError("lock system failed")
+
+        def release(self, descriptor: int) -> None:
+            del descriptor
+            pytest.fail("a failed lock must not be released")
+
+    lifetime = install_runtime_logging(AgentHome(agent_home), lock_system=FailingLock())
+    logger = logging.getLogger("myclaw.lock")
+    logger.error("first failed fallback")
+    logger.error("second failed fallback")
+    lifetime.close()
+
+    assert outside.read_bytes() == b"outside remains unchanged\n"
+    assert capsys.readouterr().err == "Runtime Log failure: PermissionError\n"
+
+
+def test_runtime_log_revalidates_the_opened_slot_after_locked_cursor_selection(
+    agent_home: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    (logs / "run.log.0").write_bytes(b"x" * _SLOT_TARGET_BYTES)
+    target = logs / "run.log.1"
+    target.write_bytes(b"old target\n")
+    cursor = logs / "run.log.cursor"
+    cursor.write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+    outside = tmp_path / "outside.log"
+    outside.write_bytes(b"outside remains unchanged\n")
+
+    def replace_then_alias_target(path: Path, content: bytes) -> None:
+        atomic_replace_bytes(path, content)
+        if path == cursor and content == b"1\n":
+            target.unlink()
+            os.link(outside, target)
+
+    lifetime = install_runtime_logging(
+        AgentHome(agent_home), replace_bytes=replace_then_alias_target
+    )
+    logging.getLogger("myclaw.lock").error("must not follow replacement")
+    lifetime.close()
+
+    assert outside.read_bytes() == b"outside remains unchanged\n"
     assert capsys.readouterr().err == "Runtime Log failure: PermissionError\n"
