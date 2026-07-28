@@ -32,6 +32,7 @@ _AUTHORIZATION: Final = re.compile(
 _BEARER: Final = re.compile(r"(?i)\b(bearer)\s+\S+")
 _API_KEY: Final = re.compile(r"(?i)\b((?:x-)?api[-_ ]?key)\s*([:=])\s*([^\s,;]+)")
 _COOKIE: Final = re.compile(r"(?i)\b((?:set-)?cookie)\s*([:=])\s*[^\n]+")
+_SANITIZE_EXCEPTION_MESSAGES: Final = "myclaw_runtime_log_sanitize_exception_messages"
 _WINDOWS_REPARSE_POINT: Final = 0x400
 _UNSUPPORTED_FSYNC_ERRNOS: Final = frozenset(
     {
@@ -42,6 +43,31 @@ _UNSUPPORTED_FSYNC_ERRNOS: Final = frozenset(
 )
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
+
+
+@contextmanager
+def runtime_log_session(session_id: str) -> Iterator[None]:
+    """Correlate records submitted in this context with an owning Session."""
+    token = _SESSION_ID.set(session_id)
+    try:
+        yield
+    finally:
+        _SESSION_ID.reset(token)
+
+
+def log_sanitized_exception(
+    logger: logging.Logger,
+    level: int,
+    message: str,
+    error: BaseException,
+) -> None:
+    """Submit an exception chain without persisting its untrusted messages."""
+    logger.log(
+        level,
+        message,
+        exc_info=(type(error), error, error.__traceback__),
+        extra={_SANITIZE_EXCEPTION_MESSAGES: True},
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,11 +169,8 @@ class RuntimeLogLifetime:
     @contextmanager
     def session(self, session_id: str) -> Iterator[None]:
         """Correlate records submitted in this context with an owning Session."""
-        token = _SESSION_ID.set(session_id)
-        try:
+        with runtime_log_session(session_id):
             yield
-        finally:
-            _SESSION_ID.reset(token)
 
     def _write_records(self) -> None:
         while True:
@@ -334,13 +357,22 @@ def _visible(value: object) -> str:
 def _exception_lines(record: logging.LogRecord) -> list[str]:
     if record.exc_info is None or record.exc_info[1] is None:
         return []
-    return _render_exception(record.exc_info[1])
+    return _render_exception(
+        record.exc_info[1],
+        sanitize_messages=bool(getattr(record, _SANITIZE_EXCEPTION_MESSAGES, False)),
+    )
 
 
-def _render_exception(error: BaseException) -> list[str]:
+def _render_exception(
+    error: BaseException,
+    *,
+    sanitize_messages: bool = False,
+) -> list[str]:
     lines: list[str] = []
     if error.__cause__ is not None:
-        lines.extend(_render_exception(error.__cause__))
+        lines.extend(
+            _render_exception(error.__cause__, sanitize_messages=sanitize_messages)
+        )
         lines.extend(
             (
                 "",
@@ -349,7 +381,9 @@ def _render_exception(error: BaseException) -> list[str]:
             )
         )
     elif error.__context__ is not None and not error.__suppress_context__:
-        lines.extend(_render_exception(error.__context__))
+        lines.extend(
+            _render_exception(error.__context__, sanitize_messages=sanitize_messages)
+        )
         lines.extend(
             (
                 "",
@@ -368,13 +402,19 @@ def _render_exception(error: BaseException) -> list[str]:
     qualified_type = type(error).__qualname__
     if type(error).__module__ not in {"builtins", "__main__"}:
         qualified_type = f"{type(error).__module__}.{qualified_type}"
-    message = _visible(error)
+    message = _REDACTED if sanitize_messages else _visible(error)
     lines.append(f"{qualified_type}: {message}" if message else qualified_type)
     if isinstance(error, BaseExceptionGroup):
         total = len(error.exceptions)
         for index, nested in enumerate(error.exceptions, start=1):
             lines.append(f"+- sub-exception {index} of {total}:")
-            lines.extend(f"  {line}" for line in _render_exception(nested))
+            lines.extend(
+                f"  {line}"
+                for line in _render_exception(
+                    nested,
+                    sanitize_messages=sanitize_messages,
+                )
+            )
     return lines
 
 

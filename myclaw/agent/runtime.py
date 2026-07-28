@@ -585,7 +585,6 @@ def prepare_repl_runtime(
         new_uuid=new_uuid,
         tool_gateway_for=scheduled_work_gateway_for,
         externalize_result_for=externalize_result_for,
-        runtime_log=runtime_log,
     )
     background_events = RuntimeEventBroker()
     scheduled_work_coordinator = ScheduledWorkCoordinator(

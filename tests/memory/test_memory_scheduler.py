@@ -24,6 +24,7 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.models import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
@@ -147,6 +148,92 @@ async def test_periodic_memory_task_runs_when_the_manager_is_idle(agent_home: Pa
         memory_updated=False,
         cursor=1,
     )
+
+
+@pytest.mark.asyncio
+async def test_periodic_memory_task_records_one_terminal_failure_without_a_session(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    summaries = JsonlSummaryStore(home)
+    await summaries.append("PRIVATE PERIODIC SUMMARY", NOW)
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelCallError(
+                ErrorInfo(code="model_failed", message="PRIVATE PERIODIC OUTPUT")
+            ),
+        )
+    )
+    lifetime = install_runtime_logging(home)
+
+    result = await _manager(
+        home=home,
+        provider=provider,
+        summaries=summaries,
+    ).run_periodic()
+    lifetime.close()
+
+    assert result is not None
+    assert result.error == ErrorInfo(
+        code="model_failed",
+        message="PRIVATE PERIODIC OUTPUT",
+    )
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert "session=- myclaw.memory.memory_task: Memory Task failed code=model_failed" in content
+    assert "PRIVATE PERIODIC SUMMARY" not in content
+    assert "PRIVATE PERIODIC OUTPUT" not in content
+
+
+@pytest.mark.asyncio
+async def test_memory_scheduler_records_the_unhandled_exception_it_isolates(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    summaries = JsonlSummaryStore(home)
+    await summaries.append("PRIVATE SCHEDULER SUMMARY", NOW)
+    attempted = asyncio.Event()
+
+    class UnexpectedFailureProvider(ScriptedFakeProvider):
+        async def complete(self, request: object) -> ModelResponse:
+            self.complete_requests.append(request)
+            attempted.set()
+            try:
+                raise OSError("technical storage cause")
+            except OSError as cause:
+                raise RuntimeError("technical trigger failure") from cause
+
+    clock = ControlledClock(NOW)
+    scheduler = MemoryTaskScheduler(
+        manager=_manager(
+            home=home,
+            provider=UnexpectedFailureProvider(),
+            summaries=summaries,
+        ),
+        schedule="0 * * * *",
+        clock=clock,
+    )
+    lifetime = install_runtime_logging(home)
+
+    scheduler.start()
+    await _wait_until(lambda: clock.sleeps == [50 * 60])
+    clock.advance(50 * 60)
+    await attempted.wait()
+    await asyncio.sleep(0)
+    await scheduler.close()
+    lifetime.close()
+
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert "session=- myclaw.memory.memory_scheduler: Memory Task trigger crashed" in content
+    assert "OSError: [REDACTED]" in content
+    assert "RuntimeError: [REDACTED]" in content
+    assert "technical storage cause" not in content
+    assert "technical trigger failure" not in content
+    assert "direct cause" in content
+    assert "PRIVATE SCHEDULER SUMMARY" not in content
 
 
 @pytest.mark.asyncio
@@ -610,6 +697,7 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
         schedule="0 * * * *",
         clock=clock,
     )
+    lifetime = install_runtime_logging(home)
     existing_tasks = asyncio.all_tasks()
 
     scheduler.start()
@@ -618,11 +706,63 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
     await started.wait()
     await scheduler.close()
     await asyncio.sleep(0)
+    lifetime.close()
 
     assert cancelled.is_set()
     assert asyncio.all_tasks() == existing_tasks
+    assert not (agent_home / "logs").exists()
     with pytest.raises(RuntimeError, match="scheduler is closed"):
         scheduler.start()
-
     recovered = await manager.run_manual()
     assert recovered.cursor == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_scheduler_records_a_distinct_shutdown_cleanup_failure(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    summaries = JsonlSummaryStore(home)
+    await summaries.append("PRIVATE CLEANUP SUMMARY", NOW)
+    started = asyncio.Event()
+
+    class CleanupFailingProvider(ScriptedFakeProvider):
+        async def complete(self, request: object) -> ModelResponse:
+            self.complete_requests.append(request)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                raise RuntimeError("technical Memory Task cleanup failure") from cancellation
+            raise AssertionError("cleanup test wait returned unexpectedly")
+
+    clock = ControlledClock(NOW)
+    scheduler = MemoryTaskScheduler(
+        manager=_manager(
+            home=home,
+            provider=CleanupFailingProvider(),
+            summaries=summaries,
+        ),
+        schedule="0 * * * *",
+        clock=clock,
+    )
+    lifetime = install_runtime_logging(home)
+
+    scheduler.start()
+    await _wait_until(lambda: clock.sleeps == [50 * 60])
+    clock.advance(50 * 60)
+    await started.wait()
+    await scheduler.close()
+    lifetime.close()
+
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert (
+        "session=- myclaw.memory.memory_scheduler: "
+        "Memory Task scheduler cleanup failed"
+    ) in content
+    assert "CancelledError" in content
+    assert "RuntimeError: [REDACTED]" in content
+    assert "technical Memory Task cleanup failure" not in content
+    assert "PRIVATE CLEANUP SUMMARY" not in content

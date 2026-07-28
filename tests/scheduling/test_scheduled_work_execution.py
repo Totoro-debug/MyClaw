@@ -22,6 +22,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.schedule.records import ScheduledWork
 from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkModelSettings,
@@ -758,6 +759,133 @@ async def test_model_failure_is_persisted_without_stopping_the_next_scheduled_wo
 
 
 @pytest.mark.asyncio
+async def test_scheduled_work_records_one_terminal_failure_with_task_session_context(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    task = replace(
+        _task(),
+        title="PRIVATE TASK DEFINITION TITLE",
+        cron="17 4 * * 2",
+        prompt="PRIVATE TASK PROMPT",
+    )
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=lambda: USER_UUID,
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelCallError(
+                ErrorInfo(code="model_failed", message="PRIVATE MODEL OUTPUT")
+            ),
+        )
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="PRIVATE LONG-TERM MEMORY",
+        settings=ScheduledWorkModelSettings(
+            model="PRIVATE MODEL ID",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
+        ),
+    )
+    lifetime = install_runtime_logging(home)
+
+    result = await runner.run(task)
+    lifetime.close()
+
+    assert result.status == "failed"
+    assert result.error == ErrorInfo(
+        code="model_failed",
+        message="PRIVATE MODEL OUTPUT",
+    )
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert (
+        f"session={TASK_SESSION_ID} myclaw.schedule.scheduled_work_execution: "
+        "Scheduled Work failed code=model_failed"
+    ) in content
+    for private_content in (
+        "PRIVATE TASK DEFINITION TITLE",
+        "PRIVATE TASK PROMPT",
+        "PRIVATE MODEL OUTPUT",
+        "PRIVATE LONG-TERM MEMORY",
+        "PRIVATE MODEL ID",
+        task.id,
+        task.cron,
+    ):
+        assert private_content not in content
+
+
+@pytest.mark.asyncio
+async def test_scheduled_work_records_an_unhandled_terminal_exception_once(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=lambda: USER_UUID,
+    )
+    provider = ScriptedFakeProvider(
+        completions=(RuntimeError("technical cron execution failure"),)
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID)).__next__,
+        tool_gateway_for=lambda session_id: _tool_gateway(
+            agent_home=agent_home,
+            workspace=workspace,
+            session_id=session_id,
+        ),
+    )
+    lifetime = install_runtime_logging(home)
+
+    with pytest.raises(RuntimeError, match="technical cron execution failure"):
+        await runner.run(_task())
+    lifetime.close()
+
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert (
+        f"session={TASK_SESSION_ID} myclaw.schedule.scheduled_work_execution: "
+        "Scheduled Work crashed"
+    ) in content
+    assert "RuntimeError: [REDACTED]" in content
+    assert "technical cron execution failure" not in content
+    assert _task().prompt not in content
+
+
+@pytest.mark.asyncio
 async def test_session_publication_failure_is_isolated_from_the_next_scheduled_work(
     agent_home: Path,
     workspace: Path,
@@ -831,9 +959,11 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
         prompt="Run independently.",
         session_id="20260712-220000-123000_22222222-2222-4222-8222-222222222222",
     )
+    lifetime = install_runtime_logging(home)
 
     failed = await runner.run(failed_task)
     completed = await runner.run(completed_task)
+    lifetime.close()
 
     assert failed.status == "failed"
     assert failed.error is not None
@@ -845,6 +975,15 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
     assert first_session.messages[-1].content == "First result was fully generated."
     second_session = await sessions.load(completed_task.session_id)
     assert second_session.messages[-1].content == "Second task remained isolated."
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert (
+        f"session={failed_task.session_id} myclaw.schedule.scheduled_work_execution: "
+        "Scheduled Work failed code=persistence_error"
+    ) in content
+    assert "private disk failure detail" not in content
+    assert failed_task.prompt not in content
+    assert "First result was fully generated." not in content
 
 
 @pytest.mark.asyncio

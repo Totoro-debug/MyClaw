@@ -1,5 +1,7 @@
 """Scheduled Work adapter over the Runtime Core Agent turn."""
 
+import asyncio
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,7 +16,7 @@ from myclaw.agent.workspace import Workspace
 from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ReasoningEffort
 from myclaw.provider.ports import ModelProvider
-from myclaw.runtime_log import RuntimeLogLifetime
+from myclaw.runtime_log import log_sanitized_exception, runtime_log_session
 from myclaw.schedule.records import ScheduledWork
 from myclaw.session.ports import SessionStore
 from myclaw.session.records import SessionMetadata
@@ -25,6 +27,7 @@ _SESSION_FAILURE = ErrorInfo(
     code="persistence_error",
     message="Scheduled Work Session could not be updated.",
 )
+logger = logging.getLogger(__name__)
 
 
 class ScheduledWorkSessionStore(SessionStore, Protocol):
@@ -74,7 +77,6 @@ class ScheduledWorkRunner:
         new_uuid: Callable[[], UUID],
         tool_gateway_for: Callable[[str], ToolGateway],
         externalize_result_for: Callable[[str], ToolResultExternalizer] | None = None,
-        runtime_log: RuntimeLogLifetime | None = None,
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -85,15 +87,30 @@ class ScheduledWorkRunner:
         self._new_uuid = new_uuid
         self._tool_gateway_for = tool_gateway_for
         self._externalize_result_for = externalize_result_for
-        self._runtime_log = runtime_log
 
     async def run(self, task: ScheduledWork) -> ScheduledWorkRunResult:
-        if self._runtime_log is None:
-            return await self._run(task)
-        with self._runtime_log.session(task.session_id):
-            return await self._run(task)
+        with runtime_log_session(task.session_id):
+            try:
+                result = await self._run_once(task)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                log_sanitized_exception(
+                    logger,
+                    logging.ERROR,
+                    "Scheduled Work crashed",
+                    error,
+                )
+                raise
+            if result.status == "failed":
+                code = result.error.code if result.error is not None else "unknown"
+                logger.error("Scheduled Work failed code=%s", code)
+            return result
 
-    async def _run(self, task: ScheduledWork) -> ScheduledWorkRunResult:
+    async def _run_once(self, task: ScheduledWork) -> ScheduledWorkRunResult:
         try:
             self._sessions.prepare_with_id(
                 session_id=task.session_id,

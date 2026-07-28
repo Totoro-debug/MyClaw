@@ -30,6 +30,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.models import ModelToolCall
 from myclaw.utils.atomic_files import atomic_replace_text
 from tests.configuration.test_config import VALID_CONFIG
@@ -199,8 +200,10 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
         ),
         batch_size=10,
     )
+    lifetime = install_runtime_logging(home)
 
     result = await manager.run_manual()
+    lifetime.close()
 
     assert result == MemoryTaskResult(
         status="No pending summaries",
@@ -209,6 +212,52 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
         cursor=0,
     )
     assert provider.complete_requests == []
+    assert not (agent_home / "logs").exists()
+
+
+@pytest.mark.asyncio
+async def test_manual_memory_task_records_one_terminal_failure_without_a_session(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    summaries = JsonlSummaryStore(home)
+    await summaries.append("PRIVATE SUMMARY CONTENT", NOW)
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelCallError(
+                ErrorInfo(code="model_failed", message="PRIVATE PROVIDER OUTPUT")
+            ),
+        )
+    )
+    manager = MemoryManager(
+        provider=provider,
+        summaries=summaries,
+        memory=FileMemoryStore(home),
+        long_term_path=agent_home / "memory" / "memory.md",
+        settings=MemoryTaskModelSettings(
+            model="memory-model",
+            max_output=512,
+            temperature=0.0,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        batch_size=10,
+    )
+    lifetime = install_runtime_logging(home)
+
+    result = await manager.run_manual()
+    lifetime.close()
+
+    assert result.error == ErrorInfo(
+        code="model_failed",
+        message="PRIVATE PROVIDER OUTPUT",
+    )
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert "session=- myclaw.memory.memory_task: Memory Task failed code=model_failed" in content
+    assert "PRIVATE SUMMARY CONTENT" not in content
+    assert "PRIVATE PROVIDER OUTPUT" not in content
 
 
 @pytest.mark.asyncio
@@ -452,8 +501,10 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
         ),
         batch_size=10,
     )
+    lifetime = install_runtime_logging(home)
 
     result = await manager.run_manual()
+    lifetime.close()
 
     assert result == MemoryTaskResult(
         status="Memory Task failed.",
@@ -467,6 +518,46 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
     )
     assert memory_path.read_bytes() == original_memory
     assert await FileMemoryStore(home).read_summary_cursor() == 0
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert "Memory Task failed code=tool_failed" in content
+    assert "The user prefers concise status reports." not in content
+    assert "Prefers concise status reports." not in content
+
+
+@pytest.mark.asyncio
+async def test_conversation_summary_read_failure_is_logged_only_at_memory_task_boundary(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    summaries = JsonlSummaryStore(home)
+    summaries.path.write_text("PRIVATE INVALID SUMMARY STREAM", encoding="utf-8")
+    manager = MemoryManager(
+        provider=ScriptedFakeProvider(),
+        summaries=summaries,
+        memory=FileMemoryStore(home),
+        long_term_path=agent_home / "memory" / "memory.md",
+        settings=MemoryTaskModelSettings(
+            model="memory-model",
+            max_output=512,
+            temperature=0.0,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        batch_size=10,
+    )
+    lifetime = install_runtime_logging(home)
+
+    result = await manager.run_manual()
+    lifetime.close()
+
+    assert result.error is not None
+    assert result.error.code == "persistence_error"
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert "Memory Task failed code=persistence_error" in content
+    assert "PRIVATE INVALID SUMMARY STREAM" not in content
 
 
 @pytest.mark.asyncio
@@ -604,12 +695,14 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
         ),
         batch_size=10,
     )
+    lifetime = install_runtime_logging(home)
 
     first_task = asyncio.create_task(manager.run_manual())
     await first_started.wait()
     overlapping = await manager.run_manual()
     release_first.set()
     first = await first_task
+    lifetime.close()
 
     assert overlapping == MemoryTaskResult(
         status="Memory Task is already running.",
@@ -623,6 +716,7 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
     )
     assert len(provider.complete_requests) == 1
     assert first.cursor == 1
+    assert not (agent_home / "logs").exists()
 
 
 @pytest.mark.asyncio
@@ -826,8 +920,10 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, memory_manager=memory_manager)
     )
+    lifetime = install_runtime_logging(home)
 
     result = await dispatcher.dispatch("/dream")
+    lifetime.close()
 
     assert result.output == (
         "persistence_error: Summary Cursor could not be updated.\n"
@@ -836,6 +932,9 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
         "cursor: 0"
     )
     assert await FileMemoryStore(home).read_summary_cursor() == 0
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert "Memory Task failed code=persistence_error" in content
 
 
 @pytest.mark.parametrize(

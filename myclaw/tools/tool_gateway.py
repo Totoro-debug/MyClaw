@@ -28,12 +28,18 @@ logger = logging.getLogger(__name__)
 class ToolGateway:
     """Resolve and execute one registered Tool Catalog."""
 
-    def __init__(self, *, sleep: Sleep = asyncio.sleep) -> None:
+    def __init__(
+        self,
+        *,
+        sleep: Sleep = asyncio.sleep,
+        owns_terminal_failures: bool = True,
+    ) -> None:
         self._registered = False
         self._tools: dict[str, BaseTool] = {}
         self._schemas: tuple[OpenAIToolSchema, ...] = ()
         self._parameter_schemas: dict[str, JsonObject] = {}
         self._sleep = sleep
+        self._owns_terminal_failures = owns_terminal_failures
 
     def register_tools(self, tools: tuple[BaseTool, ...]) -> None:
         """Register and cache one stable annotation-driven Tool Catalog."""
@@ -118,14 +124,15 @@ class ToolGateway:
                     )
                     await self._sleep(float(2**attempt))
                     continue
-                logger.error(
-                    "Tool execution failed name=%s attempt=%d/%d type=%s",
-                    tool.name,
-                    attempt_number,
-                    total_attempts,
-                    type(error).__name__,
-                    exc_info=_safe_execution_diagnostic(error),
-                )
+                if self._owns_terminal_failures:
+                    logger.error(
+                        "Tool execution failed name=%s attempt=%d/%d type=%s",
+                        tool.name,
+                        attempt_number,
+                        total_attempts,
+                        type(error).__name__,
+                        exc_info=_safe_execution_diagnostic(error),
+                    )
                 message = (
                     error.message
                     if isinstance(error, ToolError)

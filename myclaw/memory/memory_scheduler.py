@@ -1,6 +1,7 @@
 """Cron scheduling for silent periodic Memory Tasks."""
 
 import asyncio
+import logging
 from collections.abc import Callable
 from datetime import datetime, tzinfo
 from typing import Protocol
@@ -9,6 +10,9 @@ from croniter import croniter  # type: ignore[import-untyped]
 from tzlocal import get_localzone
 
 from myclaw.memory.memory_task import MemoryManager
+from myclaw.runtime_log import log_sanitized_exception
+
+logger = logging.getLogger(__name__)
 
 
 class MemorySchedulerClock(Protocol):
@@ -70,7 +74,17 @@ class MemoryTaskScheduler:
         running = tuple(self._run_tasks)
         for run_task in running:
             run_task.cancel()
-        await asyncio.gather(task, *running, return_exceptions=True)
+        results = await asyncio.gather(task, *running, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                log_sanitized_exception(
+                    logger,
+                    logging.ERROR,
+                    "Memory Task scheduler cleanup failed",
+                    result,
+                )
 
     async def _run(self) -> None:
         timezone = self._timezone
@@ -87,5 +101,14 @@ class MemoryTaskScheduler:
     async def _trigger(self) -> None:
         try:
             await self._manager.run_periodic()
-        except Exception:
+        except Exception as error:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            log_sanitized_exception(
+                logger,
+                logging.ERROR,
+                "Memory Task trigger crashed",
+                error,
+            )
             return

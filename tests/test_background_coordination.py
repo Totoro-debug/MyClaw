@@ -34,6 +34,7 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.schedule.background_coordination import (
     RuntimeEventBroker,
     ScheduledWorkCoordinator,
@@ -380,7 +381,7 @@ class LoadFailingOnceScheduledWorkStore(JsonScheduledWorkStore):
     async def load(self) -> tuple[ScheduledWork, ...]:
         if not self._failed:
             self._failed = True
-            raise ScheduledWorkPersistenceError("temporary read failure")
+            raise ScheduledWorkPersistenceError("PRIVATE SCHEDULED WORK DEFINITION PAYLOAD")
         return await super().load()
 
 
@@ -525,6 +526,7 @@ async def test_scheduler_retries_after_a_store_load_failure(
         coordinator=coordinator,
         clock=clock,
     )
+    lifetime = install_runtime_logging(home)
 
     scheduler.start()
     try:
@@ -535,9 +537,19 @@ async def test_scheduler_retries_after_a_store_load_failure(
         event = await asyncio.wait_for(events.next_background_event(), timeout=1)
     finally:
         await scheduler.close()
+        lifetime.close()
 
     assert isinstance(event.payload, BackgroundCompletedPayload)
     assert event.payload.summary == "Recovered schedule."
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert (
+        "session=- myclaw.schedule.background_coordination: "
+        "Scheduled Work definitions could not be loaded"
+    ) in content
+    assert "ScheduledWorkPersistenceError" in content
+    assert "PRIVATE SCHEDULED WORK DEFINITION PAYLOAD" not in content
+    assert _task().prompt not in content
 
 
 @pytest.mark.asyncio
@@ -617,6 +629,90 @@ async def test_scheduler_continues_after_one_scheduled_run_fails(
 
 
 @pytest.mark.asyncio
+async def test_scheduler_consumes_an_unhandled_scheduled_run_after_it_is_logged(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    clock_now = NOW.replace(microsecond=0)
+    home = AgentHome(agent_home)
+    home.initialize()
+    store = JsonScheduledWorkStore(home)
+    await store.append(replace(_task(), cron="31 0 * * *"))
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: clock_now,
+        new_uuid=uuid4,
+    )
+    attempted = asyncio.Event()
+
+    class UnexpectedFailureProvider(ScriptedFakeProvider):
+        async def complete(self, request: object) -> ModelResponse:
+            self.complete_requests.append(request)
+            attempted.set()
+            raise RuntimeError("PRIVATE TASK PROMPT")
+
+    runner = ScheduledWorkRunner(
+        provider=UnexpectedFailureProvider(),
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: clock_now,
+        new_uuid=uuid4,
+        tool_gateway_for=lambda _session_id: ToolGateway(),
+    )
+    clock = ControlledSchedulerClock(clock_now)
+    scheduler = ScheduledWorkScheduler(
+        store=store,
+        coordinator=ScheduledWorkCoordinator(
+            runner=runner,
+            events=RuntimeEventBroker(),
+            now=lambda: clock_now,
+            new_uuid=lambda: RUN_UUID,
+        ),
+        clock=clock,
+    )
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    unhandled: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    lifetime = install_runtime_logging(home)
+
+    try:
+        scheduler.start()
+        await _wait_until(lambda: clock.sleeps == [60.0])
+        await clock.advance(60)
+        await attempted.wait()
+        await _wait_until(lambda: clock.sleeps == [60.0, 60.0])
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        await scheduler.close()
+        del scheduler
+        gc.collect()
+        await asyncio.sleep(0)
+        lifetime.close()
+        loop.set_exception_handler(previous_handler)
+
+    assert unhandled == []
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert (
+        f"session={TASK_SESSION_ID} myclaw.schedule.scheduled_work_execution: "
+        "Scheduled Work crashed"
+    ) in content
+    assert "RuntimeError: [REDACTED]" in content
+    assert "PRIVATE TASK PROMPT" not in content
+
+
+@pytest.mark.asyncio
 async def test_scheduler_close_cancels_and_awaits_running_scheduled_work(
     agent_home: Path,
     workspace: Path,
@@ -661,6 +757,7 @@ async def test_scheduler_close_cancels_and_awaits_running_scheduled_work(
         ),
         clock=clock,
     )
+    lifetime = install_runtime_logging(home)
     existing_tasks = asyncio.all_tasks()
 
     scheduler.start()
@@ -669,13 +766,91 @@ async def test_scheduler_close_cancels_and_awaits_running_scheduled_work(
     await asyncio.wait_for(provider.first_started.wait(), timeout=1)
     await scheduler.close()
     await asyncio.sleep(0)
+    lifetime.close()
 
     assert provider.first_cancelled.is_set()
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(events.next_background_event(), timeout=0.01)
     assert asyncio.all_tasks() == existing_tasks
+    assert not (agent_home / "logs").exists()
     with pytest.raises(RuntimeError, match="scheduler is closed"):
         scheduler.start()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_work_scheduler_records_a_distinct_shutdown_cleanup_failure(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    clock_now = NOW.replace(microsecond=0)
+    home = AgentHome(agent_home)
+    home.initialize()
+    store = JsonScheduledWorkStore(home)
+    await store.append(replace(_task(), cron="31 0 * * *"))
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: clock_now,
+        new_uuid=uuid4,
+    )
+    started = asyncio.Event()
+
+    class CleanupFailingProvider(ScriptedFakeProvider):
+        async def complete(self, request: object) -> ModelResponse:
+            self.complete_requests.append(request)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                raise RuntimeError("technical Scheduled Work cleanup failure") from cancellation
+            raise AssertionError("cleanup test wait returned unexpectedly")
+
+    runner = ScheduledWorkRunner(
+        provider=CleanupFailingProvider(),
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: clock_now,
+        new_uuid=uuid4,
+        tool_gateway_for=lambda _session_id: ToolGateway(),
+    )
+    clock = ControlledSchedulerClock(clock_now)
+    scheduler = ScheduledWorkScheduler(
+        store=store,
+        coordinator=ScheduledWorkCoordinator(
+            runner=runner,
+            events=RuntimeEventBroker(),
+            now=lambda: clock_now,
+            new_uuid=lambda: RUN_UUID,
+        ),
+        clock=clock,
+    )
+    lifetime = install_runtime_logging(home)
+
+    scheduler.start()
+    await _wait_until(lambda: clock.sleeps == [60.0])
+    await clock.advance(60)
+    await started.wait()
+    await scheduler.close()
+    lifetime.close()
+
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert (
+        f"session={TASK_SESSION_ID} myclaw.schedule.background_coordination: "
+        "Scheduled Work scheduler cleanup failed"
+    ) in content
+    assert "CancelledError" in content
+    assert "RuntimeError: [REDACTED]" in content
+    assert "technical Scheduled Work cleanup failure" not in content
+    assert _task().prompt not in content
 
 
 class CoordinatedStreamingProvider(ScriptedFakeProvider):
@@ -760,9 +935,11 @@ async def test_completed_scheduled_work_publishes_one_background_event(
         now=lambda: NOW,
         new_uuid=lambda: RUN_UUID,
     )
+    lifetime = install_runtime_logging(home)
 
     result = await coordinator.trigger(_task())
     event = await events.next_background_event()
+    lifetime.close()
 
     assert result.status == "completed"
     assert result.content == "No open risks were found."
@@ -780,6 +957,75 @@ async def test_completed_scheduled_work_publishes_one_background_event(
     assert payload.summary == "No open risks were found."
     session = await sessions.load(TASK_SESSION_ID)
     assert [message.role for message in session.messages] == ["user", "assistant"]
+    assert not (agent_home / "logs").exists()
+
+
+@pytest.mark.asyncio
+async def test_background_event_publication_failure_is_recorded_once(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=lambda: USER_UUID,
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="PRIVATE BACKGROUND RESULT"),
+                usage=_usage(),
+                finish_reason="stop",
+            ),
+        )
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        tool_gateway_for=lambda _session_id: ToolGateway(),
+    )
+    events = RuntimeEventBroker()
+    events.close()
+    coordinator = ScheduledWorkCoordinator(
+        runner=runner,
+        events=events,
+        now=lambda: NOW,
+        new_uuid=lambda: RUN_UUID,
+    )
+    lifetime = install_runtime_logging(home)
+
+    with pytest.raises(RuntimeError, match="Runtime event broker is closed"):
+        await coordinator.trigger(_task())
+    lifetime.close()
+
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert (
+        f"session={TASK_SESSION_ID} myclaw.schedule.background_coordination: "
+        "Scheduled Work event publication failed"
+    ) in content
+    assert "RuntimeError: [REDACTED]" in content
+    assert "Runtime event broker is closed" not in content
+    for private_content in (
+        _task().title,
+        _task().prompt,
+        "PRIVATE BACKGROUND RESULT",
+    ):
+        assert private_content not in content
 
 
 @pytest.mark.asyncio
@@ -898,6 +1144,7 @@ async def test_overlapping_trigger_of_the_same_scheduled_work_is_skipped(
         now=lambda: NOW,
         new_uuid=iter((RUN_UUID, RUN_TWO_UUID)).__next__,
     )
+    lifetime = install_runtime_logging(home)
     task = _task()
     first_execution = asyncio.create_task(coordinator.trigger(task))
     await asyncio.wait_for(provider.started.wait(), timeout=1)
@@ -910,6 +1157,7 @@ async def test_overlapping_trigger_of_the_same_scheduled_work_is_skipped(
     finally:
         provider.release.set()
         first = await first_execution
+    lifetime.close()
 
     assert overlap_timed_out is False
     assert skipped is not None
@@ -924,6 +1172,7 @@ async def test_overlapping_trigger_of_the_same_scheduled_work_is_skipped(
     assert [message.role for message in session.messages] == ["user", "assistant"]
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(events.next_background_event(), timeout=0.01)
+    assert not (agent_home / "logs").exists()
 
 
 @pytest.mark.asyncio
@@ -963,6 +1212,7 @@ async def test_cancelled_scheduled_work_emits_no_event_and_can_be_retriggered(
         now=lambda: NOW,
         new_uuid=iter((RUN_UUID, RUN_TWO_UUID)).__next__,
     )
+    lifetime = install_runtime_logging(home)
     task = _task()
     cancelled = asyncio.create_task(coordinator.trigger(task))
     await asyncio.wait_for(provider.first_started.wait(), timeout=1)
@@ -975,12 +1225,14 @@ async def test_cancelled_scheduled_work_emits_no_event_and_can_be_retriggered(
 
     retried = await coordinator.trigger(task)
     event = await events.next_background_event()
+    lifetime.close()
 
     assert retried.status == "completed"
     assert event.turn_id == RUN_TWO_UUID
     assert isinstance(event.payload, BackgroundCompletedPayload)
     assert event.payload.status == "completed"
     assert event.payload.summary == "Retry completed."
+    assert not (agent_home / "logs").exists()
 
 
 @pytest.mark.asyncio

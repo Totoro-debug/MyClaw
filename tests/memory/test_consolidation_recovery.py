@@ -21,6 +21,7 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.records import (
     AssistantSessionMessage,
     UserSessionMessage,
@@ -112,6 +113,37 @@ def _manager(
 
 
 @pytest.mark.asyncio
+async def test_pending_consolidation_recovery_failure_is_recorded_at_its_boundary(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions, _session_id = await _session_ready_for_consolidation(home, workspace)
+    summaries = JsonlSummaryStore(home)
+    summaries.pending_directory.mkdir(parents=True)
+    (summaries.pending_directory / "invalid.json").write_text(
+        "PRIVATE CONSOLIDATION JOURNAL CONTENT",
+        encoding="utf-8",
+    )
+    lifetime = install_runtime_logging(home)
+
+    with pytest.raises(ModelCallError) as raised:
+        await _manager(sessions=sessions, summaries=summaries).recover_pending()
+    lifetime.close()
+
+    assert raised.value.error.code == "persistence_error"
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert (
+        "session=- myclaw.memory.conversation_summary: "
+        "Pending Conversation Summary recovery failed code=persistence_error"
+    ) in content
+    assert "JSONDecodeError" in content
+    assert "PRIVATE CONSOLIDATION JOURNAL CONTENT" not in content
+
+
+@pytest.mark.asyncio
 async def test_summary_write_failure_leaves_recovery_journal_and_old_cursor(
     agent_home: Path,
     workspace: Path,
@@ -188,6 +220,45 @@ async def test_pending_journal_recovers_exact_summary_and_cursor_once(
     ]
     assert (await sessions.load(session_id)).metadata.consolidation_cursor == 2
     assert list(recovered.pending_directory.glob("*.json")) == []
+
+
+@pytest.mark.asyncio
+async def test_pending_consolidation_recovery_records_one_degradation_warning(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    sessions, session_id = await _session_ready_for_consolidation(home, workspace)
+    replace_calls = 0
+
+    def fail_summary_replace(target: Path, content: bytes) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 2:
+            raise OSError("injected summary replacement failure")
+        atomic_replace_bytes(target, content)
+
+    with pytest.raises(ModelCallError):
+        await _manager(
+            sessions=sessions,
+            summaries=JsonlSummaryStore(home, replace_bytes=fail_summary_replace),
+        ).prepare(await sessions.load(session_id))
+    manager = _manager(sessions=sessions, summaries=JsonlSummaryStore(home))
+    lifetime = install_runtime_logging(home)
+
+    await manager.recover_pending()
+    await manager.recover_pending()
+    lifetime.close()
+
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" WARNING ") == 1
+    assert " ERROR " not in content
+    assert (
+        "session=- myclaw.memory.conversation_summary: "
+        "Pending Conversation Summary recovery completed count=1"
+    ) in content
+    assert "First turn summary." not in content
 
 
 @pytest.mark.asyncio

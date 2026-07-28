@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +26,7 @@ from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelRequest, ReasoningEffort, UserModelMessage
 from myclaw.provider.ports import ModelProvider
+from myclaw.runtime_log import log_sanitized_exception
 from myclaw.session.identifiers import require_session_id
 from myclaw.session.ports import SessionStore
 from myclaw.session.records import (
@@ -39,6 +41,8 @@ from myclaw.utils.time import format_rfc3339_milliseconds
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 type UnlinkFile = Callable[[Path], None]
+
+logger = logging.getLogger(__name__)
 
 
 def _unlink_file(path: Path) -> None:
@@ -140,7 +144,7 @@ class ConsolidatingSummaryStore(SummaryStore, Protocol):
         timestamp: datetime,
     ) -> SummaryEntry: ...
 
-    async def recover_pending(self, sessions: ConsolidationSessionStore) -> None: ...
+    async def recover_pending(self, sessions: ConsolidationSessionStore) -> int: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,10 +220,11 @@ class JsonlSummaryStore:
             self._unlink_file(journal_path)
             return entry
 
-    async def recover_pending(self, sessions: ConsolidationSessionStore) -> None:
+    async def recover_pending(self, sessions: ConsolidationSessionStore) -> int:
         async with self._lock:
             if not self.pending_directory.exists():
-                return
+                return 0
+            recovered_count = 0
             for journal_path in sorted(self.pending_directory.glob("*.json")):
                 journal = _PendingConsolidation.from_bytes(journal_path.read_bytes())
                 if journal_path.stem != journal.session_id:
@@ -231,6 +236,8 @@ class JsonlSummaryStore:
                     new_cursor=journal.new_cursor,
                 )
                 self._unlink_file(journal_path)
+                recovered_count += 1
+            return recovered_count
 
     def _append_exact(self, entry: SummaryEntry) -> None:
         entries = self._entries()
@@ -315,14 +322,25 @@ class ConversationSummaryManager:
 
     async def recover_pending(self) -> None:
         try:
-            await self._summaries.recover_pending(self._sessions)
+            recovered_count = await self._summaries.recover_pending(self._sessions)
         except (OSError, UnicodeError, ValueError) as error:
+            log_sanitized_exception(
+                logger,
+                logging.ERROR,
+                "Pending Conversation Summary recovery failed code=persistence_error",
+                error,
+            )
             raise ModelCallError(
                 ErrorInfo(
                     code="persistence_error",
                     message="Pending Conversation Summary recovery could not complete.",
                 )
             ) from error
+        if recovered_count:
+            logger.warning(
+                "Pending Conversation Summary recovery completed count=%d",
+                recovered_count,
+            )
 
     async def prepare(self, session: ConversationSession) -> ConversationSession:
         short_term = session.short_term_messages

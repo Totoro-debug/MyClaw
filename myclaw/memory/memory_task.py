@@ -1,6 +1,7 @@
 """Manual Memory Task orchestration and Agent Home persistence."""
 
 import asyncio
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,8 @@ from myclaw.tools.errors import ToolError
 from myclaw.tools.schema import ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.atomic_files import atomic_replace_text
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryPathDeniedError(PermissionError):
@@ -212,7 +215,7 @@ class MemoryManager:
         self._long_term_path = long_term_path
         self._settings = settings
         self._batch_size = batch_size
-        self._tools = ToolGateway()
+        self._tools = ToolGateway(owns_terminal_failures=False)
         self._tools.register_tools(
             (
                 MemoryReadFileTool(memory=memory, long_term_path=long_term_path),
@@ -237,7 +240,10 @@ class MemoryManager:
         self._running = True
         self._running_cursor = 0
         try:
-            return await self._run_once()
+            result = await self._run_once()
+            if result.error is not None:
+                logger.error("Memory Task failed code=%s", result.error.code)
+            return result
         finally:
             self._running = False
 
@@ -247,7 +253,10 @@ class MemoryManager:
         self._running = True
         self._running_cursor = 0
         try:
-            return await self._run_once()
+            result = await self._run_once()
+            if result.error is not None:
+                logger.error("Memory Task failed code=%s", result.error.code)
+            return result
         finally:
             self._running = False
 
