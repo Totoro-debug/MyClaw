@@ -32,7 +32,7 @@ from myclaw.tools.shell.shell_process import SubprocessShellBoundary
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import PublicWebFetchBoundary
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider, StreamScript
+from tests.fixtures import ScriptedFakeProvider, StreamScript, persist_scheduled_work
 
 NOW = datetime(2026, 7, 13, 0, 30, tzinfo=timezone(timedelta(hours=8)))
 
@@ -1309,17 +1309,16 @@ async def test_runtime_interrupt_keeps_background_work_alive_and_exit_settles_it
         memory_scheduler_clock=memory_clock,
         scheduled_work_scheduler_clock=scheduled_clock,
     )
-    await runtime.scheduled_work_store.append(
-        ScheduledWork(
-            id="11111111-1111-4111-8111-111111111111",
-            title="First lifetime task",
-            cron="31 0 * * *",
-            prompt="Run the first background task.",
-            created_at=NOW,
-            enabled=True,
-            session_id=("20260713-003000-000000_33333333-3333-4333-8333-333333333333"),
-        )
+    first_task = ScheduledWork(
+        id="11111111-1111-4111-8111-111111111111",
+        title="First lifetime task",
+        cron="31 0 * * *",
+        prompt="Run the first background task.",
+        created_at=NOW,
+        enabled=True,
+        session_id=("20260713-003000-000000_33333333-3333-4333-8333-333333333333"),
     )
+    persist_scheduled_work(agent_home, (first_task,))
     input_reader = ExitAfterInterruptInput()
     signals = SignalSetter()
     interrupts = ForegroundInterruptController(
@@ -1346,17 +1345,16 @@ async def test_runtime_interrupt_keeps_background_work_alive_and_exit_settles_it
         provider.first_background_release.set()
         await asyncio.wait_for(provider.first_background_completed.wait(), timeout=1)
 
-        await runtime.scheduled_work_store.append(
-            ScheduledWork(
-                id="22222222-2222-4222-8222-222222222222",
-                title="Second lifetime task",
-                cron="32 0 * * *",
-                prompt="Run the second background task.",
-                created_at=scheduled_clock.now(),
-                enabled=True,
-                session_id=("20260713-003100-000000_44444444-4444-4444-8444-444444444444"),
-            )
+        second_task = ScheduledWork(
+            id="22222222-2222-4222-8222-222222222222",
+            title="Second lifetime task",
+            cron="32 0 * * *",
+            prompt="Run the second background task.",
+            created_at=scheduled_clock.now(),
+            enabled=True,
+            session_id=("20260713-003100-000000_44444444-4444-4444-8444-444444444444"),
         )
+        persist_scheduled_work(agent_home, (first_task, second_task))
         await scheduled_clock.advance(60)
         await asyncio.wait_for(provider.second_background_started.wait(), timeout=1)
 

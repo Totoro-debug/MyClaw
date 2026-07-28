@@ -17,9 +17,8 @@ from myclaw.provider.models import (
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
-from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
+from myclaw.tools.files.file_tools import EditFileTool, WriteFileTool
 from myclaw.tools.models import ModelToolCall
-from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 
@@ -88,15 +87,8 @@ async def test_foreground_mutations_are_refused_without_a_permission_pause(
             ),
         )
     )
-    security = Security(
-        workspace=Workspace.from_path(workspace),
-        agent_home=agent_home,
-        artifact_directory=(sessions.directory / "artifacts" / session.id),
-    )
     gateway = ToolGateway()
-    gateway.register_tools(
-        (WriteFileTool(security=security), EditFileTool(security=security))
-    )
+    gateway.register_tools((WriteFileTool(), EditFileTool()))
     conversation = StreamingConversationPort(
         provider=provider,
         sessions=sessions,

@@ -2,7 +2,6 @@
 
 import os
 from pathlib import Path
-from stat import S_ISREG
 
 from myclaw.agent.workspace import Workspace
 from myclaw.tools.errors import ToolError
@@ -83,43 +82,6 @@ class Security:
         if scope == "workspace":
             return target.relative_to(self._workspace).as_posix()
         raise ToolError("The requested path is outside the readable scope.")
-
-    def resolve_write_path(self, requested: str) -> Path:
-        """Resolve an existing file or new file path inside the writable Workspace."""
-        candidate = Path(requested)
-        if os.name == "nt" and any(_is_windows_reserved(part) for part in candidate.parts):
-            raise ToolError("The requested path identifies a Windows device.")
-        if not candidate.is_absolute():
-            candidate = self._workspace / candidate
-        else:
-            candidate = _io_path(candidate)
-        try:
-            target = candidate.resolve(strict=False)
-        except (OSError, RuntimeError, ValueError) as error:
-            raise ToolError("The requested path could not be resolved.") from error
-        if not target.is_relative_to(self._workspace):
-            raise ToolError("The requested path resolves outside the Workspace.")
-        if target == self._agent_home or target.is_relative_to(self._agent_home):
-            raise ToolError("Agent Home internal state cannot be changed by file Tools.")
-        relative_parts = target.relative_to(self._workspace).parts
-        if os.name == "nt" and any(":" in part for part in relative_parts):
-            raise ToolError("The requested path identifies a Windows alternate data stream.")
-        if target.exists():
-            try:
-                status = target.lstat()
-            except OSError as error:
-                raise ToolError("The requested path could not be inspected.") from error
-            if not S_ISREG(status.st_mode) or status.st_nlink != 1:
-                raise ToolError("The requested path must identify an unaliased regular file.")
-        existing_parent = target.parent
-        while not existing_parent.exists():
-            parent = existing_parent.parent
-            if parent == existing_parent:
-                raise ToolError("The requested path has no existing parent directory.")
-            existing_parent = parent
-        if not existing_parent.is_dir():
-            raise ToolError("The nearest existing parent must be a directory.")
-        return target
 
     def _read_scope(self, target: Path) -> str | None:
         if target == self._agent_home or target.is_relative_to(self._agent_home):

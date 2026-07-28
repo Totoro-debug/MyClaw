@@ -52,7 +52,7 @@ from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import run_repl
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider, StreamScript
+from tests.fixtures import ScriptedFakeProvider, StreamScript, persist_scheduled_work
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 13, 0, 30, 0, 123456, tzinfo=LOCAL_TIMEZONE)
@@ -378,11 +378,11 @@ class LoadFailingOnceScheduledWorkStore(JsonScheduledWorkStore):
         super().__init__(agent_home)
         self._failed = False
 
-    async def load(self) -> tuple[ScheduledWork, ...]:
+    def load(self) -> tuple[ScheduledWork, ...]:
         if not self._failed:
             self._failed = True
             raise ScheduledWorkPersistenceError("PRIVATE SCHEDULED WORK DEFINITION PAYLOAD")
-        return await super().load()
+        return super().load()
 
 
 async def _wait_until(predicate: Callable[[], bool]) -> None:
@@ -449,16 +449,21 @@ async def test_scheduler_refreshes_persisted_work_and_ignores_disabled_records(
 
     scheduler.start()
     await _wait_until(lambda: clock.sleeps == [60.0])
-    await store.append(replace(_task(), cron="31 0 * * *"))
-    await store.append(
-        replace(
-            _task(),
-            id="11111111-1111-4111-8111-111111111111",
-            title="Disabled status",
-            cron="31 0 * * *",
-            enabled=False,
-            session_id="20260713-003000-123000_22222222-2222-4222-8222-222222222222",
-        )
+    persist_scheduled_work(
+        agent_home,
+        (
+            replace(_task(), cron="31 0 * * *"),
+            replace(
+                _task(),
+                id="11111111-1111-4111-8111-111111111111",
+                title="Disabled status",
+                cron="31 0 * * *",
+                enabled=False,
+                session_id=(
+                    "20260713-003000-123000_22222222-2222-4222-8222-222222222222"
+                ),
+            ),
+        ),
     )
     await clock.advance(60)
     event = await asyncio.wait_for(events.next_background_event(), timeout=1)
@@ -481,7 +486,7 @@ async def test_scheduler_retries_after_a_store_load_failure(
     home = AgentHome(agent_home)
     home.initialize()
     store = LoadFailingOnceScheduledWorkStore(home)
-    await store.append(replace(_task(), cron="32 0 * * *"))
+    persist_scheduled_work(agent_home, (replace(_task(), cron="32 0 * * *"),))
     sessions = JsonlSessionStore(
         agent_home=home,
         workspace=Workspace.from_path(workspace),
@@ -561,7 +566,7 @@ async def test_scheduler_continues_after_one_scheduled_run_fails(
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonScheduledWorkStore(home)
-    await store.append(replace(_task(), cron="* * * * *"))
+    persist_scheduled_work(agent_home, (replace(_task(), cron="* * * * *"),))
     sessions = JsonlSessionStore(
         agent_home=home,
         workspace=Workspace.from_path(workspace),
@@ -637,7 +642,7 @@ async def test_scheduler_consumes_an_unhandled_scheduled_run_after_it_is_logged(
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonScheduledWorkStore(home)
-    await store.append(replace(_task(), cron="31 0 * * *"))
+    persist_scheduled_work(agent_home, (replace(_task(), cron="31 0 * * *"),))
     sessions = JsonlSessionStore(
         agent_home=home,
         workspace=Workspace.from_path(workspace),
@@ -721,7 +726,7 @@ async def test_scheduler_close_cancels_and_awaits_running_scheduled_work(
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonScheduledWorkStore(home)
-    await store.append(replace(_task(), cron="31 0 * * *"))
+    persist_scheduled_work(agent_home, (replace(_task(), cron="31 0 * * *"),))
     sessions = JsonlSessionStore(
         agent_home=home,
         workspace=Workspace.from_path(workspace),
@@ -786,7 +791,7 @@ async def test_scheduled_work_scheduler_records_a_distinct_shutdown_cleanup_fail
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonScheduledWorkStore(home)
-    await store.append(replace(_task(), cron="31 0 * * *"))
+    persist_scheduled_work(agent_home, (replace(_task(), cron="31 0 * * *"),))
     sessions = JsonlSessionStore(
         agent_home=home,
         workspace=Workspace.from_path(workspace),
@@ -1885,7 +1890,7 @@ async def test_fresh_prepared_runtimes_each_run_scheduled_work(
         )
 
     first_runtime = prepare_runtime()
-    await first_runtime.scheduled_work_store.append(replace(_task(), cron="* * * * *"))
+    persist_scheduled_work(agent_home, (replace(_task(), cron="* * * * *"),))
 
     async def run_once(runtime: PreparedReplRuntime) -> list[tuple[str, str]]:
         sleep_count = len(scheduled_clock.sleeps)
@@ -1958,7 +1963,7 @@ async def test_periodic_memory_stays_silent_while_scheduled_work_remains_visible
         memory_scheduler_clock=memory_clock,
         scheduled_work_scheduler_clock=scheduled_clock,
     )
-    await runtime.scheduled_work_store.append(replace(_task(), cron="* * * * *"))
+    persist_scheduled_work(agent_home, (replace(_task(), cron="* * * * *"),))
     input_reader = ReleasedConversationInput()
     writer = RecordingWriter()
     execution = asyncio.create_task(runtime.run(input_reader=input_reader, writer=writer))

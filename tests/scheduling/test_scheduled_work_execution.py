@@ -36,8 +36,13 @@ from myclaw.session.records import (
 )
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.base import BaseTool
-from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
-from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
+from myclaw.tools.files.file_tools import (
+    EditFileTool,
+    ListFilesTool,
+    ReadFileTool,
+    SearchFilesTool,
+    WriteFileTool,
+)
 from myclaw.tools.models import (
     ModelToolCall,
     ToolResult,
@@ -49,7 +54,7 @@ from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.atomic_files import atomic_replace_bytes
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider
+from tests.fixtures import ScriptedFakeProvider, persist_scheduled_work
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 12, 23, 0, 0, 123456, tzinfo=LOCAL_TIMEZONE)
@@ -158,8 +163,8 @@ def _tool_gateway(
         ReadFileTool(security=security),
         ListFilesTool(security=security),
         SearchFilesTool(security=security),
-        WriteFileTool(security=security),
-        EditFileTool(security=security),
+        WriteFileTool(),
+        EditFileTool(),
     ]
     if shell is not None:
         tools.append(ShellTool(workspace=workspace, boundary=shell))
@@ -1941,10 +1946,8 @@ async def test_runtime_scheduled_work_uses_current_shell_and_web_enablement(
         shell=BlockingShellBoundary(),
     )
     task = _task()
-    await runtime.scheduled_work_store.append(task)
-    persisted_task = (await runtime.scheduled_work_store.load())[0]
 
-    result = await runtime.scheduled_work_runner.run(persisted_task)
+    result = await runtime.scheduled_work_runner.run(task)
 
     assert result.status == "completed"
     assert runtime.session_id != task.session_id
@@ -2101,12 +2104,14 @@ async def test_runtime_scheduled_work_refuses_recursive_task_creation(
         shell=FailingShellBoundary(),
     )
     task = _task()
-    await runtime.scheduled_work_store.append(task)
+    persist_scheduled_work(agent_home, (task,))
+    scheduled_work_path = agent_home / "scheduled-work.json"
+    persisted_before = scheduled_work_path.read_bytes()
 
     result = await runtime.scheduled_work_runner.run(task)
 
     assert result.status == "completed"
-    assert len(await runtime.scheduled_work_store.load()) == 1
+    assert scheduled_work_path.read_bytes() == persisted_before
     session = await runtime.sessions.load(task.session_id)
     recursive_result = session.messages[2]
     assert isinstance(recursive_result, ToolSessionMessage)

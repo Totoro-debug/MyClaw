@@ -271,7 +271,7 @@ class ScheduledWorkScheduler:
             raise RuntimeError("Scheduled Work scheduler was not started")
         while True:
             try:
-                records = tuple(record for record in await self._store.load() if record.enabled)
+                records = tuple(record for record in self._store.load() if record.enabled)
             except ScheduledWorkPersistenceError as error:
                 log_sanitized_exception(
                     logger,
@@ -290,7 +290,7 @@ class ScheduledWorkScheduler:
             await self._clock.sleep(max(0.0, min(60.0, min(waits, default=60.0))))
             current = self._clock.now().astimezone(timezone)
             try:
-                records = tuple(record for record in await self._store.load() if record.enabled)
+                records = tuple(record for record in self._store.load() if record.enabled)
             except ScheduledWorkPersistenceError as error:
                 log_sanitized_exception(
                     logger,

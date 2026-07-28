@@ -5,7 +5,13 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.runtime_log import install_runtime_logging
-from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
+from myclaw.tools.files.file_tools import (
+    EditFileTool,
+    ListFilesTool,
+    ReadFileTool,
+    SearchFilesTool,
+    WriteFileTool,
+)
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ToolGateway
@@ -98,6 +104,98 @@ def test_workspace_inspection_tools_export_exact_openai_schemas(
     }
     assert list_files.max_retries == 0
     assert search_files.max_retries == 0
+
+
+def test_workspace_mutation_tools_export_exact_schemas_and_zero_retries() -> None:
+    write_file = WriteFileTool()
+    edit_file = EditFileTool()
+
+    assert write_file.to_schema() == {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write UTF-8 text to a file within the current Workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace file path.",
+                        "minLength": 1,
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Complete UTF-8 text content.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    }
+    assert edit_file.to_schema() == {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact UTF-8 text in a file within the current Workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Existing Workspace file path.",
+                        "minLength": 1,
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact text to replace.",
+                        "minLength": 1,
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every exact match.",
+                        "default": False,
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    }
+    assert write_file.max_retries == 0
+    assert edit_file.max_retries == 0
+
+
+@pytest.mark.asyncio
+async def test_registered_catalog_refuses_workspace_mutations() -> None:
+    gateway = ToolGateway()
+    gateway.register_tools((WriteFileTool(), EditFileTool()))
+
+    write_result = await gateway.call(
+        ModelToolCall(
+            id="call_write",
+            name="write_file",
+            arguments='{"path":"created.txt","content":"must not be written"}',
+        )
+    )
+    edit_result = await gateway.call(
+        ModelToolCall(
+            id="call_edit",
+            name="edit_file",
+            arguments='{"path":"notes.txt","old_text":"before","new_text":"after"}',
+        )
+    )
+
+    assert (write_result.status, write_result.content) == (
+        "refused",
+        "Writing Workspace files is unavailable because confirmation is not implemented.",
+    )
+    assert (edit_result.status, edit_result.content) == (
+        "refused",
+        "Editing Workspace files is unavailable because confirmation is not implemented.",
+    )
 
 
 @pytest.mark.asyncio

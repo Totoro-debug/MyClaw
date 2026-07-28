@@ -1,7 +1,5 @@
 """Scheduled Work persisted records."""
 
-import json
-from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -57,12 +55,3 @@ class ScheduledWork:
             "enabled": self.enabled,
             "session_id": self.session_id,
         }
-
-
-def serialize_scheduled_work(records: Iterable[ScheduledWork]) -> str:
-    """Serialize the complete Scheduled Work array without persistence behavior."""
-    return json.dumps(
-        [record.to_dict() for record in records],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )

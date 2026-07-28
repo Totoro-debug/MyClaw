@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
@@ -19,7 +19,6 @@ from myclaw.provider.models import (
 from myclaw.schedule.scheduled_work import (
     CreateScheduledWorkTool,
     JsonScheduledWorkStore,
-    ScheduledWorkInvalidError,
     ScheduledWorkPersistenceError,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
@@ -37,14 +36,8 @@ def _usage() -> ModelUsage:
     return ModelUsage(input_tokens=8, output_tokens=2, total_tokens=10)
 
 
-def test_create_scheduled_work_exports_exact_schema_and_zero_retries(
-    agent_home: Path,
-) -> None:
-    tool = CreateScheduledWorkTool(
-        store=JsonScheduledWorkStore(AgentHome(agent_home)),
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
+def test_create_scheduled_work_exports_exact_schema_and_zero_retries() -> None:
+    tool = CreateScheduledWorkTool()
 
     assert tool.to_schema() == {
         "type": "function",
@@ -133,9 +126,7 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
     )
     store = JsonScheduledWorkStore(home)
     gateway = ToolGateway()
-    gateway.register_tools(
-        (CreateScheduledWorkTool(store=store, now=lambda: NOW, new_uuid=uuid4),)
-    )
+    gateway.register_tools((CreateScheduledWorkTool(),))
     conversation = StreamingConversationPort(
         provider=provider,
         sessions=sessions,
@@ -159,7 +150,7 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
         "tool_completed",
         "turn_completed",
     ]
-    assert await store.load() == ()
+    assert store.load() == ()
     session = await sessions.load(session_id)
     refused = session.messages[2]
     assert isinstance(refused, ToolSessionMessage)
@@ -211,82 +202,8 @@ async def test_runtime_chat_catalog_exposes_scheduled_work_creation(
     }
 
 
-@pytest.mark.asyncio
-async def test_invalid_cron_returns_scheduled_work_error_without_writing(
+def test_invalid_existing_record_returns_persistence_error_without_rewrite(
     agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    store = JsonScheduledWorkStore(home)
-    tool = CreateScheduledWorkTool(
-        store=store,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
-
-    with pytest.raises(ScheduledWorkInvalidError):
-        await tool.execute(
-            title="Invalid schedule",
-            cron="0 9 * * * *",
-            prompt="This must never be persisted.",
-        )
-
-    assert not store.path.exists()
-    assert await store.load() == ()
-
-
-@pytest.mark.asyncio
-async def test_refused_scheduled_work_creation_does_not_allocate_a_record(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    store = JsonScheduledWorkStore(home)
-    allocated_ids: list[UUID] = []
-
-    def allocate_uuid() -> UUID:
-        value = uuid4()
-        allocated_ids.append(value)
-        return value
-
-    def fail_now() -> datetime:
-        raise AssertionError("now must not be called")
-
-    tool = CreateScheduledWorkTool(
-        store=store,
-        now=fail_now,
-        new_uuid=allocate_uuid,
-    )
-    gateway = ToolGateway()
-    gateway.register_tools((tool,))
-
-    result = await gateway.call(
-        ModelToolCall(
-            id="call_refused_schedule",
-            name="create_scheduled_work",
-            arguments=(
-                '{"title":"Do not persist","cron":"0 9 * * 1",'
-                '"prompt":"This request was not approved."}'
-            ),
-        )
-    )
-
-    assert result.status == "refused"
-    assert result.content == (
-        "Scheduled Work creation is unavailable because confirmation is not implemented."
-    )
-    assert result.artifact is None
-    assert allocated_ids == []
-    assert not store.path.exists()
-    assert await store.load() == ()
-
-
-@pytest.mark.asyncio
-async def test_invalid_existing_record_returns_persistence_error_without_rewrite(
-    agent_home: Path,
-    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
@@ -307,60 +224,8 @@ async def test_invalid_existing_record_returns_persistence_error_without_rewrite
         separators=(",", ":"),
     )
     store.path.write_text(invalid_content, encoding="utf-8")
-    tool = CreateScheduledWorkTool(
-        store=store,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
 
     with pytest.raises(ScheduledWorkPersistenceError):
-        await tool.execute(
-            title="New valid task",
-            cron="0 10 * * 2",
-            prompt="Do not overwrite the invalid existing store.",
-        )
+        store.load()
 
     assert store.path.read_text(encoding="utf-8") == invalid_content
-
-
-@pytest.mark.asyncio
-async def test_atomic_publication_failure_preserves_existing_complete_array(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    store = JsonScheduledWorkStore(home)
-    tool = CreateScheduledWorkTool(store=store, now=lambda: NOW, new_uuid=uuid4)
-    first = await tool.execute(
-        title="Existing task",
-        cron="0 9 * * 1",
-        prompt="Preserve this task.",
-    )
-    assert first.startswith("Created Scheduled Work ")
-    official_bytes = store.path.read_bytes()
-    attempted_documents: list[str] = []
-
-    def fail_atomic_replace(path: Path, content: str) -> None:
-        assert path == store.path
-        attempted_documents.append(content)
-        raise OSError("private atomic replacement detail")
-
-    failing_store = JsonScheduledWorkStore(home, replace_text=fail_atomic_replace)
-    failing_tool = CreateScheduledWorkTool(
-        store=failing_store,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
-
-    with pytest.raises(ScheduledWorkPersistenceError):
-        await failing_tool.execute(
-            title="Unpublished task",
-            cron="0 10 * * 2",
-            prompt="This task must not appear in the official file.",
-        )
-
-    assert len(attempted_documents) == 1
-    assert len(json.loads(attempted_documents[0])) == 2
-    assert store.path.read_bytes() == official_bytes
-    assert len(await store.load()) == 1

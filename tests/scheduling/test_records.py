@@ -4,12 +4,12 @@ from typing import cast
 
 import pytest
 
-from myclaw.schedule.records import ScheduledWork, serialize_scheduled_work
+from myclaw.schedule.records import ScheduledWork
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 
 
-def test_scheduled_work_serializes_as_the_exact_seven_key_array_record() -> None:
+def test_scheduled_work_exports_the_exact_seven_key_record() -> None:
     work = ScheduledWork(
         id="550e8400-e29b-41d4-a716-446655440000",
         title="Weekly project review",
@@ -29,15 +29,6 @@ def test_scheduled_work_serializes_as_the_exact_seven_key_array_record() -> None
         "enabled": True,
         "session_id": "20260711-160000-000000_550e8400-e29b-41d4-a716-446655440000",
     }
-    assert serialize_scheduled_work((work,)) == (
-        '[{"id":"550e8400-e29b-41d4-a716-446655440000",'
-        '"title":"Weekly project review","cron":"0 9 * * 1",'
-        '"prompt":"Review the current project and summarize open risks.",'
-        '"created_at":"2026-07-11T16:00:00.000+08:00","enabled":true,'
-        '"session_id":"20260711-160000-000000_550e8400-e29b-41d4-a716-446655440000"}]'
-    )
-
-
 def test_scheduled_work_rejects_values_outside_the_record_contract() -> None:
     valid = ScheduledWork(
         id="550e8400-e29b-41d4-a716-446655440000",

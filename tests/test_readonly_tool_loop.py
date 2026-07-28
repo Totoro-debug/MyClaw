@@ -25,8 +25,13 @@ from myclaw.session.records import (
     ToolSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
-from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
-from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
+from myclaw.tools.files.file_tools import (
+    EditFileTool,
+    ListFilesTool,
+    ReadFileTool,
+    SearchFilesTool,
+    WriteFileTool,
+)
 from myclaw.tools.models import (
     ModelToolCall,
 )
@@ -70,8 +75,8 @@ def _file_gateway(
             ReadFileTool(security=security),
             ListFilesTool(security=security),
             SearchFilesTool(security=security),
-            WriteFileTool(security=security),
-            EditFileTool(security=security),
+            WriteFileTool(),
+            EditFileTool(),
         )
     )
     return gateway

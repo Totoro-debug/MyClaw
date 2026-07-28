@@ -1,79 +1,49 @@
 """Creation and persistence primitives for Scheduled Work."""
 
-import asyncio
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, cast
-from uuid import UUID
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.schedule.records import ScheduledWork, serialize_scheduled_work
-from myclaw.session.identifiers import make_session_id
+from myclaw.schedule.records import ScheduledWork
 from myclaw.tools.base import BaseTool
 from myclaw.tools.schema import ToolParam
-from myclaw.utils.atomic_files import atomic_replace_text
 
 _RECORD_FIELDS = frozenset({"id", "title", "cron", "prompt", "created_at", "enabled", "session_id"})
 
 
-class ScheduledWorkInvalidError(ValueError):
-    """Raised when create_scheduled_work receives invalid task fields."""
-
-
 class ScheduledWorkPersistenceError(RuntimeError):
-    """Raised when Scheduled Work persisted state cannot be read or replaced."""
+    """Raised when Scheduled Work persisted state cannot be read."""
 
 
 class JsonScheduledWorkStore:
-    """Atomically persist the complete Scheduled Work JSON array."""
+    """Load the complete Scheduled Work JSON array."""
 
-    def __init__(
-        self,
-        agent_home: AgentHome,
-        *,
-        replace_text: Callable[[Path, str], None] = atomic_replace_text,
-    ) -> None:
+    def __init__(self, agent_home: AgentHome) -> None:
         self._agent_home = agent_home
-        self._replace_text = replace_text
-        self._lock = asyncio.Lock()
 
     @property
     def path(self) -> Path:
         return self._agent_home.path / "scheduled-work.json"
 
-    async def load(self) -> tuple[ScheduledWork, ...]:
-        async with self._lock:
-            try:
-                return self._load_unlocked()
-            except Exception as error:
-                raise ScheduledWorkPersistenceError(
-                    "Scheduled Work state could not be read"
-                ) from error
-
-    async def append(self, record: ScheduledWork) -> None:
-        async with self._lock:
-            try:
-                records = (*self._load_unlocked(), record)
-                self._agent_home.initialize()
-                self._replace_text(self.path, serialize_scheduled_work(records))
-            except Exception as error:
-                raise ScheduledWorkPersistenceError(
-                    "Scheduled Work state could not be replaced"
-                ) from error
-
-    def _load_unlocked(self) -> tuple[ScheduledWork, ...]:
-        if not self.path.exists():
-            return ()
-        document: object = json.loads(self.path.read_text(encoding="utf-8"))
-        if not isinstance(document, list):
-            raise ValueError("Scheduled Work file must contain a JSON array")
-        return tuple(_parse_record(value) for value in document)
+    def load(self) -> tuple[ScheduledWork, ...]:
+        try:
+            if not self.path.exists():
+                return ()
+            document: object = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(document, list):
+                raise ValueError("Scheduled Work file must contain a JSON array")
+            return tuple(_parse_record(value) for value in document)
+        except Exception as error:
+            raise ScheduledWorkPersistenceError(
+                "Scheduled Work state could not be read"
+            ) from error
 
 
 class CreateScheduledWorkTool(BaseTool):
-    """Declare and directly persist one enabled Scheduled Work record."""
+    """Declare unavailable Scheduled Work creation."""
 
     name = "create_scheduled_work"
     description = "Create recurring work with a five-field cron schedule."
@@ -92,37 +62,12 @@ class CreateScheduledWorkTool(BaseTool):
         ToolParam(description="Task prompt.", min_length=1, max_length=20000),
     ]
 
-    def __init__(
-        self,
-        *,
-        store: JsonScheduledWorkStore,
-        now: Callable[[], datetime],
-        new_uuid: Callable[[], UUID],
-    ) -> None:
-        self._store = store
-        self._now = now
-        self._new_uuid = new_uuid
-
     def refusal_reason(self, *, title: str, cron: str, prompt: str) -> str:
         del title, cron, prompt
         return "Scheduled Work creation is unavailable because confirmation is not implemented."
 
     async def execute(self, *, title: str, cron: str, prompt: str) -> str:
-        created_at = self._now()
-        try:
-            record = ScheduledWork(
-                id=str(self._new_uuid()),
-                title=title,
-                cron=cron,
-                prompt=prompt,
-                created_at=created_at,
-                enabled=True,
-                session_id=make_session_id(created_at, self._new_uuid()),
-            )
-        except ValueError as error:
-            raise ScheduledWorkInvalidError("invalid Scheduled Work fields") from error
-        await self._store.append(record)
-        return f"Created Scheduled Work {record.id}."
+        raise AssertionError("Refusal-only Tool reached execution")
 
 
 def _parse_record(value: object) -> ScheduledWork:
@@ -152,5 +97,5 @@ def _parse_record(value: object) -> ScheduledWork:
 def _required_string(arguments: Mapping[str, object], name: str) -> str:
     value = arguments.get(name)
     if not isinstance(value, str) or not value:
-        raise ScheduledWorkInvalidError(f"{name} must be a non-empty string")
+        raise ValueError(f"{name} must be a non-empty string")
     return value

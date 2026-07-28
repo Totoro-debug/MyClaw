@@ -8,9 +8,7 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import AssistantModelMessage
-from myclaw.tools.errors import ToolError
 from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
-from myclaw.tools.files.workspace_write_tools import WriteFileTool
 from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.security import Security
 from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
@@ -126,38 +124,6 @@ def test_agent_home_initialization_denies_a_hard_linked_memory_file(
         AgentHome(agent_home).initialize()
 
     assert outside.read_bytes() == protected_content
-
-
-@pytest.mark.asyncio
-async def test_write_file_denies_a_hard_link_to_agent_home_state(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    protected = agent_home / "memory" / "memory.md"
-    protected_content = b"# Protected memory\n"
-    protected.write_bytes(protected_content)
-    alias = workspace / "memory-alias.md"
-    try:
-        alias.hardlink_to(protected)
-    except OSError as error:
-        pytest.skip(f"file hard links are unavailable on this host: {error}")
-    identity = Workspace.from_path(workspace)
-    tool = WriteFileTool(
-        security=Security(
-            workspace=identity,
-            agent_home=agent_home,
-            artifact_directory=(
-                agent_home / "sessions" / identity.slug / "artifacts" / SESSION_ID
-            ),
-        )
-    )
-
-    with pytest.raises(ToolError, match="unalias"):
-        await tool.execute(path=alias.name, content="overwritten")
-
-    assert protected.read_bytes() == protected_content
 
 
 @pytest.mark.asyncio
@@ -359,29 +325,6 @@ def test_tool_artifact_externalization_returns_a_new_immutable_result(
     assert original.artifact is None
     assert projected.artifact is not None
     assert artifact_path.read_text(encoding="utf-8") == raw_result
-
-
-@pytest.mark.asyncio
-@pytest.mark.skipif(os.name != "nt", reason="NTFS alternate streams are Windows-only")
-async def test_write_file_denies_a_windows_alternate_data_stream(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    identity = Workspace.from_path(workspace)
-    tool = WriteFileTool(
-        security=Security(
-            workspace=identity,
-            agent_home=agent_home,
-            artifact_directory=(
-                agent_home / "sessions" / identity.slug / "artifacts" / SESSION_ID
-            ),
-        )
-    )
-
-    with pytest.raises(ToolError, match="alternate data stream"):
-        await tool.execute(path="notes.txt:private", content="hidden")
-
-    assert not (workspace / "notes.txt").exists()
 
 
 @pytest.mark.asyncio

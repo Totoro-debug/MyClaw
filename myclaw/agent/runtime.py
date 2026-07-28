@@ -66,8 +66,13 @@ from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool
-from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
-from myclaw.tools.files.workspace_write_tools import EditFileTool, WriteFileTool
+from myclaw.tools.files.file_tools import (
+    EditFileTool,
+    ListFilesTool,
+    ReadFileTool,
+    SearchFilesTool,
+    WriteFileTool,
+)
 from myclaw.tools.models import ToolResult
 from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.tools.security import Security
@@ -174,7 +179,6 @@ class PreparedReplRuntime:
     sessions: JsonlSessionStore
     management_dispatcher: ManagementDispatcher
     scheduled_work_runner: ScheduledWorkRunner
-    scheduled_work_store: JsonScheduledWorkStore
     _shell: SubprocessShellBoundary | None
     _memory_scheduler: _RuntimeMemoryScheduler
     _scheduled_work_scheduler: _RuntimeScheduledWorkScheduler
@@ -551,11 +555,7 @@ def _prepare_repl_runtime(
         configured_shell if isinstance(configured_shell, SubprocessShellBoundary) else None
     )
     scheduled_work_store = JsonScheduledWorkStore(agent_home)
-    scheduled_work_tool = CreateScheduledWorkTool(
-        store=scheduled_work_store,
-        now=now,
-        new_uuid=new_uuid,
-    )
+    scheduled_work_tool = CreateScheduledWorkTool()
     tool_gateway = _build_tool_gateway(
         workspace=workspace_identity,
         agent_home=agent_home,
@@ -747,7 +747,6 @@ def _prepare_repl_runtime(
         sessions=sessions,
         management_dispatcher=management_dispatcher,
         scheduled_work_runner=scheduled_work_runner,
-        scheduled_work_store=scheduled_work_store,
         _shell=owned_shell,
         _memory_scheduler=memory_scheduler,
         _scheduled_work_scheduler=scheduled_work_scheduler,
@@ -779,8 +778,8 @@ def _build_tool_gateway(
         ReadFileTool(security=security),
         ListFilesTool(security=security),
         SearchFilesTool(security=security),
-        WriteFileTool(security=security),
-        EditFileTool(security=security),
+        WriteFileTool(),
+        EditFileTool(),
     ]
     if web_search is not None:
         tools.append(WebSearchTool(search=web_search))
