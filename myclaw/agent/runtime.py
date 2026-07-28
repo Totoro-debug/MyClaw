@@ -111,35 +111,15 @@ def unavailable_provider_factory(configuration: ProviderConfiguration) -> ModelP
     )
 
 
-class _RuntimeMemoryScheduler:
+class _RuntimeSchedulerOwner:
     """Own one terminal scheduler instance per Runtime run."""
 
-    def __init__(self, factory: Callable[[], MemoryTaskScheduler]) -> None:
+    def __init__(
+        self,
+        factory: Callable[[], MemoryTaskScheduler | ScheduledWorkScheduler],
+    ) -> None:
         self._factory = factory
-        self._active: MemoryTaskScheduler | None = None
-
-    def start(self) -> None:
-        scheduler = self._active
-        if scheduler is None:
-            scheduler = self._factory()
-            self._active = scheduler
-        scheduler.start()
-
-    async def close(self) -> None:
-        scheduler = self._active
-        if scheduler is None:
-            return
-        await scheduler.close()
-        if self._active is scheduler:
-            self._active = None
-
-
-class _RuntimeScheduledWorkScheduler:
-    """Own one terminal Scheduled Work scheduler per Runtime run."""
-
-    def __init__(self, factory: Callable[[], ScheduledWorkScheduler]) -> None:
-        self._factory = factory
-        self._active: ScheduledWorkScheduler | None = None
+        self._active: MemoryTaskScheduler | ScheduledWorkScheduler | None = None
 
     def start(self) -> None:
         scheduler = self._active
@@ -180,8 +160,8 @@ class PreparedReplRuntime:
     management_dispatcher: ManagementDispatcher
     scheduled_work_runner: ScheduledWorkRunner
     _shell: SubprocessShellBoundary | None
-    _memory_scheduler: _RuntimeMemoryScheduler
-    _scheduled_work_scheduler: _RuntimeScheduledWorkScheduler
+    _memory_scheduler: _RuntimeSchedulerOwner
+    _scheduled_work_scheduler: _RuntimeSchedulerOwner
     _background_events: RuntimeEventBroker
     _router: ModelRouter
     _lifetime: _RuntimeLifetime
@@ -610,7 +590,7 @@ def _prepare_repl_runtime(
         if memory_scheduler_clock is not None
         else AsyncioMemorySchedulerClock(now=now)
     )
-    memory_scheduler = _RuntimeMemoryScheduler(
+    memory_scheduler = _RuntimeSchedulerOwner(
         lambda: MemoryTaskScheduler(
             manager=memory_manager,
             schedule=configuration.memory.schedule,
@@ -667,7 +647,7 @@ def _prepare_repl_runtime(
         if scheduled_work_scheduler_clock is not None
         else AsyncioScheduledWorkSchedulerClock(now=now)
     )
-    scheduled_work_scheduler = _RuntimeScheduledWorkScheduler(
+    scheduled_work_scheduler = _RuntimeSchedulerOwner(
         lambda: ScheduledWorkScheduler(
             store=scheduled_work_store,
             coordinator=scheduled_work_coordinator,
