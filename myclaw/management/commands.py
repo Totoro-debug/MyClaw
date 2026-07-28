@@ -9,6 +9,7 @@ from myclaw.config.models import ConfigView
 from myclaw.management.models import RuntimeStatus
 from myclaw.management.service import ManagementError
 from myclaw.memory.models import MemoryTaskResult
+from myclaw.runtime_log import log_sanitized_exception
 from myclaw.session.models import ResumeResult
 from myclaw.session.records import SessionSummary
 from myclaw.session.session_store import SessionListingReport
@@ -54,12 +55,7 @@ class ManagementCommandDispatcher:
             try:
                 listing = await self._management.resumable_listing()
             except ManagementError as management_error:
-                if management_error.error.code == "persistence_error":
-                    logger.error(
-                        "Management command failed command=/resume code=%s",
-                        management_error.error.code,
-                        exc_info=True,
-                    )
+                _log_management_error("/resume", management_error)
                 return ManagementCommandResult(
                     handled=True,
                     output=f"{management_error.error.code}: {management_error.error.message}",
@@ -92,12 +88,14 @@ class ManagementCommandDispatcher:
                 status = await self._management.status()
                 output = json.dumps(status.to_dict(), ensure_ascii=False, indent=2)
             except ManagementError as management_error:
+                _log_management_error("/status", management_error)
                 output = f"{management_error.error.code}: {management_error.error.message}"
             return ManagementCommandResult(handled=True, output=output)
         if command == "/memory":
             try:
                 output = await self._management.memory_view()
             except ManagementError as management_error:
+                _log_management_error("/memory", management_error)
                 output = f"{management_error.error.code}: {management_error.error.message}"
             return ManagementCommandResult(
                 handled=True,
@@ -107,6 +105,7 @@ class ManagementCommandDispatcher:
             try:
                 result = await self._management.dream()
             except ManagementError as management_error:
+                _log_management_error("/dream", management_error)
                 output = f"{management_error.error.code}: {management_error.error.message}"
             else:
                 if result.error is None and result.status == "No pending summaries":
@@ -129,11 +128,7 @@ class ManagementCommandDispatcher:
         try:
             view = await self._management.config_view()
         except ManagementError as management_error:
-            logger.error(
-                "Management command failed command=/config code=%s",
-                management_error.error.code,
-                exc_info=True,
-            )
+            _log_management_error("/config", management_error)
             return ManagementCommandResult(
                 handled=True,
                 output=f"{management_error.error.code}: {management_error.error.message}",
@@ -154,20 +149,27 @@ class ManagementCommandDispatcher:
         try:
             result = await self._management.resume(session_id)
         except ManagementError as management_error:
-            if management_error.error.code == "persistence_error":
-                logger.error(
-                    "Management command failed command=/resume code=%s",
-                    management_error.error.code,
-                    exc_info=True,
-                )
+            _log_management_error("/resume", management_error)
             output = f"{management_error.error.code}: {management_error.error.message}"
         except Exception as error:
-            logger.error(
-                "Management command failed command=/resume type=%s",
-                type(error).__name__,
-                exc_info=True,
+            log_sanitized_exception(
+                logger,
+                logging.ERROR,
+                f"Management command failed command=/resume type={type(error).__name__}",
+                error,
             )
             raise
         else:
             output = f"Resumed session {result.session_id}."
         return ManagementCommandResult(handled=True, output=output)
+
+
+def _log_management_error(command: str, error: ManagementError) -> None:
+    if error.error.code != "persistence_error":
+        return
+    log_sanitized_exception(
+        logger,
+        logging.ERROR,
+        f"Management command failed command={command} code={error.error.code}",
+        error,
+    )

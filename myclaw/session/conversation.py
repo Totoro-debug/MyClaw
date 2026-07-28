@@ -24,6 +24,7 @@ from myclaw.provider.models import (
     UserModelMessage,
 )
 from myclaw.provider.ports import ModelProvider
+from myclaw.runtime_log import log_sanitized_exception
 from myclaw.session.ports import SessionStore
 from myclaw.session.records import ConversationSession, MetadataUpdate, UserSessionMessage
 from myclaw.session.session_titles import normalize_session_title
@@ -173,10 +174,11 @@ class StreamingConversationPort:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            logger.error(
-                "Session title task failed type=%s",
-                type(error).__name__,
-                exc_info=True,
+            log_sanitized_exception(
+                logger,
+                logging.ERROR,
+                f"Session title task failed type={type(error).__name__}",
+                error,
             )
             raise
 
@@ -316,10 +318,11 @@ async def _close_provider_stream(stream: AsyncIterator[ModelStreamEvent] | None)
     try:
         await close()
     except Exception as error:
-        logger.warning(
-            "Session title stream cleanup failed type=%s",
-            type(error).__name__,
-            exc_info=True,
+        log_sanitized_exception(
+            logger,
+            logging.WARNING,
+            f"Session title stream cleanup failed type={type(error).__name__}",
+            error,
         )
 
 

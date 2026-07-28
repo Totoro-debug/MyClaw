@@ -139,7 +139,7 @@ class FailingTitleStreamCloseProvider:
                     )
                 )
             finally:
-                raise OSError("title stream close failed")
+                raise OSError("PRIVATE_TITLE_STREAM_BODY_52")
             return
 
         await self.title_started.wait()
@@ -650,6 +650,8 @@ async def test_title_stream_cleanup_failure_warns_and_keeps_the_generated_title(
     assert content.count("WARNING pid=") == 1
     assert content.count("ERROR pid=") == 0
     assert content.count(marker) == 1
+    assert "OSError: [REDACTED]" in content
+    assert "PRIVATE_TITLE_STREAM_BODY_52" not in content
 
 
 @pytest.mark.asyncio

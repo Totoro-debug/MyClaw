@@ -44,7 +44,7 @@ from myclaw.memory.memory_scheduler import (
 from myclaw.memory.memory_task import FileMemoryStore, MemoryManager, MemoryTaskModelSettings
 from myclaw.provider.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
 from myclaw.provider.ports import ModelProvider
-from myclaw.runtime_log import RuntimeLogLifetime
+from myclaw.runtime_log import RuntimeLogLifetime, log_sanitized_exception
 from myclaw.schedule.background_coordination import (
     AsyncioScheduledWorkSchedulerClock,
     RuntimeEventBroker,
@@ -202,10 +202,11 @@ class PreparedReplRuntime:
             self._memory_scheduler.start()
             self._scheduled_work_scheduler.start()
         except BaseException as error:
-            logger.error(
-                "Runtime startup failed type=%s",
-                type(error).__name__,
-                exc_info=True,
+            log_sanitized_exception(
+                logger,
+                logging.ERROR,
+                f"Runtime startup failed type={type(error).__name__}",
+                error,
             )
             raise
 
@@ -299,10 +300,11 @@ class PreparedReplRuntime:
             if len(failures) == 1
             else BaseExceptionGroup("Runtime shutdown failed", failures)
         )
-        logger.error(
-            "Runtime shutdown failed type=%s",
-            type(failure).__name__,
-            exc_info=(type(failure), failure, failure.__traceback__),
+        log_sanitized_exception(
+            logger,
+            logging.ERROR,
+            f"Runtime shutdown failed type={type(failure).__name__}",
+            failure,
         )
         raise failure
 
@@ -471,10 +473,11 @@ def prepare_repl_runtime(
             runtime_log=runtime_log,
         )
     except Exception as error:
-        logger.error(
-            "Runtime composition failed type=%s",
-            type(error).__name__,
-            exc_info=True,
+        log_sanitized_exception(
+            logger,
+            logging.ERROR,
+            f"Runtime composition failed type={type(error).__name__}",
+            error,
         )
         raise
 

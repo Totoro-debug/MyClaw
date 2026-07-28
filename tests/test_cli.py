@@ -98,7 +98,7 @@ def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_er
             events.append("interrupt-close")
             if not self.installed:
                 raise AssertionError("SIGINT handler restored before interrupt drain")
-            raise RuntimeError("interrupt cleanup failed")
+            raise RuntimeError("PRIVATE_INTERRUPT_CLEANUP_BODY_52")
 
         def restore(self) -> None:
             self.installed = False
@@ -133,7 +133,7 @@ def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_er
         cli.main(context)
 
     assert isinstance(raised.value.__cause__, RuntimeError)
-    assert str(raised.value.__cause__) == "interrupt cleanup failed"
+    assert str(raised.value.__cause__) == "PRIVATE_INTERRUPT_CLEANUP_BODY_52"
     assert events == ["install", "runtime", "interrupt-close", "restore"]
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     marker = (
@@ -142,6 +142,8 @@ def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_er
     )
     assert content.count("ERROR pid=") == 1
     assert content.count(marker) == 1
+    assert "RuntimeError: [REDACTED]" in content
+    assert "PRIVATE_INTERRUPT_CLEANUP_BODY_52" not in content
 
 
 def test_runtime_composition_records_one_safe_error_before_propagating(
@@ -327,10 +329,8 @@ def test_installed_myclaw_stops_on_parse_schema_and_default_failures(agent_home:
         "plaintext-primary-key",
     )
     runtime_log = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert (
-        "myclaw.config.config.ConfigError: User Configuration TOML could not be parsed."
-        in runtime_log
-    )
+    assert "myclaw.config.config.ConfigError: [REDACTED]" in runtime_log
+    assert "User Configuration TOML could not be parsed." not in runtime_log
     assert "Traceback (most recent call last)" in runtime_log
     assert "[models.providers.primary]" not in runtime_log
     assert "api_key =" not in runtime_log

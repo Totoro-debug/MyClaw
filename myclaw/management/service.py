@@ -164,10 +164,10 @@ class ManagementViewService:
         """Return the complete current Long-term Memory file."""
         try:
             return self._long_term_memory.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError) as error:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Long-term Memory could not be read.")
-            ) from None
+            ) from error
 
     async def dream(self) -> MemoryTaskResult:
         """Run one foreground Memory Task and return its safe summary."""
@@ -179,7 +179,12 @@ class ManagementViewService:
         """Return the injected Runtime status snapshot."""
         if self._status_service is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Runtime status is unavailable."))
-        return await self._status_service.status()
+        try:
+            return await self._status_service.status()
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ManagementError(
+                ErrorInfo("persistence_error", "Runtime status could not be read.")
+            ) from error
 
     async def resumable_sessions(self) -> tuple[SessionSummary, ...]:
         """Return only valid Sessions belonging to this runtime's Workspace."""

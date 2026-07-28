@@ -18,6 +18,7 @@ from myclaw.provider.models import ModelUsage
 from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.records import (
     AssistantSessionMessage,
+    ConversationSession,
     MetadataUpdate,
     UserSessionMessage,
 )
@@ -313,13 +314,63 @@ async def test_memory_command_renders_safe_persistence_failure(agent_home: Path)
     home.initialize()
     (agent_home / "memory" / "memory.md").unlink()
     dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    runtime_log = install_runtime_logging(home)
 
-    result = await dispatcher.dispatch("/memory")
+    try:
+        result = await dispatcher.dispatch("/memory")
+    finally:
+        runtime_log.close()
 
     assert (result.handled, result.output) == (
         True,
         "persistence_error: Long-term Memory could not be read.",
     )
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert "Management command failed command=/memory code=persistence_error" in content
+
+
+@pytest.mark.asyncio
+async def test_status_command_logs_safe_persistence_failure(agent_home: Path) -> None:
+    class FailingStatusSessions:
+        async def current_session(self, session_id: str) -> ConversationSession:
+            del session_id
+            raise OSError("PRIVATE_STATUS_PERSISTENCE_BODY_52")
+
+    home = AgentHome(agent_home)
+    home.initialize()
+    status_service = RuntimeStatusService(
+        sessions=FailingStatusSessions(),
+        session_id="status-session",
+        resolved_chat=lambda: ResolvedChatStatus(
+            provider_id="provider",
+            model="model",
+            context_window=8,
+        ),
+        next_input=lambda _session: RuntimeStatusInput(
+            system_prompt="",
+            retained_messages=(),
+            tool_definitions=(),
+            runtime_context="",
+        ),
+        monotonic=lambda: 0.0,
+    )
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(home, status_service=status_service)
+    )
+    runtime_log = install_runtime_logging(home)
+
+    try:
+        result = await dispatcher.dispatch("/status")
+    finally:
+        runtime_log.close()
+
+    assert result.output == "persistence_error: Runtime status could not be read."
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert "Management command failed command=/status code=persistence_error" in content
+    assert "OSError: [REDACTED]" in content
+    assert "PRIVATE_STATUS_PERSISTENCE_BODY_52" not in content
 
 
 @pytest.mark.asyncio

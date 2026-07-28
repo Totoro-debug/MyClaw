@@ -279,7 +279,8 @@ async def test_unavailable_session_listing_records_one_management_error(
     )
     assert content.count("ERROR pid=") == 1
     assert content.count(marker) == 1
-    assert content.count("session directory unavailable") == 1
+    assert "OSError: [REDACTED]" in content
+    assert "session directory unavailable" not in content
 
 
 @pytest.mark.asyncio
@@ -339,7 +340,8 @@ async def test_resume_load_failure_records_one_error_and_keeps_safe_command_outp
     )
     assert content.count("ERROR pid=") == 1
     assert content.count(marker) == 1
-    assert content.count("resume target disappeared") == 1
+    assert "OSError: [REDACTED]" in content
+    assert "resume target disappeared" not in content
     assert "Persisted resume content must stay private." not in content
 
 
@@ -388,7 +390,8 @@ async def test_session_switch_failure_records_once_before_preserving_the_excepti
     )
     assert content.count("ERROR pid=") == 1
     assert content.count(marker) == 1
-    assert content.count("session switch failed") == 1
+    assert "RuntimeError: [REDACTED]" in content
+    assert "session switch failed" not in content
     assert "Private history." not in content
 
 

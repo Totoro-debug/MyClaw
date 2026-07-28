@@ -16,7 +16,11 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader, UserConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.provider.factory import create_provider
-from myclaw.runtime_log import RuntimeLogLifetime, install_runtime_logging
+from myclaw.runtime_log import (
+    RuntimeLogLifetime,
+    install_runtime_logging,
+    log_sanitized_exception,
+)
 from myclaw.terminal.interrupts import ForegroundInterruptController
 from myclaw.terminal.repl import ConsoleProgressiveWriter, ConsoleReplInput
 
@@ -65,17 +69,23 @@ def main(context: typer.Context) -> None:
         try:
             configuration = loader.load_for_startup()
         except ConfigError as config_error:
-            logger.error(
-                "Startup failed code=%s type=%s",
-                config_error.error.code,
-                type(config_error).__name__,
-                exc_info=True,
+            log_sanitized_exception(
+                logger,
+                logging.ERROR,
+                "Startup failed "
+                f"code={config_error.error.code} type={type(config_error).__name__}",
+                config_error,
             )
             _print_error(config_error.error, loader.path)
             exit_code = 1 if config_error.error.code == "persistence_error" else 2
             raise typer.Exit(code=exit_code) from None
-        except OSError:
-            logger.error("Startup failed code=persistence_error", exc_info=True)
+        except OSError as error:
+            log_sanitized_exception(
+                logger,
+                logging.ERROR,
+                "Startup failed code=persistence_error",
+                error,
+            )
             _print_error(
                 ErrorInfo("persistence_error", "User Configuration could not be read or written."),
                 loader.path,
@@ -110,10 +120,12 @@ def main(context: typer.Context) -> None:
                     try:
                         runner.run(interrupts.close())
                     except BaseException as cleanup_error:
-                        logger.error(
-                            "Interrupt controller cleanup failed type=%s",
-                            type(cleanup_error).__name__,
-                            exc_info=True,
+                        log_sanitized_exception(
+                            logger,
+                            logging.ERROR,
+                            "Interrupt controller cleanup failed "
+                            f"type={type(cleanup_error).__name__}",
+                            cleanup_error,
                         )
                         raise primary_error from cleanup_error
                     raise
@@ -121,10 +133,12 @@ def main(context: typer.Context) -> None:
                     try:
                         runner.run(interrupts.close())
                     except BaseException as cleanup_error:
-                        logger.error(
-                            "Interrupt controller cleanup failed type=%s",
-                            type(cleanup_error).__name__,
-                            exc_info=True,
+                        log_sanitized_exception(
+                            logger,
+                            logging.ERROR,
+                            "Interrupt controller cleanup failed "
+                            f"type={type(cleanup_error).__name__}",
+                            cleanup_error,
                         )
                         raise
             finally:
@@ -144,8 +158,13 @@ def config_command() -> None:
             loader.ensure_default()
             view = loader.view()
             configuration = loader.load() if view.error is None else None
-        except (OSError, UnicodeError):
-            logger.error("Configuration command failed code=persistence_error", exc_info=True)
+        except (OSError, UnicodeError) as error:
+            log_sanitized_exception(
+                logger,
+                logging.ERROR,
+                "Configuration command failed code=persistence_error",
+                error,
+            )
             _print_error(
                 ErrorInfo("persistence_error", "User Configuration could not be read or written."),
                 loader.path,

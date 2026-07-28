@@ -17,6 +17,7 @@ from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import STABLE_ERROR_CODES, ErrorCode
 from myclaw.provider.models import ModelUsage
+from myclaw.runtime_log import log_sanitized_exception
 from myclaw.session.identifiers import make_session_id, require_session_id
 from myclaw.session.records import (
     AssistantMessageStatus,
@@ -283,11 +284,12 @@ class JsonlSessionStore:
             try:
                 session = await self.load(path.stem)
             except (OSError, UnicodeError, ValueError) as error:
-                logger.warning(
-                    "Skipped corrupt or unreadable Conversation Session entry path=%s type=%s",
-                    path,
-                    type(error).__name__,
-                    exc_info=True,
+                log_sanitized_exception(
+                    logger,
+                    logging.WARNING,
+                    "Skipped corrupt or unreadable Conversation Session entry "
+                    f"path={path} type={type(error).__name__}",
+                    error,
                 )
                 skipped_count += 1
                 continue

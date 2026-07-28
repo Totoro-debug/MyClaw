@@ -413,7 +413,7 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
     class FailingCloseProvider(ScriptedFakeProvider):
         async def close(self) -> None:
             self.closed = True
-            raise RuntimeError("provider close failed")
+            raise RuntimeError("PRIVATE_PROVIDER_CLOSE_BODY_52")
 
     home = AgentHome(agent_home)
     home.initialize()
@@ -452,7 +452,7 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
     runtime_log = install_runtime_logging(home)
 
     try:
-        with pytest.raises(RuntimeError, match="provider close failed"):
+        with pytest.raises(RuntimeError, match="PRIVATE_PROVIDER_CLOSE_BODY_52"):
             await runtime.close()
 
         assert shell_execution.done()
@@ -467,7 +467,8 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
     assert content.count("ERROR pid=") == 1
     marker = "session=- myclaw.agent.runtime: Runtime shutdown failed type=RuntimeError"
     assert content.count(marker) == 1
-    assert "provider close failed" in content
+    assert "RuntimeError: [REDACTED]" in content
+    assert "PRIVATE_PROVIDER_CLOSE_BODY_52" not in content
 
 
 @pytest.mark.asyncio
