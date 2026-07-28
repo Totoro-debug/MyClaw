@@ -353,6 +353,11 @@ async def test_retryable_execution_failures_log_retries_and_one_terminal_error(
     assert "name=retry attempt=2/3 type=ToolError" in content
     assert "name=retry attempt=3/3 type=ToolError" in content
     assert "Traceback (most recent call last):" in content
+    assert content.count("ToolError: [REDACTED]") == 3
+    assert content.count("OSError: [REDACTED]") == 3
+    assert content.count(
+        "The above exception was the direct cause of the following exception:"
+    ) == 3
     assert "RAW_TOOL_ARGUMENT_51" not in content
     assert "RAW_RESPONSE_BODY_51" not in content
     assert "credential" not in content
