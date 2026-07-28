@@ -11,6 +11,9 @@ import pytest
 
 from myclaw.config.agent_home import AgentHome
 from myclaw.runtime_log import install_runtime_logging
+from myclaw.utils.atomic_files import atomic_replace_bytes
+
+_SLOT_TARGET_BYTES = 10_485_760
 
 
 def test_runtime_log_lifetime_is_lazy_and_only_persists_myclaw_warnings(
@@ -244,7 +247,10 @@ def test_runtime_log_first_use_creates_complete_private_state(agent_home: Path) 
     expected_files = {"run.log.0", "run.log.1", "run.log.cursor", "run.log.lock"}
     assert {path.name for path in logs.iterdir()} == expected_files
     assert (logs / "run.log.cursor").read_bytes() == b"0\n"
-    assert "first record" in (logs / "run.log.0").read_text(encoding="utf-8")
+    content = (logs / "run.log.0").read_text(encoding="utf-8")
+    assert "first record" in content
+    assert "cursor was recovered" not in content
+    assert content.count(" WARNING ") == 1
     assert (logs / "run.log.1").read_bytes() == b""
     if os.name == "posix":
         assert logs.stat().st_mode & 0o777 == 0o700
@@ -267,6 +273,279 @@ def test_runtime_log_appends_to_the_slot_selected_by_the_canonical_cursor(
 
     assert (logs / "run.log.0").read_bytes() == b"older slot\n"
     assert "selected slot" in (logs / "run.log.1").read_text(encoding="utf-8")
+
+
+def test_runtime_log_rotates_after_a_complete_record_crosses_the_fixed_target(
+    agent_home: Path,
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    prefix = b"x" * (_SLOT_TARGET_BYTES - 1)
+    (logs / "run.log.0").write_bytes(prefix)
+    (logs / "run.log.1").write_bytes(b"stale slot content\n")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.rotation").warning("crossing record")
+    lifetime.close()
+
+    slot_zero = (logs / "run.log.0").read_bytes()
+    assert slot_zero.startswith(prefix)
+    assert slot_zero.endswith(b"myclaw.rotation: crossing record\n")
+    assert len(slot_zero) > _SLOT_TARGET_BYTES
+    assert (logs / "run.log.1").read_bytes() == b""
+    assert (logs / "run.log.cursor").read_bytes() == b"1\n"
+
+
+def test_runtime_log_completes_an_interrupted_rotation_before_appending(
+    agent_home: Path,
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    full_slot = b"x" * _SLOT_TARGET_BYTES
+    (logs / "run.log.0").write_bytes(full_slot)
+    (logs / "run.log.1").write_bytes(b"stale slot content\n")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.rotation").warning("record after interruption")
+    lifetime.close()
+
+    assert (logs / "run.log.0").read_bytes() == full_slot
+    slot_one = (logs / "run.log.1").read_text(encoding="utf-8")
+    assert "myclaw.rotation: record after interruption" in slot_one
+    assert "stale slot content" not in slot_one
+    assert (logs / "run.log.cursor").read_bytes() == b"1\n"
+
+
+def test_runtime_log_keeps_the_utf8_crossing_record_as_the_only_overshoot(
+    agent_home: Path,
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    prefix = b"x" * (_SLOT_TARGET_BYTES - 100)
+    (logs / "run.log.0").write_bytes(prefix)
+    (logs / "run.log.1").write_bytes(b"")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.rotation").warning("crossing utf8 %s", "\u754c" * 100)
+    lifetime.close()
+
+    slot_zero = (logs / "run.log.0").read_bytes()
+    crossing_record = slot_zero[len(prefix) :]
+    assert len(slot_zero) >= _SLOT_TARGET_BYTES
+    assert len(slot_zero) < _SLOT_TARGET_BYTES + len(crossing_record)
+    assert crossing_record.decode("utf-8").endswith(
+        f"myclaw.rotation: crossing utf8 {'\u754c' * 100}\n"
+    )
+    assert (logs / "run.log.cursor").read_bytes() == b"1\n"
+
+
+def test_runtime_log_restart_continues_from_the_durable_cursor(agent_home: Path) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    (logs / "run.log.0").write_bytes(b"x" * (_SLOT_TARGET_BYTES - 1))
+    (logs / "run.log.1").write_bytes(b"old cycle\n")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+
+    first_lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.rotation").warning("record before restart")
+    first_lifetime.close()
+
+    second_lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.rotation").warning("record after restart")
+    second_lifetime.close()
+
+    assert b"record before restart" in (logs / "run.log.0").read_bytes()
+    slot_one = (logs / "run.log.1").read_text(encoding="utf-8")
+    assert "old cycle" not in slot_one
+    assert "record after restart" in slot_one
+    assert (logs / "run.log.cursor").read_bytes() == b"1\n"
+
+
+def test_runtime_log_repeatedly_alternates_between_the_two_slots(agent_home: Path) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    (logs / "run.log.0").write_bytes(b"x" * (_SLOT_TARGET_BYTES - 1))
+    (logs / "run.log.1").write_bytes(b"old cycle one\n")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+    huge_message = "y" * _SLOT_TARGET_BYTES
+
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+    logger = logging.getLogger("myclaw.rotation")
+    logger.warning("cross slot zero")
+    logger.warning("%s", huge_message)
+    logger.warning("after returning to slot zero")
+    lifetime.close()
+
+    slot_zero = (logs / "run.log.0").read_text(encoding="utf-8")
+    slot_one = (logs / "run.log.1").read_bytes()
+    assert "after returning to slot zero" in slot_zero
+    assert "cross slot zero" not in slot_zero
+    assert b"old cycle one" not in slot_one
+    assert slot_one.endswith(huge_message.encode("utf-8") + b"\n")
+    assert (logs / "run.log.cursor").read_bytes() == b"0\n"
+
+
+def test_runtime_log_recovers_a_missing_cursor_before_the_triggering_record(
+    agent_home: Path,
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    (logs / "run.log.0").write_bytes(b"older slot zero\n")
+    (logs / "run.log.1").write_bytes(b"older slot one\n")
+    (logs / "run.log.lock").write_bytes(b"")
+
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.rotation").error("triggering record")
+    lifetime.close()
+
+    slot_zero = (logs / "run.log.0").read_text(encoding="utf-8")
+    recovery = "myclaw.runtime_log: Runtime Log cursor was recovered to slot 0"
+    trigger = "myclaw.rotation: triggering record"
+    assert slot_zero.count(recovery) == 1
+    assert slot_zero.index(recovery) < slot_zero.index(trigger)
+    assert (logs / "run.log.1").read_bytes() == b"older slot one\n"
+    assert (logs / "run.log.cursor").read_bytes() == b"0\n"
+
+
+def test_runtime_log_recovers_a_malformed_cursor_without_persisting_its_bytes(
+    agent_home: Path,
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    invalid_cursor = b"1\nBearer invalid-cursor-secret\x00"
+    (logs / "run.log.0").write_bytes(b"")
+    (logs / "run.log.1").write_bytes(b"older slot one\n")
+    (logs / "run.log.cursor").write_bytes(invalid_cursor)
+    (logs / "run.log.lock").write_bytes(b"")
+
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.rotation").error("triggering malformed recovery")
+    lifetime.close()
+
+    content = (logs / "run.log.0").read_text(encoding="utf-8")
+    recovery = "myclaw.runtime_log: Runtime Log cursor was recovered to slot 0"
+    trigger = "myclaw.rotation: triggering malformed recovery"
+    assert content.count(recovery) == 1
+    assert content.index(recovery) < content.index(trigger)
+    assert "invalid-cursor-secret" not in content
+    assert "Bearer" not in content
+    assert (logs / "run.log.1").read_bytes() == b"older slot one\n"
+    assert (logs / "run.log.cursor").read_bytes() == b"0\n"
+
+
+def test_runtime_log_missing_cursor_recovery_rotates_a_full_initial_slot(
+    agent_home: Path,
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    full_slot = b"x" * _SLOT_TARGET_BYTES
+    (logs / "run.log.0").write_bytes(full_slot)
+    (logs / "run.log.1").write_bytes(b"older slot one\n")
+    (logs / "run.log.lock").write_bytes(b"")
+
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.rotation").error("trigger after full recovery")
+    lifetime.close()
+
+    assert (logs / "run.log.0").read_bytes() == full_slot
+    slot_one = (logs / "run.log.1").read_text(encoding="utf-8")
+    recovery = "myclaw.runtime_log: Runtime Log cursor was recovered to slot 0"
+    trigger = "myclaw.rotation: trigger after full recovery"
+    assert slot_one.count(recovery) == 1
+    assert slot_one.index(recovery) < slot_one.index(trigger)
+    assert "older slot one" not in slot_one
+    assert (logs / "run.log.cursor").read_bytes() == b"1\n"
+
+
+def test_runtime_log_recovers_when_target_reset_is_interrupted(agent_home: Path) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    prefix = b"x" * (_SLOT_TARGET_BYTES - 1)
+    (logs / "run.log.0").write_bytes(prefix)
+    (logs / "run.log.1").write_bytes(b"old target cycle\n")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+    interrupted = False
+
+    def interrupt_target_reset(path: Path, content: bytes) -> None:
+        nonlocal interrupted
+        if not interrupted and path == logs / "run.log.1" and content == b"":
+            interrupted = True
+            raise OSError("simulated interruption before target reset")
+        atomic_replace_bytes(path, content)
+
+    interrupted_lifetime = install_runtime_logging(
+        AgentHome(agent_home), replace_bytes=interrupt_target_reset
+    )
+    logging.getLogger("myclaw.rotation").warning("record committed before reset")
+    interrupted_lifetime.close()
+
+    assert interrupted
+    committed_slot = (logs / "run.log.0").read_bytes()
+    assert committed_slot.startswith(prefix)
+    assert committed_slot.endswith(b"myclaw.rotation: record committed before reset\n")
+    assert (logs / "run.log.1").read_bytes() == b"old target cycle\n"
+    assert (logs / "run.log.cursor").read_bytes() == b"0\n"
+
+    recovered_lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.rotation").error("record after reset recovery")
+    recovered_lifetime.close()
+
+    assert (logs / "run.log.0").read_bytes() == committed_slot
+    recovered_slot = (logs / "run.log.1").read_text(encoding="utf-8")
+    assert "old target cycle" not in recovered_slot
+    assert "record after reset recovery" in recovered_slot
+    assert (logs / "run.log.cursor").read_bytes() == b"1\n"
+
+
+def test_runtime_log_recovers_when_cursor_publication_is_interrupted(
+    agent_home: Path,
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    prefix = b"x" * (_SLOT_TARGET_BYTES - 1)
+    (logs / "run.log.0").write_bytes(prefix)
+    (logs / "run.log.1").write_bytes(b"old target cycle\n")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+    interrupted = False
+
+    def interrupt_cursor_publication(path: Path, content: bytes) -> None:
+        nonlocal interrupted
+        if not interrupted and path == logs / "run.log.cursor" and content == b"1\n":
+            interrupted = True
+            raise OSError("simulated interruption before cursor publication")
+        atomic_replace_bytes(path, content)
+
+    interrupted_lifetime = install_runtime_logging(
+        AgentHome(agent_home), replace_bytes=interrupt_cursor_publication
+    )
+    logging.getLogger("myclaw.rotation").warning("record committed before cursor publish")
+    interrupted_lifetime.close()
+
+    assert interrupted
+    committed_slot = (logs / "run.log.0").read_bytes()
+    assert committed_slot.startswith(prefix)
+    assert committed_slot.endswith(b"myclaw.rotation: record committed before cursor publish\n")
+    assert (logs / "run.log.1").read_bytes() == b""
+    assert (logs / "run.log.cursor").read_bytes() == b"0\n"
+
+    recovered_lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.rotation").error("record after cursor recovery")
+    recovered_lifetime.close()
+
+    assert (logs / "run.log.0").read_bytes() == committed_slot
+    recovered_slot = (logs / "run.log.1").read_text(encoding="utf-8")
+    assert "record after cursor recovery" in recovered_slot
+    assert (logs / "run.log.cursor").read_bytes() == b"1\n"
 
 
 def test_runtime_log_rejects_hard_linked_state_without_affecting_the_caller(

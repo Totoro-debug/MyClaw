@@ -10,7 +10,7 @@ import re
 import sys
 import threading
 import traceback
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -20,9 +20,10 @@ from stat import S_ISDIR, S_ISREG
 from typing import Final
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.utils.atomic_files import atomic_create_bytes
+from myclaw.utils.atomic_files import atomic_create_bytes, atomic_replace_bytes
 
 _LOGGER_NAME: Final = "myclaw"
+_SLOT_TARGET_BYTES: Final = 10_485_760
 _SESSION_ID: ContextVar[str] = ContextVar("myclaw_runtime_log_session", default="-")
 _REDACTED: Final = "[REDACTED]"
 _AUTHORIZATION: Final = re.compile(
@@ -39,6 +40,8 @@ _UNSUPPORTED_FSYNC_ERRNOS: Final = frozenset(
         getattr(errno, "EOPNOTSUPP", errno.EINVAL),
     }
 )
+
+type AtomicReplaceBytes = Callable[[Path, bytes], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,8 +79,14 @@ class _RuntimeLogHandler(logging.Handler):
 class RuntimeLogLifetime:
     """An installed dedicated logger handler and its owned writer lifetime."""
 
-    def __init__(self, agent_home: AgentHome) -> None:
+    def __init__(
+        self,
+        agent_home: AgentHome,
+        *,
+        replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
+    ) -> None:
         self._agent_home = agent_home
+        self._replace_bytes = replace_bytes
         self._records = _DropOldestQueue(maxsize=1024)
         self._handler = _RuntimeLogHandler(self._records)
         self._logger = logging.getLogger(_LOGGER_NAME)
@@ -163,7 +172,22 @@ class RuntimeLogLifetime:
                 self._records.task_done()
 
     def _append(self, pending: _PendingRecord) -> None:
-        slot = self._prepare_storage()
+        slot, cursor_recovered = self._prepare_storage()
+        if cursor_recovered:
+            recovery = logging.LogRecord(
+                name="myclaw.runtime_log",
+                level=logging.WARNING,
+                pathname=__file__,
+                lineno=0,
+                msg="Runtime Log cursor was recovered to slot 0",
+                args=(),
+                exc_info=None,
+            )
+            self._append_encoded(slot, self._encode(_PendingRecord(recovery, "-")))
+            slot, _ = self._prepare_storage()
+        self._append_encoded(slot, self._encode(pending))
+
+    def _encode(self, pending: _PendingRecord) -> bytes:
         record = pending.record
         timestamp = datetime.fromtimestamp(record.created).astimezone().isoformat(
             timespec="milliseconds"
@@ -178,15 +202,21 @@ class RuntimeLogLifetime:
         if continuation:
             line += "\n" + "\n".join(f"    {part}" for part in continuation)
         line += "\n"
-        encoded = self._redact(line).encode("utf-8")
+        return self._redact(line).encode("utf-8")
+
+    def _append_encoded(self, slot: Path, encoded: bytes) -> None:
         with slot.open("ab", buffering=0) as stream:
             written = stream.write(encoded)
             if written != len(encoded):
                 raise OSError("Runtime Log append did not write the complete record")
             stream.flush()
             _fsync_file(stream.fileno())
+            slot_size = os.fstat(stream.fileno()).st_size
+        if slot_size >= _SLOT_TARGET_BYTES:
+            active_slot = int(slot.name.rsplit(".", 1)[1])
+            self._rotate(slot.parent, active_slot)
 
-    def _prepare_storage(self) -> Path:
+    def _prepare_storage(self) -> tuple[Path, bool]:
         agent_home = self._agent_home.path
         agent_home.mkdir(parents=True, exist_ok=True)
         agent_home_root = agent_home.resolve(strict=True)
@@ -195,13 +225,15 @@ class RuntimeLogLifetime:
         _validate_log_directory(logs, agent_home_root)
         if os.name == "posix":
             logs.chmod(0o700)
-        initial_content = {
+        slot_existed = any(
+            (logs / name).exists() or (logs / name).is_symlink()
+            for name in ("run.log.0", "run.log.1")
+        )
+        for name, content in {
             "run.log.0": b"",
             "run.log.1": b"",
-            "run.log.cursor": b"0\n",
             "run.log.lock": b"",
-        }
-        for name, content in initial_content.items():
+        }.items():
             path = logs / name
             if path.exists() or path.is_symlink():
                 _validate_log_file(path, agent_home_root)
@@ -210,12 +242,38 @@ class RuntimeLogLifetime:
             _validate_log_file(path, agent_home_root)
             if os.name == "posix":
                 path.chmod(0o600)
-        cursor = (logs / "run.log.cursor").read_bytes()
+        cursor_path = logs / "run.log.cursor"
+        cursor_recovered = False
+        if cursor_path.exists() or cursor_path.is_symlink():
+            _validate_log_file(cursor_path, agent_home_root)
+        elif slot_existed:
+            self._replace_bytes(cursor_path, b"0\n")
+            cursor_recovered = True
+        else:
+            atomic_create_bytes(cursor_path, b"0\n")
+        _validate_log_file(cursor_path, agent_home_root)
+        if os.name == "posix":
+            cursor_path.chmod(0o600)
+        cursor = cursor_path.read_bytes()
+        if cursor not in {b"0\n", b"1\n"}:
+            self._replace_bytes(cursor_path, b"0\n")
+            cursor = b"0\n"
+            cursor_recovered = True
         if cursor == b"0\n":
-            return logs / "run.log.0"
-        if cursor == b"1\n":
-            return logs / "run.log.1"
-        raise ValueError("Runtime Log cursor is not canonical")
+            active_slot = 0
+        else:
+            active_slot = 1
+        slot = logs / f"run.log.{active_slot}"
+        if slot.stat().st_size >= _SLOT_TARGET_BYTES:
+            active_slot = self._rotate(logs, active_slot)
+            slot = logs / f"run.log.{active_slot}"
+        return slot, cursor_recovered
+
+    def _rotate(self, logs: Path, active_slot: int) -> int:
+        next_slot = 1 - active_slot
+        self._replace_bytes(logs / f"run.log.{next_slot}", b"")
+        self._replace_bytes(logs / "run.log.cursor", f"{next_slot}\n".encode())
+        return next_slot
 
     def _report_failure(self, error: Exception) -> None:
         if self._failure_reported:
@@ -242,9 +300,13 @@ class RuntimeLogLifetime:
         )
 
 
-def install_runtime_logging(agent_home: AgentHome) -> RuntimeLogLifetime:
+def install_runtime_logging(
+    agent_home: AgentHome,
+    *,
+    replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
+) -> RuntimeLogLifetime:
     """Install one process-local Runtime Log lifetime for an Agent Home."""
-    return RuntimeLogLifetime(agent_home)
+    return RuntimeLogLifetime(agent_home, replace_bytes=replace_bytes)
 
 
 def _severity(level: int) -> str:
