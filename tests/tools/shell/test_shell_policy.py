@@ -15,6 +15,7 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_tool import ShellTool
@@ -41,6 +42,15 @@ class FakeShellBoundary:
     async def execute(self, request: ShellRequest) -> str:
         self.requests.append(request)
         return next(self._outcomes)
+
+
+class FailingShellBoundary:
+    def __init__(self) -> None:
+        self.requests: list[ShellRequest] = []
+
+    async def execute(self, request: ShellRequest) -> str:
+        self.requests.append(request)
+        raise OSError(f"RAW_PROCESS_BODY_51 command={request.command}")
 
 
 def _gateway(
@@ -125,6 +135,41 @@ async def test_frozen_read_only_shell_commands_execute_through_gateway(
     assert shell.requests == [
         ShellRequest(command=command, cwd=workspace.resolve(), timeout=60)
     ]
+
+
+@pytest.mark.asyncio
+async def test_shell_failure_log_excludes_command_and_process_output(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    shell = FailingShellBoundary()
+    gateway = ToolGateway()
+    gateway.register_tools((ShellTool(workspace=workspace, boundary=shell),))
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+
+    with lifetime.session("foreground-shell-session-51"):
+        result = await gateway.call(
+            ModelToolCall(
+                id="call_shell_failure",
+                name="shell",
+                arguments='{"command":"git status","timeout":60}',
+            )
+        )
+    lifetime.close()
+
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert (result.status, result.content) == (
+        "error",
+        "shell could not complete the request.",
+    )
+    assert shell.requests == [
+        ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60)
+    ]
+    assert content.count(" ERROR ") == 1
+    assert "name=shell attempt=1/1 type=OSError" in content
+    assert "session=foreground-shell-session-51" in content
+    assert "git status" not in content
+    assert "RAW_PROCESS_BODY_51" not in content
 
 
 @pytest.mark.parametrize(

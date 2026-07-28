@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Annotated, cast
 
 import pytest
 
+from myclaw.config.agent_home import AgentHome
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
 from myclaw.tools.models import ModelToolCall
@@ -198,6 +201,42 @@ async def test_refusal_skips_execution_and_retry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_invalid_unavailable_and_refused_calls_do_not_create_runtime_logs(
+    agent_home: Path,
+) -> None:
+    class RefusingTool(BaseTool):
+        name = "refusing"
+        description = "Always refuse."
+        required = ("action",)
+        action: str
+
+        def refusal_reason(self, *, action: str) -> str:
+            return f"{action} is refused."
+
+        async def execute(self, *, action: str) -> str:
+            raise AssertionError(action)
+
+    gateway = ToolGateway()
+    gateway.register_tools((_PrepareTool(), RefusingTool()))
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+
+    with lifetime.session("foreground-session-51"):
+        malformed = await gateway.call(_call("prepare", "{"))
+        invalid = await gateway.call(_call("prepare", '{}'))
+        unavailable = await gateway.call(_call("missing", '{}'))
+        refused = await gateway.call(_call("refusing", '{"action":"write"}'))
+    lifetime.close()
+
+    assert [result.status for result in (malformed, invalid, unavailable, refused)] == [
+        "error",
+        "error",
+        "error",
+        "refused",
+    ]
+    assert not (agent_home / "logs").exists()
+
+
+@pytest.mark.asyncio
 async def test_call_normalizes_expected_unexpected_and_non_string_failures() -> None:
     class FailingTool(BaseTool):
         name = "failing"
@@ -260,6 +299,64 @@ async def test_retries_are_extra_attempts_with_bounded_exponential_delays() -> N
     assert sleeps == [1.0, 2.0, 4.0, 8.0, 16.0]
     assert result.status == "error"
     assert result.content == "The final attempt failed safely."
+
+
+@pytest.mark.asyncio
+async def test_retryable_execution_failures_log_retries_and_one_terminal_error(
+    agent_home: Path,
+) -> None:
+    class RetryTool(BaseTool):
+        name = "retry"
+        description = "Fail every attempt without exposing input or boundary details."
+        required = ("payload",)
+        max_retries = 2
+        payload: str
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, *, payload: str) -> str:
+            self.calls += 1
+            try:
+                raise OSError(
+                    "RAW_RESPONSE_BODY_51 https://user:credential@example.test/private"
+                )
+            except OSError as cause:
+                raise ToolError("The retry Tool failed safely.") from cause
+
+    tool = RetryTool()
+    sleeps: list[float] = []
+    gateway = ToolGateway(sleep=_sleep_recorder(sleeps))
+    gateway.register_tools((tool,))
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+
+    with lifetime.session("scheduled-session-51"):
+        result = await gateway.call(
+            _call("retry", '{"payload":"RAW_TOOL_ARGUMENT_51"}')
+        )
+    lifetime.close()
+
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert (result.status, result.content, result.artifact) == (
+        "error",
+        "The retry Tool failed safely.",
+        None,
+    )
+    assert tool.calls == 3
+    assert sleeps == [1.0, 2.0]
+    assert content.count(" WARNING ") == 2
+    assert content.count(" ERROR ") == 1
+    assert (
+        "session=scheduled-session-51 myclaw.tools.tool_gateway: "
+        "Tool execution failed name=retry attempt=1/3 type=ToolError"
+    ) in content
+    assert "name=retry attempt=2/3 type=ToolError" in content
+    assert "name=retry attempt=3/3 type=ToolError" in content
+    assert "Traceback (most recent call last):" in content
+    assert "RAW_TOOL_ARGUMENT_51" not in content
+    assert "RAW_RESPONSE_BODY_51" not in content
+    assert "credential" not in content
+    assert "The retry Tool failed safely." not in content
 
 
 @pytest.mark.asyncio

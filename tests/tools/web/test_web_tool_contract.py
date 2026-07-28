@@ -1,8 +1,11 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import pytest
 
+from myclaw.config.agent_home import AgentHome
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import WebFetchRejected, WebFetchTool
@@ -97,56 +100,97 @@ def test_web_tools_export_exact_schemas_and_two_extra_retries() -> None:
 
 
 @pytest.mark.asyncio
-async def test_web_search_waits_one_then_two_seconds_before_final_success() -> None:
+async def test_web_search_logs_retry_warnings_without_query_or_upstream_body(
+    agent_home: Path,
+) -> None:
     waits: list[float] = []
     expected = WebSearchResult(
         title="Result",
         url="https://example.com/result",
         snippet="Public snippet.",
     )
-    search = ScriptedSearch([OSError("first"), RuntimeError("second"), (expected,)])
+    search = ScriptedSearch(
+        [
+            OSError("RAW_SEARCH_RESPONSE_BODY_51"),
+            RuntimeError("RAW_SEARCH_RESPONSE_BODY_52"),
+            (expected,),
+        ]
+    )
     gateway = ToolGateway(sleep=_recording_sleep(waits))
     gateway.register_tools((WebSearchTool(search=search),))
+    lifetime = install_runtime_logging(AgentHome(agent_home))
 
-    result = await gateway.call(
-        ModelToolCall(
-            id="call_search_retry",
-            name="web_search",
-            arguments='{"query":"runtime"}',
+    with lifetime.session("scheduled-web-search-session-51"):
+        result = await gateway.call(
+            ModelToolCall(
+                id="call_search_retry",
+                name="web_search",
+                arguments='{"query":"RAW_WEB_QUERY_51"}',
+            )
         )
-    )
+    lifetime.close()
 
     assert result.status == "success"
     assert search.calls == 3
     assert waits == [1.0, 2.0]
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" WARNING ") == 2
+    assert " ERROR " not in content
+    assert "name=web_search attempt=1/3 type=OSError" in content
+    assert "name=web_search attempt=2/3 type=RuntimeError" in content
+    assert "session=scheduled-web-search-session-51" in content
+    assert "RAW_WEB_QUERY_51" not in content
+    assert "RAW_SEARCH_RESPONSE_BODY_51" not in content
+    assert "RAW_SEARCH_RESPONSE_BODY_52" not in content
+    assert "https://example.com/result" not in content
+    assert "Public snippet." not in content
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_expected_rejection_is_safe_after_retry_exhaustion() -> None:
+async def test_web_fetch_failure_log_excludes_credential_url_and_response_body(
+    agent_home: Path,
+) -> None:
     waits: list[float] = []
     fetch = ScriptedFetch(
         [
-            WebFetchRejected("private first detail"),
-            WebFetchRejected("private second detail"),
-            WebFetchRejected("private final detail"),
+            WebFetchRejected("RAW_FETCH_RESPONSE_BODY_51"),
+            WebFetchRejected("RAW_FETCH_RESPONSE_BODY_52"),
+            WebFetchRejected("RAW_FETCH_RESPONSE_BODY_53"),
         ]
     )
     gateway = ToolGateway(sleep=_recording_sleep(waits))
     gateway.register_tools((WebFetchTool(fetcher=fetch),))
+    lifetime = install_runtime_logging(AgentHome(agent_home))
 
-    result = await gateway.call(
-        ModelToolCall(
-            id="call_fetch_rejected",
-            name="web_fetch",
-            arguments='{"url":"https://public.example/page"}',
+    with lifetime.session("foreground-web-fetch-session-51"):
+        result = await gateway.call(
+            ModelToolCall(
+                id="call_fetch_rejected",
+                name="web_fetch",
+                arguments=(
+                    '{"url":"https://user:URL_CREDENTIAL_51@public.example/'
+                    'RAW_FETCH_PATH_51?token=RAW_FETCH_QUERY_51"}'
+                ),
+            )
         )
-    )
+    lifetime.close()
 
     assert result.status == "error"
     assert result.content == "WebFetch rejected an unsafe or unverifiable request."
-    assert "private" not in result.content
     assert fetch.calls == 3
     assert waits == [1.0, 2.0]
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" WARNING ") == 2
+    assert content.count(" ERROR ") == 1
+    assert "name=web_fetch attempt=1/3 type=ToolError" in content
+    assert "name=web_fetch attempt=3/3 type=ToolError" in content
+    assert "session=foreground-web-fetch-session-51" in content
+    assert "URL_CREDENTIAL_51" not in content
+    assert "RAW_FETCH_PATH_51" not in content
+    assert "RAW_FETCH_QUERY_51" not in content
+    assert "RAW_FETCH_RESPONSE_BODY_51" not in content
+    assert "RAW_FETCH_RESPONSE_BODY_52" not in content
+    assert "RAW_FETCH_RESPONSE_BODY_53" not in content
 
 
 @pytest.mark.asyncio

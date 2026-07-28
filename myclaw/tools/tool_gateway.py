@@ -2,10 +2,12 @@
 
 import asyncio
 import json
+import logging
 import math
 import re
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
+from types import TracebackType
 from typing import cast
 
 from jsonschema import Draft202012Validator, FormatChecker
@@ -17,8 +19,10 @@ from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.utils.json_types import JsonObject, JsonScalar, JsonValue
 
 type Sleep = Callable[[float], Awaitable[None]]
+type ExcInfo = tuple[type[BaseException], BaseException, TracebackType | None]
 
 _DECIMAL_INTEGER = re.compile(r"^[+-]?[0-9]+$")
+logger = logging.getLogger(__name__)
 
 
 class ToolGateway:
@@ -101,9 +105,27 @@ class ToolGateway:
                     raise _NonStringToolResult
                 return _success_result(tool_call, content)
             except Exception as error:
+                attempt_number = attempt + 1
+                total_attempts = tool.max_retries + 1
                 if attempt < tool.max_retries:
+                    logger.warning(
+                        "Tool execution failed name=%s attempt=%d/%d type=%s",
+                        tool.name,
+                        attempt_number,
+                        total_attempts,
+                        type(error).__name__,
+                        exc_info=_safe_execution_diagnostic(error),
+                    )
                     await self._sleep(float(2**attempt))
                     continue
+                logger.error(
+                    "Tool execution failed name=%s attempt=%d/%d type=%s",
+                    tool.name,
+                    attempt_number,
+                    total_attempts,
+                    type(error).__name__,
+                    exc_info=_safe_execution_diagnostic(error),
+                )
                 message = (
                     error.message
                     if isinstance(error, ToolError)
@@ -209,3 +231,14 @@ def _coerce(value: JsonValue, schema: JsonObject) -> tuple[bool, JsonScalar]:
 
 class _NonStringToolResult(Exception):
     pass
+
+
+class _SafeToolExecutionDiagnostic(Exception):
+    pass
+
+
+def _safe_execution_diagnostic(error: Exception) -> ExcInfo:
+    diagnostic = _SafeToolExecutionDiagnostic(type(error).__name__).with_traceback(
+        error.__traceback__
+    )
+    return type(diagnostic), diagnostic, diagnostic.__traceback__

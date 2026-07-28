@@ -3,7 +3,9 @@ from pathlib import Path
 import pytest
 
 from myclaw.agent.workspace import Workspace
-from myclaw.tools.files.file_tools import ListFilesTool, SearchFilesTool
+from myclaw.config.agent_home import AgentHome
+from myclaw.runtime_log import install_runtime_logging
+from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ToolGateway
@@ -159,3 +161,54 @@ async def test_gateway_rejects_invalid_search_contract_arguments(
 
     assert result.status == "error"
     assert result.content == "Invalid arguments for search_files."
+
+
+@pytest.mark.asyncio
+async def test_read_file_failure_logs_once_without_path_content_or_boundary_detail(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = Workspace.from_path(workspace)
+    security = Security(
+        workspace=identity,
+        agent_home=agent_home,
+        artifact_directory=(
+            agent_home / "sessions" / identity.slug / "artifacts" / SESSION_ID
+        ),
+    )
+    target = workspace / "RAW_TOOL_PATH_51.txt"
+    target.write_text("RAW_FILE_CONTENT_51", encoding="utf-8")
+    original_read_bytes = Path.read_bytes
+
+    def failing_read_bytes(path: Path) -> bytes:
+        if path.name == target.name:
+            raise OSError("RAW_FILESYSTEM_BODY_51")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", failing_read_bytes)
+    gateway = ToolGateway()
+    gateway.register_tools((ReadFileTool(security=security),))
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+
+    with lifetime.session("foreground-session-51"):
+        result = await gateway.call(
+            ModelToolCall(
+                id="call_read_failure",
+                name="read_file",
+                arguments='{"path":"RAW_TOOL_PATH_51.txt"}',
+            )
+        )
+    lifetime.close()
+
+    assert (result.status, result.content) == (
+        "error",
+        "The requested file could not be read.",
+    )
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count(" ERROR ") == 1
+    assert "name=read_file attempt=1/1 type=ToolError" in content
+    assert "session=foreground-session-51" in content
+    assert "RAW_TOOL_PATH_51.txt" not in content
+    assert "RAW_FILE_CONTENT_51" not in content
+    assert "RAW_FILESYSTEM_BODY_51" not in content
