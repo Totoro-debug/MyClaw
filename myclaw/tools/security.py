@@ -5,6 +5,7 @@ from pathlib import Path
 
 from myclaw.agent.workspace import Workspace
 from myclaw.tools.errors import ToolError
+from myclaw.utils.atomic_files import path_for_io
 
 _WINDOWS_RESERVED_BASENAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
@@ -24,13 +25,13 @@ class Security:
         artifact_directory: Path,
     ) -> None:
         self._workspace_identity = workspace
-        self._workspace = _io_path(Path(workspace.path)).resolve(strict=False)
-        self._agent_home = _io_path(agent_home).resolve(strict=False)
+        self._workspace = path_for_io(Path(workspace.path)).resolve(strict=False)
+        self._agent_home = path_for_io(agent_home).resolve(strict=False)
         self._long_term_memory = self._agent_home / "memory" / "memory.md"
         # Preserve the configured directory's lexical identity. Resolving it here
         # would make a pre-existing symlink or junction target part of the trusted
         # read scope.
-        self._artifact_directory = _io_path(artifact_directory).absolute()
+        self._artifact_directory = path_for_io(artifact_directory).absolute()
         self._session_id = artifact_directory.name
 
     def resolve_read_path(self, requested: str) -> Path:
@@ -41,15 +42,12 @@ class Security:
         if not candidate.is_absolute():
             if candidate.parts and candidate.parts[0] == "artifacts":
                 candidate = (
-                    self._agent_home
-                    / "sessions"
-                    / self._workspace_identity.slug
-                    / candidate
+                    self._agent_home / "sessions" / self._workspace_identity.slug / candidate
                 )
             else:
                 candidate = self._workspace / candidate
         else:
-            candidate = _io_path(candidate)
+            candidate = path_for_io(candidate)
         try:
             resolved = candidate.resolve(strict=True)
         except (OSError, RuntimeError, ValueError) as error:
@@ -101,14 +99,3 @@ def _is_windows_reserved(component: str) -> bool:
     normalized = component.rstrip(" .")
     basename = normalized.split(".", maxsplit=1)[0].upper()
     return basename in _WINDOWS_RESERVED_BASENAMES
-
-
-def _io_path(path: Path) -> Path:
-    if os.name != "nt":
-        return path
-    native = str(path.absolute())
-    if native.startswith("\\\\?\\"):
-        return path
-    if native.startswith("\\\\"):
-        return Path(f"\\\\?\\UNC\\{native.lstrip('\\')}")
-    return Path(f"\\\\?\\{native}")

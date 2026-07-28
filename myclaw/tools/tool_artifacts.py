@@ -10,7 +10,12 @@ from typing import Final
 from myclaw.agent.workspace import Workspace
 from myclaw.tools.artifacts import ArtifactReference, encode_artifact_tool_call_id
 from myclaw.tools.models import ToolResult
-from myclaw.utils.atomic_files import FileIdentity, atomic_create_text_with_identity, file_identity
+from myclaw.utils.atomic_files import (
+    FileIdentity,
+    atomic_create_text_with_identity,
+    file_identity,
+    path_for_io,
+)
 
 type ArtifactWriter = Callable[[Path, str], None]
 
@@ -48,10 +53,8 @@ def externalize_tool_result(
                 preview_chars=len(preview),
             ),
         )
-        io_agent_home = _io_path(agent_home)
-        io_directory = (
-            io_agent_home / "sessions" / workspace.slug / "artifacts" / session_id
-        )
+        io_agent_home = path_for_io(agent_home)
+        io_directory = io_agent_home / "sessions" / workspace.slug / "artifacts" / session_id
         io_agent_home.mkdir(parents=True, exist_ok=True)
         agent_home_root = _resolved_for_comparison(io_agent_home)
         existing_parent = io_directory
@@ -73,7 +76,7 @@ def externalize_tool_result(
             resolved_artifact = _resolved_for_comparison(artifact_path)
             if not resolved_artifact.is_relative_to(agent_home_root):
                 raise PermissionError("Tool Artifact file must remain inside Agent Home")
-            owned_path = _io_path(resolved_artifact)
+            owned_path = path_for_io(resolved_artifact)
             status = owned_path.lstat()
             if (
                 not S_ISREG(status.st_mode)
@@ -86,15 +89,6 @@ def externalize_tool_result(
     except Exception as error:
         raise ArtifactWriteError from error
     return projected
-
-
-def _io_path(path: Path) -> Path:
-    if os.name != "nt":
-        return path
-    native = str(path.absolute())
-    if native.startswith("\\\\"):
-        return Path(f"\\\\?\\UNC\\{native.lstrip('\\')}")
-    return Path(f"\\\\?\\{native}")
 
 
 def _atomic_create_artifact(path: Path, content: str) -> FileIdentity:

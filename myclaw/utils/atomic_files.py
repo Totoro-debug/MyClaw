@@ -1,4 +1,4 @@
-"""Crash-safe whole-file replacement for MyClaw state."""
+"""Shared path and atomic-write primitives for local persistence."""
 
 from __future__ import annotations
 
@@ -17,6 +17,18 @@ _UNSUPPORTED_FSYNC_ERRNOS: Final = frozenset(
         getattr(errno, "EOPNOTSUPP", errno.EINVAL),
     }
 )
+
+
+def path_for_io(path: Path) -> Path:
+    """Return a path suitable for I/O, including Windows extended paths."""
+    if os.name != "nt":
+        return path
+    native = str(path.absolute())
+    if native.startswith("\\\\?\\"):
+        return path
+    if native.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{native.lstrip('\\')}")
+    return Path(f"\\\\?\\{native}")
 
 
 def atomic_replace_text(target: Path, content: str) -> None:

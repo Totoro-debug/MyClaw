@@ -34,7 +34,7 @@ from myclaw.session.records import (
 )
 from myclaw.tools.artifacts import ArtifactReference
 from myclaw.tools.models import ModelToolCall, ToolResultStatus
-from myclaw.utils.atomic_files import atomic_replace_bytes, atomic_replace_text
+from myclaw.utils.atomic_files import atomic_replace_bytes, atomic_replace_text, path_for_io
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 
@@ -134,7 +134,7 @@ class JsonlSessionStore:
 
     async def append_message(self, session_id: str, message: SessionMessage) -> None:
         path = self.path_for(session_id)
-        io_path = _io_path(path)
+        io_path = path_for_io(path)
         async with self._lock_for(session_id):
             if not io_path.exists():
                 metadata = self._prepared.get(session_id)
@@ -172,7 +172,7 @@ class JsonlSessionStore:
     async def load(self, session_id: str) -> ConversationSession:
         path = self.path_for(session_id)
         async with self._lock_for(session_id):
-            records, _ = _read_recoverable_records(_io_path(path))
+            records, _ = _read_recoverable_records(path_for_io(path))
         metadata = _parse_metadata(records[0])
         if metadata.id != session_id:
             msg = "Session metadata ID does not match its file name"
@@ -182,7 +182,7 @@ class JsonlSessionStore:
 
     async def current_session(self, session_id: str) -> ConversationSession:
         """Return persisted state or an unmaterialized prepared Session snapshot."""
-        path = _io_path(self.path_for(session_id))
+        path = path_for_io(self.path_for(session_id))
         async with self._lock_for(session_id):
             if not path.exists():
                 metadata = self._prepared.get(session_id)
@@ -199,7 +199,7 @@ class JsonlSessionStore:
         return ConversationSession(metadata=metadata, messages=messages)
 
     async def update_metadata(self, session_id: str, update: MetadataUpdate) -> None:
-        path = _io_path(self.path_for(session_id))
+        path = path_for_io(self.path_for(session_id))
         async with self._lock_for(session_id):
             records, complete_content = _read_recoverable_records(path)
             metadata = _parse_metadata(records[0])
@@ -252,7 +252,7 @@ class JsonlSessionStore:
         matches = list((self.agent_home.path / "sessions").glob(f"*/{session_id}.jsonl"))
         if len(matches) != 1:
             raise ValueError("journal session must resolve to exactly one Session file")
-        path = _io_path(matches[0])
+        path = path_for_io(matches[0])
         async with self._lock_for(session_id):
             records, complete_content = _read_recoverable_records(path)
             metadata = _parse_metadata(records[0])
@@ -341,16 +341,6 @@ def _append_complete_line(path: Path, line: str) -> None:
             raise OSError("session append did not write the complete JSONL record")
         stream.flush()
         os.fsync(stream.fileno())
-
-
-def _io_path(path: Path) -> Path:
-    if os.name != "nt":
-        return path
-    native = str(path.absolute())
-    if native.startswith("\\\\"):
-        unc_native = native.lstrip("\\")
-        return Path(f"\\\\?\\UNC\\{unc_native}")
-    return Path(f"\\\\?\\{native}")
 
 
 def _read_recoverable_records(

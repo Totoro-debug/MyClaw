@@ -4,7 +4,23 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.utils.atomic_files import atomic_replace_bytes, atomic_replace_text
+from myclaw.utils.atomic_files import atomic_replace_bytes, atomic_replace_text, path_for_io
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended paths only")
+def test_path_for_io_normalizes_windows_local_and_unc_paths(tmp_path: Path) -> None:
+    local = tmp_path / "state.txt"
+    unc = Path(r"\\server\share\state.txt")
+
+    assert path_for_io(local) == Path(f"\\\\?\\{local.absolute()}")
+    assert path_for_io(unc) == Path(r"\\?\UNC\server\share\state.txt")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended paths only")
+def test_path_for_io_preserves_existing_windows_extended_path(tmp_path: Path) -> None:
+    extended = Path(f"\\\\?\\{tmp_path.absolute()}\\state.txt")
+
+    assert path_for_io(extended) == extended
 
 
 def test_failed_atomic_bytes_replace_preserves_official_state(
