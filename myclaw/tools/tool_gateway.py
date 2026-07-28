@@ -241,5 +241,3 @@ def _coerce(value: JsonValue, schema: JsonObject) -> tuple[bool, JsonScalar]:
 
 class _NonStringToolResult(Exception):
     pass
-
-
