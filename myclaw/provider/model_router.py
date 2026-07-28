@@ -89,18 +89,9 @@ class ModelRouter:
                     yield event
                 return
             except ModelCallError as failure:
-                if emitted or attempt == _MAX_ATTEMPTS:
+                if emitted:
                     raise
-                if _is_retryable(failure):
-                    delay = self._retry_delay(attempt, failure)
-                    _log_retry(resolved, failure, attempt=attempt, delay=delay)
-                    await self._clock.sleep(delay)
-                    continue
-                fallback = self._fallback(resolved, failure)
-                if fallback is None:
-                    raise
-                _log_fallback(resolved, fallback, failure, attempt=attempt)
-                resolved = fallback
+                resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         resolved = self._begin_call(request.route)
@@ -111,18 +102,7 @@ class ModelRouter:
             try:
                 return await provider.complete(concrete_request)
             except ModelCallError as failure:
-                if attempt == _MAX_ATTEMPTS:
-                    raise
-                if _is_retryable(failure):
-                    delay = self._retry_delay(attempt, failure)
-                    _log_retry(resolved, failure, attempt=attempt, delay=delay)
-                    await self._clock.sleep(delay)
-                    continue
-                fallback = self._fallback(resolved, failure)
-                if fallback is None:
-                    raise
-                _log_fallback(resolved, fallback, failure, attempt=attempt)
-                resolved = fallback
+                resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
 
         raise AssertionError("Provider attempt budget exhausted without a terminal result")
 
@@ -154,12 +134,42 @@ class ModelRouter:
         if failures:
             raise BaseExceptionGroup("Model Provider shutdown failed", failures)
 
-    def _retry_delay(self, attempt: int, failure: ModelCallError) -> float:
-        backoff = min(30.0, 0.5 * 2.0 ** (attempt - 1))
-        if self._jitter is not None:
-            backoff += min(backoff, max(0.0, self._jitter(backoff)))
-        retry_after = float(failure.error.retry_after_seconds or 0.0)
-        return min(60.0, max(backoff, retry_after))
+    async def _recover_attempt(
+        self,
+        current: ResolvedModelRoute,
+        failure: ModelCallError,
+        *,
+        attempt: int,
+    ) -> ResolvedModelRoute:
+        if attempt == _MAX_ATTEMPTS:
+            raise failure
+        code = failure.error.code
+        if failure.error.retryable and code in _RETRYABLE_CODES:
+            backoff = min(30.0, 0.5 * 2.0 ** (attempt - 1))
+            if self._jitter is not None:
+                backoff += min(backoff, max(0.0, self._jitter(backoff)))
+            retry_after = float(failure.error.retry_after_seconds or 0.0)
+            delay = min(60.0, max(backoff, retry_after))
+            _log_retry(current, failure, attempt=attempt, delay=delay)
+            await self._clock.sleep(delay)
+            return current
+        allows_fallback = code in _FALLBACK_CODES or (
+            code == "provider_unavailable" and not failure.error.retryable
+        )
+        if current.selected_route == "default" or not allows_fallback:
+            raise failure
+        fallback = self._configuration.resolve_route("default")
+        if fallback.provider == current.provider and fallback.route == current.route:
+            raise failure
+        requested_route = cast(ModelRoute, current.requested_route)
+        fallback = replace(
+            fallback,
+            requested_route=requested_route,
+            used_default=True,
+        )
+        self._route_statuses[requested_route] = _route_status(requested_route, fallback)
+        _log_fallback(current, fallback, failure, attempt=attempt)
+        return fallback
 
     def _provider(self, configuration: ProviderConfiguration) -> ModelProvider:
         if self._close_task is not None:
@@ -183,29 +193,6 @@ class ModelRouter:
                 resolved.route.model,
             )
         return resolved
-
-    def _fallback(
-        self,
-        current: ResolvedModelRoute,
-        failure: ModelCallError,
-    ) -> ResolvedModelRoute | None:
-        if current.selected_route == "default" or not _allows_fallback(failure):
-            return None
-        fallback = self._configuration.resolve_route("default")
-        if fallback.provider == current.provider and fallback.route == current.route:
-            return None
-        requested_route = cast(ModelRoute, current.requested_route)
-        fallback = replace(
-            fallback,
-            requested_route=requested_route,
-            used_default=True,
-        )
-        self._route_statuses[requested_route] = _route_status(requested_route, fallback)
-        return fallback
-
-
-def _is_retryable(failure: ModelCallError) -> bool:
-    return failure.error.retryable and failure.error.code in _RETRYABLE_CODES
 
 
 def _log_retry(
@@ -274,21 +261,13 @@ def _safe_provider_failure(failure: BaseException) -> BaseException:
         try:
             safe_failure = type(failure)("Diagnostic detail redacted.")
         except Exception:
-            safe_failure = RuntimeError(
-                f"{type(failure).__name__}: Diagnostic detail redacted."
-            )
+            safe_failure = RuntimeError(f"{type(failure).__name__}: Diagnostic detail redacted.")
     if failure.__cause__ is not None:
         safe_failure.__cause__ = _safe_provider_failure(failure.__cause__)
     elif failure.__context__ is not None and not failure.__suppress_context__:
         safe_failure.__context__ = _safe_provider_failure(failure.__context__)
         safe_failure.__suppress_context__ = False
     return safe_failure.with_traceback(failure.__traceback__)
-
-
-def _allows_fallback(failure: ModelCallError) -> bool:
-    return failure.error.code in _FALLBACK_CODES or (
-        failure.error.code == "provider_unavailable" and not failure.error.retryable
-    )
 
 
 def _concrete_request(request: ModelRequest, resolved: ResolvedModelRoute) -> ModelRequest:
