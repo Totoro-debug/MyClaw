@@ -20,8 +20,8 @@ from myclaw.memory.memory_task import (
     MemoryManager,
     MemoryReadFileTool,
     MemoryTaskModelSettings,
+    MemoryTaskResult,
 )
-from myclaw.memory.models import MemoryTaskResult
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,

@@ -12,7 +12,6 @@ from uuid import uuid4
 from myclaw.agent.prompts import memory_task_input, memory_task_prompt
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
-from myclaw.memory.models import MemoryTaskResult
 from myclaw.memory.ports import MemoryStore, SummaryStore
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -29,8 +28,27 @@ from myclaw.tools.errors import ToolError
 from myclaw.tools.schema import ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.atomic_files import atomic_replace_text
+from myclaw.utils.validation import require_nonnegative_int
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryTaskResult:
+    """Observable summary returned by a manual Memory Task run."""
+
+    status: str
+    processed_count: int
+    memory_updated: bool
+    cursor: int
+    error: ErrorInfo | None = None
+
+    def __post_init__(self) -> None:
+        require_nonnegative_int(self.processed_count, field="processed_count")
+        require_nonnegative_int(self.cursor, field="cursor")
+        if not isinstance(self.memory_updated, bool):
+            msg = "memory_updated must be a boolean"
+            raise ValueError(msg)
 
 
 class MemoryPathDeniedError(PermissionError):

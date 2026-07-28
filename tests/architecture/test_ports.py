@@ -4,17 +4,16 @@ from pathlib import Path
 
 from myclaw.agent.events import AgentEvent
 from myclaw.agent.ports import ConversationPort
-from myclaw.config.models import ConfigView
-from myclaw.management.models import RuntimeStatus
-from myclaw.management.ports import ManagementPort
-from myclaw.memory.models import MemoryTaskResult
+from myclaw.config.config import ConfigView
+from myclaw.management.commands import ManagementPort
+from myclaw.management.service import ResumeResult, RuntimeStatus
+from myclaw.memory.memory_task import MemoryTaskResult
 from myclaw.memory.ports import (
     MemoryStore,
     SummaryStore,
 )
 from myclaw.memory.records import SummaryEntry
 from myclaw.provider.ports import ModelProvider
-from myclaw.session.models import ResumeResult
 from myclaw.session.ports import SessionStore
 from myclaw.session.records import (
     ConversationSession,
@@ -22,6 +21,7 @@ from myclaw.session.records import (
     SessionMessage,
     SessionSummary,
 )
+from myclaw.session.session_store import SessionListingReport
 from myclaw.tools.base import BaseTool
 from tests.fixtures.provider import ScriptedFakeProvider
 from tests.fixtures.tool import FakeTool
@@ -42,7 +42,7 @@ class _ManagementPortFake:
     async def status(self) -> RuntimeStatus:
         raise NotImplementedError
 
-    async def resumable_sessions(self) -> tuple[SessionSummary, ...]:
+    async def resumable_listing(self) -> SessionListingReport:
         raise NotImplementedError
 
     async def resume(self, session_id: str) -> ResumeResult:

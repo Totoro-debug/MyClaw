@@ -14,7 +14,6 @@ import tomlkit
 from croniter import croniter  # type: ignore[import-untyped]
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.models import ConfigView
 from myclaw.errors import ErrorInfo
 from myclaw.templates import load_template
 from myclaw.utils.atomic_files import atomic_create_text
@@ -165,6 +164,15 @@ class UserConfiguration:
             route=route,
             used_default=selected_route != requested_route,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigView:
+    """A configuration path, redacted content, and optional safe parse error."""
+
+    path: Path
+    redacted_content: str
+    error: ErrorInfo | None
 
 
 class ConfigError(Exception):

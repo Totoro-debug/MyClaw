@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from myclaw.management.models import RuntimeStatus
+from myclaw.management.service import RuntimeStatus
 from myclaw.session.records import (
     CumulativeUsage,
     SessionSummary,

@@ -3,14 +3,12 @@
 import json
 import logging
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
-from myclaw.config.models import ConfigView
-from myclaw.management.models import RuntimeStatus
-from myclaw.management.service import ManagementError
-from myclaw.memory.models import MemoryTaskResult
+from myclaw.config.config import ConfigView
+from myclaw.management.service import ManagementError, ResumeResult, RuntimeStatus
+from myclaw.memory.memory_task import MemoryTaskResult
 from myclaw.runtime_log import log_sanitized_exception
-from myclaw.session.models import ResumeResult
 from myclaw.session.records import SessionSummary
 from myclaw.session.session_store import SessionListingReport
 from myclaw.utils.time import format_rfc3339_milliseconds
@@ -18,7 +16,8 @@ from myclaw.utils.time import format_rfc3339_milliseconds
 logger = logging.getLogger(__name__)
 
 
-class _ManagementViewPort(Protocol):
+@runtime_checkable
+class ManagementPort(Protocol):
     async def config_view(self) -> ConfigView: ...
 
     async def status(self) -> RuntimeStatus: ...
@@ -26,8 +25,6 @@ class _ManagementViewPort(Protocol):
     async def memory_view(self) -> str: ...
 
     async def dream(self) -> MemoryTaskResult: ...
-
-    async def resumable_sessions(self) -> tuple[SessionSummary, ...]: ...
 
     async def resumable_listing(self) -> SessionListingReport: ...
 
@@ -46,7 +43,7 @@ class ManagementCommandResult:
 class ManagementCommandDispatcher:
     """Dispatch exact built-in commands without entering conversation flow."""
 
-    def __init__(self, management: _ManagementViewPort) -> None:
+    def __init__(self, management: ManagementPort) -> None:
         self._management = management
 
     async def dispatch(self, command: str) -> ManagementCommandResult:

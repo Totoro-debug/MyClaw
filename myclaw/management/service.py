@@ -7,14 +7,13 @@ from typing import Protocol
 
 from myclaw import __version__
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ConfigLoader
-from myclaw.config.models import ConfigView
+from myclaw.config.config import ConfigLoader, ConfigView
 from myclaw.errors import ErrorInfo
-from myclaw.management.models import RuntimeStatus
-from myclaw.memory.models import MemoryTaskResult
-from myclaw.session.models import ResumeResult
-from myclaw.session.records import ConversationSession, SessionSummary
+from myclaw.memory.memory_task import MemoryTaskResult
+from myclaw.session.identifiers import require_session_id
+from myclaw.session.records import ConversationSession, CumulativeUsage, SessionSummary
 from myclaw.session.session_store import SessionListingReport
+from myclaw.utils.validation import require_nonnegative_int, require_nonnegative_number
 
 
 class _CurrentSessionStore(Protocol):
@@ -60,6 +59,52 @@ class RuntimeStatusInput:
     retained_messages: tuple[str, ...]
     tool_definitions: tuple[str, ...]
     runtime_context: str
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeStatus:
+    """The required observable fields for the `/status` view."""
+
+    version: str
+    chat_model: str
+    uptime_seconds: int
+    estimated_input_tokens: int
+    context_window: int
+    context_used_percent: float
+    session_message_count: int
+    consolidation_cursor: int
+    cumulative_usage: CumulativeUsage
+
+    def __post_init__(self) -> None:
+        require_nonnegative_int(self.uptime_seconds, field="uptime_seconds")
+        require_nonnegative_int(self.estimated_input_tokens, field="estimated_input_tokens")
+        require_nonnegative_int(self.context_window, field="context_window")
+        require_nonnegative_number(self.context_used_percent, field="context_used_percent")
+        require_nonnegative_int(self.session_message_count, field="session_message_count")
+        require_nonnegative_int(self.consolidation_cursor, field="consolidation_cursor")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "version": self.version,
+            "chat_model": self.chat_model,
+            "uptime_seconds": self.uptime_seconds,
+            "estimated_input_tokens": self.estimated_input_tokens,
+            "context_window": self.context_window,
+            "context_used_percent": self.context_used_percent,
+            "session_message_count": self.session_message_count,
+            "consolidation_cursor": self.consolidation_cursor,
+            "cumulative_usage": self.cumulative_usage.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeResult:
+    """Identity of the Conversation Session selected by a successful resume."""
+
+    session_id: str
+
+    def __post_init__(self) -> None:
+        require_session_id(self.session_id)
 
 
 def estimate_input_tokens(status_input: RuntimeStatusInput) -> int:

@@ -6,11 +6,11 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.management.models import RuntimeStatus
 from myclaw.management.service import (
     ManagementError,
     ManagementViewService,
     ResolvedChatStatus,
+    RuntimeStatus,
     RuntimeStatusInput,
     RuntimeStatusService,
 )
