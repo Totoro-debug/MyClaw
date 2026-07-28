@@ -820,6 +820,8 @@ async def test_scheduled_work_records_one_terminal_failure_with_task_session_con
         f"session={TASK_SESSION_ID} myclaw.schedule.scheduled_work_execution: "
         "Scheduled Work failed code=model_failed"
     ) in content
+    assert "Traceback (most recent call last):" in content
+    assert "ModelCallError: [REDACTED]" in content
     for private_content in (
         "PRIVATE TASK DEFINITION TITLE",
         "PRIVATE TASK PROMPT",

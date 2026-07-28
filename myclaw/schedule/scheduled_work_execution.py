@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
@@ -60,6 +60,7 @@ class ScheduledWorkRunResult:
     status: Literal["completed", "failed"]
     content: str
     error: ErrorInfo | None
+    diagnostic: BaseException | None = field(default=None, compare=False, repr=False)
 
 
 class ScheduledWorkRunner:
@@ -107,7 +108,16 @@ class ScheduledWorkRunner:
                 raise
             if result.status == "failed":
                 code = result.error.code if result.error is not None else "unknown"
-                logger.error("Scheduled Work failed code=%s", code)
+                message = f"Scheduled Work failed code={code}"
+                if result.diagnostic is None:
+                    logger.error(message)
+                else:
+                    log_sanitized_exception(
+                        logger,
+                        logging.ERROR,
+                        message,
+                        result.diagnostic,
+                    )
             return result
 
     async def _run_once(self, task: ScheduledWork) -> ScheduledWorkRunResult:
@@ -117,11 +127,12 @@ class ScheduledWorkRunner:
                 title=normalize_session_title(task.title),
                 created_at=task.created_at,
             )
-        except (OSError, UnicodeError, ValueError):
+        except (OSError, UnicodeError, ValueError) as error:
             return ScheduledWorkRunResult(
                 status="failed",
                 content="",
                 error=_SESSION_FAILURE,
+                diagnostic=error,
             )
 
         gateway = self._tool_gateway_for(task.session_id)
@@ -130,6 +141,12 @@ class ScheduledWorkRunner:
             long_term_memory=self._long_term_memory,
             tool_guidance=render_tool_guidance(gateway.schemas),
         )
+        terminal_diagnostic: BaseException | None = None
+
+        def capture_terminal_failure(error: BaseException) -> None:
+            nonlocal terminal_diagnostic
+            terminal_diagnostic = error
+
         turn = AgentTurn(
             lane="scheduled_work",
             provider=self._provider,
@@ -145,6 +162,7 @@ class ScheduledWorkRunner:
                 if self._externalize_result_for is None
                 else self._externalize_result_for(task.session_id)
             ),
+            on_terminal_failure=capture_terminal_failure,
         )
         async for payload in turn.run(task.prompt):
             if isinstance(payload, TurnCompletedPayload):
@@ -158,5 +176,6 @@ class ScheduledWorkRunner:
                     status="failed",
                     content="",
                     error=payload.error,
+                    diagnostic=terminal_diagnostic,
                 )
         raise AssertionError("Agent turn ended without a terminal payload")

@@ -32,6 +32,7 @@ class ToolGateway:
         *,
         sleep: Sleep = asyncio.sleep,
         owns_terminal_failures: bool = True,
+        on_terminal_failure: Callable[[Exception], None] | None = None,
     ) -> None:
         self._registered = False
         self._tools: dict[str, BaseTool] = {}
@@ -39,6 +40,7 @@ class ToolGateway:
         self._parameter_schemas: dict[str, JsonObject] = {}
         self._sleep = sleep
         self._owns_terminal_failures = owns_terminal_failures
+        self._on_terminal_failure = on_terminal_failure
 
     def register_tools(self, tools: tuple[BaseTool, ...]) -> None:
         """Register and cache one stable annotation-driven Tool Catalog."""
@@ -132,6 +134,8 @@ class ToolGateway:
                         f"type={type(error).__name__}",
                         error,
                     )
+                if self._on_terminal_failure is not None:
+                    self._on_terminal_failure(error)
                 message = (
                     error.message
                     if isinstance(error, ToolError)

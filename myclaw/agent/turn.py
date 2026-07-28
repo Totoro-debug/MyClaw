@@ -132,6 +132,7 @@ class AgentTurn:
         after_user_published: Callable[[UserSessionMessage], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
+        on_terminal_failure: Callable[[BaseException], None] | None = None,
     ) -> None:
         self._lane = lane
         self._provider = provider
@@ -146,6 +147,7 @@ class AgentTurn:
         self._after_user_published = after_user_published
         self._cancel_requested = cancel_requested or _never_cancelled
         self._externalize_result = externalize_result or _inline_tool_result
+        self._on_terminal_failure = on_terminal_failure
 
     async def run(self, text: str) -> AsyncGenerator[AgentTurnPayload, None]:
         yield TurnStartedPayload()
@@ -165,6 +167,8 @@ class AgentTurn:
         except _PERSISTENCE_EXCEPTIONS as failure:
             if self._lane == "foreground":
                 _log_persistence_failure(failure, operation="session_append")
+            else:
+                self._capture_terminal_failure(failure)
             yield TurnFailedPayload(error=self._session_update_failure)
             return
         if self._lane == "foreground" and self._cancel_requested():
@@ -185,6 +189,8 @@ class AgentTurn:
                 except _PERSISTENCE_EXCEPTIONS as failure:
                     if self._lane == "foreground":
                         _log_persistence_failure(failure, operation="session_read")
+                    else:
+                        self._capture_terminal_failure(failure)
                     yield TurnFailedPayload(error=self._session_read_failure)
                     return
                 if self._history_preparer is not None:
@@ -249,6 +255,8 @@ class AgentTurn:
                     except _PERSISTENCE_EXCEPTIONS as failure:
                         if self._lane == "foreground":
                             _log_persistence_failure(failure, operation="session_append")
+                        else:
+                            self._capture_terminal_failure(failure)
                         if self._lane == "foreground":
                             publication = await self._session_message_publication(assistant_message)
                             if publication is True:
@@ -336,6 +344,8 @@ class AgentTurn:
                                         )
                                     except _PERSISTENCE_EXCEPTIONS:
                                         pass
+                                else:
+                                    self._capture_terminal_failure(failure)
                                 yield TurnFailedPayload(error=self._session_update_failure)
                                 return
                             except asyncio.CancelledError:
@@ -420,6 +430,14 @@ class AgentTurn:
                         terminal_persistence_failure,
                         operation="terminal_state_append",
                     )
+            else:
+                diagnostic: BaseException = failure
+                if terminal_persistence_failure is not None:
+                    diagnostic = ExceptionGroup(
+                        "Scheduled Work terminal failure",
+                        [failure, terminal_persistence_failure],
+                    )
+                self._capture_terminal_failure(diagnostic)
             yield TurnFailedPayload(error=terminal_error)
             return
         except GeneratorExit:
@@ -450,6 +468,10 @@ class AgentTurn:
                 cleanup_failure = await _close_provider_stream(provider_stream)
                 if cleanup_failure is not None:
                     _log_cleanup_failure(cleanup_failure)
+
+    def _capture_terminal_failure(self, error: BaseException) -> None:
+        if self._on_terminal_failure is not None:
+            self._on_terminal_failure(error)
 
     def _model_request(
         self,

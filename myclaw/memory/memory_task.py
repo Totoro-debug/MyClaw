@@ -23,6 +23,7 @@ from myclaw.provider.models import (
     UserModelMessage,
 )
 from myclaw.provider.ports import ModelProvider
+from myclaw.runtime_log import log_sanitized_exception
 from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
 from myclaw.tools.schema import ToolParam
@@ -215,7 +216,11 @@ class MemoryManager:
         self._long_term_path = long_term_path
         self._settings = settings
         self._batch_size = batch_size
-        self._tools = ToolGateway(owns_terminal_failures=False)
+        self._failure_diagnostic: Exception | None = None
+        self._tools = ToolGateway(
+            owns_terminal_failures=False,
+            on_terminal_failure=self._capture_terminal_failure,
+        )
         self._tools.register_tools(
             (
                 MemoryReadFileTool(memory=memory, long_term_path=long_term_path),
@@ -239,10 +244,10 @@ class MemoryManager:
             )
         self._running = True
         self._running_cursor = 0
+        self._failure_diagnostic = None
         try:
             result = await self._run_once()
-            if result.error is not None:
-                logger.error("Memory Task failed code=%s", result.error.code)
+            self._log_failure(result)
             return result
         finally:
             self._running = False
@@ -252,10 +257,10 @@ class MemoryManager:
             return None
         self._running = True
         self._running_cursor = 0
+        self._failure_diagnostic = None
         try:
             result = await self._run_once()
-            if result.error is not None:
-                logger.error("Memory Task failed code=%s", result.error.code)
+            self._log_failure(result)
             return result
         finally:
             self._running = False
@@ -263,12 +268,14 @@ class MemoryManager:
     async def _run_once(self) -> MemoryTaskResult:
         try:
             cursor = await self._memory.read_summary_cursor()
-        except (OSError, UnicodeError, ValueError):
+        except (OSError, UnicodeError, ValueError) as error:
+            self._capture_terminal_failure(error)
             return _state_read_failure(cursor=0)
         self._running_cursor = cursor
         try:
             pending = await self._summaries.after(cursor, self._batch_size)
-        except (OSError, UnicodeError, ValueError):
+        except (OSError, UnicodeError, ValueError) as error:
+            self._capture_terminal_failure(error)
             return _state_read_failure(cursor=cursor)
         if not pending:
             return MemoryTaskResult(
@@ -300,6 +307,7 @@ class MemoryManager:
             try:
                 response = await self._provider.complete(request)
             except ModelCallError as failure:
+                self._capture_terminal_failure(failure)
                 return MemoryTaskResult(
                     status="Memory Task failed.",
                     processed_count=0,
@@ -332,7 +340,8 @@ class MemoryManager:
         new_cursor = pending[-1].index
         try:
             await self._memory.write_summary_cursor(new_cursor)
-        except (OSError, UnicodeError, ValueError):
+        except (OSError, UnicodeError, ValueError) as error:
+            self._capture_terminal_failure(error)
             return MemoryTaskResult(
                 status="Memory Task failed.",
                 processed_count=0,
@@ -351,6 +360,23 @@ class MemoryManager:
             processed_count=count,
             memory_updated=memory_updated,
             cursor=new_cursor,
+        )
+
+    def _capture_terminal_failure(self, error: Exception) -> None:
+        self._failure_diagnostic = error
+
+    def _log_failure(self, result: MemoryTaskResult) -> None:
+        if result.error is None:
+            return
+        message = f"Memory Task failed code={result.error.code}"
+        if self._failure_diagnostic is None:
+            logger.error(message)
+            return
+        log_sanitized_exception(
+            logger,
+            logging.ERROR,
+            message,
+            self._failure_diagnostic,
         )
 
 

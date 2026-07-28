@@ -521,6 +521,10 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert content.count(" ERROR ") == 1
     assert "Memory Task failed code=tool_failed" in content
+    assert "Traceback (most recent call last):" in content
+    assert "ToolError: [REDACTED]" in content
+    assert "OSError: [REDACTED]" in content
+    assert "The above exception was the direct cause" in content
     assert "The user prefers concise status reports." not in content
     assert "Prefers concise status reports." not in content
 
@@ -557,6 +561,8 @@ async def test_conversation_summary_read_failure_is_logged_only_at_memory_task_b
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert content.count(" ERROR ") == 1
     assert "Memory Task failed code=persistence_error" in content
+    assert "Traceback (most recent call last):" in content
+    assert "ValueError: [REDACTED]" in content
     assert "PRIVATE INVALID SUMMARY STREAM" not in content
 
 
