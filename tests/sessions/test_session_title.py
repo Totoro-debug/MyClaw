@@ -20,6 +20,7 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import (
     AssistantSessionMessage,
@@ -40,6 +41,15 @@ SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 SESSION_TWO_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
 REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
 TITLE_PROMPT = "Return a short title for this Conversation Session."
+
+
+def _runtime_log_text(agent_home: Path) -> str:
+    logs = agent_home / "logs"
+    return "".join(
+        path.read_text(encoding="utf-8")
+        for name in ("run.log.0", "run.log.1")
+        if (path := logs / name).exists()
+    )
 
 
 class DelayedTitleProvider:
@@ -93,7 +103,9 @@ class FailedTitleProvider:
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         if request.system_prompt == TITLE_PROMPT:
             self.title_started.set()
-            raise ModelCallError(ErrorInfo(code="model_failed", message="Title generation failed."))
+            raise ModelCallError(
+                ErrorInfo(code="model_failed", message="Title generation failed.")
+            ) from RuntimeError("private-title-provider-body")
 
         await self.title_started.wait()
         yield ModelCompleted(
@@ -171,6 +183,15 @@ class BlockingLoadSessionStore:
 
     async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]:
         return await self._delegate.list_for_workspace(workspace)
+
+
+class MetadataUpdateFailingStore(JsonlSessionStore):
+    async def update_metadata(self, session_id: str, update: MetadataUpdate) -> None:
+        del session_id, update
+        try:
+            raise RuntimeError("private-title-metadata-cause")
+        except RuntimeError as cause:
+            raise OSError("private-title-metadata-detail") from cause
 
 
 async def _collect_events(conversation: ConversationPort, text: str) -> list[str]:
@@ -368,17 +389,96 @@ async def test_failed_title_call_uses_normalized_unicode_bounded_input_fallback(
         title_prompt=TITLE_PROMPT,
     )
     first_input = "  Plan\t" + "\u754c" * 70
+    lifetime = install_runtime_logging(home)
 
-    event_types = await _collect_events(conversation, first_input)
+    with lifetime.session(session.id):
+        event_types = await _collect_events(conversation, first_input)
     for _ in range(100):
         reloaded = await store.load(session.id)
         if reloaded.metadata.title != "Untitled session":
             break
         await asyncio.sleep(0)
+    lifetime.close()
 
     assert event_types == ["turn_started", "turn_completed"]
     assert reloaded.metadata.title == "Plan " + "\u754c" * 55
     assert len(reloaded.metadata.title) == 60
+    content = _runtime_log_text(agent_home)
+    records = [
+        line for line in content.splitlines() if "myclaw.session.conversation:" in line
+    ]
+    assert len(records) == 1
+    assert " WARNING " in records[0]
+    assert "Session title fallback selected code=model_failed type=ModelCallError" in records[0]
+    assert f"session={session.id}" in records[0]
+    assert content.count("Traceback (most recent call last)") == 1
+    assert "ModelCallError: Session title generation failed." in content
+    assert first_input not in content
+    assert TITLE_PROMPT not in content
+    assert "private-title-provider-body" not in content
+
+
+@pytest.mark.asyncio
+async def test_terminal_title_metadata_failure_is_logged_without_repeating_provider_cause(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    store = MetadataUpdateFailingStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    provider = FailedTitleProvider()
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=lambda: REQUEST_UUID,
+        system_prompt="chat system prompt",
+        title_prompt=TITLE_PROMPT,
+    )
+    lifetime = install_runtime_logging(home)
+
+    with lifetime.session(session.id):
+        event_types = await _collect_events(conversation, "Fallback title input")
+        await conversation.close()
+    lifetime.close()
+
+    assert event_types == ["turn_started", "turn_completed"]
+    content = _runtime_log_text(agent_home)
+    records = [
+        line for line in content.splitlines() if "myclaw.session.conversation:" in line
+    ]
+    assert len(records) == 2
+    assert " WARNING " in records[0]
+    assert "Session title fallback selected code=model_failed type=ModelCallError" in records[0]
+    assert " ERROR " in records[1]
+    assert (
+        "Session title failed code=persistence_error operation=metadata_update type=OSError"
+        in records[1]
+    )
+    assert all(f"session={session.id}" in record for record in records)
+    error_record = content[content.index(records[1]) :]
+    assert "Traceback (most recent call last)" in error_record
+    assert "OSError" in error_record
+    assert "RuntimeError" in error_record
+    assert "ModelCallError" not in error_record
+    assert "private-title-provider-body" not in content
+    assert "private-title-metadata-detail" not in content
+    assert "private-title-metadata-cause" not in content
 
 
 @pytest.mark.asyncio
@@ -467,13 +567,16 @@ async def test_title_completion_with_tool_calls_uses_fallback_but_counts_usage(
         system_prompt="chat system prompt",
         title_prompt=TITLE_PROMPT,
     )
+    lifetime = install_runtime_logging(home)
 
-    await _collect_events(conversation, "Fallback project title")
+    with lifetime.session(session.id):
+        await _collect_events(conversation, "Fallback project title")
     for _ in range(100):
         reloaded = await store.load(session.id)
         if reloaded.metadata.cumulative_usage.model_calls == 2:
             break
         await asyncio.sleep(0)
+    lifetime.close()
 
     assert reloaded.metadata.title == "Fallback project title"
     assert reloaded.metadata.cumulative_usage == CumulativeUsage(
@@ -483,6 +586,17 @@ async def test_title_completion_with_tool_calls_uses_fallback_but_counts_usage(
         total_tokens=28,
     )
     assert [message.role for message in reloaded.messages] == ["user", "assistant"]
+    content = _runtime_log_text(agent_home)
+    records = [
+        line for line in content.splitlines() if "myclaw.session.conversation:" in line
+    ]
+    assert len(records) == 1
+    assert " WARNING " in records[0]
+    assert "Session title fallback selected code=model_failed" in records[0]
+    assert f"session={session.id}" in records[0]
+    assert "Disallowed generated title" not in content
+    assert '"path":"README.md"' not in content
+    assert "Fallback project title" not in content
 
 
 @pytest.mark.asyncio
@@ -517,14 +631,17 @@ async def test_empty_title_and_empty_normalized_input_keep_untitled_with_usage(
         system_prompt="chat system prompt",
         title_prompt=TITLE_PROMPT,
     )
+    lifetime = install_runtime_logging(home)
 
-    await _collect_events(conversation, '""')
+    with lifetime.session(session.id):
+        await _collect_events(conversation, '""')
     provider.release_title.set()
     for _ in range(100):
         reloaded = await store.load(session.id)
         if reloaded.metadata.cumulative_usage.model_calls == 2:
             break
         await asyncio.sleep(0)
+    lifetime.close()
 
     assert reloaded.metadata.title == "Untitled session"
     assert reloaded.metadata.cumulative_usage == CumulativeUsage(
@@ -534,6 +651,15 @@ async def test_empty_title_and_empty_normalized_input_keep_untitled_with_usage(
         total_tokens=25,
     )
     assert [message.role for message in reloaded.messages] == ["user", "assistant"]
+    content = _runtime_log_text(agent_home)
+    records = [
+        line for line in content.splitlines() if "myclaw.session.conversation:" in line
+    ]
+    assert len(records) == 1
+    assert " WARNING " in records[0]
+    assert "Session title fallback selected code=model_failed" in records[0]
+    assert f"session={session.id}" in records[0]
+    assert '""' not in content
 
 
 @pytest.mark.asyncio

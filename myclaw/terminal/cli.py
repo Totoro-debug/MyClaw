@@ -90,6 +90,7 @@ def main(context: typer.Context) -> None:
             provider_factory=create_provider,
             now=_local_now,
             new_uuid=uuid4,
+            runtime_log=runtime_log,
         )
         with asyncio.Runner() as runner:
             interrupts = ForegroundInterruptController(

@@ -26,6 +26,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
@@ -39,6 +40,15 @@ from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScri
 
 SESSION_ID = "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000"
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=timezone(timedelta(hours=8)))
+
+
+def _runtime_log_text(agent_home: Path) -> str:
+    logs = agent_home / "logs"
+    return "".join(
+        path.read_text(encoding="utf-8")
+        for name in ("run.log.0", "run.log.1")
+        if (path := logs / name).exists()
+    )
 
 
 def _runtime_configuration(*, max_tool_result_chars: int) -> UserConfiguration:
@@ -307,8 +317,11 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
             write_text=unavailable_artifact_boundary,
         ),
     )
+    lifetime = install_runtime_logging(home)
 
-    events = [event async for event in conversation.submit("Inspect the result")]
+    with lifetime.session(session.id):
+        events = [event async for event in conversation.submit("Inspect the result")]
+    lifetime.close()
 
     assert [event.type for event in events] == [
         "turn_started",
@@ -332,6 +345,20 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
     assert model_tool_message.content == "inspect result could not be stored."
     artifact_directory = _long_path(store.directory / "artifacts" / session.id)
     assert list(artifact_directory.iterdir()) == []
+    content = _runtime_log_text(agent_home)
+    records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
+    assert len(records) == 1
+    assert " ERROR " in records[0]
+    assert (
+        "Tool Artifact persistence failed code=persistence_error tool=inspect "
+        "type=ArtifactWriteError" in records[0]
+    )
+    assert f"session={session.id}" in records[0]
+    assert "Traceback (most recent call last)" in content
+    assert "ArtifactWriteError" in content
+    assert "RuntimeError" in content
+    assert raw_result not in content
+    assert private_write_detail not in content
 
 
 def test_invalid_empty_tool_call_id_fails_before_writing_an_artifact(

@@ -1,4 +1,5 @@
 import json
+import logging
 from collections import deque
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,8 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.provider.ports import ModelProvider
+from myclaw.runtime_log import install_runtime_logging
+from myclaw.schedule.records import ScheduledWork
 from myclaw.session.records import (
     AssistantSessionMessage,
     SessionError,
@@ -44,6 +47,15 @@ TURN_TWO_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
 USER_TWO_UUID = UUID("16fd2706-8baf-433b-82eb-8c7fada847da")
 REQUEST_TWO_UUID = UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e")
 ASSISTANT_TWO_UUID = UUID("b3f37212-6f3a-4a1b-8d2e-78ab3f9c4567")
+
+
+def _runtime_log_text(agent_home: Path) -> str:
+    logs = agent_home / "logs"
+    return "".join(
+        path.read_text(encoding="utf-8")
+        for name in ("run.log.0", "run.log.1")
+        if (path := logs / name).exists()
+    )
 
 CHAT_ROUTE_CONFIG = (
     VALID_CONFIG
@@ -89,6 +101,14 @@ class RecordingWriter:
         self.operations.append(("line", content))
 
 
+class RuntimeLogEmittingProvider(ScriptedFakeProvider):
+    async def complete(self, request: object) -> ModelResponse:
+        logging.getLogger("myclaw.tools.tool_gateway").warning(
+            "Scheduled Tool Gateway recovery code=tool_failed"
+        )
+        return await super().complete(request)
+
+
 def test_production_provider_factory_fails_closed_until_adapters_are_installed() -> None:
     configuration = ProviderConfiguration(
         provider_id="anthropic-default",
@@ -100,6 +120,109 @@ def test_production_provider_factory_fails_closed_until_adapters_are_installed()
 
     with pytest.raises(ProviderAdapterUnavailable, match="not available"):
         unavailable_provider_factory(configuration)
+
+
+@pytest.mark.asyncio
+async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_session(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    clock = FakeClock(NOW)
+    failure = ModelCallError(
+        ErrorInfo(code="model_failed", message="The model request failed.")
+    )
+    provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(), error=failure),)
+    )
+    lifetime = install_runtime_logging(home)
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=clock.now,
+        new_uuid=iter(
+            (SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)
+        ).__next__,
+        retry_clock=clock,
+        runtime_log=lifetime,
+    )
+
+    events = [
+        event async for event in runtime.conversation.submit("private foreground input")
+    ]
+    await runtime.conversation.close()
+    lifetime.close()
+
+    assert [event.type for event in events] == ["turn_started", "turn_failed"]
+    content = _runtime_log_text(agent_home)
+    records = [
+        line
+        for line in content.splitlines()
+        if "myclaw.agent.turn:" in line or "myclaw.session.conversation:" in line
+    ]
+    assert len(records) == 2
+    assert all(f"session={runtime.session_id}" in record for record in records)
+    assert "session=-" not in "\n".join(records)
+    assert "private foreground input" not in content
+
+
+@pytest.mark.asyncio
+async def test_prepared_runtime_correlates_scheduled_work_with_its_session(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    clock = FakeClock(NOW)
+    provider = RuntimeLogEmittingProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Scheduled result."),
+                usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
+                finish_reason="stop",
+            ),
+        )
+    )
+    lifetime = install_runtime_logging(home)
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        retry_clock=clock,
+        runtime_log=lifetime,
+    )
+    task = ScheduledWork(
+        id="11111111-1111-4111-8111-111111111111",
+        title="Runtime Log correlation",
+        cron="0 9 * * *",
+        prompt="private scheduled prompt",
+        created_at=NOW,
+        enabled=True,
+        session_id="20260711-153012-123000_22222222-2222-4222-8222-222222222222",
+    )
+
+    outcome = await runtime.scheduled_work_runner.run(task)
+    lifetime.close()
+
+    assert outcome.status == "completed"
+    content = _runtime_log_text(agent_home)
+    records = [
+        line
+        for line in content.splitlines()
+        if "myclaw.tools.tool_gateway:" in line
+    ]
+    assert len(records) == 1
+    assert f"session={task.session_id}" in records[0]
+    assert "session=-" not in records[0]
+    assert task.prompt not in content
 
 
 @pytest.mark.asyncio

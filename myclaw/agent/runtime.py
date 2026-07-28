@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,7 @@ from myclaw.memory.memory_scheduler import (
 from myclaw.memory.memory_task import FileMemoryStore, MemoryManager, MemoryTaskModelSettings
 from myclaw.provider.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
 from myclaw.provider.ports import ModelProvider
+from myclaw.runtime_log import RuntimeLogLifetime
 from myclaw.schedule.background_coordination import (
     AsyncioScheduledWorkSchedulerClock,
     RuntimeEventBroker,
@@ -301,6 +303,7 @@ class _DeferredConversationPort:
         history_preparer: Callable[[ConversationSession], Awaitable[ConversationSession]],
         before_submit: Callable[[], Awaitable[None]],
         on_foreground_terminal: Callable[[], None],
+        runtime_log: RuntimeLogLifetime | None = None,
         externalize_result: ToolResultExternalizer | None = None,
     ) -> None:
         self._provider = provider
@@ -315,6 +318,7 @@ class _DeferredConversationPort:
         self._history_preparer = history_preparer
         self._before_submit = before_submit
         self._on_foreground_terminal = on_foreground_terminal
+        self._runtime_log = runtime_log
         self._externalize_result = externalize_result
         self._delegate: ConversationPort | None = None
         self._close_task: asyncio.Task[None] | None = None
@@ -334,36 +338,42 @@ class _DeferredConversationPort:
         active_done = asyncio.Event()
         self._active_task = active
         self._active_done = active_done
-        try:
-            await self._before_submit()
-            if self._close_task is not None:
-                raise RuntimeError("Conversation Port is closed")
-            delegate = self._delegate
-            if delegate is None:
-                delegate = StreamingConversationPort(
-                    provider=self._provider,
-                    sessions=self._sessions,
-                    session_id=self._session_id,
-                    settings=self._settings,
-                    now=self._now,
-                    new_uuid=self._new_uuid,
-                    system_prompt=self._system_prompt,
-                    title_prompt=self._title_prompt,
-                    tool_gateway=self._tool_gateway,
-                    history_preparer=self._history_preparer,
-                    externalize_result=self._externalize_result,
-                )
-                self._delegate = delegate
-            async for event in delegate.submit(text):
-                if event.type in {"turn_completed", "turn_failed", "turn_cancelled"}:
-                    self._on_foreground_terminal()
-                yield event
-        finally:
-            if self._active_task is active:
-                self._active_task = None
-            active_done.set()
-            if self._active_done is active_done:
-                self._active_done = None
+        correlation = (
+            nullcontext()
+            if self._runtime_log is None
+            else self._runtime_log.session(self._session_id)
+        )
+        with correlation:
+            try:
+                await self._before_submit()
+                if self._close_task is not None:
+                    raise RuntimeError("Conversation Port is closed")
+                delegate = self._delegate
+                if delegate is None:
+                    delegate = StreamingConversationPort(
+                        provider=self._provider,
+                        sessions=self._sessions,
+                        session_id=self._session_id,
+                        settings=self._settings,
+                        now=self._now,
+                        new_uuid=self._new_uuid,
+                        system_prompt=self._system_prompt,
+                        title_prompt=self._title_prompt,
+                        tool_gateway=self._tool_gateway,
+                        history_preparer=self._history_preparer,
+                        externalize_result=self._externalize_result,
+                    )
+                    self._delegate = delegate
+                async for event in delegate.submit(text):
+                    if event.type in {"turn_completed", "turn_failed", "turn_cancelled"}:
+                        self._on_foreground_terminal()
+                    yield event
+            finally:
+                if self._active_task is active:
+                    self._active_task = None
+                active_done.set()
+                if self._active_done is active_done:
+                    self._active_done = None
 
     async def cancel_active_turn(self) -> None:
         delegate = self._delegate
@@ -419,6 +429,7 @@ def prepare_repl_runtime(
     web_search: WebSearchBoundary | None = None,
     web_fetch: WebFetchBoundary | None = None,
     shell: ShellBoundary | None = None,
+    runtime_log: RuntimeLogLifetime | None = None,
 ) -> PreparedReplRuntime:
     """Prepare a Session and defer provider construction until conversational input."""
     configuration.resolve_route("default")
@@ -574,6 +585,7 @@ def prepare_repl_runtime(
         new_uuid=new_uuid,
         tool_gateway_for=scheduled_work_gateway_for,
         externalize_result_for=externalize_result_for,
+        runtime_log=runtime_log,
     )
     background_events = RuntimeEventBroker()
     scheduled_work_coordinator = ScheduledWorkCoordinator(
@@ -630,6 +642,7 @@ def prepare_repl_runtime(
             history_preparer=summary_manager.prepare,
             before_submit=summary_manager.recover_pending,
             on_foreground_terminal=capture_foreground_chat_status,
+            runtime_log=runtime_log,
             externalize_result=externalize_result_for(session_id),
         )
 

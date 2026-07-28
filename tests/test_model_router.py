@@ -1,10 +1,12 @@
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 
+from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import (
     MemoryConfiguration,
     ModelsConfiguration,
@@ -30,15 +32,26 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
+from myclaw.runtime_log import install_runtime_logging
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
 REQUEST_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
+SESSION_ID = "20260711-153012-123000_550e8400-e29b-41d4-a716-446655440000"
 
 
 async def collect(stream: AsyncIterator[object]) -> list[object]:
     return [event async for event in stream]
+
+
+def runtime_log_text(agent_home: Path) -> str:
+    logs = agent_home / "logs"
+    return "".join(
+        path.read_text(encoding="utf-8")
+        for name in ("run.log.0", "run.log.1")
+        if (path := logs / name).exists()
+    )
 
 
 def configuration() -> UserConfiguration:
@@ -398,6 +411,60 @@ async def test_model_router_caps_one_logical_stream_at_five_provider_attempts() 
 
 
 @pytest.mark.asyncio
+async def test_model_router_records_only_consumed_retry_attempts(
+    agent_home: Path,
+) -> None:
+    private_failure_detail = "user-message prompt memory tool-args tool-result provider-body"
+    failure = ModelCallError(
+        ErrorInfo(
+            code="provider_timeout",
+            message=private_failure_detail,
+            retryable=True,
+        )
+    )
+    provider = ScriptedFakeProvider(
+        streams=[StreamScript(events=(), error=failure) for _ in range(5)]
+    )
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda _: provider,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+
+    with lifetime.session(SESSION_ID), pytest.raises(ModelCallError):
+        await collect(router.stream(request(route="chat")))
+    lifetime.close()
+
+    records = [
+        line
+        for line in runtime_log_text(agent_home).splitlines()
+        if "myclaw.provider.model_router:" in line
+    ]
+    assert len(records) == 4
+    for attempt, delay, record in zip(
+        range(1, 5),
+        (0.5, 1.0, 2.0, 4.0),
+        records,
+        strict=True,
+    ):
+        assert f"attempt={attempt}/5" in record
+        assert "code=provider_timeout" in record
+        assert "provider=chat-provider" in record
+        assert "requested_route=chat" in record
+        assert "selected_route=chat" in record
+        assert "model=chat-model" in record
+        assert f"planned_delay_seconds={delay}" in record
+        assert f"session={SESSION_ID}" in record
+    assert "attempt=5/5" not in runtime_log_text(agent_home)
+    content = runtime_log_text(agent_home)
+    assert content.count("Traceback (most recent call last)") == 4
+    assert content.count("ModelCallError: The Provider attempt failed.") == 4
+    assert private_failure_detail not in content
+
+
+@pytest.mark.asyncio
 async def test_model_router_uses_exponential_backoff_and_respects_retry_after() -> None:
     provider = ScriptedFakeProvider(
         streams=(
@@ -475,6 +542,63 @@ async def test_model_router_falls_back_after_a_permanent_requested_route_failure
 
 
 @pytest.mark.asyncio
+async def test_model_router_records_failed_attempt_and_default_fallback_separately(
+    agent_home: Path,
+) -> None:
+    private_provider_body = "private provider response body"
+    failure = ModelCallError(
+        ErrorInfo(code="provider_auth_error", message=private_provider_body)
+    )
+    chat_provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(), error=failure),)
+    )
+    default_provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(completed("Recovered"),)),)
+    )
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+
+    with lifetime.session(SESSION_ID):
+        observed = await collect(router.stream(request(route="chat")))
+    lifetime.close()
+
+    assert observed == [completed("Recovered")]
+    records = [
+        line
+        for line in runtime_log_text(agent_home).splitlines()
+        if "myclaw.provider.model_router:" in line
+    ]
+    assert len(records) == 2
+    assert "Provider attempt failed" in records[0]
+    assert "attempt=1/5" in records[0]
+    assert "code=provider_auth_error" in records[0]
+    assert "provider=chat-provider" in records[0]
+    assert "requested_route=chat" in records[0]
+    assert "selected_route=chat" in records[0]
+    assert "model=chat-model" in records[0]
+    assert "planned_delay_seconds=0.0" in records[0]
+    assert "Default Model Route selected" in records[1]
+    assert "requested_route=chat" in records[1]
+    assert "provider=default-provider" in records[1]
+    assert "selected_route=default" in records[1]
+    assert "model=default-model" in records[1]
+    assert all(" WARNING " in record for record in records)
+    content = runtime_log_text(agent_home)
+    assert content.count("Traceback (most recent call last)") == 1
+    assert content.count("ModelCallError: The Provider attempt failed.") == 1
+    assert private_provider_body not in content
+
+
+@pytest.mark.asyncio
 async def test_model_router_route_status_updates_when_dynamic_fallback_is_selected() -> None:
     chat_provider = ScriptedFakeProvider(
         streams=(StreamScript(events=(), error=permanent_failure()),)
@@ -535,6 +659,42 @@ def test_model_router_route_status_starts_from_static_default_fallback() -> None
         context_window=100_000,
         used_default=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_model_router_records_static_default_fallback_without_provider_attempt(
+    agent_home: Path,
+) -> None:
+    provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(completed("Static fallback"),)),)
+    )
+    router = ModelRouter(
+        configuration=configuration(),
+        provider_factory=lambda _: provider,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+
+    with lifetime.session(SESSION_ID):
+        observed = await collect(router.stream(request(route="chat")))
+    lifetime.close()
+
+    assert observed == [completed("Static fallback")]
+    records = [
+        line
+        for line in runtime_log_text(agent_home).splitlines()
+        if "myclaw.provider.model_router:" in line
+    ]
+    assert len(records) == 1
+    assert " WARNING " in records[0]
+    assert "Default Model Route selected code=route_unavailable" in records[0]
+    assert "requested_route=chat" in records[0]
+    assert "provider=default-provider" in records[0]
+    assert "selected_route=default" in records[0]
+    assert "model=default-model" in records[0]
+    assert "Provider attempt failed" not in records[0]
+    assert f"session={SESSION_ID}" in records[0]
 
 
 @pytest.mark.asyncio

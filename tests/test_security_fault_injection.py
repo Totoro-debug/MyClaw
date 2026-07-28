@@ -27,6 +27,7 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import (
     AssistantSessionMessage,
@@ -55,6 +56,15 @@ RETRY_REPAIR_UUID = UUID("84f40c92-f82d-4ce8-a57e-7d6f476893ed")
 ERROR_UUID = UUID("3d813cbb-47fb-45df-91b5-0f4b6c7f7648")
 REQUEST_TWO_UUID = UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e")
 ASSISTANT_TWO_UUID = UUID("b3f37212-6f3a-4a1b-8d2e-78ab3f9c4567")
+
+
+def _runtime_log_text(agent_home: Path) -> str:
+    logs = agent_home / "logs"
+    return "".join(
+        path.read_text(encoding="utf-8")
+        for name in ("run.log.0", "run.log.1")
+        if (path := logs / name).exists()
+    )
 
 
 def _gateway(*tools: BaseTool) -> ToolGateway:
@@ -333,6 +343,35 @@ class CloseTrackedCompletionStream:
         self._closed[0] = True
 
 
+class FailingCloseCompletionStream(CloseTrackedCompletionStream):
+    async def aclose(self) -> None:
+        try:
+            raise OSError("private-stream-close-cause")
+        except OSError as error:
+            raise RuntimeError("private-stream-close-detail") from error
+
+
+class CleanupFailingProvider:
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        return FailingCloseCompletionStream(
+            ModelCompleted(
+                response=ModelResponse(
+                    message=AssistantModelMessage(content="Completed safely."),
+                    usage=ModelUsage(input_tokens=3, output_tokens=2, total_tokens=5),
+                    finish_reason="stop",
+                )
+            ),
+            [False],
+        )
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        raise AssertionError(f"Unexpected completion request: {request!r}")
+
+    async def close(self) -> None:
+        return None
+
+
 class TitleCloseTrackingProvider:
     def __init__(self) -> None:
         self._title_closed = [False]
@@ -451,7 +490,11 @@ async def test_initial_session_publication_failure_is_one_safe_terminal_event(
         new_uuid=iter((TURN_UUID, USER_UUID)).__next__,
     )
 
-    events = [event async for event in conversation.submit("Do not leak disk details.")]
+    lifetime = install_runtime_logging(home)
+
+    with lifetime.session(session.id):
+        events = [event async for event in conversation.submit("Do not leak disk details.")]
+    lifetime.close()
 
     assert [event.type for event in events] == ["turn_started", "turn_failed"]
     failed = events[-1]
@@ -463,6 +506,17 @@ async def test_initial_session_publication_failure_is_one_safe_terminal_event(
     assert "private-api-key-and-traceback-detail" not in str(failed.to_dict())
     assert provider.stream_requests == []
     assert not sessions.path_for(session.id).exists()
+    content = _runtime_log_text(agent_home)
+    records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
+    assert len(records) == 1
+    assert (
+        "Agent Turn failed code=persistence_error operation=session_append type=OSError"
+        in records[0]
+    )
+    assert f"session={session.id}" in records[0]
+    assert "Traceback (most recent call last)" in content
+    assert "OSError" in content
+    assert "private-api-key-and-traceback-detail" not in content
     validate_agent_event_sequence(events)
 
 
@@ -496,13 +550,68 @@ async def test_closing_conversation_stream_closes_provider_iterator_immediately(
         now=clock.now,
         new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
     )
-    stream = conversation.submit("Start a streamed response.")
+    lifetime = install_runtime_logging(home)
 
-    assert (await anext(stream)).type == "turn_started"
-    assert (await anext(stream)).type == "text_delta"
-    await stream.aclose()
+    with lifetime.session(session.id):
+        stream = conversation.submit("Start a streamed response.")
+        assert (await anext(stream)).type == "turn_started"
+        assert (await anext(stream)).type == "text_delta"
+        await stream.aclose()
+    lifetime.close()
 
     assert provider.stream_closed is True
+    assert _runtime_log_text(agent_home) == ""
+
+
+@pytest.mark.asyncio
+async def test_foreground_stream_cleanup_failure_is_logged_as_an_independent_error(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = sessions.prepare()
+    conversation = StreamingConversationPort(
+        provider=CleanupFailingProvider(),
+        sessions=sessions,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+    )
+    lifetime = install_runtime_logging(home)
+
+    with lifetime.session(session.id):
+        events = [event async for event in conversation.submit("Complete the turn.")]
+    lifetime.close()
+
+    assert [event.type for event in events] == ["turn_started", "turn_completed"]
+    content = _runtime_log_text(agent_home)
+    records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
+    assert len(records) == 1
+    assert (
+        "Agent Turn cleanup failed code=model_failed operation=provider_stream_close "
+        "type=RuntimeError" in records[0]
+    )
+    assert f"session={session.id}" in records[0]
+    assert "Traceback (most recent call last)" in content
+    assert "OSError" in content
+    assert "RuntimeError" in content
+    assert "private-stream-close-cause" not in content
+    assert "private-stream-close-detail" not in content
 
 
 @pytest.mark.asyncio
@@ -537,11 +646,16 @@ async def test_title_generation_closes_provider_iterator_after_completion(
         title_prompt="Generate one title.",
     )
 
-    events = [event async for event in conversation.submit("Name this session.")]
-    await conversation.close()
+    lifetime = install_runtime_logging(home)
+
+    with lifetime.session(session.id):
+        events = [event async for event in conversation.submit("Name this session.")]
+        await conversation.close()
+    lifetime.close()
 
     assert [event.type for event in events] == ["turn_started", "turn_completed"]
     assert provider.title_stream_closed is True
+    assert _runtime_log_text(agent_home) == ""
 
 
 @pytest.mark.asyncio
@@ -781,34 +895,51 @@ async def test_tool_stage_cancellation_survives_persistent_repair_failure(
         ).__next__,
         tool_gateway=_gateway(tool),
     )
-    stream = conversation.submit("Cancel before the sensitive tool executes.")
+    lifetime = install_runtime_logging(home)
 
-    events: list[AgentEvent] = []
-    while not events or events[-1].type != "tool_started":
-        events.append(await anext(stream))
-    if termination == "cancel":
-        await conversation.cancel_active_turn()
-        events.append(await anext(stream))
-        with pytest.raises(StopAsyncIteration):
-            await anext(stream)
-        expected_events = ["turn_started"]
-        if stream_text:
-            expected_events.append("text_delta")
-        expected_events.extend(("tool_started", "turn_cancelled"))
-        assert [event.type for event in events] == expected_events
-        cancelled = events[-1]
-        assert isinstance(cancelled.payload, TurnCancelledPayload)
-        assert cancelled.payload.partial_content == ""
-        validate_agent_event_sequence(events)
-    else:
-        await stream.aclose()
-        assert [event.type for event in events] == ["turn_started", "tool_started"]
+    with lifetime.session(session.id):
+        stream = conversation.submit("Cancel before the sensitive tool executes.")
+        events: list[AgentEvent] = []
+        while not events or events[-1].type != "tool_started":
+            events.append(await anext(stream))
+        if termination == "cancel":
+            await conversation.cancel_active_turn()
+            events.append(await anext(stream))
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+            expected_events = ["turn_started"]
+            if stream_text:
+                expected_events.append("text_delta")
+            expected_events.extend(("tool_started", "turn_cancelled"))
+            assert [event.type for event in events] == expected_events
+            cancelled = events[-1]
+            assert isinstance(cancelled.payload, TurnCancelledPayload)
+            assert cancelled.payload.partial_content == ""
+            validate_agent_event_sequence(events)
+        else:
+            await stream.aclose()
+            assert [event.type for event in events] == ["turn_started", "tool_started"]
+    lifetime.close()
     rendered = str([event.to_dict() for event in events])
     assert "private-cancelled-tool-argument" not in rendered
     assert "private-persistent-tool-publication-detail" not in rendered
     assert tool.calls == []
     persisted = await sessions.load(session.id)
     assert [message.role for message in persisted.messages] == expected_roles
+    content = _runtime_log_text(agent_home)
+    records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
+    if store_type is ToolAppendAndRepairFailingStore:
+        assert len(records) == 1
+        assert (
+            "Agent Turn failed code=persistence_error "
+            "operation=interrupted_state_repair type=OSError" in records[0]
+        )
+        assert f"session={session.id}" in records[0]
+        assert "Traceback (most recent call last)" in content
+    else:
+        assert records == []
+    assert "private-cancelled-tool-argument" not in content
+    assert "private-persistent-tool-publication-detail" not in content
 
 
 @pytest.mark.asyncio
@@ -842,7 +973,11 @@ async def test_corrupt_session_before_model_call_is_a_safe_persistence_terminal(
         new_uuid=iter((TURN_UUID, USER_UUID)).__next__,
     )
 
-    events = [event async for event in conversation.submit("Stop before provider use.")]
+    lifetime = install_runtime_logging(home)
+
+    with lifetime.session(session.id):
+        events = [event async for event in conversation.submit("Stop before provider use.")]
+    lifetime.close()
 
     assert [event.type for event in events] == ["turn_started", "turn_failed"]
     failed = events[-1]
@@ -853,6 +988,16 @@ async def test_corrupt_session_before_model_call_is_a_safe_persistence_terminal(
     )
     assert "private-corrupt-jsonl-content" not in str(failed.to_dict())
     assert provider.stream_requests == []
+    content = _runtime_log_text(agent_home)
+    records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
+    assert len(records) == 1
+    assert (
+        "Agent Turn failed code=persistence_error operation=session_read type=ValueError"
+        in records[0]
+    )
+    assert f"session={session.id}" in records[0]
+    assert "Traceback (most recent call last)" in content
+    assert "private-corrupt-jsonl-content" not in content
     validate_agent_event_sequence(events)
 
 
@@ -891,7 +1036,11 @@ async def test_model_error_publication_failure_reports_only_persistence_error(
         new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
     )
 
-    events = [event async for event in conversation.submit("Fail without leaking.")]
+    lifetime = install_runtime_logging(home)
+
+    with lifetime.session(session.id):
+        events = [event async for event in conversation.submit("Fail without leaking.")]
+    lifetime.close()
 
     assert [event.type for event in events] == ["turn_started", "turn_failed"]
     failed = events[-1]
@@ -904,6 +1053,20 @@ async def test_model_error_publication_failure_reports_only_persistence_error(
     assert "private-provider-response-body" not in rendered
     assert "private-assistant-publication-detail" not in rendered
     assert [message.role for message in (await sessions.load(session.id)).messages] == ["user"]
+    content = _runtime_log_text(agent_home)
+    records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
+    assert len(records) == 2
+    assert "Agent Turn failed code=provider_unavailable type=ModelCallError" in records[0]
+    assert (
+        "Agent Turn failed code=persistence_error operation=terminal_state_append type=OSError"
+        in records[1]
+    )
+    assert all(f"session={session.id}" in record for record in records)
+    assert content.count("Traceback (most recent call last)") >= 2
+    assert "ModelCallError" in content
+    assert "OSError" in content
+    assert "private-provider-response-body" not in content
+    assert "private-assistant-publication-detail" not in content
     validate_agent_event_sequence(events)
 
 
@@ -1027,6 +1190,76 @@ async def test_cancellation_after_durable_model_error_does_not_duplicate_partial
         )
     ]
     validate_agent_event_sequence(events)
+
+
+@pytest.mark.asyncio
+async def test_foreground_model_failure_is_logged_once_without_private_content(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    clock = FakeClock(NOW)
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=clock.now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = sessions.prepare()
+    private_values = (
+        "private-user-message",
+        "private-system-prompt",
+        "private-memory-content",
+        "private-file-content",
+        "private-web-content",
+        "private-provider-response-body",
+        "private-api-key",
+    )
+    failure = ModelCallError(
+        ErrorInfo(code="provider_unavailable", message="The provider is unavailable.")
+    )
+    failure.__cause__ = RuntimeError(
+        f"{private_values[5]} Authorization: Bearer {private_values[6]}"
+    )
+    provider = ScriptedFakeProvider(streams=(StreamScript(events=(), error=failure),))
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=sessions,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=clock.now,
+        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        system_prompt=" ".join(private_values[1:5]),
+    )
+    lifetime = install_runtime_logging(home)
+    lifetime.add_api_keys((private_values[6],))
+
+    with lifetime.session(session.id):
+        events = [
+            event async for event in conversation.submit(private_values[0])
+        ]
+    lifetime.close()
+
+    assert [event.type for event in events] == ["turn_started", "turn_failed"]
+    content = _runtime_log_text(agent_home)
+    records = [
+        line for line in content.splitlines() if "myclaw.agent.turn:" in line
+    ]
+    assert len(records) == 1
+    assert " ERROR " in records[0]
+    assert f"session={session.id}" in records[0]
+    assert "Agent Turn failed code=provider_unavailable type=ModelCallError" in records[0]
+    assert "Traceback (most recent call last)" in content
+    assert "ModelCallError" in content
+    assert "RuntimeError" in content
+    assert all(value not in content for value in private_values)
 
 
 @pytest.mark.asyncio
@@ -1241,8 +1474,11 @@ async def test_assistant_publication_failure_never_reports_turn_completed(
         now=clock.now,
         new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
     )
+    lifetime = install_runtime_logging(home)
 
-    events = [event async for event in conversation.submit("Persist before completing.")]
+    with lifetime.session(session.id):
+        events = [event async for event in conversation.submit("Persist before completing.")]
+    lifetime.close()
 
     assert [event.type for event in events] == ["turn_started", "turn_failed"]
     failed = events[-1]
@@ -1254,6 +1490,15 @@ async def test_assistant_publication_failure_never_reports_turn_completed(
     assert "private-assistant-publication-detail" not in str(failed.to_dict())
     assert [message.role for message in (await sessions.load(session.id)).messages] == ["user"]
     assert len(provider.stream_requests) == 1
+    content = _runtime_log_text(agent_home)
+    records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
+    assert len(records) == 1
+    assert (
+        "Agent Turn failed code=persistence_error operation=session_append type=OSError"
+        in records[0]
+    )
+    assert f"session={session.id}" in records[0]
+    assert "private-assistant-publication-detail" not in content
     validate_agent_event_sequence(events)
 
 
@@ -1521,8 +1766,11 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
             session_id=session.id,
         ),
     )
+    lifetime = install_runtime_logging(home)
 
-    events = [event async for event in conversation.submit("Run one sensitive tool.")]
+    with lifetime.session(session.id):
+        events = [event async for event in conversation.submit("Run one sensitive tool.")]
+    lifetime.close()
 
     assert [event.type for event in events] == [
         "turn_started",
@@ -1556,6 +1804,20 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
         if expected_tool_status == "error":
             assert tool_message.content == "Tool result could not be persisted."
     assert len(provider.stream_requests) == 1
+    content = _runtime_log_text(agent_home)
+    primary_records = [
+        line
+        for line in content.splitlines()
+        if "myclaw.agent.turn:" in line and "operation=session_append" in line
+    ]
+    assert len(primary_records) == 1
+    assert "Agent Turn failed code=persistence_error" in primary_records[0]
+    assert "type=OSError" in primary_records[0]
+    assert f"session={session.id}" in primary_records[0]
+    assert "private-raw-tool-argument" not in content
+    assert "private-raw-tool-result" not in content
+    assert "private-tool-result-publication-detail" not in content
+    assert "private-persistent-tool-publication-detail" not in content
     validate_agent_event_sequence(events)
 
 

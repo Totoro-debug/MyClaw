@@ -1,6 +1,7 @@
 """Command-line Conversation adapter over the Runtime Core Agent turn."""
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +14,7 @@ from myclaw.agent.turn import (
     agent_turn_event_type,
     model_message_from_session,
 )
+from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     ModelCompleted,
     ModelRequest,
@@ -28,6 +30,8 @@ from myclaw.session.session_titles import normalize_session_title
 from myclaw.tools.tool_gateway import ToolGateway
 
 __all__ = ["ChatModelSettings", "StreamingConversationPort", "model_message_from_session"]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,29 +195,57 @@ class StreamingConversationPort:
             timeout_seconds=self._settings.timeout_seconds,
         )
         provider_stream: AsyncIterator[ModelStreamEvent] | None = None
+        fallback_reason: str | None = "incomplete_stream"
+        fallback_type = "ModelStream"
         try:
             provider_stream = self._provider.stream(request)
             async for model_event in provider_stream:
                 if not isinstance(model_event, ModelCompleted):
                     continue
-                if not model_event.response.message.tool_calls:
+                fallback_type = "ModelResponse"
+                if model_event.response.message.tool_calls:
+                    fallback_reason = "tool_calls"
+                else:
                     generated = normalize_session_title(model_event.response.message.content)
                     if generated:
                         title = generated
+                        fallback_reason = None
+                    else:
+                        fallback_reason = "empty_title"
                 usage_delta = model_event.response.usage
                 break
-        except Exception:
-            pass
+        except Exception as failure:
+            fallback_reason = None
+            code = failure.error.code if isinstance(failure, ModelCallError) else "model_failed"
+            safe_failure = _safe_title_exception(
+                failure,
+                "Session title generation failed.",
+            )
+            logger.warning(
+                "Session title fallback selected code=%s type=%s",
+                code,
+                type(failure).__name__,
+                exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
+            )
         finally:
             await _close_provider_stream(provider_stream)
-        await self._sessions.update_metadata(
-            session_id,
-            MetadataUpdate(
-                title=title,
-                updated_at=self._persisted_now(),
-                usage_delta=usage_delta,
-            ),
-        )
+        if fallback_reason is not None:
+            logger.warning(
+                "Session title fallback selected code=model_failed type=%s reason=%s",
+                fallback_type,
+                fallback_reason,
+            )
+        try:
+            await self._sessions.update_metadata(
+                session_id,
+                MetadataUpdate(
+                    title=title,
+                    updated_at=self._persisted_now(),
+                    usage_delta=usage_delta,
+                ),
+            )
+        except (OSError, UnicodeError, ValueError) as failure:
+            _log_title_persistence_failure(failure, operation="metadata_update")
 
     async def cancel_active_turn(self) -> None:
         if self._cancel_requested:
@@ -265,3 +297,32 @@ async def _close_provider_stream(stream: AsyncIterator[ModelStreamEvent] | None)
 def _consume_task_exception(task: asyncio.Future[None]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _log_title_persistence_failure(failure: Exception, *, operation: str) -> None:
+    safe_failure = _safe_title_exception(failure, "Session title persistence failed.")
+    logger.error(
+        "Session title failed code=persistence_error operation=%s type=%s",
+        operation,
+        type(failure).__name__,
+        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
+    )
+
+
+def _safe_title_exception(failure: BaseException, message: str) -> BaseException:
+    try:
+        safe_failure = type(failure)(message)
+    except Exception:
+        safe_failure = RuntimeError(f"{type(failure).__name__}: {message}")
+    if failure.__cause__ is not None:
+        safe_failure.__cause__ = _safe_title_exception(
+            failure.__cause__,
+            "Diagnostic detail redacted.",
+        )
+    elif failure.__context__ is not None and not failure.__suppress_context__:
+        safe_failure.__context__ = _safe_title_exception(
+            failure.__context__,
+            "Diagnostic detail redacted.",
+        )
+        safe_failure.__suppress_context__ = False
+    return safe_failure.with_traceback(failure.__traceback__)

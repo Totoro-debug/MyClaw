@@ -14,6 +14,7 @@ from myclaw.agent.workspace import Workspace
 from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ReasoningEffort
 from myclaw.provider.ports import ModelProvider
+from myclaw.runtime_log import RuntimeLogLifetime
 from myclaw.schedule.records import ScheduledWork
 from myclaw.session.ports import SessionStore
 from myclaw.session.records import SessionMetadata
@@ -73,6 +74,7 @@ class ScheduledWorkRunner:
         new_uuid: Callable[[], UUID],
         tool_gateway_for: Callable[[str], ToolGateway],
         externalize_result_for: Callable[[str], ToolResultExternalizer] | None = None,
+        runtime_log: RuntimeLogLifetime | None = None,
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -83,8 +85,15 @@ class ScheduledWorkRunner:
         self._new_uuid = new_uuid
         self._tool_gateway_for = tool_gateway_for
         self._externalize_result_for = externalize_result_for
+        self._runtime_log = runtime_log
 
     async def run(self, task: ScheduledWork) -> ScheduledWorkRunResult:
+        if self._runtime_log is None:
+            return await self._run(task)
+        with self._runtime_log.session(task.session_id):
+            return await self._run(task)
+
+    async def _run(self, task: ScheduledWork) -> ScheduledWorkRunResult:
         try:
             self._sessions.prepare_with_id(
                 session_id=task.session_id,

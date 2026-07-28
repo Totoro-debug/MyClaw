@@ -1,6 +1,7 @@
 """Runtime Core orchestration for one foreground or Scheduled Work Agent turn."""
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from typing import Literal, Protocol
@@ -70,6 +71,8 @@ _SCHEDULED_SESSION_FAILURE = ErrorInfo(
     code="persistence_error",
     message="Scheduled Work Session could not be updated.",
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AgentTurnModelSettings(Protocol):
@@ -159,7 +162,9 @@ class AgentTurn:
                 raise
             yield await self._cancelled_payload([], [])
             return
-        except _PERSISTENCE_EXCEPTIONS:
+        except _PERSISTENCE_EXCEPTIONS as failure:
+            if self._lane == "foreground":
+                _log_persistence_failure(failure, operation="session_append")
             yield TurnFailedPayload(error=self._session_update_failure)
             return
         if self._lane == "foreground" and self._cancel_requested():
@@ -177,14 +182,18 @@ class AgentTurn:
                 partial_content = []
                 try:
                     session = await self._sessions.load(self._session_id)
-                except _PERSISTENCE_EXCEPTIONS:
+                except _PERSISTENCE_EXCEPTIONS as failure:
+                    if self._lane == "foreground":
+                        _log_persistence_failure(failure, operation="session_read")
                     yield TurnFailedPayload(error=self._session_read_failure)
                     return
                 if self._history_preparer is not None:
                     session = await self._history_preparer(session)
                 request = self._model_request(session, current_user=user_message)
                 if self._lane == "foreground":
-                    await _close_provider_stream(provider_stream)
+                    cleanup_failure = await _close_provider_stream(provider_stream)
+                    if cleanup_failure is not None:
+                        _log_cleanup_failure(cleanup_failure)
                     try:
                         provider_stream = self._provider.stream(request)
                     except ModelCallError:
@@ -237,7 +246,9 @@ class AgentTurn:
                             partial_content.clear()
                             pending_tool_calls = list(assistant_message.tool_calls)
                         raise
-                    except _PERSISTENCE_EXCEPTIONS:
+                    except _PERSISTENCE_EXCEPTIONS as failure:
+                        if self._lane == "foreground":
+                            _log_persistence_failure(failure, operation="session_append")
                         if self._lane == "foreground":
                             publication = await self._session_message_publication(assistant_message)
                             if publication is True:
@@ -281,7 +292,9 @@ class AgentTurn:
                                 raise
                             try:
                                 result = self._externalize_result(raw_result)
-                            except ArtifactWriteError:
+                            except ArtifactWriteError as failure:
+                                if self._lane == "foreground":
+                                    _log_artifact_failure(failure, tool_name=tool_call.name)
                                 message = f"{tool_call.name} result could not be stored."
                                 result = ToolResult(
                                     tool_call_id=tool_call.id,
@@ -301,8 +314,12 @@ class AgentTurn:
                                     self._session_id,
                                     tool_message,
                                 )
-                            except _PERSISTENCE_EXCEPTIONS:
+                            except _PERSISTENCE_EXCEPTIONS as failure:
                                 if self._lane == "foreground":
+                                    _log_persistence_failure(
+                                        failure,
+                                        operation="session_append",
+                                    )
                                     publication = await self._session_message_publication(
                                         tool_message
                                     )
@@ -377,6 +394,7 @@ class AgentTurn:
                 ),
                 usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
             )
+            terminal_persistence_failure: Exception | None = None
             try:
                 await self._sessions.append_message(
                     self._session_id,
@@ -392,8 +410,16 @@ class AgentTurn:
                     pending_tool_calls,
                 )
                 return
-            except _PERSISTENCE_EXCEPTIONS:
+            except _PERSISTENCE_EXCEPTIONS as persistence_failure:
                 terminal_error = self._session_update_failure
+                terminal_persistence_failure = persistence_failure
+            if self._lane == "foreground":
+                _log_model_failure(failure)
+                if terminal_persistence_failure is not None:
+                    _log_persistence_failure(
+                        terminal_persistence_failure,
+                        operation="terminal_state_append",
+                    )
             yield TurnFailedPayload(error=terminal_error)
             return
         except GeneratorExit:
@@ -415,9 +441,15 @@ class AgentTurn:
                         pending_tool_calls,
                         error=pending_repair_error,
                     )
-                except _PERSISTENCE_EXCEPTIONS:
+                except _PERSISTENCE_EXCEPTIONS as failure:
                     pending_tool_calls.clear()
-                await _close_provider_stream(provider_stream)
+                    _log_persistence_failure(
+                        failure,
+                        operation="interrupted_state_repair",
+                    )
+                cleanup_failure = await _close_provider_stream(provider_stream)
+                if cleanup_failure is not None:
+                    _log_cleanup_failure(cleanup_failure)
 
     def _model_request(
         self,
@@ -624,16 +656,19 @@ async def _provider_events(
         yield event
 
 
-async def _close_provider_stream(stream: AsyncIterator[ModelStreamEvent] | None) -> None:
+async def _close_provider_stream(
+    stream: AsyncIterator[ModelStreamEvent] | None,
+) -> Exception | None:
     if stream is None:
-        return
+        return None
     close = getattr(stream, "aclose", None)
     if close is None:
-        return
+        return None
     try:
         await close()
-    except Exception:
-        pass
+    except Exception as failure:
+        return failure
+    return None
 
 
 def _tool_activity_summary(action: str, tool_name: str) -> str:
@@ -647,6 +682,87 @@ def _unexpected_provider_failure() -> ModelCallError:
             message="The model request failed.",
         )
     )
+
+
+def _log_model_failure(failure: ModelCallError) -> None:
+    safe_failure = ModelCallError(
+        ErrorInfo(code=failure.error.code, message="The model request failed.")
+    )
+    if failure.__cause__ is not None:
+        safe_failure.__cause__ = _safe_exception(
+            failure.__cause__,
+            "Diagnostic detail redacted.",
+        )
+    elif failure.__context__ is not None and not failure.__suppress_context__:
+        safe_failure.__context__ = _safe_exception(
+            failure.__context__,
+            "Diagnostic detail redacted.",
+        )
+        safe_failure.__suppress_context__ = False
+    safe_failure = safe_failure.with_traceback(failure.__traceback__)
+    logger.error(
+        "Agent Turn failed code=%s type=%s",
+        failure.error.code,
+        type(failure).__name__,
+        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
+    )
+
+
+def _log_persistence_failure(failure: Exception, *, operation: str) -> None:
+    safe_failure = _safe_exception(
+        failure,
+        "Conversation Session persistence failed.",
+    )
+    logger.error(
+        "Agent Turn failed code=persistence_error operation=%s type=%s",
+        operation,
+        type(failure).__name__,
+        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
+    )
+
+
+def _log_artifact_failure(failure: ArtifactWriteError, *, tool_name: str) -> None:
+    safe_failure = _safe_exception(
+        failure,
+        "Tool Artifact persistence failed.",
+    )
+    logger.error(
+        "Tool Artifact persistence failed code=persistence_error tool=%s type=%s",
+        tool_name,
+        type(failure).__name__,
+        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
+    )
+
+
+def _log_cleanup_failure(failure: Exception) -> None:
+    safe_failure = _safe_exception(
+        failure,
+        "Provider stream cleanup failed.",
+    )
+    logger.error(
+        "Agent Turn cleanup failed code=model_failed operation=provider_stream_close type=%s",
+        type(failure).__name__,
+        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
+    )
+
+
+def _safe_exception(failure: BaseException, message: str) -> BaseException:
+    try:
+        safe_failure = type(failure)(message)
+    except Exception:
+        safe_failure = RuntimeError(f"{type(failure).__name__}: {message}")
+    if failure.__cause__ is not None:
+        safe_failure.__cause__ = _safe_exception(
+            failure.__cause__,
+            "Diagnostic detail redacted.",
+        )
+    elif failure.__context__ is not None and not failure.__suppress_context__:
+        safe_failure.__context__ = _safe_exception(
+            failure.__context__,
+            "Diagnostic detail redacted.",
+        )
+        safe_failure.__suppress_context__ = False
+    return safe_failure.with_traceback(failure.__traceback__)
 
 
 def _never_cancelled() -> bool:
