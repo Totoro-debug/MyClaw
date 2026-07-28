@@ -27,6 +27,11 @@ def run_installed_myclaw(agent_home: Path, *arguments: str) -> subprocess.Comple
     environment = os.environ.copy()
     environment["HOME"] = str(agent_home.parent)
     environment["USERPROFILE"] = str(agent_home.parent)
+    source_root = str(Path(__file__).parent.parent)
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_root if not existing_pythonpath else os.pathsep.join((source_root, existing_pythonpath))
+    )
     return subprocess.run(
         [executable, *arguments],
         capture_output=True,
@@ -147,6 +152,9 @@ def test_installed_myclaw_generates_missing_configuration_and_stops(agent_home: 
     assert str(agent_home / "config.toml") in result.stdout
     assert "edit" in result.stdout.lower()
     assert "configuration gate passed" not in result.stdout
+    runtime_log = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert "ERROR" in runtime_log
+    assert "session=- myclaw.terminal.cli: Startup failed code=config_missing" in runtime_log
 
 
 def test_installed_config_command_generates_and_displays_missing_configuration(
@@ -158,6 +166,7 @@ def test_installed_config_command_generates_and_displays_missing_configuration(
     assert f"Path: {agent_home / 'config.toml'}" in result.stdout
     assert EXPECTED_DEFAULT_CONFIG in result.stdout
     assert "configuration gate passed" not in result.stdout
+    assert not (agent_home / "logs").exists()
 
 
 def test_installed_config_command_redacts_valid_configuration(agent_home: Path) -> None:
@@ -189,6 +198,15 @@ def test_installed_config_command_shows_safe_malformed_configuration(
         "first-plaintext-key",
         "second-plaintext-key",
     )
+    runtime_log = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert "ERROR" in runtime_log
+    assert (
+        "session=- myclaw.terminal.cli: Configuration command failed code=config_parse_error"
+        in runtime_log
+    )
+    assert_plaintext_absent(runtime_log, "first-plaintext-key", "second-plaintext-key")
+    assert "Traceback (most recent call last)" not in runtime_log
+    assert "ConfigError" not in runtime_log
 
 
 def test_installed_config_command_keeps_schema_invalid_content_inspectable(
@@ -255,6 +273,20 @@ def test_installed_myclaw_stops_on_parse_schema_and_default_failures(agent_home:
     )
     assert_plaintext_absent(
         combined_output,
+        "first-plaintext-key",
+        "second-plaintext-key",
+        "plaintext-primary-key",
+    )
+    runtime_log = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert (
+        "myclaw.config.config.ConfigError: User Configuration TOML could not be parsed."
+        in runtime_log
+    )
+    assert "Traceback (most recent call last)" in runtime_log
+    assert "[models.providers.primary]" not in runtime_log
+    assert "api_key =" not in runtime_log
+    assert_plaintext_absent(
+        runtime_log,
         "first-plaintext-key",
         "second-plaintext-key",
         "plaintext-primary-key",
