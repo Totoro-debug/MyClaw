@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -86,6 +87,8 @@ from myclaw.tools.web.web_search import (
     WebSearchBoundary,
     WebSearchTool,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderFactory(Protocol):
@@ -195,8 +198,16 @@ class PreparedReplRuntime:
             raise
 
     def _start_schedulers(self) -> None:
-        self._memory_scheduler.start()
-        self._scheduled_work_scheduler.start()
+        try:
+            self._memory_scheduler.start()
+            self._scheduled_work_scheduler.start()
+        except BaseException as error:
+            logger.error(
+                "Runtime startup failed type=%s",
+                type(error).__name__,
+                exc_info=True,
+            )
+            raise
 
     async def run(
         self,
@@ -281,10 +292,19 @@ class PreparedReplRuntime:
         except BaseException as error:
             failures.append(error)
 
-        if len(failures) == 1:
-            raise failures[0]
-        if failures:
-            raise BaseExceptionGroup("Runtime shutdown failed", failures)
+        if not failures:
+            return
+        failure = (
+            failures[0]
+            if len(failures) == 1
+            else BaseExceptionGroup("Runtime shutdown failed", failures)
+        )
+        logger.error(
+            "Runtime shutdown failed type=%s",
+            type(failure).__name__,
+            exc_info=(type(failure), failure, failure.__traceback__),
+        )
+        raise failure
 
 
 class _DeferredConversationPort:
@@ -414,6 +434,52 @@ class _DeferredConversationPort:
 
 
 def prepare_repl_runtime(
+    *,
+    agent_home: AgentHome,
+    workspace: Path,
+    configuration: UserConfiguration,
+    provider_factory: ProviderFactory,
+    now: Callable[[], datetime],
+    new_uuid: Callable[[], UUID],
+    retry_clock: RetryClock | None = None,
+    retry_jitter: Jitter | None = None,
+    memory_scheduler_clock: MemorySchedulerClock | None = None,
+    scheduled_work_scheduler_clock: ScheduledWorkSchedulerClock | None = None,
+    monotonic_now: Callable[[], float] = monotonic,
+    web_search: WebSearchBoundary | None = None,
+    web_fetch: WebFetchBoundary | None = None,
+    shell: ShellBoundary | None = None,
+    runtime_log: RuntimeLogLifetime | None = None,
+) -> PreparedReplRuntime:
+    """Prepare one Runtime and record terminal composition failures once."""
+    try:
+        return _prepare_repl_runtime(
+            agent_home=agent_home,
+            workspace=workspace,
+            configuration=configuration,
+            provider_factory=provider_factory,
+            now=now,
+            new_uuid=new_uuid,
+            retry_clock=retry_clock,
+            retry_jitter=retry_jitter,
+            memory_scheduler_clock=memory_scheduler_clock,
+            scheduled_work_scheduler_clock=scheduled_work_scheduler_clock,
+            monotonic_now=monotonic_now,
+            web_search=web_search,
+            web_fetch=web_fetch,
+            shell=shell,
+            runtime_log=runtime_log,
+        )
+    except Exception as error:
+        logger.error(
+            "Runtime composition failed type=%s",
+            type(error).__name__,
+            exc_info=True,
+        )
+        raise
+
+
+def _prepare_repl_runtime(
     *,
     agent_home: AgentHome,
     workspace: Path,

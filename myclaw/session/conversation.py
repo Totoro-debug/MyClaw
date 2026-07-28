@@ -145,7 +145,7 @@ class StreamingConversationPort:
         if self._title_prompt is None or self._title_task is not None:
             return
         title_task = asyncio.create_task(
-            self._generate_title_for_first_user(
+            self._run_title_task(
                 session_id=self._session_id,
                 first_user_id=user_message.id,
                 first_user_content=user_message.content,
@@ -154,6 +154,31 @@ class StreamingConversationPort:
         )
         title_task.add_done_callback(_consume_task_exception)
         self._title_task = title_task
+
+    async def _run_title_task(
+        self,
+        *,
+        session_id: str,
+        first_user_id: str,
+        first_user_content: str,
+        request_id: UUID,
+    ) -> None:
+        try:
+            await self._generate_title_for_first_user(
+                session_id=session_id,
+                first_user_id=first_user_id,
+                first_user_content=first_user_content,
+                request_id=request_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.error(
+                "Session title task failed type=%s",
+                type(error).__name__,
+                exc_info=True,
+            )
+            raise
 
     async def _generate_title_for_first_user(
         self,
@@ -290,8 +315,12 @@ async def _close_provider_stream(stream: AsyncIterator[ModelStreamEvent] | None)
         return
     try:
         await close()
-    except Exception:
-        pass
+    except Exception as error:
+        logger.warning(
+            "Session title stream cleanup failed type=%s",
+            type(error).__name__,
+            exc_info=True,
+        )
 
 
 def _consume_task_exception(task: asyncio.Future[None]) -> None:

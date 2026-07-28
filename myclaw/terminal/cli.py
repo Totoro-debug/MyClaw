@@ -110,10 +110,23 @@ def main(context: typer.Context) -> None:
                     try:
                         runner.run(interrupts.close())
                     except BaseException as cleanup_error:
+                        logger.error(
+                            "Interrupt controller cleanup failed type=%s",
+                            type(cleanup_error).__name__,
+                            exc_info=True,
+                        )
                         raise primary_error from cleanup_error
                     raise
                 else:
-                    runner.run(interrupts.close())
+                    try:
+                        runner.run(interrupts.close())
+                    except BaseException as cleanup_error:
+                        logger.error(
+                            "Interrupt controller cleanup failed type=%s",
+                            type(cleanup_error).__name__,
+                            exc_info=True,
+                        )
+                        raise
             finally:
                 interrupts.restore()
     finally:

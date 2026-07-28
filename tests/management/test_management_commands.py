@@ -15,6 +15,7 @@ from myclaw.management.service import (
     RuntimeStatusService,
 )
 from myclaw.provider.models import ModelUsage
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.records import (
     AssistantSessionMessage,
     MetadataUpdate,
@@ -200,8 +201,12 @@ async def test_config_command_renders_safe_parse_error_and_redacted_source(
     config_path = agent_home / "config.toml"
     config_path.write_text(MALFORMED_CONFIG_CONTENT, encoding="utf-8")
     dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    runtime_log = install_runtime_logging(home)
 
-    result = await dispatcher.dispatch("/config")
+    try:
+        result = await dispatcher.dispatch("/config")
+    finally:
+        runtime_log.close()
 
     assert result.handled is True
     assert result.output == (
@@ -211,6 +216,15 @@ async def test_config_command_renders_safe_parse_error_and_redacted_source(
     )
     assert "first-command-secret" not in result.output
     assert "second-command-secret" not in result.output
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    marker = (
+        "session=- myclaw.management.commands: Management command failed "
+        "command=/config code=config_parse_error"
+    )
+    assert content.count("ERROR pid=") == 1
+    assert content.count(marker) == 1
+    assert "first-command-secret" not in content
+    assert "second-command-secret" not in content
 
 
 @pytest.mark.asyncio
@@ -219,8 +233,12 @@ async def test_config_command_renders_safe_persistence_failure(agent_home: Path)
     home.initialize()
     (agent_home / "config.toml").write_bytes(b'api_key = "raw-command-secret"\xff')
     dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    runtime_log = install_runtime_logging(home)
 
-    result = await dispatcher.dispatch("/config")
+    try:
+        result = await dispatcher.dispatch("/config")
+    finally:
+        runtime_log.close()
 
     assert (result.handled, result.output) == (
         True,
@@ -228,6 +246,15 @@ async def test_config_command_renders_safe_persistence_failure(agent_home: Path)
     )
     assert result.output is not None
     assert "raw-command-secret" not in result.output
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    marker = (
+        "session=- myclaw.management.commands: Management command failed "
+        "command=/config code=persistence_error"
+    )
+    assert content.count("ERROR pid=") == 1
+    assert content.count(marker) == 1
+    assert "UnicodeDecodeError" in content
+    assert "raw-command-secret" not in content
 
 
 @pytest.mark.asyncio

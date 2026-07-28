@@ -21,6 +21,7 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.schedule.records import ScheduledWork
 from myclaw.session.conversation import ChatModelSettings
 from myclaw.session.records import ConversationSession
@@ -274,12 +275,20 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
         scheduled_work_scheduler_clock=FailingSchedulerClock(),
     )
     baseline = asyncio.all_tasks()
+    runtime_log = install_runtime_logging(home)
 
-    with pytest.raises(RuntimeError, match="scheduled scheduler failed to start"):
-        await runtime.start()
-    await asyncio.sleep(0)
+    try:
+        with pytest.raises(RuntimeError, match="scheduled scheduler failed to start"):
+            await runtime.start()
+        await asyncio.sleep(0)
+    finally:
+        runtime_log.close()
 
     assert asyncio.all_tasks() == baseline
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count("ERROR pid=") == 1
+    marker = "session=- myclaw.agent.runtime: Runtime startup failed type=RuntimeError"
+    assert content.count(marker) == 1
 
 
 @pytest.mark.asyncio
@@ -326,6 +335,43 @@ async def test_normal_repl_exit_closes_the_runtime_model_provider(
     )
 
     assert provider.closed
+
+
+@pytest.mark.parametrize("terminal_input", [None, "exit", "  QuIt  "])
+@pytest.mark.asyncio
+async def test_normal_eof_and_exit_shutdown_do_not_create_runtime_log(
+    agent_home: Path,
+    workspace: Path,
+    terminal_input: str | None,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(
+        VALID_CONFIG.replace(
+            "[tools.shell]\nenabled = true",
+            "[tools.shell]\nenabled = false",
+        ),
+        encoding="utf-8",
+    )
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: ScriptedFakeProvider(),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    runtime_log = install_runtime_logging(home)
+
+    try:
+        await runtime.run(
+            input_reader=ScriptedInput((terminal_input,)),
+            writer=SilentWriter(),
+        )
+    finally:
+        runtime_log.close()
+
+    assert not (agent_home / "logs").exists()
 
 
 @pytest.mark.asyncio
@@ -403,6 +449,7 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
         shell.execute(ShellRequest(command="blocking", cwd=workspace, timeout=60))
     )
     await process.communicate_started.wait()
+    runtime_log = install_runtime_logging(home)
 
     try:
         with pytest.raises(RuntimeError, match="provider close failed"):
@@ -414,6 +461,13 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
     finally:
         await shell.close()
         await asyncio.gather(shell_execution, return_exceptions=True)
+        runtime_log.close()
+
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count("ERROR pid=") == 1
+    marker = "session=- myclaw.agent.runtime: Runtime shutdown failed type=RuntimeError"
+    assert content.count(marker) == 1
+    assert "provider close failed" in content
 
 
 @pytest.mark.asyncio
@@ -1065,6 +1119,7 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
         set_signal=signals,
     )
     interrupts.install()
+    runtime_log = install_runtime_logging(home)
     running = asyncio.create_task(runtime.run(input_reader=input_reader, writer=SilentWriter()))
     await provider.started[0].wait()
     await memory_clock.sleep_started.wait()
@@ -1101,6 +1156,7 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
         await asyncio.gather(running, return_exceptions=True)
         await interrupts.close()
         interrupts.restore()
+        runtime_log.close()
 
     assert provider.stopped[0].is_set()
     assert provider.stopped[1].is_set()
@@ -1108,6 +1164,14 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
     assert scheduled_clock.sleep_stopped.is_set()
     assert provider.closed
     assert signals.current is previous_handler
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    records = [line for line in content.splitlines() if " pid=" in line]
+    assert len(records) == 3
+    assert all(" WARNING " in record for record in records)
+    assert all("Default Model Route selected code=route_unavailable" in record for record in records)
+    assert " ERROR " not in content
+    assert "cancel" not in content.lower()
+    assert "shutdown failed" not in content.lower()
 
 
 @pytest.mark.asyncio

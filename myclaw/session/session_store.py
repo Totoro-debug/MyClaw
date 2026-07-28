@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -35,6 +36,8 @@ from myclaw.tools.models import ModelToolCall, ToolResultStatus
 from myclaw.utils.atomic_files import atomic_replace_bytes, atomic_replace_text
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
+
+logger = logging.getLogger(__name__)
 
 _TOOL_MESSAGE_FIELDS = frozenset(
     {
@@ -279,7 +282,13 @@ class JsonlSessionStore:
         for path in self.directory.glob("*.jsonl"):
             try:
                 session = await self.load(path.stem)
-            except (OSError, UnicodeError, ValueError):
+            except (OSError, UnicodeError, ValueError) as error:
+                logger.warning(
+                    "Skipped corrupt or unreadable Conversation Session entry path=%s type=%s",
+                    path,
+                    type(error).__name__,
+                    exc_info=True,
+                )
                 skipped_count += 1
                 continue
             summaries.append(

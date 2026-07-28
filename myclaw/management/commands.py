@@ -1,6 +1,7 @@
 """Standalone dispatch for read-only Management Commands."""
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -12,6 +13,8 @@ from myclaw.session.models import ResumeResult
 from myclaw.session.records import SessionSummary
 from myclaw.session.session_store import SessionListingReport
 from myclaw.utils.time import format_rfc3339_milliseconds
+
+logger = logging.getLogger(__name__)
 
 
 class _ManagementViewPort(Protocol):
@@ -51,6 +54,12 @@ class ManagementCommandDispatcher:
             try:
                 listing = await self._management.resumable_listing()
             except ManagementError as management_error:
+                if management_error.error.code == "persistence_error":
+                    logger.error(
+                        "Management command failed command=/resume code=%s",
+                        management_error.error.code,
+                        exc_info=True,
+                    )
                 return ManagementCommandResult(
                     handled=True,
                     output=f"{management_error.error.code}: {management_error.error.message}",
@@ -120,12 +129,21 @@ class ManagementCommandDispatcher:
         try:
             view = await self._management.config_view()
         except ManagementError as management_error:
+            logger.error(
+                "Management command failed command=/config code=%s",
+                management_error.error.code,
+                exc_info=True,
+            )
             return ManagementCommandResult(
                 handled=True,
                 output=f"{management_error.error.code}: {management_error.error.message}",
             )
         prefix = f"Path: {view.path}\n"
         if view.error is not None:
+            logger.error(
+                "Management command failed command=/config code=%s",
+                view.error.code,
+            )
             prefix = f"{view.error.code}: {view.error.message}\n{prefix}"
         return ManagementCommandResult(
             handled=True,
@@ -136,7 +154,20 @@ class ManagementCommandDispatcher:
         try:
             result = await self._management.resume(session_id)
         except ManagementError as management_error:
+            if management_error.error.code == "persistence_error":
+                logger.error(
+                    "Management command failed command=/resume code=%s",
+                    management_error.error.code,
+                    exc_info=True,
+                )
             output = f"{management_error.error.code}: {management_error.error.message}"
+        except Exception as error:
+            logger.error(
+                "Management command failed command=/resume type=%s",
+                type(error).__name__,
+                exc_info=True,
+            )
+            raise
         else:
             output = f"Resumed session {result.session_id}."
         return ManagementCommandResult(handled=True, output=output)

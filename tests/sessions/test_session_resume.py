@@ -26,6 +26,7 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.provider.ports import ModelProvider
+from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import (
     AssistantSessionMessage,
@@ -197,6 +198,198 @@ async def test_session_picker_skips_corrupt_sessions_without_modifying_them(
         (prepared[0].id, "Valid title")
     ]
     assert {path: path.read_bytes() for path in corrupt_snapshots} == corrupt_snapshots
+
+
+@pytest.mark.asyncio
+async def test_management_listing_warns_once_for_each_skipped_session_entry(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
+    )
+    valid = sessions.prepare()
+    await sessions.append_message(
+        valid.id,
+        UserSessionMessage(id=str(FIRST_USER_UUID), created_at=NOW, content="Valid history."),
+    )
+    corrupt_path = sessions.directory / f"{CORRUPT_METADATA_UUID}.jsonl"
+    corrupt_path.write_text("persisted content must stay private\n", encoding="utf-8")
+    unreadable_path = sessions.directory / f"{CORRUPT_MIDDLE_UUID}.jsonl"
+    unreadable_path.mkdir()
+    management = ManagementViewService(home, sessions=sessions, workspace=workspace)
+
+    runtime_log = install_runtime_logging(home)
+    try:
+        listing = await management.resumable_listing()
+    finally:
+        runtime_log.close()
+
+    assert [summary.id for summary in listing.sessions] == [valid.id]
+    assert listing.skipped_count == 2
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert content.count("WARNING pid=") == 2
+    marker = "session=- myclaw.session.session_store: Skipped corrupt or unreadable"
+    assert content.count(marker) == 2
+    assert content.count("Skipped corrupt or unreadable Conversation Session entry") == 2
+    assert str(corrupt_path) in content
+    assert str(unreadable_path) in content
+    assert "persisted content must stay private" not in content
+
+
+@pytest.mark.asyncio
+async def test_unavailable_session_listing_records_one_management_error(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
+
+    class FailingListingStore:
+        async def scan_for_workspace(self, candidate: Path) -> SessionListingReport:
+            del candidate
+            raise OSError("session directory unavailable")
+
+        async def load(self, session_id: str) -> ConversationSession:
+            raise AssertionError(f"Unexpected Session load: {session_id}")
+
+        async def current_session(self, session_id: str) -> ConversationSession:
+            raise AssertionError(f"Unexpected current Session read: {session_id}")
+
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(home, sessions=FailingListingStore(), workspace=workspace)
+    )
+    runtime_log = install_runtime_logging(home)
+
+    try:
+        result = await dispatcher.dispatch("/resume")
+    finally:
+        runtime_log.close()
+
+    assert result.output == "persistence_error: Conversation Sessions could not be listed."
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    marker = (
+        "session=- myclaw.management.commands: Management command failed "
+        "command=/resume code=persistence_error"
+    )
+    assert content.count("ERROR pid=") == 1
+    assert content.count(marker) == 1
+    assert content.count("session directory unavailable") == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_load_failure_records_one_error_and_keeps_safe_command_output(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
+    persisted = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
+    )
+    target = persisted.prepare()
+    await persisted.append_message(
+        target.id,
+        UserSessionMessage(
+            id=str(FIRST_USER_UUID),
+            created_at=NOW,
+            content="Persisted resume content must stay private.",
+        ),
+    )
+
+    class FailingResumeLoadStore:
+        async def scan_for_workspace(self, candidate: Path) -> SessionListingReport:
+            return await persisted.scan_for_workspace(candidate)
+
+        async def load(self, session_id: str) -> ConversationSession:
+            del session_id
+            raise OSError("resume target disappeared")
+
+        async def current_session(self, session_id: str) -> ConversationSession:
+            return await persisted.current_session(session_id)
+
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(
+            home,
+            sessions=FailingResumeLoadStore(),
+            workspace=workspace,
+            switch_session=lambda _session_id: None,
+        )
+    )
+    runtime_log = install_runtime_logging(home)
+
+    try:
+        result = await dispatcher.resume(target.id)
+    finally:
+        runtime_log.close()
+
+    assert result.output == "persistence_error: The selected Conversation Session could not be loaded."
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    marker = (
+        "session=- myclaw.management.commands: Management command failed "
+        "command=/resume code=persistence_error"
+    )
+    assert content.count("ERROR pid=") == 1
+    assert content.count(marker) == 1
+    assert content.count("resume target disappeared") == 1
+    assert "Persisted resume content must stay private." not in content
+
+
+@pytest.mark.asyncio
+async def test_session_switch_failure_records_once_before_preserving_the_exception(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
+    sessions = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
+    )
+    target = sessions.prepare()
+    await sessions.append_message(
+        target.id,
+        UserSessionMessage(id=str(FIRST_USER_UUID), created_at=NOW, content="Private history."),
+    )
+
+    def fail_switch(_session_id: str) -> None:
+        raise RuntimeError("session switch failed")
+
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(
+            home,
+            sessions=sessions,
+            workspace=workspace,
+            switch_session=fail_switch,
+        )
+    )
+    runtime_log = install_runtime_logging(home)
+
+    try:
+        with pytest.raises(RuntimeError, match="session switch failed"):
+            await dispatcher.resume(target.id)
+    finally:
+        runtime_log.close()
+
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    marker = (
+        "session=- myclaw.management.commands: Management command failed "
+        "command=/resume type=RuntimeError"
+    )
+    assert content.count("ERROR pid=") == 1
+    assert content.count(marker) == 1
+    assert content.count("session switch failed") == 1
+    assert "Private history." not in content
 
 
 @pytest.mark.asyncio

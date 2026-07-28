@@ -152,13 +152,13 @@ class ManagementViewService:
         try:
             self._config.ensure_default()
             return self._config.view()
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError) as error:
             raise ManagementError(
                 ErrorInfo(
                     "persistence_error",
                     "User Configuration could not be read or written.",
                 )
-            ) from None
+            ) from error
 
     async def memory_view(self) -> str:
         """Return the complete current Long-term Memory file."""
@@ -191,10 +191,10 @@ class ManagementViewService:
             raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
         try:
             return await self._sessions.scan_for_workspace(self._workspace)
-        except (OSError, UnicodeError, ValueError):
+        except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Conversation Sessions could not be listed.")
-            ) from None
+            ) from error
 
     async def resume(self, session_id: str) -> ResumeResult:
         """Revalidate and select one Session from the current Workspace."""
@@ -210,12 +210,12 @@ class ManagementViewService:
             )
         try:
             session = await self._sessions.load(session_id)
-        except (OSError, UnicodeError, ValueError):
+        except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo(
                     "persistence_error",
                     "The selected Conversation Session could not be loaded.",
                 )
-            ) from None
+            ) from error
         self._switch_session(session.metadata.id)
         return ResumeResult(session_id=session.metadata.id)

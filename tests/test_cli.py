@@ -3,14 +3,21 @@ import os
 import shutil
 import subprocess
 from collections.abc import Awaitable, Callable, Coroutine
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from uuid import uuid4
 
 import pytest
 import typer
 
 import myclaw.terminal.cli as cli
+from myclaw.agent.runtime import prepare_repl_runtime
+from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigLoader
+from myclaw.provider.factory import create_provider
+from myclaw.runtime_log import install_runtime_logging
 from tests.configuration.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,
@@ -49,6 +56,7 @@ def assert_plaintext_absent(output: str, *plaintext_values: str) -> None:
 
 def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_error(
     monkeypatch: pytest.MonkeyPatch,
+    agent_home: Path,
 ) -> None:
     events: list[str] = []
 
@@ -118,6 +126,7 @@ def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_er
     monkeypatch.setattr(cli, "prepare_repl_runtime", lambda **_kwargs: runtime)
     monkeypatch.setattr(cli, "ForegroundInterruptController", FailingInterruptController)
     monkeypatch.setattr(asyncio, "Runner", RecordingRunner)
+    monkeypatch.setattr(AgentHome, "production", lambda: AgentHome(agent_home))
     context = cast(typer.Context, SimpleNamespace(invoked_subcommand=None))
 
     with pytest.raises(LookupError, match="runtime failed") as raised:
@@ -126,6 +135,44 @@ def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_er
     assert isinstance(raised.value.__cause__, RuntimeError)
     assert str(raised.value.__cause__) == "interrupt cleanup failed"
     assert events == ["install", "runtime", "interrupt-close", "restore"]
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    marker = (
+        "session=- myclaw.terminal.cli: Interrupt controller cleanup failed "
+        "type=RuntimeError"
+    )
+    assert content.count("ERROR pid=") == 1
+    assert content.count(marker) == 1
+
+
+def test_runtime_composition_records_one_safe_error_before_propagating(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    memory_path = agent_home / "memory" / "memory.md"
+    memory_path.unlink()
+    memory_path.mkdir()
+
+    runtime_log = install_runtime_logging(home)
+    try:
+        with pytest.raises(OSError):
+            prepare_repl_runtime(
+                agent_home=home,
+                workspace=agent_home.parent,
+                configuration=configuration,
+                provider_factory=create_provider,
+                now=lambda: datetime.now().astimezone(),
+                new_uuid=uuid4,
+            )
+    finally:
+        runtime_log.close()
+
+    runtime_log_content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    marker = "session=- myclaw.agent.runtime: Runtime composition failed type="
+    assert runtime_log_content.count(marker) == 1
+    assert "Traceback (most recent call last)" in runtime_log_content
 
 
 def test_installed_myclaw_console_entry_starts() -> None:
@@ -179,6 +226,7 @@ def test_installed_config_command_redacts_valid_configuration(agent_home: Path) 
     assert EXPECTED_REDACTED_CONFIG in result.stdout
     assert f"Path: {agent_home / 'config.toml'}" in result.stdout
     assert_plaintext_absent(result.stdout + result.stderr, "plaintext-primary-key")
+    assert not (agent_home / "logs").exists()
 
 
 def test_installed_config_command_shows_safe_malformed_configuration(
@@ -237,6 +285,7 @@ def test_installed_myclaw_passes_valid_configuration_gate(agent_home: Path) -> N
     assert result.returncode == 0, result.stderr
     assert "configuration gate passed" in result.stdout
     assert_plaintext_absent(result.stdout + result.stderr, "sk-ant-secret")
+    assert not (agent_home / "logs").exists()
 
 
 def test_installed_myclaw_stops_on_parse_schema_and_default_failures(agent_home: Path) -> None:

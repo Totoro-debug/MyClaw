@@ -123,6 +123,41 @@ class FailedTitleProvider:
         return None
 
 
+class FailingTitleStreamCloseProvider:
+    def __init__(self) -> None:
+        self.title_started = asyncio.Event()
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        if request.system_prompt == TITLE_PROMPT:
+            self.title_started.set()
+            try:
+                yield ModelCompleted(
+                    response=ModelResponse(
+                        message=AssistantModelMessage(content="Generated title"),
+                        usage=ModelUsage(input_tokens=8, output_tokens=2, total_tokens=10),
+                        finish_reason="stop",
+                    )
+                )
+            finally:
+                raise OSError("title stream close failed")
+            return
+
+        await self.title_started.wait()
+        yield ModelCompleted(
+            response=ModelResponse(
+                message=AssistantModelMessage(content="First answer."),
+                usage=ModelUsage(input_tokens=12, output_tokens=3, total_tokens=15),
+                finish_reason="stop",
+            )
+        )
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        raise AssertionError(f"Unexpected complete request: {request!r}")
+
+    async def close(self) -> None:
+        return None
+
+
 class InvalidTitleProvider:
     def __init__(self) -> None:
         self.title_started = asyncio.Event()
@@ -192,6 +227,24 @@ class MetadataUpdateFailingStore(JsonlSessionStore):
             raise RuntimeError("private-title-metadata-cause")
         except RuntimeError as cause:
             raise OSError("private-title-metadata-detail") from cause
+
+
+class FailingMetadataSessionStore:
+    def __init__(self, delegate: JsonlSessionStore) -> None:
+        self._delegate = delegate
+
+    async def append_message(self, session_id: str, message: SessionMessage) -> None:
+        await self._delegate.append_message(session_id, message)
+
+    async def update_metadata(self, session_id: str, update: MetadataUpdate) -> None:
+        del session_id, update
+        raise OSError("title metadata write failed")
+
+    async def load(self, session_id: str) -> ConversationSession:
+        return await self._delegate.load(session_id)
+
+    async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]:
+        return await self._delegate.list_for_workspace(workspace)
 
 
 async def _collect_events(conversation: ConversationPort, text: str) -> list[str]:
@@ -290,12 +343,18 @@ async def test_close_waits_for_the_detached_title_task_to_stop(
         system_prompt="chat system prompt",
         title_prompt=TITLE_PROMPT,
     )
-    await _collect_events(conversation, "Start a title that will still be running.")
-    await provider.title_started.wait()
+    runtime_log = install_runtime_logging(home)
 
-    await conversation.close()
+    try:
+        with runtime_log.session(session.id):
+            await _collect_events(conversation, "Start a title that will still be running.")
+            await provider.title_started.wait()
+            await conversation.close()
+    finally:
+        runtime_log.close()
 
     assert provider.title_stopped.is_set()
+    assert not (agent_home / "logs").exists()
 
 
 @pytest.mark.asyncio
@@ -389,16 +448,18 @@ async def test_failed_title_call_uses_normalized_unicode_bounded_input_fallback(
         title_prompt=TITLE_PROMPT,
     )
     first_input = "  Plan\t" + "\u754c" * 70
-    lifetime = install_runtime_logging(home)
+    runtime_log = install_runtime_logging(home)
 
-    with lifetime.session(session.id):
-        event_types = await _collect_events(conversation, first_input)
-    for _ in range(100):
-        reloaded = await store.load(session.id)
-        if reloaded.metadata.title != "Untitled session":
-            break
-        await asyncio.sleep(0)
-    lifetime.close()
+    try:
+        with runtime_log.session(session.id):
+            event_types = await _collect_events(conversation, first_input)
+            for _ in range(100):
+                reloaded = await store.load(session.id)
+                if reloaded.metadata.title != "Untitled session":
+                    break
+                await asyncio.sleep(0)
+    finally:
+        runtime_log.close()
 
     assert event_types == ["turn_started", "turn_completed"]
     assert reloaded.metadata.title == "Plan " + "\u754c" * 55
@@ -479,6 +540,116 @@ async def test_terminal_title_metadata_failure_is_logged_without_repeating_provi
     assert "private-title-provider-body" not in content
     assert "private-title-metadata-detail" not in content
     assert "private-title-metadata-cause" not in content
+
+
+@pytest.mark.asyncio
+async def test_title_metadata_failure_records_one_error_without_changing_foreground_events(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    persisted = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = persisted.prepare()
+    provider = DelayedTitleProvider("Generated title")
+    conversation = StreamingConversationPort(
+        provider=provider,
+        sessions=FailingMetadataSessionStore(persisted),
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=lambda: NOW,
+        new_uuid=lambda: REQUEST_UUID,
+        system_prompt="chat system prompt",
+        title_prompt=TITLE_PROMPT,
+    )
+    first_input = "This content must not enter the Runtime Log."
+    runtime_log = install_runtime_logging(home)
+
+    try:
+        with runtime_log.session(session.id):
+            event_types = await _collect_events(conversation, first_input)
+            provider.release_title.set()
+            await conversation.close()
+    finally:
+        runtime_log.close()
+
+    assert event_types == ["turn_started", "text_delta", "turn_completed"]
+    content = _runtime_log_text(agent_home)
+    records = [
+        line for line in content.splitlines() if "myclaw.session.conversation:" in line
+    ]
+    assert len(records) == 1
+    assert " ERROR " in records[0]
+    assert (
+        "Session title failed code=persistence_error operation=metadata_update type=OSError"
+        in records[0]
+    )
+    assert f"session={session.id}" in records[0]
+    assert "OSError: Session title persistence failed." in content
+    assert "title metadata write failed" not in content
+    assert first_input not in content
+
+
+@pytest.mark.asyncio
+async def test_title_stream_cleanup_failure_warns_and_keeps_the_generated_title(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    store = JsonlSessionStore(
+        agent_home=home,
+        workspace=Workspace.from_path(workspace),
+        now=lambda: NOW,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    session = store.prepare()
+    conversation = StreamingConversationPort(
+        provider=FailingTitleStreamCloseProvider(),
+        sessions=store,
+        session_id=session.id,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=lambda: NOW,
+        new_uuid=lambda: REQUEST_UUID,
+        system_prompt="chat system prompt",
+        title_prompt=TITLE_PROMPT,
+    )
+    runtime_log = install_runtime_logging(home)
+
+    try:
+        with runtime_log.session(session.id):
+            events = await _collect_events(conversation, "Name this safely.")
+            await conversation.close()
+    finally:
+        runtime_log.close()
+
+    assert events == ["turn_started", "turn_completed"]
+    assert (await store.load(session.id)).metadata.title == "Generated title"
+    content = _runtime_log_text(agent_home)
+    marker = (
+        f"session={session.id} myclaw.session.conversation: "
+        "Session title stream cleanup failed type=OSError"
+    )
+    assert content.count("WARNING pid=") == 1
+    assert content.count("ERROR pid=") == 0
+    assert content.count(marker) == 1
 
 
 @pytest.mark.asyncio
