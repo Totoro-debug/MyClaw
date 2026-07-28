@@ -2,10 +2,12 @@ import errno
 import logging
 import os
 import re
+import stat
 import threading
 import time
 import warnings
 from pathlib import Path
+from typing import IO, Any
 
 import pytest
 
@@ -957,3 +959,108 @@ def test_runtime_log_revalidates_the_opened_slot_after_locked_cursor_selection(
 
     assert outside.read_bytes() == b"outside remains unchanged\n"
     assert capsys.readouterr().err == "Runtime Log failure: PermissionError\n"
+
+
+def test_runtime_log_rejects_an_in_home_alias_swap_after_open(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    target = logs / "run.log.0"
+    target.write_bytes(b"original slot\n")
+    (logs / "run.log.1").write_bytes(b"")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+    victim = agent_home / "internal-state.txt"
+    victim.write_bytes(b"internal state must remain unchanged\n")
+    original_victim = victim.read_bytes()
+    original_open = Path.open
+    original_stat = Path.stat
+    original_resolve = Path.resolve
+    alias_opened = False
+
+    def open_alias(
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> IO[Any]:
+        nonlocal alias_opened
+        if path == target and mode == "ab":
+            alias_opened = True
+            path = victim
+        return original_open(path, mode, buffering, encoding, errors, newline)
+
+    def stat_alias(
+        path: Path, *, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        if alias_opened and path == target:
+            path = victim
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    def resolve_alias(path: Path, strict: bool = False) -> Path:
+        if alias_opened and path == target:
+            path = victim
+        return original_resolve(path, strict=strict)
+
+    def lstat_actual(path: Path) -> os.stat_result:
+        return os.lstat(path)
+
+    monkeypatch.setattr(Path, "open", open_alias)
+    monkeypatch.setattr(Path, "stat", stat_alias)
+    monkeypatch.setattr(Path, "lstat", lstat_actual)
+    monkeypatch.setattr(Path, "resolve", resolve_alias)
+
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.lock").error("must not reach another Agent Home file")
+    lifetime.close()
+
+    assert victim.read_bytes() == original_victim
+    assert target.read_bytes() == b"original slot\n"
+    assert capsys.readouterr().err == "Runtime Log failure: PermissionError\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions are unavailable")
+def test_runtime_log_narrows_cursor_permissions_before_fallback_selection(
+    agent_home: Path,
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    (logs / "run.log.0").write_bytes(b"")
+    (logs / "run.log.1").write_bytes(b"")
+    cursor = logs / "run.log.cursor"
+    cursor.write_bytes(b"0\n")
+    cursor.chmod(0o666)
+    (logs / "run.log.lock").write_bytes(b"")
+    elapsed = 0.0
+
+    class UnavailableLock:
+        def try_acquire(self, descriptor: int) -> bool:
+            del descriptor
+            return False
+
+        def release(self, descriptor: int) -> None:
+            del descriptor
+            pytest.fail("an unavailable lock must not be released")
+
+    def monotonic() -> float:
+        return elapsed
+
+    def sleep(delay: float) -> None:
+        nonlocal elapsed
+        elapsed += delay
+
+    lifetime = install_runtime_logging(
+        AgentHome(agent_home),
+        lock_system=UnavailableLock(),
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+    logging.getLogger("myclaw.lock").warning("fallback permissions")
+    lifetime.close()
+
+    assert stat.S_IMODE(cursor.stat().st_mode) == 0o600

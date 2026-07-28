@@ -616,13 +616,16 @@ def _validate_opened_log_file(
 ) -> None:
     try:
         opened = os.fstat(stream.fileno())
-        current = path.stat()
+        current = path.lstat()
         resolved = path.resolve(strict=True)
     except OSError as error:
         raise PermissionError("Runtime Log file is unavailable") from error
     if (
         not S_ISREG(opened.st_mode)
         or opened.st_nlink != 1
+        or _is_reparse(current)
+        or not S_ISREG(current.st_mode)
+        or current.st_nlink != 1
         or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
         or not resolved.is_relative_to(agent_home_root)
     ):
@@ -633,6 +636,11 @@ def _read_validated_log_file(path: Path, agent_home_root: Path) -> bytes:
     _validate_log_file(path, agent_home_root)
     with path.open("rb", buffering=0) as stream:
         _validate_opened_log_file(stream, path, agent_home_root)
+        if os.name == "posix":
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is None:
+                raise OSError("descriptor permission changes are unavailable")
+            fchmod(stream.fileno(), 0o600)
         return stream.read()
 
 

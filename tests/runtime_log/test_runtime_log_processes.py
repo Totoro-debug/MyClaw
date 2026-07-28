@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 import time
@@ -151,11 +152,22 @@ def test_runtime_log_subprocesses_append_only_complete_records(
     assert results == [(0, "")] * len(tokens)
     logs = agent_home / "logs"
     content = (logs / "run.log.0").read_text(encoding="utf-8")
-    assert len(content.splitlines()) == len(tokens) * count
-    for token in tokens:
-        for index in range(count):
-            marker = f"[{token}:{index:04d}]"
-            assert content.count(marker) == 1
+    expected = {
+        f"[{token}:{index:04d}]" + "x" * 256
+        for token in tokens
+        for index in range(count)
+    }
+    records: set[str] = set()
+    for line in content.splitlines():
+        match = re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2} "
+            r"WARNING pid=\d+ session=- myclaw\.process: (?P<body>.+)",
+            line,
+        )
+        assert match is not None, line
+        records.add(match.group("body"))
+    assert records == expected
+    assert len(content.splitlines()) == len(expected)
     assert (logs / "run.log.1").read_bytes() == b""
     assert (logs / "run.log.cursor").read_bytes() == b"0\n"
 
