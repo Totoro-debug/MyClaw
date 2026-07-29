@@ -11,6 +11,11 @@
 `myclaw/contracts/`、`tests/contract/` 和 `myclaw.contracts` 均指已经删除的旧结构，
 不是当前有效的源码或导入路径。
 
+2026-07-29 的后续整理进一步删除了通用 `ports.py` 模块：`ConversationPort` 与
+Agent Event 同归 `myclaw/agent/events.py`，`ModelProvider` 与 Provider 中立模型同归
+`myclaw/provider/models.py`，Store 协议则与各自的持久化或编排实现同模块。下文仍
+保留 Issue #37 执行时采用的中间目标路径，不代表当前导入路径。
+
 ## 1. 目标
 
 将 `myclaw/contracts/` 中集中维护的值对象、持久化记录、事件、错误和

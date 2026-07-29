@@ -12,8 +12,7 @@ from time import monotonic
 from typing import Protocol
 from uuid import UUID
 
-from myclaw.agent.events import AgentEvent
-from myclaw.agent.ports import ConversationPort
+from myclaw.agent.events import AgentEvent, ConversationPort
 from myclaw.agent.prompts import (
     chat_system_prompt,
     render_tool_guidance,
@@ -43,7 +42,7 @@ from myclaw.memory.memory_scheduler import (
 )
 from myclaw.memory.memory_task import FileMemoryStore, MemoryManager, MemoryTaskModelSettings
 from myclaw.provider.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
-from myclaw.provider.ports import ModelProvider
+from myclaw.provider.models import ModelProvider
 from myclaw.runtime_log import RuntimeLogLifetime, log_sanitized_exception
 from myclaw.schedule.background_coordination import (
     AsyncioScheduledWorkSchedulerClock,

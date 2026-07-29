@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast, runtime_checkable
 from uuid import UUID
 
 from myclaw.agent.workspace import Workspace
@@ -39,6 +39,19 @@ from myclaw.utils.atomic_files import atomic_replace_bytes, atomic_replace_text,
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class SessionStore(Protocol):
+    """Persist and query Conversation Sessions."""
+
+    async def append_message(self, session_id: str, message: SessionMessage) -> None: ...
+
+    async def update_metadata(self, session_id: str, update: MetadataUpdate) -> None: ...
+
+    async def load(self, session_id: str) -> ConversationSession: ...
+
+    async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]: ...
 
 _TOOL_MESSAGE_FIELDS = frozenset(
     {

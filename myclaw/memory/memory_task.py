@@ -6,22 +6,22 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISREG
-from typing import Annotated
+from typing import Annotated, Protocol, runtime_checkable
 from uuid import uuid4
 
 from myclaw.agent.prompts import memory_task_input, memory_task_prompt
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
-from myclaw.memory.ports import MemoryStore, SummaryStore
+from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     ModelMessage,
+    ModelProvider,
     ModelRequest,
     ReasoningEffort,
     ToolModelMessage,
     UserModelMessage,
 )
-from myclaw.provider.ports import ModelProvider
 from myclaw.runtime_log import log_sanitized_exception
 from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
@@ -31,6 +31,23 @@ from myclaw.utils.atomic_files import atomic_replace_text
 from myclaw.utils.validation import require_nonnegative_int
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class MemoryStore(Protocol):
+    """Persist Long-term Memory and its Summary Cursor."""
+
+    async def read_long_term(self) -> str: ...
+
+    async def replace_long_term(self, content: str) -> None: ...
+
+    async def read_summary_cursor(self) -> int: ...
+
+    async def write_summary_cursor(self, index: int) -> None: ...
+
+
+class _SummaryReader(Protocol):
+    async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,7 +239,7 @@ class MemoryManager:
         self,
         *,
         provider: ModelProvider,
-        summaries: SummaryStore,
+        summaries: _SummaryReader,
         memory: MemoryStore,
         long_term_path: Path,
         settings: MemoryTaskModelSettings,

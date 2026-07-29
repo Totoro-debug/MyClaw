@@ -9,7 +9,6 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import ModelUsage
-from myclaw.session.ports import SessionStore
 from myclaw.session.records import (
     AssistantSessionMessage,
     ConversationSession,
@@ -19,7 +18,7 @@ from myclaw.session.records import (
     SessionMetadata,
     UserSessionMessage,
 )
-from myclaw.session.session_store import JsonlSessionStore
+from myclaw.session.session_store import JsonlSessionStore, SessionStore
 from tests.fixtures import FakeClock
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))

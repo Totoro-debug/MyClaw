@@ -19,13 +19,13 @@ from myclaw.management.service import ManagementViewService
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelProvider,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
     TextDelta,
 )
-from myclaw.provider.ports import ModelProvider
 from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import (

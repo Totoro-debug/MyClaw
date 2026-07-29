@@ -6,7 +6,7 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.ports import ConversationPort
+from myclaw.agent.events import ConversationPort
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo

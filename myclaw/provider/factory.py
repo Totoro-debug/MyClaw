@@ -2,8 +2,8 @@
 
 from myclaw.config.config import ProviderConfiguration
 from myclaw.provider.anthropic import AnthropicProvider
+from myclaw.provider.models import ModelProvider
 from myclaw.provider.openai_compatible import OpenAICompatibleProvider
-from myclaw.provider.ports import ModelProvider
 
 
 def create_provider(configuration: ProviderConfiguration) -> ModelProvider:

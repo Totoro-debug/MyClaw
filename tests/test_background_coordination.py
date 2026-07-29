@@ -12,11 +12,11 @@ import pytest
 from myclaw.agent.events import (
     AgentEvent,
     BackgroundCompletedPayload,
+    ConversationPort,
     TurnCancelledPayload,
     TurnFailedPayload,
     TurnStartedPayload,
 )
-from myclaw.agent.ports import ConversationPort
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome

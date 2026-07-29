@@ -1,8 +1,8 @@
 """Provider-neutral model request and response values."""
 
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
 from myclaw.tools.models import ModelToolCall
@@ -173,6 +173,17 @@ class ModelCompleted:
 
 
 type ModelStreamEvent = TextDelta | ModelCompleted
+
+
+@runtime_checkable
+class ModelProvider(Protocol):
+    """Execute provider-neutral model requests."""
+
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]: ...
+
+    async def complete(self, request: ModelRequest) -> ModelResponse: ...
+
+    async def close(self) -> None: ...
 
 
 def validate_model_stream_events(events: Iterable[ModelStreamEvent]) -> None:

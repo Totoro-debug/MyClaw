@@ -4,8 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from typing import Protocol
 
-from myclaw.agent.events import AgentEvent
-from myclaw.agent.ports import ConversationPort
+from myclaw.agent.events import AgentEvent, ConversationPort
 
 
 class AgentEventSequencer(Protocol):

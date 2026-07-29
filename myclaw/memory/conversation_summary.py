@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from myclaw.agent.prompts import (
@@ -21,20 +21,18 @@ from myclaw.agent.turn import model_message_from_session
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
-from myclaw.memory.ports import SummaryStore
 from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
-from myclaw.provider.models import ModelRequest, ReasoningEffort, UserModelMessage
-from myclaw.provider.ports import ModelProvider
+from myclaw.provider.models import ModelProvider, ModelRequest, ReasoningEffort, UserModelMessage
 from myclaw.runtime_log import log_sanitized_exception
 from myclaw.session.identifiers import require_session_id
-from myclaw.session.ports import SessionStore
 from myclaw.session.records import (
     ConversationSession,
     MetadataUpdate,
     SessionMessage,
     UserSessionMessage,
 )
+from myclaw.session.session_store import SessionStore
 from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.utils.atomic_files import atomic_replace_bytes
 from myclaw.utils.time import format_rfc3339_milliseconds
@@ -43,6 +41,15 @@ type AtomicReplaceBytes = Callable[[Path, bytes], None]
 type UnlinkFile = Callable[[Path], None]
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class SummaryStore(Protocol):
+    """Append and read the ordered Conversation Summary stream."""
+
+    async def append(self, content: str, timestamp: datetime) -> SummaryEntry: ...
+
+    async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]: ...
 
 
 def _unlink_file(path: Path) -> None:

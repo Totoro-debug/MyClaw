@@ -19,11 +19,11 @@ from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelProvider,
     ModelRequest,
     ModelResponse,
     ModelUsage,
 )
-from myclaw.provider.ports import ModelProvider
 from myclaw.session.records import (
     AssistantSessionMessage,
     MetadataUpdate,

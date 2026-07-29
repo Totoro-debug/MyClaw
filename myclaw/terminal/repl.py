@@ -11,10 +11,10 @@ from rich.console import Console
 from myclaw.agent.events import (
     AgentEvent,
     BackgroundCompletedPayload,
+    ConversationPort,
     TextDeltaPayload,
     TurnFailedPayload,
 )
-from myclaw.agent.ports import ConversationPort
 from myclaw.session.records import SessionSummary
 
 

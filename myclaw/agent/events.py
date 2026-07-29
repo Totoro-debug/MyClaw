@@ -1,10 +1,10 @@
 """Typed Agent Events emitted through the Conversation Port."""
 
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import pairwise
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
 
 from myclaw.errors import ErrorInfo
@@ -199,6 +199,15 @@ class AgentEvent:
             "created_at": format_rfc3339_milliseconds(self.created_at),
             "payload": self.payload.to_dict(),
         }
+
+
+@runtime_checkable
+class ConversationPort(Protocol):
+    """Submit user input and emit ordered Agent Events."""
+
+    def submit(self, text: str) -> AsyncIterator[AgentEvent]: ...
+
+    async def cancel_active_turn(self) -> None: ...
 
 
 def validate_agent_event_sequence(events: Iterable[AgentEvent]) -> None:
