@@ -345,6 +345,29 @@ async def test_complete_normalizes_memory_and_cron_responses(route: ModelRoute) 
 
 
 @pytest.mark.asyncio
+async def test_complete_rejects_an_empty_success_response() -> None:
+    client = FakeOpenAIClient(SimpleNamespace(choices=[], usage=None))
+    provider = OpenAICompatibleProvider(
+        configuration(),
+        client_factory=FakeOpenAIClientFactory(client),
+    )
+
+    with pytest.raises(ModelCallError) as raised:
+        await provider.complete(completion_request("memory"))
+
+    assert raised.value.error.to_dict() == {
+        "code": "model_failed",
+        "message": (
+            "OpenAI-compatible provider returned an empty response. "
+            "Check its API base URL and model configuration."
+        ),
+        "retryable": False,
+        "retry_after_seconds": None,
+    }
+    assert len(client.chat.completions.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_complete_translates_tool_history_and_mixed_tool_response() -> None:
     response = SimpleNamespace(
         choices=[
@@ -580,6 +603,30 @@ async def test_stream_maps_creation_error_without_retrying() -> None:
         "retry_after_seconds": None,
     }
     assert raised.value.__cause__ is failure
+    assert len(client.chat.completions.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_an_empty_success_response() -> None:
+    client = FakeOpenAIClient(FakeOpenAIStream())
+    provider = OpenAICompatibleProvider(
+        configuration(),
+        client_factory=FakeOpenAIClientFactory(client),
+    )
+
+    with pytest.raises(ModelCallError) as raised:
+        async for _event in provider.stream(request()):
+            pass
+
+    assert raised.value.error.to_dict() == {
+        "code": "model_failed",
+        "message": (
+            "OpenAI-compatible provider returned an empty response. "
+            "Check its API base URL and model configuration."
+        ),
+        "retryable": False,
+        "retry_after_seconds": None,
+    }
     assert len(client.chat.completions.calls) == 1
 
 

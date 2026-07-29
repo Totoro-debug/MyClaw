@@ -101,6 +101,8 @@ class OpenAICompatibleProvider:
         try:
             async for event in self._stream_once(request):
                 yield event
+        except ModelCallError:
+            raise
         except Exception as failure:
             raise _model_call_error(failure) from failure
 
@@ -139,14 +141,18 @@ class OpenAICompatibleProvider:
                 input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
                 output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
 
+        content = "".join(content_parts)
+        tool_calls = tuple(
+            _model_tool_call(tool_call_parts[index]) for index in sorted(tool_call_parts)
+        )
+        if not content.strip() and not tool_calls:
+            raise _empty_response_error()
+
         yield ModelCompleted(
             response=ModelResponse(
                 message=AssistantModelMessage(
-                    content="".join(content_parts),
-                    tool_calls=tuple(
-                        _model_tool_call(tool_call_parts[index])
-                        for index in sorted(tool_call_parts)
-                    ),
+                    content=content,
+                    tool_calls=tool_calls,
                 ),
                 usage=ModelUsage(
                     input_tokens=input_tokens,
@@ -160,6 +166,8 @@ class OpenAICompatibleProvider:
     async def complete(self, request: ModelRequest) -> ModelResponse:
         try:
             return await self._complete_once(request)
+        except ModelCallError:
+            raise
         except Exception as failure:
             raise _model_call_error(failure) from failure
 
@@ -168,6 +176,8 @@ class OpenAICompatibleProvider:
             **_request_arguments(request, stream=False)
         )
         choices = cast(list[object], getattr(result, "choices", []))
+        if not choices:
+            raise _empty_response_error()
         choice = cast(_CompletionChoice, choices[0])
         message = choice.message
         content = message.content
@@ -355,6 +365,14 @@ def _model_call_error(failure: Exception) -> ModelCallError:
             "OpenAI-compatible provider rejected the request.",
         )
     return _failure("model_failed", "OpenAI-compatible provider call failed.")
+
+
+def _empty_response_error() -> ModelCallError:
+    return _failure(
+        "model_failed",
+        "OpenAI-compatible provider returned an empty response. "
+        "Check its API base URL and model configuration.",
+    )
 
 
 def _failure(
