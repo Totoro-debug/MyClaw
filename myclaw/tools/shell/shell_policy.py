@@ -35,9 +35,7 @@ def _capture_git_executable() -> _TrustedGitExecutable | None:
         status = path.stat()
     except OSError:
         return None
-    if not path.is_file() or (os.name == "nt" and path.suffix.casefold() != ".exe"):
-        return None
-    if os.name != "nt" and not os.access(path, os.X_OK):
+    if not path.is_file() or path.suffix.casefold() != ".exe":
         return None
     return _TrustedGitExecutable(
         path=path,

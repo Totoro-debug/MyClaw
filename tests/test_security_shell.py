@@ -1,6 +1,5 @@
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -15,37 +14,21 @@ from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool
 from myclaw.tools.tool_gateway import ToolGateway
 
 
-def _platform_shell_command(arguments: list[str]) -> str:
-    if os.name == "nt":
-        return subprocess.list2cmdline(arguments)
-    return shlex.join(arguments)
+def _windows_shell_command(arguments: list[str]) -> str:
+    return subprocess.list2cmdline(arguments)
 
 
 def _write_git_shadow(directory: Path, marker: Path) -> None:
-    if os.name == "nt":
-        (directory / "git.cmd").write_text(
-            (
-                "@echo off\n"
-                'echo %* | %SystemRoot%\\System32\\findstr.exe /C:" config " >nul\n'
-                "if not errorlevel 1 exit /b 1\n"
-                f'> "{marker}" echo shadow\n'
-                "exit /b 0\n"
-            ),
-            encoding="utf-8",
-        )
-        return
-    shadow = directory / "git"
-    shadow.write_text(
+    (directory / "git.cmd").write_text(
         (
-            "#!/bin/sh\n"
-            'for argument in "$@"; do\n'
-            '  test "$argument" = config && exit 1\n'
-            "done\n"
-            f"printf shadow > {shlex.quote(str(marker))}\n"
+            "@echo off\n"
+            'echo %* | %SystemRoot%\\System32\\findstr.exe /C:" config " >nul\n'
+            "if not errorlevel 1 exit /b 1\n"
+            f'> "{marker}" echo shadow\n'
+            "exit /b 0\n"
         ),
         encoding="utf-8",
     )
-    shadow.chmod(0o755)
 
 
 class RecordingShellBoundary:
@@ -109,7 +92,7 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
         "async def main():\n"
         "    workspace, _agent_home = map(Path, sys.argv[1:])\n"
         "    call = ModelToolCall(id='call_git', name='shell', "
-        "arguments='{\"command\":\"git status\",\"timeout\":60}')\n"
+        'arguments=\'{"command":"git status","timeout":60}\')\n'
         "    foreground_shell = Shell()\n"
         "    foreground = ToolGateway()\n"
         "    foreground.register_tools((ShellTool(workspace=workspace, "
@@ -141,7 +124,6 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
     assert not marker.exists()
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows executable lookup only")
 @pytest.mark.asyncio
 async def test_automatic_git_command_does_not_execute_a_workspace_git_exe(
     agent_home: Path,
@@ -279,7 +261,7 @@ async def test_configured_global_attributes_filter_is_not_automatically_allowed(
             '[filter "secret"]\n'
             "\tclean = ./leak-secret\n"
             "[core]\n"
-            f"\tattributesFile = {attributes_file.as_posix()}\n"
+            f"\tattributesFile = {str(attributes_file).replace('\\', '/')}\n"
         ),
         encoding="utf-8",
     )
@@ -376,7 +358,7 @@ async def test_non_allowlisted_secret_command_is_refused_without_execution(
                 name="shell",
                 arguments=json.dumps(
                     {
-                        "command": _platform_shell_command([sys.executable, "-c", script]),
+                        "command": _windows_shell_command([sys.executable, "-c", script]),
                         "timeout": 60,
                     }
                 ),
@@ -400,11 +382,10 @@ async def test_allowlisted_git_status_does_not_run_a_repository_fsmonitor_hook(
 ) -> None:
     subprocess.run(["git", "init", "-q", str(workspace)], check=True)
     marker = workspace / "fsmonitor-ran"
-    hook = workspace / "fsmonitor-hook"
-    hook.write_bytes(b"#!/bin/sh\nprintf ran > fsmonitor-ran\nexit 1\n")
-    hook.chmod(0o755)
+    hook = workspace / "fsmonitor-hook.cmd"
+    hook.write_bytes(b"@echo off\r\n>fsmonitor-ran echo ran\r\nexit /b 1\r\n")
     subprocess.run(
-        ["git", "-C", str(workspace), "config", "core.fsmonitor", "./fsmonitor-hook"],
+        ["git", "-C", str(workspace), "config", "core.fsmonitor", "./fsmonitor-hook.cmd"],
         check=True,
     )
     shell = SubprocessShellBoundary()
@@ -545,7 +526,7 @@ async def test_included_git_filter_configuration_is_not_automatically_allowed(
     )
     included_config = workspace / "included.gitconfig"
     included_config.write_text(
-        f"[include]\n\tpath = {nested_config.as_posix()}\n",
+        f"[include]\n\tpath = {str(nested_config).replace('\\', '/')}\n",
         encoding="utf-8",
     )
     subprocess.run(

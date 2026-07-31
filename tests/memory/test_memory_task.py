@@ -1,6 +1,5 @@
 import asyncio
 import json
-import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -8,19 +7,21 @@ from uuid import uuid4
 import pytest
 
 from myclaw.agent.runtime import prepare_repl_runtime
+from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import ManagementViewService
-from myclaw.memory.conversation_summary import JsonlSummaryStore
+from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
 from myclaw.memory.memory_task import (
-    FileMemoryStore,
     MemoryEditFileTool,
     MemoryManager,
     MemoryReadFileTool,
     MemoryTaskModelSettings,
     MemoryTaskResult,
+    WorkspaceFileMemoryStore,
 )
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -37,6 +38,14 @@ from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider
 
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+
+
+def _state(home: AgentHome) -> WorkspaceState:
+    workspace = home.path.parent / "workspace-state"
+    workspace.mkdir(exist_ok=True)
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    return state
 
 
 def _response(
@@ -57,7 +66,7 @@ async def test_summary_store_returns_the_limited_batch_after_the_cursor(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     for content in ("Summary one.", "Summary two.", "Summary three."):
         await summaries.append(content, NOW)
 
@@ -75,7 +84,7 @@ async def test_memory_store_treats_a_missing_summary_cursor_as_zero(
     home = AgentHome(agent_home)
     home.initialize()
 
-    cursor = await FileMemoryStore(home).read_summary_cursor()
+    cursor = await WorkspaceFileMemoryStore(_state(home)).read_summary_cursor()
 
     assert cursor == 0
 
@@ -87,10 +96,10 @@ async def test_memory_store_atomically_persists_the_canonical_summary_cursor(
     home = AgentHome(agent_home)
     home.initialize()
 
-    await FileMemoryStore(home).write_summary_cursor(12)
+    await WorkspaceFileMemoryStore(_state(home)).write_summary_cursor(12)
 
-    assert (agent_home / "memory" / ".cursor").read_bytes() == b"12\n"
-    assert await FileMemoryStore(home).read_summary_cursor() == 12
+    assert (_state(home).memory_directory / ".cursor").read_bytes() == b"12\n"
+    assert await WorkspaceFileMemoryStore(_state(home)).read_summary_cursor() == 12
 
 
 @pytest.mark.asyncio
@@ -101,17 +110,17 @@ async def test_memory_store_atomically_replaces_exact_long_term_memory(
     home.initialize()
     replacement = "# Long-term Memory\n\n## User Info\n\nUses UTF-8: \u4f60\u597d\n"
 
-    await FileMemoryStore(home).replace_long_term(replacement)
+    await WorkspaceFileMemoryStore(_state(home)).replace_long_term(replacement)
 
-    assert await FileMemoryStore(home).read_long_term() == replacement
-    assert (agent_home / "memory" / "memory.md").read_bytes() == replacement.encode("utf-8")
+    assert await WorkspaceFileMemoryStore(_state(home)).read_long_term() == replacement
+    assert (_state(home).long_term_memory_path).read_bytes() == replacement.encode("utf-8")
 
 
 def test_memory_tools_export_common_schemas_with_zero_retries(agent_home: Path) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    memory = FileMemoryStore(home)
-    path = agent_home / "memory" / "memory.md"
+    memory = WorkspaceFileMemoryStore(_state(home))
+    path = _state(home).long_term_memory_path
     read_tool = MemoryReadFileTool(memory=memory, long_term_path=path)
     edit_tool = MemoryEditFileTool(memory=memory, long_term_path=path)
 
@@ -188,9 +197,9 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
     provider = ScriptedFakeProvider()
     manager = MemoryManager(
         provider=provider,
-        summaries=JsonlSummaryStore(home),
-        memory=FileMemoryStore(home),
-        long_term_path=agent_home / "memory" / "memory.md",
+        summaries=WorkspaceJsonlSummaryStore(_state(home)),
+        memory=WorkspaceFileMemoryStore(_state(home)),
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -221,20 +230,18 @@ async def test_manual_memory_task_records_one_terminal_failure_without_a_session
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("PRIVATE SUMMARY CONTENT", NOW)
     provider = ScriptedFakeProvider(
         completions=(
-            ModelCallError(
-                ErrorInfo(code="model_failed", message="PRIVATE PROVIDER OUTPUT")
-            ),
+            ModelCallError(ErrorInfo(code="model_failed", message="PRIVATE PROVIDER OUTPUT")),
         )
     )
     manager = MemoryManager(
         provider=provider,
         summaries=summaries,
-        memory=FileMemoryStore(home),
-        long_term_path=agent_home / "memory" / "memory.md",
+        memory=WorkspaceFileMemoryStore(_state(home)),
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -266,9 +273,9 @@ async def test_memory_task_without_an_edit_advances_the_summary_cursor(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("The user prefers concise status reports.", NOW)
-    memory = FileMemoryStore(home)
+    memory = WorkspaceFileMemoryStore(_state(home))
     original_memory = await memory.read_long_term()
     provider = ScriptedFakeProvider(
         completions=(_response("No stable Long-term Memory update is needed."),)
@@ -277,7 +284,7 @@ async def test_memory_task_without_an_edit_advances_the_summary_cursor(
         provider=provider,
         summaries=summaries,
         memory=memory,
-        long_term_path=agent_home / "memory" / "memory.md",
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -317,9 +324,10 @@ async def test_memory_task_exact_edit_updates_long_term_memory_then_advances_cur
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("The user prefers concise status reports.", NOW)
-    memory_path = agent_home / "memory" / "memory.md"
+    memory_path = state.long_term_memory_path
     old_text = "## User Preference\n"
     new_text = "## User Preference\n\nPrefers concise status reports.\n"
     provider = ScriptedFakeProvider(
@@ -358,7 +366,7 @@ async def test_memory_task_exact_edit_updates_long_term_memory_then_advances_cur
     manager = MemoryManager(
         provider=provider,
         summaries=summaries,
-        memory=FileMemoryStore(home),
+        memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
@@ -378,8 +386,8 @@ async def test_memory_task_exact_edit_updates_long_term_memory_then_advances_cur
         memory_updated=True,
         cursor=1,
     )
-    assert new_text in await FileMemoryStore(home).read_long_term()
-    assert await FileMemoryStore(home).read_summary_cursor() == 1
+    assert new_text in await WorkspaceFileMemoryStore(_state(home)).read_long_term()
+    assert await WorkspaceFileMemoryStore(_state(home)).read_summary_cursor() == 1
     second_request = provider.complete_requests[1]
     assert isinstance(second_request, ModelRequest)
     read_result = second_request.messages[-1]
@@ -396,7 +404,8 @@ async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("A pending summary.", NOW)
     outside = agent_home.parent / "outside-memory.md"
     secret = "OUTSIDE MEMORY MUST NOT REACH THE MODEL"
@@ -418,8 +427,8 @@ async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
     manager = MemoryManager(
         provider=provider,
         summaries=summaries,
-        memory=FileMemoryStore(home),
-        long_term_path=agent_home / "memory" / "memory.md",
+        memory=WorkspaceFileMemoryStore(state),
+        long_term_path=state.long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -446,7 +455,7 @@ async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
     request = provider.complete_requests[0]
     assert isinstance(request, ModelRequest)
     assert secret not in json.dumps(request.to_dict())
-    assert await FileMemoryStore(home).read_summary_cursor() == 0
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 0
 
 
 @pytest.mark.asyncio
@@ -455,15 +464,16 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("The user prefers concise status reports.", NOW)
-    memory_path = agent_home / "memory" / "memory.md"
+    memory_path = state.long_term_memory_path
     original_memory = memory_path.read_bytes()
 
     def fail_replace(_target: Path, _content: str) -> None:
         raise OSError("injected atomic replacement failure")
 
-    memory = FileMemoryStore(home, replace_text=fail_replace)
+    memory = WorkspaceFileMemoryStore(state, replace_text=fail_replace)
     provider = ScriptedFakeProvider(
         completions=(
             _response(
@@ -477,8 +487,7 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
                                 "path": str(memory_path),
                                 "old_text": "## User Preference\n",
                                 "new_text": (
-                                    "## User Preference\n\n"
-                                    "Prefers concise status reports.\n"
+                                    "## User Preference\n\nPrefers concise status reports.\n"
                                 ),
                             }
                         ),
@@ -517,7 +526,7 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
         ),
     )
     assert memory_path.read_bytes() == original_memory
-    assert await FileMemoryStore(home).read_summary_cursor() == 0
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 0
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert content.count(" ERROR ") == 1
     assert "Memory Task failed code=tool_failed" in content
@@ -535,13 +544,13 @@ async def test_conversation_summary_read_failure_is_logged_only_at_memory_task_b
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     summaries.path.write_text("PRIVATE INVALID SUMMARY STREAM", encoding="utf-8")
     manager = MemoryManager(
         provider=ScriptedFakeProvider(),
         summaries=summaries,
-        memory=FileMemoryStore(home),
-        long_term_path=agent_home / "memory" / "memory.md",
+        memory=WorkspaceFileMemoryStore(_state(home)),
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -572,17 +581,15 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("A pending summary.", NOW)
-    memory_path = agent_home / "memory" / "memory.md"
+    memory_path = state.long_term_memory_path
     outside = agent_home.parent / "outside-memory.md"
     secret = "OUTSIDE SECRET MUST NOT REACH THE MODEL"
     outside.write_text(secret, encoding="utf-8")
     memory_path.unlink()
-    try:
-        memory_path.hardlink_to(outside)
-    except OSError as error:
-        pytest.skip(f"file hard links are unavailable on this host: {error}")
+    memory_path.hardlink_to(outside)
     provider = ScriptedFakeProvider(
         completions=(
             _response(
@@ -601,7 +608,7 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
     manager = MemoryManager(
         provider=provider,
         summaries=summaries,
-        memory=FileMemoryStore(home),
+        memory=WorkspaceFileMemoryStore(state),
         long_term_path=memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
@@ -622,7 +629,7 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
         cursor=0,
         error=ErrorInfo(
             code="tool_failed",
-            message="Long-term Memory must be a regular Agent Home file.",
+            message="Long-term Memory must be a regular Workspace State file.",
         ),
     )
     model_requests = [
@@ -634,37 +641,7 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
     )
     assert secret not in model_payload
     assert outside.read_text(encoding="utf-8") == secret
-    assert await FileMemoryStore(home).read_summary_cursor() == 0
-
-
-@pytest.mark.asyncio
-async def test_memory_task_denies_an_external_memory_directory_alias(
-    agent_home: Path,
-) -> None:
-    agent_home.mkdir(parents=True, exist_ok=True)
-    outside = agent_home.parent / "outside-memory-directory"
-    outside.mkdir()
-    secret = "JUNCTION SECRET MUST NOT REACH THE MODEL"
-    (outside / "memory.md").write_text(secret, encoding="utf-8")
-    try:
-        subprocess.run(
-            ("cmd", "/c", "mklink", "/J", str(agent_home / "memory"), str(outside)),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        pytest.skip(f"directory junctions are unavailable on this host: {error}")
-    home = AgentHome(agent_home)
-
-    with pytest.raises(
-        PermissionError,
-        match="memory directory must remain inside Agent Home",
-    ):
-        home.initialize()
-
-    assert (outside / "memory.md").read_text(encoding="utf-8") == secret
-    assert not (outside / ".cursor").exists()
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 0
 
 
 @pytest.mark.asyncio
@@ -673,7 +650,7 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("One pending summary.", NOW)
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -690,8 +667,8 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
     manager = MemoryManager(
         provider=provider,
         summaries=summaries,
-        memory=FileMemoryStore(home),
-        long_term_path=agent_home / "memory" / "memory.md",
+        memory=WorkspaceFileMemoryStore(_state(home)),
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -731,7 +708,7 @@ async def test_overlapping_manual_memory_task_ignores_a_corrupt_cursor(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("One pending summary.", NOW)
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -747,8 +724,8 @@ async def test_overlapping_manual_memory_task_ignores_a_corrupt_cursor(
     manager = MemoryManager(
         provider=provider,
         summaries=summaries,
-        memory=FileMemoryStore(home),
-        long_term_path=agent_home / "memory" / "memory.md",
+        memory=WorkspaceFileMemoryStore(_state(home)),
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -760,7 +737,7 @@ async def test_overlapping_manual_memory_task_ignores_a_corrupt_cursor(
     )
     first_task = asyncio.create_task(manager.run_manual())
     await first_started.wait()
-    (agent_home / "memory" / ".cursor").write_bytes(b"corrupt\n")
+    (_state(home).memory_directory / ".cursor").write_bytes(b"corrupt\n")
 
     try:
         overlapping = await manager.run_manual()
@@ -786,9 +763,9 @@ async def test_dream_command_returns_exact_no_pending_output_without_a_model_cal
     provider = ScriptedFakeProvider()
     memory_manager = MemoryManager(
         provider=provider,
-        summaries=JsonlSummaryStore(home),
-        memory=FileMemoryStore(home),
-        long_term_path=agent_home / "memory" / "memory.md",
+        summaries=WorkspaceJsonlSummaryStore(_state(home)),
+        memory=WorkspaceFileMemoryStore(_state(home)),
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -816,6 +793,8 @@ async def test_runtime_dream_uses_memory_route_with_static_default_fallback(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(
         VALID_CONFIG.replace(
             "[tools.shell]\nenabled = true",
@@ -824,7 +803,7 @@ async def test_runtime_dream_uses_memory_route_with_static_default_fallback(
         encoding="utf-8",
     )
     configuration = ConfigLoader(home).load()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("The user prefers concise status reports.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No durable update is needed."),))
     runtime = prepare_repl_runtime(
@@ -845,7 +824,7 @@ async def test_runtime_dream_uses_memory_route_with_static_default_fallback(
         "memory_updated: false\n"
         "cursor: 1"
     )
-    assert await FileMemoryStore(home).read_summary_cursor() == 1
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
     request = provider.complete_requests[0]
     assert isinstance(request, ModelRequest)
     assert request.route == "memory"
@@ -858,9 +837,9 @@ async def test_dream_command_renders_model_failure_without_advancing_cursor(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("One pending summary.", NOW)
-    memory = FileMemoryStore(home)
+    memory = WorkspaceFileMemoryStore(_state(home))
     provider = ScriptedFakeProvider(
         completions=(
             ModelCallError(ErrorInfo(code="model_failed", message="Memory model failed.")),
@@ -870,7 +849,7 @@ async def test_dream_command_renders_model_failure_without_advancing_cursor(
         provider=provider,
         summaries=summaries,
         memory=memory,
-        long_term_path=agent_home / "memory" / "memory.md",
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -899,7 +878,7 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("One pending summary.", NOW)
 
     def fail_cursor(target: Path, content: str) -> None:
@@ -907,13 +886,13 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
             raise OSError("injected cursor publication failure")
         atomic_replace_text(target, content)
 
-    memory = FileMemoryStore(home, replace_text=fail_cursor)
+    memory = WorkspaceFileMemoryStore(_state(home), replace_text=fail_cursor)
     provider = ScriptedFakeProvider(completions=(_response("No durable update is needed."),))
     memory_manager = MemoryManager(
         provider=provider,
         summaries=summaries,
         memory=memory,
-        long_term_path=agent_home / "memory" / "memory.md",
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -937,7 +916,7 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
         "memory_updated: false\n"
         "cursor: 0"
     )
-    assert await FileMemoryStore(home).read_summary_cursor() == 0
+    assert await WorkspaceFileMemoryStore(_state(home)).read_summary_cursor() == 0
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert content.count(" ERROR ") == 1
     assert "Memory Task failed code=persistence_error" in content
@@ -954,13 +933,13 @@ async def test_dream_reports_corrupt_cursor_without_calling_the_model(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "memory" / ".cursor").write_bytes(cursor_bytes)
+    (_state(home).memory_directory / ".cursor").write_bytes(cursor_bytes)
     provider = ScriptedFakeProvider()
     memory_manager = MemoryManager(
         provider=provider,
-        summaries=JsonlSummaryStore(home),
-        memory=FileMemoryStore(home),
-        long_term_path=agent_home / "memory" / "memory.md",
+        summaries=WorkspaceJsonlSummaryStore(_state(home)),
+        memory=WorkspaceFileMemoryStore(_state(home)),
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -983,7 +962,7 @@ async def test_dream_reports_corrupt_cursor_without_calling_the_model(
         "cursor: 0"
     )
     assert provider.complete_requests == []
-    assert (agent_home / "memory" / ".cursor").read_bytes() == cursor_bytes
+    assert (_state(home).memory_directory / ".cursor").read_bytes() == cursor_bytes
 
 
 @pytest.mark.asyncio
@@ -992,21 +971,18 @@ async def test_memory_task_rejects_an_external_hard_linked_cursor(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("One pending summary.", NOW)
     outside_cursor = agent_home.parent / "outside-cursor"
     outside_cursor.write_bytes(b"999\n")
-    cursor_path = agent_home / "memory" / ".cursor"
-    try:
-        cursor_path.hardlink_to(outside_cursor)
-    except OSError as error:
-        pytest.skip(f"file hard links are unavailable on this host: {error}")
+    cursor_path = _state(home).memory_directory / ".cursor"
+    cursor_path.hardlink_to(outside_cursor)
     provider = ScriptedFakeProvider()
     manager = MemoryManager(
         provider=provider,
         summaries=summaries,
-        memory=FileMemoryStore(home),
-        long_term_path=agent_home / "memory" / "memory.md",
+        memory=WorkspaceFileMemoryStore(_state(home)),
+        long_term_path=_state(home).long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,

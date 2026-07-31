@@ -2,7 +2,7 @@ import errno
 import logging
 import os
 import re
-import stat
+import subprocess
 import threading
 import time
 import warnings
@@ -235,14 +235,6 @@ def test_runtime_log_submission_drops_the_oldest_of_1024_pending_records(
 def test_runtime_log_first_use_creates_complete_private_state(agent_home: Path) -> None:
     logs = agent_home / "logs"
     logs.mkdir(parents=True, mode=0o777)
-    if os.name == "posix":
-        logs.chmod(0o777)
-        (logs / "run.log.0").write_bytes(b"")
-        (logs / "run.log.1").write_bytes(b"")
-        (logs / "run.log.cursor").write_bytes(b"0\n")
-        (logs / "run.log.lock").write_bytes(b"")
-        for path in logs.iterdir():
-            path.chmod(0o666)
 
     lifetime = install_runtime_logging(AgentHome(agent_home))
     logging.getLogger("myclaw.storage").warning("first record")
@@ -256,9 +248,6 @@ def test_runtime_log_first_use_creates_complete_private_state(agent_home: Path) 
     assert "cursor was recovered" not in content
     assert content.count(" WARNING ") == 1
     assert (logs / "run.log.1").read_bytes() == b""
-    if os.name == "posix":
-        assert logs.stat().st_mode & 0o777 == 0o700
-        assert all((logs / name).stat().st_mode & 0o777 == 0o600 for name in expected_files)
 
 
 def test_runtime_log_appends_to_the_slot_selected_by_the_canonical_cursor(
@@ -623,7 +612,7 @@ def test_runtime_log_tolerates_filesystems_without_fsync(
     assert capsys.readouterr().err == ""
 
 
-def test_runtime_log_rejects_reparse_or_symlink_directory_outside_agent_home(
+def test_runtime_log_rejects_a_junction_directory_outside_agent_home(
     agent_home: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -631,10 +620,12 @@ def test_runtime_log_rejects_reparse_or_symlink_directory_outside_agent_home(
     agent_home.mkdir(parents=True)
     outside = tmp_path / "outside-logs"
     outside.mkdir()
-    try:
-        (agent_home / "logs").symlink_to(outside, target_is_directory=True)
-    except OSError as error:
-        pytest.skip(f"directory symlinks are unavailable: {type(error).__name__}")
+    subprocess.run(
+        ("cmd", "/c", "mklink", "/J", str(agent_home / "logs"), str(outside)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
     lifetime = install_runtime_logging(AgentHome(agent_home))
     logging.getLogger("myclaw.storage").error("must not escape Agent Home")
@@ -995,9 +986,7 @@ def test_runtime_log_rejects_an_in_home_alias_swap_after_open(
             path = victim
         return original_open(path, mode, buffering, encoding, errors, newline)
 
-    def stat_alias(
-        path: Path, *, follow_symlinks: bool = True
-    ) -> os.stat_result:
+    def stat_alias(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
         if alias_opened and path == target:
             path = victim
         return original_stat(path, follow_symlinks=follow_symlinks)
@@ -1022,45 +1011,3 @@ def test_runtime_log_rejects_an_in_home_alias_swap_after_open(
     assert victim.read_bytes() == original_victim
     assert target.read_bytes() == b"original slot\n"
     assert capsys.readouterr().err == "Runtime Log failure: PermissionError\n"
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions are unavailable")
-def test_runtime_log_narrows_cursor_permissions_before_fallback_selection(
-    agent_home: Path,
-) -> None:
-    logs = agent_home / "logs"
-    logs.mkdir(parents=True)
-    (logs / "run.log.0").write_bytes(b"")
-    (logs / "run.log.1").write_bytes(b"")
-    cursor = logs / "run.log.cursor"
-    cursor.write_bytes(b"0\n")
-    cursor.chmod(0o666)
-    (logs / "run.log.lock").write_bytes(b"")
-    elapsed = 0.0
-
-    class UnavailableLock:
-        def try_acquire(self, descriptor: int) -> bool:
-            del descriptor
-            return False
-
-        def release(self, descriptor: int) -> None:
-            del descriptor
-            pytest.fail("an unavailable lock must not be released")
-
-    def monotonic() -> float:
-        return elapsed
-
-    def sleep(delay: float) -> None:
-        nonlocal elapsed
-        elapsed += delay
-
-    lifetime = install_runtime_logging(
-        AgentHome(agent_home),
-        lock_system=UnavailableLock(),
-        monotonic=monotonic,
-        sleep=sleep,
-    )
-    logging.getLogger("myclaw.lock").warning("fallback permissions")
-    lifetime.close()
-
-    assert stat.S_IMODE(cursor.stat().st_mode) == 0o600

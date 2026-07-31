@@ -1,210 +1,78 @@
-# MyClaw v0.1 Release Readiness
+# MyClaw Windows x64 Release Readiness
 
-This document is the release evidence index for GitHub
-[#1](https://github.com/Totoro-debug/myclaw/issues/1) and
-[#36](https://github.com/Totoro-debug/myclaw/issues/36). The local
-[PRD](myclaw-personal-agent-prd.md) remains the product source of truth and the
-[runtime contracts](myclaw-runtime-contracts.md) remain the accepted behavior and
-schema source of truth.
+Status: **READY**
 
-Evidence is separated deliberately:
+This is the current evidence index for GitHub issue
+[#56](https://github.com/Totoro-debug/myclaw/issues/56). The accepted storage and
+platform decisions are [ADR-0005](adr/0005-store-workspace-state-in-workspace.md)
+and [ADR-0006](adr/0006-support-windows-only.md). Historical ADR text remains an
+unchanged record of the decisions that applied when it was accepted.
 
-- Automated coverage links show that a public behavior has a maintained test.
-- Platform results come only from the Windows and POSIX validation reports.
-- Manual and external smoke rows use only `PASS`, `NOT RUN`, or `BLOCKED`.
-- `NOT RUN` is not treated as a pass. No local credential was read or used merely
-  to improve this report.
+## Release Contract
 
-## Platform Evidence
+- Supported runtime: 64-bit Windows on x64 hardware with Python 3.12 or later.
+- Published artifact: exactly one `py3-none-win_amd64` wheel.
+- Agent Home owns only user configuration and runtime logs.
+- Workspace State is rooted at `<workspace>\.myclaw` and owns sessions, memory,
+  summaries, scheduled work, and tool artifacts.
+- Existing state under the former Agent Home layout is preserved and ignored. No
+  automatic discovery, copy, move, or conversion is performed.
+- Unsupported platforms fail at the lightweight console entry point before the
+  runtime or CLI implementation is imported.
 
-| Environment | Evidence | Status in this synthesis |
+## Delivery Evidence
+
+| Area | Evidence | Result |
 | --- | --- | --- |
-| Windows | [Windows validation](release/windows-validation.md) | **PASS:** 653 offline and 653 warning-strict tests on the licensed candidate; Ruff lint/format; native/Linux strict Mypy; isolated wheel/sdist build; Apache-2.0 metadata/artifacts; clean-wheel install; Unicode `myclaw`/`myclaw config` smoke. |
-| POSIX | [POSIX validation](release/posix-validation.md) | **PASS:** final `ubuntu-latest` run [29214379231](https://github.com/Totoro-debug/MyClaw/actions/runs/29214379231) at SHA `31e2b17069bc54366edb6252c1a59cb2a78ed36e`; 645 offline tests passed with 8 expected Windows-only skips, the focused POSIX process suite passed 74 with 3 Windows-only skips, and Ruff, Mypy, licensed build, clean-wheel install, strict first-start/Unicode CLI, and import gates passed. |
+| Workspace State | Root-conflict, ownership, and non-migration validation | PASS |
+| Runtime storage | Session, memory, summary, scheduled-work, artifact, management, and background validation | PASS |
+| Platform gate | Windows x64 acceptance and deterministic rejection validation | PASS |
+| Process model | Windows Job Object ownership, process-tree shutdown, console handling, and cancellation validation | PASS |
+| Filesystem model | Windows file attributes, reparse-point, hard-link, and containment validation | PASS |
+| Public surface | Retired workspace-slug, compatibility, and single-implementation layers scan | PASS |
+| Release artifact | Exactly one tagged Windows x64 wheel; 73 packaged Python files match source | PASS |
+| Clean install | Isolated wheel installation, dependency check, and package-origin validation | PASS |
+| Unicode CLI | Clean Agent Home and Workspace first-start and config smoke | PASS |
 
-The security/fault baseline immediately before B18 is recorded in
-[Security and Fault Review](security-fault-review.md): 651 tests passed on the
-Windows host, including a warning-strict run, with Ruff, Mypy, package build, and
-`git diff --check` also passing. That baseline does not replace the two B18
-platform reports.
+The artifact identity, host details, and clean-install transcript are recorded in
+[Windows x64 validation](release/windows-validation.md).
 
-## User Story Traceability
+## Final Gates
 
-The following table contains exactly the 48 User Stories from the PRD, using an
-accurate short form where the full sentence would only repeat the actor and
-motivation. Implementation links identify the current production boundary;
-automated links identify public or contract test evidence.
+| Gate | Result |
+| --- | --- |
+| Root-conflict focused suite | PASS: `5 passed` |
+| Storage and filesystem safety suites | PASS: `231 passed` |
+| Complete offline suite | PASS: `842 passed`; zero skips |
+| Ruff lint | PASS: all checks passed |
+| Ruff format check over complete `myclaw tests` | PASS: `162 files already formatted` |
+| Strict Mypy | PASS: no issues in 162 source files |
+| Diff hygiene and retired-surface scan | PASS |
 
-| ID | User Story | Implementation evidence | Automated test evidence |
-| --- | --- | --- | --- |
-| US-01 | Run MyClaw locally without a multi-tenant platform. | The installable Python entry point and one-process Runtime are defined by [pyproject.toml](../pyproject.toml), [cli.py](../myclaw/terminal/cli.py), and [runtime.py](../myclaw/agent/runtime.py). | Installed package/entry behavior: [test_package.py](../tests/test_package.py), [test_cli.py](../tests/test_cli.py). |
-| US-02 | Running `myclaw` enters the REPL by default. | [cli.py](../myclaw/terminal/cli.py) composes [repl.py](../myclaw/terminal/repl.py). | Installed console entry and REPL behavior: [test_cli.py](../tests/test_cli.py), [test_repl.py](../tests/test_repl.py). |
-| US-03 | One REPL supports continuous multi-turn conversation with Short-term Memory. | [runtime.py](../myclaw/agent/runtime.py), [conversation.py](../myclaw/session/conversation.py), and [session_store.py](../myclaw/session/session_store.py) reuse the active Session and its unconsolidated suffix. | Multi-turn history and same-session reuse: [test_runtime.py](../tests/test_runtime.py), [test_conversation.py](../tests/sessions/test_conversation.py), [test_conversation_summary.py](../tests/memory/test_conversation_summary.py). |
-| US-04 | Every valid REPL start prepares a new Session by default. | Session identity preparation is in [session_store.py](../myclaw/session/session_store.py) and Runtime composition in [runtime.py](../myclaw/agent/runtime.py). | Prepared Session behavior: [test_session_store.py](../tests/sessions/test_session_store.py), [test_repl.py](../tests/test_repl.py), [test_runtime.py](../tests/test_runtime.py). |
-| US-05 | Exiting an empty REPL leaves no Session file. | [session_store.py](../myclaw/session/session_store.py) separates preparation from first durable append; [repl.py](../myclaw/terminal/repl.py) ignores blank/exit-only input. | Empty and exit-only REPL cases: [test_repl.py](../tests/test_repl.py). |
-| US-06 | Sessions are grouped and isolated by Workspace. | [workspace.py](../myclaw/agent/workspace.py), [agent_home.py](../myclaw/config/agent_home.py), and [session_store.py](../myclaw/session/session_store.py) define Workspace identity, slug, and directory. | Windows/POSIX/UNC slugs and Workspace-scoped stores: [test_workspace.py](../tests/test_workspace.py), [test_session_store.py](../tests/sessions/test_session_store.py). |
-| US-07 | `/resume` provides an interactive picker for Sessions in the current Workspace. | [session_resume.py](../myclaw/session/session_resume.py), [service.py](../myclaw/management/service.py), and [repl.py](../myclaw/terminal/repl.py). | Listing, selection, switch, and history continuation: [test_session_resume.py](../tests/sessions/test_session_resume.py). |
-| US-08 | The picker shows Session titles and times. | Picker summaries are produced by [session_store.py](../myclaw/session/session_store.py) and rendered through [session_resume.py](../myclaw/session/session_resume.py). | Stable summary fields/order and picker rendering: [test_session_resume.py](../tests/sessions/test_session_resume.py), [test_models.py](../tests/management/test_models.py). |
-| US-09 | Session titles are generated automatically. | [session_titles.py](../myclaw/session/session_titles.py) starts the asynchronous chat-route title task. | Non-blocking title generation and Session ownership: [test_session_title.py](../tests/sessions/test_session_title.py), [test_runtime_session_title.py](../tests/test_runtime_session_title.py). |
-| US-10 | Title-generation failure still leaves a readable fallback title. | Fallback normalization and truncation are in [session_titles.py](../myclaw/session/session_titles.py). | Failure, empty output, Unicode limit, and `Untitled session`: [test_session_title.py](../tests/sessions/test_session_title.py). |
-| US-11 | Main chat always streams output. | Streaming Model events are consumed by [conversation.py](../myclaw/session/conversation.py) and progressively rendered by [repl.py](../myclaw/terminal/repl.py). | Streaming contract, progressive output, and durable completion: [test_conversation.py](../tests/sessions/test_conversation.py), [test_repl.py](../tests/test_repl.py), [test_models.py](../tests/provider/test_models.py). |
-| US-12 | Ctrl+C cancels only the active turn, not background work. | [interrupts.py](../myclaw/terminal/interrupts.py), [runtime.py](../myclaw/agent/runtime.py), and [background_coordination.py](../myclaw/schedule/background_coordination.py). | Foreground-only repeated/idle interrupt and background survival: [test_runtime_shutdown.py](../tests/test_runtime_shutdown.py), [test_repl.py](../tests/test_repl.py). |
-| US-13 | `exit` or `quit` exits the REPL clearly. | [repl.py](../myclaw/terminal/repl.py) handles case-insensitive, whitespace-tolerant exit tokens; Runtime owns shutdown. | Exit/quit and all-settled shutdown: [test_repl.py](../tests/test_repl.py), [test_runtime_shutdown.py](../tests/test_runtime_shutdown.py). |
-| US-14 | `/config` displays the current configuration. | [commands.py](../myclaw/management/commands.py) uses [service.py](../myclaw/management/service.py) and [config.py](../myclaw/config/config.py). | Complete renderable configuration view: [test_management_commands.py](../tests/management/test_management_commands.py), [test_management_views.py](../tests/management/test_management_views.py). |
-| US-15 | Configuration output redacts API keys by default. | Recursive and malformed-text redaction are in [config.py](../myclaw/config/config.py) and [cli.py](../myclaw/terminal/cli.py). | Valid, invalid, escaped-key, and CLI redaction: [test_config.py](../tests/configuration/test_config.py), [test_security_web_secrets.py](../tests/test_security_web_secrets.py), [test_cli.py](../tests/test_cli.py). |
-| US-16 | `/status` shows version, chat model, uptime, token estimate, and Session state. | [service.py](../myclaw/management/service.py), [commands.py](../myclaw/management/commands.py), and [runtime.py](../myclaw/agent/runtime.py). | Exact management fields, actual values, and fallback route: [test_models.py](../tests/management/test_models.py), [test_management_views.py](../tests/management/test_management_views.py), [test_runtime.py](../tests/test_runtime.py). |
-| US-17 | `/memory` shows the complete latest on-disk Long-term Memory. | [service.py](../myclaw/management/service.py) reads the store instead of the Runtime snapshot. | Repeated latest-disk view and complete command rendering: [test_management_views.py](../tests/management/test_management_views.py), [test_management_commands.py](../tests/management/test_management_commands.py). |
-| US-18 | `/dream` manually processes pending summaries. | [memory_task.py](../myclaw/memory/memory_task.py) is exposed through [commands.py](../myclaw/management/commands.py). | Manual route, result summary, cursor success/failure: [test_memory_task.py](../tests/memory/test_memory_task.py). |
-| US-19 | `/dream` does not call a model when no summaries are pending. | The zero-work path is in [memory_task.py](../myclaw/memory/memory_task.py). | Exact no-pending output and zero Provider calls: [test_memory_task.py](../tests/memory/test_memory_task.py). |
-| US-20 | Long-term Memory is maintained automatically. | [memory_scheduler.py](../myclaw/memory/memory_scheduler.py) triggers [memory_task.py](../myclaw/memory/memory_task.py) inside the Runtime. | Periodic execution, custom cron, silence, failure isolation, and close: [test_memory_scheduler.py](../tests/memory/test_memory_scheduler.py). |
-| US-21 | Long-term Memory has User Info, User Preference, Project Fact, and Lesson sections. | The fixed template is created by [agent_home.py](../myclaw/config/agent_home.py). | Exact first-start template and preservation: [test_agent_home.py](../tests/test_agent_home.py). |
-| US-22 | Conversation Summary compresses early messages automatically. | [conversation_summary.py](../myclaw/memory/conversation_summary.py) performs pre-chat threshold/budget consolidation. | Message-count/token triggers, cutoff, cursor, and summary generation: [test_conversation_summary.py](../tests/memory/test_conversation_summary.py), [test_consolidation_recovery.py](../tests/memory/test_consolidation_recovery.py). |
-| US-23 | Original Session messages remain after summarization. | [conversation_summary.py](../myclaw/memory/conversation_summary.py) advances metadata without deleting message records; [session_store.py](../myclaw/session/session_store.py) preserves them. | Repeated consolidation and byte-preserving metadata rewrite: [test_conversation_summary.py](../tests/memory/test_conversation_summary.py), [test_session_store.py](../tests/sessions/test_session_store.py). |
-| US-24 | Long-term Memory changes only when the model decides an update is needed. | [memory_task.py](../myclaw/memory/memory_task.py) treats absence of `edit_file` as no update. | No-edit cursor advance, exact edit, and failed edit behavior: [test_memory_task.py](../tests/memory/test_memory_task.py). |
-| US-25 | File read, list, and search are available by default. | [file_tools.py](../myclaw/tools/files/file_tools.py), [security.py](../myclaw/tools/security.py), and [tool_gateway.py](../myclaw/tools/tool_gateway.py). | Public conversation Tool loop and path boundaries: [test_readonly_tool_loop.py](../tests/test_readonly_tool_loop.py), [test_security_filesystem.py](../tests/test_security_filesystem.py). |
-| US-26 | File creation and editing are refused while confirmation is unavailable. | [workspace_write_tools.py](../myclaw/tools/files/workspace_write_tools.py) exposes explicit refusal before execution. | Foreground and Scheduled Work refusal plus protected paths: [test_workspace_write_tools.py](../tests/tools/files/test_workspace_write_tools.py), [test_permission_loop.py](../tests/test_permission_loop.py). |
-| US-27 | Shell automatically allows only a tiny built-in read-only list. | [shell_policy.py](../myclaw/tools/shell/shell_policy.py), [shell_process.py](../myclaw/tools/shell/shell_process.py), and [shell_tool.py](../myclaw/tools/shell/shell_tool.py). | Five exact forms, near misses, cwd/timeout, trusted Git, and process ownership: [test_shell_policy.py](../tests/tools/shell/test_shell_policy.py), [test_security_shell.py](../tests/test_security_shell.py), [test_shell_process.py](../tests/tools/shell/test_shell_process.py). |
-| US-28 | WebSearch and WebFetch are enabled by default for public Internet access. | [web_search.py](../myclaw/tools/web/web_search.py), [web_fetch.py](../myclaw/tools/web/web_fetch.py), and Runtime catalog wiring. | Enable/disable catalogs and Provider-neutral results: [test_web_search.py](../tests/tools/web/test_web_search.py), [test_web_fetch.py](../tests/tools/web/test_web_fetch.py). Live status is recorded under External Smoke Evidence. |
-| US-29 | WebFetch blocks local and private networks. | DNS, peer, and redirect validation are in [web_fetch.py](../myclaw/tools/web/web_fetch.py). | Every non-public category, all DNS answers, peer pinning, and redirect revalidation: [test_web_fetch.py](../tests/tools/web/test_web_fetch.py), [test_security_web_secrets.py](../tests/test_security_web_secrets.py). |
-| US-30 | Large successful Tool results become Tool Artifacts. | Runtime Core applies [tool_artifacts.py](../myclaw/tools/tool_artifacts.py) after Gateway execution and before Session persistence. | Threshold, status gating, immutable projection, raw bytes, preview, safe name, and failure normalization: [test_tool_artifacts.py](../tests/tools/test_tool_artifacts.py), [test_turn.py](../tests/agent/test_turn.py). |
-| US-31 | Tool Artifacts remain with their Session and are readable after resume. | [agent_home.py](../myclaw/config/agent_home.py), [tool_artifacts.py](../myclaw/tools/tool_artifacts.py), and [file_tools.py](../myclaw/tools/files/file_tools.py) enforce current-session artifact scope. | Durable references, accepted orphan behavior, and exact read exception: [test_tool_artifacts.py](../tests/tools/test_tool_artifacts.py), [test_security_filesystem.py](../tests/test_security_filesystem.py), [test_session_resume.py](../tests/sessions/test_session_resume.py). |
-| US-32 | Existing natural-language Scheduled Work continues to execute. | [scheduled_work_execution.py](../myclaw/schedule/scheduled_work_execution.py) loads persisted definitions and runs them. | Exact seven-field record and complete cron turns: [test_scheduled_work.py](../tests/scheduling/test_scheduled_work.py), [test_scheduled_work_execution.py](../tests/scheduling/test_scheduled_work_execution.py). |
-| US-33 | Creating Scheduled Work is refused while confirmation is unavailable. | [scheduled_work.py](../myclaw/schedule/scheduled_work.py) returns an explicit refusal through [tool_gateway.py](../myclaw/tools/tool_gateway.py). | Refusal allocates no ID and persists no record: [test_scheduled_work.py](../tests/scheduling/test_scheduled_work.py), [test_permission_loop.py](../tests/test_permission_loop.py). |
-| US-34 | Scheduled Work uses a task-specific Session. | [scheduled_work_execution.py](../myclaw/schedule/scheduled_work_execution.py) prepares and reuses the task's Session ID. | First/repeated trigger history, title, route, and failure isolation: [test_scheduled_work_execution.py](../tests/scheduling/test_scheduled_work_execution.py). |
-| US-35 | Scheduled Work completion is shown when the REPL is idle, never over foreground streaming. | [background_coordination.py](../myclaw/schedule/background_coordination.py) brokers foreground and background events for [repl.py](../myclaw/terminal/repl.py). | Idle display, global ordering, and queue-until-terminal behavior: [test_background_coordination.py](../tests/test_background_coordination.py), [test_events.py](../tests/agent/test_events.py). |
-| US-36 | `default`, `chat`, `memory`, and `cron` models can be configured separately. | Typed configuration is in [config.py](../myclaw/config/config.py), routing in [model_router.py](../myclaw/provider/model_router.py), and consumers in Runtime/Memory/Scheduled Work. | Route schema and route-specific calls: [test_config.py](../tests/configuration/test_config.py), [test_model_router.py](../tests/test_model_router.py), [test_memory_task.py](../tests/memory/test_memory_task.py), [test_scheduled_work_execution.py](../tests/scheduling/test_scheduled_work_execution.py). |
-| US-37 | An unavailable specific route falls back to `default`. | [model_router.py](../myclaw/provider/model_router.py) owns fallback and the shared attempt budget. | Static/dynamic fallback, recovery, and terminal no-fallback cases: [test_model_router.py](../tests/test_model_router.py), [test_runtime.py](../tests/test_runtime.py). |
-| US-38 | Anthropic and OpenAI-compatible providers are supported. | Official-SDK adapters are [provider/anthropic.py](../myclaw/provider/anthropic.py) and [provider/openai_compatible.py](../myclaw/provider/openai_compatible.py); factory wiring is in [runtime.py](../myclaw/agent/runtime.py). | Adapter streaming/tool/error contracts and factory selection: [test_anthropic_provider.py](../tests/test_anthropic_provider.py), [test_openai_compatible_provider.py](../tests/test_openai_compatible_provider.py), [test_provider_factory.py](../tests/test_provider_factory.py). Real-provider status is recorded below. |
-| US-39 | First run generates a configuration template. | [config.py](../myclaw/config/config.py) creates the template and [cli.py](../myclaw/terminal/cli.py) exits with edit guidance. | Create-once, atomic failure, and installed CLI behavior: [test_config.py](../tests/configuration/test_config.py), [test_cli.py](../tests/test_cli.py). |
-| US-40 | Invalid configuration makes `myclaw` exit clearly instead of entering a partial REPL. | Startup gating is in [cli.py](../myclaw/terminal/cli.py), [config.py](../myclaw/config/config.py), and [runtime.py](../myclaw/agent/runtime.py). | Parse/schema/default-route failures and exit behavior: [test_cli.py](../tests/test_cli.py), [test_config.py](../tests/configuration/test_config.py). |
-| US-41 | `myclaw config` remains usable for inspecting bad configuration. | [cli.py](../myclaw/terminal/cli.py) exposes the non-interactive command through [config.py](../myclaw/config/config.py). | Parse-invalid and schema-invalid content remains safely inspectable: [test_cli.py](../tests/test_cli.py), [test_management_commands.py](../tests/management/test_management_commands.py), [test_security_web_secrets.py](../tests/test_security_web_secrets.py). |
-| US-42 | Runtime Core only orchestrates replaceable model, Tool, and store boundaries. | [runtime.py](../myclaw/agent/runtime.py) composes domain Ports plus nominal [BaseTool](../myclaw/tools/base.py) capabilities registered in [tool_gateway.py](../myclaw/tools/tool_gateway.py). | Structural substitutability and injected boundary Runtime tests: [test_ports.py](../tests/architecture/test_ports.py), [test_module_boundaries.py](../tests/architecture/test_module_boundaries.py), [test_runtime.py](../tests/test_runtime.py). |
-| US-43 | Conversation Port emits typed Agent Events so CLI only interacts and renders. | The Conversation Port and its event types are in [events.py](../myclaw/agent/events.py); [conversation.py](../myclaw/session/conversation.py) emits them. | Exact event shapes/order plus REPL rendering: [test_events.py](../tests/agent/test_events.py), [test_conversation.py](../tests/sessions/test_conversation.py), [test_repl.py](../tests/test_repl.py). |
-| US-44 | Management Port handles management commands instead of disguising them as chat. | [commands.py](../myclaw/management/commands.py) owns the Management Port and dispatch, while [service.py](../myclaw/management/service.py) owns its views and implementation. | Built-ins bypass Conversation; unknown slash input remains chat: [test_management_commands.py](../tests/management/test_management_commands.py), [test_repl.py](../tests/test_repl.py), [test_models.py](../tests/management/test_models.py). |
-| US-45 | Tool Gateway uniformly parses, prepares, refuses, executes, retries, and normalizes calls. | [tool_gateway.py](../myclaw/tools/tool_gateway.py) consumes cached annotation-derived schemas and message-only Tool failures; [security.py](../myclaw/tools/security.py) owns shared access checks. | Raw JSON, coercion, unknown Tool, refusal, retry, cancellation, safe failure, and flat results: [test_tool_gateway_call.py](../tests/tools/test_tool_gateway_call.py), [test_tool_failure_semantics.py](../tests/test_tool_failure_semantics.py), [test_models.py](../tests/tools/test_models.py). |
-| US-46 | Provider adapters use official SDKs for streaming, Tool calls, and error semantics. | SDK dependencies are pinned in [pyproject.toml](../pyproject.toml); adapters are [provider/anthropic.py](../myclaw/provider/anthropic.py) and [provider/openai_compatible.py](../myclaw/provider/openai_compatible.py). | Injected official-client boundaries and factory selection: [test_anthropic_provider.py](../tests/test_anthropic_provider.py), [test_openai_compatible_provider.py](../tests/test_openai_compatible_provider.py), [test_provider_factory.py](../tests/test_provider_factory.py). |
-| US-47 | Fake Provider and fake Tool tests avoid real API dependencies. | Reusable boundaries are [fixtures/provider.py](../tests/fixtures/provider.py) and [fixtures/tool.py](../tests/fixtures/tool.py). | Their scripted behavior is verified by [test_fake_provider.py](../tests/test_fake_provider.py) and [test_fake_tool.py](../tests/test_fake_tool.py), then reused throughout the suite. |
-| US-48 | v0.1 excludes MCP and subagent spawning to stabilize the core Runtime boundary. | The accepted negative scope is explicit in [runtime contracts](myclaw-runtime-contracts.md) and the production catalog is fixed in [runtime.py](../myclaw/agent/runtime.py) / [tool_gateway.py](../myclaw/tools/tool_gateway.py); there is no MCP/subagent production module or catalog entry. | Exact built-in catalogs are characterized by [test_readonly_tool_loop.py](../tests/test_readonly_tool_loop.py), [test_web_search.py](../tests/tools/web/test_web_search.py), [test_shell_policy.py](../tests/tools/shell/test_shell_policy.py), and [test_scheduled_work.py](../tests/scheduling/test_scheduled_work.py). This is negative-scope evidence, not a claim that an absent feature was manually exercised. |
+## Manual And External Boundaries
 
-## Required Test Traceability
-
-The PRD contains 35 Required test bullets. Each row maps one bullet to maintained
-public or contract evidence; grouping multiple test files in one row does not
-merge or omit the requirement.
-
-| ID | PRD Required test | Evidence |
+| Check | Status | Reason |
 | --- | --- | --- |
-| RT-M01 | Short-term Memory is the suffix after the Consolidation Cursor. | Exact suffix behavior: [test_records.py](../tests/sessions/test_records.py); assembled history: [test_conversation_summary.py](../tests/memory/test_conversation_summary.py). |
-| RT-M02 | Both token-budget and total-message-count summary triggers. | [test_conversation_summary.py](../tests/memory/test_conversation_summary.py). |
-| RT-M03 | Cutoff aligns to a user message on the main and fallback paths. | [test_conversation_summary.py](../tests/memory/test_conversation_summary.py). |
-| RT-M04 | Summary JSONL has only `index`, `timestamp`, and `content`. | Exact keys: [test_records.py](../tests/memory/test_records.py); persistence/index behavior: [test_conversation_summary.py](../tests/memory/test_conversation_summary.py). |
-| RT-M05 | Summary generation excludes Long-term Memory and does not immediately trigger Memory Task. | [test_conversation_summary.py](../tests/memory/test_conversation_summary.py), [test_memory_scheduler.py](../tests/memory/test_memory_scheduler.py). |
-| RT-M06 | Chat fails when memory route and default fallback both fail. | [test_conversation_summary.py](../tests/memory/test_conversation_summary.py), [test_model_router.py](../tests/test_model_router.py). |
-| RT-M07 | `/dream` with no pending summaries does not call a model. | [test_memory_task.py](../tests/memory/test_memory_task.py). |
-| RT-M08 | Summary Cursor advances for no update/edit success and does not advance for edit failure. | [test_memory_task.py](../tests/memory/test_memory_task.py). |
-| RT-M09 | Memory Task batch size, cron, non-reentrancy, and restricted `edit_file` path. | [test_memory_task.py](../tests/memory/test_memory_task.py), [test_memory_scheduler.py](../tests/memory/test_memory_scheduler.py). |
-| RT-M10 | Runtime Long-term Memory cache differs intentionally from `/memory` latest-disk view. | [test_memory_scheduler.py](../tests/memory/test_memory_scheduler.py), [test_management_views.py](../tests/management/test_management_views.py). |
-| RT-S01 | Workspace slug generation. | Windows drive, POSIX root, UNC, normalization, and Unicode: [test_workspace.py](../tests/test_workspace.py). |
-| RT-S02 | Session ID/path, metadata first line, and OpenAI-style messages. | [test_time_and_identifiers.py](../tests/utils/test_time_and_identifiers.py), [test_records.py](../tests/sessions/test_records.py), [test_session_store.py](../tests/sessions/test_session_store.py). |
-| RT-S03 | Empty REPL does not persist a Session. | [test_repl.py](../tests/test_repl.py). |
-| RT-S04 | `/resume` lists only current-Workspace Sessions and switches correctly. | [test_session_resume.py](../tests/sessions/test_session_resume.py). |
-| RT-S05 | Ordinary messages append as one line; metadata rewrites atomically. | [test_session_store.py](../tests/sessions/test_session_store.py), [test_atomic_files.py](../tests/test_atomic_files.py). |
-| RT-S06 | Same-Runtime writes to one Session are serialized. | **PASS:** `test_same_runtime_concurrent_session_writes_preserve_every_record_and_usage` in [test_session_store.py](../tests/sessions/test_session_store.py) submits 12 concurrent assistant appends after one user record, then proves all 13 records reload in submission order without loss or duplication and with exact cumulative usage. |
-| RT-S07 | Title generation is asynchronous, has fallback, counts usage, and shares the Session write lock. | [test_session_title.py](../tests/sessions/test_session_title.py), [test_runtime_session_title.py](../tests/test_runtime_session_title.py). |
-| RT-S08 | Completed stream, interrupted partial, model failure, and Tool failure persistence rules. | [test_conversation.py](../tests/sessions/test_conversation.py), [test_repl.py](../tests/test_repl.py), [test_interrupted_tool_repair.py](../tests/test_interrupted_tool_repair.py), [test_security_fault_injection.py](../tests/test_security_fault_injection.py). |
-| RT-T01 | File defaults, internal-file write protection, and out-of-scope denial. | [test_readonly_tool_loop.py](../tests/test_readonly_tool_loop.py), [test_workspace_write_tools.py](../tests/tools/files/test_workspace_write_tools.py), [test_security_filesystem.py](../tests/test_security_filesystem.py). |
-| RT-T02 | Shell exact allowlist, Workspace cwd, and 60-600 second timeout validation. | [test_shell_policy.py](../tests/tools/shell/test_shell_policy.py), [test_shell_process.py](../tests/tools/shell/test_shell_process.py). |
-| RT-T03 | WebSearch enablement plus WebFetch private-network block, redirect recheck, and five-hop limit. | [test_web_search.py](../tests/tools/web/test_web_search.py), [test_web_fetch.py](../tests/tools/web/test_web_fetch.py). |
-| RT-T04 | Scheduled Work creation is refused before ID allocation or persistence. | [test_scheduled_work.py](../tests/scheduling/test_scheduled_work.py), [test_scheduled_work_execution.py](../tests/scheduling/test_scheduled_work_execution.py), [test_permission_loop.py](../tests/test_permission_loop.py). |
-| RT-T05 | Tool Artifact threshold, path, raw content, preview, and atomic write. | [test_tool_artifacts.py](../tests/tools/test_tool_artifacts.py), [test_atomic_files.py](../tests/test_atomic_files.py), [test_security_filesystem.py](../tests/test_security_filesystem.py). |
-| RT-T06 | Tool retries are bounded per capability; Web Tools use two and other built-ins use zero. | Retry timing, final failure, cancellation, and execute-once local Tools: [test_tool_gateway_call.py](../tests/tools/test_tool_gateway_call.py), [test_tool_failure_semantics.py](../tests/test_tool_failure_semantics.py), [test_web_search.py](../tests/tools/web/test_web_search.py), [test_web_fetch.py](../tests/tools/web/test_web_fetch.py). |
-| RT-P01 | Fake Anthropic/OpenAI-compatible adapter tests cover streaming, Tool calls, timeout, and error conversion. | [test_anthropic_provider.py](../tests/test_anthropic_provider.py), [test_openai_compatible_provider.py](../tests/test_openai_compatible_provider.py). |
-| RT-P02 | Chat route is streaming; memory/cron may complete without streaming. | [test_models.py](../tests/provider/test_models.py), [test_anthropic_provider.py](../tests/test_anthropic_provider.py), [test_openai_compatible_provider.py](../tests/test_openai_compatible_provider.py). |
-| RT-P03 | Route fallback, unknown route, unknown-protocol Provider, and unusable default. | [test_config.py](../tests/configuration/test_config.py), [test_model_router.py](../tests/test_model_router.py), [test_runtime.py](../tests/test_runtime.py). |
-| RT-P04 | Five-attempt exponential backoff and `retry-after`. | [test_model_router.py](../tests/test_model_router.py). |
-| RT-P05 | First run generates configuration and exits. | [test_config.py](../tests/configuration/test_config.py), [test_cli.py](../tests/test_cli.py). |
-| RT-P06 | Invalid configuration makes `myclaw` exit directly. | [test_cli.py](../tests/test_cli.py), [test_config.py](../tests/configuration/test_config.py). |
-| RT-P07 | `myclaw config` generation, complete display, and API-key redaction. | [test_cli.py](../tests/test_cli.py), [test_management_commands.py](../tests/management/test_management_commands.py), [test_security_web_secrets.py](../tests/test_security_web_secrets.py). |
-| RT-P08 | `/config`, `/status`, `/resume`, `/memory`, and `/dream`. | [test_management_commands.py](../tests/management/test_management_commands.py), [test_management_views.py](../tests/management/test_management_views.py), [test_session_resume.py](../tests/sessions/test_session_resume.py), [test_memory_task.py](../tests/memory/test_memory_task.py). |
-| RT-P09 | Non-built-in `/...` input is sent to the model. | [test_repl.py](../tests/test_repl.py), [test_management_commands.py](../tests/management/test_management_commands.py). |
-| RT-P10 | Ctrl+C, `exit`, `quit`, and REPL exit cancellation of background work. | [test_repl.py](../tests/test_repl.py), [test_runtime_shutdown.py](../tests/test_runtime_shutdown.py), [test_background_coordination.py](../tests/test_background_coordination.py). |
-| RT-P11 | Tests do not imply a cross-process coordination guarantee for multiple REPLs. | The explicit negative boundary is [ADR-0001](adr/0001-file-first-local-persistence.md) and [runtime contracts](myclaw-runtime-contracts.md). Automated tests cover separate in-process Runtime ownership in [test_runtime.py](../tests/test_runtime.py) and [test_background_coordination.py](../tests/test_background_coordination.py); no cross-process lock guarantee is asserted. |
+| Clean-wheel installation and installed CLI smoke | PASS | Performed in a new environment outside the checkout with Unicode paths. |
+| Real Anthropic conversation | NOT RUN | No dedicated release credential was supplied. |
+| Real OpenAI-compatible conversation | NOT RUN | No dedicated endpoint, model, and credential were supplied. |
+| Public web adapter smoke | NOT RUN | This candidate gate intentionally remained offline at the application boundary. |
 
-## Manual Acceptance Checklist
+Automated Provider tests cover routing, streaming, tool calls, timeout conversion,
+and retry behavior with injected clients. They are not represented as live service
+acceptance.
 
-These statuses describe actual manual or production-boundary execution available
-to this report, not automated substitutes.
+## Known Boundaries
 
-| Check | Status | Evidence / reason |
-| --- | --- | --- |
-| Install the built wheel into a clean Windows environment; run `myclaw` and `myclaw config`. | PASS | [Windows validation](release/windows-validation.md) records an isolated venv outside the checkout, `pip check`, first-start config generation, Unicode paths, `myclaw config`, and secret redaction. |
-| Install the built wheel into a clean POSIX environment; run the offline gates and CLI smoke. | PASS | [POSIX validation](release/posix-validation.md) records final licensed run `29214379231`: clean-wheel install and `pip check`, checkout-independent import, exact first-start exit/configuration assertions, and `myclaw config` from a Unicode Workspace all passed on Ubuntu 24.04.4/Python 3.12.13. |
-| Start `myclaw` with a dedicated real Provider configuration and complete a streamed multi-turn conversation. | NOT RUN | No dedicated release Provider credential/endpoint was supplied; local potential secrets were not inspected or used. |
-| Drive a long real-Provider conversation past the threshold and inspect automatic consolidation, preserved original messages, and continued context. | NOT RUN | No dedicated real-Provider release session was provisioned. Automated threshold, cutoff, cursor, recovery, and message-preservation evidence is mapped under US-22/US-23 and RT-M01 through RT-M06, but is not presented as manual acceptance. |
-| Verify automatic title generation, exit, restart, `/resume`, picker title/time, and resumed history with a real Provider. | NOT RUN | Depends on the dedicated real-Provider setup above. Automated coverage is listed under US-07 through US-10. |
-| Exercise `/config`, `/status`, `/memory`, and `/dream` interactively against a release Agent Home. | NOT RUN | No dedicated manual release Agent Home/provider session was provisioned. |
-| Approve and refuse Workspace file changes; confirm Agent Home and traversal denial. | NOT RUN | No separate manual destructive-safety Workspace was provisioned. Automated coverage is listed under US-25/US-26 and the [security review](security-fault-review.md). |
-| Exercise all five automatic Shell forms, one approved non-automatic command, and one background refusal. | NOT RUN | No dedicated manual Shell acceptance Workspace was provisioned. Platform process evidence belongs in the validation reports. |
-| Trigger Ctrl+C during streaming while Scheduled Work/Memory scheduling remains alive, then exit cleanly. | NOT RUN | Requires a real interactive Provider run and controlled background schedule. |
-| Create and observe Scheduled Work without interleaving its completion over foreground streaming. | NOT RUN | Requires a real interactive Provider run and controlled cron schedule. |
-| Run production WebSearch against a public query. | PASS | 2026-07-13 Windows host: `DuckDuckGoSearchBoundary` query `OpenAI official documentation` returned `results=2`; both result URLs were HTTPS. |
-| Run production WebFetch through real DNS and HTTP against a public URL. | PASS | 2026-07-13 Windows host: `PublicWebFetchBoundary(SocketDNSResolver + AioHttp client)` fetched `https://example.com/`; normalized text had `chars=142` and contained `Example`. |
+- Provider credentials remain plaintext in the user-owned configuration file;
+  display paths redact them, while operating-system account access remains the
+  protection boundary.
+- File-first persistence serializes work within one runtime but does not promise
+  coordination between multiple running MyClaw processes.
+- Shell policy is a narrow command policy, not a general filesystem or network
+  sandbox.
+- Tool artifacts and Long-term Memory have no automatic retention limit.
+- Same-user filesystem replacement can still race checks that precede an operating
+  system file operation.
 
-## External Smoke Evidence
-
-| Boundary | Status | Credential / network conditions | Evidence |
-| --- | --- | --- | --- |
-| Anthropic real Provider | NOT RUN | No dedicated release API key was supplied. The task did not authorize discovery or use of a local user's potential credential. | Official-SDK behavior is automated in [test_anthropic_provider.py](../tests/test_anthropic_provider.py), but that is not a paid live-API smoke. |
-| OpenAI-compatible real Provider | NOT RUN | No dedicated release base URL, model, and API key were supplied. No arbitrary local endpoint was assumed. | Official-SDK behavior is automated in [test_openai_compatible_provider.py](../tests/test_openai_compatible_provider.py), but that is not a live endpoint smoke. |
-| Production WebSearch | PASS | Credential-free DuckDuckGo adapter; outbound public HTTPS available from the Windows host on 2026-07-13. Search result ordering/content remains backend-dependent. | Query `OpenAI official documentation` returned two Provider-neutral results with HTTPS URLs. |
-| Production WebFetch | PASS | Credential-free request to public `https://example.com/`; real DNS and HTTP client used. No private/local target was contacted as part of release smoke. | Returned 142 normalized characters and contained `Example`. |
-
-The network PASS rows prove the production adapters could reach one public target
-from the recorded Windows environment. They do not guarantee future third-party
-availability, every proxy/DNS environment, or a live POSIX network path.
-
-## Known Risks
-
-- Provider API keys are stored as plaintext in the user-owned `config.toml`.
-  Management and CLI views redact them, but MyClaw does not provide an encrypted
-  credential store; host account and filesystem access remain the protection boundary.
-- Real Anthropic and OpenAI-compatible API smoke is `NOT RUN`. Adapter contracts,
-  routing, retry, streaming, and Tool calls are tested with injected official SDK
-  clients and fake Providers, but credentials, remote account policy, model
-  availability, and billing behavior remain unverified for this release record.
-- Same-user filesystem replacement can race final validation and OS I/O. Removing
-  that TOCTOU class requires handle-relative or OS-specific confinement.
-- Shell is not an OS filesystem/network sandbox. Workspace `cwd` validation and
-  the fixed allowlist are not a general confinement mechanism; Issue #38
-  temporarily refuses the broader commands that ADR-0003 expected foreground
-  confirmation to authorize.
-- File-first persistence has in-Runtime serialization but no cross-process
-  coordination. Multiple REPLs can race Session/summary state or duplicate
-  Scheduled Work triggers; see [ADR-0001](adr/0001-file-first-local-persistence.md).
-- Runtime Core does not roll back Tool Artifacts after later Session persistence
-  failure, so an unreferenced orphan can remain by design.
-- Long-term Memory has no configured size cap, so repeated accepted updates can
-  increase prompt and disk cost until the user edits or replaces the file.
-- Tool Artifacts have no automatic retention or garbage-collection policy. Normal
-  durable results can accumulate on disk and require user-managed cleanup.
-- Live WebSearch depends on a third-party backend, and public network/DNS/proxy
-  behavior varies by environment. WebFetch SSRF tests are injected and exhaustive
-  at the boundary, while the live smoke intentionally contacted only a public URL.
-- Cross-platform release claims are valid only to the extent recorded in
-  [Windows validation](release/windows-validation.md) and
-  [POSIX validation](release/posix-validation.md). This document does not infer a
-  platform PASS from another environment.
-
-## Release Decision Inputs
-
-**Current decision: READY.** The owner selected Apache License 2.0. The repository
-contains the official full `LICENSE`; PEP 639 package metadata declares SPDX
-`Apache-2.0` and `License-File: LICENSE`; installed-distribution, wheel, and sdist
-checks prove the license is bundled with the official normalized digest.
-
-The platform closure inputs are satisfied: both linked reports are `PASS` and record
-offline test/lint/format/type/package gates plus clean-wheel installation and CLI
-smoke. This document contains exactly 48 User Story rows and all 35 Required test
-rows, and every external/manual status remains truthful. A real paid Provider PASS is
-not fabricated; its explicit `NOT RUN` status and credential limitation are part of
-the acceptance record.
+Every required gate passed; this Windows x64 candidate is ready for release.

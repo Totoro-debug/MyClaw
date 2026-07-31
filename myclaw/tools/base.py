@@ -35,7 +35,9 @@ class BaseTool:
             or parameters[0].name != "self"
             or parameters[0].kind
             not in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
-            or any(parameter.kind is not inspect.Parameter.KEYWORD_ONLY for parameter in parameters[1:])
+            or any(
+                parameter.kind is not inspect.Parameter.KEYWORD_ONLY for parameter in parameters[1:]
+            )
         ):
             msg = "Concrete Tool execute() must accept only self and keyword parameters"
             raise TypeError(msg)

@@ -8,6 +8,7 @@ import pytest
 
 from myclaw.agent.events import AgentEvent
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -57,8 +58,7 @@ async def test_same_task_cancellation_after_tool_started_prevents_execution(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -143,8 +143,7 @@ async def test_same_task_cancellation_after_tool_completed_stops_model_continuat
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -239,8 +238,7 @@ async def test_tool_execution_cancellation_keeps_completed_and_repairs_remaining
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )

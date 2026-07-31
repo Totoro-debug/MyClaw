@@ -1,10 +1,7 @@
 import asyncio
 import base64
 import ctypes
-import os
-import shlex
 import shutil
-import signal
 import subprocess
 import sys
 from ctypes import wintypes
@@ -42,20 +39,17 @@ from tests.fixtures import ScriptedFakeProvider, StreamScript
 WINDOWS_NEW_GROUP_NO_WINDOW = 0x08000200
 
 
-def _platform_shell_command(arguments: list[str]) -> str:
-    if os.name == "nt":
-        return subprocess.list2cmdline(arguments)
-    return shlex.join(arguments)
+def _windows_shell_command(arguments: list[str]) -> str:
+    return subprocess.list2cmdline(arguments)
 
 
 def _python_shell_command(script: str) -> str:
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     loader = f"import base64; exec(base64.b64decode({encoded!r}))"
-    return _platform_shell_command([sys.executable, "-c", loader])
+    return _windows_shell_command([sys.executable, "-c", loader])
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(os.name != "nt", reason="Windows process flags only")
 async def test_windows_shell_bootstrap_isolated_from_foreground_interrupts(
     monkeypatch: pytest.MonkeyPatch,
     workspace: Path,
@@ -105,26 +99,12 @@ async def test_windows_shell_bootstrap_isolated_from_foreground_interrupts(
     assert job.assigned == [123]
 
 
-def _process_exists(pid: int) -> bool:
-    if os.name == "nt":
-        return _windows_process_exists(pid)
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
-
-
 def _windows_kernel32() -> ctypes.CDLL:
-    if sys.platform == "win32":
-        return ctypes.WinDLL("kernel32", use_last_error=True)
-    raise OSError("Win32 process inspection is unavailable on this platform")
+    return ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 def _windows_last_error() -> int:
-    if sys.platform == "win32":
-        return ctypes.get_last_error()
-    raise OSError("Windows error state is unavailable on this platform")
+    return ctypes.get_last_error()
 
 
 def _windows_process_exists(pid: int) -> bool:
@@ -148,6 +128,15 @@ def _windows_process_exists(pid: int) -> bool:
         return int(wait_for_single_object(handle, 0)) == wait_timeout
     finally:
         close_handle(handle)
+
+
+def _terminate_windows_process_tree(pid: int) -> None:
+    subprocess.run(
+        ("taskkill", "/PID", str(pid), "/T", "/F"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
 
 def _windows_handle_count() -> int:
@@ -177,7 +166,7 @@ async def _wait_for_path(path: Path) -> None:
 
 async def _wait_for_process_exit(pid: int) -> bool:
     for _ in range(300):
-        if not _process_exists(pid):
+        if not _windows_process_exists(pid):
             return True
         await asyncio.sleep(0.01)
     return False
@@ -193,7 +182,7 @@ async def test_process_liveness_probe_does_not_terminate_a_live_process() -> Non
         stderr=asyncio.subprocess.DEVNULL,
     )
     try:
-        assert _process_exists(process.pid)
+        assert _windows_process_exists(process.pid)
         await asyncio.sleep(0.05)
         assert process.returncode is None
     finally:
@@ -481,7 +470,6 @@ async def test_repeated_successful_commands_release_process_tree_ownership_befor
         await shell.close()
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Win32 process handles are Windows-specific")
 @pytest.mark.asyncio
 async def test_repeated_successful_commands_do_not_accumulate_windows_handles(
     workspace: Path,
@@ -556,7 +544,7 @@ async def test_allowlisted_git_commands_disable_pager_external_diff_and_textconv
 ) -> None:
     discovered_git = shutil.which("git")
     assert discovered_git is not None
-    executed = _platform_shell_command([str(Path(discovered_git).resolve(strict=True)), *arguments])
+    executed = _windows_shell_command([str(Path(discovered_git).resolve(strict=True)), *arguments])
     spawner = FakeProcessSpawner(FakeShellProcess(b"git output\n"))
     shell = SubprocessShellBoundary(spawner=spawner)
 
@@ -874,7 +862,7 @@ async def test_close_retries_cleanup_failed_after_cancellation_during_spawn(
 
 
 @pytest.mark.asyncio
-async def test_production_shell_boundary_executes_a_real_platform_shell_process(
+async def test_production_shell_boundary_executes_a_real_windows_shell_process(
     workspace: Path,
 ) -> None:
     shell = SubprocessShellBoundary()
@@ -902,7 +890,7 @@ async def test_production_shell_cancellation_leaves_no_grandchild_process(
         f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='utf-8'); "
         "time.sleep(60)"
     )
-    command = _platform_shell_command([sys.executable, "-c", script])
+    command = _windows_shell_command([sys.executable, "-c", script])
     shell = SubprocessShellBoundary()
     child_pid: int | None = None
     execution = asyncio.create_task(
@@ -918,8 +906,8 @@ async def test_production_shell_cancellation_leaves_no_grandchild_process(
             await asyncio.wait_for(execution, timeout=3)
         assert await _wait_for_process_exit(child_pid)
     finally:
-        if child_pid is not None and _process_exists(child_pid):
-            os.kill(child_pid, signal.SIGTERM)
+        if child_pid is not None and _windows_process_exists(child_pid):
+            _terminate_windows_process_tree(child_pid)
             await _wait_for_process_exit(child_pid)
         await shell.close()
 
@@ -954,8 +942,8 @@ async def test_shell_timeout_terminates_descendants_after_the_root_process_exits
             await execution
         assert await _wait_for_process_exit(child_pid)
     finally:
-        if child_pid is not None and _process_exists(child_pid):
-            os.kill(child_pid, signal.SIGTERM)
+        if child_pid is not None and _windows_process_exists(child_pid):
+            _terminate_windows_process_tree(child_pid)
             await _wait_for_process_exit(child_pid)
         if not execution.done():
             execution.cancel()
@@ -993,13 +981,13 @@ async def test_shell_execute_terminates_descendants_after_normal_root_completion
         assert await _wait_for_process_exit(child_pid)
         await shell.close()
     finally:
-        if child_pid is not None and _process_exists(child_pid):
-            os.kill(child_pid, signal.SIGTERM)
+        if child_pid is not None and _windows_process_exists(child_pid):
+            _terminate_windows_process_tree(child_pid)
             await _wait_for_process_exit(child_pid)
 
 
 @pytest.mark.asyncio
-async def test_tool_gateway_runs_allowlisted_pwd_through_the_platform_shell(
+async def test_tool_gateway_runs_allowlisted_pwd_through_the_windows_shell(
     agent_home: Path,
     workspace: Path,
 ) -> None:

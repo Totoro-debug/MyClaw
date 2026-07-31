@@ -1,7 +1,6 @@
 import asyncio
 import io
 import json
-import os
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -162,12 +161,11 @@ async def test_default_duckduckgo_process_isolated_from_foreground_interrupts(
 
     await AsyncioDuckDuckGoSearchProcessSpawner().spawn("runtime shutdown", 3)
 
-    if os.name == "nt":
-        assert options["start_new_session"] is False
-        assert options["creationflags"] == WINDOWS_NEW_GROUP_NO_WINDOW
-    else:
-        assert options["start_new_session"] is True
-        assert options["creationflags"] == 0
+    assert options == {
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+        "creationflags": WINDOWS_NEW_GROUP_NO_WINDOW,
+    }
 
 
 @pytest.mark.asyncio

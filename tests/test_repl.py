@@ -12,9 +12,11 @@ import pytest
 from rich.console import Console
 
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import ManagementViewService
+from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
@@ -187,8 +189,7 @@ async def test_repl_without_nonblank_user_input_leaves_prepared_session_in_memor
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -236,8 +237,7 @@ async def test_repl_exit_and_quit_ignore_case_and_whitespace_without_materializi
     ):
         clock = FakeClock(NOW)
         store = JsonlSessionStore(
-            agent_home=home,
-            workspace=Workspace.from_path(workspace),
+            workspace_state=WorkspaceState(Workspace.from_path(workspace)),
             now=clock.now,
             new_uuid=iter((session_uuid,)).__next__,
         )
@@ -280,8 +280,7 @@ async def test_repl_writes_each_text_delta_progressively_then_finishes_once(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -340,8 +339,7 @@ async def test_ctrl_c_during_stream_persists_partial_and_repl_runs_the_next_turn
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -452,8 +450,7 @@ async def test_task_cancellation_during_foreground_is_cleared_before_next_input(
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -501,10 +498,11 @@ async def test_repl_dispatches_handled_management_output_and_converses_on_unknow
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -538,7 +536,9 @@ async def test_repl_dispatches_handled_management_output_and_converses_on_unknow
         now=clock.now,
         new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
     )
-    dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
+    )
     writer = RecordingProgressiveWriter()
 
     await run_repl(

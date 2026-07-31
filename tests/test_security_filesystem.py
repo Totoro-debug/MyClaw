@@ -1,11 +1,11 @@
 import json
-import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import AssistantModelMessage
 from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
@@ -13,6 +13,7 @@ from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.security import Security
 from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.utils.atomic_files import path_for_io
 
 SESSION_ID = "20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"
 OTHER_SESSION_ID = "20260713-050000-000000_550e8400-e29b-41d4-a716-446655440000"
@@ -20,16 +21,11 @@ OTHER_SESSION_ID = "20260713-050000-000000_550e8400-e29b-41d4-a716-446655440000"
 
 def _read_file_gateway(*, agent_home: Path, workspace: Path) -> ToolGateway:
     workspace_identity = Workspace.from_path(workspace)
+    workspace_state = WorkspaceState(workspace_identity)
     security = Security(
         workspace=workspace_identity,
         agent_home=agent_home,
-        artifact_directory=(
-            agent_home
-            / "sessions"
-            / workspace_identity.slug
-            / "artifacts"
-            / SESSION_ID
-        ),
+        artifact_directory=workspace_state.sessions_directory / "artifacts" / SESSION_ID,
     )
     gateway = ToolGateway()
     gateway.register_tools(
@@ -42,27 +38,28 @@ def _read_file_gateway(*, agent_home: Path, workspace: Path) -> ToolGateway:
     return gateway
 
 
+def _workspace_state(workspace: Path) -> WorkspaceState:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    return state
+
+
+def _artifact_directory(workspace: Path, session_id: str = SESSION_ID) -> Path:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    return state.sessions_directory / "artifacts" / session_id
+
+
 def _create_directory_alias(alias: Path, target: Path) -> None:
-    try:
-        alias.symlink_to(target, target_is_directory=True)
-    except OSError as symlink_error:
-        if os.name != "nt":
-            pytest.skip(f"directory symlinks are unavailable on this host: {symlink_error}")
-        try:
-            subprocess.run(
-                ("cmd", "/c", "mklink", "/J", str(alias), str(target)),
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except (OSError, subprocess.CalledProcessError) as junction_error:
-            pytest.skip(f"directory aliases are unavailable on this host: {junction_error}")
+    subprocess.run(
+        ("cmd", "/c", "mklink", "/J", str(alias), str(target)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _long_path(path: Path) -> Path:
-    if os.name != "nt":
-        return path
-    return Path(f"\\\\?\\{path.absolute()}")
+    return path_for_io(path)
 
 
 def test_assistant_message_rejects_duplicate_tool_call_ids() -> None:
@@ -81,48 +78,51 @@ def test_assistant_message_rejects_duplicate_tool_call_ids() -> None:
         AssistantModelMessage(content="", tool_calls=(first, second))
 
 
-def test_agent_home_initialization_denies_an_external_memory_directory_alias(
-    agent_home: Path,
+def test_workspace_state_initialization_denies_an_external_memory_directory_alias(
+    workspace: Path,
 ) -> None:
-    agent_home.mkdir(parents=True)
-    outside = agent_home.parent / "outside-memory"
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.path.mkdir()
+    outside = workspace.parent / "outside-memory"
     outside.mkdir()
-    _create_directory_alias(agent_home / "memory", outside)
+    _create_directory_alias(state.memory_directory, outside)
 
-    with pytest.raises(PermissionError):
-        AgentHome(agent_home).initialize()
+    with pytest.raises(WorkspaceStateError) as captured:
+        state.initialize(agent_home_root=Path.home() / ".myclaw")
 
+    assert captured.value.path == state.memory_directory
     assert not (outside / "memory.md").exists()
 
 
-def test_agent_home_initialization_denies_an_external_sessions_directory_alias(
-    agent_home: Path,
+def test_workspace_state_initialization_denies_an_external_sessions_directory_alias(
+    workspace: Path,
 ) -> None:
-    agent_home.mkdir(parents=True)
-    outside = agent_home.parent / "outside-sessions"
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.path.mkdir()
+    outside = workspace.parent / "outside-sessions"
     outside.mkdir()
-    _create_directory_alias(agent_home / "sessions", outside)
+    _create_directory_alias(state.sessions_directory, outside)
 
-    with pytest.raises(PermissionError):
-        AgentHome(agent_home).initialize()
+    with pytest.raises(WorkspaceStateError) as captured:
+        state.initialize(agent_home_root=Path.home() / ".myclaw")
+
+    assert captured.value.path == state.sessions_directory
 
 
-def test_agent_home_initialization_denies_a_hard_linked_memory_file(
-    agent_home: Path,
+def test_workspace_state_initialization_denies_a_hard_linked_memory_file(
+    workspace: Path,
 ) -> None:
-    memory_directory = agent_home / "memory"
-    memory_directory.mkdir(parents=True)
-    outside = agent_home.parent / "outside-memory.md"
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.memory_directory.mkdir(parents=True)
+    outside = workspace.parent / "outside-memory.md"
     protected_content = b"outside memory must remain unchanged\n"
     outside.write_bytes(protected_content)
-    try:
-        (memory_directory / "memory.md").hardlink_to(outside)
-    except OSError as error:
-        pytest.skip(f"file hard links are unavailable on this host: {error}")
+    state.long_term_memory_path.hardlink_to(outside)
 
-    with pytest.raises(PermissionError):
-        AgentHome(agent_home).initialize()
+    with pytest.raises(WorkspaceStateError) as captured:
+        state.initialize(agent_home_root=Path.home() / ".myclaw")
 
+    assert captured.value.path == state.long_term_memory_path
     assert outside.read_bytes() == protected_content
 
 
@@ -135,10 +135,7 @@ async def test_read_file_denies_a_hard_link_to_an_external_file(
     secret = "EXTERNAL SECRET MUST NOT BE READ"
     outside.write_text(secret, encoding="utf-8")
     alias = workspace / "external-alias.txt"
-    try:
-        alias.hardlink_to(outside)
-    except OSError as error:
-        pytest.skip(f"file hard links are unavailable on this host: {error}")
+    alias.hardlink_to(outside)
     gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
     result = await gateway.call(
@@ -163,10 +160,7 @@ async def test_search_files_skips_hard_links_to_external_files(
     secret = "SEARCH SECRET MUST NOT BE READ"
     outside.write_text(secret, encoding="utf-8")
     alias = workspace / "search-alias.txt"
-    try:
-        alias.hardlink_to(outside)
-    except OSError as error:
-        pytest.skip(f"file hard links are unavailable on this host: {error}")
+    alias.hardlink_to(outside)
     gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
     result = await gateway.call(
@@ -190,10 +184,7 @@ async def test_list_files_omits_hard_links_to_external_files(
     outside = workspace.parent / "outside-list-secret.txt"
     outside.write_text("outside", encoding="utf-8")
     alias = workspace / "list-alias.txt"
-    try:
-        alias.hardlink_to(outside)
-    except OSError as error:
-        pytest.skip(f"file hard links are unavailable on this host: {error}")
+    alias.hardlink_to(outside)
     gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
     result = await gateway.call(
@@ -214,12 +205,11 @@ def test_tool_artifact_publication_denies_an_external_directory_alias(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    raw_result = "PRIVATE ARTIFACT CONTENT MUST STAY IN AGENT HOME"
-    outside = agent_home.parent / "outside-artifacts"
+    workspace_state = _workspace_state(workspace)
+    raw_result = "PRIVATE ARTIFACT CONTENT MUST STAY IN WORKSPACE STATE"
+    outside = workspace.parent / "outside-artifacts"
     outside.mkdir()
-    sessions = agent_home / "sessions"
-    sessions.rmdir()
-    _create_directory_alias(sessions, outside)
+    _create_directory_alias(workspace_state.sessions_directory / "artifacts", outside)
     result = ToolResult(
         tool_call_id="call_external_artifact_alias",
         name="read_file",
@@ -231,8 +221,7 @@ def test_tool_artifact_publication_denies_an_external_directory_alias(
     with pytest.raises(ArtifactWriteError):
         externalize_tool_result(
             result,
-            agent_home=agent_home,
-            workspace=Workspace.from_path(workspace),
+            workspace_state=workspace_state,
             session_id=SESSION_ID,
             max_tool_result_chars=1,
         )
@@ -246,6 +235,7 @@ def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    workspace_state = _workspace_state(workspace)
     first_content = "FIRST PRIVATE ARTIFACT"
     second_content = "SECOND PRIVATE ARTIFACT"
     first = ToolResult(
@@ -265,28 +255,19 @@ def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
 
     externalize_tool_result(
         first,
-        agent_home=agent_home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=workspace_state,
         session_id=SESSION_ID,
         max_tool_result_chars=1,
     )
     with pytest.raises(ArtifactWriteError):
         externalize_tool_result(
             second,
-            agent_home=agent_home,
-            workspace=Workspace.from_path(workspace),
+            workspace_state=workspace_state,
             session_id=SESSION_ID,
             max_tool_result_chars=1,
         )
 
-    artifact_path = _long_path(
-        agent_home
-        / "sessions"
-        / Workspace.from_path(workspace).slug
-        / "artifacts"
-        / SESSION_ID
-        / "reused-call.txt"
-    )
+    artifact_path = _long_path(_artifact_directory(workspace) / "reused-call.txt")
     assert artifact_path.read_text(encoding="utf-8") == first_content
 
 
@@ -295,6 +276,7 @@ def test_tool_artifact_externalization_returns_a_new_immutable_result(
     workspace: Path,
 ) -> None:
     AgentHome(agent_home).initialize()
+    workspace_state = _workspace_state(workspace)
     raw_result = "PERSISTED RAW ARTIFACT"
     original = ToolResult(
         tool_call_id="call_immutable",
@@ -306,20 +288,12 @@ def test_tool_artifact_externalization_returns_a_new_immutable_result(
 
     projected = externalize_tool_result(
         original,
-        agent_home=agent_home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=workspace_state,
         session_id=SESSION_ID,
         max_tool_result_chars=1,
     )
 
-    artifact_path = _long_path(
-        agent_home
-        / "sessions"
-        / Workspace.from_path(workspace).slug
-        / "artifacts"
-        / SESSION_ID
-        / "call_immutable.txt"
-    )
+    artifact_path = _long_path(_artifact_directory(workspace) / "call_immutable.txt")
     assert projected is not original
     assert original.content == raw_result
     assert original.artifact is None
@@ -328,7 +302,6 @@ def test_tool_artifact_externalization_returns_a_new_immutable_result(
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(os.name != "nt", reason="NTFS alternate streams are Windows-only")
 async def test_read_file_denies_a_windows_alternate_data_stream(
     agent_home: Path,
     workspace: Path,
@@ -353,10 +326,11 @@ async def test_read_file_denies_a_windows_alternate_data_stream(
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(os.name != "nt", reason="Windows device paths are Windows-only")
+@pytest.mark.parametrize("device_path", ("NUL", "CON.txt", "LPT1.", "COM9 "))
 async def test_read_file_denies_a_windows_device_path(
     agent_home: Path,
     workspace: Path,
+    device_path: str,
 ) -> None:
     gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
@@ -364,7 +338,7 @@ async def test_read_file_denies_a_windows_device_path(
         ModelToolCall(
             id="call_read_windows_device",
             name="read_file",
-            arguments='{"path":"NUL"}',
+            arguments=json.dumps({"path": device_path}),
         )
     )
 
@@ -399,26 +373,67 @@ async def test_read_file_prioritizes_agent_home_protection_inside_the_workspace(
 
 @pytest.mark.asyncio
 async def test_read_file_allows_exact_long_term_memory_inside_the_workspace(
-    tmp_path: Path,
+    agent_home: Path,
+    workspace: Path,
 ) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    agent_home = workspace / ".myclaw"
-    memory = agent_home / "memory" / "memory.md"
-    memory.parent.mkdir(parents=True)
-    memory.write_text("# Long-term Memory\n", encoding="utf-8")
+    state = _workspace_state(workspace)
+    state.long_term_memory_path.write_text("# Long-term Memory\n", encoding="utf-8")
     gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
 
     result = await gateway.call(
         ModelToolCall(
             id="call_read_long_term_memory",
             name="read_file",
+            arguments='{"path":"memory/memory.md"}',
+        )
+    )
+
+    direct_relative = await gateway.call(
+        ModelToolCall(
+            id="call_read_direct_long_term_memory",
+            name="read_file",
             arguments='{"path":".myclaw/memory/memory.md"}',
+        )
+    )
+    direct_absolute = await gateway.call(
+        ModelToolCall(
+            id="call_read_absolute_long_term_memory",
+            name="read_file",
+            arguments=json.dumps({"path": str(state.long_term_memory_path)}),
         )
     )
 
     assert result.status == "success"
     assert result.content == "# Long-term Memory"
+    assert (direct_relative.status, direct_absolute.status) == ("error", "error")
+    assert all(
+        denied.content == "Workspace State internal files are not readable by file Tools."
+        for denied in (direct_relative, direct_absolute)
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_agent_home_memory_remains_untouched_and_unread(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    legacy = agent_home / "memory" / "memory.md"
+    legacy.parent.mkdir(parents=True)
+    legacy_bytes = b"legacy Agent Home memory secret"
+    legacy.write_bytes(legacy_bytes)
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
+
+    direct = await gateway.call(
+        ModelToolCall(
+            id="call_read_legacy_memory",
+            name="read_file",
+            arguments=json.dumps({"path": str(legacy)}),
+        )
+    )
+
+    assert direct.status == "error"
+    assert "legacy Agent Home memory secret" not in direct.content
+    assert legacy.read_bytes() == legacy_bytes
 
 
 @pytest.mark.asyncio
@@ -452,14 +467,8 @@ async def test_read_file_allows_the_current_session_artifact_reference(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    artifact = _long_path(
-        agent_home
-        / "sessions"
-        / Workspace.from_path(workspace).slug
-        / "artifacts"
-        / SESSION_ID
-        / "call_result.txt"
-    )
+    _workspace_state(workspace)
+    artifact = _long_path(_artifact_directory(workspace) / "call_result.txt")
     artifact.parent.mkdir(parents=True)
     artifact.write_text("current session artifact", encoding="utf-8")
     gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
@@ -468,9 +477,7 @@ async def test_read_file_allows_the_current_session_artifact_reference(
         ModelToolCall(
             id="call_read_current_artifact",
             name="read_file",
-            arguments=json.dumps(
-                {"path": f"artifacts/{SESSION_ID}/call_result.txt"}
-            ),
+            arguments=json.dumps({"path": f"artifacts/{SESSION_ID}/call_result.txt"}),
         )
     )
 
@@ -484,13 +491,12 @@ async def test_read_file_denies_an_aliased_current_session_artifact_directory(
     workspace: Path,
 ) -> None:
     agent_home.mkdir(parents=True)
+    _workspace_state(workspace)
     protected_directory = agent_home / "protected-artifacts"
     protected_directory.mkdir()
     secret = "OTHER AGENT HOME ARTIFACT SECRET"
     (protected_directory / "call_result.txt").write_text(secret, encoding="utf-8")
-    artifact_directory = _long_path(
-        agent_home / "sessions" / Workspace.from_path(workspace).slug / "artifacts" / SESSION_ID
-    )
+    artifact_directory = _long_path(_artifact_directory(workspace))
     artifact_directory.parent.mkdir(parents=True)
     _create_directory_alias(artifact_directory, _long_path(protected_directory))
     gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
@@ -499,15 +505,89 @@ async def test_read_file_denies_an_aliased_current_session_artifact_directory(
         ModelToolCall(
             id="call_read_aliased_current_artifact",
             name="read_file",
-            arguments=json.dumps(
-                {"path": f"artifacts/{SESSION_ID}/call_result.txt"}
-            ),
+            arguments=json.dumps({"path": f"artifacts/{SESSION_ID}/call_result.txt"}),
         )
     )
 
     assert result.status == "error"
     assert result.content == "Agent Home internal state is not readable by file Tools."
     assert secret not in result.content
+
+
+@pytest.mark.asyncio
+async def test_read_file_denies_other_session_and_direct_workspace_state_artifacts(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    _workspace_state(workspace)
+    current = _long_path(_artifact_directory(workspace) / "current.txt")
+    other = _long_path(_artifact_directory(workspace, OTHER_SESSION_ID) / "other.txt")
+    for path, content in ((current, "current artifact"), (other, "other artifact secret")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
+
+    direct_relative = await gateway.call(
+        ModelToolCall(
+            id="call_direct_state_artifact",
+            name="read_file",
+            arguments=json.dumps({"path": f".myclaw/sessions/artifacts/{SESSION_ID}/current.txt"}),
+        )
+    )
+    direct_absolute = await gateway.call(
+        ModelToolCall(
+            id="call_absolute_state_artifact",
+            name="read_file",
+            arguments=json.dumps({"path": str(current)}),
+        )
+    )
+    other_alias = await gateway.call(
+        ModelToolCall(
+            id="call_other_session_artifact",
+            name="read_file",
+            arguments=json.dumps({"path": f"artifacts/{OTHER_SESSION_ID}/other.txt"}),
+        )
+    )
+
+    assert {direct_relative.status, direct_absolute.status, other_alias.status} == {"error"}
+    assert all(
+        result.content == "Workspace State internal files are not readable by file Tools."
+        for result in (direct_relative, direct_absolute, other_alias)
+    )
+    assert "other artifact secret" not in str((direct_relative, direct_absolute, other_alias))
+
+
+@pytest.mark.asyncio
+async def test_legacy_agent_home_artifact_remains_untouched_and_unread(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    legacy = _long_path(
+        agent_home / "sessions" / "legacy-workspace-slug" / "artifacts" / SESSION_ID / "legacy.txt"
+    )
+    legacy.parent.mkdir(parents=True)
+    legacy_bytes = b"legacy Agent Home artifact secret"
+    legacy.write_bytes(legacy_bytes)
+    gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
+
+    alias = await gateway.call(
+        ModelToolCall(
+            id="call_legacy_artifact_alias",
+            name="read_file",
+            arguments=json.dumps({"path": f"artifacts/{SESSION_ID}/legacy.txt"}),
+        )
+    )
+    direct = await gateway.call(
+        ModelToolCall(
+            id="call_legacy_artifact_direct",
+            name="read_file",
+            arguments=json.dumps({"path": str(legacy)}),
+        )
+    )
+
+    assert (alias.status, direct.status) == ("error", "error")
+    assert "legacy Agent Home artifact secret" not in alias.content + direct.content
+    assert legacy.read_bytes() == legacy_bytes
 
 
 @pytest.mark.asyncio
@@ -523,7 +603,7 @@ async def test_list_files_filters_nested_agent_home_state_by_read_scope(
         "memory/summary.jsonl",
         "memory/.cursor",
         "sessions/workspace/session.jsonl",
-        f"sessions/{Workspace.from_path(workspace).slug}/artifacts/{OTHER_SESSION_ID}/other.txt",
+        f"sessions/legacy-workspace-slug/artifacts/{OTHER_SESSION_ID}/other.txt",
         "scheduled-work.json",
     )
     for relative in protected_paths:
@@ -532,14 +612,7 @@ async def test_list_files_filters_nested_agent_home_state_by_read_scope(
         target.write_text("protected", encoding="utf-8")
     memory = agent_home / "memory" / "memory.md"
     memory.write_text("allowed memory", encoding="utf-8")
-    artifact = _long_path(
-        agent_home
-        / "sessions"
-        / Workspace.from_path(workspace).slug
-        / "artifacts"
-        / SESSION_ID
-        / "current.txt"
-    )
+    artifact = _long_path(agent_home / "sessions" / "artifacts" / SESSION_ID / "current.txt")
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text("allowed artifact", encoding="utf-8")
     gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
@@ -553,9 +626,7 @@ async def test_list_files_filters_nested_agent_home_state_by_read_scope(
     )
 
     assert result.status == "success"
-    assert result.content == (
-        f"artifacts/{SESSION_ID}/\nartifacts/{SESSION_ID}/current.txt\nlocal.txt\nmemory/memory.md"
-    )
+    assert result.content == "local.txt"
 
 
 @pytest.mark.asyncio
@@ -570,7 +641,7 @@ async def test_search_files_filters_nested_agent_home_state_by_read_scope(
         "config.toml",
         "memory/summary.jsonl",
         "sessions/workspace/session.jsonl",
-        f"sessions/{Workspace.from_path(workspace).slug}/artifacts/{OTHER_SESSION_ID}/other.txt",
+        f"sessions/legacy-workspace-slug/artifacts/{OTHER_SESSION_ID}/other.txt",
         "scheduled-work.json",
     )
     for relative in protected_paths:
@@ -579,14 +650,7 @@ async def test_search_files_filters_nested_agent_home_state_by_read_scope(
         target.write_text("scope needle protected", encoding="utf-8")
     memory = agent_home / "memory" / "memory.md"
     memory.write_text("scope needle memory", encoding="utf-8")
-    artifact = _long_path(
-        agent_home
-        / "sessions"
-        / Workspace.from_path(workspace).slug
-        / "artifacts"
-        / SESSION_ID
-        / "current.txt"
-    )
+    artifact = _long_path(agent_home / "sessions" / "artifacts" / SESSION_ID / "current.txt")
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text("scope needle current", encoding="utf-8")
     gateway = _read_file_gateway(agent_home=agent_home, workspace=workspace)
@@ -600,8 +664,4 @@ async def test_search_files_filters_nested_agent_home_state_by_read_scope(
     )
 
     assert result.status == "success"
-    assert result.content == (
-        f"artifacts/{SESSION_ID}/current.txt:1:scope needle current\n"
-        "local.txt:1:scope needle local\n"
-        "memory/memory.md:1:scope needle memory"
-    )
+    assert result.content == "local.txt:1:scope needle local"

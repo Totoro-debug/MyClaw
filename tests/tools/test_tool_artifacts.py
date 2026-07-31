@@ -1,4 +1,3 @@
-import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -7,6 +6,7 @@ import pytest
 
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import (
     MemoryConfiguration,
@@ -36,6 +36,7 @@ from myclaw.tools.models import (
 )
 from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.utils.atomic_files import path_for_io
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 
 SESSION_ID = "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000"
@@ -87,9 +88,18 @@ def _runtime_configuration(*, max_tool_result_chars: int) -> UserConfiguration:
 
 
 def _long_path(path: Path) -> Path:
-    if os.name != "nt":
-        return path
-    return Path(f"\\\\?\\{path.absolute()}")
+    return path_for_io(path)
+
+
+def _workspace_state(workspace: Path) -> WorkspaceState:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    return state
+
+
+def _artifact_directory(*, workspace: Path, session_id: str) -> Path:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    return _long_path(state.sessions_directory / "artifacts" / session_id)
 
 
 def test_runtime_externalizes_only_success_results_over_the_configured_threshold(
@@ -97,6 +107,7 @@ def test_runtime_externalizes_only_success_results_over_the_configured_threshold
     workspace: Path,
 ) -> None:
     AgentHome(agent_home).initialize()
+    workspace_state = _workspace_state(workspace)
     exact_result = "a" * 2000
     expected_preview = "b" * 2000
     oversized_result = expected_preview + "!"
@@ -117,15 +128,14 @@ def test_runtime_externalizes_only_success_results_over_the_configured_threshold
 
     exact_projected = externalize_tool_result(
         exact,
-        agent_home=agent_home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=workspace_state,
         session_id=SESSION_ID,
         max_tool_result_chars=2000,
     )
+    assert not (workspace_state.sessions_directory / "artifacts").exists()
     oversized_projected = externalize_tool_result(
         oversized,
-        agent_home=agent_home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=workspace_state,
         session_id=SESSION_ID,
         max_tool_result_chars=2000,
     )
@@ -142,13 +152,7 @@ def test_runtime_externalizes_only_success_results_over_the_configured_threshold
         "total_chars": 2001,
         "preview_chars": 2000,
     }
-    artifact_directory = _long_path(
-        agent_home
-        / "sessions"
-        / Workspace.from_path(workspace).slug
-        / "artifacts"
-        / SESSION_ID
-    )
+    artifact_directory = _artifact_directory(workspace=workspace, session_id=SESSION_ID)
     assert sorted(path.name for path in artifact_directory.iterdir()) == ["call_over.txt"]
     assert (artifact_directory / "call_over.txt").read_text(encoding="utf-8") == oversized_result
 
@@ -232,7 +236,10 @@ async def test_runtime_persists_unicode_preview_and_safely_encoded_artifact_refe
     model_tool_message = second_request.messages[-1]
     assert isinstance(model_tool_message, ToolModelMessage)
     assert model_tool_message.content == expected_content
-    artifact_directory = _long_path(runtime.sessions.directory / "artifacts" / runtime.session_id)
+    artifact_directory = _artifact_directory(
+        workspace=workspace,
+        session_id=runtime.session_id,
+    )
     assert [path.name for path in artifact_directory.iterdir()] == [f"{encoded_tool_call_id}.txt"]
     assert (artifact_directory / f"{encoded_tool_call_id}.txt").read_text(
         encoding="utf-8"
@@ -248,8 +255,7 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=uuid4,
     )
@@ -310,8 +316,7 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
         tool_gateway=gateway,
         externalize_result=lambda result: externalize_tool_result(
             result,
-            agent_home=agent_home,
-            workspace=Workspace.from_path(workspace),
+            workspace_state=store.workspace_state,
             session_id=session.id,
             max_tool_result_chars=2000,
             write_text=unavailable_artifact_boundary,
@@ -343,7 +348,10 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
     model_tool_message = second_request.messages[-1]
     assert isinstance(model_tool_message, ToolModelMessage)
     assert model_tool_message.content == "inspect result could not be stored."
-    artifact_directory = _long_path(store.directory / "artifacts" / session.id)
+    artifact_directory = _artifact_directory(
+        workspace=workspace,
+        session_id=session.id,
+    )
     assert list(artifact_directory.iterdir()) == []
     content = _runtime_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
@@ -378,8 +386,7 @@ def test_invalid_empty_tool_call_id_fails_before_writing_an_artifact(
     with pytest.raises(ArtifactWriteError):
         externalize_tool_result(
             result,
-            agent_home=agent_home,
-            workspace=Workspace.from_path(workspace),
+            workspace_state=_workspace_state(workspace),
             session_id=SESSION_ID,
             max_tool_result_chars=1,
             write_text=lambda path, content: writes.append((path, content)),
@@ -403,8 +410,7 @@ def test_windows_reserved_tool_call_id_uses_canonical_safe_filename(
     )
     result = externalize_tool_result(
         original,
-        agent_home=agent_home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=_workspace_state(workspace),
         session_id=SESSION_ID,
         max_tool_result_chars=1,
         write_text=lambda path, content: writes.append((path, content)),
@@ -417,3 +423,42 @@ def test_windows_reserved_tool_call_id_uses_canonical_safe_filename(
     assert result.artifact.path == expected_path
     assert [path.name for path, _ in writes] == ["%43%4F%4E.txt"]
     assert writes[0][1] == raw_result
+
+
+def test_same_session_artifacts_are_workspace_isolated_and_legacy_bytes_are_untouched(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    other_workspace = workspace.parent / "other-workspace"
+    other_workspace.mkdir()
+    first_state = _workspace_state(workspace)
+    second_state = _workspace_state(other_workspace)
+    legacy = agent_home / "sessions" / "legacy-workspace" / "artifacts" / SESSION_ID / "same.txt"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy artifact bytes")
+
+    for state, content in (
+        (first_state, "first workspace artifact"),
+        (second_state, "second workspace artifact"),
+    ):
+        externalize_tool_result(
+            ToolResult(
+                tool_call_id="same",
+                name="inspect",
+                status="success",
+                content=content,
+                artifact=None,
+            ),
+            workspace_state=state,
+            session_id=SESSION_ID,
+            max_tool_result_chars=1,
+        )
+
+    relative = Path("artifacts") / SESSION_ID / "same.txt"
+    assert (first_state.sessions_directory / relative).read_text(encoding="utf-8") == (
+        "first workspace artifact"
+    )
+    assert (second_state.sessions_directory / relative).read_text(encoding="utf-8") == (
+        "second workspace artifact"
+    )
+    assert legacy.read_bytes() == b"legacy artifact bytes"

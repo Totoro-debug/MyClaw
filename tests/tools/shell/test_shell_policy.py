@@ -132,9 +132,7 @@ async def test_frozen_read_only_shell_commands_execute_through_gateway(
 
     assert result.status == "success"
     assert result.content == f"completed {command}"
-    assert shell.requests == [
-        ShellRequest(command=command, cwd=workspace.resolve(), timeout=60)
-    ]
+    assert shell.requests == [ShellRequest(command=command, cwd=workspace.resolve(), timeout=60)]
 
 
 @pytest.mark.asyncio
@@ -332,9 +330,9 @@ async def test_runtime_shell_enablement_controls_catalog_and_system_guidance(
     request = provider.stream_requests[0]
     assert isinstance(request, ModelRequest)
     names = [schema["function"]["name"] for schema in request.tools]
-    guidance = request.system_prompt.split("<tool_guidance>\n", 1)[1].split(
-        "</tool_guidance>", 1
-    )[0]
+    guidance = request.system_prompt.split("<tool_guidance>\n", 1)[1].split("</tool_guidance>", 1)[
+        0
+    ]
     assert ("shell" in names) is enabled
     assert ("- shell:" in guidance) is enabled
     if enabled:

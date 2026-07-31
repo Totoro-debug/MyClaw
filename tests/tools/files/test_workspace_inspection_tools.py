@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.files.file_tools import (
@@ -21,12 +22,11 @@ SESSION_ID = "20260727-120000-000000_550e8400-e29b-41d4-a716-446655440000"
 
 def _tools(*, agent_home: Path, workspace: Path) -> tuple[ListFilesTool, SearchFilesTool]:
     identity = Workspace.from_path(workspace)
+    state = WorkspaceState(identity)
     security = Security(
         workspace=identity,
         agent_home=agent_home,
-        artifact_directory=(
-            agent_home / "sessions" / identity.slug / "artifacts" / SESSION_ID
-        ),
+        artifact_directory=state.sessions_directory / "artifacts" / SESSION_ID,
     )
     return ListFilesTool(security=security), SearchFilesTool(security=security)
 
@@ -230,6 +230,57 @@ async def test_gateway_prepares_defaults_nullable_glob_and_ignores_unknown_argum
 
 
 @pytest.mark.asyncio
+async def test_workspace_state_is_omitted_and_rejected_by_listing_and_search(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    (workspace / "public.txt").write_text("isolation needle public\n", encoding="utf-8")
+    state_session = workspace / ".myclaw" / "sessions" / "private.jsonl"
+    state_session.parent.mkdir(parents=True)
+    state_session.write_text("isolation needle private\n", encoding="utf-8")
+    list_files, search_files = _tools(agent_home=agent_home, workspace=workspace)
+    gateway = ToolGateway()
+    gateway.register_tools((list_files, search_files))
+
+    listing = await gateway.call(
+        ModelToolCall(
+            id="call_list_workspace_state",
+            name="list_files",
+            arguments='{"path":".","recursive":true}',
+        )
+    )
+    search = await gateway.call(
+        ModelToolCall(
+            id="call_search_workspace_state",
+            name="search_files",
+            arguments='{"query":"isolation needle","path":"."}',
+        )
+    )
+    direct_listing = await gateway.call(
+        ModelToolCall(
+            id="call_list_workspace_state_direct",
+            name="list_files",
+            arguments='{"path":".myclaw"}',
+        )
+    )
+    direct_search = await gateway.call(
+        ModelToolCall(
+            id="call_search_workspace_state_direct",
+            name="search_files",
+            arguments='{"query":"isolation needle","path":".myclaw"}',
+        )
+    )
+
+    assert listing.status == "success"
+    assert listing.content == "public.txt"
+    assert search.status == "success"
+    assert search.content == "public.txt:1:isolation needle public"
+    assert (direct_listing.status, direct_search.status) == ("error", "error")
+    assert "Workspace State" in direct_listing.content
+    assert direct_search.content == direct_listing.content
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "arguments",
     (
@@ -268,12 +319,11 @@ async def test_read_file_failure_logs_once_without_path_content_or_boundary_deta
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     identity = Workspace.from_path(workspace)
+    state = WorkspaceState(identity)
     security = Security(
         workspace=identity,
         agent_home=agent_home,
-        artifact_directory=(
-            agent_home / "sessions" / identity.slug / "artifacts" / SESSION_ID
-        ),
+        artifact_directory=state.sessions_directory / "artifacts" / SESSION_ID,
     )
     target = workspace / "RAW_TOOL_PATH_51.txt"
     target.write_text("RAW_FILE_CONTENT_51", encoding="utf-8")

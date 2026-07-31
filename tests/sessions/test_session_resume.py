@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +11,7 @@ from myclaw.agent.events import AgentEvent
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import prepare_repl_runtime, unavailable_provider_factory
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ProviderConfiguration
 from myclaw.management.commands import ManagementCommandDispatcher
@@ -37,6 +37,7 @@ from myclaw.session.records import (
 )
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore, SessionListingReport
+from myclaw.utils.atomic_files import path_for_io
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
@@ -68,8 +69,7 @@ async def test_session_picker_lists_only_current_workspace_with_stable_summaries
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((OLDER_SESSION_UUID, NEWER_SESSION_UUID)).__next__,
     )
@@ -106,8 +106,7 @@ async def test_session_picker_lists_only_current_workspace_with_stable_summaries
 
     other_workspace = workspace.parent / "other-workspace"
     other_sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(other_workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(other_workspace)),
         now=clock.now,
         new_uuid=iter((OTHER_WORKSPACE_SESSION_UUID,)).__next__,
     )
@@ -144,13 +143,12 @@ async def test_session_picker_lists_only_current_workspace_with_stable_summaries
 @pytest.mark.asyncio
 async def test_session_picker_skips_corrupt_sessions_without_modifying_them(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter(
             (
@@ -203,13 +201,12 @@ async def test_session_picker_skips_corrupt_sessions_without_modifying_them(
 @pytest.mark.asyncio
 async def test_management_listing_warns_once_for_each_skipped_session_entry(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -245,10 +242,10 @@ async def test_management_listing_warns_once_for_each_skipped_session_entry(
 @pytest.mark.asyncio
 async def test_unavailable_session_listing_records_one_management_error(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
 
     class FailingListingStore:
         async def scan_for_workspace(self, candidate: Path) -> SessionListingReport:
@@ -286,13 +283,12 @@ async def test_unavailable_session_listing_records_one_management_error(
 @pytest.mark.asyncio
 async def test_resume_load_failure_records_one_error_and_keeps_safe_command_output(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     persisted = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -332,7 +328,9 @@ async def test_resume_load_failure_records_one_error_and_keeps_safe_command_outp
     finally:
         runtime_log.close()
 
-    assert result.output == "persistence_error: The selected Conversation Session could not be loaded."
+    assert (
+        result.output == "persistence_error: The selected Conversation Session could not be loaded."
+    )
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     marker = (
         "session=- myclaw.management.commands: Management command failed "
@@ -348,13 +346,12 @@ async def test_resume_load_failure_records_one_error_and_keeps_safe_command_outp
 @pytest.mark.asyncio
 async def test_session_switch_failure_records_once_before_preserving_the_exception(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -398,13 +395,12 @@ async def test_session_switch_failure_records_once_before_preserving_the_excepti
 @pytest.mark.asyncio
 async def test_incomplete_final_append_is_recovered_on_the_next_successful_write(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -423,8 +419,7 @@ async def test_incomplete_final_append_is_recovered_on_the_next_successful_write
     )
     crashed_bytes = path.read_bytes()
     restarted = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter(()).__next__,
     )
@@ -573,8 +568,7 @@ async def test_switchable_conversation_close_stops_delegates_from_every_selected
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID, NEWER_SESSION_UUID)).__next__,
     )
@@ -665,8 +659,7 @@ async def test_repl_resume_continues_target_history_and_switches_runtime_status(
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     clock = FakeClock(NOW)
     historical_store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -793,13 +786,12 @@ async def test_repl_resume_continues_target_history_and_switches_runtime_status(
 @pytest.mark.asyncio
 async def test_picker_rejects_unsupported_metadata_and_message_record_types(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID, CORRUPT_METADATA_UUID, CORRUPT_MIDDLE_UUID)).__next__,
     )
@@ -846,13 +838,12 @@ async def test_picker_rejects_unsupported_metadata_and_message_record_types(
 @pytest.mark.asyncio
 async def test_resume_command_aggregates_corrupt_session_warning(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID, CORRUPT_METADATA_UUID, CORRUPT_MIDDLE_UUID)).__next__,
     )
@@ -887,14 +878,14 @@ async def test_resume_command_aggregates_corrupt_session_warning(
 @pytest.mark.asyncio
 async def test_concurrent_resume_listings_keep_their_own_corruption_diagnostics(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
-    other_workspace = Path("D:/other-project") if os.name == "nt" else Path("/other-project")
+    other_workspace = workspace.parent / "other-workspace"
+    other_workspace.mkdir()
     persisted = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID, CORRUPT_METADATA_UUID)).__next__,
     )
@@ -943,15 +934,15 @@ async def test_concurrent_resume_listings_keep_their_own_corruption_diagnostics(
 @pytest.mark.asyncio
 async def test_management_resume_revalidates_workspace_and_keeps_current_session(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
-    other_workspace = Path("D:/other-project") if os.name == "nt" else Path("/other-project")
+    other_workspace = workspace.parent / "other-workspace"
+    other_workspace.mkdir()
     other_store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(other_workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(other_workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -983,20 +974,65 @@ async def test_management_resume_revalidates_workspace_and_keeps_current_session
     assert invalid_result.output == other_result.output
     assert json.loads(status_result.output or "")["session_message_count"] == 0
     assert not runtime.sessions.path_for(runtime.session_id).exists()
-    assert other_store.path_for(other.id).exists()
+    assert path_for_io(other_store.path_for(other.id)).exists()
+
+
+@pytest.mark.asyncio
+async def test_legacy_agent_home_session_is_not_resumable(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    sessions = JsonlSessionStore(
+        workspace_state=state,
+        now=lambda: NOW,
+        new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
+    )
+    metadata = sessions.prepare()
+    message = UserSessionMessage(
+        id=str(FIRST_USER_UUID),
+        created_at=NOW,
+        content="Legacy history must remain ignored.",
+    )
+    legacy_path = agent_home / "sessions" / "legacy-workspace-slug" / f"{metadata.id}.jsonl"
+    legacy_io_path = path_for_io(legacy_path)
+    legacy_io_path.parent.mkdir(parents=True)
+    legacy_io_path.write_text(metadata.to_json_line() + message.to_json_line(), encoding="utf-8")
+    legacy_bytes = legacy_io_path.read_bytes()
+    switched: list[str] = []
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(
+            home,
+            sessions=sessions,
+            workspace=workspace,
+            switch_session=switched.append,
+        )
+    )
+
+    listing = await dispatcher.dispatch("/resume")
+    resumed = await dispatcher.resume(metadata.id)
+
+    assert listing.output == "No resumable Conversation Sessions."
+    assert resumed.output == (
+        "model_invalid_request: The selected Conversation Session is not resumable."
+    )
+    assert switched == []
+    assert legacy_io_path.read_bytes() == legacy_bytes
 
 
 @pytest.mark.asyncio
 async def test_resuming_from_a_nonempty_session_preserves_its_complete_history(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     target_store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW - timedelta(minutes=5),
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -1026,12 +1062,13 @@ async def test_resuming_from_a_nonempty_session_preserves_its_complete_history(
             content="Original nonempty history.",
         ),
     )
-    original_bytes = runtime.sessions.path_for(original_session_id).read_bytes()
+    original_path = path_for_io(runtime.sessions.path_for(original_session_id))
+    original_bytes = original_path.read_bytes()
 
     result = await runtime.management_dispatcher.resume(target.id)
 
     assert result.output == f"Resumed session {target.id}."
-    assert runtime.sessions.path_for(original_session_id).read_bytes() == original_bytes
+    assert original_path.read_bytes() == original_bytes
     original = await runtime.sessions.load(original_session_id)
     assert [(message.role, message.content) for message in original.messages] == [
         ("user", "Original nonempty history.")
@@ -1047,8 +1084,7 @@ async def test_late_title_stays_with_original_and_resumed_session_is_not_retitle
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     target_store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW - timedelta(minutes=5),
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -1122,13 +1158,12 @@ async def test_late_title_stays_with_original_and_resumed_session_is_not_retitle
 @pytest.mark.asyncio
 async def test_complete_json_without_a_jsonl_newline_is_rejected_without_repair(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -1154,13 +1189,12 @@ async def test_complete_json_without_a_jsonl_newline_is_rejected_without_repair(
 @pytest.mark.asyncio
 async def test_failed_atomic_tail_repair_preserves_the_crashed_session_bytes(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -1181,8 +1215,7 @@ async def test_failed_atomic_tail_repair_preserves_the_crashed_session_bytes(
         raise OSError("injected atomic repair failure")
 
     restarted = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter(()).__next__,
         replace_bytes=fail_atomic_replace,
@@ -1204,13 +1237,12 @@ async def test_failed_atomic_tail_repair_preserves_the_crashed_session_bytes(
 @pytest.mark.asyncio
 async def test_active_turn_rejects_session_switch_and_keeps_cancellation_on_original(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    workspace = Path("D:/resume-project") if os.name == "nt" else Path("/resume-project")
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID, NEWER_SESSION_UUID)).__next__,
     )

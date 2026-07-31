@@ -12,7 +12,7 @@ from myclaw.utils.validation import require_aware_datetime, require_uuid4_string
 
 @dataclass(frozen=True, slots=True)
 class ScheduledWork:
-    """One exact element of the Agent Home Scheduled Work JSON array."""
+    """One exact element of a Workspace Scheduled Work JSON array."""
 
     id: str
     title: str

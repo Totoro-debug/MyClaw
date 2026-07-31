@@ -16,6 +16,7 @@ from myclaw.agent.events import (
     validate_agent_event_sequence,
 )
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
@@ -84,8 +85,7 @@ async def test_nonblank_turn_streams_ordered_deltas_then_persists_one_completed_
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -205,8 +205,7 @@ async def test_consecutive_turns_send_raw_short_term_memory_and_wrap_only_curren
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -360,8 +359,7 @@ async def test_final_model_failure_emits_one_failed_terminal_and_persists_safe_e
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -428,8 +426,7 @@ async def test_model_failure_after_streamed_text_persists_the_observed_partial_c
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -493,8 +490,7 @@ async def test_stream_without_completion_still_emits_one_safe_failed_terminal(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -544,8 +540,7 @@ async def test_turn_after_failure_keeps_raw_user_history_but_omits_pure_error_as
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -631,8 +626,7 @@ async def test_cancel_active_turn_persists_partial_then_releases_next_foreground
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -740,8 +734,7 @@ async def test_close_waits_for_the_active_foreground_turn_to_finish_cancelling(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -792,8 +785,7 @@ async def test_close_waits_for_turn_cleanup_without_waiting_for_unrelated_caller
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -848,8 +840,7 @@ async def test_submit_is_rejected_after_conversation_close(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -902,8 +893,7 @@ async def test_repl_writer_failure_closes_the_active_turn_iterator(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -961,8 +951,7 @@ async def test_typed_cancellation_without_partial_emits_cancelled_but_no_empty_a
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1019,8 +1008,7 @@ async def test_conversation_port_rejects_an_overlapping_foreground_submit(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )

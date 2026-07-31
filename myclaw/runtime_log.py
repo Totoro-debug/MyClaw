@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import logging
+import msvcrt
 import os
 import queue
 import re
@@ -17,16 +18,14 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from stat import S_ISDIR, S_ISREG
 from typing import BinaryIO, Final, Protocol
-
-if sys.platform == "win32":
-    import msvcrt
-else:
-    import fcntl
 
 from myclaw.config.agent_home import AgentHome
 from myclaw.utils.atomic_files import atomic_create_bytes, atomic_replace_bytes
+from myclaw.utils.windows_filesystem import (
+    is_windows_directory,
+    is_windows_regular_file,
+)
 
 _LOGGER_NAME: Final = "myclaw"
 _SLOT_TARGET_BYTES: Final = 10_485_760
@@ -34,21 +33,11 @@ _LOCK_TIMEOUT_SECONDS: Final = 1.0
 _LOCK_RETRY_SECONDS: Final = 0.01
 _SESSION_ID: ContextVar[str] = ContextVar("myclaw_runtime_log_session", default="-")
 _REDACTED: Final = "[REDACTED]"
-_AUTHORIZATION: Final = re.compile(
-    r"(?i)\b((?:proxy-)?authorization\s*:\s*(?:bearer|basic))\s+\S+"
-)
+_AUTHORIZATION: Final = re.compile(r"(?i)\b((?:proxy-)?authorization\s*:\s*(?:bearer|basic))\s+\S+")
 _BEARER: Final = re.compile(r"(?i)\b(bearer)\s+\S+")
 _API_KEY: Final = re.compile(r"(?i)\b((?:x-)?api[-_ ]?key)\s*([:=])\s*([^\s,;]+)")
 _COOKIE: Final = re.compile(r"(?i)\b((?:set-)?cookie)\s*([:=])\s*[^\n]+")
 _SANITIZE_EXCEPTION_MESSAGES: Final = "myclaw_runtime_log_sanitize_exception_messages"
-_WINDOWS_REPARSE_POINT: Final = 0x400
-_UNSUPPORTED_FSYNC_ERRNOS: Final = frozenset(
-    {
-        errno.EINVAL,
-        getattr(errno, "ENOTSUP", errno.EINVAL),
-        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
-    }
-)
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 
@@ -84,40 +73,23 @@ class _LockSystem(Protocol):
     def release(self, descriptor: int) -> None: ...
 
 
-if sys.platform == "win32":
+class _WindowsLockSystem:
+    def try_acquire(self, descriptor: int) -> bool:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise
+        return True
 
-    class _PlatformLockSystem:
-        def try_acquire(self, descriptor: int) -> bool:
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            try:
-                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-            except OSError as error:
-                if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
-                    return False
-                raise
-            return True
-
-        def release(self, descriptor: int) -> None:
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-
-else:
-
-    class _PlatformLockSystem:
-        def try_acquire(self, descriptor: int) -> bool:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as error:
-                if error.errno in {errno.EACCES, errno.EAGAIN}:
-                    return False
-                raise
-            return True
-
-        def release(self, descriptor: int) -> None:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    def release(self, descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
 
 
-_PLATFORM_LOCK_SYSTEM: Final = _PlatformLockSystem()
+_WINDOWS_LOCK_SYSTEM: Final = _WindowsLockSystem()
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,7 +132,7 @@ class RuntimeLogLifetime:
         agent_home: AgentHome,
         *,
         replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
-        lock_system: _LockSystem = _PLATFORM_LOCK_SYSTEM,
+        lock_system: _LockSystem = _WINDOWS_LOCK_SYSTEM,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -293,16 +265,12 @@ class RuntimeLogLifetime:
         logs = agent_home / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         _validate_log_directory(logs, agent_home_root)
-        if os.name == "posix":
-            logs.chmod(0o700)
         lock_path = logs / "run.log.lock"
         if lock_path.exists() or lock_path.is_symlink():
             _validate_log_file(lock_path, agent_home_root)
         else:
             _create_lock_file(lock_path)
         _validate_log_file(lock_path, agent_home_root)
-        if os.name == "posix":
-            lock_path.chmod(0o600)
         lock_stream = lock_path.open("r+b", buffering=0)
         try:
             _validate_opened_log_file(lock_stream, lock_path, agent_home_root)
@@ -343,8 +311,6 @@ class RuntimeLogLifetime:
             if not slot.exists() and not slot.is_symlink():
                 atomic_create_bytes(slot, b"")
             _validate_log_file(slot, agent_home_root)
-            if os.name == "posix":
-                slot.chmod(0o600)
             self._append_unlocked(slot, encoded)
         except Exception as fallback_error:
             raise fallback_error from lock_error
@@ -361,8 +327,8 @@ class RuntimeLogLifetime:
 
     def _encode(self, pending: _PendingRecord) -> bytes:
         record = pending.record
-        timestamp = datetime.fromtimestamp(record.created).astimezone().isoformat(
-            timespec="milliseconds"
+        timestamp = (
+            datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="milliseconds")
         )
         header = (
             f"{timestamp} {_severity(record.levelno)} pid={record.process} "
@@ -397,8 +363,6 @@ class RuntimeLogLifetime:
         logs = agent_home / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         _validate_log_directory(logs, agent_home_root)
-        if os.name == "posix":
-            logs.chmod(0o700)
         slot_existed = any(
             (logs / name).exists() or (logs / name).is_symlink()
             for name in ("run.log.0", "run.log.1")
@@ -414,8 +378,6 @@ class RuntimeLogLifetime:
             else:
                 atomic_create_bytes(path, content)
             _validate_log_file(path, agent_home_root)
-            if os.name == "posix":
-                path.chmod(0o600)
         cursor_path = logs / "run.log.cursor"
         cursor_recovered = False
         if cursor_path.exists() or cursor_path.is_symlink():
@@ -426,8 +388,6 @@ class RuntimeLogLifetime:
         else:
             atomic_create_bytes(cursor_path, b"0\n")
         _validate_log_file(cursor_path, agent_home_root)
-        if os.name == "posix":
-            cursor_path.chmod(0o600)
         cursor = _read_validated_log_file(cursor_path, agent_home_root)
         if cursor not in {b"0\n", b"1\n"}:
             self._replace_bytes(cursor_path, b"0\n")
@@ -469,16 +429,14 @@ class RuntimeLogLifetime:
         content = _API_KEY.sub(
             lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}", content
         )
-        return _COOKIE.sub(
-            lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}", content
-        )
+        return _COOKIE.sub(lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}", content)
 
 
 def install_runtime_logging(
     agent_home: AgentHome,
     *,
     replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
-    lock_system: _LockSystem = _PLATFORM_LOCK_SYSTEM,
+    lock_system: _LockSystem = _WINDOWS_LOCK_SYSTEM,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> RuntimeLogLifetime:
@@ -530,9 +488,7 @@ def _render_exception(
 ) -> list[str]:
     lines: list[str] = []
     if error.__cause__ is not None:
-        lines.extend(
-            _render_exception(error.__cause__, sanitize_messages=sanitize_messages)
-        )
+        lines.extend(_render_exception(error.__cause__, sanitize_messages=sanitize_messages))
         lines.extend(
             (
                 "",
@@ -541,9 +497,7 @@ def _render_exception(
             )
         )
     elif error.__context__ is not None and not error.__suppress_context__:
-        lines.extend(
-            _render_exception(error.__context__, sanitize_messages=sanitize_messages)
-        )
+        lines.extend(_render_exception(error.__context__, sanitize_messages=sanitize_messages))
         lines.extend(
             (
                 "",
@@ -584,12 +538,7 @@ def _validate_log_directory(path: Path, agent_home_root: Path) -> None:
         resolved = path.resolve(strict=True)
     except OSError as error:
         raise PermissionError("Runtime Log directory is unavailable") from error
-    if (
-        path.is_symlink()
-        or _is_reparse(status)
-        or not S_ISDIR(status.st_mode)
-        or not resolved.is_relative_to(agent_home_root)
-    ):
+    if not is_windows_directory(status) or not resolved.is_relative_to(agent_home_root):
         raise PermissionError("Runtime Log directory must remain unaliased inside Agent Home")
 
 
@@ -600,9 +549,7 @@ def _validate_log_file(path: Path, agent_home_root: Path) -> None:
     except OSError as error:
         raise PermissionError("Runtime Log file is unavailable") from error
     if (
-        path.is_symlink()
-        or _is_reparse(status)
-        or not S_ISREG(status.st_mode)
+        not is_windows_regular_file(status)
         or status.st_nlink != 1
         or not resolved.is_relative_to(agent_home_root)
     ):
@@ -621,10 +568,9 @@ def _validate_opened_log_file(
     except OSError as error:
         raise PermissionError("Runtime Log file is unavailable") from error
     if (
-        not S_ISREG(opened.st_mode)
+        not is_windows_regular_file(opened)
         or opened.st_nlink != 1
-        or _is_reparse(current)
-        or not S_ISREG(current.st_mode)
+        or not is_windows_regular_file(current)
         or current.st_nlink != 1
         or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
         or not resolved.is_relative_to(agent_home_root)
@@ -636,16 +582,11 @@ def _read_validated_log_file(path: Path, agent_home_root: Path) -> bytes:
     _validate_log_file(path, agent_home_root)
     with path.open("rb", buffering=0) as stream:
         _validate_opened_log_file(stream, path, agent_home_root)
-        if os.name == "posix":
-            fchmod = getattr(os, "fchmod", None)
-            if fchmod is None:
-                raise OSError("descriptor permission changes are unavailable")
-            fchmod(stream.fileno(), 0o600)
         return stream.read()
 
 
 def _create_lock_file(path: Path) -> None:
-    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_BINARY
     try:
         descriptor = os.open(path, flags, 0o600)
     except FileExistsError:
@@ -656,14 +597,9 @@ def _create_lock_file(path: Path) -> None:
         os.close(descriptor)
 
 
-def _is_reparse(status: os.stat_result) -> bool:
-    attributes = getattr(status, "st_file_attributes", 0)
-    return bool(attributes & _WINDOWS_REPARSE_POINT)
-
-
 def _fsync_file(descriptor: int) -> None:
     try:
         os.fsync(descriptor)
     except OSError as error:
-        if error.errno not in _UNSUPPORTED_FSYNC_ERRNOS:
+        if error.errno != errno.EINVAL:
             raise

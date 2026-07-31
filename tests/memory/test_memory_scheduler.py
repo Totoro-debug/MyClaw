@@ -9,16 +9,18 @@ import pytest
 
 import myclaw.memory.memory_scheduler as memory_scheduler_module
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
+from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
-from myclaw.memory.conversation_summary import JsonlSummaryStore
+from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
 from myclaw.memory.memory_scheduler import AsyncioMemorySchedulerClock, MemoryTaskScheduler
 from myclaw.memory.memory_task import (
-    FileMemoryStore,
     MemoryManager,
     MemoryTaskModelSettings,
     MemoryTaskResult,
+    WorkspaceFileMemoryStore,
 )
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -35,6 +37,14 @@ from tests.fixtures import ScriptedFakeProvider, StreamScript
 
 LOCAL = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 10, tzinfo=LOCAL)
+
+
+def _state(home: AgentHome) -> WorkspaceState:
+    workspace = home.path.parent / "workspace-state"
+    workspace.mkdir(exist_ok=True)
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    return state
 
 
 class SpringForwardTimezone(tzinfo):
@@ -117,12 +127,12 @@ def _manager(
     *,
     home: AgentHome,
     provider: ScriptedFakeProvider,
-    summaries: JsonlSummaryStore,
+    summaries: WorkspaceJsonlSummaryStore,
 ) -> MemoryManager:
     return MemoryManager(
         provider=provider,
         summaries=summaries,
-        memory=FileMemoryStore(home),
+        memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=home.path / "memory" / "memory.md",
         settings=MemoryTaskModelSettings(
             model="memory-model",
@@ -139,7 +149,7 @@ def _manager(
 async def test_periodic_memory_task_runs_when_the_manager_is_idle(agent_home: Path) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     manager = _manager(home=home, provider=provider, summaries=summaries)
@@ -160,13 +170,11 @@ async def test_periodic_memory_task_records_one_terminal_failure_without_a_sessi
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("PRIVATE PERIODIC SUMMARY", NOW)
     provider = ScriptedFakeProvider(
         completions=(
-            ModelCallError(
-                ErrorInfo(code="model_failed", message="PRIVATE PERIODIC OUTPUT")
-            ),
+            ModelCallError(ErrorInfo(code="model_failed", message="PRIVATE PERIODIC OUTPUT")),
         )
     )
     lifetime = install_runtime_logging(home)
@@ -196,7 +204,7 @@ async def test_memory_scheduler_records_the_unhandled_exception_it_isolates(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("PRIVATE SCHEDULER SUMMARY", NOW)
     attempted = asyncio.Event()
 
@@ -246,7 +254,7 @@ async def test_hourly_memory_schedule_triggers_only_at_next_local_cron_boundary(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(NOW)
@@ -266,7 +274,7 @@ async def test_hourly_memory_schedule_triggers_only_at_next_local_cron_boundary(
     await _wait_until(lambda: len(provider.complete_requests) == 1)
     await scheduler.close()
 
-    assert await FileMemoryStore(home).read_summary_cursor() == 1
+    assert await WorkspaceFileMemoryStore(_state(home)).read_summary_cursor() == 1
 
 
 @pytest.mark.asyncio
@@ -275,7 +283,7 @@ async def test_periodic_trigger_is_skipped_while_the_previous_run_is_still_activ
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("A pending summary.", NOW)
     started = asyncio.Event()
     release = asyncio.Event()
@@ -315,7 +323,7 @@ async def test_manual_memory_task_reports_running_while_a_periodic_run_is_active
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("A pending summary.", NOW)
     started = asyncio.Event()
     release = asyncio.Event()
@@ -331,7 +339,7 @@ async def test_manual_memory_task_reports_running_while_a_periodic_run_is_active
     manager = _manager(home=home, provider=provider, summaries=summaries)
     periodic = asyncio.create_task(manager.run_periodic())
     await started.wait()
-    (agent_home / "memory" / ".cursor").write_bytes(b"corrupt\n")
+    (_state(home).memory_directory / ".cursor").write_bytes(b"corrupt\n")
 
     try:
         manual = await manager.run_manual()
@@ -353,6 +361,8 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(
         VALID_CONFIG.replace(
             "[tools.shell]\nenabled = true",
@@ -360,7 +370,7 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
         ),
         encoding="utf-8",
     )
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(NOW)
@@ -380,7 +390,7 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
     await _wait_until(lambda: len(provider.complete_requests) == 1)
     await runtime.close()
 
-    assert await FileMemoryStore(home).read_summary_cursor() == 1
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
 
 
 @pytest.mark.asyncio
@@ -437,7 +447,7 @@ async def test_custom_schedule_keeps_the_runtime_startup_local_timezone(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(datetime(2026, 7, 11, 8, 50, tzinfo=LOCAL))
@@ -468,7 +478,7 @@ async def test_local_schedule_wait_uses_elapsed_time_across_daylight_saving_chan
         manager=_manager(
             home=home,
             provider=ScriptedFakeProvider(),
-            summaries=JsonlSummaryStore(home),
+            summaries=WorkspaceJsonlSummaryStore(_state(home)),
         ),
         schedule="30 3 * * *",
         clock=clock,
@@ -518,7 +528,13 @@ async def test_periodic_memory_edit_is_visible_on_disk_but_chat_uses_the_startup
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    startup_memory = (agent_home / "memory" / "memory.md").read_text(encoding="utf-8")
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    startup_memory = state.long_term_memory_path.read_text(encoding="utf-8")
+    legacy_path = agent_home / "memory" / "memory.md"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_memory = b"# Legacy Agent Home Memory\n"
+    legacy_path.write_bytes(legacy_memory)
     updated_memory = startup_memory.replace(
         "## User Preference\n",
         "## User Preference\n\nPrefers concise status reports.\n",
@@ -530,7 +546,7 @@ async def test_periodic_memory_edit_is_visible_on_disk_but_chat_uses_the_startup
         ),
         encoding="utf-8",
     )
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("The user prefers concise status reports.", NOW)
     clock = ControlledClock(NOW)
     provider = ScriptedFakeProvider(
@@ -543,7 +559,7 @@ async def test_periodic_memory_edit_is_visible_on_disk_but_chat_uses_the_startup
                         name="edit_file",
                         arguments=json.dumps(
                             {
-                                "path": str(agent_home / "memory" / "memory.md"),
+                                "path": str(state.long_term_memory_path),
                                 "old_text": startup_memory,
                                 "new_text": updated_memory,
                             }
@@ -579,6 +595,7 @@ async def test_periodic_memory_edit_is_visible_on_disk_but_chat_uses_the_startup
     assert memory_view.output == updated_memory
     assert startup_memory in first_chat.system_prompt
     assert updated_memory not in first_chat.system_prompt
+    assert legacy_path.read_bytes() == legacy_memory
 
     restarted_provider = ScriptedFakeProvider(
         streams=(StreamScript(events=(ModelCompleted(response=_response("New snapshot.")),)),)
@@ -607,6 +624,8 @@ async def test_periodic_failure_is_isolated_and_all_periodic_results_stay_silent
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(
         VALID_CONFIG.replace(
             "[tools.shell]\nenabled = true",
@@ -614,7 +633,7 @@ async def test_periodic_failure_is_isolated_and_all_periodic_results_stay_silent
         ),
         encoding="utf-8",
     )
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(
         completions=(
@@ -658,7 +677,7 @@ async def test_periodic_failure_is_isolated_and_all_periodic_results_stay_silent
     await _wait_until(lambda: clock.sleeps == [5 * 60])
     clock.advance(5 * 60)
     await _wait_until(lambda: len(provider.complete_requests) == 1)
-    assert await FileMemoryStore(home).read_summary_cursor() == 0
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 0
 
     await _wait_until(lambda: clock.sleeps == [5 * 60, 60 * 60])
     clock.advance(60 * 60)
@@ -666,7 +685,7 @@ async def test_periodic_failure_is_isolated_and_all_periodic_results_stay_silent
     exit_repl.set()
     await repl
 
-    assert await FileMemoryStore(home).read_summary_cursor() == 1
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
     assert writer.operations == []
 
 
@@ -676,7 +695,7 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("A pending summary.", NOW)
     started = asyncio.Event()
     cancelled = asyncio.Event()
@@ -727,7 +746,7 @@ async def test_memory_scheduler_records_a_distinct_shutdown_cleanup_failure(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("PRIVATE CLEANUP SUMMARY", NOW)
     started = asyncio.Event()
 
@@ -763,8 +782,7 @@ async def test_memory_scheduler_records_a_distinct_shutdown_cleanup_failure(
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert content.count(" ERROR ") == 1
     assert (
-        "session=- myclaw.memory.memory_scheduler: "
-        "Memory Task scheduler cleanup failed"
+        "session=- myclaw.memory.memory_scheduler: Memory Task scheduler cleanup failed"
     ) in content
     assert "CancelledError" in content
     assert "RuntimeError: [REDACTED]" in content

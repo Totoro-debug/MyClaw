@@ -13,6 +13,8 @@ from myclaw.agent.runtime import (
     prepare_repl_runtime,
     unavailable_provider_factory,
 )
+from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader, ProviderConfiguration
 from myclaw.errors import ErrorInfo
@@ -56,6 +58,7 @@ def _runtime_log_text(agent_home: Path) -> str:
         for name in ("run.log.0", "run.log.1")
         if (path := logs / name).exists()
     )
+
 
 CHAT_ROUTE_CONFIG = (
     VALID_CONFIG
@@ -131,12 +134,8 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     clock = FakeClock(NOW)
-    failure = ModelCallError(
-        ErrorInfo(code="model_failed", message="The model request failed.")
-    )
-    provider = ScriptedFakeProvider(
-        streams=(StreamScript(events=(), error=failure),)
-    )
+    failure = ModelCallError(ErrorInfo(code="model_failed", message="The model request failed."))
+    provider = ScriptedFakeProvider(streams=(StreamScript(events=(), error=failure),))
     lifetime = install_runtime_logging(home)
     runtime = prepare_repl_runtime(
         agent_home=home,
@@ -144,16 +143,12 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
         configuration=ConfigLoader(home).load(),
         provider_factory=lambda _: provider,
         now=clock.now,
-        new_uuid=iter(
-            (SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)
-        ).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
         retry_clock=clock,
         runtime_log=lifetime,
     )
 
-    events = [
-        event async for event in runtime.conversation.submit("private foreground input")
-    ]
+    events = [event async for event in runtime.conversation.submit("private foreground input")]
     await runtime.conversation.close()
     lifetime.close()
 
@@ -214,11 +209,7 @@ async def test_prepared_runtime_correlates_scheduled_work_with_its_session(
 
     assert outcome.status == "completed"
     content = _runtime_log_text(agent_home)
-    records = [
-        line
-        for line in content.splitlines()
-        if "myclaw.tools.tool_gateway:" in line
-    ]
+    records = [line for line in content.splitlines() if "myclaw.tools.tool_gateway:" in line]
     assert len(records) == 1
     assert f"session={task.session_id}" in records[0]
     assert "session=-" not in records[0]
@@ -267,7 +258,8 @@ async def test_prepared_repl_defers_injected_provider_factory_until_first_nonbla
     )
 
     assert factory_calls == []
-    assert not runtime.sessions.path_for(runtime.session_id).parent.exists()
+    assert runtime.sessions.directory == workspace / ".myclaw" / "sessions"
+    assert not runtime.sessions.path_for(runtime.session_id).exists()
 
     writer = RecordingWriter()
     await runtime.run(
@@ -658,8 +650,13 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     startup_memory = "# Durable Memory\n\nRemember the startup snapshot exactly.\n"
-    (agent_home / "memory" / "memory.md").write_text(startup_memory, encoding="utf-8")
+    state.long_term_memory_path.write_text(startup_memory, encoding="utf-8")
+    legacy_memory = b"# Legacy Agent Home Memory\n"
+    (agent_home / "memory").mkdir()
+    (agent_home / "memory" / "memory.md").write_bytes(legacy_memory)
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     configuration = ConfigLoader(home).load()
     clock = FakeClock(NOW)
@@ -711,7 +708,7 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
             )
         ).__next__,
     )
-    (agent_home / "memory" / "memory.md").write_text(
+    state.long_term_memory_path.write_text(
         "# Changed after startup\n",
         encoding="utf-8",
     )
@@ -754,6 +751,8 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
     assert system_prompt.index(workspace_identity) < system_prompt.index(memory_block)
     assert system_prompt.index(memory_block) < system_prompt.index("<tool_guidance>")
     assert "Changed after startup" not in system_prompt
+    assert "Legacy Agent Home Memory" not in system_prompt
+    assert (agent_home / "memory" / "memory.md").read_bytes() == legacy_memory
     reloaded = await runtime.sessions.load(runtime.session_id)
     assert reloaded.metadata.id == runtime.session_id
     assert [message.role for message in reloaded.messages] == [

@@ -19,11 +19,12 @@ from myclaw.agent.events import (
 )
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
-from myclaw.memory.conversation_summary import JsonlSummaryStore
-from myclaw.memory.memory_task import FileMemoryStore
+from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
+from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -41,7 +42,10 @@ from myclaw.schedule.background_coordination import (
     ScheduledWorkScheduler,
 )
 from myclaw.schedule.records import ScheduledWork
-from myclaw.schedule.scheduled_work import JsonScheduledWorkStore, ScheduledWorkPersistenceError
+from myclaw.schedule.scheduled_work import (
+    ScheduledWorkPersistenceError,
+    WorkspaceJsonScheduledWorkStore,
+)
 from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkModelSettings,
     ScheduledWorkRunner,
@@ -373,9 +377,9 @@ class ControlledSchedulerClock:
         self._release.set()
 
 
-class LoadFailingOnceScheduledWorkStore(JsonScheduledWorkStore):
-    def __init__(self, agent_home: AgentHome) -> None:
-        super().__init__(agent_home)
+class LoadFailingOnceScheduledWorkStore(WorkspaceJsonScheduledWorkStore):
+    def __init__(self, workspace_state: WorkspaceState) -> None:
+        super().__init__(workspace_state)
         self._failed = False
 
     def load(self) -> tuple[ScheduledWork, ...]:
@@ -393,6 +397,12 @@ async def _wait_until(predicate: Callable[[], bool]) -> None:
     raise AssertionError("condition was not reached")
 
 
+def _state(workspace: Path) -> WorkspaceState:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    return state
+
+
 @pytest.mark.asyncio
 async def test_scheduler_refreshes_persisted_work_and_ignores_disabled_records(
     agent_home: Path,
@@ -401,10 +411,10 @@ async def test_scheduler_refreshes_persisted_work_and_ignores_disabled_records(
     clock_now = NOW.replace(microsecond=0)
     home = AgentHome(agent_home)
     home.initialize()
-    store = JsonScheduledWorkStore(home)
+    state = _state(workspace)
+    store = WorkspaceJsonScheduledWorkStore(state)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=state,
         now=lambda: clock_now,
         new_uuid=uuid4,
     )
@@ -450,7 +460,7 @@ async def test_scheduler_refreshes_persisted_work_and_ignores_disabled_records(
     scheduler.start()
     await _wait_until(lambda: clock.sleeps == [60.0])
     persist_scheduled_work(
-        agent_home,
+        state.path,
         (
             replace(_task(), cron="31 0 * * *"),
             replace(
@@ -459,9 +469,7 @@ async def test_scheduler_refreshes_persisted_work_and_ignores_disabled_records(
                 title="Disabled status",
                 cron="31 0 * * *",
                 enabled=False,
-                session_id=(
-                    "20260713-003000-123000_22222222-2222-4222-8222-222222222222"
-                ),
+                session_id=("20260713-003000-123000_22222222-2222-4222-8222-222222222222"),
             ),
         ),
     )
@@ -485,11 +493,11 @@ async def test_scheduler_retries_after_a_store_load_failure(
     clock_now = NOW.replace(microsecond=0)
     home = AgentHome(agent_home)
     home.initialize()
-    store = LoadFailingOnceScheduledWorkStore(home)
-    persist_scheduled_work(agent_home, (replace(_task(), cron="32 0 * * *"),))
+    state = _state(workspace)
+    store = LoadFailingOnceScheduledWorkStore(state)
+    persist_scheduled_work(state.path, (replace(_task(), cron="32 0 * * *"),))
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=state,
         now=lambda: clock_now,
         new_uuid=uuid4,
     )
@@ -565,11 +573,11 @@ async def test_scheduler_continues_after_one_scheduled_run_fails(
     clock_now = NOW.replace(microsecond=0)
     home = AgentHome(agent_home)
     home.initialize()
-    store = JsonScheduledWorkStore(home)
-    persist_scheduled_work(agent_home, (replace(_task(), cron="* * * * *"),))
+    state = _state(workspace)
+    store = WorkspaceJsonScheduledWorkStore(state)
+    persist_scheduled_work(state.path, (replace(_task(), cron="* * * * *"),))
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=state,
         now=lambda: clock_now,
         new_uuid=uuid4,
     )
@@ -641,11 +649,11 @@ async def test_scheduler_consumes_an_unhandled_scheduled_run_after_it_is_logged(
     clock_now = NOW.replace(microsecond=0)
     home = AgentHome(agent_home)
     home.initialize()
-    store = JsonScheduledWorkStore(home)
-    persist_scheduled_work(agent_home, (replace(_task(), cron="31 0 * * *"),))
+    state = _state(workspace)
+    store = WorkspaceJsonScheduledWorkStore(state)
+    persist_scheduled_work(state.path, (replace(_task(), cron="31 0 * * *"),))
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=state,
         now=lambda: clock_now,
         new_uuid=uuid4,
     )
@@ -725,11 +733,11 @@ async def test_scheduler_close_cancels_and_awaits_running_scheduled_work(
     clock_now = NOW.replace(microsecond=0)
     home = AgentHome(agent_home)
     home.initialize()
-    store = JsonScheduledWorkStore(home)
-    persist_scheduled_work(agent_home, (replace(_task(), cron="31 0 * * *"),))
+    state = _state(workspace)
+    store = WorkspaceJsonScheduledWorkStore(state)
+    persist_scheduled_work(state.path, (replace(_task(), cron="31 0 * * *"),))
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=state,
         now=lambda: clock_now,
         new_uuid=uuid4,
     )
@@ -790,11 +798,11 @@ async def test_scheduled_work_scheduler_records_a_distinct_shutdown_cleanup_fail
     clock_now = NOW.replace(microsecond=0)
     home = AgentHome(agent_home)
     home.initialize()
-    store = JsonScheduledWorkStore(home)
-    persist_scheduled_work(agent_home, (replace(_task(), cron="31 0 * * *"),))
+    state = _state(workspace)
+    store = WorkspaceJsonScheduledWorkStore(state)
+    persist_scheduled_work(state.path, (replace(_task(), cron="31 0 * * *"),))
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=state,
         now=lambda: clock_now,
         new_uuid=uuid4,
     )
@@ -903,8 +911,7 @@ async def test_completed_scheduled_work_publishes_one_background_event(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -973,8 +980,7 @@ async def test_background_event_publication_failure_is_recorded_once(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -1041,8 +1047,7 @@ async def test_failed_scheduled_work_publishes_safe_event_and_does_not_stop_anot
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -1120,8 +1125,7 @@ async def test_overlapping_trigger_of_the_same_scheduled_work_is_skipped(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -1188,8 +1192,7 @@ async def test_cancelled_scheduled_work_emits_no_event_and_can_be_retriggered(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -1248,8 +1251,7 @@ async def test_different_scheduled_work_runs_concurrently_and_events_follow_comp
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -1527,8 +1529,7 @@ async def test_background_completion_waits_for_foreground_stream_terminal(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -1584,8 +1585,7 @@ async def test_queued_background_is_rendered_before_starting_the_next_input_read
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -1675,8 +1675,7 @@ async def test_runtime_broker_sequences_foreground_and_background_events_globall
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -1766,8 +1765,7 @@ async def test_runtime_event_ids_remain_global_after_switching_sessions(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -1855,6 +1853,11 @@ async def test_fresh_prepared_runtimes_each_run_scheduled_work(
     clock_now = NOW.replace(microsecond=0)
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    legacy_path = agent_home / "scheduled-work.json"
+    legacy_bytes = b"legacy Agent Home Scheduled Work must not be parsed\xff"
+    legacy_path.write_bytes(legacy_bytes)
     (agent_home / "config.toml").write_text(
         VALID_CONFIG.replace(
             "[tools.shell]\nenabled = true",
@@ -1890,7 +1893,7 @@ async def test_fresh_prepared_runtimes_each_run_scheduled_work(
         )
 
     first_runtime = prepare_runtime()
-    persist_scheduled_work(agent_home, (replace(_task(), cron="* * * * *"),))
+    persist_scheduled_work(state.path, (replace(_task(), cron="* * * * *"),))
 
     async def run_once(runtime: PreparedReplRuntime) -> list[tuple[str, str]]:
         sleep_count = len(scheduled_clock.sleeps)
@@ -1921,6 +1924,154 @@ async def test_fresh_prepared_runtimes_each_run_scheduled_work(
         )
     ]
     assert [len(provider.complete_requests) for provider in providers] == [1, 1]
+    assert legacy_path.read_bytes() == legacy_bytes
+
+
+@pytest.mark.asyncio
+async def test_scheduled_work_does_not_cross_trigger_between_workspaces(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    clock_now = NOW.replace(microsecond=0)
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(
+        VALID_CONFIG.replace(
+            "[tools.shell]\nenabled = true",
+            "[tools.shell]\nenabled = false",
+        ),
+        encoding="utf-8",
+    )
+    legacy_path = agent_home / "scheduled-work.json"
+    legacy_bytes = b"legacy Agent Home definitions must remain unread\xff"
+    legacy_path.write_bytes(legacy_bytes)
+
+    first_workspace = workspace / "first"
+    second_workspace = workspace / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    first_state = WorkspaceState(Workspace.from_path(first_workspace))
+    second_state = WorkspaceState(Workspace.from_path(second_workspace))
+    first_state.initialize(agent_home_root=Path.home() / ".myclaw")
+    second_state.initialize(agent_home_root=Path.home() / ".myclaw")
+    first_memory = "# First Workspace Memory\n"
+    second_memory = "# Second Workspace Memory\n"
+    first_state.long_term_memory_path.write_text(first_memory, encoding="utf-8")
+    second_state.long_term_memory_path.write_text(second_memory, encoding="utf-8")
+    first_task = replace(
+        _task(),
+        id="11111111-1111-4111-8111-111111111111",
+        title="First Workspace review",
+        cron="* * * * *",
+        prompt="Run only for the first Workspace.",
+        session_id="20260713-003000-123000_22222222-2222-4222-8222-222222222222",
+    )
+    second_task = replace(
+        _task(),
+        id="33333333-3333-4333-8333-333333333333",
+        title="Second Workspace review",
+        cron="* * * * *",
+        prompt="Run only for the second Workspace.",
+        session_id="20260713-003000-123000_44444444-4444-4444-8444-444444444444",
+    )
+    persist_scheduled_work(first_state.path, (first_task,))
+    persist_scheduled_work(second_state.path, (second_task,))
+
+    first_clock = ControlledSchedulerClock(clock_now)
+    second_clock = ControlledSchedulerClock(clock_now)
+    first_provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="First Workspace result."),
+                usage=_usage(),
+                finish_reason="stop",
+            ),
+        )
+    )
+    second_provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Second Workspace result."),
+                usage=_usage(),
+                finish_reason="stop",
+            ),
+        )
+    )
+
+    def prepare(
+        *,
+        state: WorkspaceState,
+        provider: ScriptedFakeProvider,
+        clock: ControlledSchedulerClock,
+    ) -> PreparedReplRuntime:
+        return prepare_repl_runtime(
+            agent_home=home,
+            workspace=Path(state.workspace.path),
+            configuration=ConfigLoader(home).load(),
+            provider_factory=lambda _configuration: provider,
+            now=clock.now,
+            new_uuid=uuid4,
+            memory_scheduler_clock=ControlledSchedulerClock(clock_now),
+            scheduled_work_scheduler_clock=clock,
+        )
+
+    first_runtime = prepare(state=first_state, provider=first_provider, clock=first_clock)
+    second_runtime = prepare(state=second_state, provider=second_provider, clock=second_clock)
+    first_input = WaitingExitInput()
+    second_input = WaitingExitInput()
+    first_writer = RecordingWriter()
+    second_writer = RecordingWriter()
+    first_execution = asyncio.create_task(
+        first_runtime.run(input_reader=first_input, writer=first_writer)
+    )
+    second_execution = asyncio.create_task(
+        second_runtime.run(input_reader=second_input, writer=second_writer)
+    )
+
+    await asyncio.wait_for(first_input.started.wait(), timeout=1)
+    await asyncio.wait_for(second_input.started.wait(), timeout=1)
+    await _wait_until(lambda: first_clock.sleeps == [60.0])
+    await _wait_until(lambda: second_clock.sleeps == [60.0])
+    await first_clock.advance(60)
+    await asyncio.wait_for(first_writer.written.wait(), timeout=1)
+
+    assert len(first_provider.complete_requests) == 1
+    assert second_provider.complete_requests == []
+    assert second_writer.operations == []
+
+    await second_clock.advance(60)
+    await asyncio.wait_for(second_writer.written.wait(), timeout=1)
+    first_input.release.set()
+    second_input.release.set()
+    await asyncio.gather(first_execution, second_execution)
+
+    assert first_writer.operations == [
+        (
+            "line",
+            "[Scheduled Work] First Workspace review (completed): First Workspace result.",
+        )
+    ]
+    assert second_writer.operations == [
+        (
+            "line",
+            "[Scheduled Work] Second Workspace review (completed): Second Workspace result.",
+        )
+    ]
+    first_request = first_provider.complete_requests[0]
+    second_request = second_provider.complete_requests[0]
+    assert isinstance(first_request, ModelRequest)
+    assert isinstance(second_request, ModelRequest)
+    assert first_memory in first_request.system_prompt
+    assert second_memory not in first_request.system_prompt
+    assert second_memory in second_request.system_prompt
+    assert first_memory not in second_request.system_prompt
+    assert first_runtime.sessions.path_for(first_task.session_id).parent == (
+        first_state.sessions_directory
+    )
+    assert second_runtime.sessions.path_for(second_task.session_id).parent == (
+        second_state.sessions_directory
+    )
+    assert legacy_path.read_bytes() == legacy_bytes
 
 
 @pytest.mark.asyncio
@@ -1938,6 +2089,8 @@ async def test_periodic_memory_stays_silent_while_scheduled_work_remains_visible
     clock_now = NOW.replace(microsecond=0)
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(
         VALID_CONFIG.replace(
             'schedule = "15 * * * *"',
@@ -1948,7 +2101,7 @@ async def test_periodic_memory_stays_silent_while_scheduled_work_remains_visible
         ),
         encoding="utf-8",
     )
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("A pending memory summary.", clock_now)
     scheduled_clock = ControlledSchedulerClock(clock_now)
     memory_clock = ControlledSchedulerClock(clock_now)
@@ -1963,7 +2116,7 @@ async def test_periodic_memory_stays_silent_while_scheduled_work_remains_visible
         memory_scheduler_clock=memory_clock,
         scheduled_work_scheduler_clock=scheduled_clock,
     )
-    persist_scheduled_work(agent_home, (replace(_task(), cron="* * * * *"),))
+    persist_scheduled_work(state.path, (replace(_task(), cron="* * * * *"),))
     input_reader = ReleasedConversationInput()
     writer = RecordingWriter()
     execution = asyncio.create_task(runtime.run(input_reader=input_reader, writer=writer))
@@ -1985,7 +2138,7 @@ async def test_periodic_memory_stays_silent_while_scheduled_work_remains_visible
         )
     )
     for _ in range(100):
-        cursor = await FileMemoryStore(home).read_summary_cursor()
+        cursor = await WorkspaceFileMemoryStore(state).read_summary_cursor()
         if cursor == expected_cursor:
             break
         await asyncio.sleep(0)

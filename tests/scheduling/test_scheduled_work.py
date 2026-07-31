@@ -7,6 +7,7 @@ import pytest
 
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
@@ -16,10 +17,11 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
+from myclaw.schedule.records import ScheduledWork
 from myclaw.schedule.scheduled_work import (
     CreateScheduledWorkTool,
-    JsonScheduledWorkStore,
     ScheduledWorkPersistenceError,
+    WorkspaceJsonScheduledWorkStore,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import ToolSessionMessage
@@ -30,6 +32,24 @@ from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 
 NOW = datetime(2026, 7, 12, 20, 0, 0, 123456, tzinfo=timezone(timedelta(hours=8)))
+
+
+def _state(path: Path) -> WorkspaceState:
+    state = WorkspaceState(Workspace.from_path(path))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    return state
+
+
+def _scheduled_record(*, title: str, task_id: str, session_id: str) -> ScheduledWork:
+    return ScheduledWork(
+        id=task_id,
+        title=title,
+        cron="0 9 * * 1",
+        prompt=f"Run {title}.",
+        created_at=NOW.replace(microsecond=123000),
+        enabled=True,
+        session_id=session_id,
+    )
 
 
 def _usage() -> ModelUsage:
@@ -80,8 +100,7 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -124,7 +143,7 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
             ),
         )
     )
-    store = JsonScheduledWorkStore(home)
+    store = WorkspaceJsonScheduledWorkStore(_state(workspace))
     gateway = ToolGateway()
     gateway.register_tools((CreateScheduledWorkTool(),))
     conversation = StreamingConversationPort(
@@ -197,17 +216,13 @@ async def test_runtime_chat_catalog_exposes_scheduled_work_creation(
     assert events[-1].type == "turn_completed"
     request = provider.stream_requests[0]
     assert isinstance(request, ModelRequest)
-    assert "create_scheduled_work" in {
-        schema["function"]["name"] for schema in request.tools
-    }
+    assert "create_scheduled_work" in {schema["function"]["name"] for schema in request.tools}
 
 
 def test_invalid_existing_record_returns_persistence_error_without_rewrite(
-    agent_home: Path,
+    workspace: Path,
 ) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    store = JsonScheduledWorkStore(home)
+    store = WorkspaceJsonScheduledWorkStore(_state(workspace))
     invalid_content = json.dumps(
         [
             {
@@ -229,3 +244,69 @@ def test_invalid_existing_record_returns_persistence_error_without_rewrite(
         store.load()
 
     assert store.path.read_text(encoding="utf-8") == invalid_content
+
+
+def test_workspace_scheduled_work_is_lazy_and_isolated(workspace: Path) -> None:
+    first_workspace = workspace / "first"
+    second_workspace = workspace / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    first = WorkspaceJsonScheduledWorkStore(_state(first_workspace))
+    second = WorkspaceJsonScheduledWorkStore(_state(second_workspace))
+
+    assert first.load() == ()
+    assert second.load() == ()
+    assert not first.path.exists()
+    assert not second.path.exists()
+
+    first_record = _scheduled_record(
+        title="First Workspace task",
+        task_id="11111111-1111-4111-8111-111111111111",
+        session_id="20260712-200000-123000_22222222-2222-4222-8222-222222222222",
+    )
+    second_record = _scheduled_record(
+        title="Second Workspace task",
+        task_id="33333333-3333-4333-8333-333333333333",
+        session_id="20260712-200000-123000_44444444-4444-4444-8444-444444444444",
+    )
+    for store, record in ((first, first_record), (second, second_record)):
+        store.path.write_text(
+            json.dumps([record.to_dict()], ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+    assert first.load() == (first_record,)
+    assert second.load() == (second_record,)
+
+
+@pytest.mark.parametrize("unsafe_kind", ("directory", "hardlink"))
+def test_workspace_scheduled_work_rejects_unsafe_files_without_modifying_targets(
+    workspace: Path,
+    unsafe_kind: str,
+) -> None:
+    store = WorkspaceJsonScheduledWorkStore(_state(workspace))
+    outside = workspace.parent / f"outside-{unsafe_kind}.json"
+    outside_bytes = b"outside Scheduled Work must not be parsed or modified"
+
+    if unsafe_kind == "directory":
+        store.path.mkdir()
+    else:
+        outside.write_bytes(outside_bytes)
+        store.path.hardlink_to(outside)
+
+    with pytest.raises(ScheduledWorkPersistenceError):
+        store.load()
+
+    if unsafe_kind == "hardlink":
+        assert outside.read_bytes() == outside_bytes
+
+
+def test_invalid_workspace_scheduled_work_is_not_rewritten(workspace: Path) -> None:
+    store = WorkspaceJsonScheduledWorkStore(_state(workspace))
+    invalid_bytes = b"invalid Workspace Scheduled Work\xff"
+    store.path.write_bytes(invalid_bytes)
+
+    with pytest.raises(ScheduledWorkPersistenceError):
+        store.load()
+
+    assert store.path.read_bytes() == invalid_bytes

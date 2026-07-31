@@ -11,6 +11,7 @@ from myclaw.agent.events import (
     validate_agent_event_sequence,
 )
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -60,8 +61,7 @@ async def test_unknown_long_tool_is_normalized_and_the_turn_continues_without_ev
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -185,8 +185,7 @@ async def test_invalid_arguments_are_rejected_before_the_tool_boundary_and_retur
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -287,8 +286,7 @@ async def test_tool_exception_executes_once_and_becomes_a_safe_result_before_mod
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -393,8 +391,7 @@ async def test_multiple_tool_calls_keep_mixed_results_ordered_and_recoverable(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -570,8 +567,7 @@ async def test_json_schema_format_is_enforced_before_tool_boundary_and_turn_cont
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )

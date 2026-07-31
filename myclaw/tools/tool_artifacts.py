@@ -1,13 +1,11 @@
 """Atomic externalization for oversized Tool Results."""
 
-import os
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from stat import S_ISREG
 from typing import Final
 
-from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.tools.artifacts import ArtifactReference, encode_artifact_tool_call_id
 from myclaw.tools.models import ToolResult
 from myclaw.utils.atomic_files import (
@@ -15,6 +13,10 @@ from myclaw.utils.atomic_files import (
     atomic_create_text_with_identity,
     file_identity,
     path_for_io,
+)
+from myclaw.utils.windows_filesystem import (
+    require_owned_directory,
+    require_owned_regular_file,
 )
 
 type ArtifactWriter = Callable[[Path, str], None]
@@ -29,8 +31,7 @@ class ArtifactWriteError(Exception):
 def externalize_tool_result(
     result: ToolResult,
     *,
-    agent_home: Path,
-    workspace: Workspace,
+    workspace_state: WorkspaceState,
     session_id: str,
     max_tool_result_chars: int,
     write_text: ArtifactWriter | None = None,
@@ -53,36 +54,24 @@ def externalize_tool_result(
                 preview_chars=len(preview),
             ),
         )
-        io_agent_home = path_for_io(agent_home)
-        io_directory = io_agent_home / "sessions" / workspace.slug / "artifacts" / session_id
-        io_agent_home.mkdir(parents=True, exist_ok=True)
-        agent_home_root = _resolved_for_comparison(io_agent_home)
-        existing_parent = io_directory
-        while not existing_parent.exists():
-            parent = existing_parent.parent
-            if parent == existing_parent:
-                raise PermissionError("Tool Artifact path has no existing parent")
-            existing_parent = parent
-        resolved_parent = _resolved_for_comparison(existing_parent)
-        if not resolved_parent.is_relative_to(agent_home_root) or not existing_parent.is_dir():
-            raise PermissionError("Tool Artifact directory must remain inside Agent Home")
-        io_directory.mkdir(parents=True, exist_ok=True)
-        resolved_directory = _resolved_for_comparison(io_directory)
-        if not resolved_directory.is_relative_to(agent_home_root) or not io_directory.is_dir():
-            raise PermissionError("Tool Artifact directory must remain inside Agent Home")
+        io_workspace = path_for_io(Path(workspace_state.workspace.path))
+        workspace_root = io_workspace.resolve(strict=True)
+        io_state = path_for_io(workspace_state.path)
+        state_root = require_owned_directory(io_state, within=workspace_root)
+        io_sessions = path_for_io(workspace_state.sessions_directory)
+        sessions_root = require_owned_directory(io_sessions, within=state_root)
+        artifacts_directory = io_sessions / "artifacts"
+        artifacts_directory.mkdir(exist_ok=True)
+        artifacts_root = require_owned_directory(artifacts_directory, within=sessions_root)
+        io_directory = artifacts_directory / session_id
+        io_directory.mkdir(exist_ok=True)
+        require_owned_directory(io_directory, within=artifacts_root)
         artifact_path = io_directory / f"{encoded_tool_call_id}.txt"
         if write_text is None:
             identity = _atomic_create_artifact(artifact_path, raw_content)
-            resolved_artifact = _resolved_for_comparison(artifact_path)
-            if not resolved_artifact.is_relative_to(agent_home_root):
-                raise PermissionError("Tool Artifact file must remain inside Agent Home")
+            resolved_artifact = require_owned_regular_file(artifact_path, within=sessions_root)
             owned_path = path_for_io(resolved_artifact)
-            status = owned_path.lstat()
-            if (
-                not S_ISREG(status.st_mode)
-                or status.st_nlink != 1
-                or file_identity(status) != identity
-            ):
+            if file_identity(owned_path.stat(follow_symlinks=False)) != identity:
                 raise PermissionError("Tool Artifact must be an unaliased regular file")
         else:
             write_text(artifact_path, raw_content)
@@ -96,13 +85,3 @@ def _atomic_create_artifact(path: Path, content: str) -> FileIdentity:
     if identity is None:
         raise FileExistsError("Tool Artifact already exists")
     return identity
-
-
-def _resolved_for_comparison(path: Path) -> Path:
-    resolved = path.resolve(strict=True)
-    if os.name != "nt":
-        return resolved
-    native = str(resolved)
-    if native.startswith("\\\\?\\UNC\\"):
-        return Path(f"\\\\{native.removeprefix('\\\\?\\UNC\\')}")
-    return Path(native.removeprefix("\\\\?\\"))

@@ -68,7 +68,9 @@ class ShellTool(BaseTool):
         try:
             return await self._boundary.execute(request)
         except ShellPolicyDenied as error:
-            raise ToolError("Shell process execution was rejected by the safety boundary.") from error
+            raise ToolError(
+                "Shell process execution was rejected by the safety boundary."
+            ) from error
 
     def _request(self, *, command: str, cwd: str, timeout: int) -> ShellRequest:
         try:

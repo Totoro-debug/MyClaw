@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -11,6 +10,7 @@ import pytest
 
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
@@ -52,7 +52,7 @@ from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool
 from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
-from myclaw.utils.atomic_files import atomic_replace_bytes
+from myclaw.utils.atomic_files import atomic_replace_bytes, path_for_io
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, persist_scheduled_work
 
@@ -86,16 +86,16 @@ def _usage() -> ModelUsage:
 
 
 def _externalizer_for(
-    *, agent_home: Path, workspace: Path, max_tool_result_chars: int
+    *, workspace: Path, max_tool_result_chars: int
 ) -> Callable[[str], Callable[[ToolResult], ToolResult]]:
-    workspace_identity = Workspace.from_path(workspace)
+    workspace_state = WorkspaceState(Workspace.from_path(workspace))
+    workspace_state.initialize(agent_home_root=Path.home() / ".myclaw")
 
     def for_session(session_id: str) -> Callable[[ToolResult], ToolResult]:
         def externalize(result: ToolResult) -> ToolResult:
             return externalize_tool_result(
                 result,
-                agent_home=agent_home,
-                workspace=workspace_identity,
+                workspace_state=workspace_state,
                 session_id=session_id,
                 max_tool_result_chars=max_tool_result_chars,
             )
@@ -142,22 +142,17 @@ class ObservingToolGateway(ToolGateway):
 def _tool_gateway(
     *,
     agent_home: Path,
-    workspace: Path,
+    workspace_state: WorkspaceState,
     session_id: str,
     shell: ShellBoundary | None = None,
     gateway: ToolGateway | None = None,
 ) -> ToolGateway:
-    workspace_identity = Workspace.from_path(workspace)
+    workspace_identity = workspace_state.workspace
+    workspace = Path(workspace_identity.path)
     security = Security(
         workspace=workspace_identity,
         agent_home=agent_home,
-        artifact_directory=(
-            agent_home
-            / "sessions"
-            / workspace_identity.slug
-            / "artifacts"
-            / session_id
-        ),
+        artifact_directory=workspace_state.sessions_directory / "artifacts" / session_id,
     )
     tools: list[BaseTool] = [
         ReadFileTool(security=security),
@@ -174,24 +169,25 @@ def _tool_gateway(
 
 
 def _long_path(path: Path) -> Path:
-    if os.name != "nt":
-        return path
-    return Path(f"\\\\?\\{path.absolute()}")
+    return path_for_io(path)
+
+
+def _artifact_directory(*, workspace: Path, session_id: str) -> Path:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    return state.sessions_directory / "artifacts" / session_id
 
 
 class LoadFailingSessionStore(JsonlSessionStore):
     def __init__(
         self,
         *,
-        agent_home: AgentHome,
-        workspace: Workspace,
+        workspace_state: WorkspaceState,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
         fail_on_load: int,
     ) -> None:
         super().__init__(
-            agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=workspace_state,
             now=now,
             new_uuid=new_uuid,
         )
@@ -220,14 +216,12 @@ class IndeterminateToolAppendSessionStore(JsonlSessionStore):
     def __init__(
         self,
         *,
-        agent_home: AgentHome,
-        workspace: Workspace,
+        workspace_state: WorkspaceState,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
     ) -> None:
         super().__init__(
-            agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=workspace_state,
             now=now,
             new_uuid=new_uuid,
         )
@@ -254,14 +248,12 @@ class BlockingToolAppendSessionStore(JsonlSessionStore):
     def __init__(
         self,
         *,
-        agent_home: AgentHome,
-        workspace: Workspace,
+        workspace_state: WorkspaceState,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
     ) -> None:
         super().__init__(
-            agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=workspace_state,
             now=now,
             new_uuid=new_uuid,
         )
@@ -282,14 +274,12 @@ class EffectThenBlockToolAppendSessionStore(JsonlSessionStore):
     def __init__(
         self,
         *,
-        agent_home: AgentHome,
-        workspace: Workspace,
+        workspace_state: WorkspaceState,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
     ) -> None:
         super().__init__(
-            agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=workspace_state,
             now=now,
             new_uuid=new_uuid,
         )
@@ -315,14 +305,12 @@ class EffectThenRaiseToolAppendSessionStore(JsonlSessionStore):
         self,
         *,
         failure: BaseException,
-        agent_home: AgentHome,
-        workspace: Workspace,
+        workspace_state: WorkspaceState,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
     ) -> None:
         super().__init__(
-            agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=workspace_state,
             now=now,
             new_uuid=new_uuid,
         )
@@ -346,10 +334,8 @@ async def test_first_scheduled_work_trigger_persists_a_complete_cron_turn(
     home = AgentHome(agent_home)
     home.initialize()
     long_term_memory = "# Long-term Memory\n\n## Project Fact\n\nUse strict TDD.\n"
-    (agent_home / "memory" / "memory.md").write_text(long_term_memory, encoding="utf-8")
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -379,7 +365,7 @@ async def test_first_scheduled_work_trigger_persists_a_complete_cron_turn(
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -423,8 +409,7 @@ async def test_repeated_scheduled_work_triggers_reuse_the_task_session_history(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -467,7 +452,7 @@ async def test_repeated_scheduled_work_triggers_reuse_the_task_session_history(
         ).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -504,8 +489,7 @@ async def test_scheduled_work_auto_refuses_ask_tools_and_completes_the_agent_tur
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -557,7 +541,7 @@ async def test_scheduled_work_auto_refuses_ask_tools_and_completes_the_agent_tur
         ).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -598,8 +582,7 @@ async def test_scheduled_work_commits_a_published_oversized_tool_result(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -627,7 +610,7 @@ async def test_scheduled_work_commits_a_published_oversized_tool_result(
     gateway = ObservingToolGateway()
     _tool_gateway(
         agent_home=agent_home,
-        workspace=workspace,
+        workspace_state=sessions.workspace_state,
         session_id=TASK_SESSION_ID,
         gateway=gateway,
     )
@@ -656,7 +639,6 @@ async def test_scheduled_work_commits_a_published_oversized_tool_result(
         ).__next__,
         tool_gateway_for=lambda _: gateway,
         externalize_result_for=_externalizer_for(
-            agent_home=agent_home,
             workspace=workspace,
             max_tool_result_chars=1,
         ),
@@ -676,7 +658,8 @@ async def test_scheduled_work_commits_a_published_oversized_tool_result(
     assert isinstance(tool_message, ToolSessionMessage)
     assert tool_message.artifact is not None
     artifact_path = _long_path(
-        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_scheduled_artifact.txt"
+        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
+        / "call_scheduled_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
     assert artifact_path.read_text(encoding="utf-8") == raw_result
@@ -690,8 +673,7 @@ async def test_model_failure_is_persisted_without_stopping_the_next_scheduled_wo
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -730,7 +712,7 @@ async def test_model_failure_is_persisted_without_stopping_the_next_scheduled_wo
         ).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -777,16 +759,13 @@ async def test_scheduled_work_records_one_terminal_failure_with_task_session_con
         prompt="PRIVATE TASK PROMPT",
     )
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
     provider = ScriptedFakeProvider(
         completions=(
-            ModelCallError(
-                ErrorInfo(code="model_failed", message="PRIVATE MODEL OUTPUT")
-            ),
+            ModelCallError(ErrorInfo(code="model_failed", message="PRIVATE MODEL OUTPUT")),
         )
     )
     runner = ScheduledWorkRunner(
@@ -805,7 +784,7 @@ async def test_scheduled_work_records_one_terminal_failure_with_task_session_con
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -847,14 +826,11 @@ async def test_scheduled_work_records_an_unhandled_terminal_exception_once(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
-    provider = ScriptedFakeProvider(
-        completions=(RuntimeError("technical cron execution failure"),)
-    )
+    provider = ScriptedFakeProvider(completions=(RuntimeError("technical cron execution failure"),))
     runner = ScheduledWorkRunner(
         provider=provider,
         sessions=sessions,
@@ -871,7 +847,7 @@ async def test_scheduled_work_records_an_unhandled_terminal_exception_once(
         new_uuid=iter((USER_UUID, REQUEST_UUID)).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -909,8 +885,7 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
         atomic_replace_bytes(path, content)
 
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
         replace_bytes=fail_first_publication,
@@ -954,7 +929,7 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
         ).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -1001,14 +976,13 @@ async def test_corrupt_task_session_is_isolated_before_the_model_call(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
     failed_task = _task()
     corrupt_path = sessions.path_for(failed_task.session_id)
-    io_path = Path(f"\\\\?\\{corrupt_path.absolute()}") if os.name == "nt" else corrupt_path
+    io_path = path_for_io(corrupt_path)
     io_path.parent.mkdir(parents=True)
     io_path.write_text("{not valid session json}\n", encoding="utf-8")
     provider = ScriptedFakeProvider(
@@ -1036,7 +1010,7 @@ async def test_corrupt_task_session_is_isolated_before_the_model_call(
         new_uuid=iter((USER_UUID, USER_TWO_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -1078,8 +1052,7 @@ async def test_tool_result_publication_failure_is_isolated_from_the_next_task(
         atomic_replace_bytes(path, content)
 
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
         replace_bytes=fail_tool_publication,
@@ -1129,7 +1102,7 @@ async def test_tool_result_publication_failure_is_isolated_from_the_next_task(
         ).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -1176,8 +1149,7 @@ async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_public
         atomic_replace_bytes(path, content)
 
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
         replace_bytes=fail_tool_metadata_publication,
@@ -1201,7 +1173,7 @@ async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_public
     gateway = ObservingToolGateway()
     _tool_gateway(
         agent_home=agent_home,
-        workspace=workspace,
+        workspace_state=sessions.workspace_state,
         session_id=TASK_SESSION_ID,
         gateway=gateway,
     )
@@ -1221,7 +1193,6 @@ async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_public
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
         externalize_result_for=_externalizer_for(
-            agent_home=agent_home,
             workspace=workspace,
             max_tool_result_chars=1,
         ),
@@ -1241,7 +1212,8 @@ async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_public
     assert tool_message.id == str(USER_TWO_UUID)
     assert tool_message.artifact is not None
     artifact_path = _long_path(
-        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_effect_then_raise_artifact.txt"
+        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
+        / "call_effect_then_raise_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
     assert artifact_path.read_text(encoding="utf-8") == raw_result
@@ -1255,8 +1227,7 @@ async def test_scheduled_work_leaves_an_orphan_artifact_when_tool_message_was_no
     home = AgentHome(agent_home)
     home.initialize()
     sessions = ToolAppendFailingSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -1279,7 +1250,7 @@ async def test_scheduled_work_leaves_an_orphan_artifact_when_tool_message_was_no
     gateway = ObservingToolGateway()
     _tool_gateway(
         agent_home=agent_home,
-        workspace=workspace,
+        workspace_state=sessions.workspace_state,
         session_id=TASK_SESSION_ID,
         gateway=gateway,
     )
@@ -1299,7 +1270,6 @@ async def test_scheduled_work_leaves_an_orphan_artifact_when_tool_message_was_no
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
         externalize_result_for=_externalizer_for(
-            agent_home=agent_home,
             workspace=workspace,
             max_tool_result_chars=1,
         ),
@@ -1313,7 +1283,8 @@ async def test_scheduled_work_leaves_an_orphan_artifact_when_tool_message_was_no
     session = await sessions.load(TASK_SESSION_ID)
     assert [message.role for message in session.messages] == ["user", "assistant"]
     artifact_path = _long_path(
-        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_unpublished_artifact.txt"
+        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
+        / "call_unpublished_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
 
@@ -1326,8 +1297,7 @@ async def test_scheduled_work_preserves_an_artifact_when_publication_is_indeterm
     home = AgentHome(agent_home)
     home.initialize()
     sessions = IndeterminateToolAppendSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -1350,7 +1320,7 @@ async def test_scheduled_work_preserves_an_artifact_when_publication_is_indeterm
     gateway = ObservingToolGateway()
     _tool_gateway(
         agent_home=agent_home,
-        workspace=workspace,
+        workspace_state=sessions.workspace_state,
         session_id=TASK_SESSION_ID,
         gateway=gateway,
     )
@@ -1370,7 +1340,6 @@ async def test_scheduled_work_preserves_an_artifact_when_publication_is_indeterm
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
         externalize_result_for=_externalizer_for(
-            agent_home=agent_home,
             workspace=workspace,
             max_tool_result_chars=1,
         ),
@@ -1386,7 +1355,8 @@ async def test_scheduled_work_preserves_an_artifact_when_publication_is_indeterm
     session = await sessions.load(TASK_SESSION_ID)
     assert [message.role for message in session.messages] == ["user", "assistant"]
     artifact_path = _long_path(
-        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_indeterminate_artifact.txt"
+        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
+        / "call_indeterminate_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
     assert artifact_path.read_text(encoding="utf-8") == raw_result
@@ -1400,8 +1370,7 @@ async def test_cancelling_scheduled_tool_publication_leaves_an_orphan_artifact(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = BlockingToolAppendSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -1424,7 +1393,7 @@ async def test_cancelling_scheduled_tool_publication_leaves_an_orphan_artifact(
     gateway = ObservingToolGateway()
     _tool_gateway(
         agent_home=agent_home,
-        workspace=workspace,
+        workspace_state=sessions.workspace_state,
         session_id=TASK_SESSION_ID,
         gateway=gateway,
     )
@@ -1444,7 +1413,6 @@ async def test_cancelling_scheduled_tool_publication_leaves_an_orphan_artifact(
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
         externalize_result_for=_externalizer_for(
-            agent_home=agent_home,
             workspace=workspace,
             max_tool_result_chars=1,
         ),
@@ -1459,7 +1427,8 @@ async def test_cancelling_scheduled_tool_publication_leaves_an_orphan_artifact(
     session = await sessions.load(TASK_SESSION_ID)
     assert [message.role for message in session.messages] == ["user", "assistant"]
     artifact_path = _long_path(
-        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_cancelled_artifact.txt"
+        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
+        / "call_cancelled_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
 
@@ -1472,8 +1441,7 @@ async def test_cancelling_after_scheduled_tool_publication_commits_the_durable_a
     home = AgentHome(agent_home)
     home.initialize()
     sessions = EffectThenBlockToolAppendSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -1496,7 +1464,7 @@ async def test_cancelling_after_scheduled_tool_publication_commits_the_durable_a
     gateway = ObservingToolGateway()
     _tool_gateway(
         agent_home=agent_home,
-        workspace=workspace,
+        workspace_state=sessions.workspace_state,
         session_id=TASK_SESSION_ID,
         gateway=gateway,
     )
@@ -1516,7 +1484,6 @@ async def test_cancelling_after_scheduled_tool_publication_commits_the_durable_a
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
         externalize_result_for=_externalizer_for(
-            agent_home=agent_home,
             workspace=workspace,
             max_tool_result_chars=1,
         ),
@@ -1534,7 +1501,8 @@ async def test_cancelling_after_scheduled_tool_publication_commits_the_durable_a
     assert isinstance(tool_message, ToolSessionMessage)
     assert tool_message.artifact is not None
     artifact_path = _long_path(
-        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_effect_then_cancel_artifact.txt"
+        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
+        / "call_effect_then_cancel_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
 
@@ -1549,8 +1517,7 @@ async def test_scheduled_tool_publication_preserves_a_primary_base_exception(
     failure = ToolPublicationBaseError("primary publication failure")
     sessions = EffectThenRaiseToolAppendSessionStore(
         failure=failure,
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -1573,7 +1540,7 @@ async def test_scheduled_tool_publication_preserves_a_primary_base_exception(
     gateway = ObservingToolGateway()
     _tool_gateway(
         agent_home=agent_home,
-        workspace=workspace,
+        workspace_state=sessions.workspace_state,
         session_id=TASK_SESSION_ID,
         gateway=gateway,
     )
@@ -1593,7 +1560,6 @@ async def test_scheduled_tool_publication_preserves_a_primary_base_exception(
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda _: gateway,
         externalize_result_for=_externalizer_for(
-            agent_home=agent_home,
             workspace=workspace,
             max_tool_result_chars=1,
         ),
@@ -1609,7 +1575,8 @@ async def test_scheduled_tool_publication_preserves_a_primary_base_exception(
     assert isinstance(tool_message, ToolSessionMessage)
     assert tool_message.artifact is not None
     artifact_path = _long_path(
-        sessions.directory / "artifacts" / TASK_SESSION_ID / "call_base_exception_artifact.txt"
+        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
+        / "call_base_exception_artifact.txt"
     )
     assert artifact_path.read_text(encoding="utf-8") == raw_result
 
@@ -1631,8 +1598,7 @@ async def test_model_error_publication_failure_becomes_a_persistence_outcome(
         atomic_replace_bytes(path, content)
 
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
         replace_bytes=fail_error_publication,
@@ -1672,7 +1638,7 @@ async def test_model_error_publication_failure_becomes_a_persistence_outcome(
         ).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -1721,8 +1687,7 @@ async def test_session_load_failure_is_isolated_at_every_cron_loop_boundary(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = LoadFailingSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
         fail_on_load=fail_on_load,
@@ -1771,7 +1736,7 @@ async def test_session_load_failure_is_isolated_at_every_cron_loop_boundary(
         ).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -1805,8 +1770,7 @@ async def test_cancelling_a_running_scheduled_tool_repairs_history_without_closi
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -1844,7 +1808,7 @@ async def test_cancelling_a_running_scheduled_tool_repairs_history_without_closi
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
             shell=shell,
         ),
@@ -1875,8 +1839,7 @@ async def test_scheduled_work_uses_a_normalized_task_specific_session_title(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -1907,7 +1870,7 @@ async def test_scheduled_work_uses_a_normalized_task_specific_session_title(
         new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
         ),
     )
@@ -1920,15 +1883,38 @@ async def test_scheduled_work_uses_a_normalized_task_specific_session_title(
 
 
 @pytest.mark.asyncio
-async def test_runtime_scheduled_work_uses_current_shell_and_web_enablement(
+async def test_runtime_scheduled_work_uses_current_workspace_context_and_tool_catalog(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    workspace_memory = "# Workspace Long-term Memory\n\nCurrent cron context.\n"
+    state.long_term_memory_path.write_text(workspace_memory, encoding="utf-8")
+    legacy_memory = b"# Legacy Agent Home Memory\n"
+    legacy_memory_path = agent_home / "memory" / "memory.md"
+    legacy_memory_path.parent.mkdir(parents=True)
+    legacy_memory_path.write_bytes(legacy_memory)
+    (agent_home / "config.toml").write_text(
+        VALID_CONFIG.replace("max_tool_result_chars = 60000", "max_tool_result_chars = 1000"),
+        encoding="utf-8",
+    )
+    raw_result = "W" * 2_000
+    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
+    call = ModelToolCall(
+        id="call_runtime_scheduled_artifact",
+        name="read_file",
+        arguments='{"path":"large.txt"}',
+    )
     provider = ScriptedFakeProvider(
         completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
+                usage=_usage(),
+                finish_reason="tool_calls",
+            ),
             ModelResponse(
                 message=AssistantModelMessage(content="Runtime cron result."),
                 usage=_usage(),
@@ -1942,7 +1928,7 @@ async def test_runtime_scheduled_work_uses_current_shell_and_web_enablement(
         configuration=ConfigLoader(home).load(),
         provider_factory=lambda _: provider,
         now=lambda: NOW,
-        new_uuid=iter((USER_UUID, USER_TWO_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=uuid4,
         shell=BlockingShellBoundary(),
     )
     task = _task()
@@ -1969,8 +1955,28 @@ async def test_runtime_scheduled_work_uses_current_shell_and_web_enablement(
     assert "- create_scheduled_work:" in request.system_prompt
     assert "web_search" not in request.system_prompt
     assert "web_fetch" not in request.system_prompt
+    assert str(state.workspace.path) in request.system_prompt
+    assert workspace_memory in request.system_prompt
+    assert "Legacy Agent Home Memory" not in request.system_prompt
     session = await runtime.sessions.load(task.session_id)
-    assert [message.role for message in session.messages] == ["user", "assistant"]
+    assert [message.role for message in session.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    tool_message = session.messages[2]
+    assert isinstance(tool_message, ToolSessionMessage)
+    assert tool_message.artifact is not None
+    artifact_path = (
+        state.sessions_directory
+        / "artifacts"
+        / task.session_id
+        / "call_runtime_scheduled_artifact.txt"
+    )
+    assert artifact_path.read_text(encoding="utf-8") == raw_result
+    assert runtime.sessions.path_for(task.session_id).parent == state.sessions_directory
+    assert legacy_memory_path.read_bytes() == legacy_memory
 
 
 @pytest.mark.asyncio
@@ -1981,8 +1987,7 @@ async def test_scheduled_tool_failure_is_safe_history_and_the_turn_can_finish(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -2031,7 +2036,7 @@ async def test_scheduled_tool_failure_is_safe_history_and_the_turn_can_finish(
         ).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace=workspace,
+            workspace_state=sessions.workspace_state,
             session_id=session_id,
             shell=FailingShellBoundary(),
         ),
@@ -2104,8 +2109,9 @@ async def test_runtime_scheduled_work_refuses_recursive_task_creation(
         shell=FailingShellBoundary(),
     )
     task = _task()
-    persist_scheduled_work(agent_home, (task,))
-    scheduled_work_path = agent_home / "scheduled-work.json"
+    state = WorkspaceState(Workspace.from_path(workspace))
+    persist_scheduled_work(state.path, (task,))
+    scheduled_work_path = state.scheduled_work_path
     persisted_before = scheduled_work_path.read_bytes()
 
     result = await runtime.scheduled_work_runner.run(task)

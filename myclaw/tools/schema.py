@@ -244,9 +244,7 @@ def _parse_annotation(
     ):
         msg = f"Tool parameter {parameter_name} has string constraints on a non-string"
         raise TypeError(msg)
-    if json_type != "integer" and (
-        metadata.minimum is not None or metadata.maximum is not None
-    ):
+    if json_type != "integer" and (metadata.minimum is not None or metadata.maximum is not None):
         msg = f"Tool parameter {parameter_name} has numeric constraints on a non-integer"
         raise TypeError(msg)
     return json_type, nullable, metadata

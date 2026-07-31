@@ -4,12 +4,13 @@ import json
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated, Protocol, cast
 
-from myclaw.config.agent_home import AgentHome
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.records import ScheduledWork
 from myclaw.tools.base import BaseTool
 from myclaw.tools.schema import ToolParam
+from myclaw.utils.windows_filesystem import require_owned_regular_file
 
 _RECORD_FIELDS = frozenset({"id", "title", "cron", "prompt", "created_at", "enabled", "session_id"})
 
@@ -18,28 +19,41 @@ class ScheduledWorkPersistenceError(RuntimeError):
     """Raised when Scheduled Work persisted state cannot be read."""
 
 
-class JsonScheduledWorkStore:
-    """Load the complete Scheduled Work JSON array."""
+class ScheduledWorkStore(Protocol):
+    """Load Scheduled Work definitions owned by one persistence boundary."""
 
-    def __init__(self, agent_home: AgentHome) -> None:
-        self._agent_home = agent_home
+    def load(self) -> tuple[ScheduledWork, ...]: ...
+
+
+class WorkspaceJsonScheduledWorkStore:
+    """Load Scheduled Work definitions from the current Workspace State."""
+
+    def __init__(self, workspace_state: WorkspaceState) -> None:
+        self._path = workspace_state.scheduled_work_path
+        self._within = workspace_state.path
 
     @property
     def path(self) -> Path:
-        return self._agent_home.path / "scheduled-work.json"
+        return self._path
 
     def load(self) -> tuple[ScheduledWork, ...]:
         try:
-            if not self.path.exists():
+            content = self._read_optional_text()
+            if content is None:
                 return ()
-            document: object = json.loads(self.path.read_text(encoding="utf-8"))
+            document: object = json.loads(content)
             if not isinstance(document, list):
                 raise ValueError("Scheduled Work file must contain a JSON array")
             return tuple(_parse_record(value) for value in document)
         except Exception as error:
-            raise ScheduledWorkPersistenceError(
-                "Scheduled Work state could not be read"
-            ) from error
+            raise ScheduledWorkPersistenceError("Scheduled Work state could not be read") from error
+
+    def _read_optional_text(self) -> str | None:
+        try:
+            owned_path = require_owned_regular_file(self.path, within=self._within)
+        except FileNotFoundError:
+            return None
+        return owned_path.read_text(encoding="utf-8")
 
 
 class CreateScheduledWorkTool(BaseTool):

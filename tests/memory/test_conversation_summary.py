@@ -8,12 +8,13 @@ import pytest
 
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.memory.conversation_summary import (
     ConversationSummaryManager,
-    JsonlSummaryStore,
     SummaryModelSettings,
+    WorkspaceJsonlSummaryStore,
 )
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -35,6 +36,12 @@ from tests.fixtures import ScriptedFakeProvider
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=LOCAL_OFFSET)
+
+
+def _state(workspace: Path) -> WorkspaceState:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    return state
 
 
 def _usage(input_tokens: int = 4, output_tokens: int = 2) -> ModelUsage:
@@ -87,8 +94,7 @@ async def test_message_threshold_synchronously_summarizes_early_turns(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -105,7 +111,7 @@ async def test_message_threshold_synchronously_summarizes_early_turns(
     manager = ConversationSummaryManager(
         provider=provider,
         sessions=sessions,
-        summaries=JsonlSummaryStore(home),
+        summaries=WorkspaceJsonlSummaryStore(_state(workspace)),
         settings=SummaryModelSettings(
             model="memory-model",
             max_output=512,
@@ -149,7 +155,7 @@ async def test_message_threshold_synchronously_summarizes_early_turns(
     assert "Second question." not in summary_input
     records = [
         json.loads(line)
-        for line in (agent_home / "memory" / "summary.jsonl")
+        for line in (_state(workspace).memory_directory / "summary.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
     ]
@@ -170,8 +176,7 @@ async def test_summary_usage_preserves_an_auxiliary_call_that_finishes_during_ge
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -198,7 +203,7 @@ async def test_summary_usage_preserves_an_auxiliary_call_that_finishes_during_ge
     manager = ConversationSummaryManager(
         provider=provider,
         sessions=sessions,
-        summaries=JsonlSummaryStore(home),
+        summaries=WorkspaceJsonlSummaryStore(_state(workspace)),
         settings=SummaryModelSettings(
             model="memory-model",
             max_output=512,
@@ -233,8 +238,7 @@ async def test_token_budget_summarizes_roughly_half_the_available_input(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -252,7 +256,7 @@ async def test_token_budget_summarizes_roughly_half_the_available_input(
     manager = ConversationSummaryManager(
         provider=provider,
         sessions=sessions,
-        summaries=JsonlSummaryStore(home),
+        summaries=WorkspaceJsonlSummaryStore(_state(workspace)),
         settings=SummaryModelSettings(
             model="memory-model",
             max_output=128,
@@ -292,8 +296,7 @@ async def test_repeated_consolidation_advances_cursor_and_summary_index_once_per
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -311,7 +314,7 @@ async def test_repeated_consolidation_advances_cursor_and_summary_index_once_per
             _response("Summary two."),
         )
     )
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(workspace))
     manager = ConversationSummaryManager(
         provider=provider,
         sessions=sessions,
@@ -355,8 +358,7 @@ async def test_summary_persistence_failure_does_not_advance_the_session_cursor(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -366,13 +368,13 @@ async def test_summary_persistence_failure_does_not_advance_the_session_cursor(
     await _append_user(sessions, metadata.id, "Second question.")
     await _append_assistant(sessions, metadata.id, "Second answer.")
     await _append_user(sessions, metadata.id, "Current question.")
-    summary_path = agent_home / "memory" / "summary.jsonl"
+    summary_path = _state(workspace).memory_directory / "summary.jsonl"
     summary_path.mkdir()
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
     manager = ConversationSummaryManager(
         provider=provider,
         sessions=sessions,
-        summaries=JsonlSummaryStore(home),
+        summaries=WorkspaceJsonlSummaryStore(_state(workspace)),
         settings=SummaryModelSettings(
             model="memory-model",
             max_output=512,
@@ -411,15 +413,14 @@ async def test_oversized_chat_system_prompt_fails_without_summarizing_current_in
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
     metadata = sessions.prepare()
     await _append_user(sessions, metadata.id, "Do not discard this current input.")
     provider = ScriptedFakeProvider()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(workspace))
     manager = ConversationSummaryManager(
         provider=provider,
         sessions=sessions,
@@ -457,8 +458,7 @@ async def test_context_overflow_without_an_old_complete_turn_keeps_the_current_t
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -466,7 +466,7 @@ async def test_context_overflow_without_an_old_complete_turn_keeps_the_current_t
     current_input = "Current only: " + "x" * 4_000
     await _append_user(sessions, metadata.id, current_input)
     provider = ScriptedFakeProvider()
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(workspace))
     manager = ConversationSummaryManager(
         provider=provider,
         sessions=sessions,
@@ -575,8 +575,7 @@ async def test_empty_summary_response_is_a_model_failure_without_cursor_progress
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -587,7 +586,7 @@ async def test_empty_summary_response_is_a_model_failure_without_cursor_progress
     await _append_assistant(sessions, metadata.id, "Second answer.")
     await _append_user(sessions, metadata.id, "Current question.")
     provider = ScriptedFakeProvider(completions=(_response(""),))
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(workspace))
     manager = ConversationSummaryManager(
         provider=provider,
         sessions=sessions,
@@ -668,8 +667,7 @@ async def test_cutoff_keeps_the_retained_suffix_at_a_user_boundary(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -683,7 +681,7 @@ async def test_cutoff_keeps_the_retained_suffix_at_a_user_boundary(
     manager = ConversationSummaryManager(
         provider=provider,
         sessions=sessions,
-        summaries=JsonlSummaryStore(home),
+        summaries=WorkspaceJsonlSummaryStore(_state(workspace)),
         settings=SummaryModelSettings(
             model="memory-model",
             max_output=512,

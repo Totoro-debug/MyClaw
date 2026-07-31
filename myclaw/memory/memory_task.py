@@ -1,16 +1,15 @@
-"""Manual Memory Task orchestration and Agent Home persistence."""
+"""Manual Memory Task orchestration and persistent-state adapters."""
 
 import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from stat import S_ISREG
 from typing import Annotated, Protocol, runtime_checkable
 from uuid import uuid4
 
 from myclaw.agent.prompts import memory_task_input, memory_task_prompt
-from myclaw.config.agent_home import AgentHome
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
@@ -29,6 +28,10 @@ from myclaw.tools.schema import ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.atomic_files import atomic_replace_text
 from myclaw.utils.validation import require_nonnegative_int
+from myclaw.utils.windows_filesystem import (
+    require_owned_directory,
+    require_owned_regular_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +98,7 @@ class MemoryReadFileTool(BaseTool):
         try:
             content = await self._memory.read_long_term()
         except MemoryPathDeniedError as error:
-            raise ToolError("Long-term Memory must be a regular Agent Home file.") from error
+            raise ToolError("Long-term Memory must be a regular Workspace State file.") from error
         except (OSError, UnicodeError, ValueError) as error:
             raise ToolError("Long-term Memory could not be read.") from error
         return "\n".join(content.splitlines()[offset : offset + limit])
@@ -129,7 +132,7 @@ class MemoryEditFileTool(BaseTool):
         try:
             content = await self._memory.read_long_term()
         except MemoryPathDeniedError as error:
-            raise ToolError("Long-term Memory must be a regular Agent Home file.") from error
+            raise ToolError("Long-term Memory must be a regular Workspace State file.") from error
         except (OSError, UnicodeError, ValueError) as error:
             raise ToolError("Long-term Memory could not be read.") from error
         match_count = content.count(old_text)
@@ -143,7 +146,7 @@ class MemoryEditFileTool(BaseTool):
         try:
             await self._memory.replace_long_term(replacement)
         except MemoryPathDeniedError as error:
-            raise ToolError("Long-term Memory must be a regular Agent Home file.") from error
+            raise ToolError("Long-term Memory must be a regular Workspace State file.") from error
         except (OSError, UnicodeError, ValueError) as error:
             raise ToolError("Long-term Memory could not be updated.") from error
         return "Long-term Memory updated."
@@ -154,18 +157,20 @@ def _require_long_term_path(path: str, *, expected: Path) -> None:
         raise ToolError("Memory Tasks may access only Long-term Memory.")
 
 
-class FileMemoryStore:
-    """Persist Long-term Memory and its Summary Cursor under Agent Home."""
+class WorkspaceFileMemoryStore:
+    """Persist Long-term Memory and its Summary Cursor in one Workspace State."""
 
     def __init__(
         self,
-        agent_home: AgentHome,
+        workspace_state: WorkspaceState,
         *,
         replace_text: Callable[[Path, str], None] = atomic_replace_text,
     ) -> None:
-        self._agent_home_root = agent_home.path.resolve(strict=True)
-        self._long_term_path = agent_home.path / "memory" / "memory.md"
-        self._cursor_path = agent_home.path / "memory" / ".cursor"
+        self.workspace_state = workspace_state
+        self._state_root = workspace_state.path.resolve(strict=True)
+        self._memory_directory = workspace_state.memory_directory
+        self._long_term_path = workspace_state.long_term_memory_path
+        self._cursor_path = workspace_state.memory_directory / ".cursor"
         self._replace_text = replace_text
         self._lock = asyncio.Lock()
 
@@ -183,19 +188,24 @@ class FileMemoryStore:
         self._require_private_regular_file(self._long_term_path)
 
     def _require_private_regular_file(self, path: Path) -> None:
-        resolved = path.resolve(strict=True)
-        file_status = path.lstat()
-        if (
-            not resolved.is_relative_to(self._agent_home_root)
-            or not S_ISREG(file_status.st_mode)
-            or file_status.st_nlink != 1
-        ):
-            raise MemoryPathDeniedError("Agent Home state must be an unaliased regular file")
+        self._require_private_memory_directory()
+        try:
+            require_owned_regular_file(path, within=self._state_root)
+        except PermissionError as error:
+            raise MemoryPathDeniedError(
+                "Workspace State must be an unaliased regular file"
+            ) from error
+
+    def _require_private_memory_directory(self) -> None:
+        try:
+            require_owned_directory(self._memory_directory, within=self._state_root)
+        except PermissionError as error:
+            raise MemoryPathDeniedError(
+                "Workspace State Memory directory must remain unaliased"
+            ) from error
 
     def _require_private_cursor_location(self) -> None:
-        resolved_parent = self._cursor_path.parent.resolve(strict=True)
-        if not resolved_parent.is_relative_to(self._agent_home_root):
-            raise MemoryPathDeniedError("Summary Cursor must remain inside Agent Home")
+        self._require_private_memory_directory()
         if self._cursor_path.exists() or self._cursor_path.is_symlink():
             self._require_private_regular_file(self._cursor_path)
 

@@ -12,6 +12,7 @@ from rich.console import Console
 from myclaw.agent.runtime import (
     prepare_repl_runtime,
 )
+from myclaw.agent.workspace_state import WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader, UserConfiguration
 from myclaw.errors import ErrorInfo
@@ -37,19 +38,21 @@ def _local_now() -> datetime:
     return datetime.now().astimezone()
 
 
-def _print_error(error: ErrorInfo, path: object) -> None:
+def _print_error_info(error: ErrorInfo) -> None:
     console.print(
         f"{error.code}: {error.message}",
         markup=False,
         highlight=False,
         soft_wrap=True,
     )
+
+
+def _print_error(error: ErrorInfo, path: object) -> None:
+    _print_error_info(error)
     console.print(f"Path: {path}", markup=False, highlight=False, soft_wrap=True)
 
 
-def _configure_runtime_log(
-    runtime_log: RuntimeLogLifetime, configuration: object
-) -> None:
+def _configure_runtime_log(runtime_log: RuntimeLogLifetime, configuration: object) -> None:
     if not isinstance(configuration, UserConfiguration):
         return
     runtime_log.add_api_keys(
@@ -72,8 +75,7 @@ def main(context: typer.Context) -> None:
             log_sanitized_exception(
                 logger,
                 logging.ERROR,
-                "Startup failed "
-                f"code={config_error.error.code} type={type(config_error).__name__}",
+                f"Startup failed code={config_error.error.code} type={type(config_error).__name__}",
                 config_error,
             )
             _print_error(config_error.error, loader.path)
@@ -93,15 +95,19 @@ def main(context: typer.Context) -> None:
             raise typer.Exit(code=1) from None
         _configure_runtime_log(runtime_log, configuration)
         console.print("MyClaw Personal Agent configuration gate passed.")
-        runtime = prepare_repl_runtime(
-            agent_home=loader.agent_home,
-            workspace=Path.cwd(),
-            configuration=configuration,
-            provider_factory=create_provider,
-            now=_local_now,
-            new_uuid=uuid4,
-            runtime_log=runtime_log,
-        )
+        try:
+            runtime = prepare_repl_runtime(
+                agent_home=loader.agent_home,
+                workspace=Path.cwd(),
+                configuration=configuration,
+                provider_factory=create_provider,
+                now=_local_now,
+                new_uuid=uuid4,
+                runtime_log=runtime_log,
+            )
+        except WorkspaceStateError as workspace_state_error:
+            _print_error(workspace_state_error.error, workspace_state_error.path)
+            raise typer.Exit(code=1) from None
         with asyncio.Runner() as runner:
             interrupts = ForegroundInterruptController(
                 loop=runner.get_loop(),

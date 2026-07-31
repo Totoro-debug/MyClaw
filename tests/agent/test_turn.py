@@ -1,4 +1,3 @@
-import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -9,6 +8,7 @@ import pytest
 
 from myclaw.agent.turn import AgentTurn, AgentTurnLane
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -28,6 +28,7 @@ from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.utils.atomic_files import path_for_io
 from tests.fixtures import FakeTool, ScriptedFakeProvider, StreamScript
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
@@ -78,9 +79,7 @@ def _usage() -> ModelUsage:
 
 
 def _io_path(path: Path) -> Path:
-    if os.name != "nt":
-        return path
-    return Path(f"\\\\?\\{path.absolute()}")
+    return path_for_io(path)
 
 
 def _provider(
@@ -105,8 +104,7 @@ async def _run_artifact_turn(
     lane: AgentTurnLane,
     sessions: JsonlSessionStore,
     session_id: str,
-    agent_home: Path,
-    workspace: Path,
+    workspace_state: WorkspaceState,
     completes: bool,
 ) -> tuple[tuple[object, ...], Path]:
     tool_call = ModelToolCall(
@@ -142,8 +140,7 @@ async def _run_artifact_turn(
     def externalize(result: ToolResult) -> ToolResult:
         projected = externalize_tool_result(
             result,
-            agent_home=agent_home,
-            workspace=Workspace.from_path(workspace),
+            workspace_state=workspace_state,
             session_id=session_id,
             max_tool_result_chars=4,
         )
@@ -176,9 +173,7 @@ async def _run_artifact_turn(
 
     result = externalized[0]
     assert result.artifact is not None
-    artifact_path = _io_path(
-        agent_home / "sessions" / Workspace.from_path(workspace).slug / Path(result.artifact.path)
-    )
+    artifact_path = _io_path(workspace_state.sessions_directory / Path(result.artifact.path))
     return payloads, artifact_path
 
 
@@ -192,8 +187,7 @@ async def test_agent_turn_lanes_share_one_persisted_tool_loop(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: SESSION_UUID,
     )
@@ -288,8 +282,7 @@ async def test_agent_turn_lanes_persist_a_published_tool_artifact(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: SESSION_UUID,
     )
@@ -299,8 +292,7 @@ async def test_agent_turn_lanes_persist_a_published_tool_artifact(
         lane=lane,
         sessions=sessions,
         session_id=session.id,
-        agent_home=agent_home,
-        workspace=workspace,
+        workspace_state=sessions.workspace_state,
         completes=True,
     )
 
@@ -318,8 +310,7 @@ async def test_agent_turn_lanes_accept_an_orphan_after_known_session_failure(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = _MissingToolAppendSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: SESSION_UUID,
     )
@@ -329,8 +320,7 @@ async def test_agent_turn_lanes_accept_an_orphan_after_known_session_failure(
         lane=lane,
         sessions=sessions,
         session_id=session.id,
-        agent_home=agent_home,
-        workspace=workspace,
+        workspace_state=sessions.workspace_state,
         completes=False,
     )
 
@@ -348,8 +338,7 @@ async def test_agent_turn_lanes_preserve_an_indeterminate_tool_artifact(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = _IndeterminateToolAppendSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=lambda: SESSION_UUID,
     )
@@ -359,8 +348,7 @@ async def test_agent_turn_lanes_preserve_an_indeterminate_tool_artifact(
         lane=lane,
         sessions=sessions,
         session_id=session.id,
-        agent_home=agent_home,
-        workspace=workspace,
+        workspace_state=sessions.workspace_state,
         completes=False,
     )
 

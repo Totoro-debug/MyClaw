@@ -1,6 +1,5 @@
 """Shared filesystem security rules for concrete Tools."""
 
-import os
 from pathlib import Path
 
 from myclaw.agent.workspace import Workspace
@@ -27,7 +26,8 @@ class Security:
         self._workspace_identity = workspace
         self._workspace = path_for_io(Path(workspace.path)).resolve(strict=False)
         self._agent_home = path_for_io(agent_home).resolve(strict=False)
-        self._long_term_memory = self._agent_home / "memory" / "memory.md"
+        self._workspace_state = self._workspace / ".myclaw"
+        self._long_term_memory = self._workspace_state / "memory" / "memory.md"
         # Preserve the configured directory's lexical identity. Resolving it here
         # would make a pre-existing symlink or junction target part of the trusted
         # read scope.
@@ -37,13 +37,17 @@ class Security:
     def resolve_read_path(self, requested: str) -> Path:
         """Resolve one existing readable path or raise a public-safe Tool error."""
         candidate = Path(requested)
-        if os.name == "nt" and any(_is_windows_reserved(part) for part in candidate.parts):
+        artifact_alias = False
+        memory_alias = False
+        if any(_is_windows_reserved(part) for part in candidate.parts):
             raise ToolError("The requested path identifies a Windows device.")
         if not candidate.is_absolute():
-            if candidate.parts and candidate.parts[0] == "artifacts":
-                candidate = (
-                    self._agent_home / "sessions" / self._workspace_identity.slug / candidate
-                )
+            if candidate.parts == ("memory", "memory.md"):
+                memory_alias = True
+                candidate = self._long_term_memory
+            elif candidate.parts and candidate.parts[0] == "artifacts":
+                artifact_alias = True
+                candidate = self._workspace_state / "sessions" / candidate
             else:
                 candidate = self._workspace / candidate
         else:
@@ -54,18 +58,27 @@ class Security:
             raise ToolError("The requested path does not exist.") from error
 
         scope = self._read_scope(resolved)
+        if scope == "artifact" and not artifact_alias:
+            raise ToolError("Workspace State internal files are not readable by file Tools.")
+        if scope == "memory" and not memory_alias:
+            raise ToolError("Workspace State internal files are not readable by file Tools.")
         if scope is None and (
             resolved == self._agent_home or resolved.is_relative_to(self._agent_home)
         ):
             raise ToolError("Agent Home internal state is not readable by file Tools.")
+        if scope is None and (
+            resolved == self._workspace_state or resolved.is_relative_to(self._workspace_state)
+        ):
+            raise ToolError("Workspace State internal files are not readable by file Tools.")
         if scope is None:
             raise ToolError("The requested path resolves outside the Workspace.")
-        relative_parts = (
-            resolved.relative_to(self._agent_home).parts
-            if scope in {"memory", "artifact"}
-            else resolved.relative_to(self._workspace).parts
-        )
-        if os.name == "nt" and any(":" in part for part in relative_parts):
+        if scope == "memory":
+            relative_parts = resolved.relative_to(self._long_term_memory.parent).parts
+        elif scope == "artifact":
+            relative_parts = resolved.relative_to(self._artifact_directory).parts
+        else:
+            relative_parts = resolved.relative_to(self._workspace).parts
+        if any(":" in part for part in relative_parts):
             raise ToolError("The requested path identifies a Windows alternate data stream.")
         return resolved
 
@@ -76,19 +89,19 @@ class Security:
             return "memory/memory.md"
         if scope == "artifact":
             suffix = target.relative_to(self._artifact_directory)
-            return (Path("artifacts") / self._session_id / suffix).as_posix()
+            return _slash_reference(Path("artifacts") / self._session_id / suffix)
         if scope == "workspace":
-            return target.relative_to(self._workspace).as_posix()
+            return _slash_reference(target.relative_to(self._workspace))
         raise ToolError("The requested path is outside the readable scope.")
 
     def _read_scope(self, target: Path) -> str | None:
+        if target == self._long_term_memory:
+            return "memory"
+        if target == self._artifact_directory or target.is_relative_to(self._artifact_directory):
+            return "artifact"
         if target == self._agent_home or target.is_relative_to(self._agent_home):
-            if target == self._long_term_memory:
-                return "memory"
-            if target == self._artifact_directory or target.is_relative_to(
-                self._artifact_directory
-            ):
-                return "artifact"
+            return None
+        if target == self._workspace_state or target.is_relative_to(self._workspace_state):
             return None
         if target.is_relative_to(self._workspace):
             return "workspace"
@@ -99,3 +112,7 @@ def _is_windows_reserved(component: str) -> bool:
     normalized = component.rstrip(" .")
     basename = normalized.split(".", maxsplit=1)[0].upper()
     return basename in _WINDOWS_RESERVED_BASENAMES
+
+
+def _slash_reference(path: Path) -> str:
+    return "/".join(path.parts)

@@ -546,12 +546,8 @@ async def test_model_router_records_failed_attempt_and_default_fallback_separate
     agent_home: Path,
 ) -> None:
     private_provider_body = "private provider response body"
-    failure = ModelCallError(
-        ErrorInfo(code="provider_auth_error", message=private_provider_body)
-    )
-    chat_provider = ScriptedFakeProvider(
-        streams=(StreamScript(events=(), error=failure),)
-    )
+    failure = ModelCallError(ErrorInfo(code="provider_auth_error", message=private_provider_body))
+    chat_provider = ScriptedFakeProvider(streams=(StreamScript(events=(), error=failure),))
     default_provider = ScriptedFakeProvider(
         streams=(StreamScript(events=(completed("Recovered"),)),)
     )
@@ -665,9 +661,7 @@ def test_model_router_route_status_starts_from_static_default_fallback() -> None
 async def test_model_router_records_static_default_fallback_without_provider_attempt(
     agent_home: Path,
 ) -> None:
-    provider = ScriptedFakeProvider(
-        streams=(StreamScript(events=(completed("Static fallback"),)),)
-    )
+    provider = ScriptedFakeProvider(streams=(StreamScript(events=(completed("Static fallback"),)),))
     router = ModelRouter(
         configuration=configuration(),
         provider_factory=lambda _: provider,

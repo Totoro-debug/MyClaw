@@ -84,9 +84,9 @@ and release smoke are not claimed here.
 - Cross-process coordination is out of scope. Separate MyClaw runtimes can race
   on file-first persistence, Session metadata, summary allocation, or Scheduled
   Work triggers; only in-runtime serialization is promised.
-- Real provider, live-network, and POSIX smoke evidence belongs to issue #36.
-  This review uses injected Provider/Web boundaries plus the platform-focused
-  tests available in the current environment.
+- Real provider and live-network smoke evidence is recorded separately from the
+  Windows x64 release candidate. This review uses injected Provider/Web boundaries
+  plus the Windows-focused tests available in the current environment.
 - Artifact externalization intentionally has no rollback. A later Session
   persistence failure can retain an unreferenced artifact; orphan cleanup remains
   out of scope.

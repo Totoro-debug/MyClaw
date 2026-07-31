@@ -108,30 +108,17 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
 ## Lesson
 ```
 
-### 3.2 Workspace 规范化与 slug
+### 3.2 Workspace identity 与 Workspace State
 
-固定算法：
-
-1. 获取当前工作目录的绝对路径并做词法规范化，移除 `.` 和可消解的 `..`。
-2. Workspace identity 保留规范化绝对路径，不通过 symlink realpath 改变会话归属；工具访问边界另行解析真实路径。
-3. Windows drive `D:` 转成首段 `d`；POSIX root `/` 不产生段；UNC 以 `unc-<server>-<share>` 开头。
-4. 每个非根路径段先把现有 `-` 替换为 `_`，再使用 Unicode lowercase。
-5. 移除路径分隔符并用 `-` 连接。
-
-示例：
-
-| Workspace | slug |
-| --- | --- |
-| `D:\desktop\project\Demo-one` | `d-desktop-project-demo_one` |
-| `/home/Alice/Demo-one` | `home-alice-demo_one` |
-| `\\server\share\Demo-one` | `unc-server-share-demo_one` |
-
-该规则可能让原始 `_` 与替换后的 `-` 产生 slug collision，这是 canonical 算法的已知取舍；首版不追加 hash。
+1. Workspace identity 是启动 cwd 的词法规范化绝对 Windows 路径；不解析 Git root，也不通过 filesystem alias 改变归属。
+2. Drive 和 UNC 路径均按 Windows 语义规范化；相对纯路径和其他路径语义被拒绝。
+3. Workspace 不派生第二层名称。非全局状态直接位于 `<workspace>\.myclaw\`。
+4. Agent Home 仅保留全局 User Configuration 与 Runtime Logs；旧的非全局数据不读取、不迁移、不删除。
 
 ### 3.3 原子写
 
 - 新文件或整体更新：在目标同目录创建唯一临时文件，写入完整内容，flush，尽可能 fsync，再 atomic replace。
-- replace 后尽可能 fsync 父目录；平台不支持时不得把失败伪装为数据写入失败，但应保留可测试分支。
+- 文件内容 flush 后尽可能 fsync；Windows 不支持文件 fsync 时保留可测试的 best-effort 分支。
 - session 普通 message append：持有当前 runtime 的 session lock，一次写入完整 UTF-8 record + `\n`，flush 后返回；取消不得打断临界区。
 - session metadata 更新：持有同一 session lock，读取现有 records，以新 metadata + 原 message records 原子重写。
 - 不创建跨进程 lock file，不依赖文件锁，不承诺两个 REPL 写同一 session 的顺序。
@@ -696,7 +683,7 @@ git diff --name-only
 
 执行 `git diff` 变体时 adapter 强制禁用 pager、external diff 和 textconv。其他命令一律 refused；cwd 越界、timeout 越界或命令包含 NUL/control characters 同样 fail closed。用户不能扩展 allowlist。
 
-重要边界：首版不宣称 Shell 子进程受到 OS 级文件系统或网络 sandbox。Workspace 限制严格作用于 `cwd` 和固定 allowlist。Issue #38 暂时拒绝所有非 allowlist 命令，明确偏离 ADR-0003 要求的前台确认；该偏离不增加 OS 隔离保证。若产品要求“绝不访问 Workspace 外路径”，必须先选择 Windows/POSIX 对应的进程隔离方案并新增安全 ADR，不能通过字符串扫描命令来伪造该保证。
+重要边界：首版不宣称 Shell 子进程受到 OS 级文件系统或网络 sandbox。Workspace 限制严格作用于 `cwd` 和固定 allowlist。Issue #38 暂时拒绝所有非 allowlist 命令，明确偏离 ADR-0003 要求的前台确认；该偏离不增加 OS 隔离保证。若产品要求“绝不访问 Workspace 外路径”，必须先选择并记录 Windows 进程隔离方案，不能通过字符串扫描命令来伪造该保证。
 
 ### 11.5 Web tools
 

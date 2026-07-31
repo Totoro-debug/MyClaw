@@ -1,35 +1,20 @@
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
 from myclaw.agent.workspace import Workspace
 
 
-def test_windows_drive_workspace_has_the_accepted_identity_and_slug() -> None:
+def test_windows_drive_workspace_has_the_accepted_identity() -> None:
     workspace = Workspace.from_path(PureWindowsPath(r"D:\desktop\project\Demo-one"))
 
-    assert (workspace.path, workspace.slug) == (
-        PureWindowsPath(r"D:\desktop\project\Demo-one"),
-        "d-desktop-project-demo_one",
-    )
+    assert workspace.path == PureWindowsPath(r"D:\desktop\project\Demo-one")
 
 
-def test_posix_workspace_omits_the_root_from_its_slug() -> None:
-    workspace = Workspace.from_path(PurePosixPath("/home/Alice/Demo-one"))
-
-    assert (workspace.path, workspace.slug) == (
-        PurePosixPath("/home/Alice/Demo-one"),
-        "home-alice-demo_one",
-    )
-
-
-def test_unc_workspace_has_the_accepted_identity_and_slug() -> None:
+def test_unc_workspace_has_the_accepted_identity() -> None:
     workspace = Workspace.from_path(PureWindowsPath(r"\\server\share\Demo-one"))
 
-    assert (workspace.path, workspace.slug) == (
-        PureWindowsPath(r"\\server\share\Demo-one"),
-        "unc-server-share-demo_one",
-    )
+    assert workspace.path == PureWindowsPath(r"\\server\share\Demo-one")
 
 
 def test_native_workspace_is_absolutized_and_lexically_normalized(
@@ -41,10 +26,21 @@ def test_native_workspace_is_absolutized_and_lexically_normalized(
 
     workspace = Workspace.from_path(Path("Project") / "discarded" / "..")
 
-    assert (workspace.path, isinstance(workspace.path, Path)) == (project, True)
+    assert workspace.path == PureWindowsPath(project)
 
 
-def test_workspace_slug_uses_unicode_lowercase() -> None:
-    workspace = Workspace.from_path(PurePosixPath("/\u00c4LICE/PRO-J\u00c9CT/\u0130"))
+def test_workspace_does_not_expose_a_legacy_slug() -> None:
+    workspace = Workspace.from_path(PureWindowsPath(r"D:\desktop\project"))
 
-    assert workspace.slug == "\u00e4lice-pro_j\u00e9ct-i\u0307"
+    assert not hasattr(workspace, "slug")
+
+
+def test_windows_workspace_is_lexically_normalized() -> None:
+    workspace = Workspace.from_path(PureWindowsPath(r"D:\desktop\project\discarded\..\current"))
+
+    assert workspace.path == PureWindowsPath(r"D:\desktop\project\current")
+
+
+def test_relative_pure_windows_workspace_is_rejected() -> None:
+    with pytest.raises(ValueError, match="absolute"):
+        Workspace.from_path(PureWindowsPath(r"project\subdirectory"))

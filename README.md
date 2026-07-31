@@ -1,13 +1,13 @@
 # MyClaw
 
-MyClaw is a local-first Personal Agent runtime for Python 3.12 and newer.
+MyClaw is a local-first Personal Agent runtime for 64-bit x86-64 Windows and
+Python 3.12 or newer. Other operating systems and Windows architectures are not
+supported.
 
 ## Install
 
-Create a virtual environment, install the project, and run the console entry point
-with the commands for the current platform.
-
-Windows:
+Create a Windows x64 virtual environment, install the project, and run the console
+entry point:
 
 ```text
 py -3.12 -m venv .venv
@@ -15,19 +15,10 @@ py -3.12 -m venv .venv
 .venv\Scripts\myclaw.exe
 ```
 
-POSIX:
-
-```text
-python3.12 -m venv .venv
-.venv/bin/python -m pip install .
-.venv/bin/myclaw
-```
-
 For a release wheel, replace `.` in the install line with the wheel path, for example
-`.venv\Scripts\python.exe -m pip install dist\myclaw-0.1.0-py3-none-any.whl` on
-Windows or `.venv/bin/python -m pip install dist/myclaw-0.1.0-py3-none-any.whl` on
-POSIX. The remaining examples use `myclaw` for readability; activate the virtual
-environment first or use the full console path shown above.
+`.venv\Scripts\python.exe -m pip install dist\myclaw-0.1.0-py3-none-win_amd64.whl`.
+The remaining examples use `myclaw` for readability; activate the virtual environment
+first or use the full console path shown above.
 
 The first start creates `~/.myclaw/config.toml` and the base
 Agent Home, prints `config_missing`, and exits with status 2. Edit that file before
@@ -87,13 +78,27 @@ the REPL remains available. File changes and non-automatic Shell commands requir
 foreground confirmation; background work refuses operations that would require a
 prompt.
 
-## Agent Home
+## Persistent State
 
-MyClaw uses one fixed, user-owned Agent Home at `~/.myclaw/`:
+MyClaw keeps global User Configuration and Runtime Logs in the fixed Agent Home at
+`%USERPROFILE%\.myclaw\`:
 
 ```text
-~/.myclaw/
+%USERPROFILE%\.myclaw\
   config.toml
+  logs/
+    run.log.0
+    run.log.1
+    run.log.cursor
+    run.log.lock
+```
+
+Every startup directory is an independent Workspace. Its non-global state lives in
+the reserved `.myclaw` directory beneath that Workspace:
+
+```text
+<workspace>\.myclaw\
+  .gitignore
   scheduled-work.json
   memory/
     memory.md
@@ -101,15 +106,15 @@ MyClaw uses one fixed, user-owned Agent Home at `~/.myclaw/`:
     .cursor
     pending-consolidations/
   sessions/
-    <workspace_slug>/
-      <session_id>.jsonl
-      artifacts/<session_id>/<encoded_tool_call_id>.txt
+    <session_id>.jsonl
+    artifacts/<session_id>/<encoded_tool_call_id>.txt
 ```
 
-Only `memory/`, `sessions/`, and the initial `memory/memory.md` are guaranteed after
-first start. Summary, cursor, Scheduled Work, Workspace Session, journal, and Artifact
-files are created on demand. Back up the whole directory together; do not edit
-Session, summary, cursor, or Scheduled Work files while MyClaw is running.
+Valid REPL startup creates only the Workspace State root, `.gitignore`, `memory/`,
+`sessions/`, and `memory/memory.md`. Summary, cursor, Scheduled Work, Session, journal,
+and Artifact files remain on demand. Old non-global Agent Home data is ignored and is
+never migrated or deleted. Back up each Workspace State directory with its Workspace;
+do not edit active Session, summary, cursor, or Scheduled Work files.
 
 ## Troubleshooting
 
@@ -122,11 +127,11 @@ Session, summary, cursor, or Scheduled Work files while MyClaw is running.
 - Provider authentication, timeout, or connection failures: verify the dedicated
   key, base URL, model availability, account policy, and network path. MyClaw does
   not automatically retry permanent authentication or invalid-request failures.
-- `memory_context_too_large`: reduce `memory/memory.md` or use a route with a larger
+- `memory_context_too_large`: reduce `<workspace>\.myclaw\memory\memory.md` or use a route with a larger
   context window. Long-term Memory is injected in full and has no automatic size cap.
-- Persistence errors or corrupt JSON/JSONL: stop all MyClaw processes, back up Agent
-  Home, and restore a known-good file. The runtime fails closed instead of silently
-  discarding complete but invalid records.
+- Persistence errors or corrupt JSON/JSONL: stop all MyClaw processes, back up the
+  affected Workspace State and Agent Home logs, and restore a known-good file. The
+  runtime fails closed instead of discarding complete but invalid records.
 
 ## Known Limits
 
@@ -157,7 +162,7 @@ pytest
 ruff check .
 ruff format --check .
 mypy myclaw tests
-python -m build
+python -m build --wheel
 ```
 
 The automated tests use scripted boundary fakes and temporary filesystem paths. They do

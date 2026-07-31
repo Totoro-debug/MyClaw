@@ -15,7 +15,7 @@ from myclaw.agent.events import AgentEvent, BackgroundCompletedPayload
 from myclaw.errors import ErrorInfo
 from myclaw.runtime_log import log_sanitized_exception, runtime_log_session
 from myclaw.schedule.records import ScheduledWork
-from myclaw.schedule.scheduled_work import JsonScheduledWorkStore, ScheduledWorkPersistenceError
+from myclaw.schedule.scheduled_work import ScheduledWorkPersistenceError, ScheduledWorkStore
 from myclaw.schedule.scheduled_work_execution import ScheduledWorkRunner
 
 logger = logging.getLogger(__name__)
@@ -216,7 +216,7 @@ class ScheduledWorkScheduler:
     def __init__(
         self,
         *,
-        store: JsonScheduledWorkStore,
+        store: ScheduledWorkStore,
         coordinator: ScheduledWorkCoordinator,
         clock: ScheduledWorkSchedulerClock,
     ) -> None:
@@ -254,9 +254,7 @@ class ScheduledWorkScheduler:
             return_exceptions=True,
         )
         for (_task, session_id), result in zip(owned, results, strict=True):
-            if isinstance(result, BaseException) and not isinstance(
-                result, asyncio.CancelledError
-            ):
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
                 with runtime_log_session(session_id):
                     log_sanitized_exception(
                         logger,

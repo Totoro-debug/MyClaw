@@ -76,9 +76,7 @@ class MemoryTaskScheduler:
             run_task.cancel()
         results = await asyncio.gather(task, *running, return_exceptions=True)
         for result in results:
-            if isinstance(result, BaseException) and not isinstance(
-                result, asyncio.CancelledError
-            ):
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
                 log_sanitized_exception(
                     logger,
                     logging.ERROR,

@@ -1,127 +1,88 @@
-# Windows Validation
+# Windows x64 Validation
 
 Status: **PASS**
 
-This report records the Windows half of the cross-platform release evidence for
-GitHub issue #36. The POSIX authority is tracked separately in
-[posix-validation.md](posix-validation.md).
+This report records the release evidence for GitHub issues
+[#56](https://github.com/Totoro-debug/myclaw/issues/56) and
+[#68](https://github.com/Totoro-debug/myclaw/issues/68). It applies only to the
+Windows x64 artifact built from the working tree based on commit
+`29b8b1532f59099337aefd5aa44c0bcb65157d31` on 2026-07-31.
 
-## Candidate
+## Host
 
-| Field | Evidence |
+| Field | Value |
 | --- | --- |
-| Release candidate SHA | `31e2b17069bc54366edb6252c1a59cb2a78ed36e` |
-| Operating system | Windows 11 Pro, version `10.0.26200`, build `26200`, 64-bit, x64 |
-| PowerShell | `7.6.3` |
-| Build/test Python | CPython `3.12.13` |
-| Build/test pip | `26.1.2` |
-| Clean-venv Python | CPython `3.12.13` |
-| Clean-venv pip | `25.0.1` |
-| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-apache-final-7f69cd121f77440da3f1dadb13b89249` |
+| Operating system | Windows 11 `10.0.26200`, x64 |
+| PowerShell | `7.6.4` |
+| Build Python | CPython `3.12.13`, 64-bit |
+| Build pip | `26.1.2` |
+| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-release-8bd549d63ce7466f91cbfba7682f2f72` |
 
-No Anthropic or OpenAI API key was present during the validation. Tests and the
-package build did not call a live Provider or public-network service.
+No Provider credential was read or used. The application tests and CLI smoke did
+not contact a live Provider.
 
-The final candidate adds the owner-selected Apache-2.0 license and PEP 639 package
-metadata without changing `myclaw/`. All test, type, build, artifact, clean-install,
-and installed-CLI evidence below was rerun after that packaging change.
+## Artifact
 
-## Windows Gates
-
-| Gate | Command | Result |
-| --- | --- | --- |
-| Full offline test suite | `python -m pytest -q -ra` | PASS: `653 passed in 83.85s` |
-| Warning-strict suite | `python -X dev -W error::ResourceWarning -W error::RuntimeWarning -m pytest -q -ra` | PASS: `653 passed in 84.60s` |
-| Lint | `python -m ruff check myclaw tests` | PASS: `All checks passed!` |
-| Format | `python -m ruff format --check myclaw tests` | PASS: `111 files already formatted` |
-| Strict types | `python -m mypy myclaw tests` | PASS: `Success: no issues found in 111 source files` |
-| Linux-target types | `python -m mypy --platform linux myclaw tests` | PASS: `Success: no issues found in 111 source files` |
-| Package | `python -m build` | PASS with isolated setuptools 83: wheel and sdist built |
-| License metadata | Installed distribution plus direct wheel/sdist inspection | PASS: Core Metadata 2.4, `Apache-2.0`, `License-File: LICENSE`, one wheel `licenses/LICENSE`, and sdist root `LICENSE`; normalized official digest matched |
-| Diff hygiene | `git diff --check` | PASS; only LF-to-CRLF worktree notices were emitted |
-
-The project now requires `setuptools>=77` to support PEP 639. The host's setuptools
-70.2 correctly cannot satisfy a no-isolation build, so the authoritative package gate
-used standard isolated `python -m build` and provisioned setuptools 83.
-
-## Build Artifacts
-
-| Artifact | Size | SHA-256 |
-| --- | ---: | --- |
-| `myclaw-0.1.0-py3-none-any.whl` | 112,966 bytes | `A2B8913C0B72C1E0CB42F3B8D9F3B50AB0B2BAAF6BB924F805EE5BEA6AFEAAA0` |
-| `myclaw-0.1.0.tar.gz` | 215,840 bytes | `8D1262143A085B0CD8EDEF3D9BDA6D5EF16407FCBBE259C230626A2371C8033A` |
-
-## Clean Wheel Install
-
-The wheel was installed by absolute path into a newly created venv under the
-validation root. The installed CLI smoke then ran outside the checkout with
-`PYTHONPATH` empty:
+The build directory, distribution directory, and generated package metadata were
+removed before running:
 
 ```powershell
-python -m venv <validation-root>\venv
-<validation-root>\venv\Scripts\python.exe -m pip install `
-  <checkout>\dist\myclaw-0.1.0-py3-none-any.whl
-<validation-root>\venv\Scripts\python.exe -m pip check
+python -m build --wheel
 ```
 
-The install used the configured package index for ordinary runtime dependency
-resolution. It did not import from the repository: the checkout was absent from
-`sys.path`, and `pip show myclaw` reported
-`<validation-root>\venv\Lib\site-packages`. `pip check` returned
-`No broken requirements found.` The installed console entry point was
-`myclaw=myclaw.terminal.cli:app`; `pip show myclaw` reported the isolated site-packages path
-and `License-Expression: Apache-2.0`.
+Exactly one file was emitted:
 
-Resolved direct runtime dependencies were:
+| Artifact | Size | SHA-256 | Embedded tag |
+| --- | ---: | --- | --- |
+| `myclaw-0.1.0-py3-none-win_amd64.whl` | 134,467 bytes | `2B821E26137996F357DDE14CE6557EE1E4F5E29AD2CB93C7AC2BC67D57C14E16` | `py3-none-win_amd64` |
 
-| Distribution | Installed version |
+Archive inspection found 73 packaged Python files. The packaged module set matched
+the source tree, and no additional release artifact was present. Intermediate
+`build` and `egg-info` directories were removed after inspection.
+
+## Clean Installation
+
+The exact wheel above was installed by absolute path into a new virtual environment
+outside the checkout. Dependency resolution completed and `python -m pip check`
+reported `No broken requirements found.`
+
+The installed CLI smoke used Unicode Agent Home `home-用户` and Workspace
+`workspace-验收-clean`, an empty `PYTHONPATH`, and `PYTHONNOUSERSITE=1`. First
+start exited with code `2`, reported `config_missing` without a traceback, created
+the default configuration, and did not create Workspace State while configuration
+was gated. `myclaw config` exited with code `0`. An isolated `python -I` import
+resolved `myclaw` from the clean venv's `Lib\site-packages`, not the checkout.
+
+## Quality Gates
+
+The authoritative commands are:
+
+```powershell
+python -m pytest -q tests/test_release_contract.py tests/test_platform_support.py tests/test_cli.py tests/test_package.py tests/test_templates.py tests/runtime_log
+python -m pytest -q -ra
+python -m ruff check myclaw tests
+python -m ruff format --check myclaw tests
+python -m mypy myclaw tests
+git diff --check
+```
+
+| Gate | Result |
 | --- | --- |
-| `aiohttp` | `3.14.1` |
-| `anthropic` | `0.116.0` |
-| `croniter` | `6.2.4` |
-| `ddgs` | `9.14.4` |
-| `jsonschema` | `4.26.0` |
-| `openai` | `2.45.0` |
-| `prompt-toolkit` | `3.0.52` |
-| `rich` | `14.3.4` |
-| `tomlkit` | `0.13.3` |
-| `typer` | `0.26.8` |
-| `tzlocal` | `5.4.4` |
+| Root-conflict focused suite | PASS: `5 passed in 4.01s` |
+| Storage and filesystem safety suites | PASS: `231 passed in 18.34s` |
+| Complete offline suite | PASS: `842 passed in 111.66s`; zero skips |
+| Ruff lint | PASS: all checks passed |
+| Ruff format over complete `myclaw tests` | PASS: `162 files already formatted` |
+| Strict Mypy | PASS: no issues in 162 source files |
+| Diff hygiene | PASS |
 
-## Installed CLI Smoke
+The complete decision is recorded in
+[release readiness](../release-readiness.md).
 
-The final CLI smokes used the installed `myclaw.exe`, an empty Unicode home named
-`用户-验证-3`, a separate Unicode cwd named `workspace-验收-3`, and an empty
-`PYTHONPATH`.
+## Boundaries
 
-| Smoke | Result |
-| --- | --- |
-| First `myclaw` start | PASS: exit `2`, no traceback, and a `config_missing` message containing the correct Unicode config path |
-| First-start files | PASS: `.myclaw/config.toml`, `.myclaw/memory/`, `.myclaw/sessions/`, and `.myclaw/memory/memory.md` were created |
-| `myclaw config` | PASS: exit `0` and the installed configuration rendered from the Unicode home with `[runtime]` present |
-| Secret redaction | PASS from the unchanged runtime baseline plus the final 653-test suite: the unique test key appeared only as `***REDACTED***` and never in captured output |
-
-One discarded harness attempt used PowerShell's read-only `$HOME` automatic variable;
-it was terminated during dependency installation before any CLI launch. The
-authoritative rerun used a distinct `$testHome` variable and confined both `HOME` and
-`USERPROFILE` to the validation root.
-
-## Scope And Limits
-
-- The Windows test and packaging gates were offline with respect to live Providers
-  and public application network calls. The clean venv install did use package
-  indexes to resolve declared third-party dependencies.
-- This report validates Windows packaging, dependency resolution, clean-wheel
-  isolation, first-start configuration gating, Unicode paths, config inspection,
-  and secret redaction. It does not claim a paid-Provider conversation smoke.
-- Windows process, NTFS, and shutdown behavior is covered by the full suite. POSIX
-  process groups, signals, symlinks, and Linux packaging require the separate POSIX
-  report and cannot be inferred from this host.
-- The artifact hashes identify this exact local build. Rebuilding the sdist may
-  produce a different archive hash if build timestamps are not normalized.
-
-## Final Decision
-
-PASS for the Windows portion of issue #36, including the Apache-2.0 packaging change.
-The public installed-distribution test followed RED -> GREEN; no runtime production
-code change was required.
+- This report validates the Windows x64 package, clean installation, package
+  isolation, Unicode filesystem handling, configuration gate, and installed CLI.
+- It does not claim a paid or live Provider conversation smoke.
+- The artifact hash identifies this exact local candidate. A rebuild must be
+  rehashed and revalidated.

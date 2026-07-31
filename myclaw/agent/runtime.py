@@ -21,6 +21,7 @@ from myclaw.agent.prompts import (
 )
 from myclaw.agent.turn import ToolResultExternalizer, model_message_from_session
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
 from myclaw.management.commands import ManagementCommandDispatcher
@@ -32,15 +33,19 @@ from myclaw.management.service import (
 )
 from myclaw.memory.conversation_summary import (
     ConversationSummaryManager,
-    JsonlSummaryStore,
     SummaryModelSettings,
+    WorkspaceJsonlSummaryStore,
 )
 from myclaw.memory.memory_scheduler import (
     AsyncioMemorySchedulerClock,
     MemorySchedulerClock,
     MemoryTaskScheduler,
 )
-from myclaw.memory.memory_task import FileMemoryStore, MemoryManager, MemoryTaskModelSettings
+from myclaw.memory.memory_task import (
+    MemoryManager,
+    MemoryTaskModelSettings,
+    WorkspaceFileMemoryStore,
+)
 from myclaw.provider.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
 from myclaw.provider.models import ModelProvider
 from myclaw.runtime_log import RuntimeLogLifetime, log_sanitized_exception
@@ -51,7 +56,10 @@ from myclaw.schedule.background_coordination import (
     ScheduledWorkScheduler,
     ScheduledWorkSchedulerClock,
 )
-from myclaw.schedule.scheduled_work import CreateScheduledWorkTool, JsonScheduledWorkStore
+from myclaw.schedule.scheduled_work import (
+    CreateScheduledWorkTool,
+    WorkspaceJsonScheduledWorkStore,
+)
 from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkModelSettings,
     ScheduledWorkRunner,
@@ -486,10 +494,12 @@ def _prepare_repl_runtime(
     """Prepare a Session and defer provider construction until conversational input."""
     configuration.resolve_route("default")
     workspace_identity = Workspace.from_path(workspace)
-    long_term_memory = (agent_home.path / "memory" / "memory.md").read_text(encoding="utf-8")
+    workspace_state = WorkspaceState(workspace_identity)
+    workspace_state.initialize(agent_home_root=agent_home.path)
+    long_term_memory = workspace_state.long_term_memory_path.read_text(encoding="utf-8")
+    memory_store = WorkspaceFileMemoryStore(workspace_state)
     sessions = JsonlSessionStore(
-        agent_home=agent_home,
-        workspace=workspace_identity,
+        workspace_state=workspace_state,
         now=now,
         new_uuid=new_uuid,
     )
@@ -533,10 +543,10 @@ def _prepare_repl_runtime(
     owned_shell = (
         configured_shell if isinstance(configured_shell, SubprocessShellBoundary) else None
     )
-    scheduled_work_store = JsonScheduledWorkStore(agent_home)
+    scheduled_work_store = WorkspaceJsonScheduledWorkStore(workspace_state)
     scheduled_work_tool = CreateScheduledWorkTool()
     tool_gateway = _build_tool_gateway(
-        workspace=workspace_identity,
+        workspace_state=workspace_state,
         agent_home=agent_home,
         session_id=metadata.id,
         web_search=configured_web_search,
@@ -550,7 +560,7 @@ def _prepare_repl_runtime(
         tool_guidance=render_tool_guidance(tool_gateway.schemas),
     )
     resolved_memory = configuration.resolve_route("memory")
-    summaries = JsonlSummaryStore(agent_home)
+    summaries = WorkspaceJsonlSummaryStore(workspace_state)
     summary_manager = ConversationSummaryManager(
         provider=router,
         sessions=sessions,
@@ -573,8 +583,8 @@ def _prepare_repl_runtime(
     memory_manager = MemoryManager(
         provider=router,
         summaries=summaries,
-        memory=FileMemoryStore(agent_home),
-        long_term_path=agent_home.path / "memory" / "memory.md",
+        memory=memory_store,
+        long_term_path=workspace_state.long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model=resolved_memory.route.model,
             max_output=resolved_memory.route.max_output,
@@ -599,7 +609,7 @@ def _prepare_repl_runtime(
 
     def scheduled_work_gateway_for(session_id: str) -> ToolGateway:
         return _build_tool_gateway(
-            workspace=workspace_identity,
+            workspace_state=workspace_state,
             agent_home=agent_home,
             session_id=session_id,
             web_search=configured_web_search,
@@ -610,8 +620,7 @@ def _prepare_repl_runtime(
 
     def externalize_result_for(session_id: str) -> ToolResultExternalizer:
         return _build_tool_result_externalizer(
-            workspace=workspace_identity,
-            agent_home=agent_home,
+            workspace_state=workspace_state,
             session_id=session_id,
             max_tool_result_chars=configuration.runtime.max_tool_result_chars,
         )
@@ -668,7 +677,7 @@ def _prepare_repl_runtime(
 
     def conversation_for(session_id: str) -> ConversationPort:
         session_tool_gateway = _build_tool_gateway(
-            workspace=workspace_identity,
+            workspace_state=workspace_state,
             agent_home=agent_home,
             session_id=session_id,
             web_search=configured_web_search,
@@ -719,6 +728,7 @@ def _prepare_repl_runtime(
             workspace=Path(workspace_identity.path),
             switch_session=conversation.switch_session,
             memory_manager=memory_manager,
+            memory_store=memory_store,
         )
     )
     return PreparedReplRuntime(
@@ -737,7 +747,7 @@ def _prepare_repl_runtime(
 
 def _build_tool_gateway(
     *,
-    workspace: Workspace,
+    workspace_state: WorkspaceState,
     agent_home: AgentHome,
     session_id: str,
     web_search: WebSearchBoundary | None,
@@ -745,13 +755,12 @@ def _build_tool_gateway(
     shell: ShellBoundary | None,
     scheduled_work: CreateScheduledWorkTool,
 ) -> ToolGateway:
+    workspace = workspace_state.workspace
     gateway = ToolGateway()
     security = Security(
         workspace=workspace,
         agent_home=agent_home.path,
-        artifact_directory=(
-            agent_home.path / "sessions" / workspace.slug / "artifacts" / session_id
-        ),
+        artifact_directory=workspace_state.sessions_directory / "artifacts" / session_id,
     )
     tools: list[BaseTool] = [
         ReadFileTool(security=security),
@@ -773,16 +782,14 @@ def _build_tool_gateway(
 
 def _build_tool_result_externalizer(
     *,
-    workspace: Workspace,
-    agent_home: AgentHome,
+    workspace_state: WorkspaceState,
     session_id: str,
     max_tool_result_chars: int,
 ) -> ToolResultExternalizer:
     def externalize(result: ToolResult) -> ToolResult:
         return externalize_tool_result(
             result,
-            agent_home=agent_home.path,
-            workspace=workspace,
+            workspace_state=workspace_state,
             session_id=session_id,
             max_tool_result_chars=max_tool_result_chars,
         )

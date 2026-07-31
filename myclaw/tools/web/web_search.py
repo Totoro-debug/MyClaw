@@ -4,7 +4,7 @@ import asyncio
 import json
 import sys
 from dataclasses import dataclass
-from typing import Annotated, Protocol, cast
+from typing import Annotated, Final, Protocol, cast
 
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
@@ -12,12 +12,7 @@ from ddgs.exceptions import DDGSException
 from myclaw.tools.base import BaseTool
 from myclaw.tools.schema import ToolParam
 
-if sys.platform == "win32":
-    from subprocess import CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW
-
-    _SEARCH_CREATION_FLAGS = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-else:
-    _SEARCH_CREATION_FLAGS = 0
+_SEARCH_CREATION_FLAGS: Final = 0x08000200
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +92,6 @@ class AsyncioDuckDuckGoSearchProcessSpawner:
             str(max_results),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=sys.platform != "win32",
             creationflags=_SEARCH_CREATION_FLAGS,
         )
         return _AsyncioSearchProcess(process)

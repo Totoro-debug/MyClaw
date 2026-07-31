@@ -10,6 +10,7 @@ import pytest
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import _DeferredConversationPort, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
@@ -704,8 +705,7 @@ async def test_deferred_conversation_does_not_construct_after_close_during_pre_s
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -786,8 +786,7 @@ async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_p
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -874,8 +873,7 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -1169,7 +1167,9 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
     records = [line for line in content.splitlines() if " pid=" in line]
     assert len(records) == 3
     assert all(" WARNING " in record for record in records)
-    assert all("Default Model Route selected code=route_unavailable" in record for record in records)
+    assert all(
+        "Default Model Route selected code=route_unavailable" in record for record in records
+    )
     assert " ERROR " not in content
     assert "cancel" not in content.lower()
     assert "shutdown failed" not in content.lower()
@@ -1289,6 +1289,8 @@ async def test_runtime_interrupt_keeps_background_work_alive_and_exit_settles_it
 
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(
         VALID_CONFIG.replace(
             "[tools.shell]\nenabled = true",
@@ -1318,7 +1320,7 @@ async def test_runtime_interrupt_keeps_background_work_alive_and_exit_settles_it
         enabled=True,
         session_id=("20260713-003000-000000_33333333-3333-4333-8333-333333333333"),
     )
-    persist_scheduled_work(agent_home, (first_task,))
+    persist_scheduled_work(state.path, (first_task,))
     input_reader = ExitAfterInterruptInput()
     signals = SignalSetter()
     interrupts = ForegroundInterruptController(
@@ -1354,7 +1356,7 @@ async def test_runtime_interrupt_keeps_background_work_alive_and_exit_settles_it
             enabled=True,
             session_id=("20260713-003100-000000_44444444-4444-4444-8444-444444444444"),
         )
-        persist_scheduled_work(agent_home, (first_task, second_task))
+        persist_scheduled_work(state.path, (first_task, second_task))
         await scheduled_clock.advance(60)
         await asyncio.wait_for(provider.second_background_started.wait(), timeout=1)
 

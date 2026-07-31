@@ -15,7 +15,7 @@ _WINDOWS_RESERVED_BASENAMES: Final = frozenset(
 
 
 def encode_artifact_tool_call_id(tool_call_id: str) -> str:
-    """Return the canonical cross-platform filename component for a Tool call ID."""
+    """Return the canonical Windows filename component for a Tool call ID."""
     basename = tool_call_id.split(".", maxsplit=1)[0].upper()
     if basename in _WINDOWS_RESERVED_BASENAMES:
         return "".join(f"%{byte:02X}" for byte in tool_call_id.encode("utf-8"))

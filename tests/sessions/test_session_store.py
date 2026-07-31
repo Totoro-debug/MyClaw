@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import ModelUsage
 from myclaw.session.records import (
@@ -19,6 +20,7 @@ from myclaw.session.records import (
     UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore, SessionStore
+from myclaw.utils.atomic_files import path_for_io
 from tests.fixtures import FakeClock
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -30,9 +32,7 @@ ASSISTANT_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 
 
 def read_bytes(path: Path) -> bytes:
-    if os.name == "nt":
-        path = Path(f"\\\\?\\{path.absolute()}")
-    return path.read_bytes()
+    return path_for_io(path).read_bytes()
 
 
 @pytest.mark.asyncio
@@ -46,23 +46,22 @@ async def test_prepared_session_materializes_exact_jsonl_on_first_user_message_a
     session_uuids = iter((SESSION_UUID,))
     workspace_identity = Workspace.from_path(workspace)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=workspace_identity,
+        workspace_state=WorkspaceState(workspace_identity),
         now=clock.now,
         new_uuid=session_uuids.__next__,
     )
 
     metadata = store.prepare()
     session_path = (
-        agent_home
+        workspace
+        / ".myclaw"
         / "sessions"
-        / workspace_identity.slug
         / "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000.jsonl"
     )
 
     assert metadata.id == SESSION_ID
     assert store.path_for(SESSION_ID) == session_path
-    assert not session_path.parent.exists()
+    assert not session_path.exists()
 
     user_message = UserSessionMessage(
         id=str(USER_UUID),
@@ -92,6 +91,88 @@ async def test_prepared_session_materializes_exact_jsonl_on_first_user_message_a
 
 
 @pytest.mark.asyncio
+async def test_identical_session_ids_remain_isolated_between_workspace_states(
+    workspace: Path,
+) -> None:
+    first_workspace = workspace / "first"
+    second_workspace = workspace / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    first_state = WorkspaceState(Workspace.from_path(first_workspace))
+    second_state = WorkspaceState(Workspace.from_path(second_workspace))
+    first_state.initialize(agent_home_root=Path.home() / ".myclaw")
+    second_state.initialize(agent_home_root=Path.home() / ".myclaw")
+    first = JsonlSessionStore(
+        workspace_state=first_state,
+        now=lambda: CREATED_AT,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    second = JsonlSessionStore(
+        workspace_state=second_state,
+        now=lambda: CREATED_AT,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    first_metadata = first.prepare()
+    second_metadata = second.prepare()
+
+    await first.append_message(
+        first_metadata.id,
+        UserSessionMessage(
+            id=str(USER_UUID),
+            created_at=CREATED_AT,
+            content="First Workspace history.",
+        ),
+    )
+    await second.append_message(
+        second_metadata.id,
+        UserSessionMessage(
+            id=str(USER_UUID),
+            created_at=CREATED_AT,
+            content="Second Workspace history.",
+        ),
+    )
+
+    assert first_metadata.id == second_metadata.id
+    assert first.path_for(first_metadata.id) != second.path_for(second_metadata.id)
+    assert (await first.load(first_metadata.id)).messages[0].content == "First Workspace history."
+    assert (await second.load(second_metadata.id)).messages[0].content == (
+        "Second Workspace history."
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_agent_home_session_is_never_listed_or_loaded(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    store = JsonlSessionStore(
+        workspace_state=state,
+        now=lambda: CREATED_AT,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    metadata = store.prepare()
+    message = UserSessionMessage(
+        id=str(USER_UUID),
+        created_at=CREATED_AT,
+        content="Legacy Agent Home history.",
+    )
+    legacy_path = agent_home / "sessions" / "legacy-workspace-slug" / f"{metadata.id}.jsonl"
+    legacy_io_path = path_for_io(legacy_path)
+    legacy_io_path.parent.mkdir(parents=True)
+    legacy_io_path.write_text(metadata.to_json_line() + message.to_json_line(), encoding="utf-8")
+    legacy_bytes = legacy_io_path.read_bytes()
+
+    assert await store.list_for_workspace(workspace) == ()
+    with pytest.raises(OSError):
+        await store.load(metadata.id)
+    assert legacy_io_path.read_bytes() == legacy_bytes
+
+
+@pytest.mark.asyncio
 async def test_completed_assistant_is_one_complete_record_and_reloads(
     agent_home: Path,
     workspace: Path,
@@ -100,8 +181,7 @@ async def test_completed_assistant_is_one_complete_record_and_reloads(
     home.initialize()
     clock = FakeClock(CREATED_AT)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -160,8 +240,7 @@ async def test_same_runtime_concurrent_session_writes_preserve_every_record_and_
     home.initialize()
     clock = FakeClock(CREATED_AT)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -209,8 +288,7 @@ async def test_failed_and_interrupted_assistants_reload_with_safe_error_details(
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=FakeClock(CREATED_AT).now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -255,8 +333,7 @@ async def test_first_materialized_message_updates_time_without_estimated_usage(
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=FakeClock(CREATED_AT).now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -291,8 +368,7 @@ async def test_appended_messages_update_session_time_and_actual_cumulative_usage
     home.initialize()
     clock = FakeClock(CREATED_AT)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -337,8 +413,7 @@ async def test_metadata_update_preserves_message_bytes_and_sets_exact_session_st
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=FakeClock(CREATED_AT).now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -394,8 +469,7 @@ async def test_ordinary_append_remains_complete_when_metadata_rewrite_fails(
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=FakeClock(CREATED_AT).now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )

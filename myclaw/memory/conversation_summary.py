@@ -18,7 +18,7 @@ from myclaw.agent.prompts import (
     current_user_input,
 )
 from myclaw.agent.turn import model_message_from_session
-from myclaw.config.agent_home import AgentHome
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.records import SummaryEntry
@@ -36,6 +36,10 @@ from myclaw.session.session_store import SessionStore
 from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.utils.atomic_files import atomic_replace_bytes
 from myclaw.utils.time import format_rfc3339_milliseconds
+from myclaw.utils.windows_filesystem import (
+    require_owned_directory,
+    require_owned_regular_file,
+)
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 type UnlinkFile = Callable[[Path], None]
@@ -130,6 +134,8 @@ class _PendingConsolidation:
 
 
 class ConsolidationSessionStore(SessionStore, Protocol):
+    workspace_state: WorkspaceState
+
     async def recover_consolidation_cursor(
         self,
         session_id: str,
@@ -165,18 +171,21 @@ class SummaryModelSettings:
     timeout_seconds: int
 
 
-class JsonlSummaryStore:
-    """Append the global ordered Conversation Summary stream."""
+class WorkspaceJsonlSummaryStore:
+    """Append summaries and consolidation journals in one Workspace State."""
 
     def __init__(
         self,
-        agent_home: AgentHome,
+        workspace_state: WorkspaceState,
         *,
         replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
         unlink_file: UnlinkFile = _unlink_file,
     ) -> None:
-        self.path = agent_home.path / "memory" / "summary.jsonl"
-        self.pending_directory = agent_home.path / "memory" / "pending-consolidations"
+        self.workspace_state = workspace_state
+        self._state_root = workspace_state.path.resolve(strict=True)
+        self._memory_directory = workspace_state.memory_directory
+        self.path = workspace_state.memory_directory / "summary.jsonl"
+        self.pending_directory = workspace_state.memory_directory / "pending-consolidations"
         self._replace_bytes = replace_bytes
         self._unlink_file = unlink_file
         self._lock = asyncio.Lock()
@@ -203,6 +212,7 @@ class JsonlSummaryStore:
         timestamp: datetime,
     ) -> SummaryEntry:
         async with self._lock:
+            self._require_matching_session_store(sessions)
             next_index = len(self._entries()) + 1
             entry = SummaryEntry(index=next_index, timestamp=timestamp, content=content)
             journal = _PendingConsolidation(
@@ -211,14 +221,18 @@ class JsonlSummaryStore:
                 new_cursor=new_cursor,
                 summary=entry,
             )
-            self.pending_directory.mkdir(parents=True, exist_ok=True)
+            self.pending_directory.mkdir(exist_ok=True)
+            pending_root = self._require_pending_directory()
             journal_path = self.pending_directory / f"{session_id}.json"
+            if journal_path.exists() or journal_path.is_symlink():
+                require_owned_regular_file(journal_path, within=pending_root)
             self._replace_bytes(
                 journal_path,
                 json.dumps(journal.to_dict(), ensure_ascii=False, separators=(",", ":")).encode(
                     "utf-8"
                 ),
             )
+            require_owned_regular_file(journal_path, within=pending_root)
             self._append_exact(entry)
             await sessions.update_metadata(
                 session_id,
@@ -229,10 +243,13 @@ class JsonlSummaryStore:
 
     async def recover_pending(self, sessions: ConsolidationSessionStore) -> int:
         async with self._lock:
-            if not self.pending_directory.exists():
+            self._require_matching_session_store(sessions)
+            if not self.pending_directory.exists() and not self.pending_directory.is_symlink():
                 return 0
+            pending_root = self._require_pending_directory()
             recovered_count = 0
             for journal_path in sorted(self.pending_directory.glob("*.json")):
+                require_owned_regular_file(journal_path, within=pending_root)
                 journal = _PendingConsolidation.from_bytes(journal_path.read_bytes())
                 if journal_path.stem != journal.session_id:
                     raise ValueError("journal file name must match session_id")
@@ -255,12 +272,14 @@ class JsonlSummaryStore:
         if entry.index != len(entries) + 1:
             raise ValueError("summary index must be contiguous")
         existing = self.path.read_bytes() if self.path.exists() else b""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._replace_bytes(self.path, existing + entry.to_json_line().encode("utf-8"))
+        require_owned_regular_file(self.path, within=self._state_root)
 
     def _entries(self) -> tuple[SummaryEntry, ...]:
-        if not self.path.exists():
+        self._require_memory_directory()
+        if not self.path.exists() and not self.path.is_symlink():
             return ()
+        require_owned_regular_file(self.path, within=self._state_root)
         content = self.path.read_bytes()
         if content and not content.endswith(b"\n"):
             raise ValueError("summary stream must contain complete JSONL records")
@@ -295,6 +314,17 @@ class JsonlSummaryStore:
                 )
             )
         return tuple(entries)
+
+    def _require_matching_session_store(self, sessions: ConsolidationSessionStore) -> None:
+        if sessions.workspace_state != self.workspace_state:
+            raise ValueError("Consolidation Session store belongs to another Workspace State")
+
+    def _require_memory_directory(self) -> Path:
+        return require_owned_directory(self._memory_directory, within=self._state_root)
+
+    def _require_pending_directory(self) -> Path:
+        self._require_memory_directory()
+        return require_owned_directory(self.pending_directory, within=self._state_root)
 
 
 class ConversationSummaryManager:
@@ -464,8 +494,7 @@ class ConversationSummaryManager:
                 )
             )
         tool_definitions = tuple(
-            json.dumps(tool, ensure_ascii=False, separators=(",", ":"))
-            for tool in self._tools
+            json.dumps(tool, ensure_ascii=False, separators=(",", ":")) for tool in self._tools
         )
         return RuntimeStatusInput(
             system_prompt=self._chat_system_prompt,

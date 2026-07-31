@@ -143,9 +143,9 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ### 实现任务
 
-1. 实现固定 Agent Home 路径解析，并提供仅供测试注入临时目录的 composition-root seam；不得暴露为用户配置或 profile。
-2. 首次启动创建 `memory/`、`sessions/` 和四分区 `memory/memory.md` 模板；其他运行态文件按需创建。
-3. 实现跨 Windows/POSIX 的 normalized absolute Workspace 与 slug 规则，覆盖盘符、根目录、大小写、路径段中已有 `-` 等情况。
+1. 实现固定 Agent Home 路径解析，并将其所有权限制为 User Configuration 与 Runtime Logs；不得暴露为用户配置或 profile。
+2. 有效启动在当前 Workspace 创建 `.myclaw`、`memory/`、`sessions/` 和四分区 `memory/memory.md` 模板；其他运行态文件按需创建。
+3. 实现 Windows x64 normalized absolute Workspace identity，直接在 Workspace State 存储非全局状态，不派生 slug。
 4. 实现同目录临时文件、flush、必要时 fsync、原子 replace 的写入助手，并清理失败临时文件。
 5. 实现 TOML 默认模板、解析、schema 校验、provider/route 可用性校验和用户可见错误。
 6. 实现 API key 结构化脱敏，以及 TOML 无法解析时对原始文本中明显 API key 行的保守脱敏。
@@ -326,7 +326,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 ### 实现任务
 
 1. 建立“48 条 User Stories -> 测试/演示”的追踪矩阵，以及“Required tests -> 测试文件”的反向索引。
-2. 在 Windows 和至少一个 POSIX 环境运行完整测试，重点核对路径、原子 replace、subprocess cancellation 和终端 signal 差异。
+2. 在 Windows x64 发布候选上运行完整测试，重点核对路径、原子 replace、subprocess cancellation 和终端中断行为。
 3. 执行安全复核：路径穿越与 symlink、Agent Home 内部写保护、Shell policy、SSRF/redirect、secret redaction、artifact 泄露面。
 4. 执行故障注入：磁盘写失败、损坏 JSONL/TOML/JSON、provider 连续失败、网络超时、取消发生在 stream/tool/metadata update 各阶段。
 5. 执行 REPL 手工验收：首次配置、streaming、确认/拒绝、resume、长对话 consolidation、`/dream`、后台任务提示和退出清理。
@@ -360,9 +360,9 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ### 发布候选
 
-- Windows + POSIX 测试矩阵。
-- Python 最低支持版本 + 最新稳定版本矩阵。
-- `build` 后在空虚拟环境安装 wheel，再执行 CLI smoke tests。
+- Windows x64 测试与 Python 3.12 门禁。
+- 只构建 `py3-none-win_amd64` wheel，不产生额外发行物。
+- 在空 Windows x64 虚拟环境安装唯一 wheel，再执行 Unicode CLI smoke tests。
 - 手工真实 provider 与真实网络测试从默认 CI 隔离，凭据只通过 CI secret 或本地环境提供，不写入 fixture/log。
 
 ## 15. 风险与控制措施

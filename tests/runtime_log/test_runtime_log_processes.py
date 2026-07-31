@@ -1,3 +1,4 @@
+import msvcrt
 import os
 import re
 import subprocess
@@ -6,12 +7,6 @@ import time
 from pathlib import Path
 
 import pytest
-
-if sys.platform == "win32":
-    import msvcrt
-else:
-    import fcntl
-
 
 _SLOT_TARGET_BYTES = 10_485_760
 _APPEND_SCRIPT = """
@@ -40,19 +35,13 @@ lifetime.close()
 
 
 def _lock_control_file(descriptor: int) -> None:
-    if sys.platform == "win32":
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-    else:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
 
 
 def _unlock_control_file(descriptor: int) -> None:
-    if sys.platform == "win32":
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-    else:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
 
 
 def _run_concurrent_writers(
@@ -99,7 +88,6 @@ def _run_concurrent_writers(
     return results
 
 
-@pytest.mark.skipif(os.name not in {"nt", "posix"}, reason="unsupported lock platform")
 def test_runtime_log_subprocess_uses_one_second_unlocked_fallback(agent_home: Path) -> None:
     logs = agent_home / "logs"
     logs.mkdir(parents=True)
@@ -133,7 +121,6 @@ def test_runtime_log_subprocess_uses_one_second_unlocked_fallback(agent_home: Pa
     assert (logs / "run.log.cursor").read_bytes() == b"1\n"
 
 
-@pytest.mark.skipif(os.name not in {"nt", "posix"}, reason="unsupported lock platform")
 def test_runtime_log_subprocesses_append_only_complete_records(
     agent_home: Path,
     tmp_path: Path,
@@ -152,11 +139,7 @@ def test_runtime_log_subprocesses_append_only_complete_records(
     assert results == [(0, "")] * len(tokens)
     logs = agent_home / "logs"
     content = (logs / "run.log.0").read_text(encoding="utf-8")
-    expected = {
-        f"[{token}:{index:04d}]" + "x" * 256
-        for token in tokens
-        for index in range(count)
-    }
+    expected = {f"[{token}:{index:04d}]" + "x" * 256 for token in tokens for index in range(count)}
     records: set[str] = set()
     for line in content.splitlines():
         match = re.fullmatch(
@@ -172,7 +155,6 @@ def test_runtime_log_subprocesses_append_only_complete_records(
     assert (logs / "run.log.cursor").read_bytes() == b"0\n"
 
 
-@pytest.mark.skipif(os.name not in {"nt", "posix"}, reason="unsupported lock platform")
 def test_runtime_log_subprocesses_serialize_alternating_rotations(
     agent_home: Path,
     tmp_path: Path,
@@ -225,7 +207,6 @@ def test_runtime_log_subprocesses_serialize_alternating_rotations(
     assert (final_lock_status.st_dev, final_lock_status.st_ino) == lock_identity
 
 
-@pytest.mark.skipif(os.name not in {"nt", "posix"}, reason="unsupported lock platform")
 def test_runtime_log_fallback_record_may_be_removed_by_a_later_rotation(
     agent_home: Path,
 ) -> None:

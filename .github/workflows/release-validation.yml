@@ -3,17 +3,22 @@ name: Release validation
 on:
   push:
     branches:
-      - codex/b18-posix-validation
+      - main
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  posix:
-    name: POSIX release gate
-    runs-on: ubuntu-latest
+  windows-x64:
+    name: Windows x64 release gate
+    runs-on: windows-latest
     timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: powershell
 
     steps:
       - name: Check out source
@@ -25,14 +30,14 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
+          architecture: x64
           cache: pip
 
       - name: Record platform
         run: |
-          uname -a
-          cat /etc/os-release
           python --version
           python -m pip --version
+          python -c "import platform, sysconfig; print(platform.platform()); print(sysconfig.get_platform()); assert sysconfig.get_platform().replace('-', '_').lower() == 'win_amd64'"
 
       - name: Install release test dependencies
         run: |
@@ -42,14 +47,6 @@ jobs:
       - name: Run offline test suite
         run: python -m pytest -q -ra
 
-      - name: Run POSIX process regressions
-        run: >-
-          python -m pytest -q -ra
-          tests/tools/shell/test_shell_process.py
-          tests/tools/web/test_web_search.py
-          tests/test_runtime_shutdown.py
-          tests/test_security_shell.py
-
       - name: Run lint and format gates
         run: |
           python -m ruff check myclaw tests
@@ -58,31 +55,65 @@ jobs:
       - name: Run strict type gate
         run: python -m mypy myclaw tests
 
-      - name: Build source and wheel distributions
-        run: python -m build
+      - name: Build the sole Windows x64 wheel
+        run: |
+          Remove-Item dist, build, myclaw.egg-info -Recurse -Force -ErrorAction SilentlyContinue
+          python -m build --wheel
+          $artifacts = @(Get-ChildItem dist -File)
+          if ($artifacts.Count -ne 1) {
+            throw "Expected exactly one release artifact; found $($artifacts.Count)"
+          }
+          $wheel = $artifacts[0]
+          if ($wheel.Name -notmatch '^myclaw-[^-]+-py3-none-win_amd64\.whl$') {
+            throw "Unexpected release artifact: $($wheel.Name)"
+          }
+          python -c "import sys, zipfile; archive = zipfile.ZipFile(sys.argv[1]); wheel = next(name for name in archive.namelist() if name.endswith('.dist-info/WHEEL')); tags = [line for line in archive.read(wheel).decode().splitlines() if line.startswith('Tag: ')]; assert tags == ['Tag: py3-none-win_amd64'], tags" $wheel.FullName
+          "MYCLAW_WHEEL=$($wheel.FullName)" >> $env:GITHUB_ENV
 
       - name: Install wheel in a clean environment
         run: |
-          python -m venv "$RUNNER_TEMP/myclaw-clean"
-          "$RUNNER_TEMP/myclaw-clean/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/myclaw-clean/bin/python" -m pip install dist/*.whl
-          "$RUNNER_TEMP/myclaw-clean/bin/python" -m pip check
+          $venv = Join-Path $env:RUNNER_TEMP "myclaw-clean"
+          python -m venv $venv
+          $python = Join-Path $venv "Scripts/python.exe"
+          & $python -m pip install --upgrade pip
+          & $python -m pip install $env:MYCLAW_WHEEL
+          & $python -m pip check
 
       - name: Smoke test installed CLI from a Unicode workspace
         run: |
-          mkdir -p "$RUNNER_TEMP/home" "$RUNNER_TEMP/workspace-验收"
-          cd "$RUNNER_TEMP/workspace-验收"
-          set +e
-          HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/myclaw-clean/bin/myclaw" \
-            > "$RUNNER_TEMP/myclaw-first-start.txt" 2>&1
-          first_exit=$?
-          set -e
-          test "$first_exit" -eq 2
-          grep -q 'config_missing' "$RUNNER_TEMP/myclaw-first-start.txt"
-          ! grep -q 'Traceback' "$RUNNER_TEMP/myclaw-first-start.txt"
-          test -f "$RUNNER_TEMP/home/.myclaw/config.toml"
-          HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/myclaw-clean/bin/myclaw" config \
-            > "$RUNNER_TEMP/myclaw-config.txt"
-          grep -q '\[runtime\]' "$RUNNER_TEMP/myclaw-config.txt"
-          "$RUNNER_TEMP/myclaw-clean/bin/python" -c \
-            "import myclaw; print('WHEEL_IMPORT_OK', myclaw.__version__)"
+          $venv = Join-Path $env:RUNNER_TEMP "myclaw-clean"
+          $python = Join-Path $venv "Scripts/python.exe"
+          $myclaw = Join-Path $venv "Scripts/myclaw.exe"
+          $testHome = Join-Path $env:RUNNER_TEMP "home-用户"
+          $workspace = Join-Path $env:RUNNER_TEMP "workspace-验收"
+          $firstOutput = Join-Path $env:RUNNER_TEMP "myclaw-first-start.txt"
+          $configOutput = Join-Path $env:RUNNER_TEMP "myclaw-config.txt"
+          New-Item -ItemType Directory -Force -Path $testHome, $workspace | Out-Null
+          $env:HOME = $testHome
+          $env:USERPROFILE = $testHome
+          $env:PYTHONNOUSERSITE = "1"
+          Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+          Push-Location $workspace
+          try {
+            & $myclaw *> $firstOutput
+            $firstExit = $LASTEXITCODE
+            if ($firstExit -ne 2) { throw "Unexpected first-start exit code: $firstExit" }
+            $firstText = Get-Content -Raw $firstOutput
+            if ($firstText -notmatch "config_missing") { throw "Missing config_missing output" }
+            if ($firstText -match "Traceback") { throw "First start emitted a traceback" }
+            if (-not (Test-Path (Join-Path $testHome ".myclaw/config.toml"))) {
+              throw "Default configuration was not created"
+            }
+            if (Test-Path (Join-Path $workspace ".myclaw")) {
+              throw "Configuration-gated startup created Workspace State"
+            }
+            & $myclaw config *> $configOutput
+            if ($LASTEXITCODE -ne 0) { throw "Config command failed" }
+            if ((Get-Content -Raw $configOutput) -notmatch "\[runtime\]") {
+              throw "Config output is incomplete"
+            }
+            & $python -I -c "import myclaw, pathlib, sys; package = pathlib.Path(myclaw.__file__).resolve(); site = pathlib.Path(sys.prefix, 'Lib', 'site-packages').resolve(); print('WHEEL_IMPORT_OK', myclaw.__version__, package); assert package.is_relative_to(site), (package, site)"
+          }
+          finally {
+            Pop-Location
+          }

@@ -222,8 +222,8 @@ async def test_invalid_unavailable_and_refused_calls_do_not_create_runtime_logs(
 
     with lifetime.session("foreground-session-51"):
         malformed = await gateway.call(_call("prepare", "{"))
-        invalid = await gateway.call(_call("prepare", '{}'))
-        unavailable = await gateway.call(_call("missing", '{}'))
+        invalid = await gateway.call(_call("prepare", "{}"))
+        unavailable = await gateway.call(_call("missing", "{}"))
         refused = await gateway.call(_call("refusing", '{"action":"write"}'))
     lifetime.close()
 
@@ -318,9 +318,7 @@ async def test_retryable_execution_failures_log_retries_and_one_terminal_error(
         async def execute(self, *, payload: str) -> str:
             self.calls += 1
             try:
-                raise OSError(
-                    "RAW_RESPONSE_BODY_51 https://user:credential@example.test/private"
-                )
+                raise OSError("RAW_RESPONSE_BODY_51 https://user:credential@example.test/private")
             except OSError as cause:
                 raise ToolError("The retry Tool failed safely.") from cause
 
@@ -331,9 +329,7 @@ async def test_retryable_execution_failures_log_retries_and_one_terminal_error(
     lifetime = install_runtime_logging(AgentHome(agent_home))
 
     with lifetime.session("scheduled-session-51"):
-        result = await gateway.call(
-            _call("retry", '{"payload":"RAW_TOOL_ARGUMENT_51"}')
-        )
+        result = await gateway.call(_call("retry", '{"payload":"RAW_TOOL_ARGUMENT_51"}'))
     lifetime.close()
 
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
@@ -355,9 +351,9 @@ async def test_retryable_execution_failures_log_retries_and_one_terminal_error(
     assert "Traceback (most recent call last):" in content
     assert content.count("ToolError: [REDACTED]") == 3
     assert content.count("OSError: [REDACTED]") == 3
-    assert content.count(
-        "The above exception was the direct cause of the following exception:"
-    ) == 3
+    assert (
+        content.count("The above exception was the direct cause of the following exception:") == 3
+    )
     assert "RAW_TOOL_ARGUMENT_51" not in content
     assert "RAW_RESPONSE_BODY_51" not in content
     assert "credential" not in content

@@ -2,8 +2,10 @@ import asyncio
 import os
 import shutil
 import subprocess
+import sys
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -13,9 +15,13 @@ import pytest
 import typer
 
 import myclaw.terminal.cli as cli
+import myclaw.terminal.entrypoint as entrypoint
 from myclaw.agent.runtime import prepare_repl_runtime
+from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
+from myclaw.platform_support import UnsupportedPlatformError
 from myclaw.provider.factory import create_provider
 from myclaw.runtime_log import install_runtime_logging
 from tests.configuration.test_config import (
@@ -28,7 +34,11 @@ from tests.configuration.test_config import (
 )
 
 
-def run_installed_myclaw(agent_home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def run_installed_myclaw(
+    agent_home: Path,
+    *arguments: str,
+    workspace: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     executable = shutil.which("myclaw")
     assert executable is not None
     environment = os.environ.copy()
@@ -37,13 +47,15 @@ def run_installed_myclaw(agent_home: Path, *arguments: str) -> subprocess.Comple
     source_root = str(Path(__file__).parent.parent)
     existing_pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = (
-        source_root if not existing_pythonpath else os.pathsep.join((source_root, existing_pythonpath))
+        source_root
+        if not existing_pythonpath
+        else os.pathsep.join((source_root, existing_pythonpath))
     )
     return subprocess.run(
         [executable, *arguments],
         capture_output=True,
         check=False,
-        cwd=agent_home.parent,
+        cwd=agent_home.parent if workspace is None else workspace,
         env=environment,
         text=True,
     )
@@ -52,6 +64,48 @@ def run_installed_myclaw(agent_home: Path, *arguments: str) -> subprocess.Comple
 def assert_plaintext_absent(output: str, *plaintext_values: str) -> None:
     if any(value in output for value in plaintext_values):
         pytest.fail("CLI output leaked a plaintext provider API key", pytrace=False)
+
+
+@pytest.mark.parametrize("arguments", ((), ("config",), ("--help",)))
+def test_cli_entrypoint_rejects_unsupported_platform_before_typer_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: tuple[str, ...],
+) -> None:
+    output = StringIO()
+    app_called = False
+
+    def unsupported() -> None:
+        raise UnsupportedPlatformError("unsupported_x64")
+
+    def dispatch_spy() -> None:
+        nonlocal app_called
+        app_called = True
+
+    monkeypatch.setattr(sys, "argv", ["myclaw", *arguments])
+    monkeypatch.setattr(entrypoint, "require_supported_platform", unsupported)
+    monkeypatch.setattr(entrypoint, "_dispatch_cli", dispatch_spy)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    assert entrypoint.cli_entrypoint() == 2
+    assert app_called is False
+    assert "unsupported_platform" in output.getvalue()
+    assert "unsupported_x64" in output.getvalue()
+
+
+def test_cli_entrypoint_dispatches_typer_on_windows_x64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_called = False
+
+    def dispatch_spy() -> None:
+        nonlocal app_called
+        app_called = True
+
+    monkeypatch.setattr(entrypoint, "require_supported_platform", lambda: None)
+    monkeypatch.setattr(entrypoint, "_dispatch_cli", dispatch_spy)
+
+    assert entrypoint.cli_entrypoint() == 0
+    assert app_called is True
 
 
 def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_error(
@@ -136,10 +190,7 @@ def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_er
     assert str(raised.value.__cause__) == "PRIVATE_INTERRUPT_CLEANUP_BODY_52"
     assert events == ["install", "runtime", "interrupt-close", "restore"]
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    marker = (
-        "session=- myclaw.terminal.cli: Interrupt controller cleanup failed "
-        "type=RuntimeError"
-    )
+    marker = "session=- myclaw.terminal.cli: Interrupt controller cleanup failed type=RuntimeError"
     assert content.count("ERROR pid=") == 1
     assert content.count(marker) == 1
     assert "RuntimeError: [REDACTED]" in content
@@ -148,21 +199,24 @@ def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_er
 
 def test_runtime_composition_records_one_safe_error_before_propagating(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     configuration = ConfigLoader(home).load()
-    memory_path = agent_home / "memory" / "memory.md"
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    memory_path = state.long_term_memory_path
     memory_path.unlink()
     memory_path.mkdir()
 
     runtime_log = install_runtime_logging(home)
     try:
-        with pytest.raises(OSError):
+        with pytest.raises(WorkspaceStateError):
             prepare_repl_runtime(
                 agent_home=home,
-                workspace=agent_home.parent,
+                workspace=workspace,
                 configuration=configuration,
                 provider_factory=create_provider,
                 now=lambda: datetime.now().astimezone(),
@@ -192,8 +246,11 @@ def test_installed_myclaw_console_entry_starts() -> None:
     assert "MyClaw Personal Agent" in result.stdout
 
 
-def test_installed_myclaw_generates_missing_configuration_and_stops(agent_home: Path) -> None:
-    result = run_installed_myclaw(agent_home)
+def test_installed_myclaw_generates_missing_configuration_and_stops(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    result = run_installed_myclaw(agent_home, workspace=workspace)
 
     assert result.returncode == 2
     assert (agent_home / "config.toml").read_text(encoding="utf-8") == EXPECTED_DEFAULT_CONFIG
@@ -201,6 +258,7 @@ def test_installed_myclaw_generates_missing_configuration_and_stops(agent_home: 
     assert str(agent_home / "config.toml") in result.stdout
     assert "edit" in result.stdout.lower()
     assert "configuration gate passed" not in result.stdout
+    assert not (workspace / ".myclaw").exists()
     runtime_log = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert "ERROR" in runtime_log
     assert "session=- myclaw.terminal.cli: Startup failed code=config_missing" in runtime_log
@@ -208,36 +266,43 @@ def test_installed_myclaw_generates_missing_configuration_and_stops(agent_home: 
 
 def test_installed_config_command_generates_and_displays_missing_configuration(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
-    result = run_installed_myclaw(agent_home, "config")
+    result = run_installed_myclaw(agent_home, "config", workspace=workspace)
 
     assert result.returncode == 0, result.stderr
     assert f"Path: {agent_home / 'config.toml'}" in result.stdout
     assert EXPECTED_DEFAULT_CONFIG in result.stdout
     assert "configuration gate passed" not in result.stdout
     assert not (agent_home / "logs").exists()
+    assert not (workspace / ".myclaw").exists()
 
 
-def test_installed_config_command_redacts_valid_configuration(agent_home: Path) -> None:
+def test_installed_config_command_redacts_valid_configuration(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
     agent_home.mkdir(parents=True)
     (agent_home / "config.toml").write_text(REDACTION_CONFIG, encoding="utf-8")
 
-    result = run_installed_myclaw(agent_home, "config")
+    result = run_installed_myclaw(agent_home, "config", workspace=workspace)
 
     assert result.returncode == 0, result.stderr
     assert EXPECTED_REDACTED_CONFIG in result.stdout
     assert f"Path: {agent_home / 'config.toml'}" in result.stdout
     assert_plaintext_absent(result.stdout + result.stderr, "plaintext-primary-key")
     assert not (agent_home / "logs").exists()
+    assert not (workspace / ".myclaw").exists()
 
 
 def test_installed_config_command_shows_safe_malformed_configuration(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     agent_home.mkdir(parents=True)
     (agent_home / "config.toml").write_text(MALFORMED_CONFIG, encoding="utf-8")
 
-    result = run_installed_myclaw(agent_home, "config")
+    result = run_installed_myclaw(agent_home, "config", workspace=workspace)
 
     assert result.returncode == 2
     assert "config_parse_error" in result.stdout
@@ -257,10 +322,12 @@ def test_installed_config_command_shows_safe_malformed_configuration(
     assert_plaintext_absent(runtime_log, "first-plaintext-key", "second-plaintext-key")
     assert "Traceback (most recent call last)" not in runtime_log
     assert "ConfigError" not in runtime_log
+    assert not (workspace / ".myclaw").exists()
 
 
 def test_installed_config_command_keeps_schema_invalid_content_inspectable(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     agent_home.mkdir(parents=True)
     content = REDACTION_CONFIG.replace(
@@ -269,43 +336,58 @@ def test_installed_config_command_keeps_schema_invalid_content_inspectable(
     )
     (agent_home / "config.toml").write_text(content, encoding="utf-8")
 
-    result = run_installed_myclaw(agent_home, "config")
+    result = run_installed_myclaw(agent_home, "config", workspace=workspace)
 
     assert result.returncode == 2
     assert "config_invalid" in result.stdout
     assert "runtime.misspelled_setting" in result.stdout
     assert "misspelled_setting = true" in result.stdout
     assert_plaintext_absent(result.stdout + result.stderr, "plaintext-primary-key")
+    assert not (workspace / ".myclaw").exists()
 
 
-def test_installed_myclaw_passes_valid_configuration_gate(agent_home: Path) -> None:
+def test_installed_myclaw_passes_valid_configuration_gate(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
     agent_home.mkdir(parents=True)
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
 
-    result = run_installed_myclaw(agent_home)
+    result = run_installed_myclaw(agent_home, workspace=workspace)
 
     assert result.returncode == 0, result.stderr
     assert "configuration gate passed" in result.stdout
     assert_plaintext_absent(result.stdout + result.stderr, "sk-ant-secret")
     assert not (agent_home / "logs").exists()
+    state = workspace / ".myclaw"
+    tree = tuple(
+        sorted(
+            "/".join(path.relative_to(state).parts) + ("/" if path.is_dir() else "")
+            for path in state.rglob("*")
+        )
+    )
+    assert tree == (".gitignore", "memory/", "memory/memory.md", "sessions/")
 
 
-def test_installed_myclaw_stops_on_parse_schema_and_default_failures(agent_home: Path) -> None:
+def test_installed_myclaw_stops_on_parse_schema_and_default_failures(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
     agent_home.mkdir(parents=True)
     config_path = agent_home / "config.toml"
 
     config_path.write_text(MALFORMED_CONFIG, encoding="utf-8")
-    parse_result = run_installed_myclaw(agent_home)
+    parse_result = run_installed_myclaw(agent_home, workspace=workspace)
 
     schema_content = REDACTION_CONFIG.replace(
         "max_tool_result_chars = 50000",
         "max_tool_result_chars = 50000\nmisspelled_setting = true",
     )
     config_path.write_text(schema_content, encoding="utf-8")
-    schema_result = run_installed_myclaw(agent_home)
+    schema_result = run_installed_myclaw(agent_home, workspace=workspace)
 
     config_path.write_text(EXPECTED_DEFAULT_CONFIG, encoding="utf-8")
-    default_result = run_installed_myclaw(agent_home)
+    default_result = run_installed_myclaw(agent_home, workspace=workspace)
 
     assert (parse_result.returncode, schema_result.returncode, default_result.returncode) == (
         2,
@@ -319,6 +401,7 @@ def test_installed_myclaw_stops_on_parse_schema_and_default_failures(agent_home:
         "configuration gate passed" not in result.stdout
         for result in (parse_result, schema_result, default_result)
     )
+    assert not (workspace / ".myclaw").exists()
     combined_output = "".join(
         result.stdout + result.stderr for result in (parse_result, schema_result, default_result)
     )
@@ -340,3 +423,39 @@ def test_installed_myclaw_stops_on_parse_schema_and_default_failures(agent_home:
         "second-plaintext-key",
         "plaintext-primary-key",
     )
+
+
+def test_installed_myclaw_reports_unsafe_workspace_state_without_traceback(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    agent_home.mkdir(parents=True)
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    state_path = workspace / ".myclaw"
+    state_path.write_text("private collision content", encoding="utf-8")
+
+    result = run_installed_myclaw(agent_home, workspace=workspace)
+
+    assert result.returncode == 1
+    assert "persistence_error" in result.stdout
+    assert "Workspace State" in result.stdout
+    assert str(state_path) in result.stdout
+    assert "private collision content" not in result.stdout + result.stderr
+    assert "Traceback" not in result.stdout + result.stderr
+
+
+def test_installed_myclaw_rejects_user_home_workspace_without_traceback(
+    agent_home: Path,
+) -> None:
+    agent_home.mkdir(parents=True)
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+
+    result = run_installed_myclaw(agent_home, workspace=agent_home.parent)
+
+    assert result.returncode == 1
+    assert "persistence_error" in result.stdout
+    assert "Workspace State" in result.stdout
+    assert str(agent_home) in result.stdout
+    assert "Traceback" not in result.stdout + result.stderr
+    assert not (agent_home / "memory").exists()
+    assert not (agent_home / "sessions").exists()

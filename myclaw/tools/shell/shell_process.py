@@ -2,8 +2,6 @@
 
 import asyncio
 import os
-import shlex
-import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -12,12 +10,7 @@ from typing import Final, Protocol
 
 from myclaw.tools.shell.shell_policy import ShellPolicyDenied, ShellRequest, trusted_git_executable
 
-if sys.platform == "win32":
-    from subprocess import CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW
-
-    _WINDOWS_SHELL_CREATION_FLAGS: Final = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-else:
-    _WINDOWS_SHELL_CREATION_FLAGS = 0
+_WINDOWS_SHELL_CREATION_FLAGS: Final = 0x08000200
 
 _HARDENED_GIT_ARGUMENTS: Final = {
     "git status": ("-c", "core.fsmonitor=false", "--no-pager", "status"),
@@ -75,7 +68,7 @@ class _AsyncioShellProcess:
         self,
         process: asyncio.subprocess.Process,
         *,
-        tree: _ProcessTree | None = None,
+        tree: _ProcessTree,
     ) -> None:
         self._process = process
         self._tree = tree
@@ -90,46 +83,11 @@ class _AsyncioShellProcess:
         await self._process.wait()
 
     async def terminate(self) -> None:
-        if self._tree is not None:
-            await self._tree.terminate()
-            return
-        try:
-            os.kill(-self._process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        await asyncio.sleep(0)
-        try:
-            os.kill(-self._process.pid, 9)
-        except ProcessLookupError:
-            return
-        await self._process.wait()
-        deadline = asyncio.get_running_loop().time() + 5
-        while True:
-            try:
-                os.kill(-self._process.pid, 0)
-            except ProcessLookupError:
-                return
-            if asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError("POSIX Shell process group did not terminate")
-            await asyncio.sleep(0.01)
+        await self._tree.terminate()
 
 
 class AsyncioShellProcessSpawner:
     async def spawn(self, command: str, *, cwd: Path) -> ShellProcess:
-        if os.name == "nt":
-            return await self._spawn_windows(command, cwd=cwd)
-        else:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                cwd=cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
-            )
-        return _AsyncioShellProcess(process)
-
-    @staticmethod
-    async def _spawn_windows(command: str, *, cwd: Path) -> ShellProcess:
         from myclaw.tools.shell.windows_job import WindowsJob
 
         platform_command = "cd" if command == "pwd" else command
@@ -317,9 +275,7 @@ def _resolved_shell_command(request: ShellRequest) -> str:
     if executable is None:
         raise ShellPolicyDenied("trusted Git executable is unavailable")
     command = (os.fspath(executable), *arguments)
-    if os.name == "nt":
-        return subprocess.list2cmdline(command)
-    return shlex.join(command)
+    return subprocess.list2cmdline(command)
 
 
 async def _join_spawn(task: asyncio.Task[ShellProcess]) -> ShellProcess:

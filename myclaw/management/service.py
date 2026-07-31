@@ -9,7 +9,7 @@ from myclaw import __version__
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ConfigView
 from myclaw.errors import ErrorInfo
-from myclaw.memory.memory_task import MemoryTaskResult
+from myclaw.memory.memory_task import MemoryStore, MemoryTaskResult
 from myclaw.session.identifiers import require_session_id
 from myclaw.session.records import ConversationSession, CumulativeUsage, SessionSummary
 from myclaw.session.session_store import SessionListingReport
@@ -172,7 +172,7 @@ class ManagementError(Exception):
 
 
 class ManagementViewService:
-    """Read configuration and Long-term Memory from Agent Home."""
+    """Read global configuration and injected runtime-owned views."""
 
     def __init__(
         self,
@@ -183,14 +183,15 @@ class ManagementViewService:
         workspace: Path | None = None,
         switch_session: Callable[[str], None] | None = None,
         memory_manager: _ManualMemoryManager | None = None,
+        memory_store: MemoryStore | None = None,
     ) -> None:
         self._config = ConfigLoader(agent_home)
-        self._long_term_memory = agent_home.path / "memory" / "memory.md"
         self._status_service = status_service
         self._sessions = sessions
         self._workspace = workspace
         self._switch_session = switch_session
         self._memory_manager = memory_manager
+        self._memory_store = memory_store
 
     async def config_view(self) -> ConfigView:
         """Return complete redacted User Configuration content."""
@@ -207,9 +208,13 @@ class ManagementViewService:
 
     async def memory_view(self) -> str:
         """Return the complete current Long-term Memory file."""
+        if self._memory_store is None:
+            raise ManagementError(
+                ErrorInfo("route_unavailable", "Long-term Memory is unavailable.")
+            )
         try:
-            return self._long_term_memory.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
+            return await self._memory_store.read_long_term()
+        except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Long-term Memory could not be read.")
             ) from error

@@ -7,12 +7,14 @@ import pytest
 
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.memory.conversation_summary import (
+    ConsolidatingSummaryStore,
     ConversationSummaryManager,
-    JsonlSummaryStore,
     SummaryModelSettings,
+    WorkspaceJsonlSummaryStore,
 )
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -35,6 +37,12 @@ LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=LOCAL_OFFSET)
 
 
+def _state(workspace: Path) -> WorkspaceState:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    return state
+
+
 def _usage() -> ModelUsage:
     return ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6)
 
@@ -52,8 +60,7 @@ async def _session_ready_for_consolidation(
     workspace: Path,
 ) -> tuple[JsonlSessionStore, str]:
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -89,7 +96,7 @@ async def _session_ready_for_consolidation(
 def _manager(
     *,
     sessions: JsonlSessionStore,
-    summaries: JsonlSummaryStore,
+    summaries: ConsolidatingSummaryStore,
 ) -> ConversationSummaryManager:
     return ConversationSummaryManager(
         provider=ScriptedFakeProvider(completions=(_response("First turn summary."),)),
@@ -120,7 +127,7 @@ async def test_pending_consolidation_recovery_failure_is_recorded_at_its_boundar
     home = AgentHome(agent_home)
     home.initialize()
     sessions, _session_id = await _session_ready_for_consolidation(home, workspace)
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(_state(workspace))
     summaries.pending_directory.mkdir(parents=True)
     (summaries.pending_directory / "invalid.json").write_text(
         "PRIVATE CONSOLIDATION JOURNAL CONTENT",
@@ -160,7 +167,7 @@ async def test_summary_write_failure_leaves_recovery_journal_and_old_cursor(
             raise OSError("injected summary replacement failure")
         atomic_replace_bytes(target, content)
 
-    summaries = JsonlSummaryStore(home, replace_bytes=fail_summary_replace)
+    summaries = WorkspaceJsonlSummaryStore(_state(workspace), replace_bytes=fail_summary_replace)
 
     with pytest.raises(ModelCallError) as raised:
         await _manager(sessions=sessions, summaries=summaries).prepare(
@@ -170,7 +177,7 @@ async def test_summary_write_failure_leaves_recovery_journal_and_old_cursor(
     assert raised.value.error.code == "persistence_error"
     assert not summaries.path.exists()
     assert (await sessions.load(session_id)).metadata.consolidation_cursor == 0
-    journals = list((agent_home / "memory" / "pending-consolidations").glob("*.json"))
+    journals = list((_state(workspace).memory_directory / "pending-consolidations").glob("*.json"))
     assert len(journals) == 1
     journal = json.loads(journals[0].read_text(encoding="utf-8"))
     assert journal == {
@@ -200,13 +207,13 @@ async def test_pending_journal_recovers_exact_summary_and_cursor_once(
             raise OSError("injected summary replacement failure")
         atomic_replace_bytes(target, content)
 
-    failing = JsonlSummaryStore(home, replace_bytes=fail_summary_replace)
+    failing = WorkspaceJsonlSummaryStore(_state(workspace), replace_bytes=fail_summary_replace)
     with pytest.raises(ModelCallError):
         await _manager(sessions=sessions, summaries=failing).prepare(
             await sessions.load(session_id)
         )
 
-    recovered = JsonlSummaryStore(home)
+    recovered = WorkspaceJsonlSummaryStore(_state(workspace))
     await recovered.recover_pending(sessions)
     await recovered.recover_pending(sessions)
 
@@ -242,9 +249,11 @@ async def test_pending_consolidation_recovery_records_one_degradation_warning(
     with pytest.raises(ModelCallError):
         await _manager(
             sessions=sessions,
-            summaries=JsonlSummaryStore(home, replace_bytes=fail_summary_replace),
+            summaries=WorkspaceJsonlSummaryStore(
+                _state(workspace), replace_bytes=fail_summary_replace
+            ),
         ).prepare(await sessions.load(session_id))
-    manager = _manager(sessions=sessions, summaries=JsonlSummaryStore(home))
+    manager = _manager(sessions=sessions, summaries=WorkspaceJsonlSummaryStore(_state(workspace)))
     lifetime = install_runtime_logging(home)
 
     await manager.recover_pending()
@@ -268,6 +277,8 @@ async def test_runtime_recovers_all_pending_consolidations_before_first_turn_eve
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     sessions, old_session_id = await _session_ready_for_consolidation(home, workspace)
     replace_calls = 0
 
@@ -281,7 +292,7 @@ async def test_runtime_recovers_all_pending_consolidations_before_first_turn_eve
     with pytest.raises(ModelCallError):
         await _manager(
             sessions=sessions,
-            summaries=JsonlSummaryStore(home, replace_bytes=fail_summary_replace),
+            summaries=WorkspaceJsonlSummaryStore(state, replace_bytes=fail_summary_replace),
         ).prepare(await sessions.load(old_session_id))
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     provider = ScriptedFakeProvider(
@@ -301,12 +312,13 @@ async def test_runtime_recovers_all_pending_consolidations_before_first_turn_eve
 
     assert first_event.type == "turn_started"
     assert (await runtime.sessions.load(old_session_id)).metadata.consolidation_cursor == 2
-    assert list((agent_home / "memory" / "pending-consolidations").glob("*.json")) == []
+    assert list((state.memory_directory / "pending-consolidations").glob("*.json")) == []
     _ = [event async for event in events]
+    await runtime.close()
 
 
 @pytest.mark.asyncio
-async def test_runtime_recovers_pending_session_from_another_workspace(
+async def test_runtime_ignores_pending_consolidation_from_another_workspace(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -316,6 +328,8 @@ async def test_runtime_recovers_pending_session_from_another_workspace(
     new_workspace = workspace / "new"
     old_workspace.mkdir()
     new_workspace.mkdir()
+    old_state = WorkspaceState(Workspace.from_path(old_workspace))
+    old_state.initialize(agent_home_root=Path.home() / ".myclaw")
     old_sessions, old_session_id = await _session_ready_for_consolidation(home, old_workspace)
     replace_calls = 0
 
@@ -329,8 +343,11 @@ async def test_runtime_recovers_pending_session_from_another_workspace(
     with pytest.raises(ModelCallError):
         await _manager(
             sessions=old_sessions,
-            summaries=JsonlSummaryStore(home, replace_bytes=fail_summary_replace),
+            summaries=WorkspaceJsonlSummaryStore(old_state, replace_bytes=fail_summary_replace),
         ).prepare(await old_sessions.load(old_session_id))
+    old_session_bytes = old_sessions.path_for(old_session_id).read_bytes()
+    old_pending = old_state.memory_directory / "pending-consolidations"
+    old_journal_bytes = {path: path.read_bytes() for path in old_pending.glob("*.json")}
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     provider = ScriptedFakeProvider(
         streams=(StreamScript(events=(ModelCompleted(response=_response("Chat answer.")),)),)
@@ -346,11 +363,14 @@ async def test_runtime_recovers_pending_session_from_another_workspace(
 
     events = runtime.conversation.submit("New workspace input.")
     first_event = await anext(events)
+    _ = [event async for event in events]
+    await runtime.close()
 
     assert first_event.type == "turn_started"
-    assert (await old_sessions.load(old_session_id)).metadata.consolidation_cursor == 2
-    assert list((agent_home / "memory" / "pending-consolidations").glob("*.json")) == []
-    _ = [event async for event in events]
+    assert (await old_sessions.load(old_session_id)).metadata.consolidation_cursor == 0
+    assert old_sessions.path_for(old_session_id).read_bytes() == old_session_bytes
+    assert {path: path.read_bytes() for path in old_pending.glob("*.json")} == old_journal_bytes
+    assert len(provider.stream_requests) == 1
 
 
 @pytest.mark.asyncio
@@ -360,6 +380,8 @@ async def test_runtime_reports_safe_error_for_conflicting_reserved_summary_index
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     sessions, session_id = await _session_ready_for_consolidation(home, workspace)
     replace_calls = 0
 
@@ -373,9 +395,9 @@ async def test_runtime_reports_safe_error_for_conflicting_reserved_summary_index
     with pytest.raises(ModelCallError):
         await _manager(
             sessions=sessions,
-            summaries=JsonlSummaryStore(home, replace_bytes=fail_summary_replace),
+            summaries=WorkspaceJsonlSummaryStore(state, replace_bytes=fail_summary_replace),
         ).prepare(await sessions.load(session_id))
-    summaries = JsonlSummaryStore(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("A different summary.", NOW)
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     runtime = prepare_repl_runtime(
@@ -389,6 +411,7 @@ async def test_runtime_reports_safe_error_for_conflicting_reserved_summary_index
 
     with pytest.raises(ModelCallError) as raised:
         await anext(runtime.conversation.submit("Do not accept this turn."))
+    await runtime.close()
 
     assert raised.value.error.code == "persistence_error"
     assert "different summary" not in raised.value.error.message.lower()
@@ -428,14 +451,13 @@ async def test_each_consolidation_commit_crash_window_is_recoverable(
         target.unlink()
 
     transaction_sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=uuid4,
         replace_bytes=replace_session_cursor,
     )
-    transaction_summaries = JsonlSummaryStore(
-        home,
+    transaction_summaries = WorkspaceJsonlSummaryStore(
+        _state(workspace),
         replace_bytes=replace_summary_state,
         unlink_file=unlink_journal,
     )
@@ -452,7 +474,7 @@ async def test_each_consolidation_commit_crash_window_is_recoverable(
 
     expected_prefix = ("journal", "summary", "cursor", "delete")
     assert operations == list(expected_prefix[: expected_prefix.index(failed_step) + 1])
-    healthy = JsonlSummaryStore(home)
+    healthy = WorkspaceJsonlSummaryStore(_state(workspace))
     if failed_step == "journal":
         await healthy.commit_consolidation(
             sessions=sessions,

@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 from importlib.resources import files
-from pathlib import PurePosixPath
+from pathlib import PureWindowsPath
 
 import pytest
 
@@ -106,13 +106,13 @@ def test_chat_and_tool_templates_render_exact_system_prompt() -> None:
 
     assert guidance == "- read_file: Read a file.\n- write_file: Write a file."
     assert chat_system_prompt(
-        workspace=PurePosixPath("/workspace"),
+        workspace=PureWindowsPath(r"D:\workspace"),
         long_term_memory="# Memory\n",
         tool_guidance=guidance,
     ) == (
         "You are the MyClaw Personal Agent.\n"
         "Act within the user's current Workspace.\n"
-        "Workspace: /workspace\n\n"
+        "Workspace: D:\\workspace\n\n"
         "<long_term_memory>\n"
         "# Memory\n"
         "</long_term_memory>\n\n"
@@ -124,7 +124,7 @@ def test_chat_and_tool_templates_render_exact_system_prompt() -> None:
 
 def test_specialized_model_templates_render_exact_prompts() -> None:
     summary = SummaryEntry(index=1, timestamp=NOW, content="Remember this.")
-    long_term_path = PurePosixPath("/home/user/.myclaw/memory/memory.md")
+    long_term_path = PureWindowsPath(r"D:\workspace\.myclaw\memory\memory.md")
 
     assert session_title_prompt() == (
         "Generate a concise title for this Conversation Session.\n"
@@ -139,7 +139,7 @@ def test_specialized_model_templates_render_exact_prompts() -> None:
     )
     assert memory_task_prompt(long_term_path=long_term_path) == (
         "Maintain the MyClaw Long-term Memory from new Conversation Summaries.\n"
-        "Use read_file to inspect exactly /home/user/.myclaw/memory/memory.md.\n"
+        "Use read_file to inspect exactly D:\\workspace\\.myclaw\\memory\\memory.md.\n"
         "Use edit_file only when stable information should be retained, and edit exactly that file.\n"
         "Keep the four sections: User Info, User Preference, Project Fact, and Lesson.\n"
         "Do not store transient activity, raw summaries, or duplicate facts.\n"

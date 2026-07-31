@@ -4,10 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.utils.atomic_files import atomic_replace_bytes, atomic_replace_text, path_for_io
+from myclaw.utils.atomic_files import (
+    atomic_create_text,
+    atomic_replace_bytes,
+    atomic_replace_text,
+    path_for_io,
+)
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows extended paths only")
 def test_path_for_io_normalizes_windows_local_and_unc_paths(tmp_path: Path) -> None:
     local = tmp_path / "state.txt"
     unc = Path(r"\\server\share\state.txt")
@@ -16,7 +20,6 @@ def test_path_for_io_normalizes_windows_local_and_unc_paths(tmp_path: Path) -> N
     assert path_for_io(unc) == Path(r"\\?\UNC\server\share\state.txt")
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows extended paths only")
 def test_path_for_io_preserves_existing_windows_extended_path(tmp_path: Path) -> None:
     extended = Path(f"\\\\?\\{tmp_path.absolute()}\\state.txt")
 
@@ -69,3 +72,15 @@ def test_cancelled_atomic_bytes_replace_preserves_official_state(
         b"old-state",
         ["state.bin"],
     )
+
+
+def test_atomic_create_and_replace_use_windows_extended_paths(tmp_path: Path) -> None:
+    parent = tmp_path.joinpath(*(["nested-state-directory"] * 12))
+    path_for_io(parent).mkdir(parents=True)
+    target = parent / "state.txt"
+
+    assert atomic_create_text(target, "first\n") is True
+    assert atomic_create_text(target, "must not replace\n") is False
+    atomic_replace_text(target, "second\n")
+
+    assert path_for_io(target).read_bytes() == b"second\n"

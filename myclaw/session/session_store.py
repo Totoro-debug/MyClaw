@@ -14,7 +14,7 @@ from typing import Protocol, cast, runtime_checkable
 from uuid import UUID
 
 from myclaw.agent.workspace import Workspace
-from myclaw.config.agent_home import AgentHome
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import STABLE_ERROR_CODES, ErrorCode
 from myclaw.provider.models import ModelUsage
 from myclaw.runtime_log import log_sanitized_exception
@@ -53,6 +53,7 @@ class SessionStore(Protocol):
 
     async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]: ...
 
+
 _TOOL_MESSAGE_FIELDS = frozenset(
     {
         "record_type",
@@ -88,14 +89,13 @@ class JsonlSessionStore:
     def __init__(
         self,
         *,
-        agent_home: AgentHome,
-        workspace: Workspace,
+        workspace_state: WorkspaceState,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
         replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
     ) -> None:
-        self.agent_home = agent_home
-        self.workspace = workspace
+        self.workspace_state = workspace_state
+        self.workspace = workspace_state.workspace
         self._now = now
         self._new_uuid = new_uuid
         self._replace_bytes = replace_bytes
@@ -104,7 +104,7 @@ class JsonlSessionStore:
 
     @property
     def directory(self) -> Path:
-        return self.agent_home.path / "sessions" / self.workspace.slug
+        return self.workspace_state.sessions_directory
 
     def path_for(self, session_id: str) -> Path:
         require_session_id(session_id)
@@ -260,12 +260,9 @@ class JsonlSessionStore:
         old_cursor: int,
         new_cursor: int,
     ) -> None:
-        """Idempotently advance a journaled Session cursor anywhere in Agent Home."""
+        """Idempotently advance a journaled Session cursor in this Workspace."""
         require_session_id(session_id)
-        matches = list((self.agent_home.path / "sessions").glob(f"*/{session_id}.jsonl"))
-        if len(matches) != 1:
-            raise ValueError("journal session must resolve to exactly one Session file")
-        path = path_for_io(matches[0])
+        path = path_for_io(self.path_for(session_id))
         async with self._lock_for(session_id):
             records, complete_content = _read_recoverable_records(path)
             metadata = _parse_metadata(records[0])

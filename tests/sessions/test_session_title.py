@@ -8,6 +8,7 @@ import pytest
 
 from myclaw.agent.events import ConversationPort
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
@@ -260,8 +261,7 @@ async def test_first_turn_finishes_while_title_updates_only_session_metadata_lat
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -320,8 +320,7 @@ async def test_close_waits_for_the_detached_title_task_to_stop(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -366,8 +365,7 @@ async def test_cancelling_after_first_user_persistence_does_not_cancel_title_gen
     home.initialize()
     clock = FakeClock(NOW)
     persisted = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -424,8 +422,7 @@ async def test_failed_title_call_uses_normalized_unicode_bounded_input_fallback(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -465,9 +462,7 @@ async def test_failed_title_call_uses_normalized_unicode_bounded_input_fallback(
     assert reloaded.metadata.title == "Plan " + "\u754c" * 55
     assert len(reloaded.metadata.title) == 60
     content = _runtime_log_text(agent_home)
-    records = [
-        line for line in content.splitlines() if "myclaw.session.conversation:" in line
-    ]
+    records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 1
     assert " WARNING " in records[0]
     assert "Session title fallback selected code=model_failed type=ModelCallError" in records[0]
@@ -488,8 +483,7 @@ async def test_terminal_title_metadata_failure_is_logged_without_repeating_provi
     home.initialize()
     clock = FakeClock(NOW)
     store = MetadataUpdateFailingStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -520,9 +514,7 @@ async def test_terminal_title_metadata_failure_is_logged_without_repeating_provi
 
     assert event_types == ["turn_started", "turn_completed"]
     content = _runtime_log_text(agent_home)
-    records = [
-        line for line in content.splitlines() if "myclaw.session.conversation:" in line
-    ]
+    records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 2
     assert " WARNING " in records[0]
     assert "Session title fallback selected code=model_failed type=ModelCallError" in records[0]
@@ -550,8 +542,7 @@ async def test_title_metadata_failure_records_one_error_without_changing_foregro
     home = AgentHome(agent_home)
     home.initialize()
     persisted = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -586,9 +577,7 @@ async def test_title_metadata_failure_records_one_error_without_changing_foregro
 
     assert event_types == ["turn_started", "text_delta", "turn_completed"]
     content = _runtime_log_text(agent_home)
-    records = [
-        line for line in content.splitlines() if "myclaw.session.conversation:" in line
-    ]
+    records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 1
     assert " ERROR " in records[0]
     assert (
@@ -609,8 +598,7 @@ async def test_title_stream_cleanup_failure_warns_and_keeps_the_generated_title(
     home = AgentHome(agent_home)
     home.initialize()
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: NOW,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -663,8 +651,7 @@ async def test_metadata_update_atomically_adds_auxiliary_model_usage(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -717,8 +704,7 @@ async def test_title_completion_with_tool_calls_uses_fallback_but_counts_usage(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -760,9 +746,7 @@ async def test_title_completion_with_tool_calls_uses_fallback_but_counts_usage(
     )
     assert [message.role for message in reloaded.messages] == ["user", "assistant"]
     content = _runtime_log_text(agent_home)
-    records = [
-        line for line in content.splitlines() if "myclaw.session.conversation:" in line
-    ]
+    records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 1
     assert " WARNING " in records[0]
     assert "Session title fallback selected code=model_failed" in records[0]
@@ -781,8 +765,7 @@ async def test_empty_title_and_empty_normalized_input_keep_untitled_with_usage(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -825,9 +808,7 @@ async def test_empty_title_and_empty_normalized_input_keep_untitled_with_usage(
     )
     assert [message.role for message in reloaded.messages] == ["user", "assistant"]
     content = _runtime_log_text(agent_home)
-    records = [
-        line for line in content.splitlines() if "myclaw.session.conversation:" in line
-    ]
+    records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 1
     assert " WARNING " in records[0]
     assert "Session title fallback selected code=model_failed" in records[0]
@@ -844,8 +825,7 @@ async def test_late_titles_update_the_session_that_started_each_call(
     home.initialize()
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID, SESSION_TWO_UUID)).__next__,
     )

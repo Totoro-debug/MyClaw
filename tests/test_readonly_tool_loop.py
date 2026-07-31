@@ -1,4 +1,3 @@
-import os
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +8,7 @@ import pytest
 from myclaw.agent.events import validate_agent_event_sequence
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
@@ -64,10 +64,11 @@ def _file_gateway(
     session_id: str,
 ) -> ToolGateway:
     workspace_identity = Workspace.from_path(workspace)
+    workspace_state = WorkspaceState(workspace_identity)
     security = Security(
         workspace=workspace_identity,
         agent_home=home.path,
-        artifact_directory=(home.path / "sessions" / workspace_identity.slug / "artifacts" / session_id),
+        artifact_directory=workspace_state.sessions_directory / "artifacts" / session_id,
     )
     gateway = ToolGateway()
     gateway.register_tools(
@@ -91,8 +92,7 @@ def _prepared_tool_conversation(
     conversation_uuids: tuple[UUID, ...],
 ) -> tuple[StreamingConversationPort, JsonlSessionStore, str]:
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -127,8 +127,7 @@ async def test_list_files_tool_result_continues_the_model_loop_with_linked_histo
     (workspace / "zeta.txt").write_text("zeta\n", encoding="utf-8")
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -264,8 +263,7 @@ async def test_read_file_returns_the_requested_utf8_line_window_to_the_model(
     (workspace / "notes.txt").write_bytes("zero\r\none\r\n\u4e8c\r\nthree\r\n".encode("utf-8"))
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -370,8 +368,7 @@ async def test_search_files_returns_stably_ordered_path_line_previews(
     (workspace / "binary.txt").write_bytes(b"needle\x00private")
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -570,8 +567,7 @@ async def test_read_file_normalizes_binary_content_as_an_error_before_continuing
     (workspace / "binary.dat").write_bytes(b"prefix\x00private-payload")
     clock = FakeClock(NOW)
     store = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -790,7 +786,7 @@ async def test_multiple_calls_and_tool_rounds_persist_in_order_before_one_final_
 
 
 @pytest.mark.asyncio
-async def test_read_file_denies_a_symlink_that_resolves_outside_workspace(
+async def test_read_file_denies_a_junction_that_resolves_outside_workspace(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -800,20 +796,12 @@ async def test_read_file_denies_a_symlink_that_resolves_outside_workspace(
     outside.mkdir()
     (outside / "secret.txt").write_text("symlink-secret", encoding="utf-8")
     link = workspace / "escape"
-    try:
-        link.symlink_to(outside, target_is_directory=True)
-    except OSError as error:
-        if os.name != "nt":
-            pytest.skip(f"directory symlinks are unavailable on this host: {error}")
-        try:
-            subprocess.run(
-                ("cmd", "/c", "mklink", "/J", str(link), str(outside)),
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except (OSError, subprocess.CalledProcessError) as junction_error:
-            pytest.skip(f"directory links are unavailable on this host: {junction_error}")
+    subprocess.run(
+        ("cmd", "/c", "mklink", "/J", str(link), str(outside)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     tool_call = ModelToolCall(
         id="call_symlink",
         name="read_file",

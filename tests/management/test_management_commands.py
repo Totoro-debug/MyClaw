@@ -6,6 +6,7 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import (
@@ -14,6 +15,7 @@ from myclaw.management.service import (
     RuntimeStatusInput,
     RuntimeStatusService,
 )
+from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.provider.models import ModelUsage
 from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.records import (
@@ -293,14 +295,21 @@ async def test_config_command_generates_and_displays_missing_configuration(
 
 
 @pytest.mark.asyncio
-async def test_memory_command_returns_renderable_complete_disk_text(agent_home: Path) -> None:
+async def test_memory_command_returns_renderable_complete_disk_text(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     content = "# Long-term Memory\n\n## Lesson\n\u5b8c\u6574\u5185\u5bb9\n" + (
         "memory-line\n" * 8_000
     )
-    (agent_home / "memory" / "memory.md").write_text(content, encoding="utf-8")
-    dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    state.long_term_memory_path.write_text(content, encoding="utf-8")
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
+    )
 
     result = await dispatcher.dispatch("/memory")
 
@@ -309,11 +318,18 @@ async def test_memory_command_returns_renderable_complete_disk_text(agent_home: 
 
 
 @pytest.mark.asyncio
-async def test_memory_command_renders_safe_persistence_failure(agent_home: Path) -> None:
+async def test_memory_command_renders_safe_persistence_failure(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "memory" / "memory.md").unlink()
-    dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    state.long_term_memory_path.unlink()
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
+    )
     runtime_log = install_runtime_logging(home)
 
     try:
@@ -381,8 +397,7 @@ async def test_status_command_renders_actual_runtime_and_session_state(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: STATUS_CREATED_AT,
         new_uuid=iter((STATUS_SESSION_UUID,)).__next__,
     )
@@ -466,12 +481,17 @@ async def test_unknown_or_inexact_slash_command_is_left_unhandled(
 @pytest.mark.asyncio
 async def test_config_and_memory_commands_bypass_conversation_and_provider(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(CONFIG_CONTENT, encoding="utf-8")
-    (agent_home / "memory" / "memory.md").write_text("current memory\n", encoding="utf-8")
-    dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    state.long_term_memory_path.write_text("current memory\n", encoding="utf-8")
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
+    )
     conversation = ConversationProviderSpy()
 
     async def dispatch_or_converse(text: str) -> bool:

@@ -5,6 +5,7 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.management.service import (
     ManagementError,
@@ -14,6 +15,7 @@ from myclaw.management.service import (
     RuntimeStatusInput,
     RuntimeStatusService,
 )
+from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.session.records import CumulativeUsage
 from myclaw.session.session_store import JsonlSessionStore
 
@@ -105,12 +107,15 @@ async def test_config_view_converts_decode_failure_to_safe_persistence_error(
 @pytest.mark.asyncio
 async def test_memory_view_reads_complete_latest_utf8_content_on_every_call(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    memory_path = agent_home / "memory" / "memory.md"
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    memory_path = state.long_term_memory_path
     memory_path.write_text("initial memory\n", encoding="utf-8")
-    service = ManagementViewService(home)
+    service = ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
 
     initial = await service.memory_view()
     updated_content = "# Long-term Memory\n\n\u7528\u6237\u504f\u597d\n" + (
@@ -126,13 +131,18 @@ async def test_memory_view_reads_complete_latest_utf8_content_on_every_call(
 @pytest.mark.asyncio
 async def test_memory_view_converts_decode_failure_to_safe_persistence_error(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "memory" / "memory.md").write_bytes(b"raw-secret\xff")
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    state.long_term_memory_path.write_bytes(b"raw-secret\xff")
 
     with pytest.raises(ManagementError) as raised:
-        await ManagementViewService(home).memory_view()
+        await ManagementViewService(
+            home, memory_store=WorkspaceFileMemoryStore(state)
+        ).memory_view()
 
     assert (raised.value.error.code, raised.value.error.message) == (
         "persistence_error",
@@ -145,13 +155,18 @@ async def test_memory_view_converts_decode_failure_to_safe_persistence_error(
 @pytest.mark.asyncio
 async def test_memory_view_converts_read_failure_to_safe_persistence_error(
     agent_home: Path,
+    workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "memory" / "memory.md").unlink()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    state.long_term_memory_path.unlink()
 
     with pytest.raises(ManagementError) as raised:
-        await ManagementViewService(home).memory_view()
+        await ManagementViewService(
+            home, memory_store=WorkspaceFileMemoryStore(state)
+        ).memory_view()
 
     assert (raised.value.error.code, raised.value.error.message) == (
         "persistence_error",
@@ -167,8 +182,7 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
     home = AgentHome(agent_home)
     home.initialize()
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=lambda: CREATED_AT,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )

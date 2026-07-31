@@ -1,5 +1,4 @@
 import asyncio
-import os
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,6 +14,7 @@ from myclaw.agent.events import (
     validate_agent_event_sequence,
 )
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
@@ -41,6 +41,7 @@ from myclaw.tools.base import BaseTool
 from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.utils.atomic_files import path_for_io
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -74,29 +75,27 @@ def _gateway(*tools: BaseTool) -> ToolGateway:
 
 
 def _io_path(path: Path) -> Path:
-    if os.name != "nt":
-        return path
-    native = str(path.absolute())
-    if native.startswith("\\\\"):
-        return Path(f"\\\\?\\UNC\\{native.lstrip('\\')}")
-    return Path(f"\\\\?\\{native}")
+    return path_for_io(path)
 
 
-def _externalizer(
-    *, agent_home: Path, workspace: Path, session_id: str
-) -> Callable[[ToolResult], ToolResult]:
-    workspace_identity = Workspace.from_path(workspace)
+def _externalizer(*, workspace: Path, session_id: str) -> Callable[[ToolResult], ToolResult]:
+    workspace_state = WorkspaceState(Workspace.from_path(workspace))
+    workspace_state.initialize(agent_home_root=Path.home() / ".myclaw")
 
     def externalize(result: ToolResult) -> ToolResult:
         return externalize_tool_result(
             result,
-            agent_home=agent_home,
-            workspace=workspace_identity,
+            workspace_state=workspace_state,
             session_id=session_id,
             max_tool_result_chars=1,
         )
 
     return externalize
+
+
+def _artifact_path(*, workspace: Path, session_id: str, filename: str) -> Path:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    return state.sessions_directory / "artifacts" / session_id / filename
 
 
 class InitialAppendFailingStore(JsonlSessionStore):
@@ -184,7 +183,6 @@ class ToolAppendFailingStore(JsonlSessionStore):
         if self._append_count == 3:
             assert isinstance(message, ToolSessionMessage)
             assert message.artifact is not None
-            assert _io_path(self.directory / message.artifact.path).exists()
             raise OSError("private-tool-result-publication-detail")
         await super().append_message(session_id, message)
 
@@ -468,8 +466,7 @@ async def test_initial_session_publication_failure_is_one_safe_terminal_event(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = InitialAppendFailingStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -529,8 +526,7 @@ async def test_closing_conversation_stream_closes_provider_iterator_immediately(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -572,8 +568,7 @@ async def test_foreground_stream_cleanup_failure_is_logged_as_an_independent_err
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -623,8 +618,7 @@ async def test_title_generation_closes_provider_iterator_after_completion(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -667,8 +661,7 @@ async def test_closing_conversation_stream_persists_streamed_text_as_interrupted
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -713,8 +706,7 @@ async def test_same_task_cancellation_after_turn_start_stops_before_provider(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -768,8 +760,7 @@ async def test_external_cancellation_during_initial_publication_is_one_terminal_
     home.initialize()
     clock = FakeClock(NOW)
     sessions = BlockingInitialAppendStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -841,8 +832,7 @@ async def test_tool_stage_cancellation_survives_persistent_repair_failure(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = store_type(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -951,8 +941,7 @@ async def test_corrupt_session_before_model_call_is_a_safe_persistence_terminal(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = LoadFailingStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1010,8 +999,7 @@ async def test_model_error_publication_failure_reports_only_persistence_error(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = AssistantAppendFailingStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1079,8 +1067,7 @@ async def test_cancellation_during_model_error_publication_is_one_terminal_event
     home.initialize()
     clock = FakeClock(NOW)
     sessions = BlockingModelErrorAppendStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1133,8 +1120,7 @@ async def test_cancellation_after_durable_model_error_does_not_duplicate_partial
     home.initialize()
     clock = FakeClock(NOW)
     sessions = ModelErrorAppendThenBlockingStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1201,8 +1187,7 @@ async def test_foreground_model_failure_is_logged_once_without_private_content(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1242,16 +1227,12 @@ async def test_foreground_model_failure_is_logged_once_without_private_content(
     lifetime.add_api_keys((private_values[6],))
 
     with lifetime.session(session.id):
-        events = [
-            event async for event in conversation.submit(private_values[0])
-        ]
+        events = [event async for event in conversation.submit(private_values[0])]
     lifetime.close()
 
     assert [event.type for event in events] == ["turn_started", "turn_failed"]
     content = _runtime_log_text(agent_home)
-    records = [
-        line for line in content.splitlines() if "myclaw.agent.turn:" in line
-    ]
+    records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
     assert len(records) == 1
     assert " ERROR " in records[0]
     assert f"session={session.id}" in records[0]
@@ -1271,8 +1252,7 @@ async def test_unexpected_provider_stream_failure_is_normalized_without_secret_t
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1324,8 +1304,7 @@ async def test_unsupported_provider_stream_event_is_a_safe_model_failure(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1374,8 +1353,7 @@ async def test_empty_completed_provider_response_is_a_model_failure_not_disk_fai
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1439,8 +1417,7 @@ async def test_assistant_publication_failure_never_reports_turn_completed(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = AssistantAppendFailingStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1511,8 +1488,7 @@ async def test_durable_assistant_publication_error_repairs_its_tool_call(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = AssistantAppendThenFailingStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1584,8 +1560,7 @@ async def test_cancellation_after_durable_assistant_does_not_duplicate_streamed_
     home.initialize()
     clock = FakeClock(NOW)
     sessions = AssistantAppendThenBlockingStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1701,8 +1676,7 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
     home.initialize()
     clock = FakeClock(NOW)
     sessions = store_type(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1761,7 +1735,6 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
         ).__next__,
         tool_gateway=_gateway(tool),
         externalize_result=_externalizer(
-            agent_home=agent_home,
             workspace=workspace,
             session_id=session.id,
         ),
@@ -1788,8 +1761,10 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
     assert "private-raw-tool-result" not in rendered
     assert "private-tool-result-publication-detail" not in rendered
     assert "private-persistent-tool-publication-detail" not in rendered
-    artifact_path = (
-        sessions.path_for(session.id).parent / "artifacts" / session.id / "call_sensitive.txt"
+    artifact_path = _artifact_path(
+        workspace=workspace,
+        session_id=session.id,
+        filename="call_sensitive.txt",
     )
     assert _io_path(artifact_path).exists() is artifact_persisted
     persisted = await sessions.load(session.id)
@@ -1836,8 +1811,7 @@ async def test_repair_publication_fault_does_not_duplicate_or_drop_tool_message(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = store_type(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1920,8 +1894,7 @@ async def test_cancellation_during_tool_reconciliation_is_safely_terminal(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = ToolAppendWithBlockingReconcileStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -1968,7 +1941,6 @@ async def test_cancellation_during_tool_reconciliation_is_safely_terminal(
         ).__next__,
         tool_gateway=_gateway(tool),
         externalize_result=_externalizer(
-            agent_home=agent_home,
             workspace=workspace,
             session_id=session.id,
         ),
@@ -1994,11 +1966,10 @@ async def test_cancellation_during_tool_reconciliation_is_safely_terminal(
         tool_call.id,
         "Tool call interrupted because the turn was cancelled.",
     )
-    artifact_path = (
-        sessions.path_for(session.id).parent
-        / "artifacts"
-        / session.id
-        / "call_cancel_reconcile.txt"
+    artifact_path = _artifact_path(
+        workspace=workspace,
+        session_id=session.id,
+        filename="call_cancel_reconcile.txt",
     )
     assert _io_path(artifact_path).exists()
     validate_agent_event_sequence(events)
@@ -2013,8 +1984,7 @@ async def test_cancellation_while_closing_tool_round_stops_before_next_provider_
     home.initialize()
     clock = FakeClock(NOW)
     sessions = JsonlSessionStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -2079,8 +2049,7 @@ async def test_cancellation_after_durable_tool_result_keeps_one_message_and_arti
     home.initialize()
     clock = FakeClock(NOW)
     sessions = ToolAppendThenBlockingStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -2127,7 +2096,6 @@ async def test_cancellation_after_durable_tool_result_keeps_one_message_and_arti
         ).__next__,
         tool_gateway=_gateway(tool),
         externalize_result=_externalizer(
-            agent_home=agent_home,
             workspace=workspace,
             session_id=session.id,
         ),
@@ -2153,8 +2121,10 @@ async def test_cancellation_after_durable_tool_result_keeps_one_message_and_arti
     assert [(message.tool_call_id, message.status) for message in tool_messages] == [
         (tool_call.id, "success")
     ]
-    artifact_path = (
-        sessions.path_for(session.id).parent / "artifacts" / session.id / "call_durable_cancel.txt"
+    artifact_path = _artifact_path(
+        workspace=workspace,
+        session_id=session.id,
+        filename="call_durable_cancel.txt",
     )
     assert _io_path(artifact_path).exists()
     validate_agent_event_sequence(events)
@@ -2169,8 +2139,7 @@ async def test_cancellation_after_durable_repair_does_not_duplicate_tool_message
     home.initialize()
     clock = FakeClock(NOW)
     sessions = RepairAppendThenBlockingStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -2261,8 +2230,7 @@ async def test_cancellation_retries_a_transient_second_tool_repair_failure(
     home.initialize()
     clock = FakeClock(NOW)
     sessions = SecondCancellationRepairAppendFailingOnceStore(
-        agent_home=home,
-        workspace=Workspace.from_path(workspace),
+        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
         now=clock.now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )

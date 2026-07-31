@@ -2,7 +2,6 @@
 
 import asyncio
 import ctypes
-import sys
 from ctypes import wintypes
 from typing import Final
 
@@ -63,15 +62,11 @@ class _JobBasicAccountingInformation(ctypes.Structure):
 
 
 def _windows_kernel32() -> ctypes.CDLL:
-    if sys.platform == "win32":
-        return ctypes.WinDLL("kernel32", use_last_error=True)
-    raise OSError("Windows Job Objects are unavailable on this platform")
+    return ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 def _windows_last_error() -> int:
-    if sys.platform == "win32":
-        return ctypes.get_last_error()
-    raise OSError("Windows error state is unavailable on this platform")
+    return ctypes.get_last_error()
 
 
 def _windows_error(operation: str) -> OSError:
