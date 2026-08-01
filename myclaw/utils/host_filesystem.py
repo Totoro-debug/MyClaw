@@ -49,6 +49,12 @@ class FilesystemAdapter(Protocol):
 
     def sync_parent_directory(self, path: Path) -> None: ...
 
+    def restrict_private_directory(self, path: Path) -> None: ...
+
+    def restrict_private_file(self, path: Path) -> None: ...
+
+    def restrict_private_descriptor(self, descriptor: int) -> None: ...
+
 
 class WindowsFilesystemAdapter:
     """Windows native path behavior."""
@@ -62,7 +68,7 @@ class WindowsFilesystemAdapter:
         return Path(f"\\\\?\\{native}")
 
     def is_directory(self, status: stat_result) -> bool:
-        attributes = status.st_file_attributes
+        attributes = getattr(status, "st_file_attributes", 0)
         return bool(attributes & FILE_ATTRIBUTE_DIRECTORY) and not bool(
             attributes & FILE_ATTRIBUTE_REPARSE_POINT
         )
@@ -71,7 +77,7 @@ class WindowsFilesystemAdapter:
         non_regular = (
             FILE_ATTRIBUTE_DEVICE | FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT
         )
-        return not bool(status.st_file_attributes & non_regular)
+        return not bool(getattr(status, "st_file_attributes", 0) & non_regular)
 
     def resolved_for_comparison(self, path: Path) -> Path:
         resolved = path.resolve(strict=True)
@@ -97,6 +103,15 @@ class WindowsFilesystemAdapter:
 
     def sync_parent_directory(self, path: Path) -> None:
         del path
+
+    def restrict_private_directory(self, path: Path) -> None:
+        del path
+
+    def restrict_private_file(self, path: Path) -> None:
+        del path
+
+    def restrict_private_descriptor(self, descriptor: int) -> None:
+        del descriptor
 
 
 class PosixFilesystemAdapter:
@@ -151,6 +166,18 @@ class PosixFilesystemAdapter:
             except OSError:
                 pass
 
+    def restrict_private_directory(self, path: Path) -> None:
+        path.chmod(0o700)
+
+    def restrict_private_file(self, path: Path) -> None:
+        path.chmod(0o600)
+
+    def restrict_private_descriptor(self, descriptor: int) -> None:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is None:
+            raise OSError("descriptor permission changes are unavailable")
+        fchmod(descriptor, 0o600)
+
 
 class HostFilesystem:
     """Deep boundary for native persistent filesystem behavior."""
@@ -177,6 +204,22 @@ class HostFilesystem:
     def has_alternate_data_stream(self, component: str) -> bool:
         """Return whether a component uses native alternate-stream syntax."""
         return self._adapter.has_alternate_data_stream(component)
+
+    def sync_file(self, descriptor: int) -> None:
+        """Synchronize file content with host-appropriate compatibility behavior."""
+        self._adapter.sync_file(descriptor)
+
+    def restrict_private_directory(self, path: Path) -> None:
+        """Narrow a private directory to host-appropriate owner access."""
+        self._adapter.restrict_private_directory(path)
+
+    def restrict_private_file(self, path: Path) -> None:
+        """Narrow a private file to host-appropriate owner access."""
+        self._adapter.restrict_private_file(path)
+
+    def restrict_private_descriptor(self, descriptor: int) -> None:
+        """Narrow an opened private file to host-appropriate owner access."""
+        self._adapter.restrict_private_descriptor(descriptor)
 
     def require_owned_directory(self, path: Path, *, within: Path) -> Path:
         """Return an ordinary contained directory or reject an unsafe path."""

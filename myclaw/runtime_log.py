@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import errno
 import logging
-import msvcrt
 import os
 import queue
 import re
@@ -18,9 +16,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, Final, Protocol
+from typing import BinaryIO, Final
 
 from myclaw.config.agent_home import AgentHome
+from myclaw.runtime_log_lock import PLATFORM_RUNTIME_LOG_LOCK, RuntimeLogLock
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM, UnsafeFilesystemPath
 
 _LOGGER_NAME: Final = "myclaw"
@@ -63,31 +62,6 @@ def log_sanitized_exception(
     )
 
 
-class _LockSystem(Protocol):
-    def try_acquire(self, descriptor: int) -> bool: ...
-
-    def release(self, descriptor: int) -> None: ...
-
-
-class _WindowsLockSystem:
-    def try_acquire(self, descriptor: int) -> bool:
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        try:
-            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-        except OSError as error:
-            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
-                return False
-            raise
-        return True
-
-    def release(self, descriptor: int) -> None:
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-
-
-_WINDOWS_LOCK_SYSTEM: Final = _WindowsLockSystem()
-
-
 @dataclass(frozen=True, slots=True)
 class _PendingRecord:
     record: logging.LogRecord
@@ -128,7 +102,7 @@ class RuntimeLogLifetime:
         agent_home: AgentHome,
         *,
         replace_bytes: AtomicReplaceBytes = HOST_FILESYSTEM.atomic_replace_bytes,
-        lock_system: _LockSystem = _WINDOWS_LOCK_SYSTEM,
+        lock_system: RuntimeLogLock = PLATFORM_RUNTIME_LOG_LOCK,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -261,12 +235,14 @@ class RuntimeLogLifetime:
         logs = agent_home / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         _validate_log_directory(logs, agent_home_root)
+        HOST_FILESYSTEM.restrict_private_directory(logs)
         lock_path = logs / "run.log.lock"
         if lock_path.exists() or lock_path.is_symlink():
             _validate_log_file(lock_path, agent_home_root)
         else:
             _create_lock_file(lock_path)
         _validate_log_file(lock_path, agent_home_root)
+        HOST_FILESYSTEM.restrict_private_file(lock_path)
         lock_stream = lock_path.open("r+b", buffering=0)
         try:
             _validate_opened_log_file(lock_stream, lock_path, agent_home_root)
@@ -307,6 +283,7 @@ class RuntimeLogLifetime:
             if not slot.exists() and not slot.is_symlink():
                 HOST_FILESYSTEM.atomic_create_bytes(slot, b"")
             _validate_log_file(slot, agent_home_root)
+            HOST_FILESYSTEM.restrict_private_file(slot)
             self._append_unlocked(slot, encoded)
         except Exception as fallback_error:
             raise fallback_error from lock_error
@@ -319,7 +296,7 @@ class RuntimeLogLifetime:
             if written != len(encoded):
                 raise OSError("Runtime Log append did not write the complete record")
             stream.flush()
-            _fsync_file(stream.fileno())
+            HOST_FILESYSTEM.sync_file(stream.fileno())
 
     def _encode(self, pending: _PendingRecord) -> bytes:
         record = pending.record
@@ -346,7 +323,7 @@ class RuntimeLogLifetime:
             if written != len(encoded):
                 raise OSError("Runtime Log append did not write the complete record")
             stream.flush()
-            _fsync_file(stream.fileno())
+            HOST_FILESYSTEM.sync_file(stream.fileno())
             slot_size = os.fstat(stream.fileno()).st_size
         if slot_size >= _SLOT_TARGET_BYTES:
             active_slot = int(slot.name.rsplit(".", 1)[1])
@@ -359,6 +336,7 @@ class RuntimeLogLifetime:
         logs = agent_home / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         _validate_log_directory(logs, agent_home_root)
+        HOST_FILESYSTEM.restrict_private_directory(logs)
         slot_existed = any(
             (logs / name).exists() or (logs / name).is_symlink()
             for name in ("run.log.0", "run.log.1")
@@ -374,6 +352,7 @@ class RuntimeLogLifetime:
             else:
                 HOST_FILESYSTEM.atomic_create_bytes(path, content)
             _validate_log_file(path, agent_home_root)
+            HOST_FILESYSTEM.restrict_private_file(path)
         cursor_path = logs / "run.log.cursor"
         cursor_recovered = False
         if cursor_path.exists() or cursor_path.is_symlink():
@@ -384,6 +363,7 @@ class RuntimeLogLifetime:
         else:
             HOST_FILESYSTEM.atomic_create_bytes(cursor_path, b"0\n")
         _validate_log_file(cursor_path, agent_home_root)
+        HOST_FILESYSTEM.restrict_private_file(cursor_path)
         cursor = _read_validated_log_file(cursor_path, agent_home_root)
         if cursor not in {b"0\n", b"1\n"}:
             self._replace_bytes(cursor_path, b"0\n")
@@ -432,7 +412,7 @@ def install_runtime_logging(
     agent_home: AgentHome,
     *,
     replace_bytes: AtomicReplaceBytes = HOST_FILESYSTEM.atomic_replace_bytes,
-    lock_system: _LockSystem = _WINDOWS_LOCK_SYSTEM,
+    lock_system: RuntimeLogLock = PLATFORM_RUNTIME_LOG_LOCK,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> RuntimeLogLifetime:
@@ -571,24 +551,17 @@ def _read_validated_log_file(path: Path, agent_home_root: Path) -> bytes:
     _validate_log_file(path, agent_home_root)
     with path.open("rb", buffering=0) as stream:
         _validate_opened_log_file(stream, path, agent_home_root)
+        HOST_FILESYSTEM.restrict_private_descriptor(stream.fileno())
         return stream.read()
 
 
 def _create_lock_file(path: Path) -> None:
-    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_BINARY
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     try:
         descriptor = os.open(path, flags, 0o600)
     except FileExistsError:
         return
     try:
-        _fsync_file(descriptor)
+        HOST_FILESYSTEM.sync_file(descriptor)
     finally:
         os.close(descriptor)
-
-
-def _fsync_file(descriptor: int) -> None:
-    try:
-        os.fsync(descriptor)
-    except OSError as error:
-        if error.errno != errno.EINVAL:
-            raise
