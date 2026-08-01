@@ -150,7 +150,8 @@ class PosixFilesystemAdapter:
         return False
 
     def accepts_native_executable_name(self, path: Path) -> bool:
-        return not path.suffix
+        del path
+        return True
 
     def sync_file(self, descriptor: int) -> None:
         try:

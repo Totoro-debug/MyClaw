@@ -44,7 +44,8 @@ SESSION_UUIDS = (
     ("host_filesystem", "filename", "accepted"),
     (
         (POSIX_HOST_FILESYSTEM, "git", True),
-        (POSIX_HOST_FILESYSTEM, "git.exe", False),
+        (POSIX_HOST_FILESYSTEM, "git.exe", True),
+        (POSIX_HOST_FILESYSTEM, "git.real", True),
         (WINDOWS_HOST_FILESYSTEM, "git.exe", True),
         (WINDOWS_HOST_FILESYSTEM, "git.EXE", True),
         (WINDOWS_HOST_FILESYSTEM, "git", False),
