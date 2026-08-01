@@ -4,7 +4,7 @@ Status: **PASS**
 
 This report records Windows evidence for GitHub issue
 [#69](https://github.com/Totoro-debug/myclaw/issues/69). It applies to the final
-universal-wheel candidate built from the clean tree at commit `2c67775` on
+universal-wheel candidate built from the clean tree at commit `4fd4529` on
 2026-08-02.
 
 Windows x64 is the currently validated environment. macOS Intel and Apple Silicon are
@@ -20,7 +20,7 @@ hosts attempt their selected adapter when a capability is used.
 | PowerShell | `7.6.4` |
 | Build Python | CPython `3.12.13`, 64-bit |
 | Build pip | `26.1.2` |
-| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-final-reviewed-0791068ccb4e49ce9fcfef9be821ab1d` |
+| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-final-chinese-181298d8e1f447a19100f6bc96c44e64` |
 
 No Provider credential is read or used. Application tests and CLI smoke do not contact
 a live Provider.
@@ -35,9 +35,9 @@ python -m build --wheel --outdir <validation-root>\dist
 
 | Artifact | Size | SHA-256 | Embedded tag |
 | --- | ---: | --- | --- |
-| `myclaw-0.1.0-py3-none-any.whl` | 137,653 bytes | `CDD56D4268F191E13F4A4CE6FBB47B7A4BB6ED8EE23D40BFEEBF5F3C03774802` | `py3-none-any` |
+| `myclaw-0.1.0-py3-none-any.whl` | 136,602 bytes | `E269BB51C09EB07C584725DBB8A7A453D46D1E38768DBE7CA1E3A00D54B5ED8E` | `py3-none-any` |
 
-Archive inspection found 74 packaged Python files. The packaged module set matched the
+Archive inspection found 72 packaged Python files. The packaged module set matched the
 source tree and contained the Windows and POSIX filesystem, Runtime Log lock, and owned
 process tree adapters. No compiled extension, native library, or forced platform tag
 was present.
@@ -68,12 +68,12 @@ git diff --check
 
 | Gate | Result |
 | --- | --- |
-| Complete warning-strict offline suite | PASS: `869 passed in 178.00s`; zero skips |
+| Complete warning-strict offline suite | PASS: `869 passed in 143.12s`; zero skips |
 | Ruff lint | PASS: all checks passed |
-| Ruff format | PASS: 166 files already formatted |
-| Strict Mypy | PASS: no issues in 166 source files |
+| Ruff format | PASS: 164 files already formatted |
+| Strict Mypy | PASS: no issues in 164 source files |
 | Diff hygiene | PASS |
-| Universal artifact inspection | PASS: one wheel, 74 Python files, source set matched, zero native entries |
+| Universal artifact inspection | PASS: one wheel, 72 Python files, source set matched, zero native entries |
 | Clean wheel installation and dependency check | PASS |
 | Installed CLI Unicode smoke and isolated import | PASS |
 
