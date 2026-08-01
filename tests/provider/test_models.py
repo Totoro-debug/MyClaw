@@ -11,7 +11,6 @@ from myclaw.provider.models import (
     TextDelta,
     ToolModelMessage,
     UserModelMessage,
-    validate_model_stream_events,
 )
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.schema import OpenAIToolSchema
@@ -177,31 +176,3 @@ def test_model_boundary_rejects_non_uuid4_nonstreaming_chat_and_empty_deltas() -
         request(UUID("550e8400-e29b-41d4-a716-446655440000"), stream=False)
     with pytest.raises(ValueError, match="delta must not be empty"):
         TextDelta(delta="")
-
-
-def test_model_stream_accepts_ordered_deltas_followed_by_one_completed_event() -> None:
-    response = ModelResponse(
-        message=AssistantModelMessage(content="Hello", tool_calls=()),
-        usage=ModelUsage(input_tokens=10, output_tokens=1, total_tokens=11),
-        finish_reason="stop",
-    )
-
-    validate_model_stream_events(
-        (TextDelta(delta="Hel"), TextDelta(delta="lo"), ModelCompleted(response=response))
-    )
-
-
-def test_model_stream_rejects_missing_duplicate_or_nonfinal_completed_events() -> None:
-    response = ModelResponse(
-        message=AssistantModelMessage(content="Hello", tool_calls=()),
-        usage=ModelUsage(input_tokens=10, output_tokens=1, total_tokens=11),
-        finish_reason="stop",
-    )
-    completed = ModelCompleted(response=response)
-
-    with pytest.raises(ValueError, match="exactly one completed"):
-        validate_model_stream_events((TextDelta(delta="Hello"),))
-    with pytest.raises(ValueError, match="exactly one completed"):
-        validate_model_stream_events((completed, completed))
-    with pytest.raises(ValueError, match="completed event must be last"):
-        validate_model_stream_events((completed, TextDelta(delta="late")))

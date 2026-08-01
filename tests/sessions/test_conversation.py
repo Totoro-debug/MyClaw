@@ -13,7 +13,6 @@ from myclaw.agent.events import (
     TurnCancelledPayload,
     TurnCompletedPayload,
     TurnFailedPayload,
-    validate_agent_event_sequence,
 )
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -37,7 +36,12 @@ from myclaw.session.records import (
 )
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import run_repl
-from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures import (
+    FakeClock,
+    ScriptedFakeProvider,
+    StreamScript,
+    validate_agent_event_sequence,
+)
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)

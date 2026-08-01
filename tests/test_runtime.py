@@ -8,11 +8,7 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.runtime import (
-    ProviderAdapterUnavailable,
-    prepare_repl_runtime,
-    unavailable_provider_factory,
-)
+from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -36,7 +32,12 @@ from myclaw.session.records import (
     UserSessionMessage,
 )
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures import (
+    FakeClock,
+    ScriptedFakeProvider,
+    StreamScript,
+    unexpected_provider_factory,
+)
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -110,19 +111,6 @@ class RuntimeLogEmittingProvider(ScriptedFakeProvider):
             "Scheduled Tool Gateway recovery code=tool_failed"
         )
         return await super().complete(request)
-
-
-def test_production_provider_factory_fails_closed_until_adapters_are_installed() -> None:
-    configuration = ProviderConfiguration(
-        provider_id="anthropic-default",
-        protocol="anthropic",
-        base_url="https://api.anthropic.com",
-        api_key="secret",
-        models=("test-model",),
-    )
-
-    with pytest.raises(ProviderAdapterUnavailable, match="not available"):
-        unavailable_provider_factory(configuration)
 
 
 @pytest.mark.asyncio
@@ -494,7 +482,7 @@ async def test_runtime_status_estimate_omits_a_pure_error_assistant(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
-        provider_factory=unavailable_provider_factory,
+        provider_factory=unexpected_provider_factory,
         now=FakeClock(NOW).now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -502,7 +490,7 @@ async def test_runtime_status_estimate_omits_a_pure_error_assistant(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
-        provider_factory=unavailable_provider_factory,
+        provider_factory=unexpected_provider_factory,
         now=FakeClock(NOW).now,
         new_uuid=iter((TURN_TWO_UUID,)).__next__,
     )
@@ -551,7 +539,7 @@ async def test_runtime_status_estimate_includes_the_interrupted_history_marker(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
-        provider_factory=unavailable_provider_factory,
+        provider_factory=unexpected_provider_factory,
         now=FakeClock(NOW).now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
@@ -559,7 +547,7 @@ async def test_runtime_status_estimate_includes_the_interrupted_history_marker(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
-        provider_factory=unavailable_provider_factory,
+        provider_factory=unexpected_provider_factory,
         now=FakeClock(NOW).now,
         new_uuid=iter((TURN_TWO_UUID,)).__next__,
     )
@@ -634,7 +622,7 @@ def test_prepared_repl_rejects_an_unusable_default_even_when_chat_is_usable(
             agent_home=home,
             workspace=workspace,
             configuration=configuration,
-            provider_factory=unavailable_provider_factory,
+            provider_factory=unexpected_provider_factory,
             now=FakeClock(NOW).now,
             new_uuid=iter((SESSION_UUID,)).__next__,
         )

@@ -18,14 +18,6 @@ class ShellBoundary(Protocol):
     async def execute(self, request: ShellRequest) -> str: ...
 
 
-class UnavailableShellBoundary:
-    """Fail closed until the Shell process lifecycle adapter is composed."""
-
-    async def execute(self, request: ShellRequest) -> str:
-        del request
-        raise RuntimeError("Shell process execution is unavailable.")
-
-
 class ShellTool(BaseTool):
     """Expose Shell requests through the Tool protocol."""
 

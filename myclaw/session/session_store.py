@@ -51,8 +51,6 @@ class SessionStore(Protocol):
 
     async def load(self, session_id: str) -> ConversationSession: ...
 
-    async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]: ...
-
 
 _TOOL_MESSAGE_FIELDS = frozenset(
     {
@@ -281,9 +279,6 @@ class JsonlSessionStore:
                 updated.to_json_line().encode("utf-8") + complete_content[first_line_end:],
             )
             self._prepared[session_id] = updated
-
-    async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]:
-        return (await self.scan_for_workspace(workspace)).sessions
 
     async def scan_for_workspace(self, workspace: Path) -> SessionListingReport:
         if Workspace.from_path(workspace) != self.workspace or not self.directory.exists():

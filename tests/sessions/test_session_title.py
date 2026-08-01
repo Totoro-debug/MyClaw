@@ -29,7 +29,6 @@ from myclaw.session.records import (
     CumulativeUsage,
     MetadataUpdate,
     SessionMessage,
-    SessionSummary,
     UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
@@ -217,9 +216,6 @@ class BlockingLoadSessionStore:
         await self.release_load.wait()
         return await self._delegate.load(session_id)
 
-    async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]:
-        return await self._delegate.list_for_workspace(workspace)
-
 
 class MetadataUpdateFailingStore(JsonlSessionStore):
     async def update_metadata(self, session_id: str, update: MetadataUpdate) -> None:
@@ -243,9 +239,6 @@ class FailingMetadataSessionStore:
 
     async def load(self, session_id: str) -> ConversationSession:
         return await self._delegate.load(session_id)
-
-    async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]:
-        return await self._delegate.list_for_workspace(workspace)
 
 
 async def _collect_events(conversation: ConversationPort, text: str) -> list[str]:

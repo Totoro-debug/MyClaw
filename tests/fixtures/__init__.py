@@ -6,7 +6,12 @@ from pathlib import Path
 
 from myclaw.schedule.records import ScheduledWork
 from tests.fixtures.clock import FakeClock
-from tests.fixtures.provider import ScriptedFakeProvider, StreamScript
+from tests.fixtures.events import validate_agent_event_sequence
+from tests.fixtures.provider import (
+    ScriptedFakeProvider,
+    StreamScript,
+    unexpected_provider_factory,
+)
 from tests.fixtures.tool import FakeTool, FakeToolCall
 
 
@@ -29,4 +34,6 @@ __all__ = [
     "ScriptedFakeProvider",
     "StreamScript",
     "persist_scheduled_work",
+    "unexpected_provider_factory",
+    "validate_agent_event_sequence",
 ]

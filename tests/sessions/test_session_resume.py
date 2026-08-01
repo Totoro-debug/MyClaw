@@ -9,7 +9,7 @@ import pytest
 
 from myclaw.agent.events import AgentEvent
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import prepare_repl_runtime, unavailable_provider_factory
+from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -32,14 +32,18 @@ from myclaw.session.records import (
     AssistantSessionMessage,
     ConversationSession,
     MetadataUpdate,
-    SessionSummary,
     UserSessionMessage,
 )
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore, SessionListingReport
 from myclaw.utils.atomic_files import path_for_io
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures import (
+    FakeClock,
+    ScriptedFakeProvider,
+    StreamScript,
+    unexpected_provider_factory,
+)
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -120,7 +124,7 @@ async def test_session_picker_lists_only_current_workspace_with_stable_summaries
         ),
     )
 
-    summaries = await sessions.list_for_workspace(workspace)
+    summaries = (await sessions.scan_for_workspace(workspace)).sessions
 
     assert [summary.to_dict() for summary in summaries] == [
         {
@@ -190,7 +194,7 @@ async def test_session_picker_skips_corrupt_sessions_without_modifying_them(
         path: path.read_bytes() for path in (metadata_path, middle_path, tail_path)
     }
 
-    summaries = await sessions.list_for_workspace(workspace)
+    summaries = (await sessions.scan_for_workspace(workspace)).sessions
 
     assert [(summary.id, summary.title) for summary in summaries] == [
         (prepared[0].id, "Valid title")
@@ -549,9 +553,6 @@ class CoordinatedListingStore:
     async def load(self, session_id: str) -> ConversationSession:
         return await self._delegate.load(session_id)
 
-    async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]:
-        return await self._delegate.list_for_workspace(workspace)
-
     async def scan_for_workspace(self, workspace: Path) -> SessionListingReport:
         listing = await self._delegate.scan_for_workspace(workspace)
         if Workspace.from_path(workspace) == self._delegate.workspace:
@@ -829,7 +830,7 @@ async def test_picker_rejects_unsupported_metadata_and_message_record_types(
         path: path.read_bytes() for path in (unsupported_metadata_path, wrong_message_path)
     }
 
-    summaries = await sessions.list_for_workspace(workspace)
+    summaries = (await sessions.scan_for_workspace(workspace)).sessions
 
     assert [summary.id for summary in summaries] == [prepared[0].id]
     assert {path: path.read_bytes() for path in corrupt_snapshots} == corrupt_snapshots
@@ -959,7 +960,7 @@ async def test_management_resume_revalidates_workspace_and_keeps_current_session
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
-        provider_factory=unavailable_provider_factory,
+        provider_factory=unexpected_provider_factory,
         now=lambda: NOW,
         new_uuid=iter((NEWER_SESSION_UUID,)).__next__,
     )
@@ -1049,7 +1050,7 @@ async def test_resuming_from_a_nonempty_session_preserves_its_complete_history(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
-        provider_factory=unavailable_provider_factory,
+        provider_factory=unexpected_provider_factory,
         now=lambda: NOW,
         new_uuid=iter((NEWER_SESSION_UUID,)).__next__,
     )

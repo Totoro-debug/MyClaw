@@ -1,9 +1,8 @@
 """Typed Agent Events emitted through the Conversation Port."""
 
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
-from itertools import pairwise
 from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -208,44 +207,3 @@ class ConversationPort(Protocol):
     def submit(self, text: str) -> AsyncIterator[AgentEvent]: ...
 
     async def cancel_active_turn(self) -> None: ...
-
-
-def validate_agent_event_sequence(events: Iterable[AgentEvent]) -> None:
-    """Validate one foreground turn's observable event sequence."""
-    observed = tuple(events)
-    for previous, current in pairwise(observed):
-        if current.event_id <= previous.event_id:
-            msg = "event_id values must be strictly increasing"
-            raise ValueError(msg)
-
-    terminal_types = {"turn_completed", "turn_failed", "turn_cancelled"}
-    foreground_active = False
-    for event in observed:
-        if event.type == "background_completed":
-            if foreground_active:
-                msg = "background_completed cannot interleave with an active foreground turn"
-                raise ValueError(msg)
-        elif event.type == "turn_started":
-            foreground_active = True
-        elif event.type in terminal_types:
-            foreground_active = False
-
-    foreground = tuple(event for event in observed if event.type != "background_completed")
-    if not foreground:
-        return
-    if any(event.turn_id != foreground[0].turn_id for event in foreground[1:]):
-        msg = "foreground events must use the same turn_id"
-        raise ValueError(msg)
-    if foreground[0].type != "turn_started":
-        msg = "foreground sequence must begin with turn_started"
-        raise ValueError(msg)
-
-    terminal_indexes = [
-        index for index, event in enumerate(foreground) if event.type in terminal_types
-    ]
-    if len(terminal_indexes) != 1:
-        msg = "foreground sequence must contain exactly one terminal event"
-        raise ValueError(msg)
-    if terminal_indexes[0] != len(foreground) - 1:
-        msg = "terminal event must be last in its foreground turn"
-        raise ValueError(msg)

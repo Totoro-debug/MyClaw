@@ -8,7 +8,6 @@ import pytest
 from myclaw.agent.events import (
     ToolCompletedPayload,
     ToolStartedPayload,
-    validate_agent_event_sequence,
 )
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -30,7 +29,13 @@ from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.base import BaseTool
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
-from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
+from tests.fixtures import (
+    FakeClock,
+    FakeTool,
+    ScriptedFakeProvider,
+    StreamScript,
+    validate_agent_event_sequence,
+)
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)

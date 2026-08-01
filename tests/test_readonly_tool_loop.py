@@ -5,7 +5,6 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.events import validate_agent_event_sequence
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -38,7 +37,12 @@ from myclaw.tools.models import (
 from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures import (
+    FakeClock,
+    ScriptedFakeProvider,
+    StreamScript,
+    validate_agent_event_sequence,
+)
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)

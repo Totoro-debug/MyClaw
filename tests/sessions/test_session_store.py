@@ -166,7 +166,7 @@ async def test_legacy_agent_home_session_is_never_listed_or_loaded(
     legacy_io_path.write_text(metadata.to_json_line() + message.to_json_line(), encoding="utf-8")
     legacy_bytes = legacy_io_path.read_bytes()
 
-    assert await store.list_for_workspace(workspace) == ()
+    assert (await store.scan_for_workspace(workspace)).sessions == ()
     with pytest.raises(OSError):
         await store.load(metadata.id)
     assert legacy_io_path.read_bytes() == legacy_bytes

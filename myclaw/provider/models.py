@@ -1,6 +1,6 @@
 """Provider-neutral model request and response values."""
 
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import ClassVar, Literal, Protocol, runtime_checkable
 from uuid import UUID
@@ -184,17 +184,3 @@ class ModelProvider(Protocol):
     async def complete(self, request: ModelRequest) -> ModelResponse: ...
 
     async def close(self) -> None: ...
-
-
-def validate_model_stream_events(events: Iterable[ModelStreamEvent]) -> None:
-    """Validate one successful provider-neutral streaming transcript."""
-    observed = tuple(events)
-    completed_indexes = [
-        index for index, event in enumerate(observed) if isinstance(event, ModelCompleted)
-    ]
-    if len(completed_indexes) != 1:
-        msg = "successful model stream must contain exactly one completed event"
-        raise ValueError(msg)
-    if completed_indexes[0] != len(observed) - 1:
-        msg = "completed event must be last in a successful model stream"
-        raise ValueError(msg)

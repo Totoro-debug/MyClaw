@@ -107,17 +107,6 @@ class ProviderFactory(Protocol):
     def __call__(self, configuration: ProviderConfiguration) -> ModelProvider: ...
 
 
-class ProviderAdapterUnavailable(RuntimeError):
-    """Raised when production composition has no installed adapter for a provider."""
-
-
-def unavailable_provider_factory(configuration: ProviderConfiguration) -> ModelProvider:
-    """Fail closed until a production Provider Adapter owns this boundary."""
-    raise ProviderAdapterUnavailable(
-        f"Provider Adapter for protocol '{configuration.protocol}' is not available."
-    )
-
-
 class _RuntimeSchedulerOwner:
     """Own one terminal scheduler instance per Runtime run."""
 

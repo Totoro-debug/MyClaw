@@ -5,13 +5,20 @@ from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
 from myclaw.agent.prompts import session_title_prompt
+from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
+    ModelProvider,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
 )
+
+
+def unexpected_provider_factory(configuration: ProviderConfiguration) -> ModelProvider:
+    del configuration
+    raise AssertionError("Provider factory was unexpectedly called")
 
 
 @dataclass(frozen=True, slots=True)

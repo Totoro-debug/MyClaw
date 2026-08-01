@@ -1,6 +1,5 @@
 from collections.abc import AsyncIterator
 from datetime import datetime
-from pathlib import Path
 
 from myclaw.agent.events import AgentEvent, ConversationPort
 from myclaw.config.config import ConfigView
@@ -14,7 +13,6 @@ from myclaw.session.records import (
     ConversationSession,
     MetadataUpdate,
     SessionMessage,
-    SessionSummary,
 )
 from myclaw.session.session_store import SessionListingReport, SessionStore
 from myclaw.tools.base import BaseTool
@@ -58,9 +56,6 @@ class _SessionStoreFake:
         raise NotImplementedError
 
     async def load(self, session_id: str) -> ConversationSession:
-        raise NotImplementedError
-
-    async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]:
         raise NotImplementedError
 
 
