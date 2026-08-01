@@ -191,7 +191,7 @@ class SubprocessShellBoundary:
 def _resolved_shell_command(request: ShellRequest) -> tuple[str, ...]:
     arguments = _HARDENED_GIT_ARGUMENTS.get(request.command)
     if arguments is None:
-        return (request.command,)
+        raise ShellPolicyDenied("Shell command is not permitted")
     executable = trusted_git_executable(workspace=request.workspace_root)
     if executable is None:
         raise ShellPolicyDenied("trusted Git executable is unavailable")

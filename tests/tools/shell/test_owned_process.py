@@ -308,6 +308,10 @@ async def test_windows_spawn_cancellation_assigns_the_job_and_fully_cleans_the_p
         def assign(self, pid: int) -> None:
             self.assigned.append(pid)
 
+        def resume(self, pid: int) -> None:
+            del pid
+            raise AssertionError("A cancelled suspended process must not be resumed")
+
         async def terminate(self) -> None:
             self.terminate_calls += 1
             process.returncode = 1
@@ -337,6 +341,59 @@ async def test_windows_spawn_cancellation_assigns_the_job_and_fully_cleans_the_p
     release_creation.set()
     with pytest.raises(asyncio.CancelledError):
         await spawn
+    assert job.assigned == [process.pid]
+    assert job.terminate_calls == 1
+    assert process.wait_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_windows_resume_failure_chains_cleanup_failure_after_waiting_for_root(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    class FakeProcess:
+        pid = 432
+        returncode: int | None = None
+        wait_calls = 0
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            self.returncode = 1
+            return self.returncode
+
+    process = FakeProcess()
+
+    class FakeJob:
+        def __init__(self) -> None:
+            self.assigned: list[int] = []
+            self.terminate_calls = 0
+
+        def assign(self, pid: int) -> None:
+            self.assigned.append(pid)
+
+        def resume(self, pid: int) -> None:
+            del pid
+            raise OSError("resume failed")
+
+        async def terminate(self) -> None:
+            self.terminate_calls += 1
+            raise RuntimeError("job cleanup failed")
+
+        def close(self) -> None:
+            return None
+
+    async def create_process(*command: str, **kwargs: object) -> asyncio.subprocess.Process:
+        del command, kwargs
+        return cast(asyncio.subprocess.Process, process)
+
+    job = FakeJob()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(WindowsJob, "create", staticmethod(lambda: job))
+
+    with pytest.raises(OSError, match="resume failed") as raised:
+        await WindowsOwnedProcessSpawner().spawn(("git.exe", "status"), cwd=workspace)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
     assert job.assigned == [process.pid]
     assert job.terminate_calls == 1
     assert process.wait_calls == 1

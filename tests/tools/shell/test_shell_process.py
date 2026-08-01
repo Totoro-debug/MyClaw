@@ -28,7 +28,7 @@ from myclaw.tools.shell.owned_process import (
     WindowsOwnedProcessSpawner,
     default_owned_process_spawner,
 )
-from myclaw.tools.shell.shell_policy import ShellRequest
+from myclaw.tools.shell.shell_policy import ShellPolicyDenied, ShellRequest
 from myclaw.tools.shell.shell_process import (
     SubprocessShellBoundary,
 )
@@ -38,7 +38,7 @@ from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 
-WINDOWS_NEW_GROUP_NO_WINDOW = 0x08000200
+WINDOWS_SUSPENDED_NEW_GROUP_NO_WINDOW = 0x08000204
 
 
 @pytest.mark.asyncio
@@ -48,6 +48,7 @@ async def test_windows_process_spawner_executes_argv_directly_and_assigns_the_jo
 ) -> None:
     commands: list[tuple[str, ...]] = []
     options: dict[str, object] = {}
+    events: list[str] = []
 
     class FakeProcess:
         pid = 123
@@ -59,6 +60,11 @@ async def test_windows_process_spawner_executes_argv_directly_and_assigns_the_jo
 
         def assign(self, pid: int) -> None:
             self.assigned.append(pid)
+            events.append("assigned")
+
+        def resume(self, pid: int) -> None:
+            assert pid == 123
+            events.append("resumed")
 
         def close(self) -> None:
             return None
@@ -66,6 +72,7 @@ async def test_windows_process_spawner_executes_argv_directly_and_assigns_the_jo
     async def create_process(*command: str, **kwargs: object) -> asyncio.subprocess.Process:
         commands.append(command)
         options.update(kwargs)
+        events.append("created-suspended")
         return cast(asyncio.subprocess.Process, FakeProcess())
 
     job = FakeJob()
@@ -79,8 +86,9 @@ async def test_windows_process_spawner_executes_argv_directly_and_assigns_the_jo
     assert commands == [command]
     assert options["cwd"] == workspace
     assert options["stdin"] is asyncio.subprocess.DEVNULL
-    assert options["creationflags"] == WINDOWS_NEW_GROUP_NO_WINDOW
+    assert options["creationflags"] == WINDOWS_SUSPENDED_NEW_GROUP_NO_WINDOW
     assert job.assigned == [123]
+    assert events == ["created-suspended", "assigned", "resumed"]
 
 
 def _windows_kernel32() -> ctypes.CDLL:
@@ -427,14 +435,29 @@ async def test_shell_boundary_runs_in_the_resolved_cwd_and_returns_output(
     shell = SubprocessShellBoundary(spawner=spawner)
 
     output = await shell.execute(
-        ShellRequest(command="test-operation", cwd=workspace.resolve(), timeout=60)
+        ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60)
     )
 
     assert output == "workspace output\n"
-    assert spawner.starts == [ProcessStart(command=("test-operation",), cwd=workspace.resolve())]
+    assert spawner.starts[0].cwd == workspace.resolve()
     assert process.communicated is True
     assert process.terminate_calls == 1
     assert process.wait_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_shell_boundary_rejects_unknown_commands_before_spawning(
+    workspace: Path,
+) -> None:
+    spawner = FakeProcessSpawner(FakeShellProcess(b"must not run"))
+    shell = SubprocessShellBoundary(spawner=spawner)
+
+    with pytest.raises(ShellPolicyDenied, match="not permitted"):
+        await shell.execute(
+            ShellRequest(command="test-operation", cwd=workspace.resolve(), timeout=60)
+        )
+
+    assert spawner.starts == []
 
 
 @pytest.mark.asyncio
@@ -448,7 +471,7 @@ async def test_repeated_successful_commands_release_process_tree_ownership_befor
         for index in range(12):
             assert (
                 await shell.execute(
-                    ShellRequest(command="test-operation", cwd=workspace.resolve(), timeout=60)
+                    ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60)
                 )
                 == f"output {index}\n"
             )
@@ -566,9 +589,7 @@ async def test_shell_timeout_terminates_and_awaits_the_child_process(
     )
 
     with pytest.raises(TimeoutError):
-        await shell.execute(
-            ShellRequest(command="long-running", cwd=workspace.resolve(), timeout=60)
-        )
+        await shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
 
     assert waiter.timeouts == [60]
     assert process.communicate_started.is_set()
@@ -583,7 +604,7 @@ async def test_shell_cancellation_terminates_and_awaits_the_child_process(
     process = BlockingFakeShellProcess()
     shell = SubprocessShellBoundary(spawner=FakeProcessSpawner(process))
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="long-running", cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     )
     await process.communicate_started.wait()
 
@@ -603,7 +624,7 @@ async def test_shell_cancellation_joins_spawn_before_terminating_the_created_pro
     spawner = DelayedProcessSpawner(process)
     shell = SubprocessShellBoundary(spawner=spawner)
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="starting", cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     )
     await spawner.created.wait()
 
@@ -634,7 +655,7 @@ async def test_cancellation_during_successful_finalization_surfaces_after_cleanu
     process = CompletedOutputControlledTerminateProcess(release_termination)
     shell = SubprocessShellBoundary(spawner=FakeProcessSpawner(process))
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="completed", cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     )
     await process.terminate_started.wait()
 
@@ -660,7 +681,7 @@ async def test_shell_io_failure_terminates_and_reaps_before_propagating(
     shell = SubprocessShellBoundary(spawner=FakeProcessSpawner(process))
 
     with pytest.raises(OSError, match="pipe read failed"):
-        await shell.execute(ShellRequest(command="failing", cwd=workspace.resolve(), timeout=60))
+        await shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     await shell.close()
 
     assert process.terminated is True
@@ -674,7 +695,7 @@ async def test_shell_close_terminates_and_awaits_an_active_child_process(
     process = BlockingFakeShellProcess()
     shell = SubprocessShellBoundary(spawner=FakeProcessSpawner(process))
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="long-running", cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     )
     await process.communicate_started.wait()
 
@@ -712,10 +733,10 @@ async def test_shell_close_awaits_every_process_before_propagating_a_cleanup_fai
     )
     executions = (
         asyncio.create_task(
-            shell.execute(ShellRequest(command="first", cwd=workspace.resolve(), timeout=60))
+            shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
         ),
         asyncio.create_task(
-            shell.execute(ShellRequest(command="second", cwd=workspace.resolve(), timeout=60))
+            shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
         ),
     )
     await failing.communicate_started.wait()
@@ -748,7 +769,7 @@ async def test_repeated_cancellation_remains_tracked_until_process_cleanup_finis
     process = ControlledTerminateProcess(release_termination=release_termination)
     shell = SubprocessShellBoundary(spawner=FakeProcessSpawner(process))
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="slow-stop", cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     )
     await process.communicate_started.wait()
 
@@ -788,7 +809,7 @@ async def test_cleanup_failure_does_not_replace_cancellation_or_timeout(
 
     if primary == "cancellation":
         execution = asyncio.create_task(
-            shell.execute(ShellRequest(command="cancelled", cwd=workspace.resolve(), timeout=60))
+            shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
         )
         await process.communicate_started.wait()
         execution.cancel()
@@ -797,7 +818,7 @@ async def test_cleanup_failure_does_not_replace_cancellation_or_timeout(
     else:
         with pytest.raises(TimeoutError):
             await shell.execute(
-                ShellRequest(command="timed-out", cwd=workspace.resolve(), timeout=60)
+                ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60)
             )
 
     assert process.communicate_finished or process.communicate_cancelled
@@ -815,7 +836,7 @@ async def test_close_retries_transient_failed_cleanup_and_reaps_the_process(
     )
 
     with pytest.raises(TimeoutError) as raised:
-        await shell.execute(ShellRequest(command="timed-out", cwd=workspace.resolve(), timeout=60))
+        await shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
 
     assert isinstance(raised.value.__cause__, OSError)
     assert process.terminate_calls == 1
@@ -838,7 +859,7 @@ async def test_close_retries_cleanup_failed_after_cancellation_during_spawn(
     spawner = DelayedProcessSpawner(process)
     shell = SubprocessShellBoundary(spawner=spawner)
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="starting", cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     )
     await spawner.created.wait()
 
@@ -892,7 +913,7 @@ async def test_production_shell_cancellation_leaves_no_grandchild_process(
     shell = SubprocessShellBoundary(spawner=DirectCommandSpawner((sys.executable, "-c", script)))
     child_pid: int | None = None
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="test-operation", cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     )
     try:
         await _wait_for_path(pid_path)
@@ -918,7 +939,6 @@ async def test_shell_timeout_terminates_descendants_after_the_root_process_exits
     child_script = "import time; time.sleep(10)"
     outer_script = (
         "import pathlib, subprocess, sys, time; "
-        "time.sleep(0.1); "
         f"child = subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
         f"pathlib.Path({str(pid_path)!r}).write_text(str(child.pid), encoding='utf-8')"
     )
@@ -927,7 +947,7 @@ async def test_shell_timeout_terminates_descendants_after_the_root_process_exits
         waiter=PathTimeoutWaiter(pid_path),
     )
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="test-operation", cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     )
     child_pid: int | None = None
     try:
@@ -974,7 +994,7 @@ async def test_shell_execute_terminates_descendants_after_normal_root_completion
     try:
         await shell.execute(
             ShellRequest(
-                command="test-operation",
+                command="git status",
                 cwd=workspace.resolve(),
                 timeout=60,
             )
@@ -1035,7 +1055,7 @@ async def test_runtime_close_terminates_and_awaits_its_active_shell_process(
         shell=shell,
     )
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="long-running", cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     )
     await process.communicate_started.wait()
 

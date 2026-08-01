@@ -447,7 +447,7 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
     )
     _ = [event async for event in runtime.conversation.submit("Construct the provider.")]
     shell_execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="blocking", cwd=workspace, timeout=60))
+        shell.execute(ShellRequest(command="git status", cwd=workspace, timeout=60))
     )
     await process.communicate_started.wait()
     runtime_log = install_runtime_logging(home)

@@ -10,6 +10,21 @@ _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS: Final = 1
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: Final = 9
 _PROCESS_TERMINATE: Final = 0x0001
 _PROCESS_SET_QUOTA: Final = 0x0100
+_THREAD_SUSPEND_RESUME: Final = 0x0002
+_TH32CS_SNAPTHREAD: Final = 0x00000004
+_INVALID_DWORD: Final = 0xFFFFFFFF
+
+
+class _ThreadEntry32(ctypes.Structure):
+    _fields_ = (
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", wintypes.LONG),
+        ("tpDeltaPri", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+    )
 
 
 class _JobBasicLimitInformation(ctypes.Structure):
@@ -147,6 +162,50 @@ class WindowsJob:
                 raise _windows_error("AssignProcessToJobObject")
         finally:
             self._close_handle(process_handle)
+
+    def resume(self, pid: int) -> None:
+        kernel32 = _windows_kernel32()
+        create_snapshot = kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        create_snapshot.restype = wintypes.HANDLE
+        thread_first = kernel32.Thread32First
+        thread_first.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32))
+        thread_first.restype = wintypes.BOOL
+        thread_next = kernel32.Thread32Next
+        thread_next.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32))
+        thread_next.restype = wintypes.BOOL
+        open_thread = kernel32.OpenThread
+        open_thread.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_thread.restype = wintypes.HANDLE
+        resume_thread = kernel32.ResumeThread
+        resume_thread.argtypes = (wintypes.HANDLE,)
+        resume_thread.restype = wintypes.DWORD
+
+        snapshot = create_snapshot(_TH32CS_SNAPTHREAD, 0)
+        if int(snapshot) == _INVALID_DWORD:
+            raise _windows_error("CreateToolhelp32Snapshot")
+        try:
+            entry = _ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            if not thread_first(snapshot, ctypes.byref(entry)):
+                raise _windows_error("Thread32First")
+            while int(entry.th32OwnerProcessID) != pid:
+                if not thread_next(snapshot, ctypes.byref(entry)):
+                    raise RuntimeError("Created Windows process has no resumable thread")
+            thread_handle = open_thread(
+                _THREAD_SUSPEND_RESUME,
+                False,
+                entry.th32ThreadID,
+            )
+            if not thread_handle:
+                raise _windows_error("OpenThread")
+            try:
+                if resume_thread(thread_handle) == _INVALID_DWORD:
+                    raise _windows_error("ResumeThread")
+            finally:
+                self._close_handle(thread_handle)
+        finally:
+            self._close_handle(snapshot)
 
     async def terminate(self) -> None:
         handle = self._required_handle()

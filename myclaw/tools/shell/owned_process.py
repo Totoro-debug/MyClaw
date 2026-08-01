@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Final, Protocol, cast
 
 _POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
-_WINDOWS_PROCESS_CREATION_FLAGS: Final = 0x08000200
+_WINDOWS_PROCESS_CREATION_FLAGS: Final = 0x08000204
 
 
 class OwnedProcess(Protocol):
@@ -41,6 +41,8 @@ class _ProcessTree(Protocol):
 
 class _WindowsJob(Protocol):
     def assign(self, pid: int) -> None: ...
+
+    def resume(self, pid: int) -> None: ...
 
     async def terminate(self) -> None: ...
 
@@ -203,7 +205,17 @@ class WindowsOwnedProcessSpawner:
             except BaseException as cleanup_error:
                 raise primary_error from cleanup_error
             raise primary_error
-        return await self._assign(job=job, process=process)
+        owned = await self._assign(job=job, process=process)
+        try:
+            job.resume(process.pid)
+        except BaseException as ownership_error:
+            cleanup = asyncio.create_task(owned.terminate())
+            try:
+                await _join_task(cleanup)
+            except BaseException as cleanup_error:
+                raise ownership_error from cleanup_error
+            raise
+        return owned
 
     @staticmethod
     async def _assign(
