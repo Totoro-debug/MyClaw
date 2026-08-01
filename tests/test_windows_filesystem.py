@@ -4,10 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.utils.windows_filesystem import (
-    require_owned_directory,
-    require_owned_regular_file,
-)
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="requires native Windows paths")
 
@@ -17,7 +14,9 @@ def test_require_owned_directory_returns_normalized_owned_path(tmp_path: Path) -
     child = owned / "child"
     child.mkdir(parents=True)
 
-    assert require_owned_directory(child, within=owned) == child.resolve(strict=True)
+    assert HOST_FILESYSTEM.require_owned_directory(child, within=owned) == child.resolve(
+        strict=True
+    )
 
 
 def test_require_owned_directory_rejects_junction_and_external_paths(tmp_path: Path) -> None:
@@ -34,9 +33,9 @@ def test_require_owned_directory_rejects_junction_and_external_paths(tmp_path: P
     )
 
     with pytest.raises(PermissionError):
-        require_owned_directory(junction, within=owned)
+        HOST_FILESYSTEM.require_owned_directory(junction, within=owned)
     with pytest.raises(PermissionError):
-        require_owned_directory(outside, within=owned)
+        HOST_FILESYSTEM.require_owned_directory(outside, within=owned)
 
 
 def test_require_owned_regular_file_returns_normalized_owned_path(tmp_path: Path) -> None:
@@ -45,7 +44,9 @@ def test_require_owned_regular_file_returns_normalized_owned_path(tmp_path: Path
     file = owned / "state.json"
     file.write_bytes(b"{}")
 
-    assert require_owned_regular_file(file, within=owned) == file.resolve(strict=True)
+    assert HOST_FILESYSTEM.require_owned_regular_file(file, within=owned) == file.resolve(
+        strict=True
+    )
 
 
 def test_require_owned_regular_file_rejects_directories_and_hard_links(tmp_path: Path) -> None:
@@ -59,8 +60,8 @@ def test_require_owned_regular_file_rejects_directories_and_hard_links(tmp_path:
     hard_link.hardlink_to(outside)
 
     with pytest.raises(PermissionError):
-        require_owned_regular_file(directory, within=owned)
+        HOST_FILESYSTEM.require_owned_regular_file(directory, within=owned)
     with pytest.raises(PermissionError):
-        require_owned_regular_file(hard_link, within=owned)
+        HOST_FILESYSTEM.require_owned_regular_file(hard_link, within=owned)
 
     assert outside.read_bytes() == b"private"

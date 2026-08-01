@@ -3,9 +3,9 @@
 import asyncio
 import os
 import signal
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
-from typing import Final, Protocol, cast
+from typing import Any, Final, Never, Protocol, cast
 
 _POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 _WINDOWS_PROCESS_CREATION_FLAGS: Final = 0x08000204
@@ -21,6 +21,39 @@ class OwnedProcess(Protocol):
 
 class OwnedProcessSpawner(Protocol):
     async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> OwnedProcess: ...
+
+
+async def _spawn_owned_process(
+    creation_awaitable: Coroutine[Any, Any, asyncio.subprocess.Process],
+    *,
+    own: Callable[[asyncio.subprocess.Process], Awaitable[OwnedProcess]],
+    activate: Callable[[asyncio.subprocess.Process], None] | None = None,
+    release_unowned: Callable[[], None] | None = None,
+) -> OwnedProcess:
+    creation = asyncio.create_task(creation_awaitable)
+    try:
+        process = await asyncio.shield(creation)
+    except BaseException as primary_error:
+        try:
+            process = await _join_task(creation)
+        except BaseException as creation_error:
+            if release_unowned is not None:
+                release_unowned()
+            if creation_error is primary_error:
+                raise primary_error from None
+            raise primary_error from creation_error
+        try:
+            owned = await own(process)
+        except BaseException as ownership_error:
+            raise primary_error from ownership_error
+        await _terminate_then_raise(owned, primary_error)
+    owned = await own(process)
+    if activate is not None:
+        try:
+            activate(process)
+        except BaseException as ownership_error:
+            await _terminate_then_raise(owned, ownership_error)
+    return owned
 
 
 def default_owned_process_spawner(*, host_name: str = os.name) -> OwnedProcessSpawner:
@@ -175,7 +208,7 @@ class WindowsOwnedProcessSpawner:
         from myclaw.tools.shell.windows_job import WindowsJob
 
         job = WindowsJob.create()
-        creation = asyncio.create_task(
+        owned = await _spawn_owned_process(
             asyncio.create_subprocess_exec(
                 *command,
                 cwd=cwd,
@@ -183,38 +216,11 @@ class WindowsOwnedProcessSpawner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 creationflags=_WINDOWS_PROCESS_CREATION_FLAGS,
-            )
+            ),
+            own=lambda process: self._assign(job=job, process=process),
+            activate=lambda process: job.resume(process.pid),
+            release_unowned=job.close,
         )
-        try:
-            process = await asyncio.shield(creation)
-        except BaseException as primary_error:
-            try:
-                process = await _join_task(creation)
-            except BaseException as creation_error:
-                job.close()
-                if creation_error is primary_error:
-                    raise primary_error from None
-                raise primary_error from creation_error
-            try:
-                owned = await self._assign(job=job, process=process)
-            except BaseException as ownership_error:
-                raise primary_error from ownership_error
-            cleanup = asyncio.create_task(owned.terminate())
-            try:
-                await _join_task(cleanup)
-            except BaseException as cleanup_error:
-                raise primary_error from cleanup_error
-            raise primary_error
-        owned = await self._assign(job=job, process=process)
-        try:
-            job.resume(process.pid)
-        except BaseException as ownership_error:
-            cleanup = asyncio.create_task(owned.terminate())
-            try:
-                await _join_task(cleanup)
-            except BaseException as cleanup_error:
-                raise ownership_error from cleanup_error
-            raise
         return owned
 
     @staticmethod
@@ -250,7 +256,7 @@ class PosixOwnedProcessSpawner:
         self._signal_process_group = signal_process_group
 
     async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> OwnedProcess:
-        creation = asyncio.create_task(
+        return await _spawn_owned_process(
             asyncio.create_subprocess_exec(
                 *command,
                 cwd=cwd,
@@ -258,27 +264,11 @@ class PosixOwnedProcessSpawner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
-            )
+            ),
+            own=self._owned,
         )
-        try:
-            process = await asyncio.shield(creation)
-        except BaseException as primary_error:
-            try:
-                process = await _join_task(creation)
-            except BaseException as creation_error:
-                if creation_error is primary_error:
-                    raise primary_error from None
-                raise primary_error from creation_error
-            owned = self._owned(process)
-            cleanup = asyncio.create_task(owned.terminate())
-            try:
-                await _join_task(cleanup)
-            except BaseException as cleanup_error:
-                raise primary_error from cleanup_error
-            raise primary_error
-        return self._owned(process)
 
-    def _owned(self, process: asyncio.subprocess.Process) -> OwnedProcess:
+    async def _owned(self, process: asyncio.subprocess.Process) -> OwnedProcess:
         return _AsyncioOwnedProcess(
             process,
             tree=_PosixProcessTree(
@@ -287,6 +277,15 @@ class PosixOwnedProcessSpawner:
                 signal_process_group=self._signal_process_group,
             ),
         )
+
+
+async def _terminate_then_raise(owned: OwnedProcess, primary_error: BaseException) -> Never:
+    cleanup = asyncio.create_task(owned.terminate())
+    try:
+        await _join_task(cleanup)
+    except BaseException as cleanup_error:
+        raise primary_error from cleanup_error
+    raise primary_error
 
 
 async def _join_task[T](task: asyncio.Task[T]) -> T:

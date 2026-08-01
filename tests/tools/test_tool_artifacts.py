@@ -36,7 +36,7 @@ from myclaw.tools.models import (
 )
 from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
-from myclaw.utils.atomic_files import path_for_io
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 
 SESSION_ID = "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000"
@@ -88,7 +88,7 @@ def _runtime_configuration(*, max_tool_result_chars: int) -> UserConfiguration:
 
 
 def _long_path(path: Path) -> Path:
-    return path_for_io(path)
+    return HOST_FILESYSTEM.path_for_io(path)
 
 
 def _workspace_state(workspace: Path) -> WorkspaceState:

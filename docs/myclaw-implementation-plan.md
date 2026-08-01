@@ -145,7 +145,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 1. 实现固定 Agent Home 路径解析，并将其所有权限制为 User Configuration 与 Runtime Logs；不得暴露为用户配置或 profile。
 2. 有效启动在当前 Workspace 创建 `.myclaw`、`memory/`、`sessions/` 和四分区 `memory/memory.md` 模板；其他运行态文件按需创建。
-3. 实现 Windows x64 normalized absolute Workspace identity，直接在 Workspace State 存储非全局状态，不派生 slug。
+3. 实现宿主原生 normalized absolute Workspace identity，直接在 Workspace State 存储非全局状态，不派生 slug。
 4. 实现同目录临时文件、flush、必要时 fsync、原子 replace 的写入助手，并清理失败临时文件。
 5. 实现 TOML 默认模板、解析、schema 校验、provider/route 可用性校验和用户可见错误。
 6. 实现 API key 结构化脱敏，以及 TOML 无法解析时对原始文本中明显 API key 行的保守脱敏。

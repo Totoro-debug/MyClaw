@@ -145,15 +145,17 @@ def _windows_handle_count() -> int:
     return int(count.value)
 
 
-async def _wait_for_path(path: Path) -> None:
+async def _wait_for_pid(path: Path) -> int:
     deadline = asyncio.get_running_loop().time() + 5
     while True:
-        if path.exists():
-            return
+        try:
+            return int(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
         if asyncio.get_running_loop().time() >= deadline:
             break
         await asyncio.sleep(0.01)
-    raise AssertionError(f"Timed out waiting for {path}")
+    raise AssertionError(f"Timed out waiting for a process ID in {path}")
 
 
 async def _wait_for_process_exit(pid: int) -> bool:
@@ -421,7 +423,7 @@ class PathTimeoutWaiter:
         timeout: int,
     ) -> tuple[bytes, bytes | None]:
         del output, timeout
-        await _wait_for_path(self._path)
+        await _wait_for_pid(self._path)
         await asyncio.sleep(0.1)
         raise TimeoutError
 
@@ -916,8 +918,7 @@ async def test_production_shell_cancellation_leaves_no_grandchild_process(
         shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60))
     )
     try:
-        await _wait_for_path(pid_path)
-        child_pid = int(pid_path.read_text(encoding="utf-8"))
+        child_pid = await _wait_for_pid(pid_path)
 
         execution.cancel()
 
@@ -951,8 +952,7 @@ async def test_shell_timeout_terminates_descendants_after_the_root_process_exits
     )
     child_pid: int | None = None
     try:
-        await _wait_for_path(pid_path)
-        child_pid = int(pid_path.read_text(encoding="utf-8"))
+        child_pid = await _wait_for_pid(pid_path)
         try:
             await asyncio.wait_for(asyncio.shield(execution), timeout=3)
         except TimeoutError:
@@ -999,8 +999,7 @@ async def test_shell_execute_terminates_descendants_after_normal_root_completion
                 timeout=60,
             )
         )
-        await _wait_for_path(pid_path)
-        child_pid = int(pid_path.read_text(encoding="utf-8"))
+        child_pid = await _wait_for_pid(pid_path)
 
         assert await _wait_for_process_exit(child_pid)
         await shell.close()

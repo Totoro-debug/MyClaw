@@ -36,7 +36,7 @@ from myclaw.session.records import (
 )
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore, SessionListingReport
-from myclaw.utils.atomic_files import path_for_io
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
     FakeClock,
@@ -975,7 +975,7 @@ async def test_management_resume_revalidates_workspace_and_keeps_current_session
     assert invalid_result.output == other_result.output
     assert json.loads(status_result.output or "")["session_message_count"] == 0
     assert not runtime.sessions.path_for(runtime.session_id).exists()
-    assert path_for_io(other_store.path_for(other.id)).exists()
+    assert HOST_FILESYSTEM.path_for_io(other_store.path_for(other.id)).exists()
 
 
 @pytest.mark.asyncio
@@ -999,7 +999,7 @@ async def test_legacy_agent_home_session_is_not_resumable(
         content="Legacy history must remain ignored.",
     )
     legacy_path = agent_home / "sessions" / "legacy-workspace-slug" / f"{metadata.id}.jsonl"
-    legacy_io_path = path_for_io(legacy_path)
+    legacy_io_path = HOST_FILESYSTEM.path_for_io(legacy_path)
     legacy_io_path.parent.mkdir(parents=True)
     legacy_io_path.write_text(metadata.to_json_line() + message.to_json_line(), encoding="utf-8")
     legacy_bytes = legacy_io_path.read_bytes()
@@ -1063,7 +1063,7 @@ async def test_resuming_from_a_nonempty_session_preserves_its_complete_history(
             content="Original nonempty history.",
         ),
     )
-    original_path = path_for_io(runtime.sessions.path_for(original_session_id))
+    original_path = HOST_FILESYSTEM.path_for_io(runtime.sessions.path_for(original_session_id))
     original_bytes = original_path.read_bytes()
 
     result = await runtime.management_dispatcher.resume(target.id)

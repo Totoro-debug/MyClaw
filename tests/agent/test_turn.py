@@ -28,7 +28,7 @@ from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
-from myclaw.utils.atomic_files import path_for_io
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures import FakeTool, ScriptedFakeProvider, StreamScript
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
@@ -79,7 +79,7 @@ def _usage() -> ModelUsage:
 
 
 def _io_path(path: Path) -> Path:
-    return path_for_io(path)
+    return HOST_FILESYSTEM.path_for_io(path)
 
 
 def _provider(

@@ -23,7 +23,7 @@ from myclaw.provider.models import (
 from myclaw.session.records import UserSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.templates import load_template
-from myclaw.utils.atomic_files import atomic_replace_bytes
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 
@@ -124,13 +124,13 @@ async def test_workspace_consolidation_crash_windows_recover_exactly_once(
         operations.append(step)
         if step == failed_step:
             raise OSError(f"injected {step} failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     def replace_session_cursor(target: Path, content: bytes) -> None:
         operations.append("cursor")
         if failed_step == "cursor":
             raise OSError("injected cursor failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     def unlink_journal(target: Path) -> None:
         operations.append("delete")
@@ -204,7 +204,7 @@ async def test_workspace_recovery_rejects_a_session_store_from_another_workspace
         replace_calls += 1
         if replace_calls == 2:
             raise OSError("injected summary failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     failing = WorkspaceJsonlSummaryStore(first_state, replace_bytes=fail_summary)
     with pytest.raises(OSError):

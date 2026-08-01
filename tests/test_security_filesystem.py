@@ -13,7 +13,7 @@ from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.security import Security
 from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
-from myclaw.utils.atomic_files import path_for_io
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 SESSION_ID = "20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"
 OTHER_SESSION_ID = "20260713-050000-000000_550e8400-e29b-41d4-a716-446655440000"
@@ -59,7 +59,7 @@ def _create_directory_alias(alias: Path, target: Path) -> None:
 
 
 def _long_path(path: Path) -> Path:
-    return path_for_io(path)
+    return HOST_FILESYSTEM.path_for_io(path)
 
 
 def test_assistant_message_rejects_duplicate_tool_call_ids() -> None:

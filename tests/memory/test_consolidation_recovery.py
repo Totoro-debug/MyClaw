@@ -29,7 +29,7 @@ from myclaw.session.records import (
     UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
-from myclaw.utils.atomic_files import atomic_replace_bytes
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 
@@ -165,7 +165,7 @@ async def test_summary_write_failure_leaves_recovery_journal_and_old_cursor(
         replace_calls += 1
         if replace_calls == 2:
             raise OSError("injected summary replacement failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     summaries = WorkspaceJsonlSummaryStore(_state(workspace), replace_bytes=fail_summary_replace)
 
@@ -205,7 +205,7 @@ async def test_pending_journal_recovers_exact_summary_and_cursor_once(
         replace_calls += 1
         if replace_calls == 2:
             raise OSError("injected summary replacement failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     failing = WorkspaceJsonlSummaryStore(_state(workspace), replace_bytes=fail_summary_replace)
     with pytest.raises(ModelCallError):
@@ -244,7 +244,7 @@ async def test_pending_consolidation_recovery_records_one_degradation_warning(
         replace_calls += 1
         if replace_calls == 2:
             raise OSError("injected summary replacement failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     with pytest.raises(ModelCallError):
         await _manager(
@@ -287,7 +287,7 @@ async def test_runtime_recovers_all_pending_consolidations_before_first_turn_eve
         replace_calls += 1
         if replace_calls == 2:
             raise OSError("injected summary replacement failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     with pytest.raises(ModelCallError):
         await _manager(
@@ -338,7 +338,7 @@ async def test_runtime_ignores_pending_consolidation_from_another_workspace(
         replace_calls += 1
         if replace_calls == 2:
             raise OSError("injected summary replacement failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     with pytest.raises(ModelCallError):
         await _manager(
@@ -390,7 +390,7 @@ async def test_runtime_reports_safe_error_for_conflicting_reserved_summary_index
         replace_calls += 1
         if replace_calls == 2:
             raise OSError("injected summary replacement failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     with pytest.raises(ModelCallError):
         await _manager(
@@ -436,13 +436,13 @@ async def test_each_consolidation_commit_crash_window_is_recoverable(
         operations.append(step)
         if step == failed_step:
             raise OSError(f"injected {step} failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     def replace_session_cursor(target: Path, content: bytes) -> None:
         operations.append("cursor")
         if failed_step == "cursor":
             raise OSError("injected cursor failure")
-        atomic_replace_bytes(target, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(target, content)
 
     def unlink_journal(target: Path) -> None:
         operations.append("delete")

@@ -20,7 +20,7 @@ from myclaw.session.records import (
     UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore, SessionStore
-from myclaw.utils.atomic_files import path_for_io
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures import FakeClock
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -32,7 +32,7 @@ ASSISTANT_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 
 
 def read_bytes(path: Path) -> bytes:
-    return path_for_io(path).read_bytes()
+    return HOST_FILESYSTEM.path_for_io(path).read_bytes()
 
 
 @pytest.mark.asyncio
@@ -161,7 +161,7 @@ async def test_legacy_agent_home_session_is_never_listed_or_loaded(
         content="Legacy Agent Home history.",
     )
     legacy_path = agent_home / "sessions" / "legacy-workspace-slug" / f"{metadata.id}.jsonl"
-    legacy_io_path = path_for_io(legacy_path)
+    legacy_io_path = HOST_FILESYSTEM.path_for_io(legacy_path)
     legacy_io_path.parent.mkdir(parents=True)
     legacy_io_path.write_text(metadata.to_json_line() + message.to_json_line(), encoding="utf-8")
     legacy_bytes = legacy_io_path.read_bytes()

@@ -13,7 +13,7 @@ import pytest
 
 from myclaw.config.agent_home import AgentHome
 from myclaw.runtime_log import install_runtime_logging
-from myclaw.utils.atomic_files import atomic_replace_bytes
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _SLOT_TARGET_BYTES = 10_485_760
 
@@ -473,7 +473,7 @@ def test_runtime_log_recovers_when_target_reset_is_interrupted(agent_home: Path)
         if not interrupted and path == logs / "run.log.1" and content == b"":
             interrupted = True
             raise OSError("simulated interruption before target reset")
-        atomic_replace_bytes(path, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
 
     interrupted_lifetime = install_runtime_logging(
         AgentHome(agent_home), replace_bytes=interrupt_target_reset
@@ -516,7 +516,7 @@ def test_runtime_log_recovers_when_cursor_publication_is_interrupted(
         if not interrupted and path == logs / "run.log.cursor" and content == b"1\n":
             interrupted = True
             raise OSError("simulated interruption before cursor publication")
-        atomic_replace_bytes(path, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
 
     interrupted_lifetime = install_runtime_logging(
         AgentHome(agent_home), replace_bytes=interrupt_cursor_publication
@@ -791,7 +791,7 @@ def test_runtime_log_reselects_the_cursor_and_completes_rotation_under_one_lock(
     def replace_while_locked(path: Path, content: bytes) -> None:
         assert held
         replacements.append((path, content))
-        atomic_replace_bytes(path, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
 
     def fsync_while_locked(descriptor: int) -> None:
         nonlocal synchronized
@@ -961,7 +961,7 @@ def test_runtime_log_revalidates_the_opened_slot_after_locked_cursor_selection(
     outside.write_bytes(b"outside remains unchanged\n")
 
     def replace_then_alias_target(path: Path, content: bytes) -> None:
-        atomic_replace_bytes(path, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
         if path == cursor and content == b"1\n":
             target.unlink()
             os.link(outside, target)

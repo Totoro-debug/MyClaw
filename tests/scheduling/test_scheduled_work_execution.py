@@ -52,7 +52,7 @@ from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool
 from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway
-from myclaw.utils.atomic_files import atomic_replace_bytes, path_for_io
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, persist_scheduled_work
 
@@ -169,7 +169,7 @@ def _tool_gateway(
 
 
 def _long_path(path: Path) -> Path:
-    return path_for_io(path)
+    return HOST_FILESYSTEM.path_for_io(path)
 
 
 def _artifact_directory(*, workspace: Path, session_id: str) -> Path:
@@ -882,7 +882,7 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
         publication_calls += 1
         if publication_calls == 1:
             raise OSError("private disk failure detail")
-        atomic_replace_bytes(path, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
 
     sessions = JsonlSessionStore(
         workspace_state=WorkspaceState(Workspace.from_path(workspace)),
@@ -982,7 +982,7 @@ async def test_corrupt_task_session_is_isolated_before_the_model_call(
     )
     failed_task = _task()
     corrupt_path = sessions.path_for(failed_task.session_id)
-    io_path = path_for_io(corrupt_path)
+    io_path = HOST_FILESYSTEM.path_for_io(corrupt_path)
     io_path.parent.mkdir(parents=True)
     io_path.write_text("{not valid session json}\n", encoding="utf-8")
     provider = ScriptedFakeProvider(
@@ -1049,7 +1049,7 @@ async def test_tool_result_publication_failure_is_isolated_from_the_next_task(
         publication_calls += 1
         if publication_calls == 2:
             raise OSError("private tool publication failure")
-        atomic_replace_bytes(path, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
 
     sessions = JsonlSessionStore(
         workspace_state=WorkspaceState(Workspace.from_path(workspace)),
@@ -1146,7 +1146,7 @@ async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_public
         publication_calls += 1
         if publication_calls == 2:
             raise OSError("injected metadata publication failure")
-        atomic_replace_bytes(path, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
 
     sessions = JsonlSessionStore(
         workspace_state=WorkspaceState(Workspace.from_path(workspace)),
@@ -1595,7 +1595,7 @@ async def test_model_error_publication_failure_becomes_a_persistence_outcome(
         publication_calls += 1
         if publication_calls == 1:
             raise OSError("private model error publication failure")
-        atomic_replace_bytes(path, content)
+        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
 
     sessions = JsonlSessionStore(
         workspace_state=WorkspaceState(Workspace.from_path(workspace)),

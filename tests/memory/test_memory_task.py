@@ -33,7 +33,7 @@ from myclaw.provider.models import (
 )
 from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.models import ModelToolCall
-from myclaw.utils.atomic_files import atomic_replace_text
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider
 
@@ -884,7 +884,7 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
     def fail_cursor(target: Path, content: str) -> None:
         if target.name == ".cursor":
             raise OSError("injected cursor publication failure")
-        atomic_replace_text(target, content)
+        HOST_FILESYSTEM.atomic_replace_text(target, content)
 
     memory = WorkspaceFileMemoryStore(_state(home), replace_text=fail_cursor)
     provider = ScriptedFakeProvider(completions=(_response("No durable update is needed."),))
