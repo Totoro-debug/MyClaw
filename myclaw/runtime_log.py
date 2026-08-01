@@ -208,12 +208,24 @@ class RuntimeLogLifetime:
                 raise timeout_error
             try:
                 _validate_opened_log_file(lock_stream, logs / "run.log.lock", agent_home_root)
-                self._append_locked(pending, encoded)
+                self._append_locked(
+                    pending,
+                    encoded,
+                    logs=logs,
+                    agent_home_root=agent_home_root,
+                )
             finally:
                 self._lock_system.release(lock_stream.fileno())
 
-    def _append_locked(self, pending: _PendingRecord, encoded: bytes) -> None:
-        slot, cursor_recovered = self._prepare_storage()
+    def _append_locked(
+        self,
+        pending: _PendingRecord,
+        encoded: bytes,
+        *,
+        logs: Path,
+        agent_home_root: Path,
+    ) -> None:
+        slot, cursor_recovered = self._prepare_storage(logs, agent_home_root)
         if cursor_recovered:
             recovery = logging.LogRecord(
                 name="myclaw.runtime_log",
@@ -224,9 +236,13 @@ class RuntimeLogLifetime:
                 args=(),
                 exc_info=None,
             )
-            self._append_encoded(slot, self._encode(_PendingRecord(recovery, "-")))
-            slot, _ = self._prepare_storage()
-        self._append_encoded(slot, encoded)
+            self._append_encoded(
+                slot,
+                self._encode(_PendingRecord(recovery, "-")),
+                agent_home_root=agent_home_root,
+            )
+            slot, _ = self._prepare_storage(logs, agent_home_root)
+        self._append_encoded(slot, encoded, agent_home_root=agent_home_root)
 
     def _open_lock_file(self) -> tuple[Path, Path, BinaryIO]:
         agent_home = self._agent_home.path
@@ -237,15 +253,12 @@ class RuntimeLogLifetime:
         _validate_log_directory(logs, agent_home_root)
         HOST_FILESYSTEM.restrict_private_directory(logs)
         lock_path = logs / "run.log.lock"
-        if lock_path.exists() or lock_path.is_symlink():
-            _validate_log_file(lock_path, agent_home_root)
-        else:
+        if not lock_path.exists() and not lock_path.is_symlink():
             _create_lock_file(lock_path)
-        _validate_log_file(lock_path, agent_home_root)
-        HOST_FILESYSTEM.restrict_private_file(lock_path)
         lock_stream = lock_path.open("r+b", buffering=0)
         try:
             _validate_opened_log_file(lock_stream, lock_path, agent_home_root)
+            HOST_FILESYSTEM.restrict_private_descriptor(lock_stream.fileno())
         except Exception:
             lock_stream.close()
             raise
@@ -292,6 +305,7 @@ class RuntimeLogLifetime:
         agent_home_root = self._agent_home.path.resolve(strict=True)
         with slot.open("ab", buffering=0) as stream:
             _validate_opened_log_file(stream, slot, agent_home_root)
+            HOST_FILESYSTEM.restrict_private_descriptor(stream.fileno())
             written = stream.write(encoded)
             if written != len(encoded):
                 raise OSError("Runtime Log append did not write the complete record")
@@ -315,10 +329,16 @@ class RuntimeLogLifetime:
         line += "\n"
         return self._redact(line).encode("utf-8")
 
-    def _append_encoded(self, slot: Path, encoded: bytes) -> None:
-        agent_home_root = self._agent_home.path.resolve(strict=True)
+    def _append_encoded(
+        self,
+        slot: Path,
+        encoded: bytes,
+        *,
+        agent_home_root: Path,
+    ) -> None:
         with slot.open("ab", buffering=0) as stream:
             _validate_opened_log_file(stream, slot, agent_home_root)
+            HOST_FILESYSTEM.restrict_private_descriptor(stream.fileno())
             written = stream.write(encoded)
             if written != len(encoded):
                 raise OSError("Runtime Log append did not write the complete record")
@@ -329,41 +349,27 @@ class RuntimeLogLifetime:
             active_slot = int(slot.name.rsplit(".", 1)[1])
             self._rotate(slot.parent, active_slot)
 
-    def _prepare_storage(self) -> tuple[Path, bool]:
-        agent_home = self._agent_home.path
-        agent_home.mkdir(parents=True, exist_ok=True)
-        agent_home_root = agent_home.resolve(strict=True)
-        logs = agent_home / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
-        _validate_log_directory(logs, agent_home_root)
-        HOST_FILESYSTEM.restrict_private_directory(logs)
+    def _prepare_storage(
+        self,
+        logs: Path,
+        agent_home_root: Path,
+    ) -> tuple[Path, bool]:
         slot_existed = any(
             (logs / name).exists() or (logs / name).is_symlink()
             for name in ("run.log.0", "run.log.1")
         )
-        for name, content in {
-            "run.log.0": b"",
-            "run.log.1": b"",
-            "run.log.lock": b"",
-        }.items():
+        for name in ("run.log.0", "run.log.1"):
             path = logs / name
-            if path.exists() or path.is_symlink():
-                _validate_log_file(path, agent_home_root)
-            else:
-                HOST_FILESYSTEM.atomic_create_bytes(path, content)
-            _validate_log_file(path, agent_home_root)
-            HOST_FILESYSTEM.restrict_private_file(path)
+            if not path.exists() and not path.is_symlink():
+                HOST_FILESYSTEM.atomic_create_bytes(path, b"")
         cursor_path = logs / "run.log.cursor"
         cursor_recovered = False
-        if cursor_path.exists() or cursor_path.is_symlink():
-            _validate_log_file(cursor_path, agent_home_root)
-        elif slot_existed:
-            self._replace_bytes(cursor_path, b"0\n")
-            cursor_recovered = True
-        else:
-            HOST_FILESYSTEM.atomic_create_bytes(cursor_path, b"0\n")
-        _validate_log_file(cursor_path, agent_home_root)
-        HOST_FILESYSTEM.restrict_private_file(cursor_path)
+        if not cursor_path.exists() and not cursor_path.is_symlink():
+            if slot_existed:
+                self._replace_bytes(cursor_path, b"0\n")
+                cursor_recovered = True
+            else:
+                HOST_FILESYSTEM.atomic_create_bytes(cursor_path, b"0\n")
         cursor = _read_validated_log_file(cursor_path, agent_home_root)
         if cursor not in {b"0\n", b"1\n"}:
             self._replace_bytes(cursor_path, b"0\n")
@@ -523,9 +529,7 @@ def _validate_log_file(path: Path, agent_home_root: Path) -> None:
     try:
         HOST_FILESYSTEM.require_contained_regular_file(path, within=agent_home_root)
     except UnsafeFilesystemPath as error:
-        raise PermissionError(
-            "Runtime Log files must be unaliased inside Agent Home"
-        ) from error
+        raise PermissionError("Runtime Log files must be unaliased inside Agent Home") from error
     except OSError as error:
         raise PermissionError("Runtime Log file is unavailable") from error
 
@@ -540,15 +544,12 @@ def _validate_opened_log_file(
             stream.fileno(), path, within=agent_home_root
         )
     except UnsafeFilesystemPath as error:
-        raise PermissionError(
-            "Runtime Log files must remain stable and unaliased"
-        ) from error
+        raise PermissionError("Runtime Log files must remain stable and unaliased") from error
     except OSError as error:
         raise PermissionError("Runtime Log file is unavailable") from error
 
 
 def _read_validated_log_file(path: Path, agent_home_root: Path) -> bytes:
-    _validate_log_file(path, agent_home_root)
     with path.open("rb", buffering=0) as stream:
         _validate_opened_log_file(stream, path, agent_home_root)
         HOST_FILESYSTEM.restrict_private_descriptor(stream.fileno())
