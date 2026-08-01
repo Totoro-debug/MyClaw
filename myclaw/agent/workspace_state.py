@@ -74,23 +74,15 @@ class WorkspaceState:
                 raise _UnsafeStatePath(Path(self.workspace.path))
 
             self.path.mkdir(exist_ok=True)
-            state_root = HOST_FILESYSTEM.require_owned_directory(
-                self.path, within=workspace_root
-            )
+            state_root = HOST_FILESYSTEM.require_owned_directory(self.path, within=workspace_root)
 
             # Publication is create-only, so an existing policy is never read or repaired.
-            HOST_FILESYSTEM.atomic_create_text(
-                self.path / ".gitignore", _GITIGNORE_CONTENT
-            )
+            HOST_FILESYSTEM.atomic_create_text(self.path / ".gitignore", _GITIGNORE_CONTENT)
 
             self.memory_directory.mkdir(exist_ok=True)
-            HOST_FILESYSTEM.require_owned_directory(
-                self.memory_directory, within=state_root
-            )
+            HOST_FILESYSTEM.require_owned_directory(self.memory_directory, within=state_root)
             self.sessions_directory.mkdir(exist_ok=True)
-            HOST_FILESYSTEM.require_owned_directory(
-                self.sessions_directory, within=state_root
-            )
+            HOST_FILESYSTEM.require_owned_directory(self.sessions_directory, within=state_root)
 
             HOST_FILESYSTEM.atomic_create_text(
                 self.long_term_memory_path, _LONG_TERM_MEMORY_TEMPLATE

@@ -51,13 +51,9 @@ def externalize_tool_result(
         io_workspace = HOST_FILESYSTEM.path_for_io(Path(workspace_state.workspace.path))
         workspace_root = io_workspace.resolve(strict=True)
         io_state = HOST_FILESYSTEM.path_for_io(workspace_state.path)
-        state_root = HOST_FILESYSTEM.require_owned_directory(
-            io_state, within=workspace_root
-        )
+        state_root = HOST_FILESYSTEM.require_owned_directory(io_state, within=workspace_root)
         io_sessions = HOST_FILESYSTEM.path_for_io(workspace_state.sessions_directory)
-        sessions_root = HOST_FILESYSTEM.require_owned_directory(
-            io_sessions, within=state_root
-        )
+        sessions_root = HOST_FILESYSTEM.require_owned_directory(io_sessions, within=state_root)
         artifacts_directory = io_sessions / "artifacts"
         artifacts_directory.mkdir(exist_ok=True)
         artifacts_root = HOST_FILESYSTEM.require_owned_directory(

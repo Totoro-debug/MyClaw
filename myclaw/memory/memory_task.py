@@ -194,9 +194,7 @@ class WorkspaceFileMemoryStore:
 
     def _require_private_memory_directory(self) -> None:
         try:
-            HOST_FILESYSTEM.require_owned_directory(
-                self._memory_directory, within=self._state_root
-            )
+            HOST_FILESYSTEM.require_owned_directory(self._memory_directory, within=self._state_root)
         except PermissionError as error:
             raise MemoryPathDeniedError(
                 "Workspace State Memory directory must remain unaliased"

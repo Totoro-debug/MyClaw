@@ -50,9 +50,7 @@ class WorkspaceJsonScheduledWorkStore:
 
     def _read_optional_text(self) -> str | None:
         try:
-            owned_path = HOST_FILESYSTEM.require_owned_regular_file(
-                self.path, within=self._within
-            )
+            owned_path = HOST_FILESYSTEM.require_owned_regular_file(self.path, within=self._within)
         except FileNotFoundError:
             return None
         return owned_path.read_text(encoding="utf-8")

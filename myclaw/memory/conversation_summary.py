@@ -221,18 +221,14 @@ class WorkspaceJsonlSummaryStore:
             pending_root = self._require_pending_directory()
             journal_path = self.pending_directory / f"{session_id}.json"
             if journal_path.exists() or journal_path.is_symlink():
-                HOST_FILESYSTEM.require_owned_regular_file(
-                    journal_path, within=pending_root
-                )
+                HOST_FILESYSTEM.require_owned_regular_file(journal_path, within=pending_root)
             self._replace_bytes(
                 journal_path,
                 json.dumps(journal.to_dict(), ensure_ascii=False, separators=(",", ":")).encode(
                     "utf-8"
                 ),
             )
-            HOST_FILESYSTEM.require_owned_regular_file(
-                journal_path, within=pending_root
-            )
+            HOST_FILESYSTEM.require_owned_regular_file(journal_path, within=pending_root)
             self._append_exact(entry)
             await sessions.update_metadata(
                 session_id,
@@ -249,9 +245,7 @@ class WorkspaceJsonlSummaryStore:
             pending_root = self._require_pending_directory()
             recovered_count = 0
             for journal_path in sorted(self.pending_directory.glob("*.json")):
-                HOST_FILESYSTEM.require_owned_regular_file(
-                    journal_path, within=pending_root
-                )
+                HOST_FILESYSTEM.require_owned_regular_file(journal_path, within=pending_root)
                 journal = _PendingConsolidation.from_bytes(journal_path.read_bytes())
                 if journal_path.stem != journal.session_id:
                     raise ValueError("journal file name must match session_id")

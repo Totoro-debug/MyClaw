@@ -101,5 +101,6 @@ class Security:
             return "workspace"
         return None
 
+
 def _slash_reference(path: Path) -> str:
     return "/".join(path.parts)
