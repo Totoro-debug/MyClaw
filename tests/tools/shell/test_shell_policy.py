@@ -17,6 +17,7 @@ from myclaw.provider.models import (
 )
 from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.models import ModelToolCall
+from myclaw.tools.shell import shell_policy
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_tool import ShellTool
 from myclaw.tools.tool_gateway import ToolGateway
@@ -32,6 +33,20 @@ SESSION_UUIDS = (
     "9b2c3a42-1d2e-4a1e-a827-61f36dc54713",
     "a3bb189e-8bf9-4c4b-ae4a-c6699f6f7e34",
 )
+
+
+def test_posix_git_capture_accepts_a_native_executable_name_without_exe(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "git"
+    executable.write_bytes(b"trusted executable")
+    captured = shell_policy._capture_git_executable(
+        discover=lambda _: str(executable),
+        windows_suffix_required=False,
+    )
+
+    assert captured is not None
+    assert captured.path == executable.resolve(strict=True)
 
 
 class FakeShellBoundary:

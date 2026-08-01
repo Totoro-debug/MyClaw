@@ -3,12 +3,14 @@
 import asyncio
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Final, Protocol
 
+from myclaw.tools.shell.owned_process import (
+    OwnedProcess,
+    OwnedProcessSpawner,
+    default_owned_process_spawner,
+)
 from myclaw.tools.shell.shell_policy import ShellPolicyDenied, ShellRequest, trusted_git_executable
-
-_WINDOWS_SHELL_CREATION_FLAGS: Final = 0x08000200
 
 _HARDENED_GIT_ARGUMENTS: Final = {
     "git status": ("-c", "core.fsmonitor=false", "--no-pager", "status"),
@@ -40,71 +42,6 @@ _HARDENED_GIT_ARGUMENTS: Final = {
 }
 
 
-class ShellProcess(Protocol):
-    async def communicate(self) -> tuple[bytes, bytes | None]: ...
-
-    async def terminate(self) -> None: ...
-
-    async def wait(self) -> None: ...
-
-
-class ShellProcessSpawner(Protocol):
-    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess: ...
-
-
-class _ProcessTree(Protocol):
-    async def terminate(self) -> None: ...
-
-
-class _AsyncioShellProcess:
-    def __init__(
-        self,
-        process: asyncio.subprocess.Process,
-        *,
-        tree: _ProcessTree,
-    ) -> None:
-        self._process = process
-        self._tree = tree
-
-    async def communicate(self) -> tuple[bytes, bytes | None]:
-        stdout, stderr = await self._process.communicate()
-        if self._process.returncode != 0:
-            raise RuntimeError("Shell command failed")
-        return stdout, stderr
-
-    async def wait(self) -> None:
-        await self._process.wait()
-
-    async def terminate(self) -> None:
-        await self._tree.terminate()
-
-
-class AsyncioShellProcessSpawner:
-    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess:
-        from myclaw.tools.shell.windows_job import WindowsJob
-
-        job = WindowsJob.create()
-        process: asyncio.subprocess.Process | None = None
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                cwd=cwd,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                creationflags=_WINDOWS_SHELL_CREATION_FLAGS,
-            )
-            job.assign(process.pid)
-        except BaseException:
-            job.close()
-            if process is not None:
-                if process.returncode is None:
-                    process.kill()
-                await asyncio.shield(process.wait())
-            raise
-        return _AsyncioShellProcess(process, tree=job)
-
-
 class ShellProcessWaiter(Protocol):
     async def wait(
         self,
@@ -126,7 +63,7 @@ class AsyncioShellProcessWaiter:
 
 @dataclass(slots=True)
 class _ActiveProcess:
-    process: ShellProcess
+    process: OwnedProcess
     output: asyncio.Task[tuple[bytes, bytes | None]]
     stop: asyncio.Task[None] | None = None
 
@@ -137,10 +74,10 @@ class SubprocessShellBoundary:
     def __init__(
         self,
         *,
-        spawner: ShellProcessSpawner | None = None,
+        spawner: OwnedProcessSpawner | None = None,
         waiter: ShellProcessWaiter | None = None,
     ) -> None:
-        self._spawner = AsyncioShellProcessSpawner() if spawner is None else spawner
+        self._spawner = default_owned_process_spawner() if spawner is None else spawner
         self._waiter = AsyncioShellProcessWaiter() if waiter is None else waiter
         self._active: dict[int, _ActiveProcess] = {}
         self._lock = asyncio.Lock()
@@ -261,7 +198,7 @@ def _resolved_shell_command(request: ShellRequest) -> tuple[str, ...]:
     return (os.fspath(executable), *arguments)
 
 
-async def _join_spawn(task: asyncio.Task[ShellProcess]) -> ShellProcess:
+async def _join_spawn(task: asyncio.Task[OwnedProcess]) -> OwnedProcess:
     while not task.done():
         try:
             await asyncio.shield(task)

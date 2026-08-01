@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -18,6 +19,7 @@ AUTOMATICALLY_ALLOWED_COMMANDS: Final = frozenset(
     }
 )
 _GIT_FILTER_CONFIG_PATTERN: Final = r"^filter\..*\.(clean|smudge|process)$"
+_WINDOWS_EXECUTABLE_SUFFIX_REQUIRED: Final = os.name == "nt"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,8 +28,12 @@ class _TrustedGitExecutable:
     identity: tuple[int, int, int, int]
 
 
-def _capture_git_executable() -> _TrustedGitExecutable | None:
-    discovered = shutil.which("git")
+def _capture_git_executable(
+    *,
+    discover: Callable[[str], str | None] = shutil.which,
+    windows_suffix_required: bool = _WINDOWS_EXECUTABLE_SUFFIX_REQUIRED,
+) -> _TrustedGitExecutable | None:
+    discovered = discover("git")
     if discovered is None:
         return None
     try:
@@ -35,7 +41,7 @@ def _capture_git_executable() -> _TrustedGitExecutable | None:
         status = path.stat()
     except OSError:
         return None
-    if not path.is_file() or path.suffix.casefold() != ".exe":
+    if not path.is_file() or (windows_suffix_required and path.suffix.casefold() != ".exe"):
         return None
     return _TrustedGitExecutable(
         path=path,

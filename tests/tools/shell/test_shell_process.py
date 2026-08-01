@@ -23,10 +23,13 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from myclaw.tools.models import ModelToolCall
+from myclaw.tools.shell.owned_process import (
+    OwnedProcess,
+    WindowsOwnedProcessSpawner,
+    default_owned_process_spawner,
+)
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_process import (
-    AsyncioShellProcessSpawner,
-    ShellProcess,
     SubprocessShellBoundary,
 )
 from myclaw.tools.shell.shell_tool import ShellTool
@@ -71,7 +74,7 @@ async def test_windows_process_spawner_executes_argv_directly_and_assigns_the_jo
 
     command = ("trusted-git.exe", "-c", "core.fsmonitor=false", "--no-pager", "status")
 
-    await AsyncioShellProcessSpawner().spawn(command, cwd=workspace)
+    await WindowsOwnedProcessSpawner().spawn(command, cwd=workspace)
 
     assert commands == [command]
     assert options["cwd"] == workspace
@@ -197,31 +200,31 @@ class FakeShellProcess:
 
 
 class FakeProcessSpawner:
-    def __init__(self, process: ShellProcess) -> None:
+    def __init__(self, process: OwnedProcess) -> None:
         self._process = process
         self.starts: list[ProcessStart] = []
 
-    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess:
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> OwnedProcess:
         self.starts.append(ProcessStart(command=command, cwd=cwd))
         return self._process
 
 
 class SequenceProcessSpawner:
-    def __init__(self, processes: tuple[ShellProcess, ...]) -> None:
+    def __init__(self, processes: tuple[OwnedProcess, ...]) -> None:
         self._processes = iter(processes)
 
-    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess:
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> OwnedProcess:
         del command, cwd
         return next(self._processes)
 
 
 class DelayedProcessSpawner:
-    def __init__(self, process: ShellProcess) -> None:
+    def __init__(self, process: OwnedProcess) -> None:
         self._process = process
         self.created = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess:
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> OwnedProcess:
         del command, cwd
         self.created.set()
         await self.release.wait()
@@ -232,9 +235,9 @@ class DirectCommandSpawner:
     def __init__(self, command: tuple[str, ...]) -> None:
         self._command = command
 
-    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess:
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> OwnedProcess:
         del command
-        return await AsyncioShellProcessSpawner().spawn(self._command, cwd=cwd)
+        return await default_owned_process_spawner().spawn(self._command, cwd=cwd)
 
 
 class BlockingFakeShellProcess:
