@@ -55,7 +55,7 @@ jobs:
       - name: Run strict type gate
         run: python -m mypy myclaw tests
 
-      - name: Build the sole Windows x64 wheel
+      - name: Build the sole universal wheel
         run: |
           Remove-Item dist, build, myclaw.egg-info -Recurse -Force -ErrorAction SilentlyContinue
           python -m build --wheel
@@ -64,10 +64,10 @@ jobs:
             throw "Expected exactly one release artifact; found $($artifacts.Count)"
           }
           $wheel = $artifacts[0]
-          if ($wheel.Name -notmatch '^myclaw-[^-]+-py3-none-win_amd64\.whl$') {
+          if ($wheel.Name -notmatch '^myclaw-[^-]+-py3-none-any\.whl$') {
             throw "Unexpected release artifact: $($wheel.Name)"
           }
-          python -c "import sys, zipfile; archive = zipfile.ZipFile(sys.argv[1]); wheel = next(name for name in archive.namelist() if name.endswith('.dist-info/WHEEL')); tags = [line for line in archive.read(wheel).decode().splitlines() if line.startswith('Tag: ')]; assert tags == ['Tag: py3-none-win_amd64'], tags" $wheel.FullName
+          python -c "import sys, zipfile; archive = zipfile.ZipFile(sys.argv[1]); wheel = next(name for name in archive.namelist() if name.endswith('.dist-info/WHEEL')); tags = [line for line in archive.read(wheel).decode().splitlines() if line.startswith('Tag: ')]; assert tags == ['Tag: py3-none-any'], tags" $wheel.FullName
           "MYCLAW_WHEEL=$($wheel.FullName)" >> $env:GITHUB_ENV
 
       - name: Install wheel in a clean environment

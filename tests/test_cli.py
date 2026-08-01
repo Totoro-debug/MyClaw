@@ -2,10 +2,8 @@ import asyncio
 import os
 import shutil
 import subprocess
-import sys
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import datetime
-from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -15,13 +13,11 @@ import pytest
 import typer
 
 import myclaw.terminal.cli as cli
-import myclaw.terminal.entrypoint as entrypoint
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.platform_support import UnsupportedPlatformError
 from myclaw.provider.factory import create_provider
 from myclaw.runtime_log import install_runtime_logging
 from tests.configuration.test_config import (
@@ -64,48 +60,6 @@ def run_installed_myclaw(
 def assert_plaintext_absent(output: str, *plaintext_values: str) -> None:
     if any(value in output for value in plaintext_values):
         pytest.fail("CLI output leaked a plaintext provider API key", pytrace=False)
-
-
-@pytest.mark.parametrize("arguments", ((), ("config",), ("--help",)))
-def test_cli_entrypoint_rejects_unsupported_platform_before_typer_dispatch(
-    monkeypatch: pytest.MonkeyPatch,
-    arguments: tuple[str, ...],
-) -> None:
-    output = StringIO()
-    app_called = False
-
-    def unsupported() -> None:
-        raise UnsupportedPlatformError("unsupported_x64")
-
-    def dispatch_spy() -> None:
-        nonlocal app_called
-        app_called = True
-
-    monkeypatch.setattr(sys, "argv", ["myclaw", *arguments])
-    monkeypatch.setattr(entrypoint, "require_supported_platform", unsupported)
-    monkeypatch.setattr(entrypoint, "_dispatch_cli", dispatch_spy)
-    monkeypatch.setattr(sys, "stdout", output)
-
-    assert entrypoint.cli_entrypoint() == 2
-    assert app_called is False
-    assert "unsupported_platform" in output.getvalue()
-    assert "unsupported_x64" in output.getvalue()
-
-
-def test_cli_entrypoint_dispatches_typer_on_windows_x64(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    app_called = False
-
-    def dispatch_spy() -> None:
-        nonlocal app_called
-        app_called = True
-
-    monkeypatch.setattr(entrypoint, "require_supported_platform", lambda: None)
-    monkeypatch.setattr(entrypoint, "_dispatch_cli", dispatch_spy)
-
-    assert entrypoint.cli_entrypoint() == 0
-    assert app_called is True
 
 
 def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_error(

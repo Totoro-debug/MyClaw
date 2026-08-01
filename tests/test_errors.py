@@ -15,7 +15,6 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
             "config_missing",
             "config_parse_error",
             "config_invalid",
-            "unsupported_platform",
             "persistence_error",
             "route_unavailable",
             "provider_auth_error",
