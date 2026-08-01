@@ -2,8 +2,6 @@
 
 import asyncio
 import os
-import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Protocol
@@ -40,11 +38,6 @@ _HARDENED_GIT_ARGUMENTS: Final = {
         "--name-only",
     ),
 }
-_WINDOWS_SHELL_BOOTSTRAP: Final = (
-    "import subprocess, sys; "
-    "gate = sys.stdin.buffer.read(1); "
-    "raise SystemExit(125 if gate != b'1' else subprocess.call(sys.argv[1], shell=True))"
-)
 
 
 class ShellProcess(Protocol):
@@ -56,7 +49,7 @@ class ShellProcess(Protocol):
 
 
 class ShellProcessSpawner(Protocol):
-    async def spawn(self, command: str, *, cwd: Path) -> ShellProcess: ...
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess: ...
 
 
 class _ProcessTree(Protocol):
@@ -87,38 +80,24 @@ class _AsyncioShellProcess:
 
 
 class AsyncioShellProcessSpawner:
-    async def spawn(self, command: str, *, cwd: Path) -> ShellProcess:
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess:
         from myclaw.tools.shell.windows_job import WindowsJob
 
-        platform_command = "cd" if command == "pwd" else command
         job = WindowsJob.create()
         process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-I",
-                "-S",
-                "-c",
-                _WINDOWS_SHELL_BOOTSTRAP,
-                platform_command,
+                *command,
                 cwd=cwd,
-                stdin=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 creationflags=_WINDOWS_SHELL_CREATION_FLAGS,
             )
             job.assign(process.pid)
-            if process.stdin is None:
-                raise RuntimeError("Windows Shell bootstrap has no stdin gate")
-            process.stdin.write(b"1")
-            await process.stdin.drain()
-            process.stdin.close()
-            await process.stdin.wait_closed()
         except BaseException:
             job.close()
             if process is not None:
-                if process.stdin is not None:
-                    process.stdin.close()
                 if process.returncode is None:
                     process.kill()
                 await asyncio.shield(process.wait())
@@ -168,6 +147,11 @@ class SubprocessShellBoundary:
         self._closed = False
 
     async def execute(self, request: ShellRequest) -> str:
+        if request.command == "pwd":
+            async with self._lock:
+                if self._closed:
+                    raise RuntimeError("Shell process boundary is closed")
+            return os.fspath(request.cwd)
         command = _resolved_shell_command(request)
         async with self._lock:
             if self._closed:
@@ -267,15 +251,14 @@ class SubprocessShellBoundary:
             raise cleanup_error
 
 
-def _resolved_shell_command(request: ShellRequest) -> str:
+def _resolved_shell_command(request: ShellRequest) -> tuple[str, ...]:
     arguments = _HARDENED_GIT_ARGUMENTS.get(request.command)
     if arguments is None:
-        return request.command
+        return (request.command,)
     executable = trusted_git_executable(workspace=request.workspace_root)
     if executable is None:
         raise ShellPolicyDenied("trusted Git executable is unavailable")
-    command = (os.fspath(executable), *arguments)
-    return subprocess.list2cmdline(command)
+    return (os.fspath(executable), *arguments)
 
 
 async def _join_spawn(task: asyncio.Task[ShellProcess]) -> ShellProcess:

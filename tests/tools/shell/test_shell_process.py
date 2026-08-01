@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import ctypes
 import shutil
 import subprocess
@@ -39,40 +38,17 @@ from tests.fixtures import ScriptedFakeProvider, StreamScript
 WINDOWS_NEW_GROUP_NO_WINDOW = 0x08000200
 
 
-def _windows_shell_command(arguments: list[str]) -> str:
-    return subprocess.list2cmdline(arguments)
-
-
-def _python_shell_command(script: str) -> str:
-    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
-    loader = f"import base64; exec(base64.b64decode({encoded!r}))"
-    return _windows_shell_command([sys.executable, "-c", loader])
-
-
 @pytest.mark.asyncio
-async def test_windows_shell_bootstrap_isolated_from_foreground_interrupts(
+async def test_windows_process_spawner_executes_argv_directly_and_assigns_the_job(
     monkeypatch: pytest.MonkeyPatch,
     workspace: Path,
 ) -> None:
+    commands: list[tuple[str, ...]] = []
     options: dict[str, object] = {}
-
-    class FakeStdin:
-        def write(self, data: bytes) -> None:
-            assert data == b"1"
-
-        async def drain(self) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
-
-        async def wait_closed(self) -> None:
-            return None
 
     class FakeProcess:
         pid = 123
         returncode = 0
-        stdin = FakeStdin()
 
     class FakeJob:
         def __init__(self) -> None:
@@ -85,7 +61,7 @@ async def test_windows_shell_bootstrap_isolated_from_foreground_interrupts(
             return None
 
     async def create_process(*command: str, **kwargs: object) -> asyncio.subprocess.Process:
-        del command
+        commands.append(command)
         options.update(kwargs)
         return cast(asyncio.subprocess.Process, FakeProcess())
 
@@ -93,8 +69,13 @@ async def test_windows_shell_bootstrap_isolated_from_foreground_interrupts(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
     monkeypatch.setattr(WindowsJob, "create", staticmethod(lambda: job))
 
-    await AsyncioShellProcessSpawner().spawn("echo isolated", cwd=workspace)
+    command = ("trusted-git.exe", "-c", "core.fsmonitor=false", "--no-pager", "status")
 
+    await AsyncioShellProcessSpawner().spawn(command, cwd=workspace)
+
+    assert commands == [command]
+    assert options["cwd"] == workspace
+    assert options["stdin"] is asyncio.subprocess.DEVNULL
     assert options["creationflags"] == WINDOWS_NEW_GROUP_NO_WINDOW
     assert job.assigned == [123]
 
@@ -193,7 +174,7 @@ async def test_process_liveness_probe_does_not_terminate_a_live_process() -> Non
 
 @dataclass(frozen=True, slots=True)
 class ProcessStart:
-    command: str
+    command: tuple[str, ...]
     cwd: Path
 
 
@@ -220,7 +201,7 @@ class FakeProcessSpawner:
         self._process = process
         self.starts: list[ProcessStart] = []
 
-    async def spawn(self, command: str, *, cwd: Path) -> ShellProcess:
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess:
         self.starts.append(ProcessStart(command=command, cwd=cwd))
         return self._process
 
@@ -229,7 +210,7 @@ class SequenceProcessSpawner:
     def __init__(self, processes: tuple[ShellProcess, ...]) -> None:
         self._processes = iter(processes)
 
-    async def spawn(self, command: str, *, cwd: Path) -> ShellProcess:
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess:
         del command, cwd
         return next(self._processes)
 
@@ -240,11 +221,20 @@ class DelayedProcessSpawner:
         self.created = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def spawn(self, command: str, *, cwd: Path) -> ShellProcess:
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess:
         del command, cwd
         self.created.set()
         await self.release.wait()
         return self._process
+
+
+class DirectCommandSpawner:
+    def __init__(self, command: tuple[str, ...]) -> None:
+        self._command = command
+
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> ShellProcess:
+        del command
+        return await AsyncioShellProcessSpawner().spawn(self._command, cwd=cwd)
 
 
 class BlockingFakeShellProcess:
@@ -433,10 +423,12 @@ async def test_shell_boundary_runs_in_the_resolved_cwd_and_returns_output(
     spawner = FakeProcessSpawner(process)
     shell = SubprocessShellBoundary(spawner=spawner)
 
-    output = await shell.execute(ShellRequest(command="pwd", cwd=workspace.resolve(), timeout=60))
+    output = await shell.execute(
+        ShellRequest(command="test-operation", cwd=workspace.resolve(), timeout=60)
+    )
 
     assert output == "workspace output\n"
-    assert spawner.starts == [ProcessStart(command="pwd", cwd=workspace.resolve())]
+    assert spawner.starts == [ProcessStart(command=("test-operation",), cwd=workspace.resolve())]
     assert process.communicated is True
     assert process.terminate_calls == 1
     assert process.wait_calls == 1
@@ -453,7 +445,7 @@ async def test_repeated_successful_commands_release_process_tree_ownership_befor
         for index in range(12):
             assert (
                 await shell.execute(
-                    ShellRequest(command="pwd", cwd=workspace.resolve(), timeout=60)
+                    ShellRequest(command="test-operation", cwd=workspace.resolve(), timeout=60)
                 )
                 == f"output {index}\n"
             )
@@ -474,24 +466,27 @@ async def test_repeated_successful_commands_release_process_tree_ownership_befor
 async def test_repeated_successful_commands_do_not_accumulate_windows_handles(
     workspace: Path,
 ) -> None:
+    subprocess.run(("git", "init", "-q", str(workspace)), check=True)
     shell = SubprocessShellBoundary()
 
     try:
         await shell.execute(
-            ShellRequest(command="echo warm-up", cwd=workspace.resolve(), timeout=60)
+            ShellRequest(command="git status --short", cwd=workspace.resolve(), timeout=60)
         )
         await asyncio.sleep(0)
         baseline = _windows_handle_count()
 
-        for index in range(12):
-            output = await shell.execute(
-                ShellRequest(
-                    command=f"echo handle-check-{index}",
-                    cwd=workspace.resolve(),
-                    timeout=60,
+        for _ in range(12):
+            assert (
+                await shell.execute(
+                    ShellRequest(
+                        command="git status --short",
+                        cwd=workspace.resolve(),
+                        timeout=60,
+                    )
                 )
+                == ""
             )
-            assert output.strip() == f"handle-check-{index}"
         await asyncio.sleep(0)
 
         assert _windows_handle_count() <= baseline + 4
@@ -544,7 +539,7 @@ async def test_allowlisted_git_commands_disable_pager_external_diff_and_textconv
 ) -> None:
     discovered_git = shutil.which("git")
     assert discovered_git is not None
-    executed = _windows_shell_command([str(Path(discovered_git).resolve(strict=True)), *arguments])
+    executed = (str(Path(discovered_git).resolve(strict=True)), *arguments)
     spawner = FakeProcessSpawner(FakeShellProcess(b"git output\n"))
     shell = SubprocessShellBoundary(spawner=spawner)
 
@@ -862,14 +857,15 @@ async def test_close_retries_cleanup_failed_after_cancellation_during_spawn(
 
 
 @pytest.mark.asyncio
-async def test_production_shell_boundary_executes_a_real_windows_shell_process(
+async def test_production_shell_boundary_executes_a_real_git_operation_directly(
     workspace: Path,
 ) -> None:
+    subprocess.run(("git", "init", "-q", str(workspace)), check=True)
     shell = SubprocessShellBoundary()
     try:
         output = await shell.execute(
             ShellRequest(
-                command="echo real-shell-output",
+                command="git status",
                 cwd=workspace.resolve(),
                 timeout=60,
             )
@@ -877,7 +873,7 @@ async def test_production_shell_boundary_executes_a_real_windows_shell_process(
     finally:
         await shell.close()
 
-    assert output.strip() == "real-shell-output"
+    assert "On branch" in output
 
 
 @pytest.mark.asyncio
@@ -890,11 +886,10 @@ async def test_production_shell_cancellation_leaves_no_grandchild_process(
         f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='utf-8'); "
         "time.sleep(60)"
     )
-    command = _windows_shell_command([sys.executable, "-c", script])
-    shell = SubprocessShellBoundary()
+    shell = SubprocessShellBoundary(spawner=DirectCommandSpawner((sys.executable, "-c", script)))
     child_pid: int | None = None
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command=command, cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="test-operation", cwd=workspace.resolve(), timeout=60))
     )
     try:
         await _wait_for_path(pid_path)
@@ -919,14 +914,17 @@ async def test_shell_timeout_terminates_descendants_after_the_root_process_exits
     pid_path = workspace / "orphaned-shell-child.pid"
     child_script = "import time; time.sleep(10)"
     outer_script = (
-        "import pathlib, subprocess, sys; "
+        "import pathlib, subprocess, sys, time; "
+        "time.sleep(0.1); "
         f"child = subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
         f"pathlib.Path({str(pid_path)!r}).write_text(str(child.pid), encoding='utf-8')"
     )
-    command = _python_shell_command(outer_script)
-    shell = SubprocessShellBoundary(waiter=PathTimeoutWaiter(pid_path))
+    shell = SubprocessShellBoundary(
+        spawner=DirectCommandSpawner((sys.executable, "-c", outer_script)),
+        waiter=PathTimeoutWaiter(pid_path),
+    )
     execution = asyncio.create_task(
-        shell.execute(ShellRequest(command=command, cwd=workspace.resolve(), timeout=60))
+        shell.execute(ShellRequest(command="test-operation", cwd=workspace.resolve(), timeout=60))
     )
     child_pid: int | None = None
     try:
@@ -959,18 +957,21 @@ async def test_shell_execute_terminates_descendants_after_normal_root_completion
     pid_path = workspace / "detached-shell-child.pid"
     child_script = "import time; time.sleep(10)"
     outer_script = (
-        "import pathlib, subprocess, sys; "
+        "import pathlib, subprocess, sys, time; "
+        "time.sleep(0.1); "
         "child = subprocess.Popen("
         f"[sys.executable, '-c', {child_script!r}], "
         "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
         f"pathlib.Path({str(pid_path)!r}).write_text(str(child.pid), encoding='utf-8')"
     )
-    shell = SubprocessShellBoundary()
+    shell = SubprocessShellBoundary(
+        spawner=DirectCommandSpawner((sys.executable, "-c", outer_script))
+    )
     child_pid: int | None = None
     try:
         await shell.execute(
             ShellRequest(
-                command=_python_shell_command(outer_script),
+                command="test-operation",
                 cwd=workspace.resolve(),
                 timeout=60,
             )
@@ -987,11 +988,12 @@ async def test_shell_execute_terminates_descendants_after_normal_root_completion
 
 
 @pytest.mark.asyncio
-async def test_tool_gateway_runs_allowlisted_pwd_through_the_windows_shell(
+async def test_tool_gateway_returns_validated_native_pwd_without_starting_a_process(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    shell = SubprocessShellBoundary()
+    spawner = FakeProcessSpawner(FakeShellProcess(b"process output must not be used"))
+    shell = SubprocessShellBoundary(spawner=spawner)
     gateway = ToolGateway()
     gateway.register_tools((ShellTool(workspace=workspace, boundary=shell),))
     try:
@@ -1006,7 +1008,8 @@ async def test_tool_gateway_runs_allowlisted_pwd_through_the_windows_shell(
         await shell.close()
 
     assert result.status == "success"
-    assert Path(result.content.strip()).resolve() == workspace.resolve()
+    assert result.content == str(workspace.resolve())
+    assert spawner.starts == []
 
 
 @pytest.mark.asyncio
@@ -1045,6 +1048,7 @@ async def test_runtime_shutdown_cancels_a_shell_turn_without_double_termination(
     agent_home: Path,
     workspace: Path,
 ) -> None:
+    subprocess.run(("git", "init", "-q", str(workspace)), check=True)
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
@@ -1062,7 +1066,7 @@ async def test_runtime_shutdown_cancels_a_shell_turn_without_double_termination(
                                     ModelToolCall(
                                         id="call_shell",
                                         name="shell",
-                                        arguments='{"command":"pwd","timeout":60}',
+                                        arguments='{"command":"git status","timeout":60}',
                                     ),
                                 ),
                             ),
