@@ -362,6 +362,8 @@ class RuntimeLogLifetime:
             path = logs / name
             if not path.exists() and not path.is_symlink():
                 HOST_FILESYSTEM.atomic_create_bytes(path, b"")
+            _validate_log_file(path, agent_home_root)
+            HOST_FILESYSTEM.restrict_private_file(path)
         cursor_path = logs / "run.log.cursor"
         cursor_recovered = False
         if not cursor_path.exists() and not cursor_path.is_symlink():

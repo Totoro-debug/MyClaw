@@ -562,6 +562,30 @@ def test_runtime_log_rejects_hard_linked_state_without_affecting_the_caller(
     assert capsys.readouterr().err == "Runtime Log failure: PermissionError\n"
 
 
+def test_runtime_log_rejects_an_unsafe_inactive_slot(
+    agent_home: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    active = logs / "run.log.0"
+    active.write_bytes(b"")
+    outside = tmp_path / "outside.log"
+    outside.write_text("outside remains unchanged\n", encoding="utf-8")
+    os.link(outside, logs / "run.log.1")
+    (logs / "run.log.cursor").write_bytes(b"0\n")
+    (logs / "run.log.lock").write_bytes(b"")
+
+    lifetime = install_runtime_logging(AgentHome(agent_home))
+    logging.getLogger("myclaw.storage").error("must fail before the active append")
+    lifetime.close()
+
+    assert active.read_bytes() == b""
+    assert outside.read_text(encoding="utf-8") == "outside remains unchanged\n"
+    assert capsys.readouterr().err == "Runtime Log failure: PermissionError\n"
+
+
 def test_runtime_log_close_abandons_records_after_ten_second_deadline(
     agent_home: Path,
     monkeypatch: pytest.MonkeyPatch,
