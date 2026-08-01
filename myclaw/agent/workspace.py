@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import ntpath
+import os
 from dataclasses import dataclass
-from pathlib import Path, PurePath, PureWindowsPath
+from pathlib import Path, PurePath
 from typing import Self
 
 
@@ -12,19 +12,15 @@ from typing import Self
 class Workspace:
     """A normalized absolute Workspace identity."""
 
-    path: PureWindowsPath
+    path: Path
 
     @classmethod
     def from_path(cls, path: PurePath) -> Self:
-        """Build a Windows Workspace without resolving filesystem aliases."""
+        """Build a native Workspace without resolving filesystem aliases."""
         if isinstance(path, Path):
-            if not isinstance(path, PureWindowsPath):
-                raise ValueError("Workspace path must use Windows syntax")
-            normalized = PureWindowsPath(ntpath.abspath(str(path)))
-        elif isinstance(path, PureWindowsPath):
-            normalized = PureWindowsPath(ntpath.normpath(str(path)))
+            normalized = Path(os.path.abspath(path))
         else:
-            raise ValueError("Workspace path must use Windows syntax")
+            normalized = Path(os.path.normpath(path))
 
         if not normalized.is_absolute():
             raise ValueError("Workspace path must be absolute")

@@ -12,10 +12,18 @@ from stat import (
     FILE_ATTRIBUTE_DEVICE,
     FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT,
+    S_ISDIR,
+    S_ISREG,
 )
 from typing import Final, Protocol
 
 type FileIdentity = tuple[int, int, int, int]
+
+_WINDOWS_RESERVED_BASENAMES: Final = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
 
 
 class UnsafeFilesystemPath(PermissionError):
@@ -32,6 +40,12 @@ class FilesystemAdapter(Protocol):
     def is_regular_file(self, status: stat_result) -> bool: ...
 
     def resolved_for_comparison(self, path: Path) -> Path: ...
+
+    def is_reserved_component(self, component: str) -> bool: ...
+
+    def has_alternate_data_stream(self, component: str) -> bool: ...
+
+    def sync_file(self, descriptor: int) -> None: ...
 
     def sync_parent_directory(self, path: Path) -> None: ...
 
@@ -66,8 +80,76 @@ class WindowsFilesystemAdapter:
             return Path(f"\\\\{native.removeprefix('\\\\?\\UNC\\')}")
         return Path(native.removeprefix("\\\\?\\"))
 
+    def is_reserved_component(self, component: str) -> bool:
+        normalized = component.rstrip(" .")
+        basename = normalized.split(".", maxsplit=1)[0].upper()
+        return basename in _WINDOWS_RESERVED_BASENAMES
+
+    def has_alternate_data_stream(self, component: str) -> bool:
+        return ":" in component
+
+    def sync_file(self, descriptor: int) -> None:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno != errno.EINVAL:
+                raise
+
     def sync_parent_directory(self, path: Path) -> None:
         del path
+
+
+class PosixFilesystemAdapter:
+    """POSIX native path, object-type, and durability behavior."""
+
+    def path_for_io(self, path: Path) -> Path:
+        return Path(path)
+
+    def is_directory(self, status: stat_result) -> bool:
+        return S_ISDIR(status.st_mode)
+
+    def is_regular_file(self, status: stat_result) -> bool:
+        return S_ISREG(status.st_mode)
+
+    def resolved_for_comparison(self, path: Path) -> Path:
+        return path.resolve(strict=True)
+
+    def is_reserved_component(self, component: str) -> bool:
+        del component
+        return False
+
+    def has_alternate_data_stream(self, component: str) -> bool:
+        del component
+        return False
+
+    def sync_file(self, descriptor: int) -> None:
+        unsupported = {
+            errno.EINVAL,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in unsupported:
+                raise
+
+    def sync_parent_directory(self, path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError:
+            return
+        try:
+            try:
+                os.fsync(descriptor)
+            except OSError:
+                pass
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 class HostFilesystem:
@@ -87,6 +169,14 @@ class HostFilesystem:
     def is_regular_file(self, status: stat_result) -> bool:
         """Return whether a status identifies an ordinary host regular file."""
         return self._adapter.is_regular_file(status)
+
+    def is_reserved_component(self, component: str) -> bool:
+        """Return whether a native path component names a reserved object."""
+        return self._adapter.is_reserved_component(component)
+
+    def has_alternate_data_stream(self, component: str) -> bool:
+        """Return whether a component uses native alternate-stream syntax."""
+        return self._adapter.has_alternate_data_stream(component)
 
     def require_owned_directory(self, path: Path, *, within: Path) -> Path:
         """Return an ordinary contained directory or reject an unsafe path."""
@@ -198,7 +288,7 @@ class HostFilesystem:
                 if written != len(content):
                     raise OSError("atomic creation did not write the complete content")
                 stream.flush()
-                _fsync_file(stream.fileno())
+                self._adapter.sync_file(stream.fileno())
                 identity = self.file_identity(os.fstat(stream.fileno()))
             try:
                 os.link(temporary, io_target)
@@ -232,7 +322,7 @@ class HostFilesystem:
                 if written != len(content):
                     raise OSError("atomic replacement did not write the complete content")
                 stream.flush()
-                _fsync_file(stream.fileno())
+                self._adapter.sync_file(stream.fileno())
             os.replace(temporary, io_target)
             self._adapter.sync_parent_directory(io_target.parent)
         finally:
@@ -257,13 +347,6 @@ def _raise_unsafe(path: Path) -> None:
     raise UnsafeFilesystemPath(EACCES, "Owned path is unavailable or unsafe", str(path))
 
 
-def _fsync_file(descriptor: int) -> None:
-    try:
-        os.fsync(descriptor)
-    except OSError as error:
-        if error.errno != errno.EINVAL:
-            raise
-
-
 WINDOWS_HOST_FILESYSTEM: Final = HostFilesystem(WindowsFilesystemAdapter())
-HOST_FILESYSTEM: Final = WINDOWS_HOST_FILESYSTEM
+POSIX_HOST_FILESYSTEM: Final = HostFilesystem(PosixFilesystemAdapter())
+HOST_FILESYSTEM: Final = WINDOWS_HOST_FILESYSTEM if os.name == "nt" else POSIX_HOST_FILESYSTEM

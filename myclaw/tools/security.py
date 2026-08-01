@@ -6,12 +6,6 @@ from myclaw.agent.workspace import Workspace
 from myclaw.tools.errors import ToolError
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
-_WINDOWS_RESERVED_BASENAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{index}" for index in range(1, 10)}
-    | {f"LPT{index}" for index in range(1, 10)}
-)
-
 
 class Security:
     """Resolve model-provided paths within configured readable roots."""
@@ -39,7 +33,7 @@ class Security:
         candidate = Path(requested)
         artifact_alias = False
         memory_alias = False
-        if any(_is_windows_reserved(part) for part in candidate.parts):
+        if any(HOST_FILESYSTEM.is_reserved_component(part) for part in candidate.parts):
             raise ToolError("The requested path identifies a Windows device.")
         if not candidate.is_absolute():
             if candidate.parts == ("memory", "memory.md"):
@@ -78,7 +72,7 @@ class Security:
             relative_parts = resolved.relative_to(self._artifact_directory).parts
         else:
             relative_parts = resolved.relative_to(self._workspace).parts
-        if any(":" in part for part in relative_parts):
+        if any(HOST_FILESYSTEM.has_alternate_data_stream(part) for part in relative_parts):
             raise ToolError("The requested path identifies a Windows alternate data stream.")
         return resolved
 
@@ -106,13 +100,6 @@ class Security:
         if target.is_relative_to(self._workspace):
             return "workspace"
         return None
-
-
-def _is_windows_reserved(component: str) -> bool:
-    normalized = component.rstrip(" .")
-    basename = normalized.split(".", maxsplit=1)[0].upper()
-    return basename in _WINDOWS_RESERVED_BASENAMES
-
 
 def _slash_reference(path: Path) -> str:
     return "/".join(path.parts)

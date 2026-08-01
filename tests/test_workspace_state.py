@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -145,6 +146,27 @@ def test_repeated_initialization_preserves_policy_memory_and_unknown_entries(
     assert gitignore.read_bytes() == b"!memory/memory.md\r\n"
     assert unknown.read_bytes() == b"future schema"
     assert state.long_term_memory_path.read_bytes() == b"# Existing memory\r\n"
+
+
+def test_copying_a_complete_workspace_retains_its_workspace_state(
+    agent_home: Path,
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    state = state_for(workspace)
+    state.initialize(agent_home_root=agent_home)
+    state.long_term_memory_path.write_bytes(b"# Portable memory\n")
+    session = state.sessions_directory / "portable-session.jsonl"
+    session.write_bytes(b'{"record_type":"portable-test"}\n')
+    copied_workspace = tmp_path / "copied-workspace"
+
+    shutil.copytree(workspace, copied_workspace)
+    copied_state = state_for(copied_workspace)
+
+    assert copied_state.long_term_memory_path.read_bytes() == b"# Portable memory\n"
+    assert (copied_state.sessions_directory / session.name).read_bytes() == session.read_bytes()
+    assert copied_state.path != state.path
+    assert not (copied_workspace / agent_home.name / "config.toml").exists()
 
 
 def test_generic_file_security_rejects_workspace_state(

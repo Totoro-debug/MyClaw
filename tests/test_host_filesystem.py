@@ -1,11 +1,21 @@
+import os
 import subprocess
+from os import stat_result
 from pathlib import Path
+from stat import S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG
 
 import pytest
 
-from myclaw.utils.host_filesystem import WINDOWS_HOST_FILESYSTEM
+from myclaw.utils.host_filesystem import (
+    HOST_FILESYSTEM,
+    POSIX_HOST_FILESYSTEM,
+    WINDOWS_HOST_FILESYSTEM,
+)
+
+windows_only = pytest.mark.skipif(os.name != "nt", reason="requires native Windows paths")
 
 
+@windows_only
 def test_windows_host_filesystem_prepares_local_and_unc_io_paths(tmp_path: Path) -> None:
     local = tmp_path / "state.txt"
     unc = Path(r"\\server\share\state.txt")
@@ -14,6 +24,7 @@ def test_windows_host_filesystem_prepares_local_and_unc_io_paths(tmp_path: Path)
     assert WINDOWS_HOST_FILESYSTEM.path_for_io(unc) == Path(r"\\?\UNC\server\share\state.txt")
 
 
+@windows_only
 def test_windows_host_filesystem_accepts_an_owned_directory(tmp_path: Path) -> None:
     owned = tmp_path / "owned"
     child = owned / "child"
@@ -24,6 +35,7 @@ def test_windows_host_filesystem_accepts_an_owned_directory(tmp_path: Path) -> N
     )
 
 
+@windows_only
 def test_windows_host_filesystem_rejects_redirected_or_external_directory(
     tmp_path: Path,
 ) -> None:
@@ -44,6 +56,7 @@ def test_windows_host_filesystem_rejects_redirected_or_external_directory(
             WINDOWS_HOST_FILESYSTEM.require_owned_directory(candidate, within=owned)
 
 
+@windows_only
 def test_windows_host_filesystem_accepts_an_owned_regular_file(tmp_path: Path) -> None:
     owned = tmp_path / "owned"
     owned.mkdir()
@@ -60,8 +73,8 @@ def test_host_filesystem_create_only_publication_preserves_existing_target(
 ) -> None:
     target = tmp_path / "state.txt"
 
-    assert WINDOWS_HOST_FILESYSTEM.atomic_create_text(target, "first\n") is True
-    assert WINDOWS_HOST_FILESYSTEM.atomic_create_text(target, "replacement\n") is False
+    assert HOST_FILESYSTEM.atomic_create_text(target, "first\n") is True
+    assert HOST_FILESYSTEM.atomic_create_text(target, "replacement\n") is False
     assert target.read_bytes() == b"first\n"
     assert tuple(tmp_path.iterdir()) == (target,)
 
@@ -70,13 +83,12 @@ def test_host_filesystem_atomic_replace_publishes_exact_utf8_content(tmp_path: P
     target = tmp_path / "state.txt"
     target.write_bytes(b"old")
 
-    WINDOWS_HOST_FILESYSTEM.atomic_replace_text(
-        target, "User: \u5f20\u4e09\nPreference: caf\u00e9\n"
-    )
+    HOST_FILESYSTEM.atomic_replace_text(target, "User: \u5f20\u4e09\nPreference: caf\u00e9\n")
 
     assert target.read_bytes() == (b"User: \xe5\xbc\xa0\xe4\xb8\x89\nPreference: caf\xc3\xa9\n")
 
 
+@windows_only
 def test_windows_host_filesystem_rejects_an_open_file_with_mismatched_path(
     tmp_path: Path,
 ) -> None:
@@ -92,3 +104,89 @@ def test_windows_host_filesystem_rejects_an_open_file_with_mismatched_path(
             WINDOWS_HOST_FILESYSTEM.require_opened_owned_regular_file(
                 stream.fileno(), current_path, within=owned
             )
+
+
+def test_posix_host_filesystem_classifies_only_ordinary_directories_and_files() -> None:
+    directory = stat_result((S_IFDIR | 0o700, 1, 1, 1, 0, 0, 0, 0, 0, 0))
+    regular_file = stat_result((S_IFREG | 0o600, 2, 1, 1, 0, 0, 0, 0, 0, 0))
+    symbolic_link = stat_result((S_IFLNK | 0o777, 3, 1, 1, 0, 0, 0, 0, 0, 0))
+    fifo = stat_result((S_IFIFO | 0o600, 4, 1, 1, 0, 0, 0, 0, 0, 0))
+
+    assert POSIX_HOST_FILESYSTEM.is_directory(directory)
+    assert POSIX_HOST_FILESYSTEM.is_regular_file(regular_file)
+    assert not POSIX_HOST_FILESYSTEM.is_directory(symbolic_link)
+    assert not POSIX_HOST_FILESYSTEM.is_regular_file(symbolic_link)
+    assert not POSIX_HOST_FILESYSTEM.is_regular_file(fifo)
+
+
+def test_host_filesystem_applies_only_native_reserved_component_rules() -> None:
+    assert WINDOWS_HOST_FILESYSTEM.is_reserved_component("CON.txt")
+    assert WINDOWS_HOST_FILESYSTEM.has_alternate_data_stream("state.json:secret")
+    assert not POSIX_HOST_FILESYSTEM.is_reserved_component("CON.txt")
+    assert not POSIX_HOST_FILESYSTEM.has_alternate_data_stream("state.json:secret")
+
+
+def test_posix_host_filesystem_rejects_hard_linked_and_escaping_files(
+    tmp_path: Path,
+) -> None:
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    ordinary = owned / "ordinary.json"
+    ordinary.write_bytes(b"{}")
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b"outside")
+    hard_link = owned / "hard-link.json"
+    hard_link.hardlink_to(outside)
+
+    assert POSIX_HOST_FILESYSTEM.require_owned_regular_file(
+        ordinary, within=owned
+    ) == ordinary.resolve(strict=True)
+    for candidate in (hard_link, outside):
+        with pytest.raises(PermissionError):
+            POSIX_HOST_FILESYSTEM.require_owned_regular_file(candidate, within=owned)
+
+
+def test_posix_host_filesystem_rejects_injected_symbolic_link_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = tmp_path / "owned"
+    redirected = owned / "redirected"
+    redirected.mkdir(parents=True)
+    symbolic_link = stat_result((S_IFLNK | 0o777, 3, 1, 1, 0, 0, 0, 0, 0, 0))
+    original_lstat = Path.lstat
+
+    def injected_lstat(path: Path) -> stat_result:
+        if path == redirected:
+            return symbolic_link
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", injected_lstat)
+
+    with pytest.raises(PermissionError):
+        POSIX_HOST_FILESYSTEM.require_owned_directory(redirected, within=owned)
+
+
+def test_posix_parent_sync_failure_does_not_undo_complete_atomic_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "state.txt"
+    target.write_bytes(b"old")
+    original_open = os.open
+
+    def reject_parent_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        if Path(os.fsdecode(path)) == tmp_path:
+            raise OSError("injected directory open failure")
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", reject_parent_open)
+
+    POSIX_HOST_FILESYSTEM.atomic_replace_text(target, "complete\n")
+
+    assert target.read_bytes() == b"complete\n"
+    assert tuple(tmp_path.iterdir()) == (target,)

@@ -11,7 +11,10 @@ from myclaw.utils.atomic_files import (
     path_for_io,
 )
 
+windows_only = pytest.mark.skipif(os.name != "nt", reason="requires native Windows paths")
 
+
+@windows_only
 def test_path_for_io_normalizes_windows_local_and_unc_paths(tmp_path: Path) -> None:
     local = tmp_path / "state.txt"
     unc = Path(r"\\server\share\state.txt")
@@ -20,6 +23,7 @@ def test_path_for_io_normalizes_windows_local_and_unc_paths(tmp_path: Path) -> N
     assert path_for_io(unc) == Path(r"\\?\UNC\server\share\state.txt")
 
 
+@windows_only
 def test_path_for_io_preserves_existing_windows_extended_path(tmp_path: Path) -> None:
     extended = Path(f"\\\\?\\{tmp_path.absolute()}\\state.txt")
 
@@ -74,6 +78,7 @@ def test_cancelled_atomic_bytes_replace_preserves_official_state(
     )
 
 
+@windows_only
 def test_atomic_create_and_replace_use_windows_extended_paths(tmp_path: Path) -> None:
     parent = tmp_path.joinpath(*(["nested-state-directory"] * 12))
     path_for_io(parent).mkdir(parents=True)
