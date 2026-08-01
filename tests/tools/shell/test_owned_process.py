@@ -1,16 +1,49 @@
 import asyncio
+import ctypes
 import signal
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+import myclaw.tools.shell.windows_job as windows_job
 from myclaw.tools.shell.owned_process import (
     PosixOwnedProcessSpawner,
     WindowsOwnedProcessSpawner,
     default_owned_process_spawner,
 )
 from myclaw.tools.shell.windows_job import WindowsJob
+
+
+def test_windows_job_rejects_a_pointer_sized_invalid_thread_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeFunction:
+        argtypes: object = None
+        restype: object = None
+
+        def __init__(self, result: int) -> None:
+            self._result = result
+
+        def __call__(self, *_args: object) -> int:
+            return self._result
+
+    class FakeKernel32:
+        CreateToolhelp32Snapshot = FakeFunction(cast(int, ctypes.c_void_p(-1).value))
+        Thread32First = FakeFunction(0)
+        Thread32Next = FakeFunction(0)
+        OpenThread = FakeFunction(0)
+        ResumeThread = FakeFunction(0)
+
+    closed: list[int] = []
+    job = object.__new__(WindowsJob)
+    monkeypatch.setattr(job, "_close_handle", closed.append, raising=False)
+    monkeypatch.setattr(windows_job, "_windows_kernel32", FakeKernel32)
+
+    with pytest.raises(OSError, match="CreateToolhelp32Snapshot"):
+        job.resume(123)
+
+    assert closed == []
 
 
 @pytest.mark.asyncio

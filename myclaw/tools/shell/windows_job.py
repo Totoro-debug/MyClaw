@@ -3,7 +3,7 @@
 import asyncio
 import ctypes
 from ctypes import wintypes
-from typing import Final
+from typing import Final, cast
 
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Final = 0x00002000
 _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS: Final = 1
@@ -12,6 +12,7 @@ _PROCESS_TERMINATE: Final = 0x0001
 _PROCESS_SET_QUOTA: Final = 0x0100
 _THREAD_SUSPEND_RESUME: Final = 0x0002
 _TH32CS_SNAPTHREAD: Final = 0x00000004
+_INVALID_HANDLE_VALUE: Final[int] = cast(int, ctypes.c_void_p(-1).value)
 _INVALID_DWORD: Final = 0xFFFFFFFF
 
 
@@ -182,7 +183,7 @@ class WindowsJob:
         resume_thread.restype = wintypes.DWORD
 
         snapshot = create_snapshot(_TH32CS_SNAPTHREAD, 0)
-        if int(snapshot) == _INVALID_DWORD:
+        if int(snapshot) == _INVALID_HANDLE_VALUE:
             raise _windows_error("CreateToolhelp32Snapshot")
         try:
             entry = _ThreadEntry32()
