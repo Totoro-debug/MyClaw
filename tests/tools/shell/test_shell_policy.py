@@ -21,6 +21,11 @@ from myclaw.tools.shell import shell_policy
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_tool import ShellTool
 from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.utils.host_filesystem import (
+    POSIX_HOST_FILESYSTEM,
+    WINDOWS_HOST_FILESYSTEM,
+    HostFilesystem,
+)
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
@@ -35,18 +40,32 @@ SESSION_UUIDS = (
 )
 
 
-def test_posix_git_capture_accepts_a_native_executable_name_without_exe(
+@pytest.mark.parametrize(
+    ("host_filesystem", "filename", "accepted"),
+    (
+        (POSIX_HOST_FILESYSTEM, "git", True),
+        (POSIX_HOST_FILESYSTEM, "git.exe", False),
+        (WINDOWS_HOST_FILESYSTEM, "git.exe", True),
+        (WINDOWS_HOST_FILESYSTEM, "git.EXE", True),
+        (WINDOWS_HOST_FILESYSTEM, "git", False),
+    ),
+)
+def test_git_capture_accepts_only_the_host_native_executable_name(
     tmp_path: Path,
+    host_filesystem: HostFilesystem,
+    filename: str,
+    accepted: bool,
 ) -> None:
-    executable = tmp_path / "git"
+    executable = tmp_path / filename
     executable.write_bytes(b"trusted executable")
     captured = shell_policy._capture_git_executable(
         discover=lambda _: str(executable),
-        windows_suffix_required=False,
+        host_filesystem=host_filesystem,
     )
 
-    assert captured is not None
-    assert captured.path == executable.resolve(strict=True)
+    assert (captured is not None) is accepted
+    if captured is not None:
+        assert captured.path == executable.resolve(strict=True)
 
 
 class FakeShellBoundary:

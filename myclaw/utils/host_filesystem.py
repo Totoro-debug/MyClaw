@@ -24,6 +24,13 @@ _WINDOWS_RESERVED_BASENAMES: Final = frozenset(
     | {f"COM{index}" for index in range(1, 10)}
     | {f"LPT{index}" for index in range(1, 10)}
 )
+_POSIX_UNSUPPORTED_SYNC_ERRNOS: Final = frozenset(
+    {
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+)
 
 
 class UnsafeFilesystemPath(PermissionError):
@@ -44,6 +51,8 @@ class FilesystemAdapter(Protocol):
     def is_reserved_component(self, component: str) -> bool: ...
 
     def has_alternate_data_stream(self, component: str) -> bool: ...
+
+    def accepts_native_executable_name(self, path: Path) -> bool: ...
 
     def sync_file(self, descriptor: int) -> None: ...
 
@@ -94,6 +103,9 @@ class WindowsFilesystemAdapter:
     def has_alternate_data_stream(self, component: str) -> bool:
         return ":" in component
 
+    def accepts_native_executable_name(self, path: Path) -> bool:
+        return path.suffix.casefold() == ".exe"
+
     def sync_file(self, descriptor: int) -> None:
         try:
             os.fsync(descriptor)
@@ -137,34 +149,32 @@ class PosixFilesystemAdapter:
         del component
         return False
 
+    def accepts_native_executable_name(self, path: Path) -> bool:
+        return not path.suffix
+
     def sync_file(self, descriptor: int) -> None:
-        unsupported = {
-            errno.EINVAL,
-            getattr(errno, "ENOTSUP", errno.EINVAL),
-            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
-        }
         try:
             os.fsync(descriptor)
         except OSError as error:
-            if error.errno not in unsupported:
+            if error.errno not in _POSIX_UNSUPPORTED_SYNC_ERRNOS:
                 raise
 
     def sync_parent_directory(self, path: Path) -> None:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         try:
             descriptor = os.open(path, flags)
-        except OSError:
-            return
+        except OSError as error:
+            if error.errno in _POSIX_UNSUPPORTED_SYNC_ERRNOS:
+                return
+            raise
         try:
             try:
                 os.fsync(descriptor)
-            except OSError:
-                pass
+            except OSError as error:
+                if error.errno not in _POSIX_UNSUPPORTED_SYNC_ERRNOS:
+                    raise
         finally:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+            os.close(descriptor)
 
     def restrict_private_directory(self, path: Path) -> None:
         path.chmod(0o700)
@@ -204,6 +214,10 @@ class HostFilesystem:
     def has_alternate_data_stream(self, component: str) -> bool:
         """Return whether a component uses native alternate-stream syntax."""
         return self._adapter.has_alternate_data_stream(component)
+
+    def accepts_native_executable_name(self, path: Path) -> bool:
+        """Return whether a path uses the host's native executable naming convention."""
+        return self._adapter.accepts_native_executable_name(path)
 
     def sync_file(self, descriptor: int) -> None:
         """Synchronize file content with host-appropriate compatibility behavior."""

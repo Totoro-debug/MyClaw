@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Final
 from unicodedata import category
 
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM, HostFilesystem
+
 AUTOMATICALLY_ALLOWED_COMMANDS: Final = frozenset(
     {
         "pwd",
@@ -19,7 +21,6 @@ AUTOMATICALLY_ALLOWED_COMMANDS: Final = frozenset(
     }
 )
 _GIT_FILTER_CONFIG_PATTERN: Final = r"^filter\..*\.(clean|smudge|process)$"
-_WINDOWS_EXECUTABLE_SUFFIX_REQUIRED: Final = os.name == "nt"
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +32,7 @@ class _TrustedGitExecutable:
 def _capture_git_executable(
     *,
     discover: Callable[[str], str | None] = shutil.which,
-    windows_suffix_required: bool = _WINDOWS_EXECUTABLE_SUFFIX_REQUIRED,
+    host_filesystem: HostFilesystem = HOST_FILESYSTEM,
 ) -> _TrustedGitExecutable | None:
     discovered = discover("git")
     if discovered is None:
@@ -41,7 +42,7 @@ def _capture_git_executable(
         status = path.stat()
     except OSError:
         return None
-    if not path.is_file() or (windows_suffix_required and path.suffix.casefold() != ".exe"):
+    if not path.is_file() or not host_filesystem.accepts_native_executable_name(path):
         return None
     return _TrustedGitExecutable(
         path=path,

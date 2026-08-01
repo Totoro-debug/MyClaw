@@ -1,3 +1,4 @@
+import errno
 import os
 import subprocess
 from os import stat_result
@@ -10,6 +11,7 @@ from myclaw.utils.host_filesystem import (
     HOST_FILESYSTEM,
     POSIX_HOST_FILESYSTEM,
     WINDOWS_HOST_FILESYSTEM,
+    PosixFilesystemAdapter,
 )
 
 windows_only = pytest.mark.skipif(os.name != "nt", reason="requires native Windows paths")
@@ -167,7 +169,79 @@ def test_posix_host_filesystem_rejects_injected_symbolic_link_metadata(
         POSIX_HOST_FILESYSTEM.require_owned_directory(redirected, within=owned)
 
 
-def test_posix_parent_sync_failure_does_not_undo_complete_atomic_replacement(
+@pytest.mark.parametrize(
+    "unsupported_errno",
+    (
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    ),
+)
+def test_posix_parent_sync_ignores_only_unsupported_open_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsupported_errno: int,
+) -> None:
+    def unsupported_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        del path, flags, mode
+        raise OSError(unsupported_errno, "directory sync is unsupported")
+
+    monkeypatch.setattr(os, "open", unsupported_open)
+
+    PosixFilesystemAdapter().sync_parent_directory(tmp_path)
+
+
+def test_posix_parent_sync_ignores_an_unsupported_fsync_error_and_closes_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[int] = []
+    monkeypatch.setattr(os, "open", lambda *_args: 51)
+    monkeypatch.setattr(
+        os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError(errno.EINVAL, "unsupported")),
+    )
+    monkeypatch.setattr(os, "close", closed.append)
+
+    PosixFilesystemAdapter().sync_parent_directory(tmp_path)
+
+    assert closed == [51]
+
+
+@pytest.mark.parametrize("operation", ("open", "fsync", "close"))
+def test_posix_parent_sync_propagates_real_io_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    if operation == "open":
+        monkeypatch.setattr(
+            os,
+            "open",
+            lambda *_args: (_ for _ in ()).throw(OSError(errno.EACCES, "denied")),
+        )
+    else:
+        monkeypatch.setattr(os, "open", lambda *_args: 52)
+        monkeypatch.setattr(os, "fsync", lambda _descriptor: None)
+        monkeypatch.setattr(os, "close", lambda _descriptor: None)
+        monkeypatch.setattr(
+            os,
+            operation,
+            lambda _descriptor: (_ for _ in ()).throw(OSError(errno.EIO, "io failure")),
+        )
+
+    with pytest.raises(OSError) as error:
+        PosixFilesystemAdapter().sync_parent_directory(tmp_path)
+
+    assert error.value.errno in {errno.EACCES, errno.EIO}
+
+
+def test_posix_parent_sync_failure_surfaces_after_complete_atomic_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -181,12 +255,13 @@ def test_posix_parent_sync_failure_does_not_undo_complete_atomic_replacement(
         mode: int = 0o777,
     ) -> int:
         if Path(os.fsdecode(path)) == tmp_path:
-            raise OSError("injected directory open failure")
+            raise OSError(errno.EIO, "injected directory open failure")
         return original_open(path, flags, mode)
 
     monkeypatch.setattr(os, "open", reject_parent_open)
 
-    POSIX_HOST_FILESYSTEM.atomic_replace_text(target, "complete\n")
+    with pytest.raises(OSError, match="injected directory open failure"):
+        POSIX_HOST_FILESYSTEM.atomic_replace_text(target, "complete\n")
 
     assert target.read_bytes() == b"complete\n"
     assert tuple(tmp_path.iterdir()) == (target,)
