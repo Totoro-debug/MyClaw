@@ -1,78 +1,51 @@
-# MyClaw Windows x64 Release Readiness
+# MyClaw Host-Neutral Release Readiness
 
 Status: **READY**
 
 This is the current evidence index for GitHub issue
-[#56](https://github.com/Totoro-debug/myclaw/issues/56). The accepted storage and
-platform decisions are [ADR-0005](adr/0005-store-workspace-state-in-workspace.md)
-and [ADR-0006](adr/0006-support-windows-only.md). Historical ADR text remains an
-unchanged record of the decisions that applied when it was accepted.
+[#69](https://github.com/Totoro-debug/myclaw/issues/69). The active platform decision
+is [ADR-0007](adr/0007-use-host-adapters.md), which supersedes ADR-0006 without
+rewriting that historical Windows-only decision.
 
 ## Release Contract
 
-- Supported runtime: 64-bit Windows on x64 hardware with Python 3.12 or later.
-- Published artifact: exactly one `py3-none-win_amd64` wheel.
-- Agent Home owns only user configuration and runtime logs.
-- Workspace State is rooted at `<workspace>\.myclaw` and owns sessions, memory,
-  summaries, scheduled work, and tool artifacts.
-- Existing state under the former Agent Home layout is preserved and ignored. No
-  automatic discovery, copy, move, or conversion is performed.
-- Unsupported platforms fail at the lightweight console entry point before the
-  runtime or CLI implementation is imported.
+- The installed command enters the Typer application directly with no platform gate,
+  operating-system version check, or architecture allowlist.
+- Packaging emits exactly one pure-Python `py3-none-any` wheel containing the
+  filesystem, Runtime Log lock, and owned-process adapters.
+- Windows x64 is the currently validated environment.
+- macOS Intel and Apple Silicon are intended compatibility targets but remain
+  unverified until the same suite and installed-wheel smoke run natively there.
+- Linux and other POSIX hosts may attempt the POSIX adapters, but receive no formal
+  support claim from this release.
+- Agent Home remains host-local and owns only User Configuration and Runtime Logs.
+- Workspace State remains `<workspace>/.myclaw/` and keeps every existing layout,
+  record format, Permission Policy rule, and lifecycle guarantee.
 
 ## Delivery Evidence
 
 | Area | Evidence | Result |
 | --- | --- | --- |
-| Workspace State | Root-conflict, ownership, and non-migration validation | PASS |
-| Runtime storage | Session, memory, summary, scheduled-work, artifact, management, and background validation | PASS |
-| Platform gate | Windows x64 acceptance and deterministic rejection validation | PASS |
-| Process model | Windows Job Object ownership, process-tree shutdown, console handling, and cancellation validation | PASS |
-| Filesystem model | Windows file attributes, reparse-point, hard-link, and containment validation | PASS |
-| Public surface | Retired workspace-slug, compatibility, and single-implementation layers scan | PASS |
-| Release artifact | Exactly one tagged Windows x64 wheel; 73 packaged Python files match source | PASS |
-| Clean install | Isolated wheel installation, dependency check, and package-origin validation | PASS |
-| Unicode CLI | Clean Agent Home and Workspace first-start and config smoke | PASS |
+| Host filesystem | Windows-native characterization plus POSIX contract/fault injection | PASS |
+| Workspace State | Native identity, ownership, containment, redirection, and persistence suites | PASS |
+| Runtime Log | Windows multi-process locking, POSIX lock contract, rotation, fallback, and drain suites | PASS |
+| Shell lifecycle | Direct argv, trusted Git, Windows Job, POSIX process group, cancellation, and shutdown suites | PASS |
+| CLI and package | Direct Typer entry, universal tag, clean installation, dependency check, and Unicode smoke | PASS |
+| Complete Windows gate | Full warning-strict pytest, Ruff, strict Mypy, artifact rebuild, and final clean install | PASS |
 
-The artifact identity, host details, and clean-install transcript are recorded in
+Artifact identity, host details, exact commands, and final counts are recorded in
 [Windows x64 validation](release/windows-validation.md).
 
-## Final Gates
+## Evidence Boundaries
 
-| Gate | Result |
-| --- | --- |
-| Root-conflict focused suite | PASS: `5 passed` |
-| Storage and filesystem safety suites | PASS: `231 passed` |
-| Complete offline suite | PASS: `842 passed`; zero skips |
-| Ruff lint | PASS: all checks passed |
-| Ruff format check over complete `myclaw tests` | PASS: `162 files already formatted` |
-| Strict Mypy | PASS: no issues in 162 source files |
-| Diff hygiene and retired-surface scan | PASS |
+- POSIX adapter tests run on Windows with synthetic capabilities and fault injection.
+  They are not native macOS validation.
+- No macOS CI or manual macOS evidence was added by this release.
+- No paid or live Provider conversation is required by this offline release gate.
+- File-first persistence remains uncoordinated across runtime processes except for
+  normal-path Runtime Log locking.
+- Shell command policy and owned-process cleanup are not an operating-system
+  filesystem or network sandbox.
 
-## Manual And External Boundaries
-
-| Check | Status | Reason |
-| --- | --- | --- |
-| Clean-wheel installation and installed CLI smoke | PASS | Performed in a new environment outside the checkout with Unicode paths. |
-| Real Anthropic conversation | NOT RUN | No dedicated release credential was supplied. |
-| Real OpenAI-compatible conversation | NOT RUN | No dedicated endpoint, model, and credential were supplied. |
-| Public web adapter smoke | NOT RUN | This candidate gate intentionally remained offline at the application boundary. |
-
-Automated Provider tests cover routing, streaming, tool calls, timeout conversion,
-and retry behavior with injected clients. They are not represented as live service
-acceptance.
-
-## Known Boundaries
-
-- Provider credentials remain plaintext in the user-owned configuration file;
-  display paths redact them, while operating-system account access remains the
-  protection boundary.
-- File-first persistence serializes work within one runtime but does not promise
-  coordination between multiple running MyClaw processes.
-- Shell policy is a narrow command policy, not a general filesystem or network
-  sandbox.
-- Tool artifacts and Long-term Memory have no automatic retention limit.
-- Same-user filesystem replacement can still race checks that precede an operating
-  system file operation.
-
-Every required gate passed; this Windows x64 candidate is ready for release.
+Every required Windows gate passed for the final universal-wheel candidate. Native
+macOS validation remains outstanding and is not implied by this release evidence.

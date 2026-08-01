@@ -9,7 +9,7 @@
 - 产品行为来源：`docs/myclaw-personal-agent-prd.md`
 - 实施顺序来源：`docs/myclaw-implementation-plan.md`
 
-本文把已确认的产品行为细化为可直接实现的类型、文件 schema 和代码边界。来自 canonical 文档的行为与 D01-D16 已于 2026-07-11 一并接受；Issue #38 于 2026-07-27 收缩了 Tool 契约，本文对应章节以该已批准规格为准。后续变更必须先更新本契约及受影响的 PRD/ADR。
+本文把已确认的产品行为细化为可直接实现的类型、文件 schema 和代码边界。来自 canonical 文档的行为与 D01-D16 已于 2026-07-11 一并接受；Issue #38 于 2026-07-27 收缩了 Tool 契约，Issue #69 于 2026-08-01 用 host adapter 取代 Windows-only 实现约束，本文对应章节以这些已批准规格为准。后续变更必须先更新本契约及受影响的 PRD/ADR。
 
 本文不新增 one-shot、daemon、HTTP/IPC、MCP、subagent、跨进程协调、用户可配置安全策略或用户自定义 identity。
 
@@ -77,6 +77,14 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
 ```text
 ~/.myclaw/
   config.toml
+  logs/
+    run.log.0
+    run.log.1
+    run.log.cursor
+    run.log.lock
+
+<workspace>/.myclaw/
+  .gitignore
   scheduled-work.json
   memory/
     memory.md
@@ -85,14 +93,13 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
     pending-consolidations/
       <session_id>.json
   sessions/
-    <workspace_slug>/
-      <session_id>.jsonl
-      artifacts/
-        <session_id>/
-          <encoded_tool_call_id>.txt
+    <session_id>.jsonl
+    artifacts/
+      <session_id>/
+        <encoded_tool_call_id>.txt
 ```
 
-已确定：首次启动创建 `memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`scheduled-work.json`、Workspace session directory 和 artifacts 按需创建。`pending-consolidations/` 是 D13 确定的内部恢复目录，也按需创建。
+已确定：Agent Home 只拥有 User Configuration 与 Runtime Logs。有效 REPL 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`scheduled-work.json`、Session、artifacts 与 `pending-consolidations/` 按需创建。`myclaw config` 不初始化 Workspace State。
 
 `memory.md` 初始内容固定为：
 
@@ -110,15 +117,15 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
 
 ### 3.2 Workspace identity 与 Workspace State
 
-1. Workspace identity 是启动 cwd 的词法规范化绝对 Windows 路径；不解析 Git root，也不通过 filesystem alias 改变归属。
-2. Drive 和 UNC 路径均按 Windows 语义规范化；相对纯路径和其他路径语义被拒绝。
-3. Workspace 不派生第二层名称。非全局状态直接位于 `<workspace>\.myclaw\`。
+1. Workspace identity 是启动 cwd 按当前 host 原生路径语义进行词法规范化后的绝对路径；不解析 Git root，也不搜索祖先目录或通过 filesystem alias 改变归属。
+2. Windows 保留 Drive、UNC 与 extended path 行为；POSIX 使用原生绝对路径语义。相对路径被拒绝为 Workspace identity。
+3. Workspace 不派生第二层名称。非全局状态直接位于 `<workspace>/.myclaw/`。
 4. Agent Home 仅保留全局 User Configuration 与 Runtime Logs；旧的非全局数据不读取、不迁移、不删除。
 
 ### 3.3 原子写
 
 - 新文件或整体更新：在目标同目录创建唯一临时文件，写入完整内容，flush，尽可能 fsync，再 atomic replace。
-- 文件内容 flush 后尽可能 fsync；Windows 不支持文件 fsync 时保留可测试的 best-effort 分支。
+- 文件内容 flush 后尽可能 fsync；POSIX 在发布后同步 parent directory，host 明确不支持同步时保留可测试的 best-effort 分支。
 - session 普通 message append：持有当前 runtime 的 session lock，一次写入完整 UTF-8 record + `\n`，flush 后返回；取消不得打断临界区。
 - session metadata 更新：持有同一 session lock，读取现有 records，以新 metadata + 原 message records 原子重写。
 - 不创建跨进程 lock file，不依赖文件锁，不承诺两个 REPL 写同一 session 的顺序。
@@ -668,8 +675,9 @@ ToolResult(
 - `cwd` 缺省为 Workspace，解析后必须在 Workspace 内。
 - `timeout` 必须在 `60..600` 秒。
 - `tools.shell.enabled=false` 时不进入 catalog。
-- 命令通过当前平台 shell 执行；安全策略使用原始完整命令的严格解析，不能只检查字符串前缀。
-- 含管道、重定向、命令替换、后台符号、多命令分隔符或控制字符的命令不可能自动 allow。
+- `pwd` 不创建子进程，直接返回已验证的 host-native Workspace cwd。
+- 四个 Git 操作以 trusted Git executable 和固定 hardened argv 通过 direct process execution 执行；不调用 command interpreter、login shell 或 quoting bootstrap。
+- 含管道、重定向、命令替换、后台符号、多命令分隔符或控制字符的变体不匹配精确 allowlist，并在创建进程前 refused。
 
 自动 allowlist 仅包括以下精确形状：
 
@@ -681,9 +689,9 @@ git diff --stat
 git diff --name-only
 ```
 
-执行 `git diff` 变体时 adapter 强制禁用 pager、external diff 和 textconv。其他命令一律 refused；cwd 越界、timeout 越界或命令包含 NUL/control characters 同样 fail closed。用户不能扩展 allowlist。
+执行 Git 操作时固定 argv 禁用 pager 与 filesystem monitor；`git diff` 变体还禁用 external diff 和 textconv。其他命令一律 refused；cwd 越界、timeout 越界或命令包含 NUL/control characters 同样 fail closed。用户不能扩展 allowlist。Windows 使用 Job Object 拥有完整进程树，POSIX 使用新 session 与 process-group signals；timeout、cancellation 和 shutdown 都等待 owned process tree 清理完成。
 
-重要边界：首版不宣称 Shell 子进程受到 OS 级文件系统或网络 sandbox。Workspace 限制严格作用于 `cwd` 和固定 allowlist。Issue #38 暂时拒绝所有非 allowlist 命令，明确偏离 ADR-0003 要求的前台确认；该偏离不增加 OS 隔离保证。若产品要求“绝不访问 Workspace 外路径”，必须先选择并记录 Windows 进程隔离方案，不能通过字符串扫描命令来伪造该保证。
+重要边界：首版不宣称 Shell 子进程受到 OS 级文件系统或网络 sandbox。Workspace 限制严格作用于 `cwd` 和固定 allowlist。Issue #38 暂时拒绝所有非 allowlist 命令，明确偏离 ADR-0003 要求的前台确认；该偏离不增加 OS 隔离保证。若产品要求“绝不访问 Workspace 外路径”，必须先选择并记录 host-native 进程隔离方案，不能通过字符串扫描命令来伪造该保证。
 
 ### 11.5 Web tools
 

@@ -361,7 +361,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 ### 发布候选
 
 - Windows x64 测试与 Python 3.12 门禁。
-- 只构建 `py3-none-win_amd64` wheel，不产生额外发行物。
+- 只构建通用 `py3-none-any` wheel，不产生额外发行物。
 - 在空 Windows x64 虚拟环境安装唯一 wheel，再执行 Unicode CLI smoke tests。
 - 手工真实 provider 与真实网络测试从默认 CI 隔离，凭据只通过 CI secret 或本地环境提供，不写入 fixture/log。
 

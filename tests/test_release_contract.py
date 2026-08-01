@@ -39,3 +39,39 @@ def test_active_code_has_no_platform_support_gate() -> None:
         assert residue not in production
     assert not (ROOT / "myclaw" / "platform_support.py").exists()
     assert not (ROOT / "myclaw" / "terminal" / "entrypoint.py").exists()
+
+
+def test_active_support_contract_matches_host_neutral_release_evidence() -> None:
+    decision_path = ROOT / "docs" / "adr" / "0007-use-host-adapters.md"
+    assert decision_path.exists()
+    decision = decision_path.read_text(encoding="utf-8").lower()
+    assert "status: accepted" in decision
+    assert "supersedes adr-0006" in decision
+    for boundary in ("filesystem", "runtime log locking", "owned process tree"):
+        assert boundary in decision
+
+    active_paths = (
+        ROOT / "CONTEXT.md",
+        ROOT / "README.md",
+        ROOT / "docs" / "myclaw-runtime-contracts.md",
+        ROOT / "docs" / "release-readiness.md",
+        ROOT / "docs" / "release" / "windows-validation.md",
+    )
+    support = "\n".join(path.read_text(encoding="utf-8").lower() for path in active_paths)
+    for claim in (
+        "py3-none-any",
+        "windows x64",
+        "currently validated",
+        "macos intel",
+        "apple silicon",
+        "unverified",
+        "no platform gate",
+    ):
+        assert claim in support
+
+    workflow = (ROOT / ".github" / "workflows" / "release-validation.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "runs-on: windows-latest" in workflow
+    assert "runs-on: macos" not in workflow
+    assert "runs-on: ubuntu" not in workflow

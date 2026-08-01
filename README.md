@@ -1,13 +1,13 @@
 # MyClaw
 
-MyClaw is a local-first Personal Agent runtime for 64-bit x86-64 Windows and
-Python 3.12 or newer. Other operating systems and Windows architectures are not
-supported.
+MyClaw is a host-neutral, local-first Personal Agent runtime for Python 3.12 or
+newer. It has no platform gate: Windows selects native Windows adapters and other
+hosts attempt the POSIX adapters when an operation needs them.
 
 ## Install
 
-Create a Windows x64 virtual environment, install the project, and run the console
-entry point:
+Create a virtual environment, install the project, and run the console entry point.
+On Windows x64, the currently validated environment:
 
 ```text
 py -3.12 -m venv .venv
@@ -16,9 +16,14 @@ py -3.12 -m venv .venv
 ```
 
 For a release wheel, replace `.` in the install line with the wheel path, for example
-`.venv\Scripts\python.exe -m pip install dist\myclaw-0.1.0-py3-none-win_amd64.whl`.
+`.venv\Scripts\python.exe -m pip install dist\myclaw-0.1.0-py3-none-any.whl`.
 The remaining examples use `myclaw` for readability; activate the virtual environment
 first or use the full console path shown above.
+
+The same `py3-none-any` wheel contains the Windows and POSIX host adapters. macOS
+Intel and Apple Silicon are intended compatibility targets but remain unverified;
+fake-adapter coverage is not native macOS validation. Linux and other POSIX hosts may
+attempt the POSIX adapter, but this release makes no formal support claim for them.
 
 The first start creates `~/.myclaw/config.toml` and the base
 Agent Home, prints `config_missing`, and exits with status 2. Edit that file before
@@ -80,11 +85,11 @@ prompt.
 
 ## Persistent State
 
-MyClaw keeps global User Configuration and Runtime Logs in the fixed Agent Home at
-`%USERPROFILE%\.myclaw\`:
+MyClaw keeps global User Configuration and Runtime Logs in the current account's fixed
+Agent Home at `~/.myclaw/`:
 
 ```text
-%USERPROFILE%\.myclaw\
+~/.myclaw/
   config.toml
   logs/
     run.log.0
@@ -97,7 +102,7 @@ Every startup directory is an independent Workspace. Its non-global state lives 
 the reserved `.myclaw` directory beneath that Workspace:
 
 ```text
-<workspace>\.myclaw\
+<workspace>/.myclaw/
   .gitignore
   scheduled-work.json
   memory/
@@ -127,7 +132,7 @@ do not edit active Session, summary, cursor, or Scheduled Work files.
 - Provider authentication, timeout, or connection failures: verify the dedicated
   key, base URL, model availability, account policy, and network path. MyClaw does
   not automatically retry permanent authentication or invalid-request failures.
-- `memory_context_too_large`: reduce `<workspace>\.myclaw\memory\memory.md` or use a route with a larger
+- `memory_context_too_large`: reduce `<workspace>/.myclaw/memory/memory.md` or use a route with a larger
   context window. Long-term Memory is injected in full and has no automatic size cap.
 - Persistence errors or corrupt JSON/JSONL: stop all MyClaw processes, back up the
   affected Workspace State and Agent Home logs, and restore a known-good file. The
@@ -141,7 +146,8 @@ do not edit active Session, summary, cursor, or Scheduled Work files.
 - Long-term Memory has no automatic size cap, and Tool Artifacts have no automatic
   cleanup policy.
 - v0.1 has no daemon, HTTP/IPC service, MCP support, subagent runtime, profiles,
-  cross-process locking, keychain integration, or environment-variable API keys.
+  cross-process coordination outside Runtime Log locking, keychain integration, or
+  environment-variable API keys.
 
 The full acceptance record and additional security limits are in
 [docs/release-readiness.md](docs/release-readiness.md).
