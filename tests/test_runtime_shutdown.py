@@ -165,7 +165,7 @@ class OneProcessSpawner:
     def __init__(self, process: TerminatingProcess) -> None:
         self._process = process
 
-    async def spawn(self, command: str, *, cwd: Path) -> TerminatingProcess:
+    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> TerminatingProcess:
         del command, cwd
         return self._process
 
