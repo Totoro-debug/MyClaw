@@ -21,11 +21,7 @@ from pathlib import Path
 from typing import BinaryIO, Final, Protocol
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.utils.atomic_files import atomic_create_bytes, atomic_replace_bytes
-from myclaw.utils.windows_filesystem import (
-    is_windows_directory,
-    is_windows_regular_file,
-)
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM, UnsafeFilesystemPath
 
 _LOGGER_NAME: Final = "myclaw"
 _SLOT_TARGET_BYTES: Final = 10_485_760
@@ -131,7 +127,7 @@ class RuntimeLogLifetime:
         self,
         agent_home: AgentHome,
         *,
-        replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
+        replace_bytes: AtomicReplaceBytes = HOST_FILESYSTEM.atomic_replace_bytes,
         lock_system: _LockSystem = _WINDOWS_LOCK_SYSTEM,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -309,7 +305,7 @@ class RuntimeLogLifetime:
         try:
             slot = logs / f"run.log.{active_slot}"
             if not slot.exists() and not slot.is_symlink():
-                atomic_create_bytes(slot, b"")
+                HOST_FILESYSTEM.atomic_create_bytes(slot, b"")
             _validate_log_file(slot, agent_home_root)
             self._append_unlocked(slot, encoded)
         except Exception as fallback_error:
@@ -376,7 +372,7 @@ class RuntimeLogLifetime:
             if path.exists() or path.is_symlink():
                 _validate_log_file(path, agent_home_root)
             else:
-                atomic_create_bytes(path, content)
+                HOST_FILESYSTEM.atomic_create_bytes(path, content)
             _validate_log_file(path, agent_home_root)
         cursor_path = logs / "run.log.cursor"
         cursor_recovered = False
@@ -386,7 +382,7 @@ class RuntimeLogLifetime:
             self._replace_bytes(cursor_path, b"0\n")
             cursor_recovered = True
         else:
-            atomic_create_bytes(cursor_path, b"0\n")
+            HOST_FILESYSTEM.atomic_create_bytes(cursor_path, b"0\n")
         _validate_log_file(cursor_path, agent_home_root)
         cursor = _read_validated_log_file(cursor_path, agent_home_root)
         if cursor not in {b"0\n", b"1\n"}:
@@ -435,7 +431,7 @@ class RuntimeLogLifetime:
 def install_runtime_logging(
     agent_home: AgentHome,
     *,
-    replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
+    replace_bytes: AtomicReplaceBytes = HOST_FILESYSTEM.atomic_replace_bytes,
     lock_system: _LockSystem = _WINDOWS_LOCK_SYSTEM,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
@@ -534,26 +530,24 @@ def _render_exception(
 
 def _validate_log_directory(path: Path, agent_home_root: Path) -> None:
     try:
-        status = path.lstat()
-        resolved = path.resolve(strict=True)
+        HOST_FILESYSTEM.require_contained_directory(path, within=agent_home_root)
+    except UnsafeFilesystemPath as error:
+        raise PermissionError(
+            "Runtime Log directory must remain unaliased inside Agent Home"
+        ) from error
     except OSError as error:
         raise PermissionError("Runtime Log directory is unavailable") from error
-    if not is_windows_directory(status) or not resolved.is_relative_to(agent_home_root):
-        raise PermissionError("Runtime Log directory must remain unaliased inside Agent Home")
 
 
 def _validate_log_file(path: Path, agent_home_root: Path) -> None:
     try:
-        status = path.lstat()
-        resolved = path.resolve(strict=True)
+        HOST_FILESYSTEM.require_contained_regular_file(path, within=agent_home_root)
+    except UnsafeFilesystemPath as error:
+        raise PermissionError(
+            "Runtime Log files must be unaliased inside Agent Home"
+        ) from error
     except OSError as error:
         raise PermissionError("Runtime Log file is unavailable") from error
-    if (
-        not is_windows_regular_file(status)
-        or status.st_nlink != 1
-        or not resolved.is_relative_to(agent_home_root)
-    ):
-        raise PermissionError("Runtime Log files must be unaliased inside Agent Home")
 
 
 def _validate_opened_log_file(
@@ -562,20 +556,15 @@ def _validate_opened_log_file(
     agent_home_root: Path,
 ) -> None:
     try:
-        opened = os.fstat(stream.fileno())
-        current = path.lstat()
-        resolved = path.resolve(strict=True)
+        HOST_FILESYSTEM.require_opened_contained_regular_file(
+            stream.fileno(), path, within=agent_home_root
+        )
+    except UnsafeFilesystemPath as error:
+        raise PermissionError(
+            "Runtime Log files must remain stable and unaliased"
+        ) from error
     except OSError as error:
         raise PermissionError("Runtime Log file is unavailable") from error
-    if (
-        not is_windows_regular_file(opened)
-        or opened.st_nlink != 1
-        or not is_windows_regular_file(current)
-        or current.st_nlink != 1
-        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
-        or not resolved.is_relative_to(agent_home_root)
-    ):
-        raise PermissionError("Runtime Log files must remain stable and unaliased")
 
 
 def _read_validated_log_file(path: Path, agent_home_root: Path) -> bytes:

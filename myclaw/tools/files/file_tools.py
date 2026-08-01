@@ -7,7 +7,7 @@ from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
 from myclaw.tools.schema import ToolParam
 from myclaw.tools.security import Security
-from myclaw.utils.windows_filesystem import is_windows_regular_file
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 
 class ReadFileTool(BaseTool):
@@ -33,7 +33,7 @@ class ReadFileTool(BaseTool):
             status = target.lstat()
         except OSError as error:
             raise ToolError("The requested file could not be inspected.") from error
-        if not is_windows_regular_file(status):
+        if not HOST_FILESYSTEM.is_regular_file(status):
             raise ToolError("The requested path must identify a regular file.")
         if status.st_nlink != 1:
             raise ToolError("The requested path must identify an unaliased regular file.")
@@ -80,7 +80,7 @@ class ListFilesTool(BaseTool):
                     status = resolved.lstat()
                 except (OSError, ToolError):
                     continue
-                is_file = is_windows_regular_file(status)
+                is_file = HOST_FILESYSTEM.is_regular_file(status)
                 is_directory = resolved.is_dir()
                 if not (is_file or is_directory):
                     continue
@@ -137,7 +137,7 @@ class SearchFilesTool(BaseTool):
                 status = resolved.lstat()
             except (OSError, ToolError):
                 continue
-            if not is_windows_regular_file(status) or status.st_nlink != 1:
+            if not HOST_FILESYSTEM.is_regular_file(status) or status.st_nlink != 1:
                 continue
             relative = self._security.reported_read_path(resolved)
             if glob is not None:

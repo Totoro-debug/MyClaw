@@ -8,15 +8,9 @@ from typing import Final
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.tools.artifacts import ArtifactReference, encode_artifact_tool_call_id
 from myclaw.tools.models import ToolResult
-from myclaw.utils.atomic_files import (
+from myclaw.utils.host_filesystem import (
+    HOST_FILESYSTEM,
     FileIdentity,
-    atomic_create_text_with_identity,
-    file_identity,
-    path_for_io,
-)
-from myclaw.utils.windows_filesystem import (
-    require_owned_directory,
-    require_owned_regular_file,
 )
 
 type ArtifactWriter = Callable[[Path, str], None]
@@ -54,24 +48,32 @@ def externalize_tool_result(
                 preview_chars=len(preview),
             ),
         )
-        io_workspace = path_for_io(Path(workspace_state.workspace.path))
+        io_workspace = HOST_FILESYSTEM.path_for_io(Path(workspace_state.workspace.path))
         workspace_root = io_workspace.resolve(strict=True)
-        io_state = path_for_io(workspace_state.path)
-        state_root = require_owned_directory(io_state, within=workspace_root)
-        io_sessions = path_for_io(workspace_state.sessions_directory)
-        sessions_root = require_owned_directory(io_sessions, within=state_root)
+        io_state = HOST_FILESYSTEM.path_for_io(workspace_state.path)
+        state_root = HOST_FILESYSTEM.require_owned_directory(
+            io_state, within=workspace_root
+        )
+        io_sessions = HOST_FILESYSTEM.path_for_io(workspace_state.sessions_directory)
+        sessions_root = HOST_FILESYSTEM.require_owned_directory(
+            io_sessions, within=state_root
+        )
         artifacts_directory = io_sessions / "artifacts"
         artifacts_directory.mkdir(exist_ok=True)
-        artifacts_root = require_owned_directory(artifacts_directory, within=sessions_root)
+        artifacts_root = HOST_FILESYSTEM.require_owned_directory(
+            artifacts_directory, within=sessions_root
+        )
         io_directory = artifacts_directory / session_id
         io_directory.mkdir(exist_ok=True)
-        require_owned_directory(io_directory, within=artifacts_root)
+        HOST_FILESYSTEM.require_owned_directory(io_directory, within=artifacts_root)
         artifact_path = io_directory / f"{encoded_tool_call_id}.txt"
         if write_text is None:
             identity = _atomic_create_artifact(artifact_path, raw_content)
-            resolved_artifact = require_owned_regular_file(artifact_path, within=sessions_root)
-            owned_path = path_for_io(resolved_artifact)
-            if file_identity(owned_path.stat(follow_symlinks=False)) != identity:
+            resolved_artifact = HOST_FILESYSTEM.require_owned_regular_file(
+                artifact_path, within=sessions_root
+            )
+            owned_path = HOST_FILESYSTEM.path_for_io(resolved_artifact)
+            if HOST_FILESYSTEM.file_identity(owned_path.stat(follow_symlinks=False)) != identity:
                 raise PermissionError("Tool Artifact must be an unaliased regular file")
         else:
             write_text(artifact_path, raw_content)
@@ -81,7 +83,7 @@ def externalize_tool_result(
 
 
 def _atomic_create_artifact(path: Path, content: str) -> FileIdentity:
-    identity = atomic_create_text_with_identity(path, content)
+    identity = HOST_FILESYSTEM.atomic_create_text_with_identity(path, content)
     if identity is None:
         raise FileExistsError("Tool Artifact already exists")
     return identity

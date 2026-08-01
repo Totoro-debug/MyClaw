@@ -9,11 +9,7 @@ from typing import Final
 from myclaw.agent.workspace import Workspace
 from myclaw.errors import ErrorInfo
 from myclaw.templates import load_template
-from myclaw.utils.atomic_files import atomic_create_text
-from myclaw.utils.windows_filesystem import (
-    require_owned_directory,
-    require_owned_regular_file,
-)
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _GITIGNORE_CONTENT: Final = "*\n"
 _LONG_TERM_MEMORY_TEMPLATE: Final = load_template("long-term-memory.md")
@@ -78,18 +74,30 @@ class WorkspaceState:
                 raise _UnsafeStatePath(Path(self.workspace.path))
 
             self.path.mkdir(exist_ok=True)
-            state_root = require_owned_directory(self.path, within=workspace_root)
+            state_root = HOST_FILESYSTEM.require_owned_directory(
+                self.path, within=workspace_root
+            )
 
             # Publication is create-only, so an existing policy is never read or repaired.
-            atomic_create_text(self.path / ".gitignore", _GITIGNORE_CONTENT)
+            HOST_FILESYSTEM.atomic_create_text(
+                self.path / ".gitignore", _GITIGNORE_CONTENT
+            )
 
             self.memory_directory.mkdir(exist_ok=True)
-            require_owned_directory(self.memory_directory, within=state_root)
+            HOST_FILESYSTEM.require_owned_directory(
+                self.memory_directory, within=state_root
+            )
             self.sessions_directory.mkdir(exist_ok=True)
-            require_owned_directory(self.sessions_directory, within=state_root)
+            HOST_FILESYSTEM.require_owned_directory(
+                self.sessions_directory, within=state_root
+            )
 
-            atomic_create_text(self.long_term_memory_path, _LONG_TERM_MEMORY_TEMPLATE)
-            require_owned_regular_file(self.long_term_memory_path, within=state_root)
+            HOST_FILESYSTEM.atomic_create_text(
+                self.long_term_memory_path, _LONG_TERM_MEMORY_TEMPLATE
+            )
+            HOST_FILESYSTEM.require_owned_regular_file(
+                self.long_term_memory_path, within=state_root
+            )
         except WorkspaceStateError:
             raise
         except _UnsafeStatePath as error:

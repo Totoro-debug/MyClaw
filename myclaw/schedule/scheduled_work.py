@@ -10,7 +10,7 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.records import ScheduledWork
 from myclaw.tools.base import BaseTool
 from myclaw.tools.schema import ToolParam
-from myclaw.utils.windows_filesystem import require_owned_regular_file
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _RECORD_FIELDS = frozenset({"id", "title", "cron", "prompt", "created_at", "enabled", "session_id"})
 
@@ -50,7 +50,9 @@ class WorkspaceJsonScheduledWorkStore:
 
     def _read_optional_text(self) -> str | None:
         try:
-            owned_path = require_owned_regular_file(self.path, within=self._within)
+            owned_path = HOST_FILESYSTEM.require_owned_regular_file(
+                self.path, within=self._within
+            )
         except FileNotFoundError:
             return None
         return owned_path.read_text(encoding="utf-8")

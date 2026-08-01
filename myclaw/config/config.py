@@ -16,7 +16,7 @@ from croniter import croniter  # type: ignore[import-untyped]
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
 from myclaw.templates import load_template
-from myclaw.utils.atomic_files import atomic_create_text
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 DEFAULT_CONFIG_TEMPLATE: Final = load_template("default-config.md")
 
@@ -497,7 +497,7 @@ class ConfigLoader:
     def ensure_default(self) -> bool:
         """Create the accepted default template when missing."""
         self.agent_home.initialize()
-        return atomic_create_text(self.path, DEFAULT_CONFIG_TEMPLATE)
+        return HOST_FILESYSTEM.atomic_create_text(self.path, DEFAULT_CONFIG_TEMPLATE)
 
     def load(self) -> UserConfiguration:
         """Load User Configuration as immutable typed values."""

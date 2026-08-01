@@ -26,12 +26,8 @@ from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
 from myclaw.tools.schema import ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
-from myclaw.utils.atomic_files import atomic_replace_text
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.validation import require_nonnegative_int
-from myclaw.utils.windows_filesystem import (
-    require_owned_directory,
-    require_owned_regular_file,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +160,7 @@ class WorkspaceFileMemoryStore:
         self,
         workspace_state: WorkspaceState,
         *,
-        replace_text: Callable[[Path, str], None] = atomic_replace_text,
+        replace_text: Callable[[Path, str], None] = HOST_FILESYSTEM.atomic_replace_text,
     ) -> None:
         self.workspace_state = workspace_state
         self._state_root = workspace_state.path.resolve(strict=True)
@@ -190,7 +186,7 @@ class WorkspaceFileMemoryStore:
     def _require_private_regular_file(self, path: Path) -> None:
         self._require_private_memory_directory()
         try:
-            require_owned_regular_file(path, within=self._state_root)
+            HOST_FILESYSTEM.require_owned_regular_file(path, within=self._state_root)
         except PermissionError as error:
             raise MemoryPathDeniedError(
                 "Workspace State must be an unaliased regular file"
@@ -198,7 +194,9 @@ class WorkspaceFileMemoryStore:
 
     def _require_private_memory_directory(self) -> None:
         try:
-            require_owned_directory(self._memory_directory, within=self._state_root)
+            HOST_FILESYSTEM.require_owned_directory(
+                self._memory_directory, within=self._state_root
+            )
         except PermissionError as error:
             raise MemoryPathDeniedError(
                 "Workspace State Memory directory must remain unaliased"

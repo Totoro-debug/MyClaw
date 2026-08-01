@@ -4,7 +4,7 @@ from pathlib import Path
 
 from myclaw.agent.workspace import Workspace
 from myclaw.tools.errors import ToolError
-from myclaw.utils.atomic_files import path_for_io
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _WINDOWS_RESERVED_BASENAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
@@ -24,14 +24,14 @@ class Security:
         artifact_directory: Path,
     ) -> None:
         self._workspace_identity = workspace
-        self._workspace = path_for_io(Path(workspace.path)).resolve(strict=False)
-        self._agent_home = path_for_io(agent_home).resolve(strict=False)
+        self._workspace = HOST_FILESYSTEM.path_for_io(Path(workspace.path)).resolve(strict=False)
+        self._agent_home = HOST_FILESYSTEM.path_for_io(agent_home).resolve(strict=False)
         self._workspace_state = self._workspace / ".myclaw"
         self._long_term_memory = self._workspace_state / "memory" / "memory.md"
         # Preserve the configured directory's lexical identity. Resolving it here
         # would make a pre-existing symlink or junction target part of the trusted
         # read scope.
-        self._artifact_directory = path_for_io(artifact_directory).absolute()
+        self._artifact_directory = HOST_FILESYSTEM.path_for_io(artifact_directory).absolute()
         self._session_id = artifact_directory.name
 
     def resolve_read_path(self, requested: str) -> Path:
@@ -51,7 +51,7 @@ class Security:
             else:
                 candidate = self._workspace / candidate
         else:
-            candidate = path_for_io(candidate)
+            candidate = HOST_FILESYSTEM.path_for_io(candidate)
         try:
             resolved = candidate.resolve(strict=True)
         except (OSError, RuntimeError, ValueError) as error:

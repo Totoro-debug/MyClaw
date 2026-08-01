@@ -34,12 +34,8 @@ from myclaw.session.records import (
 )
 from myclaw.session.session_store import SessionStore
 from myclaw.tools.schema import OpenAIToolSchema
-from myclaw.utils.atomic_files import atomic_replace_bytes
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
-from myclaw.utils.windows_filesystem import (
-    require_owned_directory,
-    require_owned_regular_file,
-)
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 type UnlinkFile = Callable[[Path], None]
@@ -178,7 +174,7 @@ class WorkspaceJsonlSummaryStore:
         self,
         workspace_state: WorkspaceState,
         *,
-        replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
+        replace_bytes: AtomicReplaceBytes = HOST_FILESYSTEM.atomic_replace_bytes,
         unlink_file: UnlinkFile = _unlink_file,
     ) -> None:
         self.workspace_state = workspace_state
@@ -225,14 +221,18 @@ class WorkspaceJsonlSummaryStore:
             pending_root = self._require_pending_directory()
             journal_path = self.pending_directory / f"{session_id}.json"
             if journal_path.exists() or journal_path.is_symlink():
-                require_owned_regular_file(journal_path, within=pending_root)
+                HOST_FILESYSTEM.require_owned_regular_file(
+                    journal_path, within=pending_root
+                )
             self._replace_bytes(
                 journal_path,
                 json.dumps(journal.to_dict(), ensure_ascii=False, separators=(",", ":")).encode(
                     "utf-8"
                 ),
             )
-            require_owned_regular_file(journal_path, within=pending_root)
+            HOST_FILESYSTEM.require_owned_regular_file(
+                journal_path, within=pending_root
+            )
             self._append_exact(entry)
             await sessions.update_metadata(
                 session_id,
@@ -249,7 +249,9 @@ class WorkspaceJsonlSummaryStore:
             pending_root = self._require_pending_directory()
             recovered_count = 0
             for journal_path in sorted(self.pending_directory.glob("*.json")):
-                require_owned_regular_file(journal_path, within=pending_root)
+                HOST_FILESYSTEM.require_owned_regular_file(
+                    journal_path, within=pending_root
+                )
                 journal = _PendingConsolidation.from_bytes(journal_path.read_bytes())
                 if journal_path.stem != journal.session_id:
                     raise ValueError("journal file name must match session_id")
@@ -273,13 +275,13 @@ class WorkspaceJsonlSummaryStore:
             raise ValueError("summary index must be contiguous")
         existing = self.path.read_bytes() if self.path.exists() else b""
         self._replace_bytes(self.path, existing + entry.to_json_line().encode("utf-8"))
-        require_owned_regular_file(self.path, within=self._state_root)
+        HOST_FILESYSTEM.require_owned_regular_file(self.path, within=self._state_root)
 
     def _entries(self) -> tuple[SummaryEntry, ...]:
         self._require_memory_directory()
         if not self.path.exists() and not self.path.is_symlink():
             return ()
-        require_owned_regular_file(self.path, within=self._state_root)
+        HOST_FILESYSTEM.require_owned_regular_file(self.path, within=self._state_root)
         content = self.path.read_bytes()
         if content and not content.endswith(b"\n"):
             raise ValueError("summary stream must contain complete JSONL records")
@@ -320,11 +322,15 @@ class WorkspaceJsonlSummaryStore:
             raise ValueError("Consolidation Session store belongs to another Workspace State")
 
     def _require_memory_directory(self) -> Path:
-        return require_owned_directory(self._memory_directory, within=self._state_root)
+        return HOST_FILESYSTEM.require_owned_directory(
+            self._memory_directory, within=self._state_root
+        )
 
     def _require_pending_directory(self) -> Path:
         self._require_memory_directory()
-        return require_owned_directory(self.pending_directory, within=self._state_root)
+        return HOST_FILESYSTEM.require_owned_directory(
+            self.pending_directory, within=self._state_root
+        )
 
 
 class ConversationSummaryManager:

@@ -34,7 +34,7 @@ from myclaw.session.records import (
 )
 from myclaw.tools.artifacts import ArtifactReference
 from myclaw.tools.models import ModelToolCall, ToolResultStatus
-from myclaw.utils.atomic_files import atomic_replace_bytes, atomic_replace_text, path_for_io
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 
@@ -90,7 +90,7 @@ class JsonlSessionStore:
         workspace_state: WorkspaceState,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
-        replace_bytes: AtomicReplaceBytes = atomic_replace_bytes,
+        replace_bytes: AtomicReplaceBytes = HOST_FILESYSTEM.atomic_replace_bytes,
     ) -> None:
         self.workspace_state = workspace_state
         self.workspace = workspace_state.workspace
@@ -145,7 +145,7 @@ class JsonlSessionStore:
 
     async def append_message(self, session_id: str, message: SessionMessage) -> None:
         path = self.path_for(session_id)
-        io_path = path_for_io(path)
+        io_path = HOST_FILESYSTEM.path_for_io(path)
         async with self._lock_for(session_id):
             if not io_path.exists():
                 metadata = self._prepared.get(session_id)
@@ -154,7 +154,9 @@ class JsonlSessionStore:
                     raise ValueError(msg)
                 io_path.parent.mkdir(parents=True, exist_ok=True)
                 updated = _metadata_after_message(metadata, message)
-                atomic_replace_text(io_path, updated.to_json_line() + message.to_json_line())
+                HOST_FILESYSTEM.atomic_replace_text(
+                    io_path, updated.to_json_line() + message.to_json_line()
+                )
                 self._prepared[session_id] = updated
                 return
             records, complete_content = _read_recoverable_records(io_path)
@@ -183,7 +185,7 @@ class JsonlSessionStore:
     async def load(self, session_id: str) -> ConversationSession:
         path = self.path_for(session_id)
         async with self._lock_for(session_id):
-            records, _ = _read_recoverable_records(path_for_io(path))
+            records, _ = _read_recoverable_records(HOST_FILESYSTEM.path_for_io(path))
         metadata = _parse_metadata(records[0])
         if metadata.id != session_id:
             msg = "Session metadata ID does not match its file name"
@@ -193,7 +195,7 @@ class JsonlSessionStore:
 
     async def current_session(self, session_id: str) -> ConversationSession:
         """Return persisted state or an unmaterialized prepared Session snapshot."""
-        path = path_for_io(self.path_for(session_id))
+        path = HOST_FILESYSTEM.path_for_io(self.path_for(session_id))
         async with self._lock_for(session_id):
             if not path.exists():
                 metadata = self._prepared.get(session_id)
@@ -210,7 +212,7 @@ class JsonlSessionStore:
         return ConversationSession(metadata=metadata, messages=messages)
 
     async def update_metadata(self, session_id: str, update: MetadataUpdate) -> None:
-        path = path_for_io(self.path_for(session_id))
+        path = HOST_FILESYSTEM.path_for_io(self.path_for(session_id))
         async with self._lock_for(session_id):
             records, complete_content = _read_recoverable_records(path)
             metadata = _parse_metadata(records[0])
@@ -260,7 +262,7 @@ class JsonlSessionStore:
     ) -> None:
         """Idempotently advance a journaled Session cursor in this Workspace."""
         require_session_id(session_id)
-        path = path_for_io(self.path_for(session_id))
+        path = HOST_FILESYSTEM.path_for_io(self.path_for(session_id))
         async with self._lock_for(session_id):
             records, complete_content = _read_recoverable_records(path)
             metadata = _parse_metadata(records[0])
