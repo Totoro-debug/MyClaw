@@ -21,7 +21,7 @@ from myclaw.agent.prompts import (
 )
 from myclaw.agent.turn import ToolResultExternalizer, model_message_from_session
 from myclaw.agent.workspace import Workspace
-from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
 from myclaw.management.commands import ManagementCommandDispatcher
@@ -452,6 +452,8 @@ def prepare_repl_runtime(
             shell=shell,
             runtime_log=runtime_log,
         )
+    except WorkspaceStateError:
+        raise
     except Exception as error:
         log_sanitized_exception(
             logger,

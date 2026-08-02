@@ -19,6 +19,7 @@ dependencies = [
     "croniter>=6,<7",
     "ddgs>=9,<10",
     "jsonschema>=4.23,<5",
+    "loguru>=0.7.3,<0.8",
     "openai>=2.37,<3",
     "prompt-toolkit>=3.0.52,<4",
     "rich>=13.7,<15",
@@ -38,7 +39,7 @@ dev = [
 ]
 
 [project.scripts]
-myclaw = "myclaw.terminal.cli:app"
+myclaw = "myclaw.terminal.process_entry:run"
 
 [tool.setuptools.packages.find]
 where = ["."]

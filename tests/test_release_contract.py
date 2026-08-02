@@ -4,10 +4,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_distribution_declares_supported_loguru_release_range() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+    assert "loguru>=0.7.3,<0.8" in project["dependencies"]
+
+
 def test_distribution_metadata_builds_one_host_neutral_wheel() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
-    assert project["scripts"]["myclaw"] == "myclaw.terminal.cli:app"
+    assert project["scripts"]["myclaw"] == "myclaw.terminal.process_entry:run"
     assert "Operating System :: OS Independent" not in project["classifiers"]
     assert "Operating System :: Microsoft :: Windows" not in project["classifiers"]
     setup_path = ROOT / "setup.cfg"

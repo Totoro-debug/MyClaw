@@ -3,23 +3,16 @@ import os
 import shutil
 import subprocess
 from collections.abc import Awaitable, Callable, Coroutine
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from uuid import uuid4
 
 import pytest
 import typer
 
 import myclaw.terminal.cli as cli
-from myclaw.agent.runtime import prepare_repl_runtime
-from myclaw.agent.workspace import Workspace
-from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ConfigLoader
-from myclaw.provider.factory import create_provider
-from myclaw.runtime_log import install_runtime_logging
+from myclaw.terminal.logging import configure_process_logging
 from tests.configuration.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,
@@ -62,9 +55,19 @@ def assert_plaintext_absent(output: str, *plaintext_values: str) -> None:
         pytest.fail("CLI output leaked a plaintext provider API key", pytrace=False)
 
 
+def legacy_runtime_log_snapshot(agent_home: Path) -> dict[str, bytes]:
+    logs = agent_home / "logs"
+    return {
+        path.name: path.read_bytes()
+        for path in logs.iterdir()
+        if path.is_file() and path.name.startswith("run.log.")
+    }
+
+
 def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_error(
     monkeypatch: pytest.MonkeyPatch,
     agent_home: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     events: list[str] = []
 
@@ -137,52 +140,15 @@ def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_er
     monkeypatch.setattr(AgentHome, "production", lambda: AgentHome(agent_home))
     context = cast(typer.Context, SimpleNamespace(invoked_subcommand=None))
 
+    configure_process_logging()
     with pytest.raises(LookupError, match="runtime failed") as raised:
         cli.main(context)
 
     assert isinstance(raised.value.__cause__, RuntimeError)
     assert str(raised.value.__cause__) == "PRIVATE_INTERRUPT_CLEANUP_BODY_52"
     assert events == ["install", "runtime", "interrupt-close", "restore"]
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    marker = "session=- myclaw.terminal.cli: Interrupt controller cleanup failed type=RuntimeError"
-    assert content.count("ERROR pid=") == 1
-    assert content.count(marker) == 1
-    assert "RuntimeError: [REDACTED]" in content
-    assert "PRIVATE_INTERRUPT_CLEANUP_BODY_52" not in content
-
-
-def test_runtime_composition_records_one_safe_error_before_propagating(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    configuration = ConfigLoader(home).load()
-    state = WorkspaceState(Workspace.from_path(workspace))
-    state.initialize(agent_home_root=agent_home)
-    memory_path = state.long_term_memory_path
-    memory_path.unlink()
-    memory_path.mkdir()
-
-    runtime_log = install_runtime_logging(home)
-    try:
-        with pytest.raises(WorkspaceStateError):
-            prepare_repl_runtime(
-                agent_home=home,
-                workspace=workspace,
-                configuration=configuration,
-                provider_factory=create_provider,
-                now=lambda: datetime.now().astimezone(),
-                new_uuid=uuid4,
-            )
-    finally:
-        runtime_log.close()
-
-    runtime_log_content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    marker = "session=- myclaw.agent.runtime: Runtime composition failed type="
-    assert runtime_log_content.count(marker) == 1
-    assert "Traceback (most recent call last)" in runtime_log_content
+    assert capsys.readouterr().err == "Interrupt controller cleanup failed type=RuntimeError\n"
+    assert not (agent_home / "logs").exists()
 
 
 def test_installed_myclaw_console_entry_starts() -> None:
@@ -208,14 +174,31 @@ def test_installed_myclaw_generates_missing_configuration_and_stops(
 
     assert result.returncode == 2
     assert (agent_home / "config.toml").read_text(encoding="utf-8") == EXPECTED_DEFAULT_CONFIG
-    assert "config_missing" in result.stdout
+    assert result.stdout.count("config_missing") == 1
     assert str(agent_home / "config.toml") in result.stdout
     assert "edit" in result.stdout.lower()
+    assert result.stderr == ""
     assert "configuration gate passed" not in result.stdout
     assert not (workspace / ".myclaw").exists()
-    runtime_log = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert "ERROR" in runtime_log
-    assert "session=- myclaw.terminal.cli: Startup failed code=config_missing" in runtime_log
+    assert not (agent_home / "logs").exists()
+
+
+def test_installed_myclaw_does_not_modify_legacy_runtime_log_data(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    logs = agent_home / "logs"
+    logs.mkdir(parents=True)
+    (logs / "run.log.0").write_bytes(b"legacy slot zero\n")
+    (logs / "run.log.1").write_bytes(b"legacy slot one\n")
+    (logs / "run.log.cursor").write_bytes(b"1\n")
+    (logs / "run.log.lock").write_bytes(b"legacy lock\n")
+    before = legacy_runtime_log_snapshot(agent_home)
+
+    result = run_installed_myclaw(agent_home, workspace=workspace)
+
+    assert result.returncode == 2
+    assert legacy_runtime_log_snapshot(agent_home) == before
 
 
 def test_installed_config_command_generates_and_displays_missing_configuration(
@@ -259,23 +242,16 @@ def test_installed_config_command_shows_safe_malformed_configuration(
     result = run_installed_myclaw(agent_home, "config", workspace=workspace)
 
     assert result.returncode == 2
-    assert "config_parse_error" in result.stdout
+    assert result.stdout.count("config_parse_error") == 1
     assert f"Path: {agent_home / 'config.toml'}" in result.stdout
     assert EXPECTED_REDACTED_MALFORMED_CONFIG in result.stdout
+    assert result.stderr == ""
     assert_plaintext_absent(
         result.stdout + result.stderr,
         "first-plaintext-key",
         "second-plaintext-key",
     )
-    runtime_log = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert "ERROR" in runtime_log
-    assert (
-        "session=- myclaw.terminal.cli: Configuration command failed code=config_parse_error"
-        in runtime_log
-    )
-    assert_plaintext_absent(runtime_log, "first-plaintext-key", "second-plaintext-key")
-    assert "Traceback (most recent call last)" not in runtime_log
-    assert "ConfigError" not in runtime_log
+    assert not (agent_home / "logs").exists()
     assert not (workspace / ".myclaw").exists()
 
 
@@ -359,24 +335,14 @@ def test_installed_myclaw_stops_on_parse_schema_and_default_failures(
     combined_output = "".join(
         result.stdout + result.stderr for result in (parse_result, schema_result, default_result)
     )
+    assert all(result.stderr == "" for result in (parse_result, schema_result, default_result))
     assert_plaintext_absent(
         combined_output,
         "first-plaintext-key",
         "second-plaintext-key",
         "plaintext-primary-key",
     )
-    runtime_log = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert "myclaw.config.config.ConfigError: [REDACTED]" in runtime_log
-    assert "User Configuration TOML could not be parsed." not in runtime_log
-    assert "Traceback (most recent call last)" in runtime_log
-    assert "[models.providers.primary]" not in runtime_log
-    assert "api_key =" not in runtime_log
-    assert_plaintext_absent(
-        runtime_log,
-        "first-plaintext-key",
-        "second-plaintext-key",
-        "plaintext-primary-key",
-    )
+    assert not (agent_home / "logs").exists()
 
 
 def test_installed_myclaw_reports_unsafe_workspace_state_without_traceback(
@@ -391,11 +357,13 @@ def test_installed_myclaw_reports_unsafe_workspace_state_without_traceback(
     result = run_installed_myclaw(agent_home, workspace=workspace)
 
     assert result.returncode == 1
-    assert "persistence_error" in result.stdout
+    assert result.stdout.count("persistence_error") == 1
     assert "Workspace State" in result.stdout
     assert str(state_path) in result.stdout
     assert "private collision content" not in result.stdout + result.stderr
     assert "Traceback" not in result.stdout + result.stderr
+    assert result.stderr == ""
+    assert not (agent_home / "logs").exists()
 
 
 def test_installed_myclaw_rejects_user_home_workspace_without_traceback(
@@ -407,9 +375,10 @@ def test_installed_myclaw_rejects_user_home_workspace_without_traceback(
     result = run_installed_myclaw(agent_home, workspace=agent_home.parent)
 
     assert result.returncode == 1
-    assert "persistence_error" in result.stdout
+    assert result.stdout.count("persistence_error") == 1
     assert "Workspace State" in result.stdout
     assert str(agent_home) in result.stdout
     assert "Traceback" not in result.stdout + result.stderr
+    assert result.stderr == ""
     assert not (agent_home / "memory").exists()
     assert not (agent_home / "sessions").exists()
