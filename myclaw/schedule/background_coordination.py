@@ -1,7 +1,6 @@
 """Runtime-local Scheduled Work coordination and background Agent Events."""
 
 import asyncio
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, tzinfo
@@ -9,16 +8,16 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from croniter import croniter  # type: ignore[import-untyped]
+from loguru import logger
 from tzlocal import get_localzone
 
 from myclaw.agent.events import AgentEvent, BackgroundCompletedPayload
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
-from myclaw.runtime_log import log_sanitized_exception, runtime_log_session
+from myclaw.logging.session import session_log
 from myclaw.schedule.records import ScheduledWork
 from myclaw.schedule.scheduled_work import ScheduledWorkPersistenceError, ScheduledWorkStore
 from myclaw.schedule.scheduled_work_execution import ScheduledWorkRunner
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,12 +128,14 @@ class ScheduledWorkCoordinator:
         events: RuntimeEventBroker,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
+        workspace_state: WorkspaceState | None = None,
     ) -> None:
         self._runner = runner
         self._events = events
         self._now = now
         self._new_uuid = new_uuid
         self._active_task_ids: set[str] = set()
+        self._workspace_state = workspace_state
 
     async def trigger(self, task: ScheduledWork) -> ScheduledWorkTriggerResult:
         if task.id in self._active_task_ids:
@@ -171,13 +172,13 @@ class ScheduledWorkCoordinator:
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise
-                with runtime_log_session(task.session_id):
-                    log_sanitized_exception(
-                        logger,
-                        logging.ERROR,
-                        "Scheduled Work event publication failed",
-                        error,
-                    )
+                correlation = (
+                    session_log(self._workspace_state, task.session_id)
+                    if self._workspace_state is not None
+                    else logger.contextualize(session_id=task.session_id)
+                )
+                with correlation:
+                    logger.opt(exception=error).error("Scheduled Work event publication failed")
                 raise
             return ScheduledWorkTriggerResult(
                 status=result.status,
@@ -219,6 +220,7 @@ class ScheduledWorkScheduler:
         store: ScheduledWorkStore,
         coordinator: ScheduledWorkCoordinator,
         clock: ScheduledWorkSchedulerClock,
+        workspace_state: WorkspaceState | None = None,
     ) -> None:
         self._store = store
         self._coordinator = coordinator
@@ -227,6 +229,7 @@ class ScheduledWorkScheduler:
         self._run_tasks: dict[asyncio.Task[ScheduledWorkTriggerResult], str] = {}
         self._timezone: tzinfo | None = None
         self._closed = False
+        self._workspace_state = workspace_state
 
     def start(self) -> None:
         if self._closed:
@@ -255,13 +258,13 @@ class ScheduledWorkScheduler:
         )
         for (_task, session_id), result in zip(owned, results, strict=True):
             if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-                with runtime_log_session(session_id):
-                    log_sanitized_exception(
-                        logger,
-                        logging.ERROR,
-                        "Scheduled Work scheduler cleanup failed",
-                        result,
-                    )
+                correlation = (
+                    session_log(self._workspace_state, session_id)
+                    if self._workspace_state is not None and session_id != "-"
+                    else logger.contextualize(session_id=session_id)
+                )
+                with correlation:
+                    logger.opt(exception=result).error("Scheduled Work scheduler cleanup failed")
 
     async def _run(self, previous: datetime) -> None:
         timezone = self._timezone
@@ -271,12 +274,7 @@ class ScheduledWorkScheduler:
             try:
                 records = tuple(record for record in self._store.load() if record.enabled)
             except ScheduledWorkPersistenceError as error:
-                log_sanitized_exception(
-                    logger,
-                    logging.ERROR,
-                    "Scheduled Work definitions could not be loaded",
-                    error,
-                )
+                logger.opt(exception=error).error("Scheduled Work definitions could not be loaded")
                 await self._clock.sleep(60.0)
                 previous = self._clock.now().astimezone(timezone)
                 continue
@@ -290,12 +288,7 @@ class ScheduledWorkScheduler:
             try:
                 records = tuple(record for record in self._store.load() if record.enabled)
             except ScheduledWorkPersistenceError as error:
-                log_sanitized_exception(
-                    logger,
-                    logging.ERROR,
-                    "Scheduled Work definitions could not be loaded",
-                    error,
-                )
+                logger.opt(exception=error).error("Scheduled Work definitions could not be loaded")
                 previous = current
                 continue
             for record in records:

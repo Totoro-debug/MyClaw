@@ -4,6 +4,10 @@ status: accepted
 
 # Store Workspace State in the Workspace
 
+Session technical diagnostics are Workspace-owned and stored lazily in `.myclaw\logs\<session_id>.log`; this supersedes the former Agent Home Runtime Log ownership for new writes.
+
+The Workspace State boundary therefore includes Session Logs while legacy Runtime Log files remain outside this state and untouched. The phrase "except User Configuration and Runtime Logs" below refers only to legacy files and is superseded for new diagnostics by ADR-0008.
+
 MyClaw stores all persistent state except User Configuration and Runtime Logs in `<workspace>\.myclaw\`. Each Workspace owns isolated Conversation Sessions, Memory System state, Scheduled Work, and Tool Artifacts; copying the complete Workspace carries this state, while initialization creates an internal Git ignore rule when absent. MyClaw never reads, validates, or replaces an existing `.myclaw\.gitignore`, so a later user edit may intentionally expose Workspace State to version control. Workspace State is reserved from generic file inspection, with explicit read access only for Long-term Memory and the current Conversation Session's Tool Artifacts. The `.myclaw` name itself reserves MyClaw's ownership without a directory-level marker or schema version: an existing ordinary directory is accepted, known files validate their own formats, and unknown entries are preserved without being read, while a file, symbolic link, Junction, or Reparse Point at that path fails startup. Runtime startup also fails rather than falling back to Agent Home or an ephemeral mode when Workspace State cannot otherwise be initialized safely. Existing non-global files under Agent Home are preserved but are no longer read or migrated because their global memory data cannot be assigned reliably to a Workspace. This decision supersedes ADR-0002's ownership and layout of non-global state while retaining its fixed Agent Home for User Configuration and Runtime Logs.
 
 The Workspace State layout removes the former Workspace slug layer without changing individual persistence formats:
@@ -23,6 +27,8 @@ The Workspace State layout removes the former Workspace slug layer without chang
     artifacts\
       <session_id>\
         <encoded_tool_call_id>.txt
+  logs\
+    <session_id>.log
 ```
 
 After global User Configuration loads and validates, REPL startup initializes `.myclaw\`, its internal ignore rule, `memory\`, `sessions\`, and a missing `memory\memory.md` template before accepting input. It does not create a Conversation Session JSONL file until the first message is persisted, and creates `artifacts\` only when a successful oversized Tool result is first externalized; summary, cursor, consolidation-journal, and Scheduled Work files also remain on demand. The `myclaw config` Management Command never initializes Workspace State.

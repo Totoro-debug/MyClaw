@@ -26,7 +26,6 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import (
     AssistantSessionMessage,
@@ -48,6 +47,7 @@ from tests.fixtures import (
     StreamScript,
     validate_agent_event_sequence,
 )
+from tests.fixtures.log_capture import install_log_capture
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -64,7 +64,7 @@ REQUEST_TWO_UUID = UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e")
 ASSISTANT_TWO_UUID = UUID("b3f37212-6f3a-4a1b-8d2e-78ab3f9c4567")
 
 
-def _runtime_log_text(agent_home: Path) -> str:
+def _captured_log_text(agent_home: Path) -> str:
     logs = agent_home / "logs"
     return "".join(
         path.read_text(encoding="utf-8")
@@ -492,7 +492,7 @@ async def test_initial_session_publication_failure_is_one_safe_terminal_event(
         new_uuid=iter((TURN_UUID, USER_UUID)).__next__,
     )
 
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         events = [event async for event in conversation.submit("Do not leak disk details.")]
@@ -508,7 +508,7 @@ async def test_initial_session_publication_failure_is_one_safe_terminal_event(
     assert "private-api-key-and-traceback-detail" not in str(failed.to_dict())
     assert provider.stream_requests == []
     assert not sessions.path_for(session.id).exists()
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
     assert len(records) == 1
     assert (
@@ -551,7 +551,7 @@ async def test_closing_conversation_stream_closes_provider_iterator_immediately(
         now=clock.now,
         new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         stream = conversation.submit("Start a streamed response.")
@@ -561,7 +561,7 @@ async def test_closing_conversation_stream_closes_provider_iterator_immediately(
     lifetime.close()
 
     assert provider.stream_closed is True
-    assert _runtime_log_text(agent_home) == ""
+    assert _captured_log_text(agent_home) == ""
 
 
 @pytest.mark.asyncio
@@ -592,14 +592,14 @@ async def test_foreground_stream_cleanup_failure_is_logged_as_an_independent_err
         now=clock.now,
         new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         events = [event async for event in conversation.submit("Complete the turn.")]
     lifetime.close()
 
     assert [event.type for event in events] == ["turn_started", "turn_completed"]
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
     assert len(records) == 1
     assert (
@@ -645,7 +645,7 @@ async def test_title_generation_closes_provider_iterator_after_completion(
         title_prompt="Generate one title.",
     )
 
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         events = [event async for event in conversation.submit("Name this session.")]
@@ -654,7 +654,7 @@ async def test_title_generation_closes_provider_iterator_after_completion(
 
     assert [event.type for event in events] == ["turn_started", "turn_completed"]
     assert provider.title_stream_closed is True
-    assert _runtime_log_text(agent_home) == ""
+    assert _captured_log_text(agent_home) == ""
 
 
 @pytest.mark.asyncio
@@ -890,7 +890,7 @@ async def test_tool_stage_cancellation_survives_persistent_repair_failure(
         ).__next__,
         tool_gateway=_gateway(tool),
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         stream = conversation.submit("Cancel before the sensitive tool executes.")
@@ -921,7 +921,7 @@ async def test_tool_stage_cancellation_survives_persistent_repair_failure(
     assert tool.calls == []
     persisted = await sessions.load(session.id)
     assert [message.role for message in persisted.messages] == expected_roles
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
     if store_type is ToolAppendAndRepairFailingStore:
         assert len(records) == 1
@@ -967,7 +967,7 @@ async def test_corrupt_session_before_model_call_is_a_safe_persistence_terminal(
         new_uuid=iter((TURN_UUID, USER_UUID)).__next__,
     )
 
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         events = [event async for event in conversation.submit("Stop before provider use.")]
@@ -982,7 +982,7 @@ async def test_corrupt_session_before_model_call_is_a_safe_persistence_terminal(
     )
     assert "private-corrupt-jsonl-content" not in str(failed.to_dict())
     assert provider.stream_requests == []
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
     assert len(records) == 1
     assert (
@@ -1029,7 +1029,7 @@ async def test_model_error_publication_failure_reports_only_persistence_error(
         new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
     )
 
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         events = [event async for event in conversation.submit("Fail without leaking.")]
@@ -1046,7 +1046,7 @@ async def test_model_error_publication_failure_reports_only_persistence_error(
     assert "private-provider-response-body" not in rendered
     assert "private-assistant-publication-detail" not in rendered
     assert [message.role for message in (await sessions.load(session.id)).messages] == ["user"]
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
     assert len(records) == 2
     assert "Agent Turn failed code=provider_unavailable type=ModelCallError" in records[0]
@@ -1228,7 +1228,7 @@ async def test_foreground_model_failure_is_logged_once_without_private_content(
         new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
         system_prompt=" ".join(private_values[1:5]),
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
     lifetime.add_api_keys((private_values[6],))
 
     with lifetime.session(session.id):
@@ -1236,7 +1236,7 @@ async def test_foreground_model_failure_is_logged_once_without_private_content(
     lifetime.close()
 
     assert [event.type for event in events] == ["turn_started", "turn_failed"]
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
     assert len(records) == 1
     assert " ERROR " in records[0]
@@ -1456,7 +1456,7 @@ async def test_assistant_publication_failure_never_reports_turn_completed(
         now=clock.now,
         new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         events = [event async for event in conversation.submit("Persist before completing.")]
@@ -1472,7 +1472,7 @@ async def test_assistant_publication_failure_never_reports_turn_completed(
     assert "private-assistant-publication-detail" not in str(failed.to_dict())
     assert [message.role for message in (await sessions.load(session.id)).messages] == ["user"]
     assert len(provider.stream_requests) == 1
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
     assert len(records) == 1
     assert (
@@ -1744,7 +1744,7 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
             session_id=session.id,
         ),
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         events = [event async for event in conversation.submit("Run one sensitive tool.")]
@@ -1784,7 +1784,7 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
         if expected_tool_status == "error":
             assert tool_message.content == "Tool result could not be persisted."
     assert len(provider.stream_requests) == 1
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     primary_records = [
         line
         for line in content.splitlines()

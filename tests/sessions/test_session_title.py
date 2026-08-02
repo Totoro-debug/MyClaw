@@ -21,7 +21,6 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import (
     AssistantSessionMessage,
@@ -34,6 +33,7 @@ from myclaw.session.records import (
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.models import ModelToolCall
 from tests.fixtures import FakeClock
+from tests.fixtures.log_capture import install_log_capture
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -43,7 +43,7 @@ REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
 TITLE_PROMPT = "Return a short title for this Conversation Session."
 
 
-def _runtime_log_text(agent_home: Path) -> str:
+def _captured_log_text(agent_home: Path) -> str:
     logs = agent_home / "logs"
     return "".join(
         path.read_text(encoding="utf-8")
@@ -335,15 +335,15 @@ async def test_close_waits_for_the_detached_title_task_to_stop(
         system_prompt="chat system prompt",
         title_prompt=TITLE_PROMPT,
     )
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
-        with runtime_log.session(session.id):
+        with log_capture.session(session.id):
             await _collect_events(conversation, "Start a title that will still be running.")
             await provider.title_started.wait()
             await conversation.close()
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert provider.title_stopped.is_set()
     assert not (agent_home / "logs").exists()
@@ -438,10 +438,10 @@ async def test_failed_title_call_uses_normalized_unicode_bounded_input_fallback(
         title_prompt=TITLE_PROMPT,
     )
     first_input = "  Plan\t" + "\u754c" * 70
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
-        with runtime_log.session(session.id):
+        with log_capture.session(session.id):
             event_types = await _collect_events(conversation, first_input)
             for _ in range(100):
                 reloaded = await store.load(session.id)
@@ -449,19 +449,19 @@ async def test_failed_title_call_uses_normalized_unicode_bounded_input_fallback(
                     break
                 await asyncio.sleep(0)
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert event_types == ["turn_started", "turn_completed"]
     assert reloaded.metadata.title == "Plan " + "\u754c" * 55
     assert len(reloaded.metadata.title) == 60
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 1
     assert " WARNING " in records[0]
     assert "Session title fallback selected code=model_failed type=ModelCallError" in records[0]
     assert f"session={session.id}" in records[0]
     assert content.count("Traceback (most recent call last)") == 1
-    assert "ModelCallError: Session title generation failed." in content
+    assert "ModelCallError: [REDACTED]" in content
     assert first_input not in content
     assert TITLE_PROMPT not in content
     assert "private-title-provider-body" not in content
@@ -498,7 +498,7 @@ async def test_terminal_title_metadata_failure_is_logged_without_repeating_provi
         system_prompt="chat system prompt",
         title_prompt=TITLE_PROMPT,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         event_types = await _collect_events(conversation, "Fallback title input")
@@ -506,7 +506,7 @@ async def test_terminal_title_metadata_failure_is_logged_without_repeating_provi
     lifetime.close()
 
     assert event_types == ["turn_started", "turn_completed"]
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 2
     assert " WARNING " in records[0]
@@ -557,19 +557,19 @@ async def test_title_metadata_failure_records_one_error_without_changing_foregro
         system_prompt="chat system prompt",
         title_prompt=TITLE_PROMPT,
     )
-    first_input = "This content must not enter the Runtime Log."
-    runtime_log = install_runtime_logging(home)
+    first_input = "This content must not enter the diagnostic log."
+    log_capture = install_log_capture(home)
 
     try:
-        with runtime_log.session(session.id):
+        with log_capture.session(session.id):
             event_types = await _collect_events(conversation, first_input)
             provider.release_title.set()
             await conversation.close()
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert event_types == ["turn_started", "text_delta", "turn_completed"]
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 1
     assert " ERROR " in records[0]
@@ -578,7 +578,7 @@ async def test_title_metadata_failure_records_one_error_without_changing_foregro
         in records[0]
     )
     assert f"session={session.id}" in records[0]
-    assert "OSError: Session title persistence failed." in content
+    assert "OSError: [REDACTED]" in content
     assert "title metadata write failed" not in content
     assert first_input not in content
 
@@ -612,18 +612,18 @@ async def test_title_stream_cleanup_failure_warns_and_keeps_the_generated_title(
         system_prompt="chat system prompt",
         title_prompt=TITLE_PROMPT,
     )
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
-        with runtime_log.session(session.id):
+        with log_capture.session(session.id):
             events = await _collect_events(conversation, "Name this safely.")
             await conversation.close()
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert events == ["turn_started", "turn_completed"]
     assert (await store.load(session.id)).metadata.title == "Generated title"
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     marker = (
         f"session={session.id} myclaw.session.conversation: "
         "Session title stream cleanup failed type=OSError"
@@ -719,7 +719,7 @@ async def test_title_completion_with_tool_calls_uses_fallback_but_counts_usage(
         system_prompt="chat system prompt",
         title_prompt=TITLE_PROMPT,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         await _collect_events(conversation, "Fallback project title")
@@ -738,7 +738,7 @@ async def test_title_completion_with_tool_calls_uses_fallback_but_counts_usage(
         total_tokens=28,
     )
     assert [message.role for message in reloaded.messages] == ["user", "assistant"]
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 1
     assert " WARNING " in records[0]
@@ -780,7 +780,7 @@ async def test_empty_title_and_empty_normalized_input_keep_untitled_with_usage(
         system_prompt="chat system prompt",
         title_prompt=TITLE_PROMPT,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         await _collect_events(conversation, '""')
@@ -800,7 +800,7 @@ async def test_empty_title_and_empty_normalized_input_keep_untitled_with_usage(
         total_tokens=25,
     )
     assert [message.role for message in reloaded.messages] == ["user", "assistant"]
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 1
     assert " WARNING " in records[0]

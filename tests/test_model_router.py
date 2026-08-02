@@ -32,8 +32,8 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.runtime_log import install_runtime_logging
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures.log_capture import install_log_capture
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -45,7 +45,7 @@ async def collect(stream: AsyncIterator[object]) -> list[object]:
     return [event async for event in stream]
 
 
-def runtime_log_text(agent_home: Path) -> str:
+def captured_log_text(agent_home: Path) -> str:
     logs = agent_home / "logs"
     return "".join(
         path.read_text(encoding="utf-8")
@@ -431,7 +431,7 @@ async def test_model_router_records_only_consumed_retry_attempts(
         clock=FakeClock(NOW),
         jitter=None,
     )
-    lifetime = install_runtime_logging(AgentHome(agent_home))
+    lifetime = install_log_capture(AgentHome(agent_home))
 
     with lifetime.session(SESSION_ID), pytest.raises(ModelCallError):
         await collect(router.stream(request(route="chat")))
@@ -439,7 +439,7 @@ async def test_model_router_records_only_consumed_retry_attempts(
 
     records = [
         line
-        for line in runtime_log_text(agent_home).splitlines()
+        for line in captured_log_text(agent_home).splitlines()
         if "myclaw.provider.model_router:" in line
     ]
     assert len(records) == 4
@@ -457,10 +457,10 @@ async def test_model_router_records_only_consumed_retry_attempts(
         assert "model=chat-model" in record
         assert f"planned_delay_seconds={delay}" in record
         assert f"session={SESSION_ID}" in record
-    assert "attempt=5/5" not in runtime_log_text(agent_home)
-    content = runtime_log_text(agent_home)
+    assert "attempt=5/5" not in captured_log_text(agent_home)
+    content = captured_log_text(agent_home)
     assert content.count("Traceback (most recent call last)") == 4
-    assert content.count("ModelCallError: The Provider attempt failed.") == 4
+    assert content.count("ModelCallError: [REDACTED]") == 4
     assert private_failure_detail not in content
 
 
@@ -561,7 +561,7 @@ async def test_model_router_records_failed_attempt_and_default_fallback_separate
         clock=FakeClock(NOW),
         jitter=None,
     )
-    lifetime = install_runtime_logging(AgentHome(agent_home))
+    lifetime = install_log_capture(AgentHome(agent_home))
 
     with lifetime.session(SESSION_ID):
         observed = await collect(router.stream(request(route="chat")))
@@ -570,7 +570,7 @@ async def test_model_router_records_failed_attempt_and_default_fallback_separate
     assert observed == [completed("Recovered")]
     records = [
         line
-        for line in runtime_log_text(agent_home).splitlines()
+        for line in captured_log_text(agent_home).splitlines()
         if "myclaw.provider.model_router:" in line
     ]
     assert len(records) == 2
@@ -588,9 +588,9 @@ async def test_model_router_records_failed_attempt_and_default_fallback_separate
     assert "selected_route=default" in records[1]
     assert "model=default-model" in records[1]
     assert all(" WARNING " in record for record in records)
-    content = runtime_log_text(agent_home)
+    content = captured_log_text(agent_home)
     assert content.count("Traceback (most recent call last)") == 1
-    assert content.count("ModelCallError: The Provider attempt failed.") == 1
+    assert content.count("ModelCallError: [REDACTED]") == 1
     assert private_provider_body not in content
 
 
@@ -668,7 +668,7 @@ async def test_model_router_records_static_default_fallback_without_provider_att
         clock=FakeClock(NOW),
         jitter=None,
     )
-    lifetime = install_runtime_logging(AgentHome(agent_home))
+    lifetime = install_log_capture(AgentHome(agent_home))
 
     with lifetime.session(SESSION_ID):
         observed = await collect(router.stream(request(route="chat")))
@@ -677,7 +677,7 @@ async def test_model_router_records_static_default_fallback_without_provider_att
     assert observed == [completed("Static fallback")]
     records = [
         line
-        for line in runtime_log_text(agent_home).splitlines()
+        for line in captured_log_text(agent_home).splitlines()
         if "myclaw.provider.model_router:" in line
     ]
     assert len(records) == 1

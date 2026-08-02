@@ -15,7 +15,6 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.shell import shell_policy
 from myclaw.tools.shell.shell_policy import ShellRequest
@@ -28,6 +27,7 @@ from myclaw.utils.host_filesystem import (
 )
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures.log_capture import install_log_capture
 
 SESSION_ID = "20260712-120000-000000_550e8400-e29b-41d4-a716-446655440000"
 NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
@@ -178,7 +178,7 @@ async def test_shell_failure_log_excludes_command_and_process_output(
     shell = FailingShellBoundary()
     gateway = ToolGateway()
     gateway.register_tools((ShellTool(workspace=workspace, boundary=shell),))
-    lifetime = install_runtime_logging(AgentHome(agent_home))
+    lifetime = install_log_capture(AgentHome(agent_home))
 
     with lifetime.session("foreground-shell-session-51"):
         result = await gateway.call(

@@ -84,7 +84,6 @@ def test_package_initializers_do_not_create_aggregate_import_entries() -> None:
 
 def test_host_selection_is_confined_to_the_three_native_deep_modules() -> None:
     expected = {
-        Path("myclaw/runtime_log_lock.py"),
         Path("myclaw/tools/shell/owned_process.py"),
         Path("myclaw/utils/host_filesystem.py"),
     }

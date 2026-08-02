@@ -1,19 +1,17 @@
 """Standalone dispatch for read-only Management Commands."""
 
 import json
-import logging
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+
+from loguru import logger
 
 from myclaw.config.config import ConfigView
 from myclaw.management.service import ManagementError, ResumeResult, RuntimeStatus
 from myclaw.memory.memory_task import MemoryTaskResult
-from myclaw.runtime_log import log_sanitized_exception
 from myclaw.session.records import SessionSummary
 from myclaw.session.session_store import SessionListingReport
 from myclaw.utils.time import format_rfc3339_milliseconds
-
-logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -133,7 +131,7 @@ class ManagementCommandDispatcher:
         prefix = f"Path: {view.path}\n"
         if view.error is not None:
             logger.error(
-                "Management command failed command=/config code=%s",
+                "Management command failed command=/config code={}",
                 view.error.code,
             )
             prefix = f"{view.error.code}: {view.error.message}\n{prefix}"
@@ -149,11 +147,8 @@ class ManagementCommandDispatcher:
             _log_management_error("/resume", management_error)
             output = f"{management_error.error.code}: {management_error.error.message}"
         except Exception as error:
-            log_sanitized_exception(
-                logger,
-                logging.ERROR,
-                f"Management command failed command=/resume type={type(error).__name__}",
-                error,
+            logger.opt(exception=error).error(
+                "Management command failed command=/resume type={}", type(error).__name__
             )
             raise
         else:
@@ -164,9 +159,6 @@ class ManagementCommandDispatcher:
 def _log_management_error(command: str, error: ManagementError) -> None:
     if error.error.code != "persistence_error":
         return
-    log_sanitized_exception(
-        logger,
-        logging.ERROR,
-        f"Management command failed command={command} code={error.error.code}",
-        error,
+    logger.opt(exception=error).error(
+        "Management command failed command={} code={}", command, error.error.code
     )

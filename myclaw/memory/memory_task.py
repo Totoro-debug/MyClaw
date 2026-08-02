@@ -1,12 +1,13 @@
 """Manual Memory Task orchestration and persistent-state adapters."""
 
 import asyncio
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Protocol, runtime_checkable
 from uuid import uuid4
+
+from loguru import logger
 
 from myclaw.agent.prompts import memory_task_input, memory_task_prompt
 from myclaw.agent.workspace_state import WorkspaceState
@@ -21,15 +22,12 @@ from myclaw.provider.models import (
     ToolModelMessage,
     UserModelMessage,
 )
-from myclaw.runtime_log import log_sanitized_exception
 from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
 from myclaw.tools.schema import ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.validation import require_nonnegative_int
-
-logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -413,12 +411,7 @@ class MemoryManager:
         if self._failure_diagnostic is None:
             logger.error(message)
             return
-        log_sanitized_exception(
-            logger,
-            logging.ERROR,
-            message,
-            self._failure_diagnostic,
-        )
+        logger.opt(exception=self._failure_diagnostic).error(message)
 
 
 def _state_read_failure(*, cursor: int) -> MemoryTaskResult:

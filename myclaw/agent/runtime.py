@@ -2,15 +2,16 @@
 
 import asyncio
 import json
-import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import nullcontext
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
 from typing import Protocol
 from uuid import UUID
+
+from loguru import logger
 
 from myclaw.agent.events import AgentEvent, ConversationPort
 from myclaw.agent.prompts import (
@@ -24,6 +25,7 @@ from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
+from myclaw.logging.session import session_log
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import (
     ManagementViewService,
@@ -48,7 +50,6 @@ from myclaw.memory.memory_task import (
 )
 from myclaw.provider.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
 from myclaw.provider.models import ModelProvider
-from myclaw.runtime_log import RuntimeLogLifetime, log_sanitized_exception
 from myclaw.schedule.background_coordination import (
     AsyncioScheduledWorkSchedulerClock,
     RuntimeEventBroker,
@@ -99,8 +100,6 @@ from myclaw.tools.web.web_search import (
     WebSearchBoundary,
     WebSearchTool,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class ProviderFactory(Protocol):
@@ -182,11 +181,8 @@ class PreparedReplRuntime:
             self._memory_scheduler.start()
             self._scheduled_work_scheduler.start()
         except BaseException as error:
-            log_sanitized_exception(
-                logger,
-                logging.ERROR,
-                f"Runtime startup failed type={type(error).__name__}",
-                error,
+            logger.opt(exception=error).error(
+                "Runtime startup failed type={}", type(error).__name__
             )
             raise
 
@@ -280,11 +276,8 @@ class PreparedReplRuntime:
             if len(failures) == 1
             else BaseExceptionGroup("Runtime shutdown failed", failures)
         )
-        log_sanitized_exception(
-            logger,
-            logging.ERROR,
-            f"Runtime shutdown failed type={type(failure).__name__}",
-            failure,
+        logger.opt(exception=failure).error(
+            "Runtime shutdown failed type={}", type(failure).__name__
         )
         raise failure
 
@@ -305,8 +298,8 @@ class _DeferredConversationPort:
         history_preparer: Callable[[ConversationSession], Awaitable[ConversationSession]],
         before_submit: Callable[[], Awaitable[None]],
         on_foreground_terminal: Callable[[], None],
-        runtime_log: RuntimeLogLifetime | None = None,
         externalize_result: ToolResultExternalizer | None = None,
+        workspace_state: WorkspaceState | None = None,
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -320,7 +313,7 @@ class _DeferredConversationPort:
         self._history_preparer = history_preparer
         self._before_submit = before_submit
         self._on_foreground_terminal = on_foreground_terminal
-        self._runtime_log = runtime_log
+        self._workspace_state = workspace_state
         self._externalize_result = externalize_result
         self._delegate: ConversationPort | None = None
         self._close_task: asyncio.Task[None] | None = None
@@ -340,11 +333,12 @@ class _DeferredConversationPort:
         active_done = asyncio.Event()
         self._active_task = active
         self._active_done = active_done
-        correlation = (
-            nullcontext()
-            if self._runtime_log is None
-            else self._runtime_log.session(self._session_id)
+        title_log_ready = asyncio.Event()
+        correlation: AbstractContextManager[None] = logger.contextualize(
+            session_id=self._session_id
         )
+        if self._workspace_state is not None:
+            correlation = session_log(self._workspace_state, self._session_id)
         with correlation:
             try:
                 await self._before_submit()
@@ -364,6 +358,8 @@ class _DeferredConversationPort:
                         tool_gateway=self._tool_gateway,
                         history_preparer=self._history_preparer,
                         externalize_result=self._externalize_result,
+                        workspace_state=self._workspace_state,
+                        title_log_ready=title_log_ready.wait,
                     )
                     self._delegate = delegate
                 async for event in delegate.submit(text):
@@ -376,6 +372,7 @@ class _DeferredConversationPort:
                 active_done.set()
                 if self._active_done is active_done:
                     self._active_done = None
+                title_log_ready.set()
 
     async def cancel_active_turn(self) -> None:
         delegate = self._delegate
@@ -431,7 +428,6 @@ def prepare_repl_runtime(
     web_search: WebSearchBoundary | None = None,
     web_fetch: WebFetchBoundary | None = None,
     shell: ShellBoundary | None = None,
-    runtime_log: RuntimeLogLifetime | None = None,
 ) -> PreparedReplRuntime:
     """Prepare one Runtime and record terminal composition failures once."""
     try:
@@ -450,16 +446,12 @@ def prepare_repl_runtime(
             web_search=web_search,
             web_fetch=web_fetch,
             shell=shell,
-            runtime_log=runtime_log,
         )
     except WorkspaceStateError:
         raise
     except Exception as error:
-        log_sanitized_exception(
-            logger,
-            logging.ERROR,
-            f"Runtime composition failed type={type(error).__name__}",
-            error,
+        logger.opt(exception=error).error(
+            "Runtime composition failed type={}", type(error).__name__
         )
         raise
 
@@ -480,7 +472,6 @@ def _prepare_repl_runtime(
     web_search: WebSearchBoundary | None = None,
     web_fetch: WebFetchBoundary | None = None,
     shell: ShellBoundary | None = None,
-    runtime_log: RuntimeLogLifetime | None = None,
 ) -> PreparedReplRuntime:
     """Prepare a Session and defer provider construction until conversational input."""
     configuration.resolve_route("default")
@@ -633,6 +624,7 @@ def _prepare_repl_runtime(
         new_uuid=new_uuid,
         tool_gateway_for=scheduled_work_gateway_for,
         externalize_result_for=externalize_result_for,
+        workspace_state=workspace_state,
     )
     background_events = RuntimeEventBroker()
     scheduled_work_coordinator = ScheduledWorkCoordinator(
@@ -640,6 +632,7 @@ def _prepare_repl_runtime(
         events=background_events,
         now=now,
         new_uuid=new_uuid,
+        workspace_state=workspace_state,
     )
     scheduled_scheduler_clock = (
         scheduled_work_scheduler_clock
@@ -651,6 +644,7 @@ def _prepare_repl_runtime(
             store=scheduled_work_store,
             coordinator=scheduled_work_coordinator,
             clock=scheduled_scheduler_clock,
+            workspace_state=workspace_state,
         )
     )
     foreground_chat_status: ResolvedChatStatus | None = None
@@ -689,8 +683,8 @@ def _prepare_repl_runtime(
             history_preparer=summary_manager.prepare,
             before_submit=summary_manager.recover_pending,
             on_foreground_terminal=capture_foreground_chat_status,
-            runtime_log=runtime_log,
             externalize_result=externalize_result_for(session_id),
+            workspace_state=workspace_state,
         )
 
     conversation = SwitchableConversationPort(

@@ -17,7 +17,6 @@ from myclaw.management.service import (
 )
 from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.provider.models import ModelUsage
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.records import (
     AssistantSessionMessage,
     ConversationSession,
@@ -25,6 +24,7 @@ from myclaw.session.records import (
     UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
+from tests.fixtures.log_capture import install_log_capture
 
 CONFIG_CONTENT = """[models.providers.primary]
 protocol = "anthropic"
@@ -204,12 +204,12 @@ async def test_config_command_renders_safe_parse_error_and_redacted_source(
     config_path = agent_home / "config.toml"
     config_path.write_text(MALFORMED_CONFIG_CONTENT, encoding="utf-8")
     dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
         result = await dispatcher.dispatch("/config")
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert result.handled is True
     assert result.output == (
@@ -236,12 +236,12 @@ async def test_config_command_renders_safe_persistence_failure(agent_home: Path)
     home.initialize()
     (agent_home / "config.toml").write_bytes(b'api_key = "raw-command-secret"\xff')
     dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
         result = await dispatcher.dispatch("/config")
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert (result.handled, result.output) == (
         True,
@@ -330,12 +330,12 @@ async def test_memory_command_renders_safe_persistence_failure(
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
     )
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
         result = await dispatcher.dispatch("/memory")
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert (result.handled, result.output) == (
         True,
@@ -374,12 +374,12 @@ async def test_status_command_logs_safe_persistence_failure(agent_home: Path) ->
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, status_service=status_service)
     )
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
         result = await dispatcher.dispatch("/status")
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert result.output == "persistence_error: Runtime status could not be read."
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")

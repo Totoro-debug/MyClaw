@@ -85,8 +85,8 @@ prompt.
 
 ## Persistent State
 
-MyClaw keeps global User Configuration and Runtime Logs in the current account's fixed
-Agent Home at `~/.myclaw/`:
+MyClaw keeps global User Configuration and legacy Runtime Logs in the current account's
+fixed Agent Home at `~/.myclaw/`. New Session diagnostics are Workspace-owned:
 
 ```text
 ~/.myclaw/
@@ -113,10 +113,13 @@ the reserved `.myclaw` directory beneath that Workspace:
   sessions/
     <session_id>.jsonl
     artifacts/<session_id>/<encoded_tool_call_id>.txt
+  logs/
+    <session_id>.log
 ```
 
 Valid REPL startup creates only the Workspace State root, `.gitignore`, `memory/`,
-`sessions/`, and `memory/memory.md`. Summary, cursor, Scheduled Work, Session, journal,
+`sessions/`, and `memory/memory.md`; `logs/` is created lazily by an explicit Session
+context when a WARNING or ERROR is emitted. Summary, cursor, Scheduled Work, Session, journal,
 and Artifact files remain on demand. Old non-global Agent Home data is ignored and is
 never migrated or deleted. Back up each Workspace State directory with its Workspace;
 do not edit active Session, summary, cursor, or Scheduled Work files.
@@ -146,7 +149,7 @@ do not edit active Session, summary, cursor, or Scheduled Work files.
 - Long-term Memory has no automatic size cap, and Tool Artifacts have no automatic
   cleanup policy.
 - v0.1 has no daemon, HTTP/IPC service, MCP support, subagent runtime, profiles,
-  cross-process coordination outside Runtime Log locking, keychain integration, or
+  cross-process coordination for Workspace state or Session Logs, keychain integration, or
   environment-variable API keys.
 
 The full acceptance record and additional security limits are in

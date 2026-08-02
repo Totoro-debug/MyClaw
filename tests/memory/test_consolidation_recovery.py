@@ -23,7 +23,6 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.records import (
     AssistantSessionMessage,
     UserSessionMessage,
@@ -32,6 +31,7 @@ from myclaw.session.session_store import JsonlSessionStore
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
+from tests.fixtures.log_capture import install_log_capture
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=LOCAL_OFFSET)
@@ -133,7 +133,7 @@ async def test_pending_consolidation_recovery_failure_is_recorded_at_its_boundar
         "PRIVATE CONSOLIDATION JOURNAL CONTENT",
         encoding="utf-8",
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with pytest.raises(ModelCallError) as raised:
         await _manager(sessions=sessions, summaries=summaries).recover_pending()
@@ -254,7 +254,7 @@ async def test_pending_consolidation_recovery_records_one_degradation_warning(
             ),
         ).prepare(await sessions.load(session_id))
     manager = _manager(sessions=sessions, summaries=WorkspaceJsonlSummaryStore(_state(workspace)))
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     await manager.recover_pending()
     await manager.recover_pending()

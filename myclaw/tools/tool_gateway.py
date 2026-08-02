@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import logging
 import math
 import re
 from collections.abc import Awaitable, Callable
@@ -10,8 +9,8 @@ from copy import deepcopy
 from typing import cast
 
 from jsonschema import Draft202012Validator, FormatChecker
+from loguru import logger
 
-from myclaw.runtime_log import log_sanitized_exception
 from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
 from myclaw.tools.models import ModelToolCall, ToolResult
@@ -21,7 +20,7 @@ from myclaw.utils.json_types import JsonObject, JsonScalar, JsonValue
 type Sleep = Callable[[float], Awaitable[None]]
 
 _DECIMAL_INTEGER = re.compile(r"^[+-]?[0-9]+$")
-logger = logging.getLogger(__name__)
+
 
 
 class ToolGateway:
@@ -115,24 +114,22 @@ class ToolGateway:
                 attempt_number = attempt + 1
                 total_attempts = tool.max_retries + 1
                 if attempt < tool.max_retries:
-                    log_sanitized_exception(
-                        logger,
-                        logging.WARNING,
-                        "Tool execution failed "
-                        f"name={tool.name} attempt={attempt_number}/{total_attempts} "
-                        f"type={type(error).__name__}",
-                        error,
+                    logger.opt(exception=error).warning(
+                        "Tool execution failed name={} attempt={}/{} type={}",
+                        tool.name,
+                        attempt_number,
+                        total_attempts,
+                        type(error).__name__,
                     )
                     await self._sleep(float(2**attempt))
                     continue
                 if self._owns_terminal_failures:
-                    log_sanitized_exception(
-                        logger,
-                        logging.ERROR,
-                        "Tool execution failed "
-                        f"name={tool.name} attempt={attempt_number}/{total_attempts} "
-                        f"type={type(error).__name__}",
-                        error,
+                    logger.opt(exception=error).error(
+                        "Tool execution failed name={} attempt={}/{} type={}",
+                        tool.name,
+                        attempt_number,
+                        total_attempts,
+                        type(error).__name__,
                     )
                 if self._on_terminal_failure is not None:
                     self._on_terminal_failure(error)

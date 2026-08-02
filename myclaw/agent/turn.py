@@ -1,11 +1,12 @@
 """Runtime Core orchestration for one foreground or Scheduled Work Agent turn."""
 
 import asyncio
-import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from typing import Literal, Protocol
 from uuid import UUID
+
+from loguru import logger
 
 from myclaw.agent.events import (
     AgentEventType,
@@ -72,7 +73,7 @@ _SCHEDULED_SESSION_FAILURE = ErrorInfo(
     message="Scheduled Work Session could not be updated.",
 )
 
-logger = logging.getLogger(__name__)
+
 
 
 class AgentTurnModelSettings(Protocol):
@@ -707,84 +708,34 @@ def _unexpected_provider_failure() -> ModelCallError:
 
 
 def _log_model_failure(failure: ModelCallError) -> None:
-    safe_failure = ModelCallError(
-        ErrorInfo(code=failure.error.code, message="The model request failed.")
-    )
-    if failure.__cause__ is not None:
-        safe_failure.__cause__ = _safe_exception(
-            failure.__cause__,
-            "Diagnostic detail redacted.",
-        )
-    elif failure.__context__ is not None and not failure.__suppress_context__:
-        safe_failure.__context__ = _safe_exception(
-            failure.__context__,
-            "Diagnostic detail redacted.",
-        )
-        safe_failure.__suppress_context__ = False
-    safe_failure = safe_failure.with_traceback(failure.__traceback__)
-    logger.error(
-        "Agent Turn failed code=%s type=%s",
+    logger.opt(exception=failure).error(
+        "Agent Turn failed code={} type={}",
         failure.error.code,
         type(failure).__name__,
-        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
     )
 
 
 def _log_persistence_failure(failure: Exception, *, operation: str) -> None:
-    safe_failure = _safe_exception(
-        failure,
-        "Conversation Session persistence failed.",
-    )
-    logger.error(
-        "Agent Turn failed code=persistence_error operation=%s type=%s",
+    logger.opt(exception=failure).error(
+        "Agent Turn failed code=persistence_error operation={} type={}",
         operation,
         type(failure).__name__,
-        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
     )
 
 
 def _log_artifact_failure(failure: ArtifactWriteError, *, tool_name: str) -> None:
-    safe_failure = _safe_exception(
-        failure,
-        "Tool Artifact persistence failed.",
-    )
-    logger.error(
-        "Tool Artifact persistence failed code=persistence_error tool=%s type=%s",
+    logger.opt(exception=failure).error(
+        "Tool Artifact persistence failed code=persistence_error tool={} type={}",
         tool_name,
         type(failure).__name__,
-        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
     )
 
 
 def _log_cleanup_failure(failure: Exception) -> None:
-    safe_failure = _safe_exception(
-        failure,
-        "Provider stream cleanup failed.",
-    )
-    logger.error(
-        "Agent Turn cleanup failed code=model_failed operation=provider_stream_close type=%s",
+    logger.opt(exception=failure).error(
+        "Agent Turn cleanup failed code=model_failed operation=provider_stream_close type={}",
         type(failure).__name__,
-        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
     )
-
-
-def _safe_exception(failure: BaseException, message: str) -> BaseException:
-    try:
-        safe_failure = type(failure)(message)
-    except Exception:
-        safe_failure = RuntimeError(f"{type(failure).__name__}: {message}")
-    if failure.__cause__ is not None:
-        safe_failure.__cause__ = _safe_exception(
-            failure.__cause__,
-            "Diagnostic detail redacted.",
-        )
-    elif failure.__context__ is not None and not failure.__suppress_context__:
-        safe_failure.__context__ = _safe_exception(
-            failure.__context__,
-            "Diagnostic detail redacted.",
-        )
-        safe_failure.__suppress_context__ = False
-    return safe_failure.with_traceback(failure.__traceback__)
 
 
 def _never_cancelled() -> bool:

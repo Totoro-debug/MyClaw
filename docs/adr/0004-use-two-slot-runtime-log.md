@@ -1,5 +1,8 @@
 # Use a two-slot Runtime Log
 
+> Superseded by ADR-0008 for new Session diagnostics. Existing Agent Home Runtime
+> Log files remain preserved and are not migrated or deleted.
+
 MyClaw will maintain one Agent Home-level Runtime Log shared by all Conversation
 Sessions. The log uses two equal rotating slots named `run.log.0` and `run.log.1`
 rather than a current file plus a backup file.

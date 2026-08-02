@@ -1,5 +1,4 @@
 import json
-import logging
 from collections import deque
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
@@ -7,6 +6,7 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+from loguru import logger
 
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
@@ -24,7 +24,6 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.schedule.records import ScheduledWork
 from myclaw.session.records import (
     AssistantSessionMessage,
@@ -52,13 +51,9 @@ REQUEST_TWO_UUID = UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e")
 ASSISTANT_TWO_UUID = UUID("b3f37212-6f3a-4a1b-8d2e-78ab3f9c4567")
 
 
-def _runtime_log_text(agent_home: Path) -> str:
-    logs = agent_home / "logs"
-    return "".join(
-        path.read_text(encoding="utf-8")
-        for name in ("run.log.0", "run.log.1")
-        if (path := logs / name).exists()
-    )
+def _session_log_text(workspace: Path, session_id: str) -> str:
+    path = workspace / ".myclaw" / "logs" / f"{session_id}.log"
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 CHAT_ROUTE_CONFIG = (
@@ -105,11 +100,9 @@ class RecordingWriter:
         self.operations.append(("line", content))
 
 
-class RuntimeLogEmittingProvider(ScriptedFakeProvider):
+class SessionLogEmittingProvider(ScriptedFakeProvider):
     async def complete(self, request: object) -> ModelResponse:
-        logging.getLogger("myclaw.tools.tool_gateway").warning(
-            "Scheduled Tool Gateway recovery code=tool_failed"
-        )
+        logger.warning("Scheduled Tool Gateway recovery code=tool_failed")
         return await super().complete(request)
 
 
@@ -124,7 +117,6 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
     clock = FakeClock(NOW)
     failure = ModelCallError(ErrorInfo(code="model_failed", message="The model request failed."))
     provider = ScriptedFakeProvider(streams=(StreamScript(events=(), error=failure),))
-    lifetime = install_runtime_logging(home)
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,
@@ -133,23 +125,19 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
         now=clock.now,
         new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
         retry_clock=clock,
-        runtime_log=lifetime,
     )
 
     events = [event async for event in runtime.conversation.submit("private foreground input")]
     await runtime.conversation.close()
-    lifetime.close()
 
     assert [event.type for event in events] == ["turn_started", "turn_failed"]
-    content = _runtime_log_text(agent_home)
+    content = _session_log_text(workspace, runtime.session_id)
     records = [
         line
         for line in content.splitlines()
         if "myclaw.agent.turn:" in line or "myclaw.session.conversation:" in line
     ]
     assert len(records) == 2
-    assert all(f"session={runtime.session_id}" in record for record in records)
-    assert "session=-" not in "\n".join(records)
     assert "private foreground input" not in content
 
 
@@ -162,7 +150,7 @@ async def test_prepared_runtime_correlates_scheduled_work_with_its_session(
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     clock = FakeClock(NOW)
-    provider = RuntimeLogEmittingProvider(
+    provider = SessionLogEmittingProvider(
         completions=(
             ModelResponse(
                 message=AssistantModelMessage(content="Scheduled result."),
@@ -171,7 +159,6 @@ async def test_prepared_runtime_correlates_scheduled_work_with_its_session(
             ),
         )
     )
-    lifetime = install_runtime_logging(home)
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,
@@ -180,11 +167,10 @@ async def test_prepared_runtime_correlates_scheduled_work_with_its_session(
         now=clock.now,
         new_uuid=iter((SESSION_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
         retry_clock=clock,
-        runtime_log=lifetime,
     )
     task = ScheduledWork(
         id="11111111-1111-4111-8111-111111111111",
-        title="Runtime Log correlation",
+        title="Session Log correlation",
         cron="0 9 * * *",
         prompt="private scheduled prompt",
         created_at=NOW,
@@ -193,14 +179,16 @@ async def test_prepared_runtime_correlates_scheduled_work_with_its_session(
     )
 
     outcome = await runtime.scheduled_work_runner.run(task)
-    lifetime.close()
 
     assert outcome.status == "completed"
-    content = _runtime_log_text(agent_home)
-    records = [line for line in content.splitlines() if "myclaw.tools.tool_gateway:" in line]
+    content = _session_log_text(workspace, task.session_id)
+    records = [
+        line
+        for line in content.splitlines()
+        if "Scheduled Tool Gateway recovery code=tool_failed" in line
+    ]
     assert len(records) == 1
-    assert f"session={task.session_id}" in records[0]
-    assert "session=-" not in records[0]
+    assert "tests.test_runtime:complete:" in records[0]
     assert task.prompt not in content
 
 

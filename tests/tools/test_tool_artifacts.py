@@ -26,7 +26,6 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session_store import JsonlSessionStore
@@ -38,12 +37,13 @@ from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_res
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
+from tests.fixtures.log_capture import install_log_capture
 
 SESSION_ID = "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000"
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=timezone(timedelta(hours=8)))
 
 
-def _runtime_log_text(agent_home: Path) -> str:
+def _captured_log_text(agent_home: Path) -> str:
     logs = agent_home / "logs"
     return "".join(
         path.read_text(encoding="utf-8")
@@ -322,7 +322,7 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
             write_text=unavailable_artifact_boundary,
         ),
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with lifetime.session(session.id):
         events = [event async for event in conversation.submit("Inspect the result")]
@@ -353,7 +353,7 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
         session_id=session.id,
     )
     assert list(artifact_directory.iterdir()) == []
-    content = _runtime_log_text(agent_home)
+    content = _captured_log_text(agent_home)
     records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
     assert len(records) == 1
     assert " ERROR " in records[0]

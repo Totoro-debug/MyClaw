@@ -5,11 +5,11 @@ from pathlib import Path
 import pytest
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import WebFetchRejected, WebFetchTool
 from myclaw.tools.web.web_search import WebSearchResult, WebSearchTool
+from tests.fixtures.log_capture import install_log_capture
 
 
 class ScriptedSearch:
@@ -118,7 +118,7 @@ async def test_web_search_logs_retry_warnings_without_query_or_upstream_body(
     )
     gateway = ToolGateway(sleep=_recording_sleep(waits))
     gateway.register_tools((WebSearchTool(search=search),))
-    lifetime = install_runtime_logging(AgentHome(agent_home))
+    lifetime = install_log_capture(AgentHome(agent_home))
 
     with lifetime.session("scheduled-web-search-session-51"):
         result = await gateway.call(
@@ -160,7 +160,7 @@ async def test_web_fetch_failure_log_excludes_credential_url_and_response_body(
     )
     gateway = ToolGateway(sleep=_recording_sleep(waits))
     gateway.register_tools((WebFetchTool(fetcher=fetch),))
-    lifetime = install_runtime_logging(AgentHome(agent_home))
+    lifetime = install_log_capture(AgentHome(agent_home))
 
     with lifetime.session("foreground-web-fetch-session-51"):
         result = await gateway.call(

@@ -35,7 +35,6 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.schedule.background_coordination import (
     RuntimeEventBroker,
     ScheduledWorkCoordinator,
@@ -57,6 +56,7 @@ from myclaw.terminal.repl import run_repl
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript, persist_scheduled_work
+from tests.fixtures.log_capture import install_log_capture
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 13, 0, 30, 0, 123456, tzinfo=LOCAL_TIMEZONE)
@@ -539,7 +539,7 @@ async def test_scheduler_retries_after_a_store_load_failure(
         coordinator=coordinator,
         clock=clock,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     scheduler.start()
     try:
@@ -696,7 +696,7 @@ async def test_scheduler_consumes_an_unhandled_scheduled_run_after_it_is_logged(
     previous_handler = loop.get_exception_handler()
     unhandled: list[dict[str, object]] = []
     loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     try:
         scheduler.start()
@@ -770,7 +770,7 @@ async def test_scheduler_close_cancels_and_awaits_running_scheduled_work(
         ),
         clock=clock,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
     existing_tasks = asyncio.all_tasks()
 
     scheduler.start()
@@ -845,7 +845,7 @@ async def test_scheduled_work_scheduler_records_a_distinct_shutdown_cleanup_fail
         ),
         clock=clock,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     scheduler.start()
     await _wait_until(lambda: clock.sleeps == [60.0])
@@ -947,7 +947,7 @@ async def test_completed_scheduled_work_publishes_one_background_event(
         now=lambda: NOW,
         new_uuid=lambda: RUN_UUID,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     result = await coordinator.trigger(_task())
     event = await events.next_background_event()
@@ -1017,7 +1017,7 @@ async def test_background_event_publication_failure_is_recorded_once(
         now=lambda: NOW,
         new_uuid=lambda: RUN_UUID,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with pytest.raises(RuntimeError, match="Runtime event broker is closed"):
         await coordinator.trigger(_task())
@@ -1153,7 +1153,7 @@ async def test_overlapping_trigger_of_the_same_scheduled_work_is_skipped(
         now=lambda: NOW,
         new_uuid=iter((RUN_UUID, RUN_TWO_UUID)).__next__,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
     task = _task()
     first_execution = asyncio.create_task(coordinator.trigger(task))
     await asyncio.wait_for(provider.started.wait(), timeout=1)
@@ -1220,7 +1220,7 @@ async def test_cancelled_scheduled_work_emits_no_event_and_can_be_retriggered(
         now=lambda: NOW,
         new_uuid=iter((RUN_UUID, RUN_TWO_UUID)).__next__,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
     task = _task()
     cancelled = asyncio.create_task(coordinator.trigger(task))
     await asyncio.wait_for(provider.first_started.wait(), timeout=1)

@@ -26,7 +26,6 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import (
     AssistantSessionMessage,
@@ -44,6 +43,7 @@ from tests.fixtures import (
     StreamScript,
     unexpected_provider_factory,
 )
+from tests.fixtures.log_capture import install_log_capture
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -225,11 +225,11 @@ async def test_management_listing_warns_once_for_each_skipped_session_entry(
     unreadable_path.mkdir()
     management = ManagementViewService(home, sessions=sessions, workspace=workspace)
 
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
     try:
         listing = await management.resumable_listing()
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert [summary.id for summary in listing.sessions] == [valid.id]
     assert listing.skipped_count == 2
@@ -265,12 +265,12 @@ async def test_unavailable_session_listing_records_one_management_error(
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, sessions=FailingListingStore(), workspace=workspace)
     )
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
         result = await dispatcher.dispatch("/resume")
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert result.output == "persistence_error: Conversation Sessions could not be listed."
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
@@ -325,12 +325,12 @@ async def test_resume_load_failure_records_one_error_and_keeps_safe_command_outp
             switch_session=lambda _session_id: None,
         )
     )
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
         result = await dispatcher.resume(target.id)
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert (
         result.output == "persistence_error: The selected Conversation Session could not be loaded."
@@ -376,13 +376,13 @@ async def test_session_switch_failure_records_once_before_preserving_the_excepti
             switch_session=fail_switch,
         )
     )
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
         with pytest.raises(RuntimeError, match="session switch failed"):
             await dispatcher.resume(target.id)
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     marker = (

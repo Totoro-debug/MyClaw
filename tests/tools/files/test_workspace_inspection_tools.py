@@ -5,7 +5,6 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.files.file_tools import (
     EditFileTool,
     ListFilesTool,
@@ -16,6 +15,7 @@ from myclaw.tools.files.file_tools import (
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ToolGateway
+from tests.fixtures.log_capture import install_log_capture
 
 SESSION_ID = "20260727-120000-000000_550e8400-e29b-41d4-a716-446655440000"
 
@@ -337,7 +337,7 @@ async def test_read_file_failure_logs_once_without_path_content_or_boundary_deta
     monkeypatch.setattr(Path, "read_bytes", failing_read_bytes)
     gateway = ToolGateway()
     gateway.register_tools((ReadFileTool(security=security),))
-    lifetime = install_runtime_logging(AgentHome(agent_home))
+    lifetime = install_log_capture(AgentHome(agent_home))
 
     with lifetime.session("foreground-session-51"):
         result = await gateway.call(

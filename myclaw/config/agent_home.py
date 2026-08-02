@@ -19,5 +19,5 @@ class AgentHome:
         return cls(Path.home() / ".myclaw")
 
     def initialize(self) -> None:
-        """Create the global Agent Home root for configuration and Runtime Log state."""
+        """Create the global Agent Home root for configuration state."""
         self.path.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,6 @@
 """Minimal process entry that configures logging before application imports."""
 
-from myclaw.terminal.logging import configure_process_logging
+from myclaw.logging.process import configure_process_logging
 
 
 def run() -> None:

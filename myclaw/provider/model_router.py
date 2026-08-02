@@ -1,13 +1,13 @@
 """Model Route resolution and one shared Provider attempt budget."""
 
 import asyncio
-import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
+from loguru import logger
+
 from myclaw.config.config import ProviderConfiguration, ResolvedModelRoute, UserConfiguration
-from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     ModelProvider,
@@ -21,7 +21,7 @@ _MAX_ATTEMPTS = 5
 _RETRYABLE_CODES = frozenset({"provider_rate_limited", "provider_timeout", "provider_unavailable"})
 _FALLBACK_CODES = frozenset({"route_unavailable", "provider_auth_error"})
 
-logger = logging.getLogger(__name__)
+
 
 
 class RetryClock(Protocol):
@@ -190,8 +190,8 @@ class ModelRouter:
         self._route_statuses[requested_route] = _route_status(requested_route, resolved)
         if resolved.used_default:
             logger.warning(
-                "Default Model Route selected code=route_unavailable requested_route=%s "
-                "provider=%s selected_route=%s model=%s",
+                "Default Model Route selected code=route_unavailable requested_route={} "
+                "provider={} selected_route={} model={}",
                 resolved.requested_route,
                 resolved.provider.provider_id,
                 resolved.selected_route,
@@ -207,10 +207,9 @@ def _log_retry(
     attempt: int,
     delay: float,
 ) -> None:
-    safe_failure = _safe_provider_failure(failure)
-    logger.warning(
-        "Provider attempt failed; retrying attempt=%d/%d code=%s provider=%s "
-        "requested_route=%s selected_route=%s model=%s planned_delay_seconds=%s",
+    logger.opt(exception=failure).warning(
+        "Provider attempt failed; retrying attempt={}/{} code={} provider={} "
+        "requested_route={} selected_route={} model={} planned_delay_seconds={}",
         attempt,
         _MAX_ATTEMPTS,
         failure.error.code,
@@ -219,7 +218,6 @@ def _log_retry(
         resolved.selected_route,
         resolved.route.model,
         delay,
-        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
     )
 
 
@@ -230,10 +228,9 @@ def _log_fallback(
     *,
     attempt: int,
 ) -> None:
-    safe_failure = _safe_provider_failure(failure)
-    logger.warning(
-        "Provider attempt failed; recovering attempt=%d/%d code=%s provider=%s "
-        "requested_route=%s selected_route=%s model=%s planned_delay_seconds=0.0",
+    logger.opt(exception=failure).warning(
+        "Provider attempt failed; recovering attempt={}/{} code={} provider={} "
+        "requested_route={} selected_route={} model={} planned_delay_seconds=0.0",
         attempt,
         _MAX_ATTEMPTS,
         failure.error.code,
@@ -241,39 +238,16 @@ def _log_fallback(
         failed.requested_route,
         failed.selected_route,
         failed.route.model,
-        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
     )
     logger.warning(
-        "Default Model Route selected code=%s requested_route=%s provider=%s "
-        "selected_route=%s model=%s",
+        "Default Model Route selected code={} requested_route={} provider={} "
+        "selected_route={} model={}",
         failure.error.code,
         fallback.requested_route,
         fallback.provider.provider_id,
         fallback.selected_route,
         fallback.route.model,
     )
-
-
-def _safe_provider_failure(failure: BaseException) -> BaseException:
-    if isinstance(failure, ModelCallError):
-        safe_failure: BaseException = ModelCallError(
-            ErrorInfo(
-                code=failure.error.code,
-                message="The Provider attempt failed.",
-            )
-        )
-    else:
-        try:
-            safe_failure = type(failure)("Diagnostic detail redacted.")
-        except Exception:
-            safe_failure = RuntimeError(f"{type(failure).__name__}: Diagnostic detail redacted.")
-    if failure.__cause__ is not None:
-        safe_failure.__cause__ = _safe_provider_failure(failure.__cause__)
-    elif failure.__context__ is not None and not failure.__suppress_context__:
-        safe_failure.__context__ = _safe_provider_failure(failure.__context__)
-        safe_failure.__suppress_context__ = False
-    return safe_failure.with_traceback(failure.__traceback__)
-
 
 def _concrete_request(request: ModelRequest, resolved: ResolvedModelRoute) -> ModelRequest:
     route = resolved.route

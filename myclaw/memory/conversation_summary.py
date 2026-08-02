@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 from uuid import UUID
+
+from loguru import logger
 
 from myclaw.agent.prompts import (
     conversation_summary_input,
@@ -24,7 +25,6 @@ from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelProvider, ModelRequest, ReasoningEffort, UserModelMessage
-from myclaw.runtime_log import log_sanitized_exception
 from myclaw.session.identifiers import require_session_id
 from myclaw.session.records import (
     ConversationSession,
@@ -40,7 +40,7 @@ from myclaw.utils.time import format_rfc3339_milliseconds
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 type UnlinkFile = Callable[[Path], None]
 
-logger = logging.getLogger(__name__)
+
 
 
 @runtime_checkable
@@ -361,11 +361,8 @@ class ConversationSummaryManager:
         try:
             recovered_count = await self._summaries.recover_pending(self._sessions)
         except (OSError, UnicodeError, ValueError) as error:
-            log_sanitized_exception(
-                logger,
-                logging.ERROR,
-                "Pending Conversation Summary recovery failed code=persistence_error",
-                error,
+            logger.opt(exception=error).error(
+                "Pending Conversation Summary recovery failed code=persistence_error"
             )
             raise ModelCallError(
                 ErrorInfo(
@@ -375,7 +372,7 @@ class ConversationSummaryManager:
             ) from error
         if recovered_count:
             logger.warning(
-                "Pending Conversation Summary recovery completed count=%d",
+                "Pending Conversation Summary recovery completed count={}",
                 recovered_count,
             )
 

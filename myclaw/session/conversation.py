@@ -1,11 +1,12 @@
 """Command-line Conversation adapter over the Runtime Core Agent turn."""
 
 import asyncio
-import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID, uuid4
+
+from loguru import logger
 
 from myclaw.agent.events import AgentEvent
 from myclaw.agent.turn import (
@@ -14,6 +15,8 @@ from myclaw.agent.turn import (
     agent_turn_event_type,
     model_message_from_session,
 )
+from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.logging.session import session_log
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     ModelCompleted,
@@ -24,7 +27,6 @@ from myclaw.provider.models import (
     ReasoningEffort,
     UserModelMessage,
 )
-from myclaw.runtime_log import log_sanitized_exception
 from myclaw.session.records import ConversationSession, MetadataUpdate, UserSessionMessage
 from myclaw.session.session_store import SessionStore
 from myclaw.session.session_titles import normalize_session_title
@@ -32,7 +34,7 @@ from myclaw.tools.tool_gateway import ToolGateway
 
 __all__ = ["ChatModelSettings", "StreamingConversationPort", "model_message_from_session"]
 
-logger = logging.getLogger(__name__)
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +68,8 @@ class StreamingConversationPort:
             Callable[[ConversationSession], Awaitable[ConversationSession]] | None
         ) = None,
         externalize_result: ToolResultExternalizer | None = None,
+        workspace_state: WorkspaceState | None = None,
+        title_log_ready: Callable[[], Awaitable[object]] | None = None,
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -75,6 +79,8 @@ class StreamingConversationPort:
         self._new_uuid = new_uuid
         self._title_prompt = title_prompt
         self._title_new_uuid = title_new_uuid
+        self._workspace_state = workspace_state
+        self._title_log_ready = title_log_ready
         self._title_task: asyncio.Task[None] | None = None
         self._next_event_id = 0
         self._foreground_active = False
@@ -164,6 +170,29 @@ class StreamingConversationPort:
         first_user_content: str,
         request_id: UUID,
     ) -> None:
+        if self._title_log_ready is not None:
+            await self._title_log_ready()
+        correlation = (
+            session_log(self._workspace_state, session_id)
+            if self._workspace_state is not None
+            else logger.contextualize(session_id=session_id)
+        )
+        with correlation:
+            await self._run_title_task_inner(
+                session_id=session_id,
+                first_user_id=first_user_id,
+                first_user_content=first_user_content,
+                request_id=request_id,
+            )
+
+    async def _run_title_task_inner(
+        self,
+        *,
+        session_id: str,
+        first_user_id: str,
+        first_user_content: str,
+        request_id: UUID,
+    ) -> None:
         try:
             await self._generate_title_for_first_user(
                 session_id=session_id,
@@ -174,11 +203,8 @@ class StreamingConversationPort:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            log_sanitized_exception(
-                logger,
-                logging.ERROR,
-                f"Session title task failed type={type(error).__name__}",
-                error,
+            logger.opt(exception=error).error(
+                "Session title task failed type={}", type(error).__name__
             )
             raise
 
@@ -244,21 +270,16 @@ class StreamingConversationPort:
         except Exception as failure:
             fallback_reason = None
             code = failure.error.code if isinstance(failure, ModelCallError) else "model_failed"
-            safe_failure = _safe_title_exception(
-                failure,
-                "Session title generation failed.",
-            )
-            logger.warning(
-                "Session title fallback selected code=%s type=%s",
+            logger.opt(exception=failure).warning(
+                "Session title fallback selected code={} type={}",
                 code,
                 type(failure).__name__,
-                exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
             )
         finally:
             await _close_provider_stream(provider_stream)
         if fallback_reason is not None:
             logger.warning(
-                "Session title fallback selected code=model_failed type=%s reason=%s",
+                "Session title fallback selected code=model_failed type={} reason={}",
                 fallback_type,
                 fallback_reason,
             )
@@ -318,11 +339,8 @@ async def _close_provider_stream(stream: AsyncIterator[ModelStreamEvent] | None)
     try:
         await close()
     except Exception as error:
-        log_sanitized_exception(
-            logger,
-            logging.WARNING,
-            f"Session title stream cleanup failed type={type(error).__name__}",
-            error,
+        logger.opt(exception=error).warning(
+            "Session title stream cleanup failed type={}", type(error).__name__
         )
 
 
@@ -332,29 +350,8 @@ def _consume_task_exception(task: asyncio.Future[None]) -> None:
 
 
 def _log_title_persistence_failure(failure: Exception, *, operation: str) -> None:
-    safe_failure = _safe_title_exception(failure, "Session title persistence failed.")
-    logger.error(
-        "Session title failed code=persistence_error operation=%s type=%s",
+    logger.opt(exception=failure).error(
+        "Session title failed code=persistence_error operation={} type={}",
         operation,
         type(failure).__name__,
-        exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__),
     )
-
-
-def _safe_title_exception(failure: BaseException, message: str) -> BaseException:
-    try:
-        safe_failure = type(failure)(message)
-    except Exception:
-        safe_failure = RuntimeError(f"{type(failure).__name__}: {message}")
-    if failure.__cause__ is not None:
-        safe_failure.__cause__ = _safe_title_exception(
-            failure.__cause__,
-            "Diagnostic detail redacted.",
-        )
-    elif failure.__context__ is not None and not failure.__suppress_context__:
-        safe_failure.__context__ = _safe_title_exception(
-            failure.__context__,
-            "Diagnostic detail redacted.",
-        )
-        safe_failure.__suppress_context__ = False
-    return safe_failure.with_traceback(failure.__traceback__)

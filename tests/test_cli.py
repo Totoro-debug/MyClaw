@@ -12,7 +12,7 @@ import typer
 
 import myclaw.terminal.cli as cli
 from myclaw.config.agent_home import AgentHome
-from myclaw.terminal.logging import configure_process_logging
+from myclaw.logging.process import configure_process_logging
 from tests.configuration.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,

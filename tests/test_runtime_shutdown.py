@@ -22,7 +22,6 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.schedule.records import ScheduledWork
 from myclaw.session.conversation import ChatModelSettings
 from myclaw.session.records import ConversationSession
@@ -34,6 +33,7 @@ from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import PublicWebFetchBoundary
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript, persist_scheduled_work
+from tests.fixtures.log_capture import install_log_capture
 
 NOW = datetime(2026, 7, 13, 0, 30, tzinfo=timezone(timedelta(hours=8)))
 
@@ -276,14 +276,14 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
         scheduled_work_scheduler_clock=FailingSchedulerClock(),
     )
     baseline = asyncio.all_tasks()
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
         with pytest.raises(RuntimeError, match="scheduled scheduler failed to start"):
             await runtime.start()
         await asyncio.sleep(0)
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert asyncio.all_tasks() == baseline
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
@@ -340,7 +340,7 @@ async def test_normal_repl_exit_closes_the_runtime_model_provider(
 
 @pytest.mark.parametrize("terminal_input", [None, "exit", "  QuIt  "])
 @pytest.mark.asyncio
-async def test_normal_eof_and_exit_shutdown_do_not_create_runtime_log(
+async def test_normal_eof_and_exit_shutdown_do_not_create_diagnostic_log(
     agent_home: Path,
     workspace: Path,
     terminal_input: str | None,
@@ -362,7 +362,7 @@ async def test_normal_eof_and_exit_shutdown_do_not_create_runtime_log(
         now=lambda: NOW,
         new_uuid=uuid4,
     )
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
         await runtime.run(
@@ -370,7 +370,7 @@ async def test_normal_eof_and_exit_shutdown_do_not_create_runtime_log(
             writer=SilentWriter(),
         )
     finally:
-        runtime_log.close()
+        log_capture.close()
 
     assert not (agent_home / "logs").exists()
 
@@ -450,7 +450,7 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
         shell.execute(ShellRequest(command="git status", cwd=workspace, timeout=60))
     )
     await process.communicate_started.wait()
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
 
     try:
         with pytest.raises(RuntimeError, match="PRIVATE_PROVIDER_CLOSE_BODY_52"):
@@ -462,7 +462,7 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
     finally:
         await shell.close()
         await asyncio.gather(shell_execution, return_exceptions=True)
-        runtime_log.close()
+        log_capture.close()
 
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert content.count("ERROR pid=") == 1
@@ -1118,7 +1118,7 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
         set_signal=signals,
     )
     interrupts.install()
-    runtime_log = install_runtime_logging(home)
+    log_capture = install_log_capture(home)
     running = asyncio.create_task(runtime.run(input_reader=input_reader, writer=SilentWriter()))
     await provider.started[0].wait()
     await memory_clock.sleep_started.wait()
@@ -1155,7 +1155,7 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
         await asyncio.gather(running, return_exceptions=True)
         await interrupts.close()
         interrupts.restore()
-        runtime_log.close()
+        log_capture.close()
 
     assert provider.stopped[0].is_set()
     assert provider.stopped[1].is_set()

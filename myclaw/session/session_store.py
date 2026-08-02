@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -13,11 +12,12 @@ from pathlib import Path
 from typing import Protocol, cast, runtime_checkable
 from uuid import UUID
 
+from loguru import logger
+
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import STABLE_ERROR_CODES, ErrorCode
 from myclaw.provider.models import ModelUsage
-from myclaw.runtime_log import log_sanitized_exception
 from myclaw.session.identifiers import make_session_id, require_session_id
 from myclaw.session.records import (
     AssistantMessageStatus,
@@ -38,7 +38,7 @@ from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 
-logger = logging.getLogger(__name__)
+
 
 
 @runtime_checkable
@@ -291,12 +291,10 @@ class JsonlSessionStore:
             try:
                 session = await self.load(path.stem)
             except (OSError, UnicodeError, ValueError) as error:
-                log_sanitized_exception(
-                    logger,
-                    logging.WARNING,
-                    "Skipped corrupt or unreadable Conversation Session entry "
-                    f"path={path} type={type(error).__name__}",
-                    error,
+                logger.opt(exception=error).warning(
+                    "Skipped corrupt or unreadable Conversation Session entry path={} type={}",
+                    path,
+                    type(error).__name__,
                 )
                 skipped_count += 1
                 continue

@@ -31,11 +31,11 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.models import ModelToolCall
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider
+from tests.fixtures.log_capture import install_log_capture
 
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=timezone(timedelta(hours=8)))
 
@@ -209,7 +209,7 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
         ),
         batch_size=10,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     result = await manager.run_manual()
     lifetime.close()
@@ -251,7 +251,7 @@ async def test_manual_memory_task_records_one_terminal_failure_without_a_session
         ),
         batch_size=10,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     result = await manager.run_manual()
     lifetime.close()
@@ -510,7 +510,7 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
         ),
         batch_size=10,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     result = await manager.run_manual()
     lifetime.close()
@@ -560,7 +560,7 @@ async def test_conversation_summary_read_failure_is_logged_only_at_memory_task_b
         ),
         batch_size=10,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     result = await manager.run_manual()
     lifetime.close()
@@ -678,7 +678,7 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
         ),
         batch_size=10,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     first_task = asyncio.create_task(manager.run_manual())
     await first_started.wait()
@@ -905,7 +905,7 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, memory_manager=memory_manager)
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     result = await dispatcher.dispatch("/dream")
     lifetime.close()

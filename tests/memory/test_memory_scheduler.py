@@ -30,10 +30,10 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.models import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
+from tests.fixtures.log_capture import install_log_capture
 
 LOCAL = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 10, tzinfo=LOCAL)
@@ -177,7 +177,7 @@ async def test_periodic_memory_task_records_one_terminal_failure_without_a_sessi
             ModelCallError(ErrorInfo(code="model_failed", message="PRIVATE PERIODIC OUTPUT")),
         )
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     result = await _manager(
         home=home,
@@ -227,7 +227,7 @@ async def test_memory_scheduler_records_the_unhandled_exception_it_isolates(
         schedule="0 * * * *",
         clock=clock,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     scheduler.start()
     await _wait_until(lambda: clock.sleeps == [50 * 60])
@@ -720,7 +720,7 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
         schedule="0 * * * *",
         clock=clock,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
     existing_tasks = asyncio.all_tasks()
 
     scheduler.start()
@@ -770,7 +770,7 @@ async def test_memory_scheduler_records_a_distinct_shutdown_cleanup_failure(
         schedule="0 * * * *",
         clock=clock,
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     scheduler.start()
     await _wait_until(lambda: clock.sleeps == [50 * 60])

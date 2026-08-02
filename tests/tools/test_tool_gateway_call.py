@@ -8,12 +8,12 @@ from typing import Annotated, cast
 import pytest
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.schema import OpenAIToolSchema, ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
+from tests.fixtures.log_capture import install_log_capture
 
 
 def _call(name: str, arguments: str, *, call_id: str = "call_1") -> ModelToolCall:
@@ -201,7 +201,7 @@ async def test_refusal_skips_execution_and_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_unavailable_and_refused_calls_do_not_create_runtime_logs(
+async def test_invalid_unavailable_and_refused_calls_do_not_create_diagnostic_logs(
     agent_home: Path,
 ) -> None:
     class RefusingTool(BaseTool):
@@ -218,7 +218,7 @@ async def test_invalid_unavailable_and_refused_calls_do_not_create_runtime_logs(
 
     gateway = ToolGateway()
     gateway.register_tools((_PrepareTool(), RefusingTool()))
-    lifetime = install_runtime_logging(AgentHome(agent_home))
+    lifetime = install_log_capture(AgentHome(agent_home))
 
     with lifetime.session("foreground-session-51"):
         malformed = await gateway.call(_call("prepare", "{"))
@@ -326,7 +326,7 @@ async def test_retryable_execution_failures_log_retries_and_one_terminal_error(
     sleeps: list[float] = []
     gateway = ToolGateway(sleep=_sleep_recorder(sleeps))
     gateway.register_tools((tool,))
-    lifetime = install_runtime_logging(AgentHome(agent_home))
+    lifetime = install_log_capture(AgentHome(agent_home))
 
     with lifetime.session("scheduled-session-51"):
         result = await gateway.call(_call("retry", '{"payload":"RAW_TOOL_ARGUMENT_51"}'))

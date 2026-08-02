@@ -52,6 +52,11 @@ class WorkspaceState:
         return self.path / "sessions"
 
     @property
+    def logs_directory(self) -> Path:
+        """Canonical, lazily-created Workspace-owned Session Log directory."""
+        return self.path / "logs"
+
+    @property
     def scheduled_work_path(self) -> Path:
         return self.path / "scheduled-work.json"
 

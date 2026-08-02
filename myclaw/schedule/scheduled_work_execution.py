@@ -1,7 +1,6 @@
 """Scheduled Work adapter over the Runtime Core Agent turn."""
 
 import asyncio
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,13 +8,16 @@ from pathlib import Path
 from typing import Literal, Protocol
 from uuid import UUID
 
+from loguru import logger
+
 from myclaw.agent.events import TurnCompletedPayload, TurnFailedPayload
 from myclaw.agent.prompts import chat_system_prompt, render_tool_guidance
 from myclaw.agent.turn import AgentTurn, ToolResultExternalizer
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
+from myclaw.logging.session import session_log
 from myclaw.provider.models import ModelProvider, ReasoningEffort
-from myclaw.runtime_log import log_sanitized_exception, runtime_log_session
 from myclaw.schedule.records import ScheduledWork
 from myclaw.session.records import SessionMetadata
 from myclaw.session.session_store import SessionStore
@@ -26,7 +28,7 @@ _SESSION_FAILURE = ErrorInfo(
     code="persistence_error",
     message="Scheduled Work Session could not be updated.",
 )
-logger = logging.getLogger(__name__)
+
 
 
 class ScheduledWorkSessionStore(SessionStore, Protocol):
@@ -77,6 +79,7 @@ class ScheduledWorkRunner:
         new_uuid: Callable[[], UUID],
         tool_gateway_for: Callable[[str], ToolGateway],
         externalize_result_for: Callable[[str], ToolResultExternalizer] | None = None,
+        workspace_state: WorkspaceState | None = None,
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -87,9 +90,15 @@ class ScheduledWorkRunner:
         self._new_uuid = new_uuid
         self._tool_gateway_for = tool_gateway_for
         self._externalize_result_for = externalize_result_for
+        self._workspace_state = workspace_state
 
     async def run(self, task: ScheduledWork) -> ScheduledWorkRunResult:
-        with runtime_log_session(task.session_id):
+        correlation = (
+            session_log(self._workspace_state, task.session_id)
+            if self._workspace_state is not None
+            else logger.contextualize(session_id=task.session_id)
+        )
+        with correlation:
             try:
                 result = await self._run_once(task)
             except asyncio.CancelledError:
@@ -98,12 +107,7 @@ class ScheduledWorkRunner:
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise
-                log_sanitized_exception(
-                    logger,
-                    logging.ERROR,
-                    "Scheduled Work crashed",
-                    error,
-                )
+                logger.opt(exception=error).error("Scheduled Work crashed")
                 raise
             if result.status == "failed":
                 code = result.error.code if result.error is not None else "unknown"
@@ -111,12 +115,7 @@ class ScheduledWorkRunner:
                 if result.diagnostic is None:
                     logger.error(message)
                 else:
-                    log_sanitized_exception(
-                        logger,
-                        logging.ERROR,
-                        message,
-                        result.diagnostic,
-                    )
+                    logger.opt(exception=result.diagnostic).error(message)
             return result
 
     async def _run_once(self, task: ScheduledWork) -> ScheduledWorkRunResult:

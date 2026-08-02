@@ -22,7 +22,6 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
-from myclaw.runtime_log import install_runtime_logging
 from myclaw.schedule.records import ScheduledWork
 from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkModelSettings,
@@ -55,6 +54,7 @@ from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, persist_scheduled_work
+from tests.fixtures.log_capture import install_log_capture
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 12, 23, 0, 0, 123456, tzinfo=LOCAL_TIMEZONE)
@@ -788,7 +788,7 @@ async def test_scheduled_work_records_one_terminal_failure_with_task_session_con
             session_id=session_id,
         ),
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     result = await runner.run(task)
     lifetime.close()
@@ -851,7 +851,7 @@ async def test_scheduled_work_records_an_unhandled_terminal_exception_once(
             session_id=session_id,
         ),
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     with pytest.raises(RuntimeError, match="technical cron execution failure"):
         await runner.run(_task())
@@ -941,7 +941,7 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
         prompt="Run independently.",
         session_id="20260712-220000-123000_22222222-2222-4222-8222-222222222222",
     )
-    lifetime = install_runtime_logging(home)
+    lifetime = install_log_capture(home)
 
     failed = await runner.run(failed_task)
     completed = await runner.run(completed_task)

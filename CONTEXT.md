@@ -9,7 +9,7 @@ A host-neutral, local-first, single-user Agent runtime that can run continuously
 _Avoid_: Bot platform, multi-tenant assistant, channel-first agent, agent platform
 
 **Agent Home**:
-The fixed `~/.myclaw/` location for the current operating-system account that stores global User Configuration and Runtime Log files for the Personal Agent. All other persistent state belongs to a Workspace rather than Agent Home.
+The fixed `~/.myclaw/` location for the current operating-system account that stores global User Configuration and legacy Runtime Log files for the Personal Agent. Session technical diagnostics belong to Workspace State rather than Agent Home.
 _Avoid_: Project workspace, session directory, install directory, configurable data root
 
 **Workspace**:
@@ -17,7 +17,7 @@ The current user-selected working directory for a Personal Agent interaction, id
 _Avoid_: Agent Home, install directory, session directory, project ID
 
 **Workspace State**:
-The persistent Personal Agent state owned by exactly one Workspace and stored in `<workspace>/.myclaw/`. It includes Conversation Sessions, the Memory System, Scheduled Work, and Tool Artifacts, but never User Configuration or Runtime Logs; it is reserved local runtime state rather than ordinary Workspace content, is initialized with a Git ignore rule while remaining portable when the whole Workspace directory is copied, and is not generally exposed through file capabilities.
+The persistent Personal Agent state owned by exactly one Workspace and stored in `<workspace>/.myclaw/`. It includes Conversation Sessions, the Memory System, Scheduled Work, Tool Artifacts, and lazily-created Session Logs, but never User Configuration; it is reserved local runtime state rather than ordinary Workspace content, is initialized with a Git ignore rule while remaining portable when the whole Workspace directory is copied, and is not generally exposed through file capabilities.
 _Avoid_: Agent Home, project source, global state, cache
 
 **Conversation Port**:
@@ -44,9 +44,9 @@ _Avoid_: Conversation Port, direct file access, admin API
 The lifecycle of a Personal Agent runtime process. Each REPL invocation creates one MyClaw runtime instance, and the interactive REPL is the long-running foreground runtime; multiple REPL instances in the same Workspace are allowed and remain uncoordinated except for normal-path writes to the shared Runtime Log, and each runtime independently starts Memory Task and Scheduled Work schedulers. Background work only lives while the runtime process is running. User messages are queued and processed serially in the foreground conversation lane, while Memory Tasks and Scheduled Work run as asynchronous background tasks inside the same runtime; Ctrl+C cancels only the active foreground turn; entering `exit` or `quit` with surrounding whitespace ignored and case-insensitive matching exits the REPL and immediately cancels running background tasks, and there is no detached daemon runtime or one-shot runtime in the first version.
 _Avoid_: Detached mode, daemon mode, persistent background process, one-shot command
 
-**Runtime Log**:
-The Agent Home-level persistent diagnostic stream shared by all Conversation Sessions and runtime processes. It is always enabled at WARNING and ERROR levels and stored under `~/.myclaw/logs/` in two equal UTF-8 plain-text slots, `run.log.0` and `run.log.1`, with a global cursor, a cross-process lock, and a fixed 10 MiB threshold per slot. Each process submits records without waiting to one dedicated writer thread through a 1024-entry queue that silently discards the oldest pending record when full; normal shutdown waits up to ten seconds for queued records. Recoverable failures are recorded where retry, fallback, skipping, or degradation occurs, while terminal failures are recorded once at the highest boundary of the independent work unit. Records may contain complete local paths and sanitized tracebacks but never conversation content, prompts, memory content, Tool arguments or results, file or web content, provider bodies, or authentication material. Runtime Log failure never changes Personal Agent behavior; lock-acquisition failure falls back to a best-effort unlocked append to the cursor-selected slot.
-_Avoid_: Conversation log, Session log, chat transcript, audit log, activity feed
+**Session Log**:
+Workspace-owned technical diagnostics for one Conversation Session, stored lazily under `<workspace>/.myclaw/logs/<session_id>.log` through an explicit validated Session context. WARNING and ERROR records use a Loguru file sink with enqueue, UTF-8 output, exact 10 MiB rotation, and at most one retained historical file. Sink setup and writes are fail-open, setup retries on the next context, and context exit removes the sink after queued records drain. Same-Session concurrency is intentionally unsupported; no registry, lock, or cross-process coordination is provided. Legacy Agent Home Runtime Log files remain untouched and are not updated.
+_Avoid_: Runtime Log, Conversation log, chat transcript, audit log, activity feed
 
 **Runtime Core**:
 The orchestration layer for a Personal Agent turn. It coordinates session state, context assembly, model routing, tool execution, and memory processing through code-level boundaries rather than owning their concrete implementations. After Tool execution, Runtime Core alone externalizes oversized successful results before Conversation Session persistence; it does not roll artifacts back if later persistence fails.

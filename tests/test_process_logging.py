@@ -6,7 +6,7 @@ from collections.abc import Iterator
 import pytest
 from loguru import logger
 
-from myclaw.terminal.logging import configure_process_logging
+from myclaw.logging.process import configure_process_logging
 from myclaw.terminal.process_entry import run
 
 
