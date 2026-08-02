@@ -1,19 +1,23 @@
+import asyncio
 import json
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from loguru import logger
 
-from myclaw.agent.runtime import prepare_repl_runtime
+from myclaw.agent.events import ConversationPort, ToolCompletedPayload, TurnFailedPayload
+from myclaw.agent.prompts import session_title_prompt
+from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader, ProviderConfiguration
 from myclaw.errors import ErrorInfo
+from myclaw.logging.process import configure_process_logging
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -21,6 +25,7 @@ from myclaw.provider.models import (
     ModelProvider,
     ModelRequest,
     ModelResponse,
+    ModelStreamEvent,
     ModelUsage,
     TextDelta,
 )
@@ -28,8 +33,11 @@ from myclaw.schedule.records import ScheduledWork
 from myclaw.session.records import (
     AssistantSessionMessage,
     SessionError,
+    ToolSessionMessage,
     UserSessionMessage,
 )
+from myclaw.tools.models import ModelToolCall
+from myclaw.tools.web.web_search import WebSearchResult
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
     FakeClock,
@@ -45,6 +53,9 @@ TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
 USER_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
 ASSISTANT_UUID = UUID("a3bb189e-8bf9-4c4b-ae4a-c6699f6f7e34")
+TOOL_UUID = UUID("11111111-1111-4111-8111-111111111111")
+FINAL_REQUEST_UUID = UUID("a8098c1a-f86e-4f33-8a28-25f602f8e603")
+FINAL_ASSISTANT_UUID = UUID("67e55044-10b1-426f-9247-bb680e5fe0c8")
 TURN_TWO_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
 USER_TWO_UUID = UUID("16fd2706-8baf-433b-82eb-8c7fada847da")
 REQUEST_TWO_UUID = UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e")
@@ -106,6 +117,52 @@ class SessionLogEmittingProvider(ScriptedFakeProvider):
         return await super().complete(request)
 
 
+class SensitiveFailingWebSearch:
+    async def search(self, query: str, max_results: int) -> tuple[WebSearchResult, ...]:
+        del max_results
+        raise ExceptionGroup(
+            "RAW_PROVIDER_BODY",
+            [
+                OSError(f"query={query}"),
+                ValueError("auth=PRIVATE_WEB_CREDENTIAL"),
+            ],
+        )
+
+
+class BlockingSessionLogProvider:
+    def __init__(self, *, marker: str, release: asyncio.Event) -> None:
+        self._marker = marker
+        self._release = release
+        self.started = asyncio.Event()
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        if request.system_prompt == session_title_prompt():
+            yield ModelCompleted(
+                response=ModelResponse(
+                    message=AssistantModelMessage(content=f"{self._marker} title"),
+                    usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
+                    finish_reason="stop",
+                )
+            )
+            return
+        logger.warning("Concurrent foreground marker={}", self._marker)
+        self.started.set()
+        await self._release.wait()
+        yield ModelCompleted(
+            response=ModelResponse(
+                message=AssistantModelMessage(content=f"{self._marker} response"),
+                usage=ModelUsage(input_tokens=3, output_tokens=1, total_tokens=4),
+                finish_reason="stop",
+            )
+        )
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        raise AssertionError(f"Unexpected complete request: {request!r}")
+
+    async def close(self) -> None:
+        return None
+
+
 @pytest.mark.asyncio
 async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_session(
     agent_home: Path,
@@ -138,7 +195,326 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
         if "myclaw.agent.turn:" in line or "myclaw.session.conversation:" in line
     ]
     assert len(records) == 2
+    assert content.count("ModelCallError: [REDACTED]") == 2
     assert "private foreground input" not in content
+    assert "The model request failed." not in content
+    assert "No title response was scripted." not in content
+
+
+@pytest.mark.asyncio
+async def test_concurrent_foreground_sessions_write_only_to_their_own_session_logs(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    release = asyncio.Event()
+    first_provider = BlockingSessionLogProvider(marker="FIRST_SESSION", release=release)
+    second_provider = BlockingSessionLogProvider(marker="SECOND_SESSION", release=release)
+
+    def runtime_for(provider: BlockingSessionLogProvider) -> PreparedReplRuntime:
+        return prepare_repl_runtime(
+            agent_home=home,
+            workspace=workspace,
+            configuration=configuration,
+            provider_factory=lambda _: provider,
+            now=FakeClock(NOW).now,
+            new_uuid=uuid4,
+        )
+
+    first_runtime = runtime_for(first_provider)
+    second_runtime = runtime_for(second_provider)
+    first_submit = asyncio.create_task(
+        _collect_event_types(first_runtime.conversation, "First Session request.")
+    )
+    second_submit = asyncio.create_task(
+        _collect_event_types(second_runtime.conversation, "Second Session request.")
+    )
+    await asyncio.wait_for(
+        asyncio.gather(first_provider.started.wait(), second_provider.started.wait()),
+        timeout=3,
+    )
+    release.set()
+
+    first_events, second_events = await asyncio.gather(first_submit, second_submit)
+    await asyncio.gather(first_runtime.close(), second_runtime.close())
+
+    assert first_events == ["turn_started", "turn_completed"]
+    assert second_events == ["turn_started", "turn_completed"]
+    first_log = _session_log_text(workspace, first_runtime.session_id)
+    second_log = _session_log_text(workspace, second_runtime.session_id)
+    assert "marker=FIRST_SESSION" in first_log
+    assert "marker=SECOND_SESSION" not in first_log
+    assert "marker=SECOND_SESSION" in second_log
+    assert "marker=FIRST_SESSION" not in second_log
+
+
+async def _collect_event_types(conversation: ConversationPort, text: str) -> list[str]:
+    return [event.type async for event in conversation.submit(text)]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_session_log_preserves_events_session_and_tool_failure(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    unavailable_workspace = workspace / "unavailable"
+    unavailable_workspace.mkdir()
+
+    def provider() -> ScriptedFakeProvider:
+        return ScriptedFakeProvider(
+            streams=(
+                StreamScript(
+                    events=(
+                        ModelCompleted(
+                            response=ModelResponse(
+                                message=AssistantModelMessage(
+                                    content="",
+                                    tool_calls=(
+                                        ModelToolCall(
+                                            id="call_unavailable",
+                                            name="unavailable_tool",
+                                            arguments="{}",
+                                        ),
+                                    ),
+                                ),
+                                usage=ModelUsage(
+                                    input_tokens=4,
+                                    output_tokens=2,
+                                    total_tokens=6,
+                                ),
+                                finish_reason="tool_calls",
+                            )
+                        ),
+                    )
+                ),
+                StreamScript(
+                    events=(),
+                    error=ModelCallError(
+                        ErrorInfo(code="model_failed", message="The model request failed.")
+                    ),
+                ),
+            )
+        )
+
+    unavailable_runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=unavailable_workspace,
+        configuration=configuration,
+        provider_factory=lambda _: provider(),
+        now=FakeClock(NOW).now,
+        new_uuid=iter(
+            (
+                SESSION_UUID,
+                TURN_UUID,
+                USER_UUID,
+                REQUEST_UUID,
+                ASSISTANT_UUID,
+                TOOL_UUID,
+                FINAL_REQUEST_UUID,
+                FINAL_ASSISTANT_UUID,
+            )
+        ).__next__,
+    )
+    unavailable_logs = unavailable_workspace / ".myclaw" / "logs"
+    unavailable_logs.write_text("Session Log unavailable", encoding="utf-8")
+
+    unavailable_events = [
+        event async for event in unavailable_runtime.conversation.submit("Fail-open request.")
+    ]
+    await unavailable_runtime.close()
+    unavailable_session = await unavailable_runtime.sessions.load(unavailable_runtime.session_id)
+
+    assert [event.type for event in unavailable_events] == [
+        "turn_started",
+        "tool_started",
+        "tool_completed",
+        "turn_failed",
+    ]
+    assert [event.payload.to_dict() for event in unavailable_events] == [
+        {},
+        {
+            "tool_call_id": "call_unavailable",
+            "tool_name": "unavailable_tool",
+            "summary": "Running unavailable_tool",
+        },
+        {
+            "tool_call_id": "call_unavailable",
+            "tool_name": "unavailable_tool",
+            "status": "error",
+            "summary": "Finished unavailable_tool",
+        },
+        {
+            "error": {
+                "code": "model_failed",
+                "message": "The model request failed.",
+                "retryable": False,
+                "retry_after_seconds": None,
+            }
+        },
+    ]
+    assert isinstance(unavailable_events[2].payload, ToolCompletedPayload)
+    assert unavailable_events[2].payload.status == "error"
+    assert isinstance(unavailable_events[-1].payload, TurnFailedPayload)
+    assert unavailable_events[-1].payload.error == ErrorInfo(
+        code="model_failed",
+        message="The model request failed.",
+    )
+    assert [message.role for message in unavailable_session.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert [
+        message.status
+        for message in unavailable_session.messages
+        if isinstance(message, (AssistantSessionMessage, ToolSessionMessage))
+    ] == ["completed", "error", "error"]
+    assert unavailable_session.metadata.title == "Fail-open request."
+    assert unavailable_session.metadata.cumulative_usage.to_dict() == {
+        "model_calls": 2,
+        "input_tokens": 4,
+        "output_tokens": 2,
+        "total_tokens": 6,
+    }
+    assert unavailable_logs.is_file()
+    assert _session_log_text(unavailable_workspace, unavailable_runtime.session_id) == ""
+
+
+@pytest.mark.asyncio
+async def test_foreground_tool_diagnostics_do_not_persist_boundary_or_conversation_data(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    web_enabled_config = VALID_CONFIG.replace("enabled = false", "enabled = true", 1)
+    (agent_home / "config.toml").write_text(web_enabled_config, encoding="utf-8")
+    clock = FakeClock(NOW)
+    private_query = "PRIVATE_CONVERSATION_QUERY"
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(
+                                content="",
+                                tool_calls=(
+                                    ModelToolCall(
+                                        id="call_private_search",
+                                        name="web_search",
+                                        arguments=json.dumps({"query": private_query}),
+                                    ),
+                                ),
+                            ),
+                            usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
+                            finish_reason="tool_calls",
+                        )
+                    ),
+                )
+            ),
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Search failed safely."),
+                            usage=ModelUsage(input_tokens=8, output_tokens=3, total_tokens=11),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=clock.now,
+        new_uuid=uuid4,
+        retry_clock=clock,
+        web_search=SensitiveFailingWebSearch(),
+    )
+
+    events = [event async for event in runtime.conversation.submit(private_query)]
+    await runtime.conversation.close()
+
+    assert [event.type for event in events] == [
+        "turn_started",
+        "tool_started",
+        "tool_completed",
+        "turn_completed",
+    ]
+    assert isinstance(events[2].payload, ToolCompletedPayload)
+    assert events[2].payload.status == "error"
+    content = _session_log_text(workspace, runtime.session_id)
+    assert content.count("Tool execution failed name=web_search") == 3
+    assert "Traceback (most recent call last):" in content
+    assert content.count("ExceptionGroup: [REDACTED]") == 3
+    assert content.count("OSError: [REDACTED]") == 3
+    assert content.count("ValueError: [REDACTED]") == 3
+    assert private_query not in content
+    assert "RAW_PROVIDER_BODY" not in content
+    assert "PRIVATE_WEB_CREDENTIAL" not in content
+
+
+@pytest.mark.asyncio
+async def test_foreground_model_failure_emits_stable_agent_event_and_redacted_session_log(
+    agent_home: Path,
+    workspace: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    clock = FakeClock(NOW)
+    private_input = "PRIVATE_FOREGROUND_PROMPT"
+    provider_failure = ModelCallError(
+        ErrorInfo(code="model_failed", message="The model request failed.")
+    )
+    provider_failure.__cause__ = RuntimeError("RAW_PROVIDER_BODY auth=PRIVATE_MODEL_CREDENTIAL")
+    provider = ScriptedFakeProvider(streams=(StreamScript(events=(), error=provider_failure),))
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=clock.now,
+        new_uuid=uuid4,
+        retry_clock=clock,
+    )
+
+    configure_process_logging()
+    try:
+        events = [event async for event in runtime.conversation.submit(private_input)]
+        await runtime.conversation.close()
+        terminal_output = capsys.readouterr().err
+    finally:
+        logger.remove()
+
+    assert [event.type for event in events] == ["turn_started", "turn_failed"]
+    assert isinstance(events[1].payload, TurnFailedPayload)
+    assert events[1].payload.error == ErrorInfo(
+        code="model_failed",
+        message="The model request failed.",
+    )
+    content = _session_log_text(workspace, runtime.session_id)
+    assert content.count("Agent Turn failed code=model_failed type=ModelCallError") == 1
+    assert "Traceback (most recent call last):" in content
+    assert "ModelCallError: [REDACTED]" in content
+    assert private_input not in content
+    assert "RAW_PROVIDER_BODY" not in content
+    assert "PRIVATE_MODEL_CREDENTIAL" not in content
+    assert terminal_output == ""
 
 
 @pytest.mark.asyncio
@@ -324,17 +700,21 @@ async def test_prepared_repl_routes_transient_provider_failures_through_one_retr
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     configuration = ConfigLoader(home).load()
     clock = FakeClock(NOW)
+    transient_failure = ModelCallError(
+        ErrorInfo(
+            code="provider_timeout",
+            message="The provider timed out.",
+            retryable=True,
+        )
+    )
+    transient_failure.__cause__ = RuntimeError(
+        "RAW_RETRY_PROVIDER_BODY auth=PRIVATE_RETRY_CREDENTIAL"
+    )
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
                 events=(),
-                error=ModelCallError(
-                    ErrorInfo(
-                        code="provider_timeout",
-                        message="The provider timed out.",
-                        retryable=True,
-                    )
-                ),
+                error=transient_failure,
             ),
             StreamScript(
                 events=(
@@ -369,6 +749,12 @@ async def test_prepared_repl_routes_transient_provider_failures_through_one_retr
     assert len(provider.stream_requests) == 2
     assert clock.sleeps == [0.5]
     assert writer.operations == [("delta", "Recovered response."), ("finish", "")]
+    content = _session_log_text(workspace, runtime.session_id)
+    assert content.count("Provider attempt failed; retrying attempt=1/5") == 1
+    assert "ModelCallError: [REDACTED]" in content
+    assert "RuntimeError: [REDACTED]" in content
+    assert "RAW_RETRY_PROVIDER_BODY" not in content
+    assert "PRIVATE_RETRY_CREDENTIAL" not in content
 
 
 @pytest.mark.asyncio

@@ -9,8 +9,8 @@ from copy import deepcopy
 from typing import cast
 
 from jsonschema import Draft202012Validator, FormatChecker
-from loguru import logger
 
+from myclaw.logging.diagnostics import exception_logger
 from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
 from myclaw.tools.models import ModelToolCall, ToolResult
@@ -20,7 +20,6 @@ from myclaw.utils.json_types import JsonObject, JsonScalar, JsonValue
 type Sleep = Callable[[float], Awaitable[None]]
 
 _DECIMAL_INTEGER = re.compile(r"^[+-]?[0-9]+$")
-
 
 
 class ToolGateway:
@@ -114,7 +113,7 @@ class ToolGateway:
                 attempt_number = attempt + 1
                 total_attempts = tool.max_retries + 1
                 if attempt < tool.max_retries:
-                    logger.opt(exception=error).warning(
+                    exception_logger(error).warning(
                         "Tool execution failed name={} attempt={}/{} type={}",
                         tool.name,
                         attempt_number,
@@ -124,7 +123,7 @@ class ToolGateway:
                     await self._sleep(float(2**attempt))
                     continue
                 if self._owns_terminal_failures:
-                    logger.opt(exception=error).error(
+                    exception_logger(error).error(
                         "Tool execution failed name={} attempt={}/{} type={}",
                         tool.name,
                         attempt_number,

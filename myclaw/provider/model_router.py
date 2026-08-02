@@ -8,6 +8,7 @@ from typing import Protocol, cast
 from loguru import logger
 
 from myclaw.config.config import ProviderConfiguration, ResolvedModelRoute, UserConfiguration
+from myclaw.logging.diagnostics import exception_logger
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     ModelProvider,
@@ -20,8 +21,6 @@ from myclaw.provider.models import (
 _MAX_ATTEMPTS = 5
 _RETRYABLE_CODES = frozenset({"provider_rate_limited", "provider_timeout", "provider_unavailable"})
 _FALLBACK_CODES = frozenset({"route_unavailable", "provider_auth_error"})
-
-
 
 
 class RetryClock(Protocol):
@@ -207,7 +206,7 @@ def _log_retry(
     attempt: int,
     delay: float,
 ) -> None:
-    logger.opt(exception=failure).warning(
+    exception_logger(failure).warning(
         "Provider attempt failed; retrying attempt={}/{} code={} provider={} "
         "requested_route={} selected_route={} model={} planned_delay_seconds={}",
         attempt,
@@ -228,7 +227,7 @@ def _log_fallback(
     *,
     attempt: int,
 ) -> None:
-    logger.opt(exception=failure).warning(
+    exception_logger(failure).warning(
         "Provider attempt failed; recovering attempt={}/{} code={} provider={} "
         "requested_route={} selected_route={} model={} planned_delay_seconds=0.0",
         attempt,
@@ -248,6 +247,7 @@ def _log_fallback(
         fallback.selected_route,
         fallback.route.model,
     )
+
 
 def _concrete_request(request: ModelRequest, resolved: ResolvedModelRoute) -> ModelRequest:
     route = resolved.route

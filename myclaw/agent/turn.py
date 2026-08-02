@@ -6,8 +6,6 @@ from datetime import datetime
 from typing import Literal, Protocol
 from uuid import UUID
 
-from loguru import logger
-
 from myclaw.agent.events import (
     AgentEventType,
     TextDeltaPayload,
@@ -20,6 +18,7 @@ from myclaw.agent.events import (
 )
 from myclaw.agent.prompts import current_user_input, interrupted_assistant_content
 from myclaw.errors import ErrorInfo
+from myclaw.logging.diagnostics import exception_logger
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -72,8 +71,6 @@ _SCHEDULED_SESSION_FAILURE = ErrorInfo(
     code="persistence_error",
     message="Scheduled Work Session could not be updated.",
 )
-
-
 
 
 class AgentTurnModelSettings(Protocol):
@@ -708,7 +705,7 @@ def _unexpected_provider_failure() -> ModelCallError:
 
 
 def _log_model_failure(failure: ModelCallError) -> None:
-    logger.opt(exception=failure).error(
+    exception_logger(failure).error(
         "Agent Turn failed code={} type={}",
         failure.error.code,
         type(failure).__name__,
@@ -716,7 +713,7 @@ def _log_model_failure(failure: ModelCallError) -> None:
 
 
 def _log_persistence_failure(failure: Exception, *, operation: str) -> None:
-    logger.opt(exception=failure).error(
+    exception_logger(failure).error(
         "Agent Turn failed code=persistence_error operation={} type={}",
         operation,
         type(failure).__name__,
@@ -724,7 +721,7 @@ def _log_persistence_failure(failure: Exception, *, operation: str) -> None:
 
 
 def _log_artifact_failure(failure: ArtifactWriteError, *, tool_name: str) -> None:
-    logger.opt(exception=failure).error(
+    exception_logger(failure).error(
         "Tool Artifact persistence failed code=persistence_error tool={} type={}",
         tool_name,
         type(failure).__name__,
@@ -732,7 +729,7 @@ def _log_artifact_failure(failure: ArtifactWriteError, *, tool_name: str) -> Non
 
 
 def _log_cleanup_failure(failure: Exception) -> None:
-    logger.opt(exception=failure).error(
+    exception_logger(failure).error(
         "Agent Turn cleanup failed code=model_failed operation=provider_stream_close type={}",
         type(failure).__name__,
     )
