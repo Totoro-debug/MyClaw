@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import math
+import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Self, cast
@@ -25,6 +28,18 @@ _HEADER_FIELDS = frozenset(
 _UNSUPPORTED_MESSAGE_FIELDS = frozenset({"id", "record_type", "schema_version"})
 
 
+@dataclass(frozen=True, slots=True)
+class _Snapshot:
+    """A complete immutable-in-practice copy of one persistence attempt."""
+
+    session_id: str
+    created_at: datetime
+    updated_at: datetime
+    last_consolidated: int
+    metadata: dict[str, Any]
+    messages: list[dict[str, Any]]
+
+
 class Session:
     """Own the in-memory state and identity of one Conversation Session."""
 
@@ -35,6 +50,8 @@ class Session:
     messages: list[dict[str, Any]]
     metadata: dict[str, Any]
     last_consolidated: int
+    _pending_persist: asyncio.Task[None] | None
+    _closed: bool
 
     def __init__(self) -> None:
         raise TypeError("Use Session.create() or Session.load()")
@@ -63,6 +80,8 @@ class Session:
         session.messages = messages
         session.metadata = metadata
         session.last_consolidated = last_consolidated
+        session._pending_persist = None
+        session._closed = False
         return session
 
     @classmethod
@@ -176,6 +195,71 @@ class Session:
         if updated_usage is not None:
             self.metadata["token_usage"] = updated_usage
 
+    def persist(self) -> None:
+        """Schedule a silent, ordered write of the current complete Session snapshot."""
+        if self._closed:
+            return
+        self._updated_at = _local_now()
+        if not self.messages:
+            return
+        try:
+            snapshot = self._snapshot()
+            loop = asyncio.get_running_loop()
+            previous = self._pending_persist
+            self._pending_persist = loop.create_task(self._persist_after(previous, snapshot))
+        except Exception:
+            return
+
+    def close(self) -> None:
+        """Synchronously make a bounded best-effort final save and close the Session."""
+        if self._closed:
+            return
+        self._closed = True
+        if not self.messages:
+            return
+
+        for attempt in range(3):
+            try:
+                self._updated_at = _local_now()
+                self._write_snapshot(self._snapshot())
+                return
+            except Exception:
+                if attempt < 2:
+                    time.sleep((0.1, 0.2)[attempt])
+
+    def _snapshot(self) -> _Snapshot:
+        return _Snapshot(
+            session_id=self._session_id,
+            created_at=self._created_at,
+            updated_at=self._updated_at,
+            last_consolidated=self.last_consolidated,
+            metadata=copy.deepcopy(self.metadata),
+            messages=copy.deepcopy(self.messages),
+        )
+
+    async def _persist_after(
+        self,
+        previous: asyncio.Task[None] | None,
+        snapshot: _Snapshot,
+    ) -> None:
+        if previous is not None and not previous.done():
+            try:
+                await previous
+            except Exception:
+                pass
+        if self._closed:
+            return
+        try:
+            self._write_snapshot(snapshot)
+        except Exception:
+            pass
+
+    def _write_snapshot(self, snapshot: _Snapshot) -> None:
+        path = self._workspace_state.sessions_directory / f"{snapshot.session_id}.jsonl"
+        content = _serialize_snapshot(snapshot)
+        HOST_FILESYSTEM.path_for_io(path.parent).mkdir(parents=True, exist_ok=True)
+        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
+
     def _usage_after_assistant(self, message: dict[str, Any]) -> dict[str, int] | None:
         if message["role"] != "assistant" or "token_usage" not in message:
             return None
@@ -209,6 +293,21 @@ def _initial_metadata() -> dict[str, Any]:
             "total_tokens": 0,
         },
     }
+
+
+def _serialize_snapshot(snapshot: _Snapshot) -> bytes:
+    header = {
+        "session_id": snapshot.session_id,
+        "created_at": format_rfc3339_milliseconds(snapshot.created_at),
+        "updated_at": format_rfc3339_milliseconds(snapshot.updated_at),
+        "last_consolidated": snapshot.last_consolidated,
+        "metadata": snapshot.metadata,
+    }
+    records = (header, *snapshot.messages)
+    return "".join(
+        json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+        for record in records
+    ).encode("utf-8")
 
 
 def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:

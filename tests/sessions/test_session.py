@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.session.session import Session
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 CREATED_AT = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -91,6 +93,228 @@ def test_create_starts_a_memory_only_session_with_private_identity_generation(
 
     with pytest.raises(TypeError, match=r"Session\.create\(\) or Session\.load\(\)"):
         Session()
+
+
+@pytest.mark.asyncio
+async def test_persist_writes_one_complete_compact_utf8_snapshot_atomically(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "请读取 README。", extension={"nested": ["value"]})
+    replacements: list[tuple[Path, bytes]] = []
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+
+    def record_replace(target: Path, content: bytes) -> None:
+        replacements.append((target, content))
+        replace(target, content)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_replace)
+
+    message_timestamp = session.messages[0]["timestamp"]
+    assert isinstance(message_timestamp, str)
+
+    session.persist()
+    expected = (
+        f'{{"session_id":"{session.session_id}",'
+        f'"created_at":"{session.created_at.isoformat(timespec="milliseconds")}",'
+        f'"updated_at":"{session.updated_at.isoformat(timespec="milliseconds")}",'
+        '"last_consolidated":0,'
+        '"metadata":{"title":"Untitled session",'
+        '"token_usage":{"model_calls":0,"input_tokens":0,'
+        '"output_tokens":0,"total_tokens":0}}}\n'
+        f'{{"role":"user","content":"请读取 README。",'
+        f'"timestamp":"{message_timestamp}",'
+        '"extension":{"nested":["value"]}}\n'
+    ).encode()
+
+    assert replacements == []
+    await asyncio.sleep(0)
+
+    path = state.sessions_directory / f"{session.session_id}.jsonl"
+    raw = HOST_FILESYSTEM.path_for_io(path).read_bytes()
+
+    assert replacements == [(path, expected)]
+    assert raw == expected
+    assert b"\xe8\xaf\xb7\xe8\xaf\xbb" in raw
+    assert Session.load(state, session.session_id).messages == session.messages
+
+
+@pytest.mark.asyncio
+async def test_persist_freezes_each_call_and_finishes_snapshots_in_call_order(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "Before mutation")
+    snapshots: list[list[dict[str, Any]]] = []
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+
+    def record_replace(_target: Path, content: bytes) -> None:
+        records = [json.loads(line) for line in content.splitlines()]
+        snapshots.append(records[1:])
+        replace(_target, content)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_replace)
+
+    session.persist()
+    session.messages[0]["content"] = "After mutation"
+    session.persist()
+    await asyncio.sleep(0)
+
+    assert [snapshot[0]["content"] for snapshot in snapshots] == [
+        "Before mutation",
+        "After mutation",
+    ]
+    assert Session.load(state, session.session_id).messages[0]["content"] == "After mutation"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_persist_failure_is_silent_and_a_later_persist_is_independent(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "First attempt")
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+
+    def fail_replace(_target: Path, _content: bytes) -> None:
+        raise OSError("simulated snapshot failure")
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_replace)
+    session.persist()
+    await asyncio.sleep(0)
+
+    replacements: list[bytes] = []
+
+    def record_later_replace(target: Path, content: bytes) -> None:
+        replacements.append(content)
+        replace(target, content)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_later_replace)
+    session.add_message("user", "Second attempt")
+    session.persist()
+    await asyncio.sleep(0)
+
+    assert len(replacements) == 1
+    assert [message["content"] for message in Session.load(state, session.session_id).messages] == [
+        "First attempt",
+        "Second attempt",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_empty_session_persist_and_close_remain_unmaterialized(
+    workspace: Path,
+) -> None:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    session = Session.create(state)
+
+    session.persist()
+    session.close()
+    await asyncio.sleep(0)
+
+    assert not state.sessions_directory.exists()
+
+
+def test_close_retries_latest_snapshot_with_bounded_delays(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "Save during shutdown")
+    attempts: list[bytes] = []
+    sleeps: list[float] = []
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+
+    def fail_twice_then_replace(target: Path, content: bytes) -> None:
+        attempts.append(content)
+        if len(attempts) < 3:
+            raise OSError("transient snapshot failure")
+        replace(target, content)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_twice_then_replace)
+    monkeypatch.setattr("myclaw.session.session.time.sleep", sleeps.append)
+
+    session.close()
+
+    assert len(attempts) == 3
+    assert sleeps == [0.1, 0.2]
+    assert Session.load(state, session.session_id).messages == session.messages
+
+
+def test_close_swallows_failure_after_three_attempts(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "Best effort shutdown")
+    attempts: list[bytes] = []
+    sleeps: list[float] = []
+
+    def fail_replace(_target: Path, content: bytes) -> None:
+        attempts.append(content)
+        raise OSError("permanent snapshot failure")
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_replace)
+    monkeypatch.setattr("myclaw.session.session.time.sleep", sleeps.append)
+
+    session.close()
+
+    assert len(attempts) == 3
+    assert sleeps == [0.1, 0.2]
+
+
+@pytest.mark.asyncio
+async def test_close_supersedes_queued_persist_and_refreshes_each_attempt_timestamp(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "Final state")
+    timestamps = iter(
+        (
+            datetime(2026, 7, 11, 15, 30, 13, 100000, tzinfo=LOCAL_OFFSET),
+            datetime(2026, 7, 11, 15, 30, 13, 200000, tzinfo=LOCAL_OFFSET),
+            datetime(2026, 7, 11, 15, 30, 13, 300000, tzinfo=LOCAL_OFFSET),
+            datetime(2026, 7, 11, 15, 30, 13, 400000, tzinfo=LOCAL_OFFSET),
+        )
+    )
+    replacements: list[dict[str, Any]] = []
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+
+    def record_replace(target: Path, content: bytes) -> None:
+        replacements.append(json.loads(content.splitlines()[0]))
+        if len(replacements) < 3:
+            raise OSError("transient snapshot failure")
+        replace(target, content)
+
+    monkeypatch.setattr("myclaw.session.session._local_now", timestamps.__next__)
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_replace)
+    monkeypatch.setattr("myclaw.session.session.time.sleep", lambda _delay: None)
+
+    session.persist()
+    session.close()
+    await asyncio.sleep(0)
+
+    assert [header["updated_at"] for header in replacements] == [
+        "2026-07-11T15:30:13.200+08:00",
+        "2026-07-11T15:30:13.300+08:00",
+        "2026-07-11T15:30:13.400+08:00",
+    ]
+    assert Session.load(state, session.session_id).messages == session.messages
 
 
 def test_session_identity_fields_are_read_only(
