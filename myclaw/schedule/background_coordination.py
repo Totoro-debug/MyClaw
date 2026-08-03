@@ -4,12 +4,11 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, tzinfo
-from typing import Literal, Protocol
+from typing import Literal
 from uuid import UUID
 
 from croniter import croniter  # type: ignore[import-untyped]
 from loguru import logger
-from tzlocal import get_localzone
 
 from myclaw.agent.events import AgentEvent, BackgroundCompletedPayload
 from myclaw.agent.workspace_state import WorkspaceState
@@ -18,6 +17,7 @@ from myclaw.logging.session import session_log, without_session_log
 from myclaw.schedule.records import ScheduledWork
 from myclaw.schedule.scheduled_work import ScheduledWorkPersistenceError, ScheduledWorkStore
 from myclaw.schedule.scheduled_work_execution import ScheduledWorkRunner
+from myclaw.utils.scheduler import SchedulerClock
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,28 +191,6 @@ class ScheduledWorkCoordinator:
             self._active_task_ids.discard(task.id)
 
 
-class ScheduledWorkSchedulerClock(Protocol):
-    """Timezone-aware wall clock boundary used by Scheduled Work."""
-
-    def now(self) -> datetime: ...
-
-    async def sleep(self, seconds: float) -> None: ...
-
-
-class AsyncioScheduledWorkSchedulerClock:
-    """Use an injected wall clock in the system local timezone."""
-
-    def __init__(self, *, now: Callable[[], datetime]) -> None:
-        self._now = now
-        self._timezone = get_localzone()
-
-    def now(self) -> datetime:
-        return self._now().astimezone(self._timezone)
-
-    async def sleep(self, seconds: float) -> None:
-        await asyncio.sleep(seconds)
-
-
 class ScheduledWorkScheduler:
     """Reload and trigger enabled Scheduled Work on local cron boundaries."""
 
@@ -221,7 +199,7 @@ class ScheduledWorkScheduler:
         *,
         store: ScheduledWorkStore,
         coordinator: ScheduledWorkCoordinator,
-        clock: ScheduledWorkSchedulerClock,
+        clock: SchedulerClock,
     ) -> None:
         self._store = store
         self._coordinator = coordinator

@@ -19,7 +19,7 @@ from myclaw.session.records import (
     SessionMetadata,
     UserSessionMessage,
 )
-from myclaw.session.session_store import JsonlSessionStore, SessionStore
+from myclaw.session.session_store import JsonlSessionStore
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures import FakeClock
 
@@ -87,9 +87,6 @@ async def test_prepared_session_materializes_exact_jsonl_on_first_user_message_a
         metadata=metadata,
         messages=(user_message,),
     )
-    assert isinstance(store, SessionStore)
-
-
 @pytest.mark.asyncio
 async def test_identical_session_ids_remain_isolated_between_workspace_states(
     workspace: Path,

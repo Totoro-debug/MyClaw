@@ -496,7 +496,7 @@ async def test_initial_session_publication_failure_is_one_safe_terminal_event(
         code="persistence_error",
         message="Conversation Session could not be updated.",
     )
-    assert "private-api-key-and-traceback-detail" not in str(failed.to_dict())
+    assert "private-api-key-and-traceback-detail" not in repr(failed)
     assert provider.stream_requests == []
     assert not sessions.path_for(session.id).exists()
     content = capture.text
@@ -909,7 +909,7 @@ async def test_tool_stage_cancellation_survives_persistent_repair_failure(
             await stream.aclose()
             assert [event.type for event in events] == ["turn_started", "tool_started"]
     capture.close()
-    rendered = str([event.to_dict() for event in events])
+    rendered = repr(events)
     assert "private-cancelled-tool-argument" not in rendered
     assert "private-persistent-tool-publication-detail" not in rendered
     assert tool.calls == []
@@ -974,7 +974,7 @@ async def test_corrupt_session_before_model_call_is_a_safe_persistence_terminal(
         code="persistence_error",
         message="Conversation Session could not be read.",
     )
-    assert "private-corrupt-jsonl-content" not in str(failed.to_dict())
+    assert "private-corrupt-jsonl-content" not in repr(failed)
     assert provider.stream_requests == []
     content = capture.text
     event_text = capture.event_text
@@ -1037,7 +1037,7 @@ async def test_model_error_publication_failure_reports_only_persistence_error(
         code="persistence_error",
         message="Conversation Session could not be updated.",
     )
-    rendered = str(failed.to_dict())
+    rendered = repr(failed)
     assert "private-provider-response-body" not in rendered
     assert "private-assistant-publication-detail" not in rendered
     assert [message.role for message in (await sessions.load(session.id)).messages] == ["user"]
@@ -1293,7 +1293,7 @@ async def test_unexpected_provider_stream_failure_is_normalized_without_secret_t
     )
     persisted = await sessions.load(session.id)
     assert "sk-private" not in str([message.to_dict() for message in persisted.messages])
-    assert "Traceback" not in str([event.to_dict() for event in events])
+    assert "Traceback" not in repr(events)
     validate_agent_event_sequence(events)
 
 
@@ -1342,7 +1342,7 @@ async def test_unsupported_provider_stream_event_is_a_safe_model_failure(
         code="model_failed",
         message="The model request failed.",
     )
-    assert "sk-invalid-event" not in str([event.to_dict() for event in events])
+    assert "sk-invalid-event" not in repr(events)
     validate_agent_event_sequence(events)
 
 
@@ -1466,7 +1466,7 @@ async def test_assistant_publication_failure_never_reports_turn_completed(
         code="persistence_error",
         message="Conversation Session could not be updated.",
     )
-    assert "private-assistant-publication-detail" not in str(failed.to_dict())
+    assert "private-assistant-publication-detail" not in repr(failed)
     assert [message.role for message in (await sessions.load(session.id)).messages] == ["user"]
     assert len(provider.stream_requests) == 1
     content = capture.text
@@ -1759,7 +1759,7 @@ async def test_tool_result_publication_failure_stops_with_correlated_safe_histor
         code="persistence_error",
         message="Conversation Session could not be updated.",
     )
-    rendered = str([event.to_dict() for event in events])
+    rendered = repr(events)
     assert "private-raw-tool-argument" not in rendered
     assert "private-raw-tool-result" not in rendered
     assert "private-tool-result-publication-detail" not in rendered

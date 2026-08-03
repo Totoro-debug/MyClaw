@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 from uuid import UUID
 
 from loguru import logger
@@ -42,7 +42,6 @@ type AtomicReplaceBytes = Callable[[Path, bytes], None]
 type UnlinkFile = Callable[[Path], None]
 
 
-@runtime_checkable
 class SummaryStore(Protocol):
     """Append and read the ordered Conversation Summary stream."""
 

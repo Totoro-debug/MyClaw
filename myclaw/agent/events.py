@@ -3,20 +3,18 @@
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol
 from uuid import UUID
 
 from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ModelUsage
 from myclaw.session.identifiers import require_session_id
 from myclaw.tools.models import ToolResultStatus
-from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_aware_datetime, require_nonnegative_int, require_uuid4
 
 type AgentEventType = Literal[
     "turn_started",
     "text_delta",
-    "progress",
     "tool_started",
     "tool_completed",
     "turn_completed",
@@ -34,8 +32,7 @@ def _require_summary(value: str, *, field: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class TurnStartedPayload:
-    def to_dict(self) -> dict[str, object]:
-        return {}
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,22 +44,6 @@ class TextDeltaPayload:
             msg = "delta must not be empty"
             raise ValueError(msg)
 
-    def to_dict(self) -> dict[str, object]:
-        return {"delta": self.delta}
-
-
-@dataclass(frozen=True, slots=True)
-class ProgressPayload:
-    status: str
-    summary: str
-
-    def __post_init__(self) -> None:
-        _require_summary(self.summary, field="summary")
-
-    def to_dict(self) -> dict[str, object]:
-        return {"status": self.status, "summary": self.summary}
-
-
 @dataclass(frozen=True, slots=True)
 class ToolStartedPayload:
     tool_call_id: str
@@ -71,14 +52,6 @@ class ToolStartedPayload:
 
     def __post_init__(self) -> None:
         _require_summary(self.summary, field="summary")
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "tool_call_id": self.tool_call_id,
-            "tool_name": self.tool_name,
-            "summary": self.summary,
-        }
-
 
 @dataclass(frozen=True, slots=True)
 class ToolCompletedPayload:
@@ -90,38 +63,20 @@ class ToolCompletedPayload:
     def __post_init__(self) -> None:
         _require_summary(self.summary, field="summary")
 
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "tool_call_id": self.tool_call_id,
-            "tool_name": self.tool_name,
-            "status": self.status,
-            "summary": self.summary,
-        }
-
-
 @dataclass(frozen=True, slots=True)
 class TurnCompletedPayload:
     content: str
     usage: ModelUsage
-
-    def to_dict(self) -> dict[str, object]:
-        return {"content": self.content, "usage": self.usage.to_dict()}
 
 
 @dataclass(frozen=True, slots=True)
 class TurnFailedPayload:
     error: ErrorInfo
 
-    def to_dict(self) -> dict[str, object]:
-        return {"error": self.error.to_dict()}
-
 
 @dataclass(frozen=True, slots=True)
 class TurnCancelledPayload:
     partial_content: str
-
-    def to_dict(self) -> dict[str, object]:
-        return {"partial_content": self.partial_content}
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,20 +91,9 @@ class BackgroundCompletedPayload:
         require_session_id(self.session_id)
         _require_summary(self.summary, field="summary")
 
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "kind": self.kind,
-            "title": self.title,
-            "session_id": self.session_id,
-            "status": self.status,
-            "summary": self.summary,
-        }
-
-
 type AgentEventPayload = (
     TurnStartedPayload
     | TextDeltaPayload
-    | ProgressPayload
     | ToolStartedPayload
     | ToolCompletedPayload
     | TurnCompletedPayload
@@ -161,7 +105,6 @@ type AgentEventPayload = (
 _EVENT_PAYLOAD_TYPES: dict[AgentEventType, type[object]] = {
     "turn_started": TurnStartedPayload,
     "text_delta": TextDeltaPayload,
-    "progress": ProgressPayload,
     "tool_started": ToolStartedPayload,
     "tool_completed": ToolCompletedPayload,
     "turn_completed": TurnCompletedPayload,
@@ -190,17 +133,6 @@ class AgentEvent:
             msg = f"payload does not match event type {self.type}"
             raise ValueError(msg)
 
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "type": self.type,
-            "event_id": self.event_id,
-            "turn_id": str(self.turn_id),
-            "created_at": format_rfc3339_milliseconds(self.created_at),
-            "payload": self.payload.to_dict(),
-        }
-
-
-@runtime_checkable
 class ConversationPort(Protocol):
     """Submit user input and emit ordered Agent Events."""
 

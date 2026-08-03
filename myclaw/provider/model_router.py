@@ -26,13 +26,6 @@ class RetryClock(Protocol):
     async def sleep(self, seconds: float) -> None: ...
 
 
-class AsyncioRetryClock:
-    """Production retry clock backed by the event loop's monotonic timer."""
-
-    async def sleep(self, seconds: float) -> None:
-        await asyncio.sleep(seconds)
-
-
 type ProviderFactory = Callable[[ProviderConfiguration], ModelProvider]
 type Jitter = Callable[[float], float]
 
@@ -57,7 +50,7 @@ class ModelRouter:
         *,
         configuration: UserConfiguration,
         provider_factory: ProviderFactory,
-        clock: RetryClock,
+        clock: RetryClock | None = None,
         jitter: Jitter | None = None,
     ) -> None:
         self._configuration = configuration
@@ -154,7 +147,10 @@ class ModelRouter:
             retry_after = float(failure.error.retry_after_seconds or 0.0)
             delay = min(60.0, max(backoff, retry_after))
             _log_retry(current, failure, attempt=attempt, delay=delay)
-            await self._clock.sleep(delay)
+            if self._clock is None:
+                await asyncio.sleep(delay)
+            else:
+                await self._clock.sleep(delay)
             return current
         allows_fallback = code in _FALLBACK_CODES or (
             code == "provider_unavailable" and not failure.error.retryable

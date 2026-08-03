@@ -151,7 +151,7 @@ async def test_unknown_long_tool_is_normalized_and_the_turn_continues_without_ev
     assert len(started.summary) <= 240
     assert len(completed.summary) <= 240
     assert completed.status == "error"
-    assert all(secret_argument not in str(event.to_dict()) for event in events[1:3])
+    assert all(secret_argument not in repr(event) for event in events[1:3])
 
     reloaded = await store.load(session.id)
     assert [message.role for message in reloaded.messages] == [
@@ -269,7 +269,7 @@ async def test_invalid_arguments_are_rejected_before_the_tool_boundary_and_retur
     ]
     validate_agent_event_sequence(events)
     assert tool.calls == []
-    assert all(secret_argument not in str(event.to_dict()) for event in events[1:3])
+    assert all(secret_argument not in repr(event) for event in events[1:3])
     reloaded = await store.load(session.id)
     tool_message = reloaded.messages[2]
     assert isinstance(tool_message, ToolSessionMessage)
@@ -373,7 +373,7 @@ async def test_tool_exception_executes_once_and_becomes_a_safe_result_before_mod
     ]
     validate_agent_event_sequence(events)
     assert len(tool.calls) == 1
-    assert all(raw_exception_detail not in str(event.to_dict()) for event in events)
+    assert all(raw_exception_detail not in repr(event) for event in events)
     reloaded = await store.load(session.id)
     assert raw_exception_detail not in str([message.to_dict() for message in reloaded.messages])
     tool_message = reloaded.messages[2]
@@ -504,7 +504,7 @@ async def test_multiple_tool_calls_keep_mixed_results_ordered_and_recoverable(
         "success",
         "error",
     ]
-    activity = str([event.to_dict() for event in events[1:5]])
+    activity = repr(events[1:5])
     for private_value in (
         "private-argument-one",
         "private-argument-two",
@@ -653,7 +653,7 @@ async def test_json_schema_format_is_enforced_before_tool_boundary_and_turn_cont
     ]
     validate_agent_event_sequence(events)
     assert tool.calls == []
-    assert invalid_email not in str([event.to_dict() for event in events[1:3]])
+    assert invalid_email not in repr(events[1:3])
     reloaded = await store.load(session.id)
     tool_message = reloaded.messages[2]
     assert isinstance(tool_message, ToolSessionMessage)

@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Protocol
 from uuid import UUID
 
 from loguru import logger
@@ -38,24 +37,18 @@ from myclaw.memory.conversation_summary import (
     SummaryModelSettings,
     WorkspaceJsonlSummaryStore,
 )
-from myclaw.memory.memory_scheduler import (
-    AsyncioMemorySchedulerClock,
-    MemorySchedulerClock,
-    MemoryTaskScheduler,
-)
+from myclaw.memory.memory_scheduler import MemoryTaskScheduler
 from myclaw.memory.memory_task import (
     MemoryManager,
     MemoryTaskModelSettings,
     WorkspaceFileMemoryStore,
 )
-from myclaw.provider.model_router import AsyncioRetryClock, Jitter, ModelRouter, RetryClock
+from myclaw.provider.model_router import Jitter, ModelRouter, RetryClock
 from myclaw.provider.models import ModelProvider
 from myclaw.schedule.background_coordination import (
-    AsyncioScheduledWorkSchedulerClock,
     RuntimeEventBroker,
     ScheduledWorkCoordinator,
     ScheduledWorkScheduler,
-    ScheduledWorkSchedulerClock,
 )
 from myclaw.schedule.scheduled_work import (
     CreateScheduledWorkTool,
@@ -100,10 +93,7 @@ from myclaw.tools.web.web_search import (
     WebSearchBoundary,
     WebSearchTool,
 )
-
-
-class ProviderFactory(Protocol):
-    def __call__(self, configuration: ProviderConfiguration) -> ModelProvider: ...
+from myclaw.utils.scheduler import AsyncioSchedulerClock, SchedulerClock
 
 
 class _RuntimeSchedulerOwner:
@@ -419,13 +409,13 @@ def prepare_repl_runtime(
     agent_home: AgentHome,
     workspace: Path,
     configuration: UserConfiguration,
-    provider_factory: ProviderFactory,
+    provider_factory: Callable[[ProviderConfiguration], ModelProvider],
     now: Callable[[], datetime],
     new_uuid: Callable[[], UUID],
     retry_clock: RetryClock | None = None,
     retry_jitter: Jitter | None = None,
-    memory_scheduler_clock: MemorySchedulerClock | None = None,
-    scheduled_work_scheduler_clock: ScheduledWorkSchedulerClock | None = None,
+    memory_scheduler_clock: SchedulerClock | None = None,
+    scheduled_work_scheduler_clock: SchedulerClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     web_search: WebSearchBoundary | None = None,
     web_fetch: WebFetchBoundary | None = None,
@@ -463,13 +453,13 @@ def _prepare_repl_runtime(
     agent_home: AgentHome,
     workspace: Path,
     configuration: UserConfiguration,
-    provider_factory: ProviderFactory,
+    provider_factory: Callable[[ProviderConfiguration], ModelProvider],
     now: Callable[[], datetime],
     new_uuid: Callable[[], UUID],
     retry_clock: RetryClock | None = None,
     retry_jitter: Jitter | None = None,
-    memory_scheduler_clock: MemorySchedulerClock | None = None,
-    scheduled_work_scheduler_clock: ScheduledWorkSchedulerClock | None = None,
+    memory_scheduler_clock: SchedulerClock | None = None,
+    scheduled_work_scheduler_clock: SchedulerClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     web_search: WebSearchBoundary | None = None,
     web_fetch: WebFetchBoundary | None = None,
@@ -499,7 +489,7 @@ def _prepare_repl_runtime(
     router = ModelRouter(
         configuration=configuration,
         provider_factory=provider_factory,
-        clock=retry_clock if retry_clock is not None else AsyncioRetryClock(),
+        clock=retry_clock,
         jitter=retry_jitter,
     )
     configured_web_search = (
@@ -581,7 +571,7 @@ def _prepare_repl_runtime(
     scheduler_clock = (
         memory_scheduler_clock
         if memory_scheduler_clock is not None
-        else AsyncioMemorySchedulerClock(now=now)
+        else AsyncioSchedulerClock(now=now)
     )
     memory_scheduler = _RuntimeSchedulerOwner(
         lambda: MemoryTaskScheduler(
@@ -638,7 +628,7 @@ def _prepare_repl_runtime(
     scheduled_scheduler_clock = (
         scheduled_work_scheduler_clock
         if scheduled_work_scheduler_clock is not None
-        else AsyncioScheduledWorkSchedulerClock(now=now)
+        else AsyncioSchedulerClock(now=now)
     )
     scheduled_work_scheduler = _RuntimeSchedulerOwner(
         lambda: ScheduledWorkScheduler(

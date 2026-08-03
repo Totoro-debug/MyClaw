@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from loguru import logger
 
@@ -15,7 +15,6 @@ from myclaw.session.session_store import SessionListingReport
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 
-@runtime_checkable
 class ManagementPort(Protocol):
     async def config_view(self) -> ConfigView: ...
 

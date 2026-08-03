@@ -782,7 +782,7 @@ async def test_conversation_returns_a_safe_error_for_web_fetch_failure(
     assert isinstance(completed, ToolCompletedPayload)
     assert completed.status == "error"
     assert fetch.calls == ["https://public.example/page"] * 3
-    assert "127.0.0.1" not in str([event.to_dict() for event in events])
+    assert "127.0.0.1" not in repr(events)
     second_request = provider.stream_requests[1]
     assert isinstance(second_request, ModelRequest)
     tool_message = second_request.messages[-1]

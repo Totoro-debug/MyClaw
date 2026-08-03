@@ -51,16 +51,6 @@ class ShellProcessWaiter(Protocol):
     ) -> tuple[bytes, bytes | None]: ...
 
 
-class AsyncioShellProcessWaiter:
-    async def wait(
-        self,
-        output: asyncio.Task[tuple[bytes, bytes | None]],
-        *,
-        timeout: int,
-    ) -> tuple[bytes, bytes | None]:
-        return await asyncio.wait_for(asyncio.shield(output), timeout=timeout)
-
-
 @dataclass(slots=True)
 class _ActiveProcess:
     process: OwnedProcess
@@ -78,7 +68,7 @@ class SubprocessShellBoundary:
         waiter: ShellProcessWaiter | None = None,
     ) -> None:
         self._spawner = default_owned_process_spawner() if spawner is None else spawner
-        self._waiter = AsyncioShellProcessWaiter() if waiter is None else waiter
+        self._waiter = waiter
         self._active: dict[int, _ActiveProcess] = {}
         self._lock = asyncio.Lock()
         self._closed = False
@@ -122,7 +112,13 @@ class SubprocessShellBoundary:
             active = _ActiveProcess(process=process, output=output)
             self._active[id(process)] = active
         try:
-            stdout, _ = await self._waiter.wait(output, timeout=request.timeout)
+            if self._waiter is None:
+                stdout, _ = await asyncio.wait_for(
+                    asyncio.shield(output),
+                    timeout=request.timeout,
+                )
+            else:
+                stdout, _ = await self._waiter.wait(output, timeout=request.timeout)
         except BaseException as primary_error:
             try:
                 await self._terminate_and_wait(active)

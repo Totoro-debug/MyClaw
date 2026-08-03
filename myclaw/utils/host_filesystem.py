@@ -245,14 +245,6 @@ class HostFilesystem:
             _raise_unsafe(path)
         return resolved
 
-    def require_contained_directory(self, path: Path, *, within: Path) -> Path:
-        """Validate a directory beneath an already-resolved owned root."""
-        status = path.lstat()
-        resolved = path.resolve(strict=True)
-        if not self._adapter.is_directory(status) or not resolved.is_relative_to(within):
-            _raise_unsafe(path)
-        return resolved
-
     def require_owned_regular_file(self, path: Path, *, within: Path) -> Path:
         """Return an ordinary singly linked contained file or reject an unsafe path."""
         owned_root = self._require_owned_root(within)
@@ -262,18 +254,6 @@ class HostFilesystem:
             not self._adapter.is_regular_file(status)
             or status.st_nlink != 1
             or not resolved.is_relative_to(owned_root)
-        ):
-            _raise_unsafe(path)
-        return resolved
-
-    def require_contained_regular_file(self, path: Path, *, within: Path) -> Path:
-        """Validate a regular file beneath an already-resolved owned root."""
-        status = path.lstat()
-        resolved = path.resolve(strict=True)
-        if (
-            not self._adapter.is_regular_file(status)
-            or status.st_nlink != 1
-            or not resolved.is_relative_to(within)
         ):
             _raise_unsafe(path)
         return resolved
@@ -297,24 +277,6 @@ class HostFilesystem:
             _raise_unsafe(path)
         return resolved
 
-    def require_opened_contained_regular_file(
-        self, descriptor: int, path: Path, *, within: Path
-    ) -> Path:
-        """Validate an open file beneath an already-resolved owned root."""
-        opened = os.fstat(descriptor)
-        current = path.lstat()
-        resolved = path.resolve(strict=True)
-        if (
-            not self._adapter.is_regular_file(opened)
-            or opened.st_nlink != 1
-            or not self._adapter.is_regular_file(current)
-            or current.st_nlink != 1
-            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
-            or not resolved.is_relative_to(within)
-        ):
-            _raise_unsafe(path)
-        return resolved
-
     def atomic_create_text(self, target: Path, content: str) -> bool:
         """Create exact UTF-8 content without replacing an existing target."""
         return self.atomic_create_text_with_identity(target, content) is not None
@@ -322,10 +284,6 @@ class HostFilesystem:
     def atomic_create_text_with_identity(self, target: Path, content: str) -> FileIdentity | None:
         """Create exact UTF-8 content and return its publication identity."""
         return self.atomic_create_bytes_with_identity(target, content.encode("utf-8"))
-
-    def atomic_create_bytes(self, target: Path, content: bytes) -> bool:
-        """Create complete byte content without replacing an existing target."""
-        return self.atomic_create_bytes_with_identity(target, content) is not None
 
     def atomic_create_bytes_with_identity(
         self, target: Path, content: bytes

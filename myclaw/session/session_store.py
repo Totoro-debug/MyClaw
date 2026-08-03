@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, cast
 from uuid import UUID
 
 from loguru import logger
@@ -39,7 +39,6 @@ from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 
 
-@runtime_checkable
 class SessionStore(Protocol):
     """Persist and query Conversation Sessions."""
 

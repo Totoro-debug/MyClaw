@@ -25,7 +25,7 @@ A code-level boundary through which user-facing interfaces submit conversational
 _Avoid_: CLI service, message bus API, run facade, network port
 
 **Agent Event**:
-A typed runtime event emitted through the Conversation Port, such as streamed text, progress, tool activity, final output, or errors. Main chat conversations using the chat Model Route must support streamed text events in the first version; memory and cron routes are not required to stream; streamed assistant text is written to the session only after completion, and tool activity events expose tool name and status summary rather than full arguments or results by default. The current Tool contract has no permission-request event or paused confirmation state.
+A typed runtime event emitted through the Conversation Port, such as streamed text, tool activity, final output, or errors. Main chat conversations using the chat Model Route must support streamed text events in the first version; memory and cron routes are not required to stream; streamed assistant text is written to the session only after completion, and tool activity events expose tool name and status summary rather than full arguments or results by default. The current Tool contract has no permission-request event or paused confirmation state.
 _Avoid_: Callback, log line, text chunk
 
 **Command-line Conversation**:

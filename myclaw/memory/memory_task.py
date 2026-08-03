@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Protocol, runtime_checkable
+from typing import Annotated, Protocol
 from uuid import uuid4
 
 from loguru import logger
@@ -31,7 +31,6 @@ from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.validation import require_nonnegative_int
 
 
-@runtime_checkable
 class MemoryStore(Protocol):
     """Persist Long-term Memory and its Summary Cursor."""
 

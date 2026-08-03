@@ -504,7 +504,7 @@ async def test_conversation_returns_one_safe_tool_error_for_a_web_search_network
     assert isinstance(completed, ToolCompletedPayload)
     assert completed.status == "error"
     assert search.calls == [("MyClaw runtime", 3)] * 3
-    assert "private upstream" not in str([event.to_dict() for event in events])
+    assert "private upstream" not in repr(events)
     assert len(provider.stream_requests) == 2
     first_request = provider.stream_requests[0]
     second_request = provider.stream_requests[1]

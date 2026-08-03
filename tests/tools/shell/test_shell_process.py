@@ -600,6 +600,21 @@ async def test_shell_timeout_terminates_and_awaits_the_child_process(
 
 
 @pytest.mark.asyncio
+async def test_default_shell_waiter_timeout_terminates_and_awaits_the_child_process(
+    workspace: Path,
+) -> None:
+    process = BlockingFakeShellProcess()
+    shell = SubprocessShellBoundary(spawner=FakeProcessSpawner(process))
+
+    with pytest.raises(TimeoutError):
+        await shell.execute(ShellRequest(command="git status", cwd=workspace.resolve(), timeout=0))
+
+    assert process.communicate_started.is_set()
+    assert process.terminated is True
+    assert process.reaped is True
+
+
+@pytest.mark.asyncio
 async def test_shell_cancellation_terminates_and_awaits_the_child_process(
     workspace: Path,
 ) -> None:

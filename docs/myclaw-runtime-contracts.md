@@ -563,7 +563,6 @@ adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不
 | --- | --- | --- |
 | `turn_started` | `{}` | 前台 turn 接受并开始 |
 | `text_delta` | `{delta}` | chat streaming 文本 |
-| `progress` | `{status, summary}` | 非敏感进度 |
 | `tool_started` | `{tool_call_id, tool_name, summary}` | 不含完整 arguments |
 | `tool_completed` | `{tool_call_id, tool_name, status, summary}` | 不含完整 raw result |
 | `turn_completed` | `{content, usage}` | 一个 turn 恰好一个终态 |

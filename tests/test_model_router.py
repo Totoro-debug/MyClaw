@@ -453,7 +453,7 @@ async def test_model_router_records_only_consumed_retry_attempts(
 
 
 @pytest.mark.asyncio
-async def test_model_router_uses_exponential_backoff_and_respects_retry_after() -> None:
+async def test_model_router_uses_injected_clock_for_exponential_backoff_and_retry_after() -> None:
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(events=(), error=retryable_timeout()),
@@ -475,6 +475,33 @@ async def test_model_router_uses_exponential_backoff_and_respects_retry_after() 
 
     assert observed == [completed()]
     assert clock.sleeps == [0.5, 1.0, 7, 60]
+
+
+@pytest.mark.asyncio
+async def test_model_router_uses_asyncio_sleep_when_clock_is_not_injected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(events=(), error=retryable_timeout()),
+            StreamScript(events=(completed(),)),
+        )
+    )
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    router = ModelRouter(
+        configuration=configuration(),
+        provider_factory=lambda _: provider,
+    )
+
+    observed = await collect(router.stream(request()))
+
+    assert observed == [completed()]
+    assert sleeps == [0.5]
 
 
 @pytest.mark.asyncio

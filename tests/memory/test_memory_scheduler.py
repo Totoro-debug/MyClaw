@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-import myclaw.memory.memory_scheduler as memory_scheduler_module
+import myclaw.utils.scheduler as scheduler_module
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -16,7 +16,7 @@ from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
 from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
-from myclaw.memory.memory_scheduler import AsyncioMemorySchedulerClock, MemoryTaskScheduler
+from myclaw.memory.memory_scheduler import MemoryTaskScheduler
 from myclaw.memory.memory_task import (
     MemoryManager,
     MemoryTaskModelSettings,
@@ -34,6 +34,7 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from myclaw.tools.models import ModelToolCall
+from myclaw.utils.scheduler import AsyncioSchedulerClock
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
@@ -497,14 +498,14 @@ def test_production_scheduler_clock_uses_the_rule_bearing_system_timezone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     zone = SpringForwardTimezone()
-    monkeypatch.setattr(memory_scheduler_module, "get_localzone", lambda: zone)
+    monkeypatch.setattr(scheduler_module, "get_localzone", lambda: zone)
     instants = iter(
         (
             datetime(2026, 3, 8, 6, 50, tzinfo=UTC),
             datetime(2026, 3, 8, 7, 30, tzinfo=UTC),
         )
     )
-    clock = AsyncioMemorySchedulerClock(now=lambda: next(instants))
+    clock = AsyncioSchedulerClock(now=lambda: next(instants))
 
     before_transition = clock.now()
     after_transition = clock.now()

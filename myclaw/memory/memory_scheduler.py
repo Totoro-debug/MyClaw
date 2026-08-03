@@ -1,38 +1,14 @@
 """Cron scheduling for silent periodic Memory Tasks."""
 
 import asyncio
-from collections.abc import Callable
 from datetime import datetime, tzinfo
-from typing import Protocol
 
 from croniter import croniter  # type: ignore[import-untyped]
 from loguru import logger
-from tzlocal import get_localzone
 
 from myclaw.logging.session import without_session_log
 from myclaw.memory.memory_task import MemoryManager
-
-
-class MemorySchedulerClock(Protocol):
-    """Timezone-aware wall clock boundary used by Memory Task scheduling."""
-
-    def now(self) -> datetime: ...
-
-    async def sleep(self, seconds: float) -> None: ...
-
-
-class AsyncioMemorySchedulerClock:
-    """Use an injected local wall clock and asyncio for production waits."""
-
-    def __init__(self, *, now: Callable[[], datetime]) -> None:
-        self._now = now
-        self._timezone = get_localzone()
-
-    def now(self) -> datetime:
-        return self._now().astimezone(self._timezone)
-
-    async def sleep(self, seconds: float) -> None:
-        await asyncio.sleep(seconds)
+from myclaw.utils.scheduler import SchedulerClock
 
 
 class MemoryTaskScheduler:
@@ -43,7 +19,7 @@ class MemoryTaskScheduler:
         *,
         manager: MemoryManager,
         schedule: str,
-        clock: MemorySchedulerClock,
+        clock: SchedulerClock,
     ) -> None:
         self._manager = manager
         self._schedule = schedule

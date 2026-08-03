@@ -208,7 +208,7 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
     assert len(records) == 2
     assert "ModelCallError: The model request failed." in content
     assert "ModelCallError: No title response was scripted." in content
-    assert private_input not in str([event.to_dict() for event in events])
+    assert private_input not in repr(events)
     assert {name: (legacy_logs / name).read_bytes() for name in legacy_files} == legacy_files
 
 
@@ -347,28 +347,6 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
         "tool_started",
         "tool_completed",
         "turn_failed",
-    ]
-    assert [event.payload.to_dict() for event in unavailable_events] == [
-        {},
-        {
-            "tool_call_id": "call_unavailable",
-            "tool_name": "unavailable_tool",
-            "summary": "Running unavailable_tool",
-        },
-        {
-            "tool_call_id": "call_unavailable",
-            "tool_name": "unavailable_tool",
-            "status": "error",
-            "summary": "Finished unavailable_tool",
-        },
-        {
-            "error": {
-                "code": "model_failed",
-                "message": "The model request failed.",
-                "retryable": False,
-                "retry_after_seconds": None,
-            }
-        },
     ]
     assert isinstance(unavailable_events[2].payload, ToolCompletedPayload)
     assert unavailable_events[2].payload.status == "error"

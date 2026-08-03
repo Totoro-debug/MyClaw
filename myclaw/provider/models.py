@@ -2,7 +2,7 @@
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import ClassVar, Literal, Protocol, runtime_checkable
+from typing import ClassVar, Literal, Protocol
 from uuid import UUID
 
 from myclaw.tools.models import ModelToolCall
@@ -175,7 +175,6 @@ class ModelCompleted:
 type ModelStreamEvent = TextDelta | ModelCompleted
 
 
-@runtime_checkable
 class ModelProvider(Protocol):
     """Execute provider-neutral model requests."""
 
