@@ -7,11 +7,12 @@ import copy
 import json
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Self, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.session.identifiers import make_session_id as _make_session_id
@@ -47,6 +48,7 @@ class Session:
     _session_id: str
     _created_at: datetime
     _updated_at: datetime
+    _now: Callable[[], datetime] | None
     messages: list[dict[str, Any]]
     metadata: dict[str, Any]
     last_consolidated: int
@@ -67,6 +69,7 @@ class Session:
         messages: list[dict[str, Any]],
         metadata: dict[str, Any],
         last_consolidated: int,
+        now: Callable[[], datetime] | None = None,
     ) -> Self:
         _require_session_id(session_id)
         require_aware_datetime(created_at, field="created_at")
@@ -77,6 +80,7 @@ class Session:
         session._session_id = session_id
         session._created_at = created_at
         session._updated_at = updated_at
+        session._now = now
         session.messages = messages
         session.metadata = metadata
         session.last_consolidated = last_consolidated
@@ -88,17 +92,22 @@ class Session:
     def create(
         cls,
         workspace_state: WorkspaceState,
+        *,
+        now: Callable[[], datetime] | None = None,
+        new_uuid: Callable[[], UUID] | None = None,
     ) -> Self:
         """Create a memory-only Session with a new local timestamp-plus-UUID4 ID."""
-        created_at = _local_now()
+        created_at = _clock_now(now)
+        allocate_uuid = uuid4 if new_uuid is None else new_uuid
         return cls._from_state(
             workspace_state=workspace_state,
-            session_id=_make_session_id(created_at, uuid4()),
+            session_id=_make_session_id(created_at, allocate_uuid()),
             created_at=created_at,
             updated_at=created_at,
             messages=[],
             metadata=_initial_metadata(),
             last_consolidated=0,
+            now=now,
         )
 
     @classmethod
@@ -106,6 +115,8 @@ class Session:
         cls,
         workspace_state: WorkspaceState,
         session_id: str,
+        *,
+        now: Callable[[], datetime] | None = None,
     ) -> Self:
         """Load one current-format Session synchronously from Workspace State."""
         _require_session_id(session_id)
@@ -126,6 +137,7 @@ class Session:
             messages=messages,
             metadata=metadata,
             last_consolidated=last_consolidated,
+            now=now,
         )
 
     @property
@@ -135,6 +147,10 @@ class Session:
     @property
     def created_at(self) -> datetime:
         return self._created_at
+
+    @property
+    def workspace_state(self) -> WorkspaceState:
+        return self._workspace_state
 
     @property
     def updated_at(self) -> datetime:
@@ -155,7 +171,7 @@ class Session:
         message: dict[str, Any] = {
             "role": role,
             "content": content,
-            "timestamp": format_rfc3339_milliseconds(_local_now()),
+            "timestamp": format_rfc3339_milliseconds(self._clock_now()),
             **copied_fields,
         }
         _validate_message(message)
@@ -199,7 +215,7 @@ class Session:
         """Schedule a silent, ordered write of the current complete Session snapshot."""
         if self._closed:
             return
-        self._updated_at = _local_now()
+        self._updated_at = self._clock_now()
         if not self.messages:
             return
         try:
@@ -220,7 +236,7 @@ class Session:
 
         for attempt in range(3):
             try:
-                self._updated_at = _local_now()
+                self._updated_at = self._clock_now()
                 self._write_snapshot(self._snapshot())
                 return
             except Exception:
@@ -278,9 +294,16 @@ class Session:
             for key in ("model_calls", "input_tokens", "output_tokens", "total_tokens")
         }
 
+    def _clock_now(self) -> datetime:
+        return _clock_now(self._now)
+
 
 def _local_now() -> datetime:
     return datetime.now().astimezone()
+
+
+def _clock_now(now: Callable[[], datetime] | None) -> datetime:
+    return _local_now() if now is None else now()
 
 
 def _initial_metadata() -> dict[str, Any]:

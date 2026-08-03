@@ -21,7 +21,6 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
-from myclaw.session.records import ToolSessionMessage
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_search import (
@@ -514,8 +513,8 @@ async def test_conversation_returns_one_safe_tool_error_for_a_web_search_network
     tool_message = second_request.messages[-1]
     assert isinstance(tool_message, ToolModelMessage)
     assert tool_message.content == "web_search could not complete the request."
-    persisted = (await runtime.sessions.load(runtime.session_id)).messages[2]
-    assert isinstance(persisted, ToolSessionMessage)
+    persisted = runtime.session.messages[2]
+    assert persisted["role"] == "tool"
 
 
 @pytest.mark.asyncio
@@ -601,10 +600,10 @@ async def test_conversation_receives_only_provider_neutral_web_search_results(
     ]
     assert json.loads(tool_message.content) == expected
     assert "provider_metadata" not in tool_message.content
-    persisted = (await runtime.sessions.load(runtime.session_id)).messages[2]
-    assert isinstance(persisted, ToolSessionMessage)
-    assert persisted.status == "success"
-    assert json.loads(persisted.content) == expected
+    persisted = runtime.session.messages[2]
+    assert persisted["role"] == "tool"
+    assert persisted["status"] == "success"
+    assert json.loads(persisted["content"]) == expected
 
 
 @pytest.mark.asyncio

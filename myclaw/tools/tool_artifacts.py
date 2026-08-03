@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Final
 
 from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.session.session import Session
 from myclaw.tools.artifacts import ArtifactReference, encode_artifact_tool_call_id
 from myclaw.tools.models import ToolResult
 from myclaw.utils.host_filesystem import (
@@ -25,19 +26,30 @@ class ArtifactWriteError(Exception):
 def externalize_tool_result(
     result: ToolResult,
     *,
-    workspace_state: WorkspaceState,
-    session_id: str,
+    session: Session | None = None,
+    workspace_state: WorkspaceState | None = None,
+    session_id: str | None = None,
     max_tool_result_chars: int,
     write_text: ArtifactWriter | None = None,
 ) -> ToolResult:
     """Externalize one oversized successful result without lifecycle ownership."""
+    if session is not None:
+        if workspace_state is not None or session_id is not None:
+            raise TypeError("Active Tool Artifact externalization requires only a Session")
+        resolved_workspace_state = session.workspace_state
+        resolved_session_id = session.session_id
+    else:
+        if workspace_state is None or session_id is None:
+            raise TypeError("Legacy Tool Artifact externalization requires Workspace State and ID")
+        resolved_workspace_state = workspace_state
+        resolved_session_id = session_id
     if result.status != "success" or len(result.content) <= max_tool_result_chars:
         return result
 
     try:
         raw_content = result.content
         encoded_tool_call_id = encode_artifact_tool_call_id(result.tool_call_id)
-        relative_path = f"artifacts/{session_id}/{encoded_tool_call_id}.txt"
+        relative_path = f"artifacts/{resolved_session_id}/{encoded_tool_call_id}.txt"
         preview = raw_content[:_PREVIEW_CHARS]
         projected = replace(
             result,
@@ -48,18 +60,18 @@ def externalize_tool_result(
                 preview_chars=len(preview),
             ),
         )
-        io_workspace = HOST_FILESYSTEM.path_for_io(Path(workspace_state.workspace.path))
+        io_workspace = HOST_FILESYSTEM.path_for_io(Path(resolved_workspace_state.workspace.path))
         workspace_root = io_workspace.resolve(strict=True)
-        io_state = HOST_FILESYSTEM.path_for_io(workspace_state.path)
+        io_state = HOST_FILESYSTEM.path_for_io(resolved_workspace_state.path)
         state_root = HOST_FILESYSTEM.require_owned_directory(io_state, within=workspace_root)
-        io_sessions = HOST_FILESYSTEM.path_for_io(workspace_state.sessions_directory)
+        io_sessions = HOST_FILESYSTEM.path_for_io(resolved_workspace_state.sessions_directory)
         sessions_root = HOST_FILESYSTEM.require_owned_directory(io_sessions, within=state_root)
         artifacts_directory = io_sessions / "artifacts"
         artifacts_directory.mkdir(exist_ok=True)
         artifacts_root = HOST_FILESYSTEM.require_owned_directory(
             artifacts_directory, within=sessions_root
         )
-        io_directory = artifacts_directory / session_id
+        io_directory = artifacts_directory / resolved_session_id
         io_directory.mkdir(exist_ok=True)
         HOST_FILESYSTEM.require_owned_directory(io_directory, within=artifacts_root)
         artifact_path = io_directory / f"{encoded_tool_call_id}.txt"

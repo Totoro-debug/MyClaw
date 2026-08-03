@@ -129,7 +129,7 @@ class AgentTurn:
         system_prompt: str,
         tool_gateway: ToolGateway | None,
         history_preparer: Callable[[Any], Awaitable[Any]] | None = None,
-        after_user_published: Callable[[UserSessionMessage], None] | None = None,
+        after_user_published: Callable[[Session | UserSessionMessage], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
         on_terminal_failure: Callable[[BaseException], None] | None = None,
@@ -188,8 +188,11 @@ class AgentTurn:
         if self._lane == "foreground" and self._cancel_requested():
             yield await self._cancelled_payload([], [])
             return
-        if self._after_user_published is not None and user_message is not None:
-            self._after_user_published(user_message)
+        if self._after_user_published is not None:
+            if self._session is not None:
+                self._after_user_published(self._session)
+            elif user_message is not None:
+                self._after_user_published(user_message)
 
         partial_content: list[str] = []
         pending_tool_calls: list[ModelToolCall] = []

@@ -537,9 +537,9 @@ async def test_production_conversation_denies_parent_escape_without_reading_the_
         "content": "The requested path resolves outside the Workspace.",
     }
     assert "do-not-leak" not in denied_message.content
-    persisted = (await runtime.sessions.load(runtime.session_id)).messages[2]
-    assert isinstance(persisted, ToolSessionMessage)
-    assert persisted.status == "error"
+    persisted = runtime.session.messages[2]
+    assert persisted["role"] == "tool"
+    assert persisted["status"] == "error"
     first_request = provider.stream_requests[0]
     assert isinstance(first_request, ModelRequest)
     tool_guidance = first_request.system_prompt.split("<tool_guidance>\n", 1)[1].split(

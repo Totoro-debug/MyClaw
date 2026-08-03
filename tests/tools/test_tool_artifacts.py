@@ -28,6 +28,7 @@ from myclaw.provider.models import (
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import ToolSessionMessage
+from myclaw.session.session import Session
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.models import (
     ModelToolCall,
@@ -148,6 +149,45 @@ def test_runtime_externalizes_only_success_results_over_the_configured_threshold
     assert (artifact_directory / "call_over.txt").read_text(encoding="utf-8") == oversized_result
 
 
+def test_active_session_is_the_only_tool_artifact_workspace_authority(
+    workspace: Path,
+) -> None:
+    workspace_state = _workspace_state(workspace)
+    other_workspace = workspace.parent / "other-workspace"
+    other_workspace.mkdir()
+    other_state = _workspace_state(other_workspace)
+    session = Session.create(
+        workspace_state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    result = ToolResult(
+        tool_call_id="call_active_authority",
+        name="inspect",
+        status="success",
+        content="oversized",
+        artifact=None,
+    )
+
+    projected = externalize_tool_result(
+        result,
+        session=session,
+        max_tool_result_chars=1,
+    )
+
+    assert projected.artifact is not None
+    own_artifact = workspace_state.sessions_directory / projected.artifact.path
+    assert own_artifact.read_text(encoding="utf-8") == "oversized"
+    assert not (other_state.sessions_directory / "artifacts").exists()
+    with pytest.raises(TypeError, match="requires only a Session"):
+        externalize_tool_result(
+            result,
+            session=session,
+            workspace_state=other_state,
+            max_tool_result_chars=1,
+        )
+
+
 @pytest.mark.asyncio
 async def test_runtime_persists_unicode_preview_and_safely_encoded_artifact_reference(
     agent_home: Path,
@@ -212,12 +252,11 @@ async def test_runtime_persists_unicode_preview_and_safely_encoded_artifact_refe
     expected_content = (
         f"{expected_preview}\n\n...[truncated; full result stored at {relative_path}]"
     )
-    reloaded = await runtime.sessions.load(runtime.session_id)
+    reloaded = runtime.session
     tool_message = reloaded.messages[2]
-    assert isinstance(tool_message, ToolSessionMessage)
-    assert tool_message.content == expected_content
-    assert tool_message.artifact is not None
-    assert tool_message.artifact.to_dict() == {
+    assert tool_message["role"] == "tool"
+    assert tool_message["content"] == expected_content
+    assert tool_message["artifact"] == {
         "path": relative_path,
         "total_chars": 2001,
         "preview_chars": 2000,

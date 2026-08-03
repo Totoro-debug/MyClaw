@@ -1030,25 +1030,16 @@ async def test_resuming_from_a_nonempty_session_preserves_its_complete_history(
         new_uuid=iter((NEWER_SESSION_UUID,)).__next__,
     )
     original_session_id = runtime.session_id
-    await runtime.sessions.append_message(
-        original_session_id,
-        UserSessionMessage(
-            id=str(SECOND_USER_UUID),
-            created_at=NOW,
-            content="Original nonempty history.",
-        ),
-    )
-    original_path = HOST_FILESYSTEM.path_for_io(runtime.sessions.path_for(original_session_id))
-    original_bytes = original_path.read_bytes()
+    runtime.session.add_message("user", "Original nonempty history.")
 
     result = await runtime.management_dispatcher.resume(target.id)
 
     assert result.output == f"Resumed session {target.id}."
-    assert original_path.read_bytes() == original_bytes
-    original = await runtime.sessions.load(original_session_id)
-    assert [(message.role, message.content) for message in original.messages] == [
-        ("user", "Original nonempty history.")
+    assert runtime.session.session_id == original_session_id
+    assert [message["content"] for message in runtime.session.messages] == [
+        "Original nonempty history."
     ]
+    await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -1103,16 +1094,13 @@ async def test_late_title_stays_with_original_and_resumed_session_is_not_retitle
             )
         ).__next__,
     )
-    original_session_id = runtime.session_id
-
     _ = [event async for event in runtime.conversation.submit("Create the original title.")]
     await asyncio.wait_for(provider.title_started.wait(), timeout=1)
 
     resume_result = await runtime.management_dispatcher.resume(target.id)
     provider.release_title.set()
     for _ in range(100):
-        original = await runtime.sessions.load(original_session_id)
-        if original.metadata.title == "Late original title":
+        if runtime.session.metadata["title"] == "Late original title":
             break
         await asyncio.sleep(0)
 
@@ -1120,7 +1108,7 @@ async def test_late_title_stays_with_original_and_resumed_session_is_not_retitle
 
     resumed = await runtime.sessions.load(target.id)
     assert resume_result.output == f"Resumed session {target.id}."
-    assert original.metadata.title == "Late original title"
+    assert runtime.session.metadata["title"] == "Late original title"
     assert resumed.metadata.title == "Existing target title"
     assert provider.title_request_count == 1
     assert [(message.role, message.content) for message in resumed.messages] == [

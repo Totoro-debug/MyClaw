@@ -353,7 +353,13 @@ async def test_runtime_routes_memory_without_legacy_summary_recovery(
             StreamScript(events=(ModelCompleted(response=_response(f"Answer {index}.")),))
             for index in range(1, 4)
         ),
-        completions=(),
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Summary of the first turn."),
+                usage=ModelUsage(input_tokens=3, output_tokens=1, total_tokens=4),
+                finish_reason="stop",
+            ),
+        ),
     )
     runtime = prepare_repl_runtime(
         agent_home=home,
@@ -376,7 +382,10 @@ async def test_runtime_routes_memory_without_legacy_summary_recovery(
     assert "# Workspace Memory" in first_request.system_prompt
     assert "# Agent Home Memory" not in first_request.system_prompt
     assert memory_view.output == "# Workspace Memory\n"
-    assert not (state.memory_directory / "summary.jsonl").exists()
+    assert (state.memory_directory / "summary.jsonl").is_file()
+    assert "Summary of the first turn." in (state.memory_directory / "summary.jsonl").read_text(
+        encoding="utf-8"
+    )
     assert not (state.memory_directory / "pending-consolidations").exists()
     assert not (state.memory_directory / ".cursor").exists()
     assert state.long_term_memory_path.read_text(encoding="utf-8") == "# Workspace Memory\n"

@@ -18,7 +18,6 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
-from myclaw.session.records import ToolSessionMessage
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import (
@@ -788,6 +787,6 @@ async def test_conversation_returns_a_safe_error_for_web_fetch_failure(
     tool_message = second_request.messages[-1]
     assert isinstance(tool_message, ToolModelMessage)
     assert tool_message.content == "WebFetch rejected an unsafe or unverifiable request."
-    persisted = (await runtime.sessions.load(runtime.session_id)).messages[2]
-    assert isinstance(persisted, ToolSessionMessage)
-    assert "private upstream" not in persisted.content
+    persisted = runtime.session.messages[2]
+    assert persisted["role"] == "tool"
+    assert "private upstream" not in persisted["content"]

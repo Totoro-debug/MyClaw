@@ -12,6 +12,7 @@ from loguru import logger
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.session.identifiers import require_session_id
+from myclaw.session.session import Session
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _ROTATION_BYTES = 10_485_760
@@ -27,12 +28,25 @@ def without_session_log() -> Iterator[None]:
 
 
 @contextmanager
-def session_log(workspace_state: WorkspaceState, session_id: str) -> Iterator[None]:
+def session_log(
+    workspace_or_session: WorkspaceState | Session,
+    session_id: str | None = None,
+) -> Iterator[None]:
     """Route WARNING+ Loguru records to one Session-owned file for this scope."""
-    require_session_id(session_id)
-    handler_id = _add_sink(workspace_state, session_id)
+    if isinstance(workspace_or_session, Session):
+        if session_id is not None:
+            raise TypeError("Session Log cannot receive both a Session and a Session ID")
+        workspace_state = workspace_or_session.workspace_state
+        resolved_session_id = workspace_or_session.session_id
+    else:
+        if session_id is None:
+            raise TypeError("Session Log requires a Session ID")
+        workspace_state = workspace_or_session
+        resolved_session_id = session_id
+    require_session_id(resolved_session_id)
+    handler_id = _add_sink(workspace_state, resolved_session_id)
     try:
-        with logger.contextualize(session_id=session_id):
+        with logger.contextualize(session_id=resolved_session_id):
             yield
     finally:
         if handler_id is not None:

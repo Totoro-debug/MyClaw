@@ -17,7 +17,6 @@ from myclaw.provider.models import (
     ModelStreamEvent,
     ModelUsage,
 )
-from myclaw.session.records import CumulativeUsage
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock
 
@@ -84,8 +83,7 @@ async def test_prepared_runtime_uses_an_isolated_chat_stream_for_session_title(
         event.type async for event in runtime.conversation.submit("  First\t runtime input.  ")
     ]
     for _ in range(100):
-        reloaded = await runtime.sessions.load(runtime.session_id)
-        if len(provider.requests) == 2 and reloaded.metadata.title == "Runtime project":
+        if len(provider.requests) == 2 and runtime.session.metadata["title"] == "Runtime project":
             break
         await asyncio.sleep(0)
 
@@ -104,11 +102,11 @@ async def test_prepared_runtime_uses_an_isolated_chat_stream_for_session_title(
     ]
     assert "<runtime_context>" not in title_request.system_prompt
     assert "<long_term_memory>" not in title_request.system_prompt
-    assert reloaded.metadata.title == "Runtime project"
-    assert reloaded.metadata.cumulative_usage == CumulativeUsage(
-        model_calls=2,
-        input_tokens=11,
-        output_tokens=3,
-        total_tokens=14,
-    )
-    assert [message.role for message in reloaded.messages] == ["user", "assistant"]
+    assert runtime.session.metadata["title"] == "Runtime project"
+    assert runtime.session.metadata["token_usage"] == {
+        "model_calls": 2,
+        "input_tokens": 11,
+        "output_tokens": 3,
+        "total_tokens": 14,
+    }
+    assert [message["role"] for message in runtime.session.messages] == ["user", "assistant"]

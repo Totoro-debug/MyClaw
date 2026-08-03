@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from myclaw import __version__
 from myclaw.config.agent_home import AgentHome
@@ -12,6 +12,7 @@ from myclaw.errors import ErrorInfo
 from myclaw.memory.memory_task import MemoryStore, MemoryTaskResult
 from myclaw.session.identifiers import require_session_id
 from myclaw.session.records import ConversationSession, CumulativeUsage, SessionSummary
+from myclaw.session.session import Session
 from myclaw.session.session_store import SessionListingReport
 from myclaw.utils.validation import require_nonnegative_int, require_nonnegative_number
 
@@ -125,30 +126,85 @@ class RuntimeStatusService:
     def __init__(
         self,
         *,
-        sessions: _CurrentSessionStore,
-        session_id: str | Callable[[], str],
+        session: Session | Callable[[], Session] | None = None,
+        sessions: _CurrentSessionStore | None = None,
+        session_id: str | Callable[[], str] | None = None,
         resolved_chat: Callable[[], ResolvedChatStatus],
-        next_input: Callable[[ConversationSession], RuntimeStatusInput],
+        next_input: Callable[[Session | ConversationSession], RuntimeStatusInput],
         monotonic: Callable[[], float],
         version: str = __version__,
     ) -> None:
-        self._sessions = sessions
-        self._session_id: Callable[[], str]
-        if isinstance(session_id, str):
-            self._session_id = lambda: session_id
+        self._session: Callable[[], Session] | None
+        self._initial_session: Callable[[], Session] | None
+        self._sessions: _CurrentSessionStore | None
+        self._session_id: Callable[[], str] | None
+        if session is not None:
+            if isinstance(session, Session):
+                self._session = lambda: session
+            else:
+                self._session = session
+            self._initial_session = self._session
+            self._sessions = sessions
+            if session_id is None:
+                self._session_id = None
+            elif isinstance(session_id, str):
+                self._session_id = lambda: session_id
+            else:
+                self._session_id = session_id
         else:
-            self._session_id = session_id
+            if sessions is None or session_id is None:
+                raise TypeError("Legacy status requires a Session Store and Session ID")
+            self._session = None
+            self._initial_session = None
+            self._sessions = sessions
+            if isinstance(session_id, str):
+                self._session_id = lambda: session_id
+            else:
+                self._session_id = session_id
         self._resolved_chat = resolved_chat
         self._next_input = next_input
         self._monotonic = monotonic
         self._started_at = monotonic()
         self._version = version
 
+    def use_session(self, session_id: str) -> None:
+        """Select legacy Store-backed status only after the existing resume flow switches."""
+        require_session_id(session_id)
+        initial_session = self._initial_session
+        if initial_session is not None and initial_session().session_id == session_id:
+            self._session = initial_session
+            return
+        if self._sessions is None:
+            raise RuntimeError("Legacy Session status is unavailable")
+        self._session = None
+        self._session_id = lambda: session_id
+
     async def status(self) -> RuntimeStatus:
         """Return all required runtime and current-session status fields."""
-        session = await self._sessions.current_session(self._session_id())
+        active_session = self._session
+        if active_session is not None:
+            session = active_session()
+            resolved = self._resolved_chat()
+            estimated = estimate_input_tokens(self._next_input(session))
+            uptime = max(0, int(self._monotonic() - self._started_at))
+            return RuntimeStatus(
+                version=self._version,
+                chat_model=resolved.chat_model,
+                uptime_seconds=uptime,
+                estimated_input_tokens=estimated,
+                context_window=resolved.context_window,
+                context_used_percent=estimated / resolved.context_window * 100,
+                session_message_count=len(session.messages),
+                consolidation_cursor=session.last_consolidated,
+                cumulative_usage=_active_session_usage(session),
+            )
+        sessions = self._sessions
+        session_id = self._session_id
+        assert sessions is not None
+        assert session_id is not None
+        persisted_session = await sessions.current_session(session_id())
         resolved = self._resolved_chat()
-        estimated = estimate_input_tokens(self._next_input(session))
+        estimated = estimate_input_tokens(self._next_input(persisted_session))
         uptime = max(0, int(self._monotonic() - self._started_at))
         return RuntimeStatus(
             version=self._version,
@@ -157,10 +213,26 @@ class RuntimeStatusService:
             estimated_input_tokens=estimated,
             context_window=resolved.context_window,
             context_used_percent=estimated / resolved.context_window * 100,
-            session_message_count=len(session.messages),
-            consolidation_cursor=session.metadata.consolidation_cursor,
-            cumulative_usage=session.metadata.cumulative_usage,
+            session_message_count=len(persisted_session.messages),
+            consolidation_cursor=persisted_session.metadata.consolidation_cursor,
+            cumulative_usage=persisted_session.metadata.cumulative_usage,
         )
+
+
+def _active_session_usage(session: Session) -> CumulativeUsage:
+    value = session.metadata.get("token_usage")
+    if not isinstance(value, dict):
+        raise ValueError("Active Session token usage is malformed")
+    fields = ("model_calls", "input_tokens", "output_tokens", "total_tokens")
+    usage = {field: value.get(field) for field in fields}
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in usage.values()):
+        raise ValueError("Active Session token usage is malformed")
+    return CumulativeUsage(
+        model_calls=cast(int, usage["model_calls"]),
+        input_tokens=cast(int, usage["input_tokens"]),
+        output_tokens=cast(int, usage["output_tokens"]),
+        total_tokens=cast(int, usage["total_tokens"]),
+    )
 
 
 class ManagementError(Exception):

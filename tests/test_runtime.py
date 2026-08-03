@@ -31,11 +31,9 @@ from myclaw.provider.models import (
 )
 from myclaw.schedule.records import ScheduledWork
 from myclaw.session.records import (
-    AssistantSessionMessage,
-    SessionError,
-    ToolSessionMessage,
     UserSessionMessage,
 )
+from myclaw.session.session import Session
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.web.web_search import WebSearchResult
 from tests.configuration.test_config import VALID_CONFIG
@@ -340,7 +338,7 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
         event async for event in unavailable_runtime.conversation.submit("Fail-open request.")
     ]
     await unavailable_runtime.close()
-    unavailable_session = await unavailable_runtime.sessions.load(unavailable_runtime.session_id)
+    unavailable_session = unavailable_runtime.session
 
     assert [event.type for event in unavailable_events] == [
         "turn_started",
@@ -355,19 +353,19 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
         code="model_failed",
         message="The model request failed.",
     )
-    assert [message.role for message in unavailable_session.messages] == [
+    assert [message["role"] for message in unavailable_session.messages] == [
         "user",
         "assistant",
         "tool",
         "assistant",
     ]
     assert [
-        message.status
+        message["status"]
         for message in unavailable_session.messages
-        if isinstance(message, (AssistantSessionMessage, ToolSessionMessage))
+        if message["role"] in {"assistant", "tool"}
     ] == ["completed", "error", "error"]
-    assert unavailable_session.metadata.title == "Fail-open request."
-    assert unavailable_session.metadata.cumulative_usage.to_dict() == {
+    assert unavailable_session.metadata["title"] == "Fail-open request."
+    assert unavailable_session.metadata["token_usage"] == {
         "model_calls": 2,
         "input_tokens": 4,
         "output_tokens": 2,
@@ -610,9 +608,7 @@ async def test_prepared_repl_defers_injected_provider_factory_until_first_nonbla
         ("delta", "the configured provider."),
         ("finish", ""),
     ]
-    assert [
-        message.role for message in (await runtime.sessions.load(runtime.session_id)).messages
-    ] == [
+    assert [message["role"] for message in runtime.session.messages] == [
         "user",
         "assistant",
     ]
@@ -856,19 +852,15 @@ async def test_runtime_status_estimate_omits_a_pure_error_assistant(
         created_at=NOW,
         content="Keep the next context stable.",
     )
-    await first.sessions.append_message(first.session_id, user)
-    await second.sessions.append_message(second.session_id, user)
-    await second.sessions.append_message(
-        second.session_id,
-        AssistantSessionMessage(
-            id=str(ASSISTANT_UUID),
-            created_at=NOW,
-            content="",
-            tool_calls=(),
-            status="error",
-            error=SessionError(code="model_failed", message="Safe final failure."),
-            usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
-        ),
+    first.session.add_message("user", user.content)
+    second.session.add_message("user", user.content)
+    second.session.add_message(
+        "assistant",
+        "",
+        tool_calls=[],
+        status="error",
+        error={"code": "model_failed", "message": "Safe final failure."},
+        token_usage={"model_calls": 1, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     )
     first_writer = RecordingWriter()
     second_writer = RecordingWriter()
@@ -913,31 +905,23 @@ async def test_runtime_status_estimate_includes_the_interrupted_history_marker(
         created_at=NOW,
         content="Keep the interrupted context stable.",
     )
-    await interrupted.sessions.append_message(interrupted.session_id, user)
-    await projected.sessions.append_message(projected.session_id, user)
-    await interrupted.sessions.append_message(
-        interrupted.session_id,
-        AssistantSessionMessage(
-            id=str(ASSISTANT_UUID),
-            created_at=NOW,
-            content="Partial first turn.",
-            tool_calls=(),
-            status="interrupted",
-            error=SessionError(code="turn_cancelled", message="Turn interrupted by user."),
-            usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
-        ),
+    interrupted.session.add_message("user", user.content)
+    projected.session.add_message("user", user.content)
+    interrupted.session.add_message(
+        "assistant",
+        "Partial first turn.",
+        tool_calls=[],
+        status="interrupted",
+        error={"code": "turn_cancelled", "message": "Turn interrupted by user."},
+        token_usage={"model_calls": 1, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     )
-    await projected.sessions.append_message(
-        projected.session_id,
-        AssistantSessionMessage(
-            id=str(ASSISTANT_TWO_UUID),
-            created_at=NOW,
-            content="Partial first turn.\n\n[Turn interrupted by user.]",
-            tool_calls=(),
-            status="completed",
-            error=None,
-            usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
-        ),
+    projected.session.add_message(
+        "assistant",
+        "Partial first turn.\n\n[Turn interrupted by user.]",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={"model_calls": 1, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     )
     interrupted_writer = RecordingWriter()
     projected_writer = RecordingWriter()
@@ -1098,9 +1082,9 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
     assert "Changed after startup" not in system_prompt
     assert "Legacy Agent Home Memory" not in system_prompt
     assert (agent_home / "memory" / "memory.md").read_bytes() == legacy_memory
-    reloaded = await runtime.sessions.load(runtime.session_id)
-    assert reloaded.metadata.id == runtime.session_id
-    assert [message.role for message in reloaded.messages] == [
+    reloaded = Session.load(runtime.session.workspace_state, runtime.session_id)
+    assert reloaded.session_id == runtime.session_id
+    assert [message["role"] for message in reloaded.messages] == [
         "user",
         "assistant",
         "user",

@@ -154,9 +154,30 @@ class StreamingConversationPort:
         finally:
             await payloads.aclose()
 
-    def _start_title_for_first_user(self, user_message: UserSessionMessage) -> None:
+    def _start_title_for_first_user(
+        self,
+        published: Session | UserSessionMessage,
+    ) -> None:
         if self._title_prompt is None or self._title_task is not None:
             return
+        if isinstance(published, Session):
+            if len(published.messages) != 1:
+                return
+            first_message = published.messages[0]
+            content = first_message.get("content")
+            if first_message.get("role") != "user" or not isinstance(content, str):
+                return
+            title_task = asyncio.create_task(
+                self._run_active_title_task(
+                    session=published,
+                    first_user_content=content,
+                    request_id=self._title_new_uuid(),
+                )
+            )
+            title_task.add_done_callback(_consume_task_exception)
+            self._title_task = title_task
+            return
+        user_message = published
         title_task = asyncio.create_task(
             self._run_title_task(
                 session_id=self._session_id,
@@ -167,6 +188,36 @@ class StreamingConversationPort:
         )
         title_task.add_done_callback(_consume_task_exception)
         self._title_task = title_task
+
+    async def _run_active_title_task(
+        self,
+        *,
+        session: Session,
+        first_user_content: str,
+        request_id: UUID,
+    ) -> None:
+        if self._title_log_ready is not None:
+            await self._title_log_ready()
+        correlation = (
+            session_log(session)
+            if self._workspace_state is not None
+            else logger.contextualize(session_id=session.session_id)
+        )
+        with correlation:
+            try:
+                await self._generate_title(
+                    session=session,
+                    first_user_content=first_user_content,
+                    request_id=request_id,
+                )
+            except asyncio.CancelledError:
+                if session.metadata.get("title") == "Untitled session":
+                    session.update_metadata(title=first_user_content)
+                raise
+            except Exception as error:
+                logger.opt(exception=error).error(
+                    "Session title task failed type={}", type(error).__name__
+                )
 
     async def _run_title_task(
         self,
@@ -234,11 +285,12 @@ class StreamingConversationPort:
     async def _generate_title(
         self,
         *,
-        session_id: str,
+        session: Session | None = None,
+        session_id: str | None = None,
         first_user_content: str,
         request_id: UUID,
     ) -> None:
-        title = normalize_session_title(first_user_content) or "Untitled session"
+        title_candidate = first_user_content
         usage_delta: ModelUsage | None = None
         request = ModelRequest(
             request_id=request_id,
@@ -267,7 +319,7 @@ class StreamingConversationPort:
                 else:
                     generated = normalize_session_title(model_event.response.message.content)
                     if generated:
-                        title = generated
+                        title_candidate = model_event.response.message.content
                         fallback_reason = None
                     else:
                         fallback_reason = "empty_title"
@@ -290,14 +342,26 @@ class StreamingConversationPort:
                 fallback_reason,
             )
         try:
-            await self._sessions.update_metadata(
-                session_id,
-                MetadataUpdate(
-                    title=title,
-                    updated_at=self._persisted_now(),
-                    usage_delta=usage_delta,
-                ),
-            )
+            if session is not None:
+                if session_id is not None:
+                    raise TypeError("Active title generation cannot receive a Session ID")
+                token_delta = (
+                    None if usage_delta is None else {"model_calls": 1, **usage_delta.to_dict()}
+                )
+                session.update_metadata(title=title_candidate, usage_delta=token_delta)
+                session.persist()
+            else:
+                if session_id is None:
+                    raise TypeError("Legacy title generation requires a Session ID")
+                title = normalize_session_title(title_candidate) or "Untitled session"
+                await self._sessions.update_metadata(
+                    session_id,
+                    MetadataUpdate(
+                        title=title,
+                        updated_at=self._persisted_now(),
+                        usage_delta=usage_delta,
+                    ),
+                )
         except (OSError, UnicodeError, ValueError) as failure:
             _log_title_persistence_failure(failure, operation="metadata_update")
 
