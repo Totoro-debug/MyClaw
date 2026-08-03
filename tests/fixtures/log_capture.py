@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from myclaw.config.agent_home import AgentHome
+from myclaw.logging.process import configure_process_logging
 
 if TYPE_CHECKING:
     from loguru import Message, Record
@@ -59,6 +60,15 @@ class LogCapture:
 
 def install_log_capture(agent_home: AgentHome) -> LogCapture:
     return LogCapture(agent_home)
+
+
+@contextmanager
+def configured_process_logging() -> Iterator[None]:
+    configure_process_logging()
+    try:
+        yield
+    finally:
+        logger.remove()
 
 
 def _render_exception(exception: object) -> str:

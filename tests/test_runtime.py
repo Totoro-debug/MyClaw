@@ -541,7 +541,7 @@ async def test_prepared_runtime_correlates_scheduled_work_with_its_session(
         configuration=ConfigLoader(home).load(),
         provider_factory=lambda _: provider,
         now=clock.now,
-        new_uuid=iter((SESSION_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=uuid4,
         retry_clock=clock,
     )
     task = ScheduledWork(
@@ -554,7 +554,7 @@ async def test_prepared_runtime_correlates_scheduled_work_with_its_session(
         session_id="20260711-153012-123000_22222222-2222-4222-8222-222222222222",
     )
 
-    outcome = await runtime.scheduled_work_runner.run(task)
+    outcome = await runtime.scheduled_work_coordinator.trigger(task)
 
     assert outcome.status == "completed"
     content = _session_log_text(workspace, task.session_id)

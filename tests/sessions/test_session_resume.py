@@ -14,6 +14,7 @@ from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ProviderConfiguration
+from myclaw.logging.session import session_log
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import ManagementViewService
 from myclaw.provider.models import (
@@ -43,7 +44,7 @@ from tests.fixtures import (
     StreamScript,
     unexpected_provider_factory,
 )
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures.log_capture import configured_process_logging, install_log_capture
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -244,9 +245,10 @@ async def test_management_listing_warns_once_for_each_skipped_session_entry(
 
 
 @pytest.mark.asyncio
-async def test_unavailable_session_listing_records_one_management_error(
+async def test_unavailable_session_listing_renders_error_without_terminal_duplicate(
     agent_home: Path,
     workspace: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
@@ -265,29 +267,19 @@ async def test_unavailable_session_listing_records_one_management_error(
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, sessions=FailingListingStore(), workspace=workspace)
     )
-    log_capture = install_log_capture(home)
-
-    try:
+    with configured_process_logging():
         result = await dispatcher.dispatch("/resume")
-    finally:
-        log_capture.close()
 
     assert result.output == "persistence_error: Conversation Sessions could not be listed."
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    marker = (
-        "session=- myclaw.management.commands: Management command failed "
-        "command=/resume code=persistence_error"
-    )
-    assert content.count("ERROR pid=") == 1
-    assert content.count(marker) == 1
-    assert "OSError: [REDACTED]" in content
-    assert "session directory unavailable" not in content
+    assert capsys.readouterr().err == ""
+    assert not (workspace / ".myclaw" / "logs").exists()
 
 
 @pytest.mark.asyncio
-async def test_resume_load_failure_records_one_error_and_keeps_safe_command_output(
+async def test_resume_load_failure_renders_safe_output_without_terminal_duplicate(
     agent_home: Path,
     workspace: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
@@ -325,37 +317,27 @@ async def test_resume_load_failure_records_one_error_and_keeps_safe_command_outp
             switch_session=lambda _session_id: None,
         )
     )
-    log_capture = install_log_capture(home)
-
-    try:
+    with configured_process_logging():
         result = await dispatcher.resume(target.id)
-    finally:
-        log_capture.close()
 
     assert (
         result.output == "persistence_error: The selected Conversation Session could not be loaded."
     )
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    marker = (
-        "session=- myclaw.management.commands: Management command failed "
-        "command=/resume code=persistence_error"
-    )
-    assert content.count("ERROR pid=") == 1
-    assert content.count(marker) == 1
-    assert "OSError: [REDACTED]" in content
-    assert "resume target disappeared" not in content
-    assert "Persisted resume content must stay private." not in content
+    assert capsys.readouterr().err == ""
+    assert not (workspace / ".myclaw" / "logs").exists()
 
 
 @pytest.mark.asyncio
-async def test_session_switch_failure_records_once_before_preserving_the_exception(
+async def test_session_switch_failure_is_terminal_only_without_a_session_log(
     agent_home: Path,
     workspace: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
     sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
+        workspace_state=state,
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
     )
@@ -376,24 +358,14 @@ async def test_session_switch_failure_records_once_before_preserving_the_excepti
             switch_session=fail_switch,
         )
     )
-    log_capture = install_log_capture(home)
-
-    try:
+    with configured_process_logging(), session_log(state, target.id):
         with pytest.raises(RuntimeError, match="session switch failed"):
             await dispatcher.resume(target.id)
-    finally:
-        log_capture.close()
 
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    marker = (
-        "session=- myclaw.management.commands: Management command failed "
-        "command=/resume type=RuntimeError"
+    assert capsys.readouterr().err == (
+        "Management command failed command=/resume type=RuntimeError\n"
     )
-    assert content.count("ERROR pid=") == 1
-    assert content.count(marker) == 1
-    assert "RuntimeError: [REDACTED]" in content
-    assert "session switch failed" not in content
-    assert "Private history." not in content
+    assert not (state.logs_directory / f"{target.id}.log").exists()
 
 
 @pytest.mark.asyncio
@@ -840,11 +812,13 @@ async def test_picker_rejects_unsupported_metadata_and_message_record_types(
 async def test_resume_command_aggregates_corrupt_session_warning(
     agent_home: Path,
     workspace: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
     sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
+        workspace_state=state,
         now=lambda: NOW,
         new_uuid=iter((OLDER_SESSION_UUID, CORRUPT_METADATA_UUID, CORRUPT_MIDDLE_UUID)).__next__,
     )
@@ -864,8 +838,8 @@ async def test_resume_command_aggregates_corrupt_session_warning(
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, sessions=sessions, workspace=workspace)
     )
-
-    result = await dispatcher.dispatch("/resume")
+    with configured_process_logging(), session_log(state, prepared[0].id):
+        result = await dispatcher.dispatch("/resume")
 
     assert result.output == (
         "Warning: Skipped 2 corrupt Conversation Sessions.\n"
@@ -874,6 +848,8 @@ async def test_resume_command_aggregates_corrupt_session_warning(
     )
     assert result.resume_sessions is not None
     assert [session.id for session in result.resume_sessions] == [prepared[0].id]
+    assert capsys.readouterr().err == ""
+    assert not (state.logs_directory / f"{prepared[0].id}.log").exists()
 
 
 @pytest.mark.asyncio

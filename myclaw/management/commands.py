@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 from loguru import logger
 
 from myclaw.config.config import ConfigView
+from myclaw.logging.session import without_session_log
 from myclaw.management.service import ManagementError, ResumeResult, RuntimeStatus
 from myclaw.memory.memory_task import MemoryTaskResult
 from myclaw.session.records import SessionSummary
@@ -46,11 +47,14 @@ class ManagementCommandDispatcher:
 
     async def dispatch(self, command: str) -> ManagementCommandResult:
         """Return rendered output for a recognized Management Command."""
+        with without_session_log():
+            return await self._dispatch(command)
+
+    async def _dispatch(self, command: str) -> ManagementCommandResult:
         if command == "/resume":
             try:
                 listing = await self._management.resumable_listing()
             except ManagementError as management_error:
-                _log_management_error("/resume", management_error)
                 return ManagementCommandResult(
                     handled=True,
                     output=f"{management_error.error.code}: {management_error.error.message}",
@@ -83,14 +87,12 @@ class ManagementCommandDispatcher:
                 status = await self._management.status()
                 output = json.dumps(status.to_dict(), ensure_ascii=False, indent=2)
             except ManagementError as management_error:
-                _log_management_error("/status", management_error)
                 output = f"{management_error.error.code}: {management_error.error.message}"
             return ManagementCommandResult(handled=True, output=output)
         if command == "/memory":
             try:
                 output = await self._management.memory_view()
             except ManagementError as management_error:
-                _log_management_error("/memory", management_error)
                 output = f"{management_error.error.code}: {management_error.error.message}"
             return ManagementCommandResult(
                 handled=True,
@@ -100,7 +102,6 @@ class ManagementCommandDispatcher:
             try:
                 result = await self._management.dream()
             except ManagementError as management_error:
-                _log_management_error("/dream", management_error)
                 output = f"{management_error.error.code}: {management_error.error.message}"
             else:
                 if result.error is None and result.status == "No pending summaries":
@@ -123,17 +124,12 @@ class ManagementCommandDispatcher:
         try:
             view = await self._management.config_view()
         except ManagementError as management_error:
-            _log_management_error("/config", management_error)
             return ManagementCommandResult(
                 handled=True,
                 output=f"{management_error.error.code}: {management_error.error.message}",
             )
         prefix = f"Path: {view.path}\n"
         if view.error is not None:
-            logger.error(
-                "Management command failed command=/config code={}",
-                view.error.code,
-            )
             prefix = f"{view.error.code}: {view.error.message}\n{prefix}"
         return ManagementCommandResult(
             handled=True,
@@ -141,24 +137,16 @@ class ManagementCommandDispatcher:
         )
 
     async def resume(self, session_id: str) -> ManagementCommandResult:
-        try:
-            result = await self._management.resume(session_id)
-        except ManagementError as management_error:
-            _log_management_error("/resume", management_error)
-            output = f"{management_error.error.code}: {management_error.error.message}"
-        except Exception as error:
-            logger.opt(exception=error).error(
-                "Management command failed command=/resume type={}", type(error).__name__
-            )
-            raise
-        else:
-            output = f"Resumed session {result.session_id}."
-        return ManagementCommandResult(handled=True, output=output)
-
-
-def _log_management_error(command: str, error: ManagementError) -> None:
-    if error.error.code != "persistence_error":
-        return
-    logger.opt(exception=error).error(
-        "Management command failed command={} code={}", command, error.error.code
-    )
+        with without_session_log():
+            try:
+                result = await self._management.resume(session_id)
+            except ManagementError as management_error:
+                output = f"{management_error.error.code}: {management_error.error.message}"
+            except Exception as error:
+                logger.opt(exception=error).error(
+                    "Management command failed command=/resume type={}", type(error).__name__
+                )
+                raise
+            else:
+                output = f"Resumed session {result.session_id}."
+            return ManagementCommandResult(handled=True, output=output)

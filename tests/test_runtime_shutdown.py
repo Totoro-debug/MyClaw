@@ -13,6 +13,7 @@ from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
+from myclaw.logging.session import session_log
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
@@ -24,6 +25,7 @@ from myclaw.provider.models import (
 )
 from myclaw.schedule.records import ScheduledWork
 from myclaw.session.conversation import ChatModelSettings
+from myclaw.session.identifiers import make_session_id
 from myclaw.session.records import ConversationSession
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.models import ModelToolCall
@@ -277,18 +279,22 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
     )
     baseline = asyncio.all_tasks()
     log_capture = install_log_capture(home)
+    state = WorkspaceState(Workspace.from_path(workspace))
+    ambient_session_id = make_session_id(NOW, uuid4())
 
     try:
-        with pytest.raises(RuntimeError, match="scheduled scheduler failed to start"):
-            await runtime.start()
+        with session_log(state, ambient_session_id):
+            with pytest.raises(RuntimeError, match="scheduled scheduler failed to start"):
+                await runtime.start()
         await asyncio.sleep(0)
     finally:
         log_capture.close()
 
     assert asyncio.all_tasks() == baseline
+    assert not (state.logs_directory / f"{ambient_session_id}.log").exists()
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert content.count("ERROR pid=") == 1
-    marker = "session=- myclaw.agent.runtime: Runtime startup failed type=RuntimeError"
+    marker = "session=None myclaw.agent.runtime: Runtime startup failed type=RuntimeError"
     assert content.count(marker) == 1
 
 
@@ -451,10 +457,13 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
     )
     await process.communicate_started.wait()
     log_capture = install_log_capture(home)
+    state = WorkspaceState(Workspace.from_path(workspace))
+    ambient_session_id = make_session_id(NOW, uuid4())
 
     try:
-        with pytest.raises(RuntimeError, match="PRIVATE_PROVIDER_CLOSE_BODY_52"):
-            await runtime.close()
+        with session_log(state, ambient_session_id):
+            with pytest.raises(RuntimeError, match="PRIVATE_PROVIDER_CLOSE_BODY_52"):
+                await runtime.close()
 
         assert shell_execution.done()
         assert process.terminated
@@ -464,9 +473,10 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
         await asyncio.gather(shell_execution, return_exceptions=True)
         log_capture.close()
 
+    assert not (state.logs_directory / f"{ambient_session_id}.log").exists()
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert content.count("ERROR pid=") == 1
-    marker = "session=- myclaw.agent.runtime: Runtime shutdown failed type=RuntimeError"
+    marker = "session=None myclaw.agent.runtime: Runtime shutdown failed type=RuntimeError"
     assert content.count(marker) == 1
     assert "RuntimeError: [REDACTED]" in content
     assert "PRIVATE_PROVIDER_CLOSE_BODY_52" not in content

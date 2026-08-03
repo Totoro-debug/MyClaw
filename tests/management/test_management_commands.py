@@ -24,7 +24,7 @@ from myclaw.session.records import (
     UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures.log_capture import configured_process_logging
 
 CONFIG_CONTENT = """[models.providers.primary]
 protocol = "anthropic"
@@ -198,18 +198,15 @@ async def test_config_command_returns_renderable_complete_redacted_text(
 @pytest.mark.asyncio
 async def test_config_command_renders_safe_parse_error_and_redacted_source(
     agent_home: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     config_path = agent_home / "config.toml"
     config_path.write_text(MALFORMED_CONFIG_CONTENT, encoding="utf-8")
     dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
-    log_capture = install_log_capture(home)
-
-    try:
+    with configured_process_logging():
         result = await dispatcher.dispatch("/config")
-    finally:
-        log_capture.close()
 
     assert result.handled is True
     assert result.output == (
@@ -219,29 +216,21 @@ async def test_config_command_renders_safe_parse_error_and_redacted_source(
     )
     assert "first-command-secret" not in result.output
     assert "second-command-secret" not in result.output
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    marker = (
-        "session=- myclaw.management.commands: Management command failed "
-        "command=/config code=config_parse_error"
-    )
-    assert content.count("ERROR pid=") == 1
-    assert content.count(marker) == 1
-    assert "first-command-secret" not in content
-    assert "second-command-secret" not in content
+    assert capsys.readouterr().err == ""
+    assert not (agent_home / "logs").exists()
 
 
 @pytest.mark.asyncio
-async def test_config_command_renders_safe_persistence_failure(agent_home: Path) -> None:
+async def test_config_command_renders_safe_persistence_failure(
+    agent_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_bytes(b'api_key = "raw-command-secret"\xff')
     dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
-    log_capture = install_log_capture(home)
-
-    try:
+    with configured_process_logging():
         result = await dispatcher.dispatch("/config")
-    finally:
-        log_capture.close()
 
     assert (result.handled, result.output) == (
         True,
@@ -249,15 +238,8 @@ async def test_config_command_renders_safe_persistence_failure(agent_home: Path)
     )
     assert result.output is not None
     assert "raw-command-secret" not in result.output
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    marker = (
-        "session=- myclaw.management.commands: Management command failed "
-        "command=/config code=persistence_error"
-    )
-    assert content.count("ERROR pid=") == 1
-    assert content.count(marker) == 1
-    assert "UnicodeDecodeError" in content
-    assert "raw-command-secret" not in content
+    assert capsys.readouterr().err == ""
+    assert not (agent_home / "logs").exists()
 
 
 @pytest.mark.asyncio
@@ -321,6 +303,7 @@ async def test_memory_command_returns_renderable_complete_disk_text(
 async def test_memory_command_renders_safe_persistence_failure(
     agent_home: Path,
     workspace: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
@@ -330,24 +313,22 @@ async def test_memory_command_renders_safe_persistence_failure(
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
     )
-    log_capture = install_log_capture(home)
-
-    try:
+    with configured_process_logging():
         result = await dispatcher.dispatch("/memory")
-    finally:
-        log_capture.close()
 
     assert (result.handled, result.output) == (
         True,
         "persistence_error: Long-term Memory could not be read.",
     )
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count(" ERROR ") == 1
-    assert "Management command failed command=/memory code=persistence_error" in content
+    assert capsys.readouterr().err == ""
+    assert not state.logs_directory.exists()
 
 
 @pytest.mark.asyncio
-async def test_status_command_logs_safe_persistence_failure(agent_home: Path) -> None:
+async def test_status_command_renders_safe_persistence_failure(
+    agent_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     class FailingStatusSessions:
         async def current_session(self, session_id: str) -> ConversationSession:
             del session_id
@@ -374,19 +355,12 @@ async def test_status_command_logs_safe_persistence_failure(agent_home: Path) ->
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, status_service=status_service)
     )
-    log_capture = install_log_capture(home)
-
-    try:
+    with configured_process_logging():
         result = await dispatcher.dispatch("/status")
-    finally:
-        log_capture.close()
 
     assert result.output == "persistence_error: Runtime status could not be read."
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count(" ERROR ") == 1
-    assert "Management command failed command=/status code=persistence_error" in content
-    assert "OSError: [REDACTED]" in content
-    assert "PRIVATE_STATUS_PERSISTENCE_BODY_52" not in content
+    assert capsys.readouterr().err == ""
+    assert not (agent_home / "logs").exists()
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from croniter import croniter  # type: ignore[import-untyped]
 from loguru import logger
 from tzlocal import get_localzone
 
+from myclaw.logging.session import without_session_log
 from myclaw.memory.memory_task import MemoryManager
 
 
@@ -60,21 +61,25 @@ class MemoryTaskScheduler:
             if startup.utcoffset() is None or startup.tzinfo is None:
                 raise ValueError("Memory Task scheduler clock must be timezone-aware")
             self._timezone = startup.tzinfo
-            self._loop_task = asyncio.create_task(self._run())
+            with without_session_log():
+                self._loop_task = asyncio.create_task(self._run())
 
     async def close(self) -> None:
-        self._closed = True
-        task = self._loop_task
-        if task is None:
-            return
-        task.cancel()
-        running = tuple(self._run_tasks)
-        for run_task in running:
-            run_task.cancel()
-        results = await asyncio.gather(task, *running, return_exceptions=True)
-        for result in results:
-            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-                logger.opt(exception=result).error("Memory Task scheduler cleanup failed")
+        with without_session_log():
+            self._closed = True
+            task = self._loop_task
+            if task is None:
+                return
+            task.cancel()
+            running = tuple(self._run_tasks)
+            for run_task in running:
+                run_task.cancel()
+            results = await asyncio.gather(task, *running, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    logger.opt(exception=result).error("Memory Task scheduler cleanup failed")
 
     async def _run(self) -> None:
         timezone = self._timezone

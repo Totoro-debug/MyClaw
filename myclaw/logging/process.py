@@ -16,7 +16,7 @@ def _basic_terminal_format(_record: object) -> str:
 
 
 def _without_session_ownership(record: Record) -> bool:
-    return "session_id" not in record["extra"]
+    return record["extra"].get("session_id") is None
 
 
 def configure_process_logging() -> None:

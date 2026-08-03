@@ -21,6 +21,7 @@ from myclaw.agent.prompts import (
 from myclaw.agent.turn import model_message_from_session
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
+from myclaw.logging.session import without_session_log
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
@@ -358,25 +359,30 @@ class ConversationSummaryManager:
         self._new_uuid = new_uuid
 
     async def recover_pending(self) -> None:
-        try:
-            recovered_count = await self._summaries.recover_pending(self._sessions)
-        except (OSError, UnicodeError, ValueError) as error:
-            logger.opt(exception=error).error(
-                "Pending Conversation Summary recovery failed code=persistence_error"
-            )
-            raise ModelCallError(
-                ErrorInfo(
-                    code="persistence_error",
-                    message="Pending Conversation Summary recovery could not complete.",
+        with without_session_log():
+            try:
+                recovered_count = await self._summaries.recover_pending(self._sessions)
+            except (OSError, UnicodeError, ValueError) as error:
+                logger.opt(exception=error).error(
+                    "Pending Conversation Summary recovery failed code=persistence_error"
                 )
-            ) from error
-        if recovered_count:
-            logger.warning(
-                "Pending Conversation Summary recovery completed count={}",
-                recovered_count,
-            )
+                raise ModelCallError(
+                    ErrorInfo(
+                        code="persistence_error",
+                        message="Pending Conversation Summary recovery could not complete.",
+                    )
+                ) from error
+            if recovered_count:
+                logger.warning(
+                    "Pending Conversation Summary recovery completed count={}",
+                    recovered_count,
+                )
 
     async def prepare(self, session: ConversationSession) -> ConversationSession:
+        with without_session_log():
+            return await self._prepare(session)
+
+    async def _prepare(self, session: ConversationSession) -> ConversationSession:
         short_term = session.short_term_messages
         available_input = self._chat_context_window - self._chat_max_output
         system_tokens = estimate_input_tokens(

@@ -10,6 +10,7 @@ from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
+from myclaw.logging.session import session_log
 from myclaw.memory.conversation_summary import (
     ConsolidatingSummaryStore,
     ConversationSummaryManager,
@@ -31,7 +32,7 @@ from myclaw.session.session_store import JsonlSessionStore
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures.log_capture import configured_process_logging
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=LOCAL_OFFSET)
@@ -123,31 +124,30 @@ def _manager(
 async def test_pending_consolidation_recovery_failure_is_recorded_at_its_boundary(
     agent_home: Path,
     workspace: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    sessions, _session_id = await _session_ready_for_consolidation(home, workspace)
-    summaries = WorkspaceJsonlSummaryStore(_state(workspace))
+    sessions, session_id = await _session_ready_for_consolidation(home, workspace)
+    state = _state(workspace)
+    summaries = WorkspaceJsonlSummaryStore(state)
     summaries.pending_directory.mkdir(parents=True)
     (summaries.pending_directory / "invalid.json").write_text(
         "PRIVATE CONSOLIDATION JOURNAL CONTENT",
         encoding="utf-8",
     )
-    lifetime = install_log_capture(home)
-
-    with pytest.raises(ModelCallError) as raised:
+    with (
+        configured_process_logging(),
+        session_log(state, session_id),
+        pytest.raises(ModelCallError) as raised,
+    ):
         await _manager(sessions=sessions, summaries=summaries).recover_pending()
-    lifetime.close()
 
     assert raised.value.error.code == "persistence_error"
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count(" ERROR ") == 1
-    assert (
-        "session=- myclaw.memory.conversation_summary: "
-        "Pending Conversation Summary recovery failed code=persistence_error"
-    ) in content
-    assert "JSONDecodeError" in content
-    assert "PRIVATE CONSOLIDATION JOURNAL CONTENT" not in content
+    assert capsys.readouterr().err == (
+        "Pending Conversation Summary recovery failed code=persistence_error\n"
+    )
+    assert not (state.logs_directory / f"{session_id}.log").exists()
 
 
 @pytest.mark.asyncio
@@ -230,9 +230,10 @@ async def test_pending_journal_recovers_exact_summary_and_cursor_once(
 
 
 @pytest.mark.asyncio
-async def test_pending_consolidation_recovery_records_one_degradation_warning(
+async def test_pending_consolidation_recovery_keeps_degradation_warning_silent(
     agent_home: Path,
     workspace: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
@@ -253,21 +254,14 @@ async def test_pending_consolidation_recovery_records_one_degradation_warning(
                 _state(workspace), replace_bytes=fail_summary_replace
             ),
         ).prepare(await sessions.load(session_id))
-    manager = _manager(sessions=sessions, summaries=WorkspaceJsonlSummaryStore(_state(workspace)))
-    lifetime = install_log_capture(home)
+    state = _state(workspace)
+    manager = _manager(sessions=sessions, summaries=WorkspaceJsonlSummaryStore(state))
+    with configured_process_logging():
+        await manager.recover_pending()
+        await manager.recover_pending()
 
-    await manager.recover_pending()
-    await manager.recover_pending()
-    lifetime.close()
-
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count(" WARNING ") == 1
-    assert " ERROR " not in content
-    assert (
-        "session=- myclaw.memory.conversation_summary: "
-        "Pending Conversation Summary recovery completed count=1"
-    ) in content
-    assert "First turn summary." not in content
+    assert capsys.readouterr().err == ""
+    assert not state.logs_directory.exists()
 
 
 @pytest.mark.asyncio

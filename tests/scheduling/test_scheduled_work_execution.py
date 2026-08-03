@@ -22,6 +22,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
+from myclaw.schedule.background_coordination import RuntimeEventBroker, ScheduledWorkCoordinator
 from myclaw.schedule.records import ScheduledWork
 from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkModelSettings,
@@ -54,7 +55,6 @@ from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, persist_scheduled_work
-from tests.fixtures.log_capture import install_log_capture
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 12, 23, 0, 0, 123456, tzinfo=LOCAL_TIMEZONE)
@@ -758,8 +758,10 @@ async def test_scheduled_work_records_one_terminal_failure_with_task_session_con
         cron="17 4 * * 2",
         prompt="PRIVATE TASK PROMPT",
     )
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
     sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
+        workspace_state=state,
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -788,28 +790,32 @@ async def test_scheduled_work_records_one_terminal_failure_with_task_session_con
             session_id=session_id,
         ),
     )
-    lifetime = install_log_capture(home)
+    events = RuntimeEventBroker()
+    coordinator = ScheduledWorkCoordinator(
+        runner=runner,
+        events=events,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        workspace_state=state,
+    )
 
-    result = await runner.run(task)
-    lifetime.close()
+    result = await coordinator.trigger(task)
+    await events.next_background_event()
 
     assert result.status == "failed"
     assert result.error == ErrorInfo(
         code="model_failed",
         message="PRIVATE MODEL OUTPUT",
     )
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = (state.logs_directory / f"{task.session_id}.log").read_text(encoding="utf-8")
     assert content.count(" ERROR ") == 1
-    assert (
-        f"session={TASK_SESSION_ID} myclaw.schedule.scheduled_work_execution: "
-        "Scheduled Work failed code=model_failed"
-    ) in content
+    assert "myclaw.schedule.scheduled_work_execution:run:" in content
+    assert "Scheduled Work failed code=model_failed" in content
     assert "Traceback (most recent call last):" in content
-    assert "ModelCallError: [REDACTED]" in content
+    assert "ModelCallError: PRIVATE MODEL OUTPUT" in content
     for private_content in (
         "PRIVATE TASK DEFINITION TITLE",
         "PRIVATE TASK PROMPT",
-        "PRIVATE MODEL OUTPUT",
         "PRIVATE LONG-TERM MEMORY",
         "PRIVATE MODEL ID",
         task.id,
@@ -825,8 +831,10 @@ async def test_scheduled_work_records_an_unhandled_terminal_exception_once(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
     sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
+        workspace_state=state,
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
     )
@@ -851,20 +859,22 @@ async def test_scheduled_work_records_an_unhandled_terminal_exception_once(
             session_id=session_id,
         ),
     )
-    lifetime = install_log_capture(home)
+    coordinator = ScheduledWorkCoordinator(
+        runner=runner,
+        events=RuntimeEventBroker(),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        workspace_state=state,
+    )
 
     with pytest.raises(RuntimeError, match="technical cron execution failure"):
-        await runner.run(_task())
-    lifetime.close()
+        await coordinator.trigger(_task())
 
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = (state.logs_directory / f"{TASK_SESSION_ID}.log").read_text(encoding="utf-8")
     assert content.count(" ERROR ") == 1
-    assert (
-        f"session={TASK_SESSION_ID} myclaw.schedule.scheduled_work_execution: "
-        "Scheduled Work crashed"
-    ) in content
-    assert "RuntimeError: [REDACTED]" in content
-    assert "technical cron execution failure" not in content
+    assert "myclaw.schedule.scheduled_work_execution:run:" in content
+    assert "Scheduled Work crashed" in content
+    assert "RuntimeError: technical cron execution failure" in content
     assert _task().prompt not in content
 
 
@@ -884,8 +894,10 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
             raise OSError("private disk failure detail")
         HOST_FILESYSTEM.atomic_replace_bytes(path, content)
 
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
     sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
+        workspace_state=state,
         now=lambda: NOW,
         new_uuid=lambda: USER_UUID,
         replace_bytes=fail_first_publication,
@@ -941,11 +953,19 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
         prompt="Run independently.",
         session_id="20260712-220000-123000_22222222-2222-4222-8222-222222222222",
     )
-    lifetime = install_log_capture(home)
+    events = RuntimeEventBroker()
+    coordinator = ScheduledWorkCoordinator(
+        runner=runner,
+        events=events,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        workspace_state=state,
+    )
 
-    failed = await runner.run(failed_task)
-    completed = await runner.run(completed_task)
-    lifetime.close()
+    failed = await coordinator.trigger(failed_task)
+    completed = await coordinator.trigger(completed_task)
+    await events.next_background_event()
+    await events.next_background_event()
 
     assert failed.status == "failed"
     assert failed.error is not None
@@ -957,13 +977,13 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
     assert first_session.messages[-1].content == "First result was fully generated."
     second_session = await sessions.load(completed_task.session_id)
     assert second_session.messages[-1].content == "Second task remained isolated."
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = (state.logs_directory / f"{failed_task.session_id}.log").read_text(
+        encoding="utf-8"
+    )
     assert content.count(" ERROR ") == 1
-    assert (
-        f"session={failed_task.session_id} myclaw.schedule.scheduled_work_execution: "
-        "Scheduled Work failed code=persistence_error"
-    ) in content
-    assert "private disk failure detail" not in content
+    assert "myclaw.schedule.scheduled_work_execution:run:" in content
+    assert "Scheduled Work failed code=persistence_error" in content
+    assert "OSError: private disk failure detail" in content
     assert failed_task.prompt not in content
     assert "First result was fully generated." not in content
 
@@ -1933,7 +1953,7 @@ async def test_runtime_scheduled_work_uses_current_workspace_context_and_tool_ca
     )
     task = _task()
 
-    result = await runtime.scheduled_work_runner.run(task)
+    result = await runtime.scheduled_work_coordinator.trigger(task)
 
     assert result.status == "completed"
     assert runtime.session_id != task.session_id
@@ -2095,17 +2115,7 @@ async def test_runtime_scheduled_work_refuses_recursive_task_creation(
         configuration=ConfigLoader(home).load(),
         provider_factory=lambda _: provider,
         now=lambda: NOW,
-        new_uuid=iter(
-            (
-                USER_UUID,
-                USER_TWO_UUID,
-                REQUEST_UUID,
-                ASSISTANT_UUID,
-                REQUEST_TWO_UUID,
-                ASSISTANT_TWO_UUID,
-                FINAL_RUNTIME_UUID,
-            )
-        ).__next__,
+        new_uuid=uuid4,
         shell=FailingShellBoundary(),
     )
     task = _task()
@@ -2114,7 +2124,7 @@ async def test_runtime_scheduled_work_refuses_recursive_task_creation(
     scheduled_work_path = state.scheduled_work_path
     persisted_before = scheduled_work_path.read_bytes()
 
-    result = await runtime.scheduled_work_runner.run(task)
+    result = await runtime.scheduled_work_coordinator.trigger(task)
 
     assert result.status == "completed"
     assert scheduled_work_path.read_bytes() == persisted_before
@@ -2158,10 +2168,10 @@ async def test_runtime_scheduled_work_uses_enabled_web_and_disabled_shell_catalo
         configuration=ConfigLoader(home).load(),
         provider_factory=lambda _: provider,
         now=lambda: NOW,
-        new_uuid=iter((USER_UUID, USER_TWO_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=uuid4,
     )
 
-    result = await runtime.scheduled_work_runner.run(_task())
+    result = await runtime.scheduled_work_coordinator.trigger(_task())
 
     assert result.status == "completed"
     request = provider.complete_requests[0]
@@ -2218,7 +2228,7 @@ async def test_runtime_scheduled_work_calls_registered_workspace_inspection_tool
         new_uuid=uuid4,
     )
 
-    result = await runtime.scheduled_work_runner.run(_task())
+    result = await runtime.scheduled_work_coordinator.trigger(_task())
 
     assert result.status == "completed"
     follow_up = provider.complete_requests[1]

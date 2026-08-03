@@ -14,6 +14,7 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
+from myclaw.logging.session import session_log
 from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
 from myclaw.memory.memory_scheduler import AsyncioMemorySchedulerClock, MemoryTaskScheduler
 from myclaw.memory.memory_task import (
@@ -23,20 +24,23 @@ from myclaw.memory.memory_task import (
     WorkspaceFileMemoryStore,
 )
 from myclaw.provider.errors import ModelCallError
+from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelProvider,
     ModelRequest,
     ModelResponse,
     ModelUsage,
 )
 from myclaw.tools.models import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider, StreamScript
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures.log_capture import configured_process_logging, install_log_capture
 
 LOCAL = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 10, tzinfo=LOCAL)
+SESSION_ID = "20260711-161000-000000_550e8400-e29b-41d4-a716-446655440000"
 
 
 def _state(home: AgentHome) -> WorkspaceState:
@@ -126,7 +130,7 @@ def _response(
 def _manager(
     *,
     home: AgentHome,
-    provider: ScriptedFakeProvider,
+    provider: ModelProvider,
     summaries: WorkspaceJsonlSummaryStore,
 ) -> MemoryManager:
     return MemoryManager(
@@ -165,46 +169,53 @@ async def test_periodic_memory_task_runs_when_the_manager_is_idle(agent_home: Pa
 
 
 @pytest.mark.asyncio
-async def test_periodic_memory_task_records_one_terminal_failure_without_a_session(
+async def test_periodic_memory_task_does_not_borrow_a_foreground_session_log(
     agent_home: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = WorkspaceJsonlSummaryStore(_state(home))
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("PRIVATE PERIODIC SUMMARY", NOW)
     provider = ScriptedFakeProvider(
         completions=(
             ModelCallError(ErrorInfo(code="model_failed", message="PRIVATE PERIODIC OUTPUT")),
         )
     )
-    lifetime = install_log_capture(home)
-
-    result = await _manager(
-        home=home,
-        provider=provider,
-        summaries=summaries,
-    ).run_periodic()
-    lifetime.close()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    router = ModelRouter(
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        clock=FakeClock(NOW),
+    )
+    with configured_process_logging(), session_log(state, SESSION_ID):
+        result = await _manager(
+            home=home,
+            provider=router,
+            summaries=summaries,
+        ).run_periodic()
 
     assert result is not None
     assert result.error == ErrorInfo(
         code="model_failed",
         message="PRIVATE PERIODIC OUTPUT",
     )
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count(" ERROR ") == 1
-    assert "session=- myclaw.memory.memory_task: Memory Task failed code=model_failed" in content
-    assert "PRIVATE PERIODIC SUMMARY" not in content
-    assert "PRIVATE PERIODIC OUTPUT" not in content
+    assert result.cursor == 0
+    assert capsys.readouterr().err == "Memory Task failed code=model_failed\n"
+    assert not (state.logs_directory / f"{SESSION_ID}.log").exists()
+    await router.close()
 
 
 @pytest.mark.asyncio
-async def test_memory_scheduler_records_the_unhandled_exception_it_isolates(
+async def test_memory_scheduler_trigger_does_not_borrow_a_foreground_session_log(
     agent_home: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = WorkspaceJsonlSummaryStore(_state(home))
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("PRIVATE SCHEDULER SUMMARY", NOW)
     attempted = asyncio.Event()
 
@@ -227,25 +238,16 @@ async def test_memory_scheduler_records_the_unhandled_exception_it_isolates(
         schedule="0 * * * *",
         clock=clock,
     )
-    lifetime = install_log_capture(home)
+    with configured_process_logging(), session_log(state, SESSION_ID):
+        scheduler.start()
+        await _wait_until(lambda: clock.sleeps == [50 * 60])
+        clock.advance(50 * 60)
+        await attempted.wait()
+        await asyncio.sleep(0)
+        await scheduler.close()
 
-    scheduler.start()
-    await _wait_until(lambda: clock.sleeps == [50 * 60])
-    clock.advance(50 * 60)
-    await attempted.wait()
-    await asyncio.sleep(0)
-    await scheduler.close()
-    lifetime.close()
-
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count(" ERROR ") == 1
-    assert "session=- myclaw.memory.memory_scheduler: Memory Task trigger crashed" in content
-    assert "OSError: [REDACTED]" in content
-    assert "RuntimeError: [REDACTED]" in content
-    assert "technical storage cause" not in content
-    assert "technical trigger failure" not in content
-    assert "direct cause" in content
-    assert "PRIVATE SCHEDULER SUMMARY" not in content
+    assert capsys.readouterr().err == "Memory Task trigger crashed\n"
+    assert not (state.logs_directory / f"{SESSION_ID}.log").exists()
 
 
 @pytest.mark.asyncio
@@ -741,12 +743,14 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
 
 
 @pytest.mark.asyncio
-async def test_memory_scheduler_records_a_distinct_shutdown_cleanup_failure(
+async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
     agent_home: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = WorkspaceJsonlSummaryStore(_state(home))
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("PRIVATE CLEANUP SUMMARY", NOW)
     started = asyncio.Event()
 
@@ -770,21 +774,12 @@ async def test_memory_scheduler_records_a_distinct_shutdown_cleanup_failure(
         schedule="0 * * * *",
         clock=clock,
     )
-    lifetime = install_log_capture(home)
+    with configured_process_logging():
+        scheduler.start()
+        await _wait_until(lambda: clock.sleeps == [50 * 60])
+        clock.advance(50 * 60)
+        await started.wait()
+        await scheduler.close()
 
-    scheduler.start()
-    await _wait_until(lambda: clock.sleeps == [50 * 60])
-    clock.advance(50 * 60)
-    await started.wait()
-    await scheduler.close()
-    lifetime.close()
-
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count(" ERROR ") == 1
-    assert (
-        "session=- myclaw.memory.memory_scheduler: Memory Task scheduler cleanup failed"
-    ) in content
-    assert "CancelledError" in content
-    assert "RuntimeError: [REDACTED]" in content
-    assert "technical Memory Task cleanup failure" not in content
-    assert "PRIVATE CLEANUP SUMMARY" not in content
+    assert capsys.readouterr().err == "Memory Task scheduler cleanup failed\n"
+    assert not state.logs_directory.exists()

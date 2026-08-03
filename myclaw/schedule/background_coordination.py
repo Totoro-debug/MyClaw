@@ -14,7 +14,7 @@ from tzlocal import get_localzone
 from myclaw.agent.events import AgentEvent, BackgroundCompletedPayload
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
-from myclaw.logging.session import session_log
+from myclaw.logging.session import session_log, without_session_log
 from myclaw.schedule.records import ScheduledWork
 from myclaw.schedule.scheduled_work import ScheduledWorkPersistenceError, ScheduledWorkStore
 from myclaw.schedule.scheduled_work_execution import ScheduledWorkRunner
@@ -146,45 +146,49 @@ class ScheduledWorkCoordinator:
             )
         self._active_task_ids.add(task.id)
         run_id = self._new_uuid()
+        correlation = (
+            session_log(self._workspace_state, task.session_id)
+            if self._workspace_state is not None
+            else logger.contextualize(session_id=task.session_id)
+        )
         try:
-            result = await self._runner.run(task)
-            if result.status == "completed":
-                summary = result.content or "Scheduled Work completed."
-            else:
-                summary = (
-                    result.error.message if result.error is not None else "Scheduled Work failed."
-                )
-            try:
-                await self._events.publish_background(
-                    turn_id=run_id,
-                    created_at=self._now(),
-                    payload=BackgroundCompletedPayload(
-                        kind="scheduled_work",
-                        title=task.title,
-                        session_id=task.session_id,
-                        status=result.status,
-                        summary=summary[:240],
-                    ),
-                )
-            except asyncio.CancelledError:
-                raise
-            except BaseException as error:
-                current = asyncio.current_task()
-                if current is not None and current.cancelling():
+            with correlation:
+                result = await self._runner.run(task)
+                if result.status == "completed":
+                    summary = result.content or "Scheduled Work completed."
+                else:
+                    summary = (
+                        result.error.message
+                        if result.error is not None
+                        else "Scheduled Work failed."
+                    )
+                try:
+                    await self._events.publish_background(
+                        turn_id=run_id,
+                        created_at=self._now(),
+                        payload=BackgroundCompletedPayload(
+                            kind="scheduled_work",
+                            title=task.title,
+                            session_id=task.session_id,
+                            status=result.status,
+                            summary=summary[:240],
+                        ),
+                    )
+                except asyncio.CancelledError:
                     raise
-                correlation = (
-                    session_log(self._workspace_state, task.session_id)
-                    if self._workspace_state is not None
-                    else logger.contextualize(session_id=task.session_id)
+                except BaseException as error:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                    logger.opt(exception=error).error(
+                        "Scheduled Work event publication failed"
+                    )
+                    raise
+                return ScheduledWorkTriggerResult(
+                    status=result.status,
+                    content=result.content,
+                    error=result.error,
                 )
-                with correlation:
-                    logger.opt(exception=error).error("Scheduled Work event publication failed")
-                raise
-            return ScheduledWorkTriggerResult(
-                status=result.status,
-                content=result.content,
-                error=result.error,
-            )
         finally:
             self._active_task_ids.discard(task.id)
 
@@ -220,16 +224,14 @@ class ScheduledWorkScheduler:
         store: ScheduledWorkStore,
         coordinator: ScheduledWorkCoordinator,
         clock: ScheduledWorkSchedulerClock,
-        workspace_state: WorkspaceState | None = None,
     ) -> None:
         self._store = store
         self._coordinator = coordinator
         self._clock = clock
         self._loop_task: asyncio.Task[None] | None = None
-        self._run_tasks: dict[asyncio.Task[ScheduledWorkTriggerResult], str] = {}
+        self._run_tasks: set[asyncio.Task[ScheduledWorkTriggerResult]] = set()
         self._timezone: tzinfo | None = None
         self._closed = False
-        self._workspace_state = workspace_state
 
     def start(self) -> None:
         if self._closed:
@@ -245,61 +247,61 @@ class ScheduledWorkScheduler:
     async def close(self) -> None:
         self._closed = True
         loop_task = self._loop_task
-        running = tuple(self._run_tasks.items())
+        running = tuple(self._run_tasks)
         if loop_task is not None:
             loop_task.cancel()
-        for run_task, _session_id in running:
+        for run_task in running:
             run_task.cancel()
-        loop_owned = () if loop_task is None else ((loop_task, "-"),)
+        loop_owned = () if loop_task is None else (loop_task,)
         owned = (*loop_owned, *running)
         results = await asyncio.gather(
-            *(task for task, _session_id in owned),
+            *owned,
             return_exceptions=True,
         )
-        for (_task, session_id), result in zip(owned, results, strict=True):
+        for result in results:
             if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-                correlation = (
-                    session_log(self._workspace_state, session_id)
-                    if self._workspace_state is not None and session_id != "-"
-                    else logger.contextualize(session_id=session_id)
-                )
-                with correlation:
+                with without_session_log():
                     logger.opt(exception=result).error("Scheduled Work scheduler cleanup failed")
 
     async def _run(self, previous: datetime) -> None:
-        timezone = self._timezone
-        if timezone is None:
-            raise RuntimeError("Scheduled Work scheduler was not started")
-        while True:
-            try:
-                records = tuple(record for record in self._store.load() if record.enabled)
-            except ScheduledWorkPersistenceError as error:
-                logger.opt(exception=error).error("Scheduled Work definitions could not be loaded")
-                await self._clock.sleep(60.0)
-                previous = self._clock.now().astimezone(timezone)
-                continue
-            waits = (
-                croniter(record.cron, previous).get_next(datetime).timestamp()
-                - previous.timestamp()
-                for record in records
-            )
-            await self._clock.sleep(max(0.0, min(60.0, min(waits, default=60.0))))
-            current = self._clock.now().astimezone(timezone)
-            try:
-                records = tuple(record for record in self._store.load() if record.enabled)
-            except ScheduledWorkPersistenceError as error:
-                logger.opt(exception=error).error("Scheduled Work definitions could not be loaded")
+        with without_session_log():
+            timezone = self._timezone
+            if timezone is None:
+                raise RuntimeError("Scheduled Work scheduler was not started")
+            while True:
+                try:
+                    records = tuple(record for record in self._store.load() if record.enabled)
+                except ScheduledWorkPersistenceError as error:
+                    logger.opt(exception=error).error(
+                        "Scheduled Work definitions could not be loaded"
+                    )
+                    await self._clock.sleep(60.0)
+                    previous = self._clock.now().astimezone(timezone)
+                    continue
+                waits = (
+                    croniter(record.cron, previous).get_next(datetime).timestamp()
+                    - previous.timestamp()
+                    for record in records
+                )
+                await self._clock.sleep(max(0.0, min(60.0, min(waits, default=60.0))))
+                current = self._clock.now().astimezone(timezone)
+                try:
+                    records = tuple(record for record in self._store.load() if record.enabled)
+                except ScheduledWorkPersistenceError as error:
+                    logger.opt(exception=error).error(
+                        "Scheduled Work definitions could not be loaded"
+                    )
+                    previous = current
+                    continue
+                for record in records:
+                    next_run = croniter(record.cron, previous).get_next(datetime)
+                    if next_run.timestamp() <= current.timestamp():
+                        run_task = asyncio.create_task(self._coordinator.trigger(record))
+                        self._run_tasks.add(run_task)
+                        run_task.add_done_callback(self._run_finished)
                 previous = current
-                continue
-            for record in records:
-                next_run = croniter(record.cron, previous).get_next(datetime)
-                if next_run.timestamp() <= current.timestamp():
-                    run_task = asyncio.create_task(self._coordinator.trigger(record))
-                    self._run_tasks[run_task] = record.session_id
-                    run_task.add_done_callback(self._run_finished)
-            previous = current
 
     def _run_finished(self, task: asyncio.Task[ScheduledWorkTriggerResult]) -> None:
-        self._run_tasks.pop(task, None)
+        self._run_tasks.discard(task)
         if not task.cancelled():
             task.exception()

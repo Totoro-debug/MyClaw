@@ -12,6 +12,7 @@ from loguru import logger
 from myclaw.agent.prompts import memory_task_input, memory_task_prompt
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
+from myclaw.logging.session import without_session_log
 from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -270,39 +271,41 @@ class MemoryManager:
         self._running_cursor = 0
 
     async def run_manual(self) -> MemoryTaskResult:
-        if self._running:
-            return MemoryTaskResult(
-                status="Memory Task is already running.",
-                processed_count=0,
-                memory_updated=False,
-                cursor=self._running_cursor,
-                error=ErrorInfo(
-                    code="memory_task_running",
-                    message="A Memory Task is already running.",
-                ),
-            )
-        self._running = True
-        self._running_cursor = 0
-        self._failure_diagnostic = None
-        try:
-            result = await self._run_once()
-            self._log_failure(result)
-            return result
-        finally:
-            self._running = False
+        with without_session_log():
+            if self._running:
+                return MemoryTaskResult(
+                    status="Memory Task is already running.",
+                    processed_count=0,
+                    memory_updated=False,
+                    cursor=self._running_cursor,
+                    error=ErrorInfo(
+                        code="memory_task_running",
+                        message="A Memory Task is already running.",
+                    ),
+                )
+            self._running = True
+            self._running_cursor = 0
+            self._failure_diagnostic = None
+            try:
+                result = await self._run_once()
+                self._log_failure(result)
+                return result
+            finally:
+                self._running = False
 
     async def run_periodic(self) -> MemoryTaskResult | None:
-        if self._running:
-            return None
-        self._running = True
-        self._running_cursor = 0
-        self._failure_diagnostic = None
-        try:
-            result = await self._run_once()
-            self._log_failure(result)
-            return result
-        finally:
-            self._running = False
+        with without_session_log():
+            if self._running:
+                return None
+            self._running = True
+            self._running_cursor = 0
+            self._failure_diagnostic = None
+            try:
+                result = await self._run_once()
+                self._log_failure(result)
+                return result
+            finally:
+                self._running = False
 
     async def _run_once(self) -> MemoryTaskResult:
         try:
@@ -407,11 +410,12 @@ class MemoryManager:
     def _log_failure(self, result: MemoryTaskResult) -> None:
         if result.error is None:
             return
-        message = f"Memory Task failed code={result.error.code}"
         if self._failure_diagnostic is None:
-            logger.error(message)
+            logger.error("Memory Task failed code={}", result.error.code)
             return
-        logger.opt(exception=self._failure_diagnostic).error(message)
+        logger.opt(exception=self._failure_diagnostic).error(
+            "Memory Task failed code={}", result.error.code
+        )
 
 
 def _state_read_failure(*, cursor: int) -> MemoryTaskResult:

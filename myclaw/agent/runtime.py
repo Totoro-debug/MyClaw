@@ -25,7 +25,7 @@ from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
-from myclaw.logging.session import session_log
+from myclaw.logging.session import session_log, without_session_log
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import (
     ManagementViewService,
@@ -153,7 +153,7 @@ class PreparedReplRuntime:
     conversation: SwitchableConversationPort
     sessions: JsonlSessionStore
     management_dispatcher: ManagementDispatcher
-    scheduled_work_runner: ScheduledWorkRunner
+    scheduled_work_coordinator: ScheduledWorkCoordinator
     _shell: SubprocessShellBoundary | None
     _memory_scheduler: _RuntimeSchedulerOwner
     _scheduled_work_scheduler: _RuntimeSchedulerOwner
@@ -177,14 +177,15 @@ class PreparedReplRuntime:
             raise
 
     def _start_schedulers(self) -> None:
-        try:
-            self._memory_scheduler.start()
-            self._scheduled_work_scheduler.start()
-        except BaseException as error:
-            logger.opt(exception=error).error(
-                "Runtime startup failed type={}", type(error).__name__
-            )
-            raise
+        with without_session_log():
+            try:
+                self._memory_scheduler.start()
+                self._scheduled_work_scheduler.start()
+            except BaseException as error:
+                logger.opt(exception=error).error(
+                    "Runtime startup failed type={}", type(error).__name__
+                )
+                raise
 
     async def run(
         self,
@@ -246,40 +247,41 @@ class PreparedReplRuntime:
         await _await_shared_shutdown(task)
 
     async def _close_owned_resources(self, run_done: asyncio.Event | None) -> None:
-        failures: list[BaseException] = []
-        try:
-            self._background_events.close()
-        except BaseException as error:
-            failures.append(error)
+        with without_session_log():
+            failures: list[BaseException] = []
+            try:
+                self._background_events.close()
+            except BaseException as error:
+                failures.append(error)
 
-        shutdowns: list[Awaitable[object]] = [
-            self._scheduled_work_scheduler.close(),
-            self._memory_scheduler.close(),
-            self.conversation.close(),
-        ]
-        if self._shell is not None:
-            shutdowns.append(self._shell.close())
-        if run_done is not None:
-            shutdowns.append(run_done.wait())
-        results = await asyncio.gather(*shutdowns, return_exceptions=True)
-        failures.extend(result for result in results if isinstance(result, BaseException))
+            shutdowns: list[Awaitable[object]] = [
+                self._scheduled_work_scheduler.close(),
+                self._memory_scheduler.close(),
+                self.conversation.close(),
+            ]
+            if self._shell is not None:
+                shutdowns.append(self._shell.close())
+            if run_done is not None:
+                shutdowns.append(run_done.wait())
+            results = await asyncio.gather(*shutdowns, return_exceptions=True)
+            failures.extend(result for result in results if isinstance(result, BaseException))
 
-        try:
-            await self._router.close()
-        except BaseException as error:
-            failures.append(error)
+            try:
+                await self._router.close()
+            except BaseException as error:
+                failures.append(error)
 
-        if not failures:
-            return
-        failure = (
-            failures[0]
-            if len(failures) == 1
-            else BaseExceptionGroup("Runtime shutdown failed", failures)
-        )
-        logger.opt(exception=failure).error(
-            "Runtime shutdown failed type={}", type(failure).__name__
-        )
-        raise failure
+            if not failures:
+                return
+            failure = (
+                failures[0]
+                if len(failures) == 1
+                else BaseExceptionGroup("Runtime shutdown failed", failures)
+            )
+            logger.opt(exception=failure).error(
+                "Runtime shutdown failed type={}", type(failure).__name__
+            )
+            raise failure
 
 
 class _DeferredConversationPort:
@@ -624,7 +626,6 @@ def _prepare_repl_runtime(
         new_uuid=new_uuid,
         tool_gateway_for=scheduled_work_gateway_for,
         externalize_result_for=externalize_result_for,
-        workspace_state=workspace_state,
     )
     background_events = RuntimeEventBroker()
     scheduled_work_coordinator = ScheduledWorkCoordinator(
@@ -644,7 +645,6 @@ def _prepare_repl_runtime(
             store=scheduled_work_store,
             coordinator=scheduled_work_coordinator,
             clock=scheduled_scheduler_clock,
-            workspace_state=workspace_state,
         )
     )
     foreground_chat_status: ResolvedChatStatus | None = None
@@ -720,7 +720,7 @@ def _prepare_repl_runtime(
         conversation=conversation,
         sessions=sessions,
         management_dispatcher=management_dispatcher,
-        scheduled_work_runner=scheduled_work_runner,
+        scheduled_work_coordinator=scheduled_work_coordinator,
         _shell=owned_shell,
         _memory_scheduler=memory_scheduler,
         _scheduled_work_scheduler=scheduled_work_scheduler,

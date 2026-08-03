@@ -9,7 +9,7 @@ from loguru import logger
 
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.logging.session import session_log
+from myclaw.logging.session import session_log, without_session_log
 from myclaw.session.identifiers import make_session_id
 
 
@@ -59,6 +59,20 @@ def test_session_log_contexts_do_not_cross_write(tmp_path: Path) -> None:
     assert "first" in (state.logs_directory / f"{first}.log").read_text(encoding="utf-8")
     assert "second" not in (state.logs_directory / f"{first}.log").read_text(encoding="utf-8")
     assert "second" in (state.logs_directory / f"{second}.log").read_text(encoding="utf-8")
+
+
+def test_without_session_log_temporarily_clears_session_ownership(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    session_id = _session_id()
+
+    with session_log(state, session_id):
+        with without_session_log():
+            logger.error("unowned failure")
+        logger.error("owned failure")
+
+    content = (state.logs_directory / f"{session_id}.log").read_text(encoding="utf-8")
+    assert "unowned failure" not in content
+    assert "owned failure" in content
 
 
 def test_session_log_does_not_create_a_file_without_a_warning(tmp_path: Path) -> None:

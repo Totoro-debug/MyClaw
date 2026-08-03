@@ -12,6 +12,7 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
+from myclaw.logging.session import session_log
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import ManagementViewService
 from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
@@ -24,6 +25,7 @@ from myclaw.memory.memory_task import (
     WorkspaceFileMemoryStore,
 )
 from myclaw.provider.errors import ModelCallError
+from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelRequest,
@@ -34,10 +36,11 @@ from myclaw.provider.models import (
 from myclaw.tools.models import ModelToolCall
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures import FakeClock, ScriptedFakeProvider
+from tests.fixtures.log_capture import configured_process_logging, install_log_capture
 
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+SESSION_ID = "20260711-160000-000000_550e8400-e29b-41d4-a716-446655440000"
 
 
 def _state(home: AgentHome) -> WorkspaceState:
@@ -225,23 +228,31 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
 
 
 @pytest.mark.asyncio
-async def test_manual_memory_task_records_one_terminal_failure_without_a_session(
+async def test_manual_memory_task_does_not_borrow_a_foreground_session_log(
     agent_home: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    summaries = WorkspaceJsonlSummaryStore(_state(home))
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("PRIVATE SUMMARY CONTENT", NOW)
     provider = ScriptedFakeProvider(
         completions=(
             ModelCallError(ErrorInfo(code="model_failed", message="PRIVATE PROVIDER OUTPUT")),
         )
     )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    router = ModelRouter(
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        clock=FakeClock(NOW),
+    )
     manager = MemoryManager(
-        provider=provider,
+        provider=router,
         summaries=summaries,
-        memory=WorkspaceFileMemoryStore(_state(home)),
-        long_term_path=_state(home).long_term_memory_path,
+        memory=WorkspaceFileMemoryStore(state),
+        long_term_path=state.long_term_memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",
             max_output=512,
@@ -251,20 +262,17 @@ async def test_manual_memory_task_records_one_terminal_failure_without_a_session
         ),
         batch_size=10,
     )
-    lifetime = install_log_capture(home)
-
-    result = await manager.run_manual()
-    lifetime.close()
+    with configured_process_logging(), session_log(state, SESSION_ID):
+        result = await manager.run_manual()
 
     assert result.error == ErrorInfo(
         code="model_failed",
         message="PRIVATE PROVIDER OUTPUT",
     )
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count(" ERROR ") == 1
-    assert "session=- myclaw.memory.memory_task: Memory Task failed code=model_failed" in content
-    assert "PRIVATE SUMMARY CONTENT" not in content
-    assert "PRIVATE PROVIDER OUTPUT" not in content
+    assert result.cursor == 0
+    assert capsys.readouterr().err == "Memory Task failed code=model_failed\n"
+    assert not (state.logs_directory / f"{SESSION_ID}.log").exists()
+    await router.close()
 
 
 @pytest.mark.asyncio

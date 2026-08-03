@@ -11,12 +11,14 @@ from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
+from myclaw.logging.session import session_log
 from myclaw.memory.conversation_summary import (
     ConversationSummaryManager,
     SummaryModelSettings,
     WorkspaceJsonlSummaryStore,
 )
 from myclaw.provider.errors import ModelCallError
+from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
@@ -32,7 +34,8 @@ from myclaw.session.records import (
 )
 from myclaw.session.session_store import JsonlSessionStore
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider
+from tests.fixtures import FakeClock, ScriptedFakeProvider
+from tests.fixtures.log_capture import configured_process_logging
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=LOCAL_OFFSET)
@@ -90,6 +93,7 @@ async def _append_assistant(
 async def test_message_threshold_synchronously_summarizes_early_turns(
     agent_home: Path,
     workspace: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
@@ -108,10 +112,17 @@ async def test_message_threshold_synchronously_summarizes_early_turns(
     provider = ScriptedFakeProvider(
         completions=(_response("First turn summary.", usage=summary_usage),)
     )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    router = ModelRouter(
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        clock=FakeClock(NOW),
+    )
+    state = _state(workspace)
     manager = ConversationSummaryManager(
-        provider=provider,
+        provider=router,
         sessions=sessions,
-        summaries=WorkspaceJsonlSummaryStore(_state(workspace)),
+        summaries=WorkspaceJsonlSummaryStore(state),
         settings=SummaryModelSettings(
             model="memory-model",
             max_output=512,
@@ -127,8 +138,8 @@ async def test_message_threshold_synchronously_summarizes_early_turns(
         now=lambda: NOW,
         new_uuid=uuid4,
     )
-
-    prepared = await manager.prepare(await sessions.load(metadata.id))
+    with configured_process_logging(), session_log(state, metadata.id):
+        prepared = await manager.prepare(await sessions.load(metadata.id))
 
     assert [message.content for message in prepared.short_term_messages] == [
         "Second question.",
@@ -153,6 +164,8 @@ async def test_message_threshold_synchronously_summarizes_early_turns(
     assert "First question." in summary_input
     assert "First answer." in summary_input
     assert "Second question." not in summary_input
+    assert capsys.readouterr().err == ""
+    assert not (state.logs_directory / f"{metadata.id}.log").exists()
     records = [
         json.loads(line)
         for line in (_state(workspace).memory_directory / "summary.jsonl")
@@ -166,6 +179,7 @@ async def test_message_threshold_synchronously_summarizes_early_turns(
             "content": "First turn summary.",
         }
     ]
+    await router.close()
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 import pytest
+from loguru import logger
 
 from myclaw.agent.events import (
     AgentEvent,
@@ -23,6 +24,8 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
+from myclaw.logging.process import configure_process_logging
+from myclaw.logging.session import session_log
 from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
 from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.provider.errors import ModelCallError
@@ -50,13 +53,14 @@ from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkRunner,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.records import AssistantSessionMessage
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import run_repl
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript, persist_scheduled_work
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures.log_capture import configured_process_logging, install_log_capture
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 13, 0, 30, 0, 123456, tzinfo=LOCAL_TIMEZONE)
@@ -120,6 +124,7 @@ class CancellableThenSuccessfulCompletionProvider(ScriptedFakeProvider):
             except asyncio.CancelledError:
                 self.first_cancelled.set()
                 raise
+        logger.warning("Scheduled retry completed after cancellation")
         return ModelResponse(
             message=AssistantModelMessage(content="Retry completed."),
             usage=_usage(),
@@ -149,6 +154,17 @@ class ConcurrentCompletionProvider(ScriptedFakeProvider):
             usage=_usage(),
             finish_reason="stop",
         )
+
+
+class ConcurrentDiagnosticProvider(ConcurrentCompletionProvider):
+    async def complete(self, request: object) -> ModelResponse:
+        assert isinstance(request, ModelRequest)
+        current = request.messages[-1].content
+        key = "first" if "Run first task." in current else "second"
+        logger.warning("Scheduled concurrent marker={} phase=started", key)
+        response = await super().complete(request)
+        logger.warning("Scheduled concurrent marker={} phase=finished", key)
+        return response
 
 
 class RuntimeCoordinationProvider(ScriptedFakeProvider):
@@ -557,12 +573,69 @@ async def test_scheduler_retries_after_a_store_load_failure(
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert content.count(" ERROR ") == 1
     assert (
-        "session=- myclaw.schedule.background_coordination: "
+        "session=None myclaw.schedule.background_coordination: "
         "Scheduled Work definitions could not be loaded"
     ) in content
     assert "ScheduledWorkPersistenceError" in content
     assert "PRIVATE SCHEDULED WORK DEFINITION PAYLOAD" not in content
     assert _task().prompt not in content
+
+
+@pytest.mark.asyncio
+async def test_scheduler_store_failure_does_not_borrow_an_active_session_sink(
+    agent_home: Path,
+    workspace: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    clock_now = NOW.replace(microsecond=0)
+    state = _state(workspace)
+    store = LoadFailingOnceScheduledWorkStore(state)
+    sessions = JsonlSessionStore(
+        workspace_state=state,
+        now=lambda: clock_now,
+        new_uuid=uuid4,
+    )
+    runner = ScheduledWorkRunner(
+        provider=ScriptedFakeProvider(),
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: clock_now,
+        new_uuid=uuid4,
+        tool_gateway_for=lambda _session_id: ToolGateway(),
+    )
+    clock = ControlledSchedulerClock(clock_now)
+    scheduler = ScheduledWorkScheduler(
+        store=store,
+        coordinator=ScheduledWorkCoordinator(
+            runner=runner,
+            events=RuntimeEventBroker(),
+            now=lambda: clock_now,
+            new_uuid=lambda: RUN_UUID,
+            workspace_state=state,
+        ),
+        clock=clock,
+    )
+
+    configure_process_logging()
+    try:
+        with session_log(state, TASK_SESSION_ID):
+            scheduler.start()
+            await _wait_until(lambda: clock.sleeps == [60.0])
+        await scheduler.close()
+        terminal_output = capsys.readouterr().err
+    finally:
+        logger.remove()
+
+    assert terminal_output == "Scheduled Work definitions could not be loaded\n"
+    assert list(state.logs_directory.glob("*.log*")) == []
 
 
 @pytest.mark.asyncio
@@ -857,13 +930,85 @@ async def test_scheduled_work_scheduler_records_a_distinct_shutdown_cleanup_fail
     content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
     assert content.count(" ERROR ") == 1
     assert (
-        f"session={TASK_SESSION_ID} myclaw.schedule.background_coordination: "
+        "session=None myclaw.schedule.background_coordination: "
         "Scheduled Work scheduler cleanup failed"
     ) in content
     assert "CancelledError" in content
     assert "RuntimeError: [REDACTED]" in content
     assert "technical Scheduled Work cleanup failure" not in content
     assert _task().prompt not in content
+
+
+@pytest.mark.asyncio
+async def test_scheduler_shutdown_failure_does_not_enter_any_session_log(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    clock_now = NOW.replace(microsecond=0)
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = _state(workspace)
+    store = WorkspaceJsonScheduledWorkStore(state)
+    persist_scheduled_work(state.path, (replace(_task(), cron="31 0 * * *"),))
+    sessions = JsonlSessionStore(
+        workspace_state=state,
+        now=lambda: clock_now,
+        new_uuid=uuid4,
+    )
+    started = asyncio.Event()
+
+    class CleanupFailingProvider(ScriptedFakeProvider):
+        async def complete(self, request: object) -> ModelResponse:
+            self.complete_requests.append(request)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                raise RuntimeError("PRIVATE SCHEDULER SHUTDOWN DETAIL") from cancellation
+            raise AssertionError("cleanup test wait returned unexpectedly")
+
+    runner = ScheduledWorkRunner(
+        provider=CleanupFailingProvider(),
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: clock_now,
+        new_uuid=uuid4,
+        tool_gateway_for=lambda _session_id: ToolGateway(),
+    )
+    clock = ControlledSchedulerClock(clock_now)
+    scheduler = ScheduledWorkScheduler(
+        store=store,
+        coordinator=ScheduledWorkCoordinator(
+            runner=runner,
+            events=RuntimeEventBroker(),
+            now=lambda: clock_now,
+            new_uuid=lambda: RUN_UUID,
+            workspace_state=state,
+        ),
+        clock=clock,
+    )
+    lifetime = install_log_capture(home)
+
+    scheduler.start()
+    await _wait_until(lambda: clock.sleeps == [60.0])
+    await clock.advance(60)
+    await started.wait()
+    await scheduler.close()
+    lifetime.close()
+
+    assert list(state.logs_directory.glob("*.log*")) == []
+    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    assert "session=None myclaw.schedule.background_coordination: " in content
+    assert "Scheduled Work scheduler cleanup failed" in content
+    assert "PRIVATE SCHEDULER SHUTDOWN DETAIL" not in content
 
 
 class CoordinatedStreamingProvider(ScriptedFakeProvider):
@@ -970,6 +1115,160 @@ async def test_completed_scheduled_work_publishes_one_background_event(
     session = await sessions.load(TASK_SESSION_ID)
     assert [message.role for message in session.messages] == ["user", "assistant"]
     assert not (agent_home / "logs").exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_scheduled_work_keeps_outcomes_and_logs_to_owning_session(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    sessions = JsonlSessionStore(
+        workspace_state=state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelCallError(
+                ErrorInfo(
+                    code="model_failed",
+                    message="PRIVATE SAFE MODEL FAILURE",
+                )
+            ),
+        )
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="PRIVATE LONG-TERM MEMORY",
+        settings=ScheduledWorkModelSettings(
+            model="PRIVATE MODEL ID",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        tool_gateway_for=lambda _session_id: ToolGateway(),
+    )
+    events = RuntimeEventBroker()
+    coordinator = ScheduledWorkCoordinator(
+        runner=runner,
+        events=events,
+        now=lambda: NOW,
+        new_uuid=lambda: RUN_UUID,
+        workspace_state=state,
+    )
+
+    result = await coordinator.trigger(_task())
+    event = await events.next_background_event()
+
+    assert result.status == "failed"
+    assert result.error == ErrorInfo(
+        code="model_failed",
+        message="PRIVATE SAFE MODEL FAILURE",
+    )
+    assert isinstance(event.payload, BackgroundCompletedPayload)
+    assert event.payload.status == "failed"
+    assert event.payload.summary == "PRIVATE SAFE MODEL FAILURE"
+    session = await sessions.load(TASK_SESSION_ID)
+    assert [message.role for message in session.messages] == ["user", "assistant"]
+    persisted_failure = session.messages[-1]
+    assert isinstance(persisted_failure, AssistantSessionMessage)
+    assert persisted_failure.error is not None
+    assert persisted_failure.error.code == result.error.code
+    assert persisted_failure.error.message == result.error.message
+    content = (state.logs_directory / f"{TASK_SESSION_ID}.log").read_text(encoding="utf-8")
+    assert content.count("Scheduled Work failed code=model_failed") == 1
+    assert "ModelCallError" in content
+    for private_content in (
+        _task().prompt,
+        "PRIVATE LONG-TERM MEMORY",
+        "PRIVATE MODEL ID",
+    ):
+        assert private_content not in content
+
+
+@pytest.mark.asyncio
+async def test_session_log_initialization_failure_is_fail_open_for_later_tasks(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    state.logs_directory.write_text("Session Log unavailable", encoding="utf-8")
+    sessions = JsonlSessionStore(
+        workspace_state=state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="First task preserved."),
+                usage=_usage(),
+                finish_reason="stop",
+            ),
+            ModelCallError(
+                ErrorInfo(code="model_failed", message="Second task failed safely.")
+            ),
+        )
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        tool_gateway_for=lambda _session_id: ToolGateway(),
+    )
+    events = RuntimeEventBroker()
+    coordinator = ScheduledWorkCoordinator(
+        runner=runner,
+        events=events,
+        now=lambda: NOW,
+        new_uuid=iter((RUN_UUID, RUN_TWO_UUID)).__next__,
+        workspace_state=state,
+    )
+    first_task = _task()
+    second_task = replace(
+        first_task,
+        id="11111111-1111-4111-8111-111111111111",
+        session_id="20260713-003000-123000_22222222-2222-4222-8222-222222222222",
+    )
+
+    first = await coordinator.trigger(first_task)
+    first_event = await events.next_background_event()
+    state.logs_directory.unlink()
+    second = await coordinator.trigger(second_task)
+    second_event = await events.next_background_event()
+
+    assert first.status == "completed"
+    assert first.content == "First task preserved."
+    assert isinstance(first_event.payload, BackgroundCompletedPayload)
+    assert first_event.payload.status == "completed"
+    first_session = await sessions.load(first_task.session_id)
+    assert first_session.messages[-1].content == "First task preserved."
+    assert second.status == "failed"
+    assert second.error == ErrorInfo(code="model_failed", message="Second task failed safely.")
+    assert isinstance(second_event.payload, BackgroundCompletedPayload)
+    assert second_event.payload.status == "failed"
+    second_session = await sessions.load(second_task.session_id)
+    persisted_failure = second_session.messages[-1]
+    assert isinstance(persisted_failure, AssistantSessionMessage)
+    assert persisted_failure.error is not None
+    content = (state.logs_directory / f"{second_task.session_id}.log").read_text(
+        encoding="utf-8"
+    )
+    assert content.count("Scheduled Work failed code=model_failed") == 1
 
 
 @pytest.mark.asyncio
@@ -1191,8 +1490,9 @@ async def test_cancelled_scheduled_work_emits_no_event_and_can_be_retriggered(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    state = _state(workspace)
     sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
+        workspace_state=state,
         now=lambda: NOW,
         new_uuid=uuid4,
     )
@@ -1219,27 +1519,29 @@ async def test_cancelled_scheduled_work_emits_no_event_and_can_be_retriggered(
         events=events,
         now=lambda: NOW,
         new_uuid=iter((RUN_UUID, RUN_TWO_UUID)).__next__,
+        workspace_state=state,
     )
-    lifetime = install_log_capture(home)
     task = _task()
-    cancelled = asyncio.create_task(coordinator.trigger(task))
-    await asyncio.wait_for(provider.first_started.wait(), timeout=1)
+    with configured_process_logging():
+        cancelled = asyncio.create_task(coordinator.trigger(task))
+        await asyncio.wait_for(provider.first_started.wait(), timeout=1)
 
-    cancelled.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await cancelled
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(events.next_background_event(), timeout=0.01)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(events.next_background_event(), timeout=0.01)
 
-    retried = await coordinator.trigger(task)
-    event = await events.next_background_event()
-    lifetime.close()
+        retried = await coordinator.trigger(task)
+        event = await events.next_background_event()
 
     assert retried.status == "completed"
     assert event.turn_id == RUN_TWO_UUID
     assert isinstance(event.payload, BackgroundCompletedPayload)
     assert event.payload.status == "completed"
     assert event.payload.summary == "Retry completed."
+    content = (state.logs_directory / f"{task.session_id}.log").read_text(encoding="utf-8")
+    assert content.count("Scheduled retry completed after cancellation") == 1
     assert not (agent_home / "logs").exists()
 
 
@@ -1318,6 +1620,68 @@ async def test_different_scheduled_work_runs_concurrently_and_events_follow_comp
     second_session = await sessions.load(second_task.session_id)
     assert first_session.messages[-1].content == "First finished second."
     assert second_session.messages[-1].content == "Second finished first."
+
+
+@pytest.mark.asyncio
+async def test_different_session_logs_remain_isolated_when_one_run_settles_first(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    sessions = JsonlSessionStore(
+        workspace_state=state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    provider = ConcurrentDiagnosticProvider()
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        sessions=sessions,
+        workspace=workspace,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        tool_gateway_for=lambda _session_id: ToolGateway(),
+    )
+    coordinator = ScheduledWorkCoordinator(
+        runner=runner,
+        events=RuntimeEventBroker(),
+        now=lambda: NOW,
+        new_uuid=iter((RUN_UUID, RUN_TWO_UUID)).__next__,
+        workspace_state=state,
+    )
+    first_task = replace(_task(), prompt="Run first task.")
+    second_task = replace(
+        _task(),
+        id="11111111-1111-4111-8111-111111111111",
+        prompt="Run second task.",
+        session_id="20260713-003000-123000_22222222-2222-4222-8222-222222222222",
+    )
+
+    first_execution = asyncio.create_task(coordinator.trigger(first_task))
+    second_execution = asyncio.create_task(coordinator.trigger(second_task))
+    await asyncio.wait_for(provider.both_started.wait(), timeout=1)
+    provider.release["second"].set()
+    await second_execution
+    provider.release["first"].set()
+    await first_execution
+
+    first_content = (state.logs_directory / f"{first_task.session_id}.log").read_text(
+        encoding="utf-8"
+    )
+    second_content = (state.logs_directory / f"{second_task.session_id}.log").read_text(
+        encoding="utf-8"
+    )
+    assert first_content.count("Scheduled concurrent marker=first") == 2
+    assert "Scheduled concurrent marker=second" not in first_content
+    assert second_content.count("Scheduled concurrent marker=second") == 2
+    assert "Scheduled concurrent marker=first" not in second_content
 
 
 @pytest.mark.asyncio

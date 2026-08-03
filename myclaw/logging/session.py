@@ -16,7 +16,14 @@ from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _ROTATION_BYTES = 10_485_760
 _failure_reported = False
-__all__ = ["session_log"]
+__all__ = ["session_log", "without_session_log"]
+
+
+@contextmanager
+def without_session_log() -> Iterator[None]:
+    """Run diagnostics without Conversation Session ownership."""
+    with logger.contextualize(session_id=None):
+        yield
 
 
 @contextmanager
