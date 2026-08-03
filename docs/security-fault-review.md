@@ -81,7 +81,7 @@ and release smoke are not claimed here.
   validation do not provide general child-process confinement, as documented by
   ADR-0003; Issue #38 temporarily refuses the broader commands that ADR expected
   foreground confirmation to authorize.
-- Cross-process coordination outside Runtime Log locking is out of scope. Separate
+- Cross-process coordination is out of scope. Separate
   MyClaw runtimes can race on file-first persistence, Session metadata, summary
   allocation, or Scheduled Work triggers; only in-runtime serialization is promised
   for those state domains.

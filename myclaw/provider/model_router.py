@@ -8,7 +8,6 @@ from typing import Protocol, cast
 from loguru import logger
 
 from myclaw.config.config import ProviderConfiguration, ResolvedModelRoute, UserConfiguration
-from myclaw.logging.diagnostics import exception_logger
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     ModelProvider,
@@ -206,7 +205,7 @@ def _log_retry(
     attempt: int,
     delay: float,
 ) -> None:
-    exception_logger(failure).warning(
+    logger.opt(exception=failure).warning(
         "Provider attempt failed; retrying attempt={}/{} code={} provider={} "
         "requested_route={} selected_route={} model={} planned_delay_seconds={}",
         attempt,
@@ -227,7 +226,7 @@ def _log_fallback(
     *,
     attempt: int,
 ) -> None:
-    exception_logger(failure).warning(
+    logger.opt(exception=failure).warning(
         "Provider attempt failed; recovering attempt={}/{} code={} provider={} "
         "requested_route={} selected_route={} model={} planned_delay_seconds=0.0",
         attempt,

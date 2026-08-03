@@ -28,7 +28,6 @@ _SESSION_FAILURE = ErrorInfo(
 )
 
 
-
 class ScheduledWorkSessionStore(SessionStore, Protocol):
     """Session operations needed when a task owns its identity before first trigger."""
 
@@ -104,9 +103,7 @@ class ScheduledWorkRunner:
             if result.diagnostic is None:
                 logger.error("Scheduled Work failed code={}", code)
             else:
-                logger.opt(exception=result.diagnostic).error(
-                    "Scheduled Work failed code={}", code
-                )
+                logger.opt(exception=result.diagnostic).error("Scheduled Work failed code={}", code)
         return result
 
     async def _run_once(self, task: ScheduledWork) -> ScheduledWorkRunResult:

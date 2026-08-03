@@ -44,7 +44,7 @@ from tests.fixtures import (
     StreamScript,
     unexpected_provider_factory,
 )
-from tests.fixtures.log_capture import configured_process_logging, install_log_capture
+from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -226,7 +226,7 @@ async def test_management_listing_warns_once_for_each_skipped_session_entry(
     unreadable_path.mkdir()
     management = ManagementViewService(home, sessions=sessions, workspace=workspace)
 
-    log_capture = install_log_capture(home)
+    log_capture = capture_diagnostics()
     try:
         listing = await management.resumable_listing()
     finally:
@@ -234,11 +234,10 @@ async def test_management_listing_warns_once_for_each_skipped_session_entry(
 
     assert [summary.id for summary in listing.sessions] == [valid.id]
     assert listing.skipped_count == 2
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count("WARNING pid=") == 2
-    marker = "session=- myclaw.session.session_store: Skipped corrupt or unreadable"
+    content = log_capture.text
+    assert content.count(" WARNING ") == 2
+    marker = "Skipped corrupt or unreadable Conversation Session entry"
     assert content.count(marker) == 2
-    assert content.count("Skipped corrupt or unreadable Conversation Session entry") == 2
     assert str(corrupt_path) in content
     assert str(unreadable_path) in content
     assert "persisted content must stay private" not in content

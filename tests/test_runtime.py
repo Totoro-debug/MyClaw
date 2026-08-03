@@ -170,6 +170,16 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
+    legacy_files = {
+        "run.log.0": b"legacy slot zero\n",
+        "run.log.1": b"legacy slot one\n",
+        "run.log.cursor": b"1\n",
+        "run.log.lock": b"legacy lock\n",
+    }
+    legacy_logs = agent_home / "logs"
+    legacy_logs.mkdir()
+    for name, legacy_content in legacy_files.items():
+        (legacy_logs / name).write_bytes(legacy_content)
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     clock = FakeClock(NOW)
     failure = ModelCallError(ErrorInfo(code="model_failed", message="The model request failed."))
@@ -184,8 +194,9 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
         retry_clock=clock,
     )
 
-    events = [event async for event in runtime.conversation.submit("private foreground input")]
-    await runtime.conversation.close()
+    private_input = " ".join(("private", "foreground", "input"))
+    events = [event async for event in runtime.conversation.submit(private_input)]
+    await runtime.close()
 
     assert [event.type for event in events] == ["turn_started", "turn_failed"]
     content = _session_log_text(workspace, runtime.session_id)
@@ -195,10 +206,10 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
         if "myclaw.agent.turn:" in line or "myclaw.session.conversation:" in line
     ]
     assert len(records) == 2
-    assert content.count("ModelCallError: [REDACTED]") == 2
-    assert "private foreground input" not in content
-    assert "The model request failed." not in content
-    assert "No title response was scripted." not in content
+    assert "ModelCallError: The model request failed." in content
+    assert "ModelCallError: No title response was scripted." in content
+    assert private_input not in str([event.to_dict() for event in events])
+    assert {name: (legacy_logs / name).read_bytes() for name in legacy_files} == legacy_files
 
 
 @pytest.mark.asyncio
@@ -389,7 +400,7 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
 
 
 @pytest.mark.asyncio
-async def test_foreground_tool_diagnostics_do_not_persist_boundary_or_conversation_data(
+async def test_foreground_tool_diagnostics_preserve_boundary_exception_details(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -459,16 +470,13 @@ async def test_foreground_tool_diagnostics_do_not_persist_boundary_or_conversati
     content = _session_log_text(workspace, runtime.session_id)
     assert content.count("Tool execution failed name=web_search") == 3
     assert "Traceback (most recent call last):" in content
-    assert content.count("ExceptionGroup: [REDACTED]") == 3
-    assert content.count("OSError: [REDACTED]") == 3
-    assert content.count("ValueError: [REDACTED]") == 3
-    assert private_query not in content
-    assert "RAW_PROVIDER_BODY" not in content
-    assert "PRIVATE_WEB_CREDENTIAL" not in content
+    assert content.count("RAW_PROVIDER_BODY") >= 3
+    assert content.count(f"OSError: query={private_query}") == 3
+    assert content.count("ValueError: auth=PRIVATE_WEB_CREDENTIAL") == 3
 
 
 @pytest.mark.asyncio
-async def test_foreground_model_failure_emits_stable_agent_event_and_redacted_session_log(
+async def test_foreground_model_failure_keeps_event_safe_without_log_redaction(
     agent_home: Path,
     workspace: Path,
     capsys: pytest.CaptureFixture[str],
@@ -510,10 +518,9 @@ async def test_foreground_model_failure_emits_stable_agent_event_and_redacted_se
     content = _session_log_text(workspace, runtime.session_id)
     assert content.count("Agent Turn failed code=model_failed type=ModelCallError") == 1
     assert "Traceback (most recent call last):" in content
-    assert "ModelCallError: [REDACTED]" in content
+    assert "ModelCallError: The model request failed." in content
     assert private_input not in content
-    assert "RAW_PROVIDER_BODY" not in content
-    assert "PRIVATE_MODEL_CREDENTIAL" not in content
+    assert "RAW_PROVIDER_BODY auth=PRIVATE_MODEL_CREDENTIAL" in content
     assert terminal_output == ""
 
 
@@ -751,10 +758,8 @@ async def test_prepared_repl_routes_transient_provider_failures_through_one_retr
     assert writer.operations == [("delta", "Recovered response."), ("finish", "")]
     content = _session_log_text(workspace, runtime.session_id)
     assert content.count("Provider attempt failed; retrying attempt=1/5") == 1
-    assert "ModelCallError: [REDACTED]" in content
-    assert "RuntimeError: [REDACTED]" in content
-    assert "RAW_RETRY_PROVIDER_BODY" not in content
-    assert "PRIVATE_RETRY_CREDENTIAL" not in content
+    assert "ModelCallError: The provider timed out." in content
+    assert "RuntimeError: RAW_RETRY_PROVIDER_BODY auth=PRIVATE_RETRY_CREDENTIAL" in content
 
 
 @pytest.mark.asyncio

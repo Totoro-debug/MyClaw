@@ -6,7 +6,6 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import (
     MemoryConfiguration,
     ModelsConfiguration,
@@ -33,7 +32,7 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -43,15 +42,6 @@ SESSION_ID = "20260711-153012-123000_550e8400-e29b-41d4-a716-446655440000"
 
 async def collect(stream: AsyncIterator[object]) -> list[object]:
     return [event async for event in stream]
-
-
-def captured_log_text(agent_home: Path) -> str:
-    logs = agent_home / "logs"
-    return "".join(
-        path.read_text(encoding="utf-8")
-        for name in ("run.log.0", "run.log.1")
-        if (path := logs / name).exists()
-    )
 
 
 def configuration() -> UserConfiguration:
@@ -431,16 +421,14 @@ async def test_model_router_records_only_consumed_retry_attempts(
         clock=FakeClock(NOW),
         jitter=None,
     )
-    lifetime = install_log_capture(AgentHome(agent_home))
+    capture = capture_diagnostics()
 
-    with lifetime.session(SESSION_ID), pytest.raises(ModelCallError):
+    with capture.session(SESSION_ID), pytest.raises(ModelCallError):
         await collect(router.stream(request(route="chat")))
-    lifetime.close()
+    capture.close()
 
     records = [
-        line
-        for line in captured_log_text(agent_home).splitlines()
-        if "myclaw.provider.model_router:" in line
+        line for line in capture.text.splitlines() if "myclaw.provider.model_router:" in line
     ]
     assert len(records) == 4
     for attempt, delay, record in zip(
@@ -456,12 +444,12 @@ async def test_model_router_records_only_consumed_retry_attempts(
         assert "selected_route=chat" in record
         assert "model=chat-model" in record
         assert f"planned_delay_seconds={delay}" in record
-        assert f"session={SESSION_ID}" in record
-    assert "attempt=5/5" not in captured_log_text(agent_home)
-    content = captured_log_text(agent_home)
+    assert "attempt=5/5" not in capture.text
+    content = capture.text
+    event_text = capture.event_text
     assert content.count("Traceback (most recent call last)") == 4
-    assert content.count("ModelCallError: [REDACTED]") == 4
-    assert private_failure_detail not in content
+    assert content.count(f"ModelCallError: {private_failure_detail}") == 4
+    assert private_failure_detail not in event_text
 
 
 @pytest.mark.asyncio
@@ -561,17 +549,15 @@ async def test_model_router_records_failed_attempt_and_default_fallback_separate
         clock=FakeClock(NOW),
         jitter=None,
     )
-    lifetime = install_log_capture(AgentHome(agent_home))
+    capture = capture_diagnostics()
 
-    with lifetime.session(SESSION_ID):
+    with capture.session(SESSION_ID):
         observed = await collect(router.stream(request(route="chat")))
-    lifetime.close()
+    capture.close()
 
     assert observed == [completed("Recovered")]
     records = [
-        line
-        for line in captured_log_text(agent_home).splitlines()
-        if "myclaw.provider.model_router:" in line
+        line for line in capture.text.splitlines() if "myclaw.provider.model_router:" in line
     ]
     assert len(records) == 2
     assert "Provider attempt failed" in records[0]
@@ -588,10 +574,11 @@ async def test_model_router_records_failed_attempt_and_default_fallback_separate
     assert "selected_route=default" in records[1]
     assert "model=default-model" in records[1]
     assert all(" WARNING " in record for record in records)
-    content = captured_log_text(agent_home)
+    content = capture.text
+    event_text = capture.event_text
     assert content.count("Traceback (most recent call last)") == 1
-    assert content.count("ModelCallError: [REDACTED]") == 1
-    assert private_provider_body not in content
+    assert content.count(f"ModelCallError: {private_provider_body}") == 1
+    assert private_provider_body not in event_text
 
 
 @pytest.mark.asyncio
@@ -668,17 +655,15 @@ async def test_model_router_records_static_default_fallback_without_provider_att
         clock=FakeClock(NOW),
         jitter=None,
     )
-    lifetime = install_log_capture(AgentHome(agent_home))
+    capture = capture_diagnostics()
 
-    with lifetime.session(SESSION_ID):
+    with capture.session(SESSION_ID):
         observed = await collect(router.stream(request(route="chat")))
-    lifetime.close()
+    capture.close()
 
     assert observed == [completed("Static fallback")]
     records = [
-        line
-        for line in captured_log_text(agent_home).splitlines()
-        if "myclaw.provider.model_router:" in line
+        line for line in capture.text.splitlines() if "myclaw.provider.model_router:" in line
     ]
     assert len(records) == 1
     assert " WARNING " in records[0]
@@ -688,7 +673,6 @@ async def test_model_router_records_static_default_fallback_without_provider_att
     assert "selected_route=default" in records[0]
     assert "model=default-model" in records[0]
     assert "Provider attempt failed" not in records[0]
-    assert f"session={SESSION_ID}" in records[0]
 
 
 @pytest.mark.asyncio

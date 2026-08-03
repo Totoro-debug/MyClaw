@@ -77,11 +77,6 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
 ```text
 ~/.myclaw/
   config.toml
-  logs/
-    run.log.0
-    run.log.1
-    run.log.cursor
-    run.log.lock
 
 <workspace>/.myclaw/
   .gitignore
@@ -97,9 +92,11 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
     artifacts/
       <session_id>/
         <encoded_tool_call_id>.txt
+  logs/
+    <session_id>.log
 ```
 
-已确定：Agent Home 只拥有 User Configuration 与 Runtime Logs。有效 REPL 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`scheduled-work.json`、Session、artifacts 与 `pending-consolidations/` 按需创建。`myclaw config` 不初始化 Workspace State。
+已确定：Agent Home 拥有 User Configuration；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 REPL 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`scheduled-work.json`、Session、artifacts、`logs/` 与 `pending-consolidations/` 按需创建。`myclaw config` 不初始化 Workspace State。
 
 `memory.md` 初始内容固定为：
 
@@ -120,9 +117,17 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
 1. Workspace identity 是启动 cwd 按当前 host 原生路径语义进行词法规范化后的绝对路径；不解析 Git root，也不搜索祖先目录或通过 filesystem alias 改变归属。
 2. Windows 保留 Drive、UNC 与 extended path 行为；POSIX 使用原生绝对路径语义。相对路径被拒绝为 Workspace identity。
 3. Workspace 不派生第二层名称。非全局状态直接位于 `<workspace>/.myclaw/`。
-4. Agent Home 仅保留全局 User Configuration 与 Runtime Logs；旧的非全局数据不读取、不迁移、不删除。
+4. Agent Home 仅保留全局 User Configuration 与 untouched legacy Runtime Log files；旧的非全局数据不读取、不迁移、不删除。
 
-### 3.3 原子写
+### 3.3 Session Log
+
+Session technical diagnostics 位于 `<workspace>/.myclaw/logs/<session_id>.log`。显式 Session context 先验证 Session ID，再按需准备 `logs/`，并注册只接受相同 Session ID 的 Loguru Sink。WARNING 与 ERROR 写入；DEBUG 与 INFO 不写入。第三方标准库 `logging` record 不桥接到 Session Log，只有 MyClaw 边界捕获的异常可以成为 MyClaw Loguru event。
+
+文件 Sink 固定使用 `enqueue=True`、UTF-8、`catch=True`、精确 10,485,760-byte rotation 与最多一个历史文件的 per-Session retention。Sink 初始化 fail-open，下一次 context 重试；context exit 移除 Sink 并无限等待队列排空。
+
+以下风险已明确接受：Loguru queue 无界；正常退出是 infinite drain；没有 per-record fsync，崩溃、断电或强制终止可丢失最近记录；没有 active redaction 或 control escaping，异常消息中的 credential 与控制字符可能原样持久化；retention 仅限单个 Session，Workspace 总日志量无上限；同一 Session 的单进程重叠或跨进程并发不受支持，不检测且不协调。
+
+### 3.4 原子写
 
 - 新文件或整体更新：在目标同目录创建唯一临时文件，写入完整内容，flush，尽可能 fsync，再 atomic replace。
 - 文件内容 flush 后尽可能 fsync；POSIX 在发布后同步 parent directory，host 明确不支持同步时保留可测试的 best-effort 分支。
@@ -787,7 +792,7 @@ ErrorInfo(
 )
 ```
 
-`ErrorInfo` 仍用于 model、assistant turn 和 service-level error contract，不用于 `ToolError` 或 Tool Result。`ToolError` 只有安全的 message；cause、traceback、SDK response body 只存在于瞬时诊断上下文，不写 Tool message 或 Agent Event。首版无持久化 runtime log。
+`ErrorInfo` 仍用于 model、assistant turn 和 service-level error contract，不用于 `ToolError` 或 Tool Result。`ToolError` 只有安全的 message；cause、traceback、SDK response body 不写 Tool message 或 Agent Event，但在拥有明确 Session 的 MyClaw 边界可进入 Session Log。Session Log 不执行主动脱敏。
 
 ### 13.2 稳定 code
 

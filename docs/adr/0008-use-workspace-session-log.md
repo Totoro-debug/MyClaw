@@ -14,3 +14,9 @@ Loguru drain its queue without a custom deadline. Same-Session concurrency is
 deliberately unsupported and is not coordinated by a registry or lock. This decision
 supersedes ADR-0004; legacy Agent Home Runtime Log files are preserved but no longer
 updated by the production entry point.
+
+This replacement intentionally accepts an unbounded queue, infinite drain, no
+per-record fsync, weaker crash durability, no active redaction, no control escaping,
+and per-Session retention without a Workspace-wide size bound. The Loguru default text
+format is diagnostic output rather than a stable record protocol. MyClaw does not
+bridge third-party standard-library logging records into Session Logs.

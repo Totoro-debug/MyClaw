@@ -4,7 +4,6 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.config.agent_home import AgentHome
 from myclaw.tools.files.file_tools import (
     EditFileTool,
     ListFilesTool,
@@ -15,7 +14,7 @@ from myclaw.tools.files.file_tools import (
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ToolGateway
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 SESSION_ID = "20260727-120000-000000_550e8400-e29b-41d4-a716-446655440000"
 
@@ -337,9 +336,9 @@ async def test_read_file_failure_logs_once_without_path_content_or_boundary_deta
     monkeypatch.setattr(Path, "read_bytes", failing_read_bytes)
     gateway = ToolGateway()
     gateway.register_tools((ReadFileTool(security=security),))
-    lifetime = install_log_capture(AgentHome(agent_home))
+    capture = capture_diagnostics()
 
-    with lifetime.session("foreground-session-51"):
+    with capture.session("foreground-session-51"):
         result = await gateway.call(
             ModelToolCall(
                 id="call_read_failure",
@@ -347,16 +346,17 @@ async def test_read_file_failure_logs_once_without_path_content_or_boundary_deta
                 arguments='{"path":"RAW_TOOL_PATH_51.txt"}',
             )
         )
-    lifetime.close()
+    capture.close()
 
     assert (result.status, result.content) == (
         "error",
         "The requested file could not be read.",
     )
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
+    event_text = capture.event_text
     assert content.count(" ERROR ") == 1
     assert "name=read_file attempt=1/1 type=ToolError" in content
-    assert "session=foreground-session-51" in content
-    assert "RAW_TOOL_PATH_51.txt" not in content
-    assert "RAW_FILE_CONTENT_51" not in content
-    assert "RAW_FILESYSTEM_BODY_51" not in content
+    assert "RAW_TOOL_PATH_51.txt" not in event_text
+    assert "RAW_FILE_CONTENT_51" not in event_text
+    assert "RAW_FILESYSTEM_BODY_51" not in event_text
+    assert "RAW_FILESYSTEM_BODY_51" in content

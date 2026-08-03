@@ -32,7 +32,7 @@ from myclaw.session.session_store import JsonlSessionStore
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
-from tests.fixtures.log_capture import configured_process_logging
+from tests.fixtures.diagnostic_capture import configured_process_logging
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=LOCAL_OFFSET)

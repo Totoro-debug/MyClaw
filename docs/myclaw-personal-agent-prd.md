@@ -101,7 +101,7 @@
 
 - Agent Home 固定为 `~/.myclaw/`，不支持覆盖或多个 profile。
 - 首次启动创建 `~/.myclaw/memory/` 和 `~/.myclaw/sessions/`。
-- 首版不维护单独的持久化 runtime log。
+- 技术诊断按 Conversation Session 写入 Workspace-owned Session Log；不维护 Agent Home 或 Workspace 级全局 Runtime Log。
 - 所有 Agent Home 写入必须满足原子性；普通 session 消息以完整 JSONL 单行追加。
 - User Configuration 位于 `~/.myclaw/config.toml`。
 - Long-term Memory 位于 `~/.myclaw/memory/memory.md`。
@@ -310,7 +310,7 @@
 - Agent profiles、session overrides、per-chat settings。
 - Session list/view/delete/rename 管理命令。
 - Scheduled Work list/view/delete/pause/resume/run-now 管理命令。
-- 持久化 runtime log。
+- Agent Home 或 Workspace 级全局 Runtime Log；按 Session 归属的 Session Log 由 ADR-0008 约束。
 - SQLite、混合数据库或向量数据库记忆。
 - Long-term Memory 相关性筛选或大小上限。
 - Tool Gateway 对前台和后台工具调用加全局锁。

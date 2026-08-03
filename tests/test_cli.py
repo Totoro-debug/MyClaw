@@ -196,8 +196,10 @@ def test_installed_myclaw_does_not_modify_legacy_runtime_log_data(
     before = legacy_runtime_log_snapshot(agent_home)
 
     result = run_installed_myclaw(agent_home, workspace=workspace)
+    config_result = run_installed_myclaw(agent_home, "config", workspace=workspace)
 
     assert result.returncode == 2
+    assert config_result.returncode == 0
     assert legacy_runtime_log_snapshot(agent_home) == before
 
 

@@ -143,7 +143,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ### 实现任务
 
-1. 实现固定 Agent Home 路径解析，并将其所有权限制为 User Configuration 与 Runtime Logs；不得暴露为用户配置或 profile。
+1. 实现固定 Agent Home 路径解析，并将其所有权限制为 User Configuration 与 untouched legacy Runtime Log files；新的 Session Logs 属于 Workspace State，不得暴露为用户配置或 profile。
 2. 有效启动在当前 Workspace 创建 `.myclaw`、`memory/`、`sessions/` 和四分区 `memory/memory.md` 模板；其他运行态文件按需创建。
 3. 实现宿主原生 normalized absolute Workspace identity，直接在 Workspace State 存储非全局状态，不派生 slug。
 4. 实现同目录临时文件、flush、必要时 fsync、原子 replace 的写入助手，并清理失败临时文件。
@@ -382,7 +382,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ## 16. 明确不进入首版的工作
 
-以下事项不得作为“顺手优化”加入任何 Phase：one-shot 对话、daemon/系统服务、HTTP/IPC、跨进程锁或调度去重、MCP、subagent、多 Agent 编排、用户配置 identity、profiles、session 管理扩展、Scheduled Work 管理命令、持久化 runtime log、SQLite/向量数据库、Long-term Memory 相关性筛选或大小上限、可扩展 Shell allowlist、密钥链或环境变量 key reference、artifact 自动清理、notification adapter、非交互 status，以及 nanobot 等宽 provider registry。
+以下事项不得作为“顺手优化”加入任何 Phase：one-shot 对话、daemon/系统服务、HTTP/IPC、跨进程锁或调度去重、MCP、subagent、多 Agent 编排、用户配置 identity、profiles、session 管理扩展、Scheduled Work 管理命令、Agent Home 或 Workspace 级全局 Runtime Log、SQLite/向量数据库、Long-term Memory 相关性筛选或大小上限、可扩展 Shell allowlist、密钥链或环境变量 key reference、artifact 自动清理、notification adapter、非交互 status，以及 nanobot 等宽 provider registry。
 
 如确需其中任一能力，应先进入下一版本需求与 ADR，不应延后当前 Phase 的退出条件。
 

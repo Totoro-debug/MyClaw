@@ -85,17 +85,14 @@ prompt.
 
 ## Persistent State
 
-MyClaw keeps global User Configuration and legacy Runtime Logs in the current account's
-fixed Agent Home at `~/.myclaw/`. New Session diagnostics are Workspace-owned:
+MyClaw keeps global User Configuration in the current account's fixed Agent Home at
+`~/.myclaw/`. Legacy Agent Home Runtime Log files remain untouched: upgrades never
+read, move, delete, truncate, or update existing `run.log.0`, `run.log.1`,
+`run.log.cursor`, or `run.log.lock` files.
 
 ```text
 ~/.myclaw/
   config.toml
-  logs/
-    run.log.0
-    run.log.1
-    run.log.cursor
-    run.log.lock
 ```
 
 Every startup directory is an independent Workspace. Its non-global state lives in
@@ -124,6 +121,15 @@ and Artifact files remain on demand. Old non-global Agent Home data is ignored a
 never migrated or deleted. Back up each Workspace State directory with its Workspace;
 do not edit active Session, summary, cursor, or Scheduled Work files.
 
+Session Logs use Loguru with a WARNING threshold, an unbounded queue, exact 10 MiB
+rotation, and per-Session retention of at most one historical file. Same-Session
+concurrency is unsupported, both within one process and across processes. Normal
+context exit performs an infinite drain. There is no per-record fsync, so crashes,
+power loss, or forced termination can lose recent records. No active redaction and
+no control escaping are performed: exception messages, credentials, newlines, and
+other control characters supplied to a log call may be stored verbatim. Retention is
+per Session only, so total Workspace log usage is unbounded across Sessions.
+
 ## Troubleshooting
 
 - `config_missing`: edit the generated `~/.myclaw/config.toml`, define a usable
@@ -138,12 +144,13 @@ do not edit active Session, summary, cursor, or Scheduled Work files.
 - `memory_context_too_large`: reduce `<workspace>/.myclaw/memory/memory.md` or use a route with a larger
   context window. Long-term Memory is injected in full and has no automatic size cap.
 - Persistence errors or corrupt JSON/JSONL: stop all MyClaw processes, back up the
-  affected Workspace State and Agent Home logs, and restore a known-good file. The
+  affected Workspace State and Session Logs, and restore a known-good file. The
   runtime fails closed instead of discarding complete but invalid records.
 
 ## Known Limits
 
-- Multiple REPL processes do not coordinate Session writes or background schedules.
+- Multiple REPL processes do not coordinate Session writes, Session Logs, or background
+  schedules. In particular, same-Session concurrency is unsupported.
 - Approved Shell commands are not an operating-system sandbox and can affect more
   than the Workspace according to the user's OS permissions.
 - Long-term Memory has no automatic size cap, and Tool Artifacts have no automatic

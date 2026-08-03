@@ -36,7 +36,7 @@ from myclaw.provider.models import (
 from myclaw.tools.models import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
-from tests.fixtures.log_capture import configured_process_logging, install_log_capture
+from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
 
 LOCAL = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 10, tzinfo=LOCAL)
@@ -722,7 +722,7 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
         schedule="0 * * * *",
         clock=clock,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
     existing_tasks = asyncio.all_tasks()
 
     scheduler.start()
@@ -731,7 +731,7 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
     await started.wait()
     await scheduler.close()
     await asyncio.sleep(0)
-    lifetime.close()
+    capture.close()
 
     assert cancelled.is_set()
     assert asyncio.all_tasks() == existing_tasks

@@ -60,7 +60,7 @@ from myclaw.terminal.repl import run_repl
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript, persist_scheduled_work
-from tests.fixtures.log_capture import configured_process_logging, install_log_capture
+from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 13, 0, 30, 0, 123456, tzinfo=LOCAL_TIMEZONE)
@@ -555,7 +555,7 @@ async def test_scheduler_retries_after_a_store_load_failure(
         coordinator=coordinator,
         clock=clock,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     scheduler.start()
     try:
@@ -566,19 +566,18 @@ async def test_scheduler_retries_after_a_store_load_failure(
         event = await asyncio.wait_for(events.next_background_event(), timeout=1)
     finally:
         await scheduler.close()
-        lifetime.close()
+        capture.close()
 
     assert isinstance(event.payload, BackgroundCompletedPayload)
     assert event.payload.summary == "Recovered schedule."
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
+    event_text = capture.event_text
     assert content.count(" ERROR ") == 1
-    assert (
-        "session=None myclaw.schedule.background_coordination: "
-        "Scheduled Work definitions could not be loaded"
-    ) in content
+    assert "Scheduled Work definitions could not be loaded" in content
     assert "ScheduledWorkPersistenceError" in content
-    assert "PRIVATE SCHEDULED WORK DEFINITION PAYLOAD" not in content
-    assert _task().prompt not in content
+    assert "PRIVATE SCHEDULED WORK DEFINITION PAYLOAD" not in event_text
+    assert _task().prompt not in event_text
+    assert "PRIVATE SCHEDULED WORK DEFINITION PAYLOAD" in content
 
 
 @pytest.mark.asyncio
@@ -769,7 +768,7 @@ async def test_scheduler_consumes_an_unhandled_scheduled_run_after_it_is_logged(
     previous_handler = loop.get_exception_handler()
     unhandled: list[dict[str, object]] = []
     loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     try:
         scheduler.start()
@@ -784,18 +783,16 @@ async def test_scheduler_consumes_an_unhandled_scheduled_run_after_it_is_logged(
         del scheduler
         gc.collect()
         await asyncio.sleep(0)
-        lifetime.close()
+        capture.close()
         loop.set_exception_handler(previous_handler)
 
     assert unhandled == []
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
+    event_text = capture.event_text
     assert content.count(" ERROR ") == 1
-    assert (
-        f"session={TASK_SESSION_ID} myclaw.schedule.scheduled_work_execution: "
-        "Scheduled Work crashed"
-    ) in content
-    assert "RuntimeError: [REDACTED]" in content
-    assert "PRIVATE TASK PROMPT" not in content
+    assert "Scheduled Work crashed" in content
+    assert "RuntimeError: PRIVATE TASK PROMPT" in content
+    assert "PRIVATE TASK PROMPT" not in event_text
 
 
 @pytest.mark.asyncio
@@ -843,7 +840,7 @@ async def test_scheduler_close_cancels_and_awaits_running_scheduled_work(
         ),
         clock=clock,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
     existing_tasks = asyncio.all_tasks()
 
     scheduler.start()
@@ -852,7 +849,7 @@ async def test_scheduler_close_cancels_and_awaits_running_scheduled_work(
     await asyncio.wait_for(provider.first_started.wait(), timeout=1)
     await scheduler.close()
     await asyncio.sleep(0)
-    lifetime.close()
+    capture.close()
 
     assert provider.first_cancelled.is_set()
     with pytest.raises(TimeoutError):
@@ -918,25 +915,23 @@ async def test_scheduled_work_scheduler_records_a_distinct_shutdown_cleanup_fail
         ),
         clock=clock,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     scheduler.start()
     await _wait_until(lambda: clock.sleeps == [60.0])
     await clock.advance(60)
     await started.wait()
     await scheduler.close()
-    lifetime.close()
+    capture.close()
 
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
+    event_text = capture.event_text
     assert content.count(" ERROR ") == 1
-    assert (
-        "session=None myclaw.schedule.background_coordination: "
-        "Scheduled Work scheduler cleanup failed"
-    ) in content
+    assert "Scheduled Work scheduler cleanup failed" in content
     assert "CancelledError" in content
-    assert "RuntimeError: [REDACTED]" in content
-    assert "technical Scheduled Work cleanup failure" not in content
-    assert _task().prompt not in content
+    assert "RuntimeError: technical Scheduled Work cleanup failure" in content
+    assert "technical Scheduled Work cleanup failure" not in event_text
+    assert _task().prompt not in event_text
 
 
 @pytest.mark.asyncio
@@ -995,20 +990,19 @@ async def test_scheduler_shutdown_failure_does_not_enter_any_session_log(
         ),
         clock=clock,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     scheduler.start()
     await _wait_until(lambda: clock.sleeps == [60.0])
     await clock.advance(60)
     await started.wait()
     await scheduler.close()
-    lifetime.close()
+    capture.close()
 
     assert list(state.logs_directory.glob("*.log*")) == []
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert "session=None myclaw.schedule.background_coordination: " in content
+    content = capture.text
     assert "Scheduled Work scheduler cleanup failed" in content
-    assert "PRIVATE SCHEDULER SHUTDOWN DETAIL" not in content
+    assert "PRIVATE SCHEDULER SHUTDOWN DETAIL" in content
 
 
 class CoordinatedStreamingProvider(ScriptedFakeProvider):
@@ -1092,11 +1086,11 @@ async def test_completed_scheduled_work_publishes_one_background_event(
         now=lambda: NOW,
         new_uuid=lambda: RUN_UUID,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     result = await coordinator.trigger(_task())
     event = await events.next_background_event()
-    lifetime.close()
+    capture.close()
 
     assert result.status == "completed"
     assert result.content == "No open risks were found."
@@ -1209,9 +1203,7 @@ async def test_session_log_initialization_failure_is_fail_open_for_later_tasks(
                 usage=_usage(),
                 finish_reason="stop",
             ),
-            ModelCallError(
-                ErrorInfo(code="model_failed", message="Second task failed safely.")
-            ),
+            ModelCallError(ErrorInfo(code="model_failed", message="Second task failed safely.")),
         )
     )
     runner = ScheduledWorkRunner(
@@ -1265,9 +1257,7 @@ async def test_session_log_initialization_failure_is_fail_open_for_later_tasks(
     persisted_failure = second_session.messages[-1]
     assert isinstance(persisted_failure, AssistantSessionMessage)
     assert persisted_failure.error is not None
-    content = (state.logs_directory / f"{second_task.session_id}.log").read_text(
-        encoding="utf-8"
-    )
+    content = (state.logs_directory / f"{second_task.session_id}.log").read_text(encoding="utf-8")
     assert content.count("Scheduled Work failed code=model_failed") == 1
 
 
@@ -1316,26 +1306,24 @@ async def test_background_event_publication_failure_is_recorded_once(
         now=lambda: NOW,
         new_uuid=lambda: RUN_UUID,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     with pytest.raises(RuntimeError, match="Runtime event broker is closed"):
         await coordinator.trigger(_task())
-    lifetime.close()
+    capture.close()
 
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
+    event_text = capture.event_text
     assert content.count(" ERROR ") == 1
-    assert (
-        f"session={TASK_SESSION_ID} myclaw.schedule.background_coordination: "
-        "Scheduled Work event publication failed"
-    ) in content
-    assert "RuntimeError: [REDACTED]" in content
-    assert "Runtime event broker is closed" not in content
+    assert "Scheduled Work event publication failed" in content
+    assert "RuntimeError: Runtime event broker is closed" in content
+    assert "Runtime event broker is closed" not in event_text
     for private_content in (
         _task().title,
         _task().prompt,
         "PRIVATE BACKGROUND RESULT",
     ):
-        assert private_content not in content
+        assert private_content not in event_text
 
 
 @pytest.mark.asyncio
@@ -1452,7 +1440,7 @@ async def test_overlapping_trigger_of_the_same_scheduled_work_is_skipped(
         now=lambda: NOW,
         new_uuid=iter((RUN_UUID, RUN_TWO_UUID)).__next__,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
     task = _task()
     first_execution = asyncio.create_task(coordinator.trigger(task))
     await asyncio.wait_for(provider.started.wait(), timeout=1)
@@ -1465,7 +1453,7 @@ async def test_overlapping_trigger_of_the_same_scheduled_work_is_skipped(
     finally:
         provider.release.set()
         first = await first_execution
-    lifetime.close()
+    capture.close()
 
     assert overlap_timed_out is False
     assert skipped is not None

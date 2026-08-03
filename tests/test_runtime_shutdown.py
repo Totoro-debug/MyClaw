@@ -35,7 +35,7 @@ from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import PublicWebFetchBoundary
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript, persist_scheduled_work
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 NOW = datetime(2026, 7, 13, 0, 30, tzinfo=timezone(timedelta(hours=8)))
 
@@ -278,7 +278,7 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
         scheduled_work_scheduler_clock=FailingSchedulerClock(),
     )
     baseline = asyncio.all_tasks()
-    log_capture = install_log_capture(home)
+    log_capture = capture_diagnostics()
     state = WorkspaceState(Workspace.from_path(workspace))
     ambient_session_id = make_session_id(NOW, uuid4())
 
@@ -292,9 +292,9 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
 
     assert asyncio.all_tasks() == baseline
     assert not (state.logs_directory / f"{ambient_session_id}.log").exists()
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count("ERROR pid=") == 1
-    marker = "session=None myclaw.agent.runtime: Runtime startup failed type=RuntimeError"
+    content = log_capture.text
+    assert content.count(" ERROR ") == 1
+    marker = "Runtime startup failed type=RuntimeError"
     assert content.count(marker) == 1
 
 
@@ -368,7 +368,7 @@ async def test_normal_eof_and_exit_shutdown_do_not_create_diagnostic_log(
         now=lambda: NOW,
         new_uuid=uuid4,
     )
-    log_capture = install_log_capture(home)
+    log_capture = capture_diagnostics()
 
     try:
         await runtime.run(
@@ -456,7 +456,7 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
         shell.execute(ShellRequest(command="git status", cwd=workspace, timeout=60))
     )
     await process.communicate_started.wait()
-    log_capture = install_log_capture(home)
+    log_capture = capture_diagnostics()
     state = WorkspaceState(Workspace.from_path(workspace))
     ambient_session_id = make_session_id(NOW, uuid4())
 
@@ -474,12 +474,11 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
         log_capture.close()
 
     assert not (state.logs_directory / f"{ambient_session_id}.log").exists()
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    assert content.count("ERROR pid=") == 1
-    marker = "session=None myclaw.agent.runtime: Runtime shutdown failed type=RuntimeError"
+    content = log_capture.text
+    assert content.count(" ERROR ") == 1
+    marker = "Runtime shutdown failed type=RuntimeError"
     assert content.count(marker) == 1
-    assert "RuntimeError: [REDACTED]" in content
-    assert "PRIVATE_PROVIDER_CLOSE_BODY_52" not in content
+    assert "RuntimeError: PRIVATE_PROVIDER_CLOSE_BODY_52" in content
 
 
 @pytest.mark.asyncio
@@ -1128,7 +1127,7 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
         set_signal=signals,
     )
     interrupts.install()
-    log_capture = install_log_capture(home)
+    log_capture = capture_diagnostics()
     running = asyncio.create_task(runtime.run(input_reader=input_reader, writer=SilentWriter()))
     await provider.started[0].wait()
     await memory_clock.sleep_started.wait()
@@ -1173,8 +1172,8 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
     assert scheduled_clock.sleep_stopped.is_set()
     assert provider.closed
     assert signals.current is previous_handler
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
-    records = [line for line in content.splitlines() if " pid=" in line]
+    content = log_capture.text
+    records = [line for line in content.splitlines() if "myclaw.provider.model_router:" in line]
     assert len(records) == 3
     assert all(" WARNING " in record for record in records)
     assert all(

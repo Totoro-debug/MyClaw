@@ -37,7 +37,7 @@ from myclaw.tools.models import ModelToolCall
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider
-from tests.fixtures.log_capture import configured_process_logging, install_log_capture
+from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
 
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=timezone(timedelta(hours=8)))
 SESSION_ID = "20260711-160000-000000_550e8400-e29b-41d4-a716-446655440000"
@@ -212,10 +212,10 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
         ),
         batch_size=10,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     result = await manager.run_manual()
-    lifetime.close()
+    capture.close()
 
     assert result == MemoryTaskResult(
         status="No pending summaries",
@@ -518,10 +518,10 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
         ),
         batch_size=10,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     result = await manager.run_manual()
-    lifetime.close()
+    capture.close()
 
     assert result == MemoryTaskResult(
         status="Memory Task failed.",
@@ -535,15 +535,16 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
     )
     assert memory_path.read_bytes() == original_memory
     assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 0
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
+    event_text = capture.event_text
     assert content.count(" ERROR ") == 1
     assert "Memory Task failed code=tool_failed" in content
     assert "Traceback (most recent call last):" in content
-    assert "ToolError: [REDACTED]" in content
-    assert "OSError: [REDACTED]" in content
+    assert "ToolError: Long-term Memory could not be updated." in content
+    assert "OSError: injected atomic replacement failure" in content
     assert "The above exception was the direct cause" in content
-    assert "The user prefers concise status reports." not in content
-    assert "Prefers concise status reports." not in content
+    assert "The user prefers concise status reports." not in event_text
+    assert "Prefers concise status reports." not in event_text
 
 
 @pytest.mark.asyncio
@@ -568,18 +569,18 @@ async def test_conversation_summary_read_failure_is_logged_only_at_memory_task_b
         ),
         batch_size=10,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     result = await manager.run_manual()
-    lifetime.close()
+    capture.close()
 
     assert result.error is not None
     assert result.error.code == "persistence_error"
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
     assert content.count(" ERROR ") == 1
     assert "Memory Task failed code=persistence_error" in content
     assert "Traceback (most recent call last):" in content
-    assert "ValueError: [REDACTED]" in content
+    assert "ValueError: summary stream must contain complete JSONL records" in content
     assert "PRIVATE INVALID SUMMARY STREAM" not in content
 
 
@@ -686,14 +687,14 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
         ),
         batch_size=10,
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     first_task = asyncio.create_task(manager.run_manual())
     await first_started.wait()
     overlapping = await manager.run_manual()
     release_first.set()
     first = await first_task
-    lifetime.close()
+    capture.close()
 
     assert overlapping == MemoryTaskResult(
         status="Memory Task is already running.",
@@ -913,10 +914,10 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, memory_manager=memory_manager)
     )
-    lifetime = install_log_capture(home)
+    capture = capture_diagnostics()
 
     result = await dispatcher.dispatch("/dream")
-    lifetime.close()
+    capture.close()
 
     assert result.output == (
         "persistence_error: Summary Cursor could not be updated.\n"
@@ -925,7 +926,7 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
         "cursor: 0"
     )
     assert await WorkspaceFileMemoryStore(_state(home)).read_summary_cursor() == 0
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
     assert content.count(" ERROR ") == 1
     assert "Memory Task failed code=persistence_error" in content
 

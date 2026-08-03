@@ -7,13 +7,12 @@ from typing import Annotated, cast
 
 import pytest
 
-from myclaw.config.agent_home import AgentHome
 from myclaw.tools.base import BaseTool
 from myclaw.tools.errors import ToolError
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.schema import OpenAIToolSchema, ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 
 def _call(name: str, arguments: str, *, call_id: str = "call_1") -> ModelToolCall:
@@ -218,14 +217,14 @@ async def test_invalid_unavailable_and_refused_calls_do_not_create_diagnostic_lo
 
     gateway = ToolGateway()
     gateway.register_tools((_PrepareTool(), RefusingTool()))
-    lifetime = install_log_capture(AgentHome(agent_home))
+    capture = capture_diagnostics()
 
-    with lifetime.session("foreground-session-51"):
+    with capture.session("foreground-session-51"):
         malformed = await gateway.call(_call("prepare", "{"))
         invalid = await gateway.call(_call("prepare", "{}"))
         unavailable = await gateway.call(_call("missing", "{}"))
         refused = await gateway.call(_call("refusing", '{"action":"write"}'))
-    lifetime.close()
+    capture.close()
 
     assert [result.status for result in (malformed, invalid, unavailable, refused)] == [
         "error",
@@ -326,13 +325,14 @@ async def test_retryable_execution_failures_log_retries_and_one_terminal_error(
     sleeps: list[float] = []
     gateway = ToolGateway(sleep=_sleep_recorder(sleeps))
     gateway.register_tools((tool,))
-    lifetime = install_log_capture(AgentHome(agent_home))
+    capture = capture_diagnostics()
 
-    with lifetime.session("scheduled-session-51"):
+    with capture.session("scheduled-session-51"):
         result = await gateway.call(_call("retry", '{"payload":"RAW_TOOL_ARGUMENT_51"}'))
-    lifetime.close()
+    capture.close()
 
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
+    event_text = capture.event_text
     assert (result.status, result.content, result.artifact) == (
         "error",
         "The retry Tool failed safely.",
@@ -342,22 +342,21 @@ async def test_retryable_execution_failures_log_retries_and_one_terminal_error(
     assert sleeps == [1.0, 2.0]
     assert content.count(" WARNING ") == 2
     assert content.count(" ERROR ") == 1
-    assert (
-        "session=scheduled-session-51 myclaw.tools.tool_gateway: "
-        "Tool execution failed name=retry attempt=1/3 type=ToolError"
-    ) in content
+    assert "Tool execution failed name=retry attempt=1/3 type=ToolError" in content
     assert "name=retry attempt=2/3 type=ToolError" in content
     assert "name=retry attempt=3/3 type=ToolError" in content
     assert "Traceback (most recent call last):" in content
-    assert content.count("ToolError: [REDACTED]") == 3
-    assert content.count("OSError: [REDACTED]") == 3
+    assert content.count("ToolError: The retry Tool failed safely.") == 3
+    assert content.count("OSError: RAW_RESPONSE_BODY_51") == 3
     assert (
         content.count("The above exception was the direct cause of the following exception:") == 3
     )
-    assert "RAW_TOOL_ARGUMENT_51" not in content
-    assert "RAW_RESPONSE_BODY_51" not in content
-    assert "credential" not in content
-    assert "The retry Tool failed safely." not in content
+    assert "RAW_TOOL_ARGUMENT_51" not in event_text
+    assert "RAW_RESPONSE_BODY_51" not in event_text
+    assert "credential" not in event_text
+    assert "RAW_RESPONSE_BODY_51" in content
+    assert "credential" in content
+    assert not (agent_home / "logs").exists()
 
 
 @pytest.mark.asyncio

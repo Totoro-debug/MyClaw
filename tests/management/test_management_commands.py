@@ -24,7 +24,7 @@ from myclaw.session.records import (
     UserSessionMessage,
 )
 from myclaw.session.session_store import JsonlSessionStore
-from tests.fixtures.log_capture import configured_process_logging
+from tests.fixtures.diagnostic_capture import configured_process_logging
 
 CONFIG_CONTENT = """[models.providers.primary]
 protocol = "anthropic"

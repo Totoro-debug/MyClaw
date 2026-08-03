@@ -39,8 +39,6 @@ from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 
 
-
-
 @runtime_checkable
 class SessionStore(Protocol):
     """Persist and query Conversation Sessions."""

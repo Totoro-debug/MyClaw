@@ -1,3 +1,4 @@
+import ast
 import tomllib
 from pathlib import Path
 
@@ -21,20 +22,15 @@ def test_distribution_metadata_builds_one_host_neutral_wheel() -> None:
     assert "plat_name" not in setup
 
 
-def test_release_workflow_builds_and_smokes_one_universal_wheel_on_windows() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release-validation.yml").read_text(
-        encoding="utf-8"
-    )
+def test_release_evidence_builds_and_smokes_one_universal_wheel_on_windows() -> None:
+    evidence = (ROOT / "docs" / "release" / "windows-validation.md").read_text(encoding="utf-8")
 
-    assert "runs-on: windows-latest" in workflow
-    assert "python -m build --wheel" in workflow
-    assert "py3-none-any" in workflow
-    assert "py3-none-win_amd64" not in workflow
-    assert "Expected exactly one release artifact" in workflow
-    assert "PYTHONNOUSERSITE" in workflow
-    assert "Remove-Item Env:PYTHONPATH" in workflow
-    assert "python -m build\n" not in workflow
-    assert "ubuntu-latest" not in workflow
+    assert "python -m build --wheel" in evidence
+    assert "py3-none-any" in evidence
+    assert "py3-none-win_amd64" not in evidence
+    assert "PYTHONNOUSERSITE" in evidence
+    assert "python -m pip check" in evidence
+    assert "installed CLI" in evidence
 
 
 def test_active_code_has_no_platform_support_gate() -> None:
@@ -47,14 +43,94 @@ def test_active_code_has_no_platform_support_gate() -> None:
     assert not (ROOT / "myclaw" / "terminal" / "entrypoint.py").exists()
 
 
+def test_obsolete_runtime_log_contract_surface_is_absent() -> None:
+    obsolete_paths = (
+        ROOT / "myclaw" / "runtime_log.py",
+        ROOT / "myclaw" / "runtime_log_lock.py",
+        ROOT / "myclaw" / "logging" / "diagnostics.py",
+        ROOT / "tests" / "runtime_log",
+        ROOT / "tests" / "fixtures" / "log_capture.py",
+    )
+
+    assert not [path for path in obsolete_paths if path.exists()]
+
+
+def test_user_and_release_docs_publish_the_session_log_risk_contract() -> None:
+    required_contract = (
+        "same-session concurrency is unsupported",
+        "unbounded queue",
+        "infinite drain",
+        "no per-record fsync",
+        "no active redaction",
+        "no control escaping",
+        "per-session retention",
+        "legacy agent home runtime log files remain untouched",
+    )
+
+    for path in (ROOT / "README.md", ROOT / "docs" / "release-readiness.md"):
+        content = path.read_text(encoding="utf-8").lower()
+        assert all(statement in content for statement in required_contract), path
+
+
+def test_active_contract_docs_do_not_claim_the_removed_runtime_log_implementation() -> None:
+    active_contracts = (
+        ROOT / "CONTEXT.md",
+        ROOT / "docs" / "myclaw-runtime-contracts.md",
+        ROOT / "docs" / "release-readiness.md",
+        ROOT / "docs" / "release" / "windows-validation.md",
+        ROOT / "docs" / "adr" / "0007-use-host-adapters.md",
+    )
+    obsolete_claims = (
+        "shared runtime log",
+        "runtime log lock",
+        "runtime log locking",
+        "runtime log |",
+        "首版无持久化 runtime log",
+    )
+
+    for path in active_contracts:
+        content = path.read_text(encoding="utf-8").lower()
+        assert not [claim for claim in obsolete_claims if claim in content], path
+
+
+def test_application_modules_do_not_depend_on_standard_library_logging() -> None:
+    violations: list[str] = []
+
+    for path in sorted((ROOT / "myclaw").rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import) and any(
+                alias.name == "logging" for alias in node.names
+            ):
+                violations.append(f"{path}: imports logging")
+            if isinstance(node, ast.ImportFrom) and node.module == "logging":
+                violations.append(f"{path}: imports from logging")
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"debug", "info", "warning", "error", "critical"}
+                and len(node.args) > 1
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and "%" in node.args[0].value
+            ):
+                violations.append(f"{path}:{node.lineno}: percent-style logging arguments")
+        if "InterceptHandler" in source:
+            violations.append(f"{path}: logging interception bridge")
+
+    assert violations == []
+
+
 def test_active_support_contract_matches_host_neutral_release_evidence() -> None:
     decision_path = ROOT / "docs" / "adr" / "0007-use-host-adapters.md"
     assert decision_path.exists()
     decision = decision_path.read_text(encoding="utf-8").lower()
     assert "status: accepted" in decision
     assert "supersedes adr-0006" in decision
-    for boundary in ("filesystem", "runtime log locking", "owned process tree"):
+    for boundary in ("filesystem", "owned process tree"):
         assert boundary in decision
+    assert "runtime log locking" not in decision
 
     active_paths = (
         ROOT / "CONTEXT.md",
@@ -74,10 +150,3 @@ def test_active_support_contract_matches_host_neutral_release_evidence() -> None
         "no platform gate",
     ):
         assert claim in support
-
-    workflow = (ROOT / ".github" / "workflows" / "release-validation.yml").read_text(
-        encoding="utf-8"
-    )
-    assert "runs-on: windows-latest" in workflow
-    assert "runs-on: macos" not in workflow
-    assert "runs-on: ubuntu" not in workflow

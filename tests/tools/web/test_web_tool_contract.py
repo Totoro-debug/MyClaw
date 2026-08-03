@@ -4,12 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.config.agent_home import AgentHome
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import WebFetchRejected, WebFetchTool
 from myclaw.tools.web.web_search import WebSearchResult, WebSearchTool
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 
 class ScriptedSearch:
@@ -118,9 +117,9 @@ async def test_web_search_logs_retry_warnings_without_query_or_upstream_body(
     )
     gateway = ToolGateway(sleep=_recording_sleep(waits))
     gateway.register_tools((WebSearchTool(search=search),))
-    lifetime = install_log_capture(AgentHome(agent_home))
+    capture = capture_diagnostics()
 
-    with lifetime.session("scheduled-web-search-session-51"):
+    with capture.session("scheduled-web-search-session-51"):
         result = await gateway.call(
             ModelToolCall(
                 id="call_search_retry",
@@ -128,22 +127,24 @@ async def test_web_search_logs_retry_warnings_without_query_or_upstream_body(
                 arguments='{"query":"RAW_WEB_QUERY_51"}',
             )
         )
-    lifetime.close()
+    capture.close()
 
     assert result.status == "success"
     assert search.calls == 3
     assert waits == [1.0, 2.0]
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
+    event_text = capture.event_text
     assert content.count(" WARNING ") == 2
     assert " ERROR " not in content
     assert "name=web_search attempt=1/3 type=OSError" in content
     assert "name=web_search attempt=2/3 type=RuntimeError" in content
-    assert "session=scheduled-web-search-session-51" in content
-    assert "RAW_WEB_QUERY_51" not in content
-    assert "RAW_SEARCH_RESPONSE_BODY_51" not in content
-    assert "RAW_SEARCH_RESPONSE_BODY_52" not in content
-    assert "https://example.com/result" not in content
-    assert "Public snippet." not in content
+    assert "RAW_WEB_QUERY_51" not in event_text
+    assert "RAW_SEARCH_RESPONSE_BODY_51" not in event_text
+    assert "RAW_SEARCH_RESPONSE_BODY_52" not in event_text
+    assert "https://example.com/result" not in event_text
+    assert "Public snippet." not in event_text
+    assert "RAW_SEARCH_RESPONSE_BODY_51" in content
+    assert "RAW_SEARCH_RESPONSE_BODY_52" in content
 
 
 @pytest.mark.asyncio
@@ -160,9 +161,9 @@ async def test_web_fetch_failure_log_excludes_credential_url_and_response_body(
     )
     gateway = ToolGateway(sleep=_recording_sleep(waits))
     gateway.register_tools((WebFetchTool(fetcher=fetch),))
-    lifetime = install_log_capture(AgentHome(agent_home))
+    capture = capture_diagnostics()
 
-    with lifetime.session("foreground-web-fetch-session-51"):
+    with capture.session("foreground-web-fetch-session-51"):
         result = await gateway.call(
             ModelToolCall(
                 id="call_fetch_rejected",
@@ -173,24 +174,27 @@ async def test_web_fetch_failure_log_excludes_credential_url_and_response_body(
                 ),
             )
         )
-    lifetime.close()
+    capture.close()
 
     assert result.status == "error"
     assert result.content == "WebFetch rejected an unsafe or unverifiable request."
     assert fetch.calls == 3
     assert waits == [1.0, 2.0]
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
+    event_text = capture.event_text
     assert content.count(" WARNING ") == 2
     assert content.count(" ERROR ") == 1
     assert "name=web_fetch attempt=1/3 type=ToolError" in content
     assert "name=web_fetch attempt=3/3 type=ToolError" in content
-    assert "session=foreground-web-fetch-session-51" in content
-    assert "URL_CREDENTIAL_51" not in content
-    assert "RAW_FETCH_PATH_51" not in content
-    assert "RAW_FETCH_QUERY_51" not in content
-    assert "RAW_FETCH_RESPONSE_BODY_51" not in content
-    assert "RAW_FETCH_RESPONSE_BODY_52" not in content
-    assert "RAW_FETCH_RESPONSE_BODY_53" not in content
+    assert "URL_CREDENTIAL_51" not in event_text
+    assert "RAW_FETCH_PATH_51" not in event_text
+    assert "RAW_FETCH_QUERY_51" not in event_text
+    assert "RAW_FETCH_RESPONSE_BODY_51" not in event_text
+    assert "RAW_FETCH_RESPONSE_BODY_52" not in event_text
+    assert "RAW_FETCH_RESPONSE_BODY_53" not in event_text
+    assert "RAW_FETCH_RESPONSE_BODY_51" in content
+    assert "RAW_FETCH_RESPONSE_BODY_52" in content
+    assert "RAW_FETCH_RESPONSE_BODY_53" in content
 
 
 @pytest.mark.asyncio

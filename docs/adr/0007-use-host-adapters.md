@@ -10,20 +10,19 @@ missing operating-system capabilities fail at the operation that needs them. Thi
 decision supersedes ADR-0006 while retaining that document as the historical record
 of the former Windows-only release.
 
-Operating-system differences are concentrated behind three deep modules: filesystem
-operations, Runtime Log locking, and owned process tree execution. The filesystem
+Operating-system differences are concentrated behind two deep modules: filesystem
+operations and owned process tree execution. The filesystem
 module owns native I/O paths, object-type and redirection checks, containment,
 create-only publication, atomic replacement, and host-appropriate synchronization.
-Runtime Log locking uses `msvcrt` on Windows and `fcntl` on POSIX behind one lock
-interface. Shell execution uses Windows Job Objects or a POSIX process session and
+Shell execution uses Windows Job Objects or a POSIX process session and
 process group behind one owned-process interface. These adapters use only the Python
 standard library.
 
 Workspace identity is the normalized absolute path under the current host's native
 path semantics. Workspace State remains `<workspace>/.myclaw/` with unchanged record
 formats and lifecycle. Copying a complete Workspace carries its Workspace State;
-Agent Home remains local to the operating-system account and continues to own only
-User Configuration and Runtime Logs.
+Agent Home remains local to the operating-system account and owns User Configuration;
+legacy Runtime Log files there are preserved without being opened.
 
 The installed `myclaw` command enters the Typer application directly. Packaging emits
 one pure-Python `py3-none-any` wheel and performs no operating-system version,

@@ -42,8 +42,6 @@ type AtomicReplaceBytes = Callable[[Path, bytes], None]
 type UnlinkFile = Callable[[Path], None]
 
 
-
-
 @runtime_checkable
 class SummaryStore(Protocol):
     """Append and read the ordered Conversation Summary stream."""

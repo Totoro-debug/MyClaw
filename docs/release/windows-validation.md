@@ -3,9 +3,8 @@
 Status: **PASS**
 
 This report records Windows evidence for GitHub issue
-[#69](https://github.com/Totoro-debug/myclaw/issues/69). It applies to the final
-universal-wheel candidate built from the clean tree at commit `4fd4529` on
-2026-08-02.
+[#83](https://github.com/Totoro-debug/myclaw/issues/83). It applies to the
+Session Log contract-replacement universal-wheel candidate built on 2026-08-03.
 
 Windows x64 is the currently validated environment. macOS Intel and Apple Silicon are
 intended compatibility targets but remain unverified. This report is not native macOS
@@ -20,7 +19,7 @@ hosts attempt their selected adapter when a capability is used.
 | PowerShell | `7.6.4` |
 | Build Python | CPython `3.12.13`, 64-bit |
 | Build pip | `26.1.2` |
-| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-final-chinese-181298d8e1f447a19100f6bc96c44e64` |
+| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-issue83-ffd7fe03dd7b44a1abfdc6f8756da733` |
 
 No Provider credential is read or used. Application tests and CLI smoke do not contact
 a live Provider.
@@ -35,12 +34,12 @@ python -m build --wheel --outdir <validation-root>\dist
 
 | Artifact | Size | SHA-256 | Embedded tag |
 | --- | ---: | --- | --- |
-| `myclaw-0.1.0-py3-none-any.whl` | 136,602 bytes | `E269BB51C09EB07C584725DBB8A7A453D46D1E38768DBE7CA1E3A00D54B5ED8E` | `py3-none-any` |
+| `myclaw-0.1.0-py3-none-any.whl` | 131,945 bytes | `3EC216ABB8A80DBCD8D8BDA9970F307123F577B61F036C8A7F4FCB6193E60CB8` | `py3-none-any` |
 
-Archive inspection found 72 packaged Python files. The packaged module set matched the
-source tree and contained the Windows and POSIX filesystem, Runtime Log lock, and owned
-process tree adapters. No compiled extension, native library, or forced platform tag
-was present.
+Archive inspection found 74 packaged Python files. The packaged module set matched the
+source tree and contained the Windows and POSIX filesystem and owned-process adapters.
+It contained the Loguru dependency metadata and no obsolete Runtime Log or lock module.
+No compiled extension, native library, or forced platform tag was present.
 
 ## Clean Installation
 
@@ -53,6 +52,27 @@ exited with code `2`, reported `config_missing` without a traceback, created the
 default configuration, and did not create Workspace State before the configuration
 gate. `myclaw config` exited with code `0`. An isolated `python -I` import resolved
 `myclaw` from the clean venv's `Lib\site-packages`, not the checkout.
+
+## Session Log Windows Evidence
+
+The native Session Log contract suite creates a Windows Junction at `.myclaw\logs`,
+confirms its Reparse Point is rejected, and verifies that no file is written through
+the redirect while Session work continues. A hard-linked active Session Log is also
+rejected without changing either link's bytes, and the next clean Session context
+successfully retries activation.
+
+The rotation test reaches exactly 10,485,760 bytes without rotating, confirms that
+the next record rotates, then performs two further rotations. The active file remains
+present and only the newest history file survives. Separate injected `logger.add`,
+opener, write, and rotation failures leave the business result unchanged. Consecutive
+activation failures emit one basic diagnostic, a successful activation resets that
+latch, and a later failure is reported again.
+
+Native `Get-Acl` probes confirm that creating and writing the logs directory does not
+change the Workspace State ACL, and that both `logs` and the active file keep Windows
+ACL inheritance enabled with inherited access rules. This matches the Workspace State
+contract: MyClaw preserves the Workspace's inherited DACL rather than replacing it
+with a private owner-only DACL on Windows.
 
 ## Quality Gates
 
@@ -68,12 +88,12 @@ git diff --check
 
 | Gate | Result |
 | --- | --- |
-| Complete warning-strict offline suite | PASS: `869 passed in 143.12s`; zero skips |
+| Complete warning-strict offline suite | PASS: `865 passed`; zero skips |
 | Ruff lint | PASS: all checks passed |
-| Ruff format | PASS: 164 files already formatted |
-| Strict Mypy | PASS: no issues in 164 source files |
+| Ruff format | PASS: 165 files already formatted |
+| Strict Mypy | PASS: no issues in 165 source files |
 | Diff hygiene | PASS |
-| Universal artifact inspection | PASS: one wheel, 72 Python files, source set matched, zero native entries |
+| Universal artifact inspection | PASS: one wheel, 74 Python files, source set matched, zero native entries |
 | Clean wheel installation and dependency check | PASS |
 | Installed CLI Unicode smoke and isolated import | PASS |
 

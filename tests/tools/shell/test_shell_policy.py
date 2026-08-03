@@ -27,7 +27,7 @@ from myclaw.utils.host_filesystem import (
 )
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
-from tests.fixtures.log_capture import install_log_capture
+from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 SESSION_ID = "20260712-120000-000000_550e8400-e29b-41d4-a716-446655440000"
 NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
@@ -178,9 +178,9 @@ async def test_shell_failure_log_excludes_command_and_process_output(
     shell = FailingShellBoundary()
     gateway = ToolGateway()
     gateway.register_tools((ShellTool(workspace=workspace, boundary=shell),))
-    lifetime = install_log_capture(AgentHome(agent_home))
+    capture = capture_diagnostics()
 
-    with lifetime.session("foreground-shell-session-51"):
+    with capture.session("foreground-shell-session-51"):
         result = await gateway.call(
             ModelToolCall(
                 id="call_shell_failure",
@@ -188,9 +188,10 @@ async def test_shell_failure_log_excludes_command_and_process_output(
                 arguments='{"command":"git status","timeout":60}',
             )
         )
-    lifetime.close()
+    capture.close()
 
-    content = (agent_home / "logs" / "run.log.0").read_text(encoding="utf-8")
+    content = capture.text
+    event_text = capture.event_text
     assert (result.status, result.content) == (
         "error",
         "shell could not complete the request.",
@@ -200,9 +201,9 @@ async def test_shell_failure_log_excludes_command_and_process_output(
     ]
     assert content.count(" ERROR ") == 1
     assert "name=shell attempt=1/1 type=OSError" in content
-    assert "session=foreground-shell-session-51" in content
-    assert "git status" not in content
-    assert "RAW_PROCESS_BODY_51" not in content
+    assert "git status" not in event_text
+    assert "RAW_PROCESS_BODY_51" not in event_text
+    assert "RAW_PROCESS_BODY_51 command=git status" in content
 
 
 @pytest.mark.parametrize(

@@ -180,9 +180,7 @@ class ScheduledWorkCoordinator:
                     current = asyncio.current_task()
                     if current is not None and current.cancelling():
                         raise
-                    logger.opt(exception=error).error(
-                        "Scheduled Work event publication failed"
-                    )
+                    logger.opt(exception=error).error("Scheduled Work event publication failed")
                     raise
                 return ScheduledWorkTriggerResult(
                     status=result.status,

@@ -16,7 +16,6 @@ from myclaw.agent.turn import (
     model_message_from_session,
 )
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.logging.diagnostics import exception_logger
 from myclaw.logging.session import session_log
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -202,7 +201,9 @@ class StreamingConversationPort:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            exception_logger(error).error("Session title task failed type={}", type(error).__name__)
+            logger.opt(exception=error).error(
+                "Session title task failed type={}", type(error).__name__
+            )
             raise
 
     async def _generate_title_for_first_user(
@@ -267,7 +268,7 @@ class StreamingConversationPort:
         except Exception as failure:
             fallback_reason = None
             code = failure.error.code if isinstance(failure, ModelCallError) else "model_failed"
-            exception_logger(failure).warning(
+            logger.opt(exception=failure).warning(
                 "Session title fallback selected code={} type={}",
                 code,
                 type(failure).__name__,
@@ -336,7 +337,7 @@ async def _close_provider_stream(stream: AsyncIterator[ModelStreamEvent] | None)
     try:
         await close()
     except Exception as error:
-        exception_logger(error).warning(
+        logger.opt(exception=error).warning(
             "Session title stream cleanup failed type={}", type(error).__name__
         )
 
@@ -347,7 +348,7 @@ def _consume_task_exception(task: asyncio.Future[None]) -> None:
 
 
 def _log_title_persistence_failure(failure: Exception, *, operation: str) -> None:
-    exception_logger(failure).error(
+    logger.opt(exception=failure).error(
         "Session title failed code=persistence_error operation={} type={}",
         operation,
         type(failure).__name__,

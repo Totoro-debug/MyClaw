@@ -977,9 +977,7 @@ async def test_session_publication_failure_is_isolated_from_the_next_scheduled_w
     assert first_session.messages[-1].content == "First result was fully generated."
     second_session = await sessions.load(completed_task.session_id)
     assert second_session.messages[-1].content == "Second task remained isolated."
-    content = (state.logs_directory / f"{failed_task.session_id}.log").read_text(
-        encoding="utf-8"
-    )
+    content = (state.logs_directory / f"{failed_task.session_id}.log").read_text(encoding="utf-8")
     assert content.count(" ERROR ") == 1
     assert "myclaw.schedule.scheduled_work_execution:run:" in content
     assert "Scheduled Work failed code=persistence_error" in content
