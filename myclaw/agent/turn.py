@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
 from loguru import logger
@@ -27,6 +27,7 @@ from myclaw.provider.models import (
     ModelMessage,
     ModelProvider,
     ModelRequest,
+    ModelResponse,
     ModelStreamEvent,
     ModelUsage,
     ReasoningEffort,
@@ -42,6 +43,7 @@ from myclaw.session.records import (
     ToolSessionMessage,
     UserSessionMessage,
 )
+from myclaw.session.session import Session
 from myclaw.session.session_store import SessionStore
 from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.tool_artifacts import ArtifactWriteError
@@ -118,8 +120,9 @@ class AgentTurn:
         *,
         lane: AgentTurnLane,
         provider: ModelProvider,
-        sessions: SessionStore,
-        session_id: str,
+        session: Session | None = None,
+        sessions: SessionStore | None = None,
+        session_id: str | None = None,
         settings: AgentTurnModelSettings,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
@@ -135,8 +138,14 @@ class AgentTurn:
     ) -> None:
         self._lane = lane
         self._provider = provider
-        self._sessions = sessions
-        self._session_id = session_id
+        if session is None:
+            if sessions is None or session_id is None:
+                raise TypeError("Legacy AgentTurn requires sessions and session_id")
+        elif sessions is not None or session_id is not None:
+            raise TypeError("Session AgentTurn cannot receive a SessionStore or session ID")
+        self._session = session
+        self._sessions = cast(SessionStore, sessions)
+        self._session_id = session.session_id if session is not None else cast(str, session_id)
         self._settings = settings
         self._now = now
         self._new_uuid = new_uuid
@@ -147,33 +156,41 @@ class AgentTurn:
         self._cancel_requested = cancel_requested or _never_cancelled
         self._externalize_result = externalize_result or _inline_tool_result
         self._on_terminal_failure = on_terminal_failure
+        self._session_persist_requested = False
 
     async def run(self, text: str) -> AsyncGenerator[AgentTurnPayload, None]:
+        self._session_persist_requested = False
         yield TurnStartedPayload()
 
-        user_message = UserSessionMessage(
-            id=str(self._new_uuid()),
-            created_at=self._persisted_now(),
-            content=text,
-        )
-        try:
-            await self._sessions.append_message(self._session_id, user_message)
-        except asyncio.CancelledError:
-            if self._lane == "scheduled_work":
-                raise
-            yield await self._cancelled_payload([], [])
-            return
-        except _PERSISTENCE_EXCEPTIONS as failure:
-            if self._lane == "foreground":
-                _log_persistence_failure(failure, operation="session_append")
-            else:
-                self._capture_terminal_failure(failure)
-            yield TurnFailedPayload(error=self._session_update_failure)
-            return
+        current_session_user: dict[str, Any] | None = None
+        user_message: UserSessionMessage | None = None
+        if self._session is not None:
+            self._session.add_message("user", text)
+            current_session_user = self._session.messages[-1]
+        else:
+            user_message = UserSessionMessage(
+                id=str(self._new_uuid()),
+                created_at=self._persisted_now(),
+                content=text,
+            )
+            try:
+                await self._sessions.append_message(self._session_id, user_message)
+            except asyncio.CancelledError:
+                if self._lane == "scheduled_work":
+                    raise
+                yield await self._cancelled_payload([], [])
+                return
+            except _PERSISTENCE_EXCEPTIONS as failure:
+                if self._lane == "foreground":
+                    _log_persistence_failure(failure, operation="session_append")
+                else:
+                    self._capture_terminal_failure(failure)
+                yield TurnFailedPayload(error=self._session_update_failure)
+                return
         if self._lane == "foreground" and self._cancel_requested():
             yield await self._cancelled_payload([], [])
             return
-        if self._after_user_published is not None:
+        if self._after_user_published is not None and user_message is not None:
             self._after_user_published(user_message)
 
         partial_content: list[str] = []
@@ -183,18 +200,22 @@ class AgentTurn:
         try:
             while True:
                 partial_content = []
-                try:
-                    session = await self._sessions.load(self._session_id)
-                except _PERSISTENCE_EXCEPTIONS as failure:
-                    if self._lane == "foreground":
-                        _log_persistence_failure(failure, operation="session_read")
-                    else:
-                        self._capture_terminal_failure(failure)
-                    yield TurnFailedPayload(error=self._session_read_failure)
-                    return
-                if self._history_preparer is not None:
-                    session = await self._history_preparer(session)
-                request = self._model_request(session, current_user=user_message)
+                if current_session_user is not None:
+                    request = self._session_model_request(current_session_user)
+                else:
+                    try:
+                        session = await self._sessions.load(self._session_id)
+                    except _PERSISTENCE_EXCEPTIONS as failure:
+                        if self._lane == "foreground":
+                            _log_persistence_failure(failure, operation="session_read")
+                        else:
+                            self._capture_terminal_failure(failure)
+                        yield TurnFailedPayload(error=self._session_read_failure)
+                        return
+                    if self._history_preparer is not None:
+                        session = await self._history_preparer(session)
+                    assert user_message is not None
+                    request = self._model_request(session, current_user=user_message)
                 if self._lane == "foreground":
                     cleanup_failure = await _close_provider_stream(provider_stream)
                     if cleanup_failure is not None:
@@ -224,55 +245,65 @@ class AgentTurn:
                         raise _unexpected_provider_failure()
 
                     response = model_event.response
-                    try:
-                        assistant_message = AssistantSessionMessage(
-                            id=str(self._new_uuid()),
-                            created_at=self._persisted_now(),
-                            content=response.message.content,
-                            tool_calls=response.message.tool_calls,
-                            status="completed",
-                            error=None,
-                            usage=response.usage,
-                        )
-                    except ValueError:
-                        if self._lane == "foreground":
-                            raise _unexpected_provider_failure() from None
-                        raise
-                    try:
-                        await self._sessions.append_message(
-                            self._session_id,
-                            assistant_message,
-                        )
-                    except asyncio.CancelledError:
-                        if self._lane == "scheduled_work":
+                    if self._session is not None:
+                        try:
+                            self._add_session_assistant(response)
+                        except ValueError:
+                            if self._lane == "foreground":
+                                raise _unexpected_provider_failure() from None
                             raise
-                        publication = await self._session_message_publication(assistant_message)
-                        if publication is True:
-                            partial_content.clear()
-                            pending_tool_calls = list(assistant_message.tool_calls)
-                        raise
-                    except _PERSISTENCE_EXCEPTIONS as failure:
-                        if self._lane == "foreground":
-                            _log_persistence_failure(failure, operation="session_append")
-                        else:
-                            self._capture_terminal_failure(failure)
-                        if self._lane == "foreground":
+                    else:
+                        try:
+                            assistant_message = AssistantSessionMessage(
+                                id=str(self._new_uuid()),
+                                created_at=self._persisted_now(),
+                                content=response.message.content,
+                                tool_calls=response.message.tool_calls,
+                                status="completed",
+                                error=None,
+                                usage=response.usage,
+                            )
+                        except ValueError:
+                            if self._lane == "foreground":
+                                raise _unexpected_provider_failure() from None
+                            raise
+                        try:
+                            await self._sessions.append_message(
+                                self._session_id,
+                                assistant_message,
+                            )
+                        except asyncio.CancelledError:
+                            if self._lane == "scheduled_work":
+                                raise
                             publication = await self._session_message_publication(assistant_message)
                             if publication is True:
+                                partial_content.clear()
                                 pending_tool_calls = list(assistant_message.tool_calls)
-                                pending_repair_error = SessionError(
-                                    code="persistence_error",
-                                    message="Assistant response could not be persisted.",
+                            raise
+                        except _PERSISTENCE_EXCEPTIONS as failure:
+                            if self._lane == "foreground":
+                                _log_persistence_failure(failure, operation="session_append")
+                            else:
+                                self._capture_terminal_failure(failure)
+                            if self._lane == "foreground":
+                                publication = await self._session_message_publication(
+                                    assistant_message
                                 )
-                                try:
-                                    await self._repair_unfinished_tool_calls(
-                                        pending_tool_calls,
-                                        error=pending_repair_error,
+                                if publication is True:
+                                    pending_tool_calls = list(assistant_message.tool_calls)
+                                    pending_repair_error = SessionError(
+                                        code="persistence_error",
+                                        message="Assistant response could not be persisted.",
                                     )
-                                except _PERSISTENCE_EXCEPTIONS:
-                                    pass
-                        yield TurnFailedPayload(error=self._session_update_failure)
-                        return
+                                    try:
+                                        await self._repair_unfinished_tool_calls(
+                                            pending_tool_calls,
+                                            error=pending_repair_error,
+                                        )
+                                    except _PERSISTENCE_EXCEPTIONS:
+                                        pass
+                            yield TurnFailedPayload(error=self._session_update_failure)
+                            return
 
                     partial_content = []
                     if response.message.tool_calls and self._tool_gateway is not None:
@@ -311,52 +342,55 @@ class AgentTurn:
                                     artifact=None,
                                 )
 
-                            tool_message = _tool_session_message(
-                                result,
-                                message_id=str(self._new_uuid()),
-                                created_at=self._persisted_now(),
-                            )
-                            try:
-                                await self._sessions.append_message(
-                                    self._session_id,
-                                    tool_message,
+                            if self._session is not None:
+                                self._add_session_tool(result)
+                            else:
+                                tool_message = _tool_session_message(
+                                    result,
+                                    message_id=str(self._new_uuid()),
+                                    created_at=self._persisted_now(),
                                 )
-                            except _PERSISTENCE_EXCEPTIONS as failure:
-                                if self._lane == "foreground":
-                                    _log_persistence_failure(
-                                        failure,
-                                        operation="session_append",
+                                try:
+                                    await self._sessions.append_message(
+                                        self._session_id,
+                                        tool_message,
                                     )
-                                    publication = await self._session_message_publication(
-                                        tool_message
-                                    )
-                                    if publication is True:
-                                        pending_tool_calls.pop(0)
-                                    pending_repair_error = SessionError(
-                                        code="persistence_error",
-                                        message="Tool result could not be persisted.",
-                                    )
-                                    try:
-                                        await self._repair_unfinished_tool_calls(
-                                            pending_tool_calls,
-                                            error=pending_repair_error,
+                                except _PERSISTENCE_EXCEPTIONS as failure:
+                                    if self._lane == "foreground":
+                                        _log_persistence_failure(
+                                            failure,
+                                            operation="session_append",
                                         )
-                                    except _PERSISTENCE_EXCEPTIONS:
-                                        pass
-                                else:
-                                    self._capture_terminal_failure(failure)
-                                yield TurnFailedPayload(error=self._session_update_failure)
-                                return
-                            except asyncio.CancelledError:
-                                if self._lane == "foreground":
-                                    publication = await self._session_message_publication(
-                                        tool_message
-                                    )
-                                    if publication is True:
-                                        pending_tool_calls.pop(0)
-                                raise
-                            except BaseException:
-                                raise
+                                        publication = await self._session_message_publication(
+                                            tool_message
+                                        )
+                                        if publication is True:
+                                            pending_tool_calls.pop(0)
+                                        pending_repair_error = SessionError(
+                                            code="persistence_error",
+                                            message="Tool result could not be persisted.",
+                                        )
+                                        try:
+                                            await self._repair_unfinished_tool_calls(
+                                                pending_tool_calls,
+                                                error=pending_repair_error,
+                                            )
+                                        except _PERSISTENCE_EXCEPTIONS:
+                                            pass
+                                    else:
+                                        self._capture_terminal_failure(failure)
+                                    yield TurnFailedPayload(error=self._session_update_failure)
+                                    return
+                                except asyncio.CancelledError:
+                                    if self._lane == "foreground":
+                                        publication = await self._session_message_publication(
+                                            tool_message
+                                        )
+                                        if publication is True:
+                                            pending_tool_calls.pop(0)
+                                    raise
+                                except BaseException:
+                                    raise
                             pending_tool_calls.pop(0)
                             yield ToolCompletedPayload(
                                 tool_call_id=result.tool_call_id,
@@ -371,6 +405,7 @@ class AgentTurn:
                                 )
                                 return
                         break
+                    self._persist_session_once()
                     yield TurnCompletedPayload(
                         content=response.message.content,
                         usage=response.usage,
@@ -391,37 +426,45 @@ class AgentTurn:
                 )
                 return
             terminal_error = failure.error
-            error_message = AssistantSessionMessage(
-                id=str(self._new_uuid()),
-                created_at=self._persisted_now(),
-                content="".join(partial_content) if self._lane == "foreground" else "",
-                tool_calls=(),
-                status="error",
-                error=SessionError(
-                    code=failure.error.code,
-                    message=failure.error.message,
-                ),
-                usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
-            )
             terminal_persistence_failure: Exception | None = None
-            try:
-                await self._sessions.append_message(
-                    self._session_id,
-                    error_message,
+            if self._session is not None:
+                self._add_session_assistant(
+                    content="".join(partial_content) if self._lane == "foreground" else "",
+                    status="error",
+                    error={"code": failure.error.code, "message": failure.error.message},
+                    usage=_zero_assistant_usage(),
                 )
-            except asyncio.CancelledError:
-                if self._lane == "scheduled_work":
-                    raise
-                if await self._session_message_publication(error_message) is True:
-                    partial_content.clear()
-                yield await self._cancelled_payload(
-                    partial_content,
-                    pending_tool_calls,
+            else:
+                error_message = AssistantSessionMessage(
+                    id=str(self._new_uuid()),
+                    created_at=self._persisted_now(),
+                    content="".join(partial_content) if self._lane == "foreground" else "",
+                    tool_calls=(),
+                    status="error",
+                    error=SessionError(
+                        code=failure.error.code,
+                        message=failure.error.message,
+                    ),
+                    usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
                 )
-                return
-            except _PERSISTENCE_EXCEPTIONS as persistence_failure:
-                terminal_error = self._session_update_failure
-                terminal_persistence_failure = persistence_failure
+                try:
+                    await self._sessions.append_message(
+                        self._session_id,
+                        error_message,
+                    )
+                except asyncio.CancelledError:
+                    if self._lane == "scheduled_work":
+                        raise
+                    if await self._session_message_publication(error_message) is True:
+                        partial_content.clear()
+                    yield await self._cancelled_payload(
+                        partial_content,
+                        pending_tool_calls,
+                    )
+                    return
+                except _PERSISTENCE_EXCEPTIONS as persistence_failure:
+                    terminal_error = self._session_update_failure
+                    terminal_persistence_failure = persistence_failure
             if self._lane == "foreground":
                 _log_model_failure(failure)
                 if terminal_persistence_failure is not None:
@@ -437,6 +480,7 @@ class AgentTurn:
                         [failure, terminal_persistence_failure],
                     )
                 self._capture_terminal_failure(diagnostic)
+            self._persist_session_once()
             yield TurnFailedPayload(error=terminal_error)
             return
         except GeneratorExit:
@@ -467,6 +511,95 @@ class AgentTurn:
                 cleanup_failure = await _close_provider_stream(provider_stream)
                 if cleanup_failure is not None:
                     _log_cleanup_failure(cleanup_failure)
+            self._persist_session_once()
+
+    def _session_model_request(self, current_user: dict[str, Any]) -> ModelRequest:
+        session = self._session
+        assert session is not None
+        messages: list[ModelMessage] = []
+        for message in session.messages[session.last_consolidated :]:
+            if message is current_user:
+                timestamp = message["timestamp"]
+                if not isinstance(timestamp, str):
+                    raise TypeError("Session user timestamp must be a string")
+                messages.append(
+                    UserModelMessage(
+                        content=current_user_input(
+                            content=message["content"],
+                            current_time=datetime.fromisoformat(timestamp),
+                            session_id=session.session_id,
+                        )
+                    )
+                )
+                continue
+            model_message = model_message_from_session(message)
+            if model_message is not None:
+                messages.append(model_message)
+        return ModelRequest(
+            request_id=self._new_uuid(),
+            route="chat" if self._lane == "foreground" else "cron",
+            system_prompt=self._system_prompt,
+            messages=tuple(messages),
+            tools=() if self._tool_gateway is None else self._tool_gateway.schemas,
+            stream=self._lane == "foreground",
+            model=self._settings.model,
+            max_output=self._settings.max_output,
+            temperature=self._settings.temperature,
+            reasoning_effort=self._settings.reasoning_effort,
+            timeout_seconds=self._settings.timeout_seconds,
+        )
+
+    def _add_session_assistant(
+        self,
+        response: ModelResponse | None = None,
+        *,
+        content: str | None = None,
+        status: str = "completed",
+        error: dict[str, str] | None = None,
+        usage: dict[str, int] | None = None,
+    ) -> None:
+        session = self._session
+        assert session is not None
+        if response is not None:
+            message = response.message
+            session.add_message(
+                "assistant",
+                message.content,
+                tool_calls=[tool_call.to_dict() for tool_call in message.tool_calls],
+                status="completed",
+                error=None,
+                token_usage=_assistant_token_usage(response.usage),
+            )
+            return
+        session.add_message(
+            "assistant",
+            content or "",
+            tool_calls=[],
+            status=status,
+            error=error,
+            token_usage=usage or _zero_assistant_usage(),
+        )
+
+    def _add_session_tool(self, result: ToolResult) -> None:
+        session = self._session
+        assert session is not None
+        session.add_message(
+            "tool",
+            result.content,
+            tool_call_id=result.tool_call_id,
+            name=result.name,
+            status=result.status,
+            artifact=None if result.artifact is None else result.artifact.to_dict(),
+        )
+
+    def _persist_session_once(self) -> None:
+        if self._session is None or self._session_persist_requested:
+            return
+        self._session_persist_requested = True
+        try:
+            self._session.persist()
+        except Exception:
+            pass
 
     def _capture_terminal_failure(self, error: BaseException) -> None:
         if self._on_terminal_failure is not None:
@@ -528,6 +661,20 @@ class AgentTurn:
         partial_chunks: list[str],
         pending_tool_calls: list[ModelToolCall],
     ) -> None:
+        if self._session is not None:
+            if partial_chunks:
+                self._add_session_assistant(
+                    content="".join(partial_chunks),
+                    status="interrupted",
+                    error={
+                        "code": "turn_cancelled",
+                        "message": "Turn interrupted by user.",
+                    },
+                    usage=_zero_assistant_usage(),
+                )
+            await self._repair_unfinished_tool_calls(pending_tool_calls)
+            self._persist_session_once()
+            return
         partial_content = "".join(partial_chunks)
         if partial_content:
             try:
@@ -559,6 +706,24 @@ class AgentTurn:
         *,
         error: SessionError | None = None,
     ) -> None:
+        if self._session is not None:
+            while pending_tool_calls:
+                tool_call = pending_tool_calls[0]
+                failure = error or SessionError(
+                    code="turn_cancelled",
+                    message="Tool call interrupted because the turn was cancelled.",
+                )
+                self._add_session_tool(
+                    ToolResult(
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                        content=failure.message,
+                        status="error",
+                        artifact=None,
+                    )
+                )
+                pending_tool_calls.pop(0)
+            return
         while pending_tool_calls:
             tool_call = pending_tool_calls[0]
             failure = error or SessionError(
@@ -594,6 +759,18 @@ class AgentTurn:
         self,
         unfinished_tool_calls: tuple[ModelToolCall, ...],
     ) -> None:
+        if self._session is not None:
+            for unfinished in unfinished_tool_calls:
+                self._add_session_tool(
+                    ToolResult(
+                        tool_call_id=unfinished.id,
+                        name=unfinished.name,
+                        content="Scheduled Work tool call cancelled.",
+                        status="error",
+                        artifact=None,
+                    )
+                )
+            return
         for unfinished in unfinished_tool_calls:
             try:
                 await self._sessions.append_message(
@@ -744,10 +921,25 @@ def _inline_tool_result(result: ToolResult) -> ToolResult:
     return result
 
 
+def _assistant_token_usage(usage: ModelUsage) -> dict[str, int]:
+    return {"model_calls": 1, **usage.to_dict()}
+
+
+def _zero_assistant_usage() -> dict[str, int]:
+    return {
+        "model_calls": 1,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
 def model_message_from_session(
-    message: SessionMessage,
+    message: SessionMessage | dict[str, Any],
 ) -> UserModelMessage | AssistantModelMessage | ToolModelMessage | None:
     """Project persisted conversation history into the next provider request."""
+    if isinstance(message, dict):
+        return _model_message_from_json(message)
     if isinstance(message, UserSessionMessage):
         return UserModelMessage(content=message.content)
     if isinstance(message, AssistantSessionMessage):
@@ -766,3 +958,48 @@ def model_message_from_session(
             content=message.content,
         )
     raise TypeError("Unsupported Short-term Memory message")
+
+
+def _model_message_from_json(
+    message: dict[str, Any],
+) -> UserModelMessage | AssistantModelMessage | ToolModelMessage | None:
+    role = message.get("role")
+    if role == "user":
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise TypeError("Session user content must be a string")
+        return UserModelMessage(content=content)
+    if role == "assistant":
+        content = message.get("content")
+        tool_calls = message.get("tool_calls")
+        status = message.get("status")
+        if not isinstance(content, str) or not isinstance(tool_calls, list):
+            raise TypeError("Session assistant message is malformed")
+        projected_tool_calls = tuple(
+            ModelToolCall(
+                id=tool_call["id"],
+                name=tool_call["name"],
+                arguments=tool_call["arguments"],
+            )
+            for tool_call in tool_calls
+        )
+        if status == "error" and not content and not projected_tool_calls:
+            return None
+        if status == "interrupted":
+            return AssistantModelMessage(
+                content=interrupted_assistant_content(content),
+                tool_calls=projected_tool_calls,
+            )
+        return AssistantModelMessage(content=content, tool_calls=projected_tool_calls)
+    if role == "tool":
+        tool_call_id = message.get("tool_call_id")
+        name = message.get("name")
+        content = message.get("content")
+        if not all(isinstance(value, str) for value in (tool_call_id, name, content)):
+            raise TypeError("Session tool message is malformed")
+        return ToolModelMessage(
+            tool_call_id=cast(str, tool_call_id),
+            name=cast(str, name),
+            content=cast(str, content),
+        )
+    raise TypeError("Unsupported Session message role")

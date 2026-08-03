@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import cast
 from uuid import UUID, uuid4
 
 from loguru import logger
@@ -28,6 +29,7 @@ from myclaw.provider.models import (
     UserModelMessage,
 )
 from myclaw.session.records import ConversationSession, MetadataUpdate, UserSessionMessage
+from myclaw.session.session import Session
 from myclaw.session.session_store import SessionStore
 from myclaw.session.session_titles import normalize_session_title
 from myclaw.tools.tool_gateway import ToolGateway
@@ -53,8 +55,9 @@ class StreamingConversationPort:
         self,
         *,
         provider: ModelProvider,
-        sessions: SessionStore,
-        session_id: str,
+        session: Session | None = None,
+        sessions: SessionStore | None = None,
+        session_id: str | None = None,
         settings: ChatModelSettings,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
@@ -69,9 +72,15 @@ class StreamingConversationPort:
         workspace_state: WorkspaceState | None = None,
         title_log_ready: Callable[[], Awaitable[object]] | None = None,
     ) -> None:
+        if session is None:
+            if sessions is None or session_id is None:
+                raise TypeError("Legacy Conversation Port requires sessions and session_id")
+        elif sessions is not None or session_id is not None:
+            raise TypeError("Session Conversation Port cannot receive a SessionStore or ID")
         self._provider = provider
-        self._sessions = sessions
-        self._session_id = session_id
+        self._session = session
+        self._sessions = cast(SessionStore, sessions)
+        self._session_id = session.session_id if session is not None else cast(str, session_id)
         self._settings = settings
         self._now = now
         self._new_uuid = new_uuid
@@ -89,6 +98,7 @@ class StreamingConversationPort:
         self._turn = AgentTurn(
             lane="foreground",
             provider=provider,
+            session=session,
             sessions=sessions,
             session_id=session_id,
             settings=settings,
