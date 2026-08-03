@@ -8,10 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
-
-from loguru import logger
 
 from myclaw.agent.prompts import (
     conversation_summary_input,
@@ -28,11 +26,9 @@ from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelProvider, ModelRequest, ReasoningEffort, UserModelMessage
 from myclaw.session.identifiers import require_session_id
 from myclaw.session.records import (
-    ConversationSession,
     MetadataUpdate,
-    SessionMessage,
-    UserSessionMessage,
 )
+from myclaw.session.session import Session
 from myclaw.session.session_store import SessionStore
 from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
@@ -332,8 +328,7 @@ class ConversationSummaryManager:
         self,
         *,
         provider: ModelProvider,
-        sessions: ConsolidationSessionStore,
-        summaries: ConsolidatingSummaryStore,
+        summaries: SummaryStore,
         settings: SummaryModelSettings,
         chat_context_window: int,
         chat_max_output: int,
@@ -344,7 +339,6 @@ class ConversationSummaryManager:
         new_uuid: Callable[[], UUID],
     ) -> None:
         self._provider = provider
-        self._sessions = sessions
         self._summaries = summaries
         self._settings = settings
         self._chat_context_window = chat_context_window
@@ -355,32 +349,12 @@ class ConversationSummaryManager:
         self._now = now
         self._new_uuid = new_uuid
 
-    async def recover_pending(self) -> None:
-        with without_session_log():
-            try:
-                recovered_count = await self._summaries.recover_pending(self._sessions)
-            except (OSError, UnicodeError, ValueError) as error:
-                logger.opt(exception=error).error(
-                    "Pending Conversation Summary recovery failed code=persistence_error"
-                )
-                raise ModelCallError(
-                    ErrorInfo(
-                        code="persistence_error",
-                        message="Pending Conversation Summary recovery could not complete.",
-                    )
-                ) from error
-            if recovered_count:
-                logger.warning(
-                    "Pending Conversation Summary recovery completed count={}",
-                    recovered_count,
-                )
-
-    async def prepare(self, session: ConversationSession) -> ConversationSession:
+    async def prepare(self, session: Session) -> Session:
         with without_session_log():
             return await self._prepare(session)
 
-    async def _prepare(self, session: ConversationSession) -> ConversationSession:
-        short_term = session.short_term_messages
+    async def _prepare(self, session: Session) -> Session:
+        short_term = _short_term_messages(session)
         available_input = self._chat_context_window - self._chat_max_output
         system_tokens = estimate_input_tokens(
             RuntimeStatusInput(
@@ -432,18 +406,7 @@ class ConversationSummaryManager:
             timeout_seconds=self._settings.timeout_seconds,
         )
         response = await self._provider.complete(request)
-        try:
-            await self._sessions.update_metadata(
-                session.metadata.id,
-                MetadataUpdate(usage_delta=response.usage),
-            )
-        except (OSError, UnicodeError, ValueError) as error:
-            raise ModelCallError(
-                ErrorInfo(
-                    code="persistence_error",
-                    message="Conversation Summary usage could not be persisted.",
-                )
-            ) from error
+        session.update_metadata(usage_delta={"model_calls": 1, **response.usage.to_dict()})
         if not response.message.content:
             raise ModelCallError(
                 ErrorInfo(
@@ -452,16 +415,13 @@ class ConversationSummaryManager:
                 )
             )
         try:
-            new_cursor = session.metadata.consolidation_cursor + cutoff
-            await self._summaries.commit_consolidation(
-                sessions=self._sessions,
-                session_id=session.metadata.id,
-                old_cursor=session.metadata.consolidation_cursor,
-                new_cursor=new_cursor,
+            new_cursor = session.last_consolidated + cutoff
+            await self._summaries.append(
                 content=response.message.content,
                 timestamp=self._persisted_now(),
             )
-            return await self._sessions.load(session.metadata.id)
+            session.last_consolidated = new_cursor
+            return session
         except (OSError, UnicodeError, ValueError) as error:
             raise ModelCallError(
                 ErrorInfo(
@@ -470,20 +430,24 @@ class ConversationSummaryManager:
                 )
             ) from error
 
-    def _chat_input(self, session: ConversationSession) -> RuntimeStatusInput:
-        short_term = session.short_term_messages
+    def _chat_input(self, session: Session) -> RuntimeStatusInput:
+        short_term = _short_term_messages(session)
         current_user_index = _last_user_index(short_term)
         retained: list[str] = []
         for index, message in enumerate(short_term):
             model_message = model_message_from_session(message)
             if model_message is None:
                 continue
-            if index == current_user_index and isinstance(message, UserSessionMessage):
+            if index == current_user_index and message.get("role") == "user":
+                content = message.get("content")
+                timestamp = message.get("timestamp")
+                if not isinstance(content, str) or not isinstance(timestamp, str):
+                    raise TypeError("Session user message is malformed")
                 model_message = UserModelMessage(
                     content=current_user_input(
-                        content=message.content,
-                        current_time=message.created_at,
-                        session_id=session.metadata.id,
+                        content=content,
+                        current_time=datetime.fromisoformat(timestamp),
+                        session_id=session.session_id,
                     )
                 )
             retained.append(
@@ -508,17 +472,21 @@ class ConversationSummaryManager:
         return value.replace(microsecond=value.microsecond // 1000 * 1000)
 
 
-def _aligned_cutoff(messages: tuple[SessionMessage, ...], initial: int) -> int:
+def _short_term_messages(session: Session) -> list[dict[str, Any]]:
+    return session.messages[session.last_consolidated :]
+
+
+def _aligned_cutoff(messages: list[dict[str, Any]], initial: int) -> int:
     for index in range(initial, len(messages)):
-        if isinstance(messages[index], UserSessionMessage):
+        if messages[index].get("role") == "user":
             return index
     for index in range(initial - 1, -1, -1):
-        if isinstance(messages[index], UserSessionMessage):
+        if messages[index].get("role") == "user":
             return index
     return 0
 
 
-def _token_cutoff(messages: tuple[SessionMessage, ...], input_budget: int) -> int:
+def _token_cutoff(messages: list[dict[str, Any]], input_budget: int) -> int:
     current_turn_start = _last_user_index(messages)
     target_bytes = input_budget // 2 * 4
     selected_bytes = 0
@@ -537,14 +505,14 @@ def _token_cutoff(messages: tuple[SessionMessage, ...], input_budget: int) -> in
     return current_turn_start
 
 
-def _last_user_index(messages: tuple[SessionMessage, ...]) -> int:
+def _last_user_index(messages: list[dict[str, Any]]) -> int:
     for index in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[index], UserSessionMessage):
+        if messages[index].get("role") == "user":
             return index
     return len(messages)
 
 
-def _summary_input(messages: tuple[SessionMessage, ...]) -> str:
+def _summary_input(messages: list[dict[str, Any]]) -> str:
     records = [
         model_message.to_dict()
         for message in messages

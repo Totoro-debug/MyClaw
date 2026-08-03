@@ -324,7 +324,7 @@ async def test_workspace_pending_journal_rejects_a_hard_link(
 
 
 @pytest.mark.asyncio
-async def test_runtime_routes_memory_and_summaries_to_the_current_workspace(
+async def test_runtime_routes_memory_without_legacy_summary_recovery(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -353,7 +353,7 @@ async def test_runtime_routes_memory_and_summaries_to_the_current_workspace(
             StreamScript(events=(ModelCompleted(response=_response(f"Answer {index}.")),))
             for index in range(1, 4)
         ),
-        completions=(_response("Workspace summary."),),
+        completions=(),
     )
     runtime = prepare_repl_runtime(
         agent_home=home,
@@ -376,9 +376,8 @@ async def test_runtime_routes_memory_and_summaries_to_the_current_workspace(
     assert "# Workspace Memory" in first_request.system_prompt
     assert "# Agent Home Memory" not in first_request.system_prompt
     assert memory_view.output == "# Workspace Memory\n"
-    assert "Workspace summary." in (state.memory_directory / "summary.jsonl").read_text(
-        encoding="utf-8"
-    )
+    assert not (state.memory_directory / "summary.jsonl").exists()
+    assert not (state.memory_directory / "pending-consolidations").exists()
     assert not (state.memory_directory / ".cursor").exists()
     assert state.long_term_memory_path.read_text(encoding="utf-8") == "# Workspace Memory\n"
     assert {path: path.read_bytes() for path in legacy_files} == legacy_files

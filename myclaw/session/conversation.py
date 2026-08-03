@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from loguru import logger
@@ -28,7 +28,7 @@ from myclaw.provider.models import (
     ReasoningEffort,
     UserModelMessage,
 )
-from myclaw.session.records import ConversationSession, MetadataUpdate, UserSessionMessage
+from myclaw.session.records import MetadataUpdate, UserSessionMessage
 from myclaw.session.session import Session
 from myclaw.session.session_store import SessionStore
 from myclaw.session.session_titles import normalize_session_title
@@ -65,9 +65,7 @@ class StreamingConversationPort:
         title_prompt: str | None = None,
         title_new_uuid: Callable[[], UUID] = uuid4,
         tool_gateway: ToolGateway | None = None,
-        history_preparer: (
-            Callable[[ConversationSession], Awaitable[ConversationSession]] | None
-        ) = None,
+        history_preparer: Callable[[Any], Awaitable[Any]] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
         workspace_state: WorkspaceState | None = None,
         title_log_ready: Callable[[], Awaitable[object]] | None = None,

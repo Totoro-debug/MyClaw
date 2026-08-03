@@ -128,9 +128,7 @@ class AgentTurn:
         new_uuid: Callable[[], UUID],
         system_prompt: str,
         tool_gateway: ToolGateway | None,
-        history_preparer: (
-            Callable[[ConversationSession], Awaitable[ConversationSession]] | None
-        ) = None,
+        history_preparer: Callable[[Any], Awaitable[Any]] | None = None,
         after_user_published: Callable[[UserSessionMessage], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
@@ -201,6 +199,11 @@ class AgentTurn:
             while True:
                 partial_content = []
                 if current_session_user is not None:
+                    if self._history_preparer is not None:
+                        prepared = await self._history_preparer(self._session)
+                        if not isinstance(prepared, Session):
+                            raise TypeError("Session history preparer must return a Session")
+                        self._session = prepared
                     request = self._session_model_request(current_session_user)
                 else:
                     try:

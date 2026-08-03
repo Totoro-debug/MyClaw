@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
+from typing import Any
 from uuid import UUID
 
 from loguru import logger
@@ -33,8 +34,6 @@ from myclaw.management.service import (
     RuntimeStatusService,
 )
 from myclaw.memory.conversation_summary import (
-    ConversationSummaryManager,
-    SummaryModelSettings,
     WorkspaceJsonlSummaryStore,
 )
 from myclaw.memory.memory_scheduler import MemoryTaskScheduler
@@ -287,9 +286,9 @@ class _DeferredConversationPort:
         system_prompt: str,
         title_prompt: str,
         tool_gateway: ToolGateway,
-        history_preparer: Callable[[ConversationSession], Awaitable[ConversationSession]],
-        before_submit: Callable[[], Awaitable[None]],
         on_foreground_terminal: Callable[[], None],
+        history_preparer: Callable[[Any], Awaitable[Any]] | None = None,
+        before_submit: Callable[[], Awaitable[None]] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
         workspace_state: WorkspaceState | None = None,
     ) -> None:
@@ -333,7 +332,8 @@ class _DeferredConversationPort:
             correlation = session_log(self._workspace_state, self._session_id)
         with correlation:
             try:
-                await self._before_submit()
+                if self._before_submit is not None:
+                    await self._before_submit()
                 if self._close_task is not None:
                     raise RuntimeError("Conversation Port is closed")
                 delegate = self._delegate
@@ -535,25 +535,6 @@ def _prepare_repl_runtime(
     )
     resolved_memory = configuration.resolve_route("memory")
     summaries = WorkspaceJsonlSummaryStore(workspace_state)
-    summary_manager = ConversationSummaryManager(
-        provider=router,
-        sessions=sessions,
-        summaries=summaries,
-        settings=SummaryModelSettings(
-            model=resolved_memory.route.model,
-            max_output=resolved_memory.route.max_output,
-            temperature=resolved_memory.route.temperature,
-            reasoning_effort=resolved_memory.route.reasoning_effort,
-            timeout_seconds=resolved_memory.route.timeout,
-        ),
-        chat_context_window=resolved.route.context_window,
-        chat_max_output=resolved.route.max_output,
-        consolidation_message_threshold=(configuration.memory.consolidation_message_threshold),
-        chat_system_prompt=system_prompt,
-        tools=tool_gateway.schemas,
-        now=now,
-        new_uuid=new_uuid,
-    )
     memory_manager = MemoryManager(
         provider=router,
         summaries=summaries,
@@ -670,8 +651,6 @@ def _prepare_repl_runtime(
             system_prompt=system_prompt,
             title_prompt=session_title_prompt(),
             tool_gateway=session_tool_gateway,
-            history_preparer=summary_manager.prepare,
-            before_submit=summary_manager.recover_pending,
             on_foreground_terminal=capture_foreground_chat_status,
             externalize_result=externalize_result_for(session_id),
             workspace_state=workspace_state,
