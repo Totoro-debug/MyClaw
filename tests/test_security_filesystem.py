@@ -2,6 +2,7 @@ import json
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -52,12 +53,13 @@ def _artifact_directory(workspace: Path, session_id: str = SESSION_ID) -> Path:
 
 
 def _artifact_session(state: WorkspaceState) -> Session:
-    return Session._create_with_id(
+    session = Session.create(
         state,
-        SESSION_ID,
-        datetime(2026, 7, 13, 4, tzinfo=UTC),
-        title="Artifact test",
+        now=lambda: datetime(2026, 7, 13, 4, tzinfo=UTC),
+        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
     )
+    session.update_metadata(title="Artifact test")
+    return session
 
 
 def _create_directory_alias(alias: Path, target: Path) -> None:

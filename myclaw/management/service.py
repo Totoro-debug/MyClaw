@@ -14,6 +14,7 @@ from myclaw.config.config import ConfigLoader, ConfigView
 from myclaw.errors import ErrorInfo
 from myclaw.memory.memory_task import MemoryStore, MemoryTaskResult
 from myclaw.session.session import Session
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_nonnegative_int, require_nonnegative_number
 
@@ -296,12 +297,13 @@ class ManagementViewService:
         workspace_state = self._workspace_state
         if workspace_state is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
-        if not workspace_state.sessions_directory.exists():
-            return SessionListingReport(sessions=(), skipped_count=0)
         summaries: list[SessionListingEntry] = []
         skipped_count = 0
         try:
-            paths = tuple(workspace_state.sessions_directory.glob("*.jsonl"))
+            sessions_directory = workspace_state.existing_sessions_directory()
+            if sessions_directory is None:
+                return SessionListingReport(sessions=(), skipped_count=0)
+            paths = tuple(HOST_FILESYSTEM.path_for_io(sessions_directory).glob("*.jsonl"))
         except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Conversation Sessions could not be listed.")

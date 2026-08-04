@@ -64,6 +64,41 @@ class WorkspaceState:
     def long_term_memory_path(self) -> Path:
         return self.memory_directory / "memory.md"
 
+    def existing_sessions_directory(self) -> Path | None:
+        """Return the validated sessions directory without materializing state."""
+        workspace_root = self._owned_workspace_root()
+        state_root = self._existing_owned_directory(self.path, within=workspace_root)
+        if state_root is None:
+            return None
+        return self._existing_owned_directory(self.sessions_directory, within=state_root)
+
+    def prepare_sessions_directory(self) -> Path:
+        """Lazily prepare and validate the owned sessions directory for writes."""
+        workspace_root = self._owned_workspace_root()
+        state_path = HOST_FILESYSTEM.path_for_io(self.path)
+        if not _path_entry_exists(state_path):
+            state_path.mkdir(exist_ok=True)
+        state_root = HOST_FILESYSTEM.require_owned_directory(
+            state_path,
+            within=workspace_root,
+        )
+
+        sessions_path = HOST_FILESYSTEM.path_for_io(self.sessions_directory)
+        if not _path_entry_exists(sessions_path):
+            sessions_path.mkdir(exist_ok=True)
+        return HOST_FILESYSTEM.require_owned_directory(sessions_path, within=state_root)
+
+    def _owned_workspace_root(self) -> Path:
+        workspace_path = HOST_FILESYSTEM.path_for_io(Path(self.workspace.path))
+        return HOST_FILESYSTEM.require_owned_directory(workspace_path, within=workspace_path)
+
+    @staticmethod
+    def _existing_owned_directory(path: Path, *, within: Path) -> Path | None:
+        io_path = HOST_FILESYSTEM.path_for_io(path)
+        if not _path_entry_exists(io_path):
+            return None
+        return HOST_FILESYSTEM.require_owned_directory(io_path, within=within)
+
     def initialize(self, *, agent_home_root: Path) -> None:
         """Create required base state while rejecting redirected known paths."""
         try:
@@ -104,3 +139,11 @@ class WorkspaceState:
             raise WorkspaceStateError(affected) from error
         except RuntimeError as error:
             raise WorkspaceStateError(self.path) from error
+
+
+def _path_entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True

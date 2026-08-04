@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any
 from uuid import UUID
 
 from loguru import logger
@@ -298,7 +297,7 @@ class _DeferredConversationPort:
         title_prompt: str,
         tool_gateway: ToolGateway,
         on_foreground_terminal: Callable[[], None],
-        history_preparer: Callable[[Any], Awaitable[Any]] | None = None,
+        history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
         before_submit: Callable[[], Awaitable[None]] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
     ) -> None:
@@ -601,7 +600,6 @@ def _prepare_repl_runtime(
     scheduled_work_runner = ScheduledWorkRunner(
         provider=router,
         workspace_state=workspace_state,
-        workspace=Path(workspace_identity.path),
         long_term_memory=long_term_memory,
         settings=ScheduledWorkModelSettings(
             model=resolved_cron.route.model,

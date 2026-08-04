@@ -15,7 +15,7 @@ from stat import (
     S_ISDIR,
     S_ISREG,
 )
-from typing import Final, Protocol
+from typing import Final, NoReturn, Protocol
 
 type FileIdentity = tuple[int, int, int, int]
 
@@ -240,7 +240,7 @@ class HostFilesystem:
         """Return an ordinary contained directory or reject an unsafe path."""
         owned_root = self._require_owned_root(within)
         status = path.lstat()
-        resolved = self._adapter.resolved_for_comparison(path)
+        resolved = self._resolved_existing_path(path)
         if not self._adapter.is_directory(status) or not resolved.is_relative_to(owned_root):
             _raise_unsafe(path)
         return resolved
@@ -249,7 +249,7 @@ class HostFilesystem:
         """Return an ordinary singly linked contained file or reject an unsafe path."""
         owned_root = self._require_owned_root(within)
         status = path.lstat()
-        resolved = self._adapter.resolved_for_comparison(path)
+        resolved = self._resolved_existing_path(path)
         if (
             not self._adapter.is_regular_file(status)
             or status.st_nlink != 1
@@ -265,7 +265,7 @@ class HostFilesystem:
         owned_root = self._require_owned_root(within)
         opened = os.fstat(descriptor)
         current = path.lstat()
-        resolved = self._adapter.resolved_for_comparison(path)
+        resolved = self._resolved_existing_path(path)
         if (
             not self._adapter.is_regular_file(opened)
             or opened.st_nlink != 1
@@ -353,13 +353,19 @@ class HostFilesystem:
 
     def _require_owned_root(self, path: Path) -> Path:
         status = path.lstat()
-        resolved = self._adapter.resolved_for_comparison(path)
+        resolved = self._resolved_existing_path(path)
         if not self._adapter.is_directory(status):
             _raise_unsafe(path)
         return resolved
 
+    def _resolved_existing_path(self, path: Path) -> Path:
+        try:
+            return self._adapter.resolved_for_comparison(path)
+        except (OSError, RuntimeError):
+            _raise_unsafe(path)
 
-def _raise_unsafe(path: Path) -> None:
+
+def _raise_unsafe(path: Path) -> NoReturn:
     raise UnsafeFilesystemPath(EACCES, "Owned path is unavailable or unsafe", str(path))
 
 

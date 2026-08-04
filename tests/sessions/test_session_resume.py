@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,13 +31,8 @@ def _state(workspace: Path, agent_home: Path) -> WorkspaceState:
 
 
 def _session(state: WorkspaceState, session_uuid: UUID, title: str) -> Session:
-    session = Session._create_with_id(
-        state,
-        f"20260801-120000-123000_{session_uuid}",
-        NOW,
-        title=title,
-        now=lambda: NOW,
-    )
+    session = Session.create(state, now=lambda: NOW, new_uuid=lambda: session_uuid)
+    session.update_metadata(title=title)
     session.add_message("user", f"History for {title}.")
     return session
 
@@ -84,6 +80,42 @@ async def test_resume_listing_skips_corrupt_entries_without_mutating_them(
     assert listing.skipped_count == 1
     assert [item.id for item in listing.sessions] == [valid.session_id]
     assert corrupt_path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_resume_listing_skips_a_session_with_malformed_field_types(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = _state(workspace, agent_home)
+    valid = _session(state, FIRST_UUID, "Valid session")
+    valid.close()
+    corrupt_id = "20260801-120000-123000_6fa459ea-ee8a-4ca4-894e-db77e160355e"
+    corrupt_path = state.sessions_directory / f"{corrupt_id}.jsonl"
+    corrupt_path.write_text(
+        json.dumps(
+            {
+                "session_id": corrupt_id,
+                "created_at": "2026-08-01T12:00:00.123+08:00",
+                "updated_at": "2026-08-01T12:00:00.123+08:00",
+                "last_consolidated": 0,
+                "metadata": {
+                    "title": "Corrupt session",
+                    "token_usage": "not-an-object",
+                },
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    listing = await ManagementViewService(home, workspace_state=state).resumable_listing()
+
+    assert listing.skipped_count == 1
+    assert [item.id for item in listing.sessions] == [valid.session_id]
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
 from uuid import UUID, uuid4
 
 from loguru import logger
@@ -60,7 +59,7 @@ class StreamingConversationPort:
         title_prompt: str | None = None,
         title_new_uuid: Callable[[], UUID] = uuid4,
         tool_gateway: ToolGateway | None = None,
-        history_preparer: Callable[[Any], Awaitable[Any]] | None = None,
+        history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
         workspace_state: WorkspaceState | None = None,
         title_log_ready: Callable[[], Awaitable[object]] | None = None,
@@ -249,14 +248,8 @@ class StreamingConversationPort:
                 fallback_type,
                 fallback_reason,
             )
-        try:
-            token_delta = (
-                None if usage_delta is None else {"model_calls": 1, **usage_delta.to_dict()}
-            )
-            session.update_metadata(title=title_candidate, usage_delta=token_delta)
-            session.persist()
-        except (OSError, UnicodeError, ValueError) as failure:
-            _log_title_persistence_failure(failure, operation="metadata_update")
+        token_delta = None if usage_delta is None else {"model_calls": 1, **usage_delta.to_dict()}
+        session.update_metadata(title=title_candidate, usage_delta=token_delta)
 
     async def cancel_active_turn(self) -> None:
         if self._cancel_requested:
@@ -306,11 +299,3 @@ async def _close_provider_stream(stream: AsyncIterator[ModelStreamEvent] | None)
 def _consume_task_exception(task: asyncio.Future[None]) -> None:
     if not task.cancelled():
         task.exception()
-
-
-def _log_title_persistence_failure(failure: Exception, *, operation: str) -> None:
-    logger.opt(exception=failure).error(
-        "Session title failed code=persistence_error operation={} type={}",
-        operation,
-        type(failure).__name__,
-    )

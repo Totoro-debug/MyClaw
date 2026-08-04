@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -130,7 +131,13 @@ async def test_scheduled_work_preserves_tool_call_relationships(
 
     assert result.status == "completed"
     messages = Session.load(state, TASK_SESSION_ID).messages
-    assert messages[1]["tool_calls"] == [tool_call.to_dict()]
+    assert messages[1]["tool_calls"] == [
+        {
+            "id": "call_read",
+            "name": "read_file",
+            "arguments": '{"path":"README.md"}',
+        }
+    ]
     assert messages[2]["tool_call_id"] == "call_read"
     assert messages[2]["name"] == "read_file"
     assert messages[2]["content"] == "README contents"
@@ -158,3 +165,39 @@ async def test_scheduled_model_failure_is_recorded_as_an_assistant_error(
         "code": "model_failed",
         "message": "Model unavailable.",
     }
+
+
+@pytest.mark.asyncio
+async def test_scheduled_work_returns_a_safe_error_for_malformed_session_field_types(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    path = state.sessions_directory / f"{TASK_SESSION_ID}.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "session_id": TASK_SESSION_ID,
+                "created_at": "2026-07-12T22:00:00.123+08:00",
+                "updated_at": "2026-07-12T22:00:00.123+08:00",
+                "last_consolidated": 0,
+                "metadata": {
+                    "title": "Weekly project review",
+                    "token_usage": "not-an-object",
+                },
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    runner = _runner(state, ScriptedFakeProvider())
+
+    result = await runner.run(_task())
+
+    assert result.status == "failed"
+    assert result.content == ""
+    assert result.error == ErrorInfo(
+        code="persistence_error",
+        message="Scheduled Work Session could not be updated.",
+    )

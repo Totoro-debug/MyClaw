@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
@@ -13,7 +12,6 @@ from loguru import logger
 from myclaw.agent.events import TurnCompletedPayload, TurnFailedPayload
 from myclaw.agent.prompts import chat_system_prompt, render_tool_guidance
 from myclaw.agent.turn import AgentTurn, ToolResultExternalizer
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ModelProvider, ReasoningEffort
@@ -55,8 +53,7 @@ class ScheduledWorkRunner:
         self,
         *,
         provider: ModelProvider,
-        workspace_state: WorkspaceState | None = None,
-        workspace: Path | None = None,
+        workspace_state: WorkspaceState,
         long_term_memory: str,
         settings: ScheduledWorkModelSettings,
         now: Callable[[], datetime],
@@ -65,12 +62,6 @@ class ScheduledWorkRunner:
         externalize_result_for: Callable[[Session], ToolResultExternalizer] | None = None,
     ) -> None:
         self._provider = provider
-        if workspace_state is None:
-            if workspace is None:
-                raise TypeError("Scheduled Work requires Workspace State or a Workspace path")
-            workspace_state = WorkspaceState(Workspace.from_path(workspace))
-        elif workspace is not None and workspace_state.workspace != Workspace.from_path(workspace):
-            raise ValueError("Workspace State does not match the Scheduled Work Workspace")
         self._workspace_state = workspace_state
         self._workspace = workspace_state.workspace
         self._long_term_memory = long_term_memory

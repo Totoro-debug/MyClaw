@@ -150,15 +150,25 @@ class Session:
     ) -> Self:
         """Load one current-format Session synchronously from Workspace State."""
         cls._require_id(session_id)
-        path = workspace_state.sessions_directory / f"{session_id}.jsonl"
-        records = _read_jsonl_records(path)
+        sessions_directory = workspace_state.existing_sessions_directory()
+        if sessions_directory is None:
+            raise FileNotFoundError(workspace_state.sessions_directory)
+        path = sessions_directory / f"{session_id}.jsonl"
+        owned_path = HOST_FILESYSTEM.require_owned_regular_file(
+            path,
+            within=sessions_directory,
+        )
+        records = _read_jsonl_records(owned_path)
         if not records:
             raise ValueError("Session must contain a header record")
-        header = records[0]
-        loaded_id, created_at, updated_at, last_consolidated, metadata = _parse_header(header)
-        if loaded_id != session_id:
-            raise ValueError("Session metadata ID does not match its file name")
-        messages = [_parse_message(record) for record in records[1:]]
+        try:
+            header = records[0]
+            loaded_id, created_at, updated_at, last_consolidated, metadata = _parse_header(header)
+            if loaded_id != session_id:
+                raise ValueError("Session metadata ID does not match its file name")
+            messages = [_parse_message(record) for record in records[1:]]
+        except TypeError as error:
+            raise ValueError("Session JSONL contains malformed persisted data") from error
         return cls._from_state(
             workspace_state=workspace_state,
             session_id=loaded_id,
@@ -305,9 +315,20 @@ class Session:
             pass
 
     def _write_content(self, content: bytes) -> None:
-        path = self._workspace_state.sessions_directory / f"{self._session_id}.jsonl"
-        HOST_FILESYSTEM.path_for_io(path.parent).mkdir(parents=True, exist_ok=True)
+        sessions_directory = self._workspace_state.prepare_sessions_directory()
+        path = sessions_directory / f"{self._session_id}.jsonl"
+        io_path = HOST_FILESYSTEM.path_for_io(path)
+        try:
+            io_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            HOST_FILESYSTEM.require_owned_regular_file(
+                io_path,
+                within=sessions_directory,
+            )
         HOST_FILESYSTEM.atomic_replace_bytes(path, content)
+        HOST_FILESYSTEM.require_owned_regular_file(path, within=sessions_directory)
 
     def _usage_after_assistant(self, message: dict[str, Any]) -> dict[str, int] | None:
         if message["role"] != "assistant" or "token_usage" not in message:

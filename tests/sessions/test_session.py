@@ -102,7 +102,12 @@ async def test_persist_writes_one_complete_compact_utf8_snapshot_atomically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = _state(workspace, agent_home)
-    session = Session.create(state)
+    timestamps = iter((CREATED_AT, CREATED_AT + timedelta(seconds=1), UPDATED_AT))
+    session = Session.create(
+        state,
+        now=timestamps.__next__,
+        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
+    )
     session.add_message("user", "请读取 README。", extension={"nested": ["value"]})
     replacements: list[tuple[Path, bytes]] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
@@ -113,33 +118,30 @@ async def test_persist_writes_one_complete_compact_utf8_snapshot_atomically(
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_replace)
 
-    message_timestamp = session.messages[0]["timestamp"]
-    assert isinstance(message_timestamp, str)
-
     session.persist()
     expected = (
-        f'{{"session_id":"{session.session_id}",'
-        f'"created_at":"{session.created_at.isoformat(timespec="milliseconds")}",'
-        f'"updated_at":"{session.updated_at.isoformat(timespec="milliseconds")}",'
+        '{"session_id":"20260711-153012-123000_550e8400-e29b-41d4-a716-446655440000",'
+        '"created_at":"2026-07-11T15:30:12.123+08:00",'
+        '"updated_at":"2026-07-11T15:30:17.123+08:00",'
         '"last_consolidated":0,'
         '"metadata":{"title":"Untitled session",'
         '"token_usage":{"model_calls":0,"input_tokens":0,'
         '"output_tokens":0,"total_tokens":0}}}\n'
-        f'{{"role":"user","content":"请读取 README。",'
-        f'"timestamp":"{message_timestamp}",'
+        '{"role":"user","content":"请读取 README。",'
+        '"timestamp":"2026-07-11T15:30:13.123+08:00",'
         '"extension":{"nested":["value"]}}\n'
     ).encode()
 
     assert replacements == []
     await asyncio.sleep(0)
 
-    path = state.sessions_directory / f"{session.session_id}.jsonl"
+    path = state.sessions_directory / f"{SESSION_ID}.jsonl"
     raw = HOST_FILESYSTEM.path_for_io(path).read_bytes()
 
     assert replacements == [(path, expected)]
     assert raw == expected
     assert b"\xe8\xaf\xb7\xe8\xaf\xbb" in raw
-    assert Session.load(state, session.session_id).messages == session.messages
+    assert Session.load(state, SESSION_ID).messages == session.messages
 
 
 @pytest.mark.asyncio
@@ -282,16 +284,22 @@ async def test_close_supersedes_queued_persist_and_refreshes_each_attempt_timest
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = _state(workspace, agent_home)
-    session = Session.create(state)
-    session.add_message("user", "Final state")
     timestamps = iter(
         (
+            CREATED_AT,
+            datetime(2026, 7, 11, 15, 30, 13, 50000, tzinfo=LOCAL_OFFSET),
             datetime(2026, 7, 11, 15, 30, 13, 100000, tzinfo=LOCAL_OFFSET),
             datetime(2026, 7, 11, 15, 30, 13, 200000, tzinfo=LOCAL_OFFSET),
             datetime(2026, 7, 11, 15, 30, 13, 300000, tzinfo=LOCAL_OFFSET),
             datetime(2026, 7, 11, 15, 30, 13, 400000, tzinfo=LOCAL_OFFSET),
         )
     )
+    session = Session.create(
+        state,
+        now=timestamps.__next__,
+        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
+    )
+    session.add_message("user", "Final state")
     replacements: list[dict[str, Any]] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
 
@@ -301,7 +309,6 @@ async def test_close_supersedes_queued_persist_and_refreshes_each_attempt_timest
             raise OSError("transient snapshot failure")
         replace(target, content)
 
-    monkeypatch.setattr("myclaw.session.session._local_now", timestamps.__next__)
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_replace)
     monkeypatch.setattr("myclaw.session.session.time.sleep", lambda _delay: None)
 

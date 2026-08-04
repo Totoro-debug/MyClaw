@@ -105,7 +105,7 @@ class AgentTurn:
         new_uuid: Callable[[], UUID],
         system_prompt: str,
         tool_gateway: ToolGateway | None,
-        history_preparer: Callable[[Any], Awaitable[Any]] | None = None,
+        history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
         after_user_published: Callable[[Session], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
@@ -132,11 +132,11 @@ class AgentTurn:
 
         self._session.add_message("user", text)
         current_user = self._session.messages[-1]
+        if self._after_user_published is not None:
+            self._after_user_published(self._session)
         if self._lane == "foreground" and self._cancel_requested():
             yield await self._cancelled_payload([], [])
             return
-        if self._after_user_published is not None:
-            self._after_user_published(self._session)
 
         partial_content: list[str] = []
         pending_tool_calls: list[ModelToolCall] = []
@@ -146,10 +146,7 @@ class AgentTurn:
             while True:
                 partial_content = []
                 if self._history_preparer is not None:
-                    prepared = await self._history_preparer(self._session)
-                    if not isinstance(prepared, Session):
-                        raise TypeError("Session history preparer must return a Session")
-                    self._session = prepared
+                    self._session = await self._history_preparer(self._session)
                 request = self._session_model_request(current_user)
                 if self._lane == "foreground":
                     cleanup_failure = await _close_provider_stream(provider_stream)
@@ -567,12 +564,6 @@ def model_message_from_session(
     message: dict[str, Any],
 ) -> UserModelMessage | AssistantModelMessage | ToolModelMessage | None:
     """Project persisted conversation history into the next provider request."""
-    return _model_message_from_json(message)
-
-
-def _model_message_from_json(
-    message: dict[str, Any],
-) -> UserModelMessage | AssistantModelMessage | ToolModelMessage | None:
     role = message.get("role")
     if role == "user":
         content = message.get("content")

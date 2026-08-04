@@ -177,7 +177,13 @@ async def test_agent_turn_uses_one_active_session_for_the_complete_tool_round(
         "assistant",
     ]
     assert session.messages[1]["content"] == "Reading."
-    assert session.messages[1]["tool_calls"] == [tool_call.to_dict()]
+    assert session.messages[1]["tool_calls"] == [
+        {
+            "id": "call_read",
+            "name": "read_file",
+            "arguments": '{"path":"README.md"}',
+        }
+    ]
     assert session.messages[1]["status"] == "completed"
     assert session.messages[1]["error"] is None
     assert session.messages[1]["token_usage"] == {
@@ -193,7 +199,11 @@ async def test_agent_turn_uses_one_active_session_for_the_complete_tool_round(
         "tool_call_id": "call_read",
         "name": "read_file",
         "status": "success",
-        "artifact": artifact.to_dict(),
+        "artifact": {
+            "path": f"artifacts/{session.session_id}/call_read.txt",
+            "total_chars": 13,
+            "preview_chars": 7,
+        },
     }
     assert session.metadata["token_usage"] == {
         "model_calls": 2,
@@ -450,7 +460,10 @@ async def test_agent_turn_repairs_every_unfinished_tool_call_before_cancel_termi
         "tool",
     ]
     assert session.messages[1]["content"] == "I will inspect both."
-    assert session.messages[1]["tool_calls"] == [call.to_dict() for call in tool_calls]
+    assert session.messages[1]["tool_calls"] == [
+        {"id": "call_first", "name": "read_file", "arguments": '{"path":"one"}'},
+        {"id": "call_second", "name": "read_file", "arguments": '{"path":"two"}'},
+    ]
     assert [message["tool_call_id"] for message in session.messages[2:]] == [
         "call_first",
         "call_second",

@@ -160,6 +160,64 @@ async def test_runtime_routes_turn_title_status_and_close_through_one_active_ses
     assert close_calls == [True]
     assert provider.closed
     assert (workspace / ".myclaw" / "sessions" / f"{session.session_id}.jsonl").exists()
+    assert Session.load(session.workspace_state, session.session_id).metadata["title"] == (
+        "Generated runtime title"
+    )
+
+
+@pytest.mark.asyncio
+async def test_late_title_is_saved_by_the_next_complete_turn(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = RuntimeProvider(
+        (
+            ModelResponse(
+                message=AssistantModelMessage(content="First response."),
+                usage=ModelUsage(input_tokens=5, output_tokens=2, total_tokens=7),
+                finish_reason="stop",
+            ),
+            ModelResponse(
+                message=AssistantModelMessage(content="Second response."),
+                usage=ModelUsage(input_tokens=6, output_tokens=2, total_tokens=8),
+                finish_reason="stop",
+            ),
+        )
+    )
+    provider.delay_title = True
+    runtime = _runtime(agent_home, workspace, provider)
+    session = runtime.session
+
+    _ = [event async for event in runtime.conversation.submit("First input.")]
+    await provider.title_started.wait()
+    await asyncio.sleep(0)
+    assert Session.load(session.workspace_state, session.session_id).metadata["title"] == (
+        "Untitled session"
+    )
+
+    provider.release_title.set()
+    for _ in range(100):
+        if session.metadata["title"] == "Generated runtime title":
+            break
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert session.metadata["title"] == "Generated runtime title"
+    assert Session.load(session.workspace_state, session.session_id).metadata["title"] == (
+        "Untitled session"
+    )
+
+    _ = [event async for event in runtime.conversation.submit("Second input.")]
+    await asyncio.sleep(0)
+
+    reloaded = Session.load(session.workspace_state, session.session_id)
+    assert reloaded.metadata["title"] == "Generated runtime title"
+    assert [message["role"] for message in reloaded.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -274,6 +332,36 @@ async def test_runtime_shutdown_applies_first_user_title_fallback_before_final_s
     reloaded = Session.load(session.workspace_state, session.session_id)
     assert reloaded.metadata["title"] == "Shutdown fallback title."
     assert reloaded.metadata["token_usage"]["model_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_immediate_turn_cancellation_keeps_the_first_user_title_lifecycle(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = RuntimeProvider(
+        (
+            ModelResponse(
+                message=AssistantModelMessage(content="Unused response."),
+                usage=ModelUsage(input_tokens=5, output_tokens=2, total_tokens=7),
+                finish_reason="stop",
+            ),
+        )
+    )
+    provider.delay_title = True
+    runtime = _runtime(agent_home, workspace, provider)
+    session = runtime.session
+    events = runtime.conversation.submit("  Cancelled first title.  ")
+
+    assert (await anext(events)).type == "turn_started"
+    await runtime.conversation.cancel_active_turn()
+    assert [event.type async for event in events] == ["turn_cancelled"]
+    await asyncio.wait_for(provider.title_started.wait(), timeout=1)
+    await runtime.close()
+
+    assert session.metadata["title"] == "Cancelled first title."
+    reloaded = Session.load(session.workspace_state, session.session_id)
+    assert reloaded.metadata["title"] == "Cancelled first title."
 
 
 @pytest.mark.asyncio
