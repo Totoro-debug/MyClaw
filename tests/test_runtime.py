@@ -797,7 +797,7 @@ async def test_prepared_repl_status_reports_the_actual_fallback_route_and_sessio
     assert status["chat_model"] == "anthropic-default/claude-model"
     assert status["context_window"] == 200000
     assert status["session_message_count"] == 2
-    assert status["consolidation_cursor"] == 0
+    assert status["last_consolidated"] == 0
     assert status["cumulative_usage"] == {
         "model_calls": 1,
         "input_tokens": 9,

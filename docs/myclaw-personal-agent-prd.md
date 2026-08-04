@@ -90,7 +90,7 @@
 - 只有内置 slash commands 进入 Management Port；其它 `/` 开头文本作为普通用户消息发送给模型。
 - `/config` 完整显示配置，但脱敏 plaintext API key。
 - 配置语法错误时，`myclaw config` 显示解析错误、配置路径和原文，并对明显 API key 行做文本级脱敏。
-- `/status` 显示版本、chat model、runtime uptime、估算 token 状态、当前 session 消息数、Consolidation Cursor 和当前 session 累计 model usage。
+- `/status` 显示版本、chat model、runtime uptime、估算 token 状态、当前 Session 消息数、`last_consolidated` 和当前 Session 累计 model usage。
 - `/status` 的 provider-neutral token estimate 使用 `ceil(UTF-8 byte length / 4)`，展示估算输入 token、context window 和占比；实际 cumulative usage 不混入估算值。
 - `/resume` 只展示当前 Workspace 的 sessions；选择后直接切换。原 session 有消息则保留，无消息可丢弃。
 - `/memory` 不分页，完整读取并显示磁盘最新 `memory.md`。
@@ -100,45 +100,43 @@
 ### Agent Home and persistence
 
 - Agent Home 固定为 `~/.myclaw/`，不支持覆盖或多个 profile。
-- 首次启动创建 `~/.myclaw/memory/` 和 `~/.myclaw/sessions/`。
+- 有效 REPL 启动在当前 Workspace 创建 `.myclaw/`、`memory/`、`sessions/` 和 Long-term Memory template；`myclaw config` 只处理 Agent Home。
 - 技术诊断按 Conversation Session 写入 Workspace-owned Session Log；不维护 Agent Home 或 Workspace 级全局 Runtime Log。
-- 所有 Agent Home 写入必须满足原子性；普通 session 消息以完整 JSONL 单行追加。
+- 所有 Workspace State 写入必须满足各自的原子性契约；Conversation Session 在 turn 完成后以完整 JSONL snapshot 一次 replacement。
 - User Configuration 位于 `~/.myclaw/config.toml`。
-- Long-term Memory 位于 `~/.myclaw/memory/memory.md`。
-- Conversation Summary 位于 `~/.myclaw/memory/summary.jsonl`。
-- Summary Cursor 是纯文本文件 `~/.myclaw/memory/.cursor`。
-- Scheduled Work 定义保存在 Agent Home 根目录的 `scheduled-work.json` JSON 数组文件中。
-- Conversation Summary 与 session Consolidation Cursor 的跨文件提交使用按需创建的 `memory/pending-consolidations/<session_id>.json` journal 恢复崩溃窗口。
+- Long-term Memory 位于 `<workspace>/.myclaw/memory/memory.md`。
+- Conversation Summary 位于 `<workspace>/.myclaw/memory/summary.jsonl`。
+- Summary Cursor 是纯文本文件 `<workspace>/.myclaw/memory/.cursor`。
+- Scheduled Work 定义保存在 Workspace State 根目录的 `scheduled-work.json` JSON 数组文件中。
 - Long-term Memory 缺失时，runtime 启动会创建包含 User Info、User Preference、Project Fact、Lesson 四个空分区的模板。
 - Conversation Summary、Summary Cursor、Scheduled Work 等运行态文件按需创建。
 
 ### Workspace and sessions
 
 - Workspace 由规范化绝对路径识别。
-- Workspace slug：路径段统一小写、用 `-` 连接，原路径段中的 `-` 替换为 `_`。例如 `D:\desktop\project\Demo-one` → `d-desktop-project-demo_one`。
-- Workspace session directory 为 `~/.myclaw/sessions/<workspace_slug>/`。
+- Workspace State 不派生 slug；Session history directory 为 `<workspace>/.myclaw/sessions/`。
 - Session ID 使用系统本地时间戳 + UUID4，固定格式为 `YYYYMMDD-HHMMSS-ffffff_<uuid4>`。
-- Session 文件为 `~/.myclaw/sessions/<workspace_slug>/<session_id>.jsonl`。
-- JSONL 第一行是 metadata，包含 ID、title、created_at、updated_at、Consolidation Cursor 和 cumulative model usage。
-- 后续行是 OpenAI-style user、assistant、tool messages。
-- 普通消息追加单行；metadata 更新时原子重写整个 session 文件。
-- 同一 session 写入仅在单 runtime 内串行化，不提供跨进程保护。
+- Session 文件为 `<workspace>/.myclaw/sessions/<session_id>.jsonl`。
+- JSONL 第一行是严格 header，恰好包含 `session_id`、`created_at`、`updated_at`、`last_consolidated` 和 `metadata`；metadata 当前包含 title 与 cumulative `token_usage`。
+- 后续行是 JSON-native OpenAI-style user、assistant、tool message dictionaries，公共字段为 role、content、local-time timestamp；不含通用 message ID、line type marker 或 schema version。
+- 每次 Session mutation 的持久化都是完整 compact JSONL atomic replacement；turn 内只改 active Session memory，terminal work 后 `persist()` ordered async scheduling，shutdown 由 `close()` bounded synchronous retry。
+- 普通异步 persistence failure 静默吞掉，不提供 acknowledgement、failure logging 或 stronger crash consistency；同一 runtime 内保证 snapshot order，不提供跨进程保护。
 - 新 REPL 准备新 session；第一条 user message 之前退出不持久化 session。
 - Session title 在首条用户输入后异步使用 chat route 生成，不阻塞首轮回复。
 - 标题生成失败时使用截断的首条用户消息作为 fallback。
 - 生成标题和 fallback 都折叠空白并截断为最多 60 个 Unicode code points；结果为空时使用 `Untitled session`。
-- 标题调用不写入对话历史，但 usage 计入 session 累计 usage；metadata 更新使用同一个 session 写锁。
+- 标题调用不写入对话历史，但 usage 计入 Session 累计 usage；late title 可等到后续 turn 或 close 才落盘。
 - 首版不支持 title rename 或 regenerate。
 - assistant streaming 完成后一次性写入 session。
 - streaming 被中断时保存 partial assistant，并标记 interrupted/error。
 - assistant content 和 tool_calls 可存在于同一 assistant message。
 - 模型最终失败写 assistant error message；工具失败或拒绝写 tool error/result message。
-- session schema version 首版固定为 1；仅可恢复一个因 append 中断而不完整的最终尾行，中间损坏或完整但非法的尾行使 session 不可恢复且不会被自动删除。
+- 旧 Session schema unsupported；无 migration、compatibility reader、lazy upgrade 或 version dispatch。缺少完整 snapshot trailing newline 或包含非法 header/message 时 Session 不可恢复且不会被自动删除。
 
 ### Memory system
 
 - Memory System 包含 Short-term Memory、Conversation Summary 和 Long-term Memory。
-- Short-term Memory 是 session 中 Consolidation Cursor 之后的消息后缀。
+- Short-term Memory 是 active Session 中 `last_consolidated` 之后的消息后缀。
 - Conversation Summary 是全局 JSONL 流，每条只包含自增 index、timestamp、content，不保存 source session 或 message range。
 - Conversation Summary index 从 1 开始；缺失的 Summary Cursor 文件等价于 0。
 - Conversation Summary 不直接进入 chat 上下文，也不会在新增后立即触发 Memory Task。
@@ -154,13 +152,13 @@
 - Memory Task 使用系统本地时区 cron，默认每小时一次。
 - Memory Task 的 `batch_size` 是全局配置，默认 10。
 - Memory Manager 读取 Summary Cursor 和 summary batch，然后构造 memory prompt。
-- memory 模型通过标准 Tool Gateway 和专用 read/edit Tool 读取 Long-term Memory，并且只能编辑 `~/.myclaw/memory/memory.md`；它不使用 Conversation Session 或 Tool Artifact。
+- memory 模型通过标准 Tool Gateway 和专用 read/edit Tool 读取 Long-term Memory，并且只能编辑 `<workspace>/.myclaw/memory/memory.md`；它不使用 Conversation Session 或 Tool Artifact。
 - Memory Task 没有调用 `edit_file` 时视为 no update 并推进 Summary Cursor。
 - 需要编辑且成功时推进 cursor；编辑失败时不推进。
 - Memory Task 在单 runtime 内不重入：周期触发遇到运行中任务则跳过，`/dream` 遇到运行中任务则拒绝并提示。
 - 周期 Memory Task 成功或失败都不通知 REPL；手动 `/dream` 输出摘要状态。
 - 主 Agent 可读取 Long-term Memory，但不能编辑 Long-term Memory、User Configuration 或 Agent Home 内部状态文件。
-- consolidation 在 global summary lock 内先原子写 pending journal，再幂等 append summary、更新 session Consolidation Cursor，最后删除 journal；runtime 启动时先恢复 journal。该协议不提供跨进程协调。
+- Conversation Summary 在 global summary lock 内完成自己的 summary stream operation 后直接更新 active Session 的 `last_consolidated`；没有 pending journal 或启动恢复协议。crash 后 Summary 与 Session snapshot 可 divergence，且不提供跨进程协调。
 
 ### Model routing and providers
 
@@ -205,7 +203,7 @@
 - Tool Gateway 不序列化前台和后台工具调用。
 - File read/list/search 默认 allow。
 - Workspace 内新建文件和编辑已有文件固定 refused。
-- 主 Agent 不可编辑 config、memory、session、summary、cursor、Scheduled Work 等 Agent Home 内部文件。
+- 主 Agent 不可编辑 config、memory、Session、Summary、Summary Cursor、Scheduled Work 等 Workspace State 或 Agent Home 内部文件。
 - File access 越过 Workspace 和允许的 Agent Home 范围时 fail closed。
 - Shell 与 Web 可由配置启用/禁用；开关同时适用于前台 chat 和 Scheduled Work。
 - Shell cwd 可指定，但必须位于 Workspace 内。
@@ -220,7 +218,7 @@
 ### Tool Artifacts
 
 - Runtime Core 只在成功工具结果超过 `max_tool_result_chars = 50000` 时外部化；error 和 refused 保持 inline。
-- Artifact 路径为 `~/.myclaw/sessions/<workspace_slug>/artifacts/<session_id>/<tool_call_id>.txt`。
+- Artifact 路径为 `<workspace>/.myclaw/sessions/artifacts/<session_id>/<tool_call_id>.txt`。
 - Artifact 保存原始工具结果，必须原子写入。
 - Session tool message 保存 artifact 引用和前 2000 个 Unicode code points 的截断 preview；原始 immutable Tool Result 不被修改。
 - tool call ID 含文件系统不安全字符时，Artifact 文件名使用 UTF-8 percent-encoding，逻辑 tool_call_id 保持不变。
@@ -230,7 +228,7 @@
 ### Scheduled Work
 
 - Scheduled Work 是自然语言 Agent 任务，不是 shell cron job。
-- 定义存储为 Agent Home 根 JSON 数组的元素，字段为 id、title、cron、prompt、created_at、enabled、session_id。
+- 定义存储为 Workspace State 根 JSON 数组的元素，字段为 id、title、cron、prompt、created_at、enabled、session_id。
 - 新任务固定 `enabled=true`；首版没有 task 管理命令修改或删除任务。
 - 当前 `create_scheduled_work` 固定 refused，在分配 ID 或写 store 前结束；已持久化任务照常执行。
 - 创建时不静态分析未来是否需要已禁用的 web/shell。
@@ -246,12 +244,12 @@
 ## Testing Decisions
 
 - 测试只验证外部可观察行为，不绑定内部实现细节。
-- 优先测试最高 seam：Conversation Port、Management Port、Runtime Core、Memory Manager、Tool Gateway、Session Store、Model Router/Provider Adapter。
+- 优先测试最高 seam：Conversation Port、Management Port、Runtime Core、Memory Manager、Tool Gateway、active Session、Model Router/Provider Adapter。
 - 测试使用 fake provider、fake tool、临时 Agent Home 和临时 Workspace，不调用真实模型 API。
 
 ### Required memory tests
 
-- Short-term Memory 是 Consolidation Cursor 后缀。
+- Short-term Memory 是 `last_consolidated` 后缀。
 - Token 和总消息数两种摘要触发条件。
 - Cutoff 对齐 user message 的主路径和 fallback 路径。
 - Summary JSONL schema 只有 index、timestamp、content。
@@ -264,13 +262,12 @@
 
 ### Required session tests
 
-- Workspace slug 生成规则。
-- Session ID、文件路径、metadata 第一行和 OpenAI-style messages。
+- Session ID、Workspace-owned 文件路径、strict header 第一行和 JSON-native OpenAI-style messages。
 - 空 REPL 不持久化 session。
 - `/resume` 只列当前 Workspace sessions，并正确切换。
-- 普通消息单行追加，metadata 原子重写。
-- 同 runtime session 写入串行化。
-- title 异步生成、fallback、usage 计入及写锁。
+- 每轮一次完整 JSONL replacement、snapshot freeze 和同 runtime ordered persistence。
+- empty Session lazy materialization、silent ordinary failure、bounded close retry 与 host filesystem fault seam。
+- title 异步生成、fallback、usage 计入、late title 和后续 snapshot/close 落盘。
 - streaming 完成、中断 partial、模型失败和工具失败写入规则。
 
 ### Required tool tests

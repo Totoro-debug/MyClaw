@@ -11,6 +11,11 @@
 `myclaw/contracts/`、`tests/contract/` 和 `myclaw.contracts` 均指已经删除的旧结构，
 不是当前有效的源码或导入路径。
 
+2026-08-04 的 Session 架构替换已删除下文记录的 Session 类型和 persistence
+ports；当前 active Session 与 snapshot behavior 由
+`docs/adr/0009-active-session-snapshot-persistence.md` 约束。为保留 Issue #37 的
+历史证据，下文的中间目标和迁移步骤不回写为当前 API。
+
 2026-07-29 的后续整理进一步删除了通用 `ports.py` 模块：`ConversationPort` 与
 Agent Event 同归 `myclaw/agent/events.py`，`ModelProvider` 与 Provider 中立模型同归
 `myclaw/provider/models.py`，Store 协议则与各自的持久化或编排实现同模块。下文仍

@@ -110,7 +110,7 @@ class RuntimeStatus:
     context_window: int
     context_used_percent: float
     session_message_count: int
-    consolidation_cursor: int
+    last_consolidated: int
     cumulative_usage: dict[str, int]
 
     def __post_init__(self) -> None:
@@ -119,7 +119,7 @@ class RuntimeStatus:
         require_nonnegative_int(self.context_window, field="context_window")
         require_nonnegative_number(self.context_used_percent, field="context_used_percent")
         require_nonnegative_int(self.session_message_count, field="session_message_count")
-        require_nonnegative_int(self.consolidation_cursor, field="consolidation_cursor")
+        require_nonnegative_int(self.last_consolidated, field="last_consolidated")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -130,7 +130,7 @@ class RuntimeStatus:
             "context_window": self.context_window,
             "context_used_percent": self.context_used_percent,
             "session_message_count": self.session_message_count,
-            "consolidation_cursor": self.consolidation_cursor,
+            "last_consolidated": self.last_consolidated,
             "cumulative_usage": dict(self.cumulative_usage),
         }
 
@@ -198,7 +198,7 @@ class RuntimeStatusService:
             context_window=resolved.context_window,
             context_used_percent=estimated / resolved.context_window * 100,
             session_message_count=len(session.messages),
-            consolidation_cursor=session.last_consolidated,
+            last_consolidated=session.last_consolidated,
             cumulative_usage=_active_session_usage(session),
         )
 

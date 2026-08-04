@@ -106,7 +106,6 @@ the reserved `.myclaw` directory beneath that Workspace:
     memory.md
     summary.jsonl
     .cursor
-    pending-consolidations/
   sessions/
     <session_id>.jsonl
     artifacts/<session_id>/<encoded_tool_call_id>.txt
@@ -116,10 +115,23 @@ the reserved `.myclaw` directory beneath that Workspace:
 
 Valid REPL startup creates only the Workspace State root, `.gitignore`, `memory/`,
 `sessions/`, and `memory/memory.md`; `logs/` is created lazily by an explicit Session
-context when a WARNING or ERROR is emitted. Summary, cursor, Scheduled Work, Session, journal,
-and Artifact files remain on demand. Old non-global Agent Home data is ignored and is
-never migrated or deleted. Back up each Workspace State directory with its Workspace;
-do not edit active Session, summary, cursor, or Scheduled Work files.
+context when a WARNING or ERROR is emitted. Summary, Summary Cursor, Scheduled Work,
+Session, and Artifact files remain on demand. Old non-global Agent Home data is ignored
+and is never migrated or deleted. Back up each Workspace State directory with its
+Workspace; do not edit active Session, Summary, Summary Cursor, or Scheduled Work files.
+
+Each foreground Runtime has one active Conversation Session. Its in-memory messages
+are ordinary JSON-compatible dictionaries and its metadata is a JSON-compatible
+dictionary. A nonempty Session is written as a complete compact JSONL snapshot: the
+first line has exactly `session_id`, `created_at`, `updated_at`, `last_consolidated`,
+and `metadata`, and each later line is a user, assistant, or tool message with a
+local-time `timestamp`. Session state is changed in memory during a turn; after terminal
+work `persist()` schedules an ordered atomic replacement, while `close()` makes at most
+three bounded synchronous save attempts. Ordinary save failures are silent and provide
+no acknowledgement or failure log. Old Session schemas are unsupported, with no
+migration or version dispatch. A late generated title may wait for a later turn or
+shutdown save, and a crash can leave Conversation Summary and `last_consolidated`
+temporarily divergent.
 
 Session Logs use Loguru with a WARNING threshold, an unbounded queue, exact 10 MiB
 rotation, and per-Session retention of at most one historical file. Same-Session
@@ -143,14 +155,18 @@ per Session only, so total Workspace log usage is unbounded across Sessions.
   not automatically retry permanent authentication or invalid-request failures.
 - `memory_context_too_large`: reduce `<workspace>/.myclaw/memory/memory.md` or use a route with a larger
   context window. Long-term Memory is injected in full and has no automatic size cap.
-- Persistence errors or corrupt JSON/JSONL: stop all MyClaw processes, back up the
-  affected Workspace State and Session Logs, and restore a known-good file. The
-  runtime fails closed instead of discarding complete but invalid records.
+- Corrupt JSON/JSONL or Session load errors: stop all MyClaw processes, back up the
+  affected Workspace State and Session Logs, and restore a known-good file. Loads fail
+  closed instead of discarding complete but invalid records. Ordinary background
+  Session save failures are silent and do not produce a troubleshooting error.
 
 ## Known Limits
 
 - Multiple REPL processes do not coordinate Session writes, Session Logs, or background
   schedules. In particular, same-Session concurrency is unsupported.
+- A failed background Session snapshot can lose the latest in-memory turn after an
+  abnormal process exit; Session persistence has no ordinary acknowledgement or failure
+  logging. Conversation Summary and `last_consolidated` can diverge after a crash.
 - Approved Shell commands are not an operating-system sandbox and can affect more
   than the Workspace according to the user's OS permissions.
 - Long-term Memory has no automatic size cap, and Tool Artifacts have no automatic

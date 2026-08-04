@@ -410,7 +410,7 @@ async def test_status_command_renders_actual_runtime_and_session_state(
         "context_window": 8,
         "context_used_percent": 12.5,
         "session_message_count": 2,
-        "consolidation_cursor": 1,
+        "last_consolidated": 1,
         "cumulative_usage": {
             "model_calls": 1,
             "input_tokens": 10,

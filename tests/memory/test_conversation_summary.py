@@ -216,7 +216,7 @@ async def test_token_budget_summarizes_roughly_half_the_available_input(
 
 
 @pytest.mark.asyncio
-async def test_repeated_consolidation_advances_cursor_once_per_appended_summary(
+async def test_repeated_summary_preparation_advances_last_consolidated_once_per_summary(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
@@ -238,7 +238,7 @@ async def test_repeated_consolidation_advances_cursor_once_per_appended_summary(
     manager = _manager(provider, summaries)
 
     first = await manager.prepare(session)
-    first_cursor = first.last_consolidated
+    first_position = first.last_consolidated
     _add_assistant(session, "Answer three.")
     session.add_message("user", "Question four.")
     _add_assistant(session, "Answer four.")
@@ -247,7 +247,7 @@ async def test_repeated_consolidation_advances_cursor_once_per_appended_summary(
 
     assert first is session
     assert second is session
-    assert first_cursor == 2
+    assert first_position == 2
     assert second.last_consolidated == 4
     assert [entry.index for entry in await summaries.after(0, 10)] == [1, 2]
     second_request = provider.complete_requests[1]
@@ -258,7 +258,7 @@ async def test_repeated_consolidation_advances_cursor_once_per_appended_summary(
 
 
 @pytest.mark.asyncio
-async def test_summary_append_failure_keeps_cursor_without_journal(
+async def test_summary_persistence_failure_leaves_last_consolidated_unchanged(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
@@ -281,7 +281,7 @@ async def test_summary_append_failure_keeps_cursor_without_journal(
 
 
 @pytest.mark.asyncio
-async def test_oversized_system_prompt_fails_without_summary_or_cursor_progress(
+async def test_oversized_system_prompt_fails_without_summary_or_last_consolidated_progress(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
@@ -334,7 +334,7 @@ async def test_context_overflow_without_old_complete_turn_keeps_current_message(
 
 
 @pytest.mark.asyncio
-async def test_empty_summary_response_is_model_failure_without_cursor_progress(
+async def test_empty_summary_response_is_model_failure_without_last_consolidated_progress(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
@@ -444,7 +444,7 @@ async def test_summary_failure_is_not_rewritten_by_silent_session_persistence_fa
 
 
 @pytest.mark.parametrize(
-    ("messages", "expected_cursor", "last_summarized", "first_retained"),
+    ("messages", "expected_position", "last_summarized", "first_retained"),
     [
         (
             (
@@ -480,7 +480,7 @@ async def test_summary_failure_is_not_rewritten_by_silent_session_persistence_fa
 async def test_cutoff_keeps_retained_suffix_at_user_boundary(
     workspace: Path,
     messages: tuple[tuple[str, str], ...],
-    expected_cursor: int,
+    expected_position: int,
     last_summarized: str,
     first_retained: str,
 ) -> None:
@@ -502,7 +502,7 @@ async def test_cutoff_keeps_retained_suffix_at_user_boundary(
         threshold=6,
     ).prepare(session)
 
-    assert session.last_consolidated == expected_cursor
+    assert session.last_consolidated == expected_position
     assert session.messages[session.last_consolidated]["content"] == first_retained
     request = provider.complete_requests[0]
     assert isinstance(request, ModelRequest)

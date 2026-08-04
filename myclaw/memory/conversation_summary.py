@@ -52,7 +52,7 @@ class SummaryModelSettings:
 
 
 class WorkspaceJsonlSummaryStore:
-    """Append summaries and consolidation journals in one Workspace State."""
+    """Persist Conversation Summary entries in one Workspace State."""
 
     def __init__(
         self,
@@ -230,12 +230,12 @@ class ConversationSummaryManager:
                 )
             )
         try:
-            new_cursor = session.last_consolidated + cutoff
+            new_last_consolidated = session.last_consolidated + cutoff
             await self._summaries.append(
                 content=response.message.content,
                 timestamp=self._persisted_now(),
             )
-            session.last_consolidated = new_cursor
+            session.last_consolidated = new_last_consolidated
             return session
         except (OSError, UnicodeError, ValueError) as error:
             raise ModelCallError(

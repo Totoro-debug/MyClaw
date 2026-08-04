@@ -3,8 +3,8 @@
 Status: **PASS**
 
 This report records Windows evidence for GitHub issue
-[#83](https://github.com/Totoro-debug/myclaw/issues/83). It applies to the
-Session Log contract-replacement universal-wheel candidate built on 2026-08-03.
+[#92](https://github.com/Totoro-debug/myclaw/issues/92). It applies to the
+active-Session architecture universal-wheel candidate built on 2026-08-04.
 
 Windows x64 is the currently validated environment. macOS Intel and Apple Silicon are
 intended compatibility targets but remain unverified. This report is not native macOS
@@ -19,25 +19,27 @@ hosts attempt their selected adapter when a capability is used.
 | PowerShell | `7.6.4` |
 | Build Python | CPython `3.12.13`, 64-bit |
 | Build pip | `26.1.2` |
-| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-issue83-ffd7fe03dd7b44a1abfdc6f8756da733` |
+| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-issue92-review-e4fddfe9` |
 
 No Provider credential is read or used. Application tests and CLI smoke do not contact
 a live Provider.
 
 ## Artifact
 
-The final gate built exactly one wheel with:
+The final gate used `<validation-root>\build-venv\Scripts\python.exe`. With that
+environment active, the equivalent module command that built exactly one wheel was:
 
 ```powershell
-python -m build --wheel --outdir <validation-root>\dist
+python -m build --wheel --no-isolation --outdir <validation-root>\dist
 ```
 
 | Artifact | Size | SHA-256 | Embedded tag |
 | --- | ---: | --- | --- |
-| `myclaw-0.1.0-py3-none-any.whl` | 131,945 bytes | `3EC216ABB8A80DBCD8D8BDA9970F307123F577B61F036C8A7F4FCB6193E60CB8` | `py3-none-any` |
+| `myclaw-0.1.0-py3-none-any.whl` | 128,811 bytes | `89B89DB5B123F9135065A3F9F930F12208A9FCDEF37E67F16F0D9A5009F1B6FD` | `py3-none-any` |
 
-Archive inspection found 74 packaged Python files. The packaged module set matched the
-source tree and contained the Windows and POSIX filesystem and owned-process adapters.
+Archive inspection found 72 packaged Python files and 14 template files. The packaged
+module set matched the source tree and contained the Windows and POSIX filesystem and
+owned-process adapters.
 It contained the Loguru dependency metadata and no obsolete Runtime Log or lock module.
 No compiled extension, native library, or forced platform tag was present.
 
@@ -53,7 +55,20 @@ default configuration, and did not create Workspace State before the configurati
 gate. `myclaw config` exited with code `0`. An isolated `python -I` import resolved
 `myclaw` from the clean venv's `Lib\site-packages`, not the checkout.
 
-## Session Log Windows Evidence
+## Session and Host-Filesystem Windows Evidence
+
+The active Session public-interface suite covered complete compact UTF-8 JSONL
+replacement, snapshot freeze and call-order completion, lazy materialization of empty
+Sessions, silent ordinary background failure, cleanup of queued background persistence
+before shutdown, three-attempt shutdown retry with 100 ms/200 ms delays, and final
+failure swallowing. The host filesystem suite exercised the atomic replacement seam and
+injected synchronization failures. The combined Windows-focused command was:
+
+```powershell
+python -W error -m pytest -q -ra tests/sessions/test_session.py tests/test_host_filesystem.py tests/test_windows_filesystem.py tests/test_runtime_shutdown.py
+```
+
+Result: `72 passed`.
 
 The native Session Log contract suite creates a Windows Junction at `.myclaw\logs`,
 confirms its Reparse Point is rejected, and verifies that no file is written through
@@ -88,12 +103,12 @@ git diff --check
 
 | Gate | Result |
 | --- | --- |
-| Complete warning-strict offline suite | PASS: `865 passed`; zero skips |
+| Complete warning-strict offline suite | PASS: `726 passed`; zero skips |
 | Ruff lint | PASS: all checks passed |
-| Ruff format | PASS: 165 files already formatted |
-| Strict Mypy | PASS: no issues in 165 source files |
+| Ruff format | PASS: 153 files already formatted |
+| Strict Mypy | PASS: no issues in 153 source files |
 | Diff hygiene | PASS |
-| Universal artifact inspection | PASS: one wheel, 74 Python files, source set matched, zero native entries |
+| Universal artifact inspection | PASS: one wheel, 72 Python files, 14 templates, source set matched, zero native entries |
 | Clean wheel installation and dependency check | PASS |
 | Installed CLI Unicode smoke and isolated import | PASS |
 

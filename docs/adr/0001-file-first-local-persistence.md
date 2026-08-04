@@ -1,7 +1,26 @@
 # Use file-first local persistence
 
-The first version of the Personal Agent stores its configuration, Workspace-scoped Conversation Sessions, Conversation Summary, Summary Cursor, Long-term Memory, Scheduled Work definitions, and Tool Artifacts as local files rather than starting with SQLite or a mixed storage model. This keeps the local-first system transparent, inspectable, and easy to migrate while remaining close to nanobot's operational style. The implementation relies on atomic writes and in-runtime serialization where required, but intentionally provides no cross-process coordination or locking between multiple REPL instances; duplicate background triggers and concurrent access to the same session are accepted first-version risks.
+The first version of the Personal Agent stores User Configuration, Workspace
+State, Conversation Summary, Long-term Memory, Scheduled Work definitions, Tool
+Artifacts, and Session Logs as local files rather than starting with SQLite or a
+mixed storage model. This keeps the local-first system transparent and
+inspectable. The implementation relies on atomic writes and in-runtime
+ordering where required, but intentionally provides no cross-process
+coordination for Workspace-owned state.
 
-Session message append writes one complete UTF-8 JSONL record while holding the session's in-runtime lock. A loader may recover one incomplete final line caused by an interrupted append, but rejects corruption in the middle of the file or a complete invalid final line; it never silently skips or deletes those records.
+ADR-0009 partially supersedes this decision for the foreground Conversation
+Session lifecycle. The current Session authority is one active in-memory
+`Session`, and its history is written as a complete atomic JSONL snapshot after
+each completed turn. The former per-message write, incomplete-line repair,
+typed persistence-object, and cross-file consolidation-journal contracts are
+retired; they are not current file-first guarantees.
 
-Conversation Summary append and session Consolidation Cursor update cannot be committed atomically as one filesystem operation. The runtime therefore writes `memory/pending-consolidations/<session_id>.json` before appending the reserved Summary index, updates the session cursor after an idempotent append, and deletes the journal last. Runtime startup recovers pending journals before accepting turns. This provides deterministic single-runtime crash recovery without adding source identity to the fixed Summary JSONL schema. It does not coordinate two REPL processes that allocate the same global Summary index; that remains an accepted first-version risk.
+File-first remains the storage choice for Workspace State and for the separate
+Conversation Summary stream. Summary state and `Session.last_consolidated` are
+not committed as one filesystem transaction. Their possible divergence after a
+crash or failed Session snapshot is accepted by ADR-0009. Separate REPL
+processes remain uncoordinated.
+
+---
+status: accepted
+---

@@ -637,7 +637,7 @@ def test_load_current_five_field_jsonl_preserves_json_native_extensions(
         ],
     ],
 )
-def test_load_rejects_malformed_core_legacy_or_partial_message_records(
+def test_load_rejects_malformed_core_or_unsupported_message_shapes(
     agent_home: Path,
     workspace: Path,
     records: list[dict[str, Any]],
@@ -649,7 +649,7 @@ def test_load_rejects_malformed_core_legacy_or_partial_message_records(
         Session.load(state, SESSION_ID)
 
 
-def test_load_rejects_a_jsonl_file_without_a_complete_trailing_line(
+def test_load_rejects_jsonl_without_a_trailing_newline(
     agent_home: Path,
     workspace: Path,
 ) -> None:

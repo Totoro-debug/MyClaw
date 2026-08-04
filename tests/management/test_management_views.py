@@ -215,7 +215,7 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
         context_window=10,
         context_used_percent=40.0,
         session_message_count=0,
-        consolidation_cursor=0,
+        last_consolidated=0,
         cumulative_usage={
             "model_calls": 0,
             "input_tokens": 0,

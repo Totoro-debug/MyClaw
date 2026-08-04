@@ -2,8 +2,9 @@
 
 Status: **READY**
 
-This is the current evidence index for GitHub issue
-[#69](https://github.com/Totoro-debug/myclaw/issues/69). The active platform decision
+This is the current evidence index for GitHub issues
+[#69](https://github.com/Totoro-debug/myclaw/issues/69) and the final Session
+architecture gate [#92](https://github.com/Totoro-debug/myclaw/issues/92). The active platform decision
 is [ADR-0007](adr/0007-use-host-adapters.md), which supersedes ADR-0006 without
 rewriting that historical Windows-only decision.
 
@@ -20,8 +21,11 @@ rewriting that historical Windows-only decision.
   support claim from this release.
 - Agent Home remains host-local and owns User Configuration. Legacy Agent Home Runtime
   Log files remain untouched and are no longer opened by MyClaw.
-- Workspace State remains `<workspace>/.myclaw/` and keeps every existing layout,
-  record format, Permission Policy rule, and lifecycle guarantee.
+- Workspace State remains `<workspace>/.myclaw/` and owns Conversation Session history,
+  Conversation Summary, Long-term Memory, Scheduled Work, Tool Artifacts, and Session
+  Logs. Active Session format and lifecycle follow ADR-0009: JSON-native state, strict
+  five-field header, complete atomic JSONL snapshots, ordered async `persist()`, and
+  bounded synchronous `close()`.
 
 ## Delivery Evidence
 
@@ -29,6 +33,7 @@ rewriting that historical Windows-only decision.
 | --- | --- | --- |
 | Host filesystem | Windows-native characterization plus POSIX contract/fault injection | PASS |
 | Workspace State | Native identity, ownership, containment, redirection, and persistence suites | PASS |
+| Active Session | JSONL replacement, lazy materialization, snapshot ordering, silent failure, close retry, and status vocabulary | PASS |
 | Session Log | Workspace path safety, routing, rotation, retention, terminal behavior, failure isolation, and drain suites | PASS |
 | Shell lifecycle | Direct argv, trusted Git, Windows Job, POSIX process group, cancellation, and shutdown suites | PASS |
 | CLI and package | Direct Typer entry, universal tag, clean installation, dependency check, and Unicode smoke | PASS |
@@ -44,6 +49,9 @@ Artifact identity, host details, exact commands, and final counts are recorded i
 - No macOS CI or manual macOS evidence was added by this release.
 - No paid or live Provider conversation is required by this offline release gate.
 - File-first persistence and Session Logs remain uncoordinated across runtime processes.
+- Ordinary Session persistence has no acknowledgement or failure logging; a crash can
+  lose the latest turn, and Conversation Summary can diverge from `last_consolidated`.
+- Existing Session schemas are unsupported; no migration or version dispatch is provided.
 - Shell command policy and owned-process cleanup are not an operating-system
   filesystem or network sandbox.
 

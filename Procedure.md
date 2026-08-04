@@ -12,7 +12,7 @@ This file is the delivery ledger. It was created before any implementation file.
 
 The public seams are already agreed by the user through issue #1, each child issue's acceptance criteria, and the canonical testing decisions in `docs/myclaw-runtime-contracts.md` and `docs/myclaw-personal-agent-prd.md`.
 
-- Test only observable behavior at these public seams: CLI/REPL, Conversation Port, Management Port, Runtime Core, Memory Manager, Tool Gateway, Session Store, Model Router, and Provider Adapter.
+- Test only observable behavior at these public seams: CLI/REPL, Conversation Port, Management Port, Runtime Core, Memory Manager, Tool Gateway, active Session, Model Router, and Provider Adapter. Historical rows below may mention superseded Session structures; they are delivery evidence, not current API or persistence guidance.
 - Work one vertical slice at a time: add one behavior test, run it and capture the expected failure (RED), add only enough implementation for that behavior, then run it to green (GREEN).
 - Prefer real in-process integration through public interfaces. Mock only system boundaries such as provider SDKs, HTTP/DNS, clocks, subprocesses, and fault-injected filesystems.
 - Do not test private methods, internal call counts, or implementation layout. Expected values must be literals or contract examples rather than recomputing the implementation.

@@ -7,7 +7,8 @@
 1. `CONTEXT.md`：canonical domain language 与边界规则，发生冲突时优先级最高。
 2. `docs/myclaw-personal-agent-prd.md`：产品行为、实现决策、必测场景和 Out of Scope。
 3. `docs/adr/0001-file-first-local-persistence.md`：file-first persistence 与不做跨进程协调的边界。
-4. `docs/adr/0002-fixed-agent-home.md`：固定 `~/.myclaw/` 与目录布局。
+4. `docs/adr/0002-fixed-agent-home.md`：固定 `~/.myclaw/` 与 User Configuration ownership。
+5. `docs/adr/0005-store-workspace-state-in-workspace.md` 与 `docs/adr/0009-active-session-snapshot-persistence.md`：Workspace State layout、active Session authority 和 snapshot persistence。
 
 需求基线是提交 `d6b6e00` 及工作区中 PRD 对 GitHub issue 链接的后续更新。开始编码前应把本计划与当前 canonical 文档一起确认；后续需求变化必须先更新对应文档，再调整实现和测试。
 
@@ -23,9 +24,9 @@
 ## 2. 实施原则
 
 - 采用纵向切片推进。每个阶段都产出可运行行为，不按“先写完所有接口、最后统一集成”的方式实施。
-- 测试外部可观察行为。优先从 Conversation Port、Management Port、Runtime Core、Memory Manager、Tool Gateway、Session Store、Model Router/Provider Adapter 验证契约。
+- 测试外部可观察行为。优先从 Conversation Port、Management Port、Runtime Core、Memory Manager、Tool Gateway、active Session、Model Router/Provider Adapter 验证契约。
 - 核心层不依赖 Typer、Rich、Anthropic SDK、OpenAI SDK 或具体文件路径实现；这些依赖通过 adapter 接入。
-- 所有 Agent Home 写入都采用原子写策略；session 普通消息是完整 JSONL 单行追加，metadata 更新是持锁后的原子重写。
+- Workspace State 写入采用各自的原子写策略；active Session 在 turn 结束后冻结完整 JSON-native state，并通过 ordered async JSONL replacement 持久化，shutdown 使用 bounded synchronous close。
 - 所有并发保证仅限单 runtime。不得意外引入或在测试中承诺跨进程锁、去重或一致性。
 - 先用 fake provider 打通 Runtime Core，再接真实 provider，避免把 SDK 行为和编排错误混在一起定位。
 - 任何阶段都不得重新引入 one-shot、daemon、HTTP/IPC、MCP、subagent、可配置 Permission Policy 或用户自定义 identity。
@@ -43,7 +44,7 @@ myclaw/
   memory/              # Summary records、Memory models/ports、任务与 scheduler
   provider/            # Model models/Port、Router、errors 与 Provider adapters
   schedule/            # Scheduled Work records、持久化、执行与后台协调
-  session/             # identifiers、records、models/Port、Conversation、Store 与 resume
+  session/             # active Session、Conversation 与 resume
   terminal/            # Typer CLI、REPL 与 foreground interrupts
   tools/
     models.py          # Tool 定义、调用、结果与执行上下文
@@ -61,7 +62,7 @@ tests/
   memory/              # Conversation Summary 与 Memory Task
   provider/            # Provider-neutral models
   scheduling/          # Scheduled Work persistence 与执行
-  sessions/            # Conversation、Session Store、resume 与 title
+  sessions/            # Conversation、active Session、resume 与 title
   tools/               # files、shell、web 与 artifact 行为
   utils/               # 时间格式与 Session identifier 行为
   fixtures/            # fake provider、fake tool、clock、Agent Home builders
@@ -72,14 +73,14 @@ tests/
 
 ```text
 CLI -> Conversation Port / Management Port -> Runtime Core
-Runtime Core -> Session Store / Memory Manager / Model Router / Tool Gateway
+Runtime Core -> active Session / Memory Manager / Model Router / Tool Gateway
 Model Router -> Provider Adapter
 Tool Gateway -> Permission Policy / Built-in Tools / Artifact Store
 Schedulers -> Runtime Core or Memory Manager
-Concrete stores -> Agent Home path and atomic persistence helpers
+Persistence adapters -> Workspace State paths and atomic persistence helpers
 ```
 
-反向依赖不允许出现。例如 provider adapter 不知道 REPL，Session Store 不渲染 Rich 输出，Tool Gateway 不直接处理用户输入。
+反向依赖不允许出现。例如 provider adapter 不知道 REPL，Session 不渲染 Rich 输出，Tool Gateway 不直接处理用户输入。
 
 ## 4. 阶段总览与依赖
 
@@ -109,8 +110,8 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 1. 确定 Python 最低版本、构建后端、依赖管理方式和 `src/` 布局，配置 `myclaw` console script。
 2. 加入 Typer、Rich、TOML/schema、async 测试、cron、HTTP、Anthropic SDK 和 OpenAI SDK 的依赖；锁定兼容版本范围。
-3. 定义核心值对象和 typed contracts：Agent Event、model message/tool call、model usage、normalized tool result、permission decision、session metadata、summary entry、scheduled work record。
-4. 定义 Conversation Port、Management Port、Model Provider、Session Store、Summary Store、Memory Store 和 Tool 接口的最小方法集合。
+3. 定义核心值对象和 typed contracts：Agent Event、model message/tool call、model usage、normalized tool result、permission decision、JSON-native Session state、summary entry、scheduled work state。
+4. 定义 Conversation Port、Management Port、active Session、Model Provider、Summary Store、Memory Store 和 Tool 接口的最小方法集合。
 5. 确认所有时间字段格式、local timezone 语义、UUID 形式、错误分类和用户可见错误映射。
 6. 建立 `pytest`、async 测试支持、lint、format、type check 和覆盖率命令；提供 fake clock、scripted fake provider、fake tool、临时 Agent Home/Workspace fixtures。
 7. 为内置 prompts 建立版本可追踪的独立资源，避免 prompt 字符串散落在编排代码中。
@@ -171,7 +172,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 1. 实现 Model Router，只接受 default/chat/memory/cron；具体 route 缺失或不可用时 fallback default。
 2. 实现统一 model request/stream event/response/usage/error contract，以及固定最多 5 次的 retry coordinator。
 3. retry 仅处理明确的临时 provider/model 错误，使用可注入 clock 的指数退避，并尊重 retry-after；取消和永久错误不得重试。
-4. 实现 Session Store 最小能力：延迟创建、metadata 第一行、OpenAI-style message 追加、metadata 原子重写、单 runtime 的 session 写锁。
+4. 实现 active Session：延迟物化、严格五字段 header、JSON-native message dictionaries、完整 atomic JSONL replacement、ordered async `persist()` 和 bounded synchronous `close()`。
 5. 实现 typed Agent Events 的最小集合：streamed text、final output、error；明确事件顺序和每个 turn 只有一个终态。
 6. 实现 Conversation Port 和 Runtime Core 的单轮 chat 路径；chat 必须 streaming，完成后一次写入 assistant message。
 7. 实现 system prompt 和 Runtime Context 组装：内置 identity + 启动时缓存的 Long-term Memory + Workspace；每轮 user input 带当前时间和 session ID。
@@ -194,9 +195,9 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ### 实现任务
 
-1. 完成 session ID、metadata、cumulative usage、Consolidation Cursor、message count 与 updated time 管理。
+1. 完成 Session ID、JSON-native metadata、cumulative usage、`last_consolidated`、message count 与 local-time updated time 管理。
 2. 首条用户输入后异步调用 chat route 生成 title，不阻塞首轮回复；失败时使用确定性的截断标题。
-3. title 调用不写入 conversation history，但 usage 计入 session，并与消息写入共享同一个 session 锁。
+3. title 调用不写入 conversation history，但 usage 计入 Session；late title 可由后续 ordered snapshot 或 bounded close 落盘。
 4. 实现当前 Workspace session 枚举、排序、损坏文件隔离和 Rich 交互式 picker。
 5. 实现 `/resume` 切换：只列当前 Workspace；保留有消息的原 session，可丢弃空 session；新输入写入被选择的 session。
 6. 实现 Management Port 和 `/config`、`/status`、`/memory` 的只读路径。
@@ -205,8 +206,8 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ### 测试与退出条件
 
-- 覆盖 Workspace slug、session 路径、metadata 第一行、三种 role、原子 metadata rewrite 和同 runtime 并发写序。
-- 验证 title 的异步性、fallback、usage 累计、写锁竞争和 late completion 时的正确 session 归属。
+- 覆盖 Workspace-owned Session 路径、strict header、三种 role、完整 replacement、snapshot freeze 和同 runtime ordered persistence。
+- 验证 title 的异步性、fallback、usage 累计、late completion、silent ordinary failure、bounded close retry 和正确 Session 归属。
 - `/resume` 不泄露其他 Workspace session，切换后上下文和新消息归属正确。
 - `/config` 完整但脱敏；`/status` 字段齐全；`/memory` 能看到 runtime 启动后发生的磁盘修改。
 - 未知 slash 输入仍进入 Conversation Port，绝不能被 CLI 吞掉或当作错误命令。
@@ -270,11 +271,11 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ### 实现任务
 
-1. 实现 Short-term Memory 为 session Consolidation Cursor 之后的 suffix，并纳入 chat context assembly。
+1. 实现 Short-term Memory 为 active Session `last_consolidated` 之后的 suffix，并纳入 chat context assembly。
 2. 在 chat 调用前同时评估 token budget 与总消息数阈值，达到任一条件则同步执行 consolidation。
 3. 实现选择约半预算/半阈值早期消息、cutoff 向下一个 user 对齐、无后继 user 时回退最近前一个 user 的算法。
 4. 使用 memory route 生成 summary，不注入 Long-term Memory；memory 与 default 都失败时使当前 chat 明确失败。
-5. 以 `{index, timestamp, content}` 追加全局 `summary.jsonl`，之后再更新 session Consolidation Cursor；定义两步操作失败时的可恢复/幂等策略。
+5. 以 `{index, timestamp, content}` 写入全局 `summary.jsonl`，之后直接更新 active Session `last_consolidated`；接受两者在 crash 或 Session snapshot failure 后 divergence，不引入 pending journal。
 6. 实现 Summary Cursor 纯文本 store、batch 读取和 Memory Manager prompt。
 7. 建立受限 memory Tool Gateway：可以读取当前 Long-term Memory，只能编辑 `memory/memory.md`，无需用户确认。
 8. 实现 Memory Task 状态机：no edit 与 edit success 推进 cursor，required edit failure 不推进；单 runtime 内不重入。
@@ -286,7 +287,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 - PRD 的全部 required memory tests 通过，包括两种触发、两条 cutoff 路径和 summary 不带 source identity。
 - 验证 summary 不直接注入 chat、不立即触发 Memory Task、生成时不注入 Long-term Memory。
-- 对 summary append 与 session cursor update 注入故障，重启后不得重复丢失或跳过未总结消息；具体恢复策略需写成契约测试。
+- 对 Summary 写入和 Session snapshot 注入故障，验证 failure silence、`last_consolidated` 保持内存语义，以及 crash divergence 的已接受边界；不得声称跨文件强一致或启动恢复。
 - Summary Cursor 在 no update、edit success、edit failure 下严格按规则推进。
 - batch size、手工/周期不重入、受限 edit 路径、runtime cache 与磁盘视图差异均有 integration tests。
 

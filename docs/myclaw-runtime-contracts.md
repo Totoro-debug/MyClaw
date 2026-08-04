@@ -17,9 +17,9 @@
 
 ### 1.1 兼容性
 
-- `config.toml`、session JSONL、summary JSONL、Summary Cursor、Long-term Memory、Scheduled Work JSON 和 Tool Artifact 是持久化契约。
-- session metadata 的 `schema_version` 固定为 `1`。同一文件中的 message records 按该版本解释。
-- 首版不实现旧 schema migration；遇到不支持的 `schema_version` 时只读失败并给出用户可见错误，不自动重写。
+- `config.toml`、Session JSONL、Summary JSONL、Summary Cursor、Long-term Memory、Scheduled Work JSON 和 Tool Artifact 是持久化契约。
+- Session JSONL 的第一行是当前严格 header，后续行是 JSON-native message dictionaries；不包含 schema version 或 line type marker。
+- 旧 Session schema unsupported；不提供 migration、compatibility reader、lazy upgrade 或 version dispatch。
 - summary JSONL 必须严格保持 `index`、`timestamp`、`content` 三个字段，因此不增加版本字段。
 - 内部 Python 类型、类名和文件拆分不是持久化契约，可在不改变外部行为的情况下调整。
 
@@ -43,7 +43,7 @@
 
 - UUID 均使用小写、带连字符的 UUID4。
 - Session ID 使用 `<local_timestamp>_<uuid4>`：`YYYYMMDD-HHMMSS-ffffff_550e8400-e29b-41d4-a716-446655440000`。
-- Scheduled Work ID、turn ID 和 message ID 使用 UUID4。
+- Scheduled Work ID 和 turn ID 使用 UUID4；Conversation Session message dictionaries 没有通用 message ID。
 - provider 返回的 tool call ID 原样保存在 message 中，不在业务层重新命名。
 - Tool Artifact 文件名使用 tool call ID 的 UTF-8 percent-encoding，通常为 `safe="-_."`；Windows 保留 basename（`CON`、`PRN`、`AUX`、`NUL`、`COM1`-`COM9`、`LPT1`-`LPT9`）全量编码，避免保留名以及 `/`、`\\`、`:` 等字符破坏路径；逻辑路径仍对应原 tool call ID。
 
@@ -62,13 +62,13 @@
 | D09 | token estimate 使用 `ceil(UTF-8 byte length / 4)`，展示估算输入 token、context window 和占比 | provider-neutral，明确它只是估算值 | PRD 可补充 |
 | D10 | WebSearch 使用无凭据的内置 adapter，首选 DuckDuckGo；后端不进入持久化配置契约 | 保持 User Configuration 只控制 enablement，adapter 可替换 | PRD |
 | D11 | Shell allowlist 只包含本文列出的精确只读命令形状；Issue #38 期间其他命令一律 refused | 规则可审计，不做不可靠的“只读意图”推断；这是对 ADR-0003 的临时偏离 | PRD/Issue #38 |
-| D12 | session 仅允许恢复单个不完整尾行；中间损坏或完整但非法的尾行视为损坏并拒绝加载 | 兼顾 append 崩溃恢复与不静默跳过历史 | PRD/ADR 0001 可补充 |
-| D13 | 使用 `memory/pending-consolidations/` journal 协调 summary append 与 session cursor 更新 | summary schema 不能保存 source identity，持久化 journal 才能确定性恢复崩溃窗口 | ADR 0001 |
+| D12 | Session 只接受完整当前 JSONL snapshot；缺少尾随换行、非法 header/message 或旧 schema 都拒绝加载，不做尾行修复 | 完整 atomic replacement 简化 Session authority；不静默修复或迁移不支持的历史格式 | ADR-0009 |
+| D13 | Conversation Summary 直接更新 Session 的 `last_consolidated`，不创建 pending journal 或跨文件恢复协议 | 接受 Summary 与 Session snapshot 在 crash 后 divergence，以保持 Session 接口小且无 persistence acknowledgement | ADR-0009 |
 | D14 | Tool Artifact preview 保留前 `2000` 字符，加固定截断提示和相对路径 | 给模型足够上下文，同时稳定控制 session 大小 | PRD 可补充 |
 | D15 | 配置、持久化、模型与服务级错误使用稳定 error code；`ToolError` 与 Tool Result 仅使用安全 message | Tool 消息与模型消费格式保持扁平，其他上层逻辑仍不依赖易变终端文案 | 实施契约/Issue #38 |
 | D16 | 首版 Shell 不宣称提供 OS 级文件系统/网络隔离；强制 Workspace cwd，执行仅限精确只读命令 | 仅校验 cwd 无法约束子进程访问绝对路径，不能制造虚假的 sandbox 保证 | PRD/ADR 0003/Issue #38 |
 
-D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D13、D16 是已显式接受的产品或风险边界。
+D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D13、D16 是已显式接受的产品或风险边界；Session snapshot 细节由 ADR-0009 补充。
 
 ## 3. Agent Home 与 Workspace
 
@@ -85,8 +85,6 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
     memory.md
     summary.jsonl
     .cursor
-    pending-consolidations/
-      <session_id>.json
   sessions/
     <session_id>.jsonl
     artifacts/
@@ -96,7 +94,7 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
     <session_id>.log
 ```
 
-已确定：Agent Home 拥有 User Configuration；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 REPL 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`scheduled-work.json`、Session、artifacts、`logs/` 与 `pending-consolidations/` 按需创建。`myclaw config` 不初始化 Workspace State。
+已确定：Agent Home 拥有 User Configuration；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 REPL 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`scheduled-work.json`、Session、artifacts 和 `logs/` 按需创建。`myclaw config` 不初始化 Workspace State。
 
 `memory.md` 初始内容固定为：
 
@@ -131,9 +129,9 @@ Session technical diagnostics 位于 `<workspace>/.myclaw/logs/<session_id>.log`
 
 - 新文件或整体更新：在目标同目录创建唯一临时文件，写入完整内容，flush，尽可能 fsync，再 atomic replace。
 - 文件内容 flush 后尽可能 fsync；POSIX 在发布后同步 parent directory，host 明确不支持同步时保留可测试的 best-effort 分支。
-- session 普通 message append：持有当前 runtime 的 session lock，一次写入完整 UTF-8 record + `\n`，flush 后返回；取消不得打断临界区。
-- session metadata 更新：持有同一 session lock，读取现有 records，以新 metadata + 原 message records 原子重写。
-- 不创建跨进程 lock file，不依赖文件锁，不承诺两个 REPL 写同一 session 的顺序。
+- Session snapshot：当前 runtime 的 active Session 在 turn 结束后捕获完整 JSON-native state，按 `persist()` 调用顺序异步进行一次 UTF-8 JSONL atomic replacement；取消不得打断已开始的 filesystem operation。
+- `Session.close()` 在 shutdown 中对最新非空 state 做最多三次同步 replacement attempt，普通异步失败和 close 最终失败均 silent，不产生 acknowledgement 或 failure log。
+- 不创建 Session 跨进程 lock file，不依赖文件锁，不承诺两个 REPL 写同一 Session 的顺序。
 
 ## 4. User Configuration 契约
 
@@ -241,51 +239,53 @@ timeout = 120
 
 ## 5. Conversation Session 契约
 
-### 5.1 Metadata record
+### 5.1 Header and state
 
 第一行必须是：
 
 ```json
-{"record_type":"metadata","schema_version":1,"id":"20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000","title":"MyClaw implementation","created_at":"2026-07-11T15:30:12.123+08:00","updated_at":"2026-07-11T15:31:02.456+08:00","consolidation_cursor":0,"cumulative_usage":{"model_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0}}
+{"session_id":"20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000","created_at":"2026-07-11T15:30:12.123+08:00","updated_at":"2026-07-11T15:31:02.456+08:00","last_consolidated":0,"metadata":{"title":"MyClaw implementation","token_usage":{"model_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0}}}
 ```
 
 规则：
 
-- `consolidation_cursor` 是 canonical `Consolidation Cursor` 的持久化表示，是从 `0` 开始的 message boundary，表示前多少条 message records 已被 Conversation Summary 覆盖；Short-term Memory 是 `messages[consolidation_cursor:]`。
-- `cumulative_usage` 包含主 chat、tool loop 中的模型调用、title、summary 和与当前 session 直接相关的辅助调用；Memory Task 与 Scheduled Work 计入各自执行所属 session，不计入当前前台 session。
+- `last_consolidated` 是从 `0` 开始的 message boundary，表示前多少条 Session messages 已被 Conversation Summary 覆盖；Short-term Memory 是 `messages[last_consolidated:]`。Conversation Summary 直接赋值，不调用 cursor-specific method，也不通过 journal 与 Session snapshot 协调。
+- `metadata` 当前拥有 `title` 与 `token_usage`；`token_usage` 包含主 chat、Tool loop、title、Conversation Summary 和与当前 Session 直接相关的辅助调用。Memory Task 不接收 Conversation Session；Scheduled Work 的模型调用计入其 task-specific Session，不计入当前前台 Session。
 - `total_tokens` 必须等于 `input_tokens + output_tokens`。provider 未返回某项时该项为 `0`，不得用估算值混入实际 usage。
-- metadata 更新必须保留所有 message record 的字节语义，不排序或重排历史。
+- 每次成功持久化都是完整 compact UTF-8 JSONL atomic replacement，header 与所有 message lines 一起提交；不存在逐消息写入或 metadata-only rewrite。
+- 当前 header 必须恰好包含 `session_id`、`created_at`、`updated_at`、`last_consolidated`、`metadata`。旧 schema unsupported，不 migration、不 version dispatch。
 
 ### 5.2 User message
 
 ```json
-{"record_type":"message","id":"0f8fad5b-d9cb-469f-a165-70867728950e","created_at":"2026-07-11T15:30:12.200+08:00","role":"user","content":"Help me inspect this project."}
+{"role":"user","content":"Help me inspect this project.","timestamp":"2026-07-11T15:30:12.200+08:00"}
 ```
 
-- `content` 是非空 string；只包含空白的 REPL 输入不创建 message，也不调用模型。
+- `content` 是非空 string；只包含空白的 REPL 输入不创建 message，也不调用模型。`timestamp` 使用 system local timezone 的 ISO 8601 string。
 - Runtime Context 是发给模型时临时 prepend 的内容，不写回 `content`。
 
 ### 5.3 Assistant message
 
 ```json
-{"record_type":"message","id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","created_at":"2026-07-11T15:30:13.000+08:00","role":"assistant","content":"I will inspect the files.","tool_calls":[{"id":"call_123","name":"list_files","arguments":"{\"path\":\".\"}"}],"status":"completed","error":null,"usage":{"input_tokens":120,"output_tokens":24,"total_tokens":144}}
+{"role":"assistant","content":"I will inspect the files.","timestamp":"2026-07-11T15:30:13.000+08:00","tool_calls":[{"id":"call_123","name":"list_files","arguments":"{\"path\":\".\"}"}],"status":"completed","error":null,"token_usage":{"model_calls":1,"input_tokens":120,"output_tokens":24,"total_tokens":144}}
 ```
 
 字段规则：
 
-- `content` 是 string，可为空；`tool_calls` 是 array，可为空；两者至少一个非空，除非 `status=error`。
-- tool call `arguments` 必须保留 provider 的原始 JSON string。Tool Gateway 无法解析时追加 flat `tool` error record，不执行具体 Tool。
+- `content` 是 string，可为空；`tool_calls` 是 array，可为空；两者至少一个非空，除非 `status=error`。通用 message ID 不存在。
+- tool call `arguments` 必须保留 provider 的原始 JSON string。Tool Gateway 无法解析时追加 flat `tool` error message，不执行具体 Tool。
 - `status` 仅为 `completed`、`interrupted`、`error`。
 - `error` 在 `completed` 时必须为 `null`；其他状态为 `{code, message}`，message 必须可安全展示。
-- streaming 正常完成后才写一条 `completed` assistant record。
-- Ctrl+C 时有 partial text 就写 `interrupted` record；没有 partial text 且没有 tool call 时不写空 assistant record。
-- 最终 model failure 写 `error` assistant record；恢复对话构建 model context 时省略纯 error record，保留 interrupted partial content并追加内部中断标记。
-- 如果 assistant 已产生 tool calls 后 turn 被取消，必须为每个尚无结果的 call 追加 tool error record。
+- `token_usage` 使用四字段结构 `model_calls`、`input_tokens`、`output_tokens`、`total_tokens`；每个 assistant model result 的 `model_calls` 为 `1`，并累计到 Session metadata 的 `token_usage`。
+- streaming 正常完成后才把一条 `completed` assistant message 加入 active Session；`persist()` 在 turn terminal work 之后一次写入完整 snapshot。
+- Ctrl+C 时有 partial text 就写 `interrupted` assistant message；没有 partial text 且没有 tool call 时不写空 assistant message。
+- 最终 model failure 写 `error` assistant message；恢复对话构建 model context 时省略纯 error message，保留 interrupted partial content 并追加内部中断标记。
+- 如果 assistant 已产生 tool calls 后 turn 被取消，必须为每个尚无结果的 call 添加 tool error message。
 
 错误示例：
 
 ```json
-{"record_type":"message","id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","created_at":"2026-07-11T15:30:13.000+08:00","role":"assistant","content":"Partial answer","tool_calls":[],"status":"interrupted","error":{"code":"turn_cancelled","message":"Turn interrupted by user."},"usage":{"input_tokens":120,"output_tokens":8,"total_tokens":128}}
+{"role":"assistant","content":"Partial answer","timestamp":"2026-07-11T15:30:13.000+08:00","tool_calls":[],"status":"interrupted","error":{"code":"turn_cancelled","message":"Turn interrupted by user."},"token_usage":{"model_calls":1,"input_tokens":120,"output_tokens":8,"total_tokens":128}}
 ```
 
 ### 5.4 Tool message
@@ -293,19 +293,19 @@ timeout = 120
 普通结果：
 
 ```json
-{"record_type":"message","id":"9b2c3a42-1d2e-4a1e-a827-61f36dc54713","created_at":"2026-07-11T15:30:13.500+08:00","role":"tool","tool_call_id":"call_123","name":"list_files","content":"CONTEXT.md\ndocs/","status":"success","artifact":null}
+{"role":"tool","content":"CONTEXT.md\ndocs/","timestamp":"2026-07-11T15:30:13.500+08:00","tool_call_id":"call_123","name":"list_files","status":"success","artifact":null}
 ```
 
 拒绝或失败：
 
 ```json
-{"record_type":"message","id":"9b2c3a42-1d2e-4a1e-a827-61f36dc54713","created_at":"2026-07-11T15:30:13.500+08:00","role":"tool","tool_call_id":"call_123","name":"write_file","content":"Writing Workspace files is unavailable because confirmation is not implemented.","status":"refused","artifact":null}
+{"role":"tool","content":"Writing Workspace files is unavailable because confirmation is not implemented.","timestamp":"2026-07-11T15:30:13.500+08:00","tool_call_id":"call_123","name":"write_file","status":"refused","artifact":null}
 ```
 
 字段规则：
 
 - `status` 仅为 `success`、`error`、`refused`。
-- tool 参数校验失败、执行异常和未完成 call 都使用 `error`，不新增 role。
+- tool 参数校验失败、执行异常和未完成 call 都使用 `error`，不新增 role；这些字段仍作为 JSON-native tool message 保存在完整 Session snapshot 中。
 - tool result 会回传模型，因此 `content` 必须是 normalized、可读的 UTF-8 text，不包含 Python repr 或 traceback。
 - Tool Gateway 按具体 Tool 的 `max_retries` 执行有界指数退避；WebSearch/WebFetch 为 2，其余内置 Tool 为 0。
 - 旧的 structured arguments 和 nested Tool error JSONL shape 不兼容且不恢复读取。
@@ -314,23 +314,23 @@ timeout = 120
 
 固定规则：
 
-1. 首条 user message 持久化后异步使用 chat route生成 title。
+1. 首条 user message 加入 active Session 后异步使用 chat route 生成 title，不阻塞首轮 terminal response 或 end-of-turn snapshot。
 2. 模型输出取第一条非空行，去除成对引号和首尾空白，内部连续空白折叠为一个空格，截断到 60 个 Unicode code points。
 3. 模型失败、空输出或非法输出时，对首条 user content 应用同样的规范化和截断。
 4. fallback 仍为空时使用 `Untitled session`。
-5. title 调用 usage 计入 session metadata，但不新增 message。
+5. title 调用 usage 计入 Session metadata，但不新增 message；late title 可能只存在于内存，直到后续 turn 或 `close()` 再落盘。
 
-### 5.6 损坏恢复
+### 5.6 格式边界与失败语义
 
-- 第一行缺失、非法或不是 supported metadata：session 不可恢复。
-- 中间 message record 非法：session 不可恢复，不静默跳过。
-- 文件最后没有 `\n` 且最后一段不是合法完整 JSON：视为 append 中断，忽略该尾段并保留此前 records；首次后续成功写入前原子修复文件。
-- 有 `\n` 的非法尾行视为完整但损坏，拒绝恢复。
-- picker 跳过不可恢复 session，同时显示一条汇总警告；不得把损坏文件自动删除。
+- 第一行缺失、字段不是当前严格五字段 header、日期不是带 offset 的 ISO 8601、`last_consolidated` 为负数或 metadata 不合法：Session 不可恢复。
+- 任一 message line 非法、包含旧 line-marker/version fields、缺少 trailing `\n`，或文件为空：Session 不可恢复，不静默跳过、不做 partial-line repair，也不自动迁移。
+- `Session.load()` 是同步且严格的当前格式读取；picker 跳过不可恢复 Session，同时显示一条汇总警告；不得把损坏文件自动删除。
+- `persist()` 不等待 filesystem operation，不返回 task、acknowledgement 或 failure；普通写入异常不产生 Agent Event、Session Log 或其他诊断记录。
+- `close()` 标记 Session closed 后抑制过期异步 snapshot，最多同步尝试三次（间隔 `100 ms`、`200 ms`），最终失败静默吞掉。
 
 ## 6. Conversation Summary、Cursor 与 Long-term Memory
 
-### 6.1 Summary record
+### 6.1 Summary entry
 
 每行严格只有三个字段：
 
@@ -341,7 +341,7 @@ timeout = 120
 - `index` 全局严格递增，从 `1` 开始。
 - `content` 非空。
 - 不保存 source session、message ID、message range、route 或 usage。
-- append 使用 runtime 内全局 summary lock。
+- Summary entries use the runtime's global summary lock and remain a separate ordered stream from Session snapshots。
 
 ### 6.2 Summary Cursor
 
@@ -350,23 +350,15 @@ timeout = 120
 - cursor 表示 Memory Task 已成功处理的最大 summary index。
 - no update 或 edit success 后原子写入 batch 的最后 index；required edit failure 不写。
 
-### 6.3 Consolidation crash consistency
+### 6.3 Summary and `last_consolidated` consistency
 
-file-first 无法原子提交“追加 global summary”和“更新 session metadata”。使用内部 journal：
-
-```json
-{"session_id":"<session_id>","old_cursor":0,"new_cursor":8,"summary_index":12,"timestamp":"2026-07-11T16:00:00.000+08:00","content":"..."}
-```
-
-提交协议：
-
-1. 在 global summary lock 内确定下一个 `summary_index`，生成 summary content 和目标 session cutoff。
-2. 原子写入 `memory/pending-consolidations/<session_id>.json`，其中保存即将写入的完整 summary record 信息。
-3. 如果 `summary.jsonl` 尚无该 index，append journal 中的精确 record；如果已有相同 record，视为幂等成功；如果 index 已存在但内容不同，停止并报告 `persistence_error`。
-4. 原子更新 session `consolidation_cursor = new_cursor`。
-5. 删除 journal。删除前崩溃不会破坏正确性，恢复时重复步骤 3-5。
-
-runtime 启动时先恢复所有 journal，再接受新 chat turn。journal 是 Agent Home 内部状态，主 Agent file tools 不可读写。该协议只保证单 runtime 正常恢复；两个 REPL 同时 consolidation 仍可能争用全局 index，这是首版明确接受的跨进程风险。
+Conversation Summary generation appends its one summary entry under the
+single-runtime Summary lock, then directly assigns the active Session's
+`last_consolidated`. There is no pending journal, startup recovery path, or
+cross-file transaction between `summary.jsonl` and Session JSONL. A crash or
+failed Session snapshot may leave the summary entry and `last_consolidated`
+divergent; subsequent work may therefore repeat or omit a summary range. This
+is accepted by ADR-0009 and does not provide cross-process coordination.
 
 ### 6.4 Long-term Memory cache
 
@@ -378,7 +370,7 @@ runtime 启动时先恢复所有 journal，再接受新 chat turn。journal 是 
 
 ## 7. Scheduled Work 契约
 
-固定文件名：`~/.myclaw/scheduled-work.json`。
+固定文件名：`<workspace>/.myclaw/scheduled-work.json`。
 
 顶层必须是 JSON array；空状态可以由文件缺失或 `[]` 表示。记录示例：
 
@@ -406,7 +398,7 @@ runtime 启动时先恢复所有 journal，再接受新 chat turn。journal 是 
 - store update 在单 runtime lock 内执行整体 JSON array 原子 rewrite。
 - 单条 record 非法使整个文件配置无效，scheduler 不启动；REPL 主对话仍可运行并通过 `/status` 显示 scheduler error。不得静默丢弃非法任务。
 - 当前 Tool contract 固定拒绝创建 Scheduled Work；拒绝时不分配持久化 record。
-- task-specific session 使用普通 session schema；每次 trigger 追加 prompt user message和最终 assistant/tool history。
+- task-specific Conversation Session 使用当前 `Session` JSONL shape；每次 trigger 把 prompt user message 和最终 assistant/Tool history 加入该 `Session`，并在 terminal work 后按完整 snapshot lifecycle 持久化。
 
 ## 8. Prompt、Runtime Context 与预算
 
@@ -443,9 +435,9 @@ session_id: <session_id>
 ### 8.3 专用 prompts
 
 - Session title：只接收规范化后的首条 user content，不注入 Long-term Memory、tools 或 conversation history。
-- Conversation Summary：只接收本次选中的早期 session messages，不注入 Long-term Memory 或 Tool Catalog。
+- Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory 或 Tool Catalog。
 - Memory Task：接收 Summary Cursor 后的 batch 和四分区维护规则，并只暴露 restricted memory tools。
-- Scheduled Work：使用 chat/cron system composition，把 task prompt 作为 task-specific session 的普通 user message。
+- Scheduled Work：使用 chat/cron system composition，把 task prompt 作为 task-specific Conversation Session 的普通 user message。
 
 prompt 文本存放在独立、可版本追踪的 package resources；测试断言组成部分和是否注入，不锁死整段自然语言文案。
 
@@ -656,9 +648,9 @@ ToolResult(
 
 - Workspace 内 read/list/search：allow。
 - Workspace 内 write/edit：refused。
-- Agent Home 的 `memory/memory.md`：main catalog read allow，write/edit refused；Memory Task 专用 edit Tool 仅允许精确文件。
+- Workspace State 的 `memory/memory.md`：main catalog read allow，write/edit refused；Memory Task 专用 edit Tool 仅允许精确文件。
 - 当前 session 的 artifact directory：read allow，write/edit refused。
-- `config.toml`、session JSONL、summary、cursor、Scheduled Work JSON 和其他 Agent Home 内部路径：main file Tools read/write/edit 均 fail closed；这些内容只通过对应 Port/Store 暴露。
+- `config.toml`、Session JSONL、Summary、Summary Cursor、Scheduled Work JSON 和其他 Workspace State 内部路径：main file Tools read/write/edit 均 fail closed；这些内容只通过对应 Port 或 domain interface 暴露。
 - 其他路径：fail closed，不升级为 confirmation。
 
 路径检查必须基于解析后的目标和最近存在父目录，防止 `..`、symlink、junction/reparse point 越界。拒绝访问 device file、named pipe 和非普通文件。
@@ -834,7 +826,7 @@ CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`
   "context_window": 200000,
   "context_used_percent": 2.1,
   "session_message_count": 12,
-  "consolidation_cursor": 4,
+  "last_consolidated": 4,
   "cumulative_usage": {
     "model_calls": 5,
     "input_tokens": 6100,
@@ -846,19 +838,27 @@ CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`
 
 - `chat_model` 显示解析后的实际 route；chat fallback default 时显示 default 对应 provider/model。
 - token estimate 对下一次 chat request 的 system prompt、retained messages、tool definitions 和 Runtime Context 的 UTF-8 bytes 求和后除以 4 向上取整。
-- 没有已持久化 message 的准备中 session：message count/cursor/usage 都为 0。
+- 没有已持久化 message 的准备中 Session：message count/`last_consolidated`/usage 都为 0。
 - scheduler 初始化失败可附加非持久化 warning，但不得取代 required fields。
 
-## 15. 最小 Store/Provider/Tool 接口
+## 15. 最小 Session/Provider/Tool 接口
 
-以下签名用于限定职责，不要求使用特定 ABC library：
+以下签名用于限定职责，不要求使用特定 ABC library。Conversation Session 的
+identity、messages、metadata、`last_consolidated` 和 complete snapshot
+persistence 由同一个 active `Session` instance 负责；Session 不暴露
+filesystem acknowledgement，也不承担 Conversation Port 或 Model Provider
+职责：
 
 ```python
-class SessionStore(Protocol):
-    async def append_message(self, session_id: str, message: SessionMessage) -> None: ...
-    async def update_metadata(self, session_id: str, update: MetadataUpdate) -> None: ...
-    async def load(self, session_id: str) -> ConversationSession: ...
-    async def list_for_workspace(self, workspace: Path) -> tuple[SessionSummary, ...]: ...
+class Session:
+    @classmethod
+    def create(cls, workspace_state: WorkspaceState) -> "Session": ...
+    @classmethod
+    def load(cls, workspace_state: WorkspaceState, session_id: str) -> "Session": ...
+    def add_message(self, role: str, content: str, **fields: JsonValue) -> None: ...
+    def update_metadata(self, metadata: dict[str, JsonValue] | None = None, **updates: JsonValue) -> None: ...
+    def persist(self) -> None: ...
+    def close(self) -> None: ...
 
 class SummaryStore(Protocol):
     async def append(self, content: str, timestamp: datetime) -> SummaryEntry: ...
@@ -892,17 +892,17 @@ Phase 0 应先把以下内容固化为 fixtures/snapshots：
 
 - 默认 config template 与一个完整有效 config。
 - config unknown field、unknown route、unknown protocol 和 redaction cases。
-- 四种 session records：metadata、user、assistant mixed content/raw tool calls、flat tool artifact/error。
-- 完成、中断、model failure、tool failure 后的完整 session JSONL snapshots。
+- 当前 Session header 与 user/assistant/tool message shape 的 exact-key assertion。
+- 完成、中断、model failure、tool failure 后的完整 Session JSONL snapshots，以及 ordered async persist 和 bounded close。
 - summary schema exact-key assertion、index/cursor 起点和 batch 行为。
 - Scheduled Work JSON exact-key assertion。
 - 全部 Agent Event payload schema 与事件顺序。
 - Model Provider scripted transcript：text deltas、tool call deltas、usage、retry-after、timeout、cancellation。
 - Tool fail-closed matrix、file path boundary、Shell exact allowlist 和 WebFetch redirect/IP cases。
-- atomic rewrite、incomplete final JSONL line、middle corruption 和 consolidation crash window。
+- complete atomic JSONL replacement、缺少 trailing newline、middle corruption、旧 schema rejection，以及 Summary/`last_consolidated` crash divergence。
 
 契约测试断言稳定 code、结构和文件内容；终端文案除脱敏与必需信息外不做全文 snapshot，以免实现被展示细节锁死。
 
 ## 17. 确认记录
 
-D01-D16 已于 2026-07-11 全部接受，Tool 契约由 Issue #38 于 2026-07-27 更新。ADR-0001 和 ADR-0002 继续有效；非 allowlist Shell 暂时直接拒绝的行为是对 ADR-0003 前台确认规则的已批准临时偏离。本文 schema 是 Python 类型、持久化实现与 contract fixtures 的直接输入。
+D01-D16 已于 2026-07-11 全部接受，Tool 契约由 Issue #38 于 2026-07-27 更新，Session snapshot 契约由 ADR-0009 于 2026-08-04 接受。ADR-0001 对 Session lifecycle 的旧条款已部分 superseded，ADR-0002 的非全局布局由 ADR-0005 superseded；非 allowlist Shell 暂时直接拒绝的行为是对 ADR-0003 前台确认规则的已批准临时偏离。本文 schema 是 Python 类型、持久化实现与 contract fixtures 的直接输入。
