@@ -11,7 +11,6 @@ from pathlib import Path
 from loguru import logger
 
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.session.identifiers import require_session_id
 from myclaw.session.session import Session
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
@@ -43,7 +42,7 @@ def session_log(
             raise TypeError("Session Log requires a Session ID")
         workspace_state = workspace_or_session
         resolved_session_id = session_id
-    require_session_id(resolved_session_id)
+    Session._require_id(resolved_session_id)
     handler_id = _add_sink(workspace_state, resolved_session_id)
     try:
         with logger.contextualize(session_id=resolved_session_id):

@@ -24,8 +24,7 @@ from myclaw.schedule.scheduled_work import (
     WorkspaceJsonScheduledWorkStore,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.session.records import ToolSessionMessage
-from myclaw.session.session_store import JsonlSessionStore
+from myclaw.session.session import Session
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
@@ -99,12 +98,8 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
-    session_id = sessions.prepare().id
+    state = _state(workspace)
+    session = Session.create(state, now=lambda: NOW, new_uuid=uuid4)
     prompt = "Use disabled shell and web tools later if the task needs them."
     tool_call = ModelToolCall(
         id="call_schedule",
@@ -143,13 +138,12 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
             ),
         )
     )
-    store = WorkspaceJsonScheduledWorkStore(_state(workspace))
+    store = WorkspaceJsonScheduledWorkStore(state)
     gateway = ToolGateway()
     gateway.register_tools((CreateScheduledWorkTool(),))
     conversation = StreamingConversationPort(
         provider=provider,
-        sessions=sessions,
-        session_id=session_id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=1024,
@@ -170,11 +164,9 @@ async def test_foreground_scheduled_work_creation_is_refused_without_confirmatio
         "turn_completed",
     ]
     assert store.load() == ()
-    session = await sessions.load(session_id)
     refused = session.messages[2]
-    assert isinstance(refused, ToolSessionMessage)
-    assert refused.status == "refused"
-    assert refused.content == (
+    assert refused["status"] == "refused"
+    assert refused["content"] == (
         "Scheduled Work creation is unavailable because confirmation is not implemented."
     )
 

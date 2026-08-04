@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from typing import Any, Protocol
+from typing import Protocol
 
 from myclaw.agent.events import AgentEvent, ConversationPort
 from myclaw.session.session import Session
@@ -18,17 +18,11 @@ class SwitchableConversationPort:
     def __init__(
         self,
         *,
-        session: Session | None = None,
-        session_id: str | None = None,
-        build_conversation: Callable[[Any], ConversationPort],
+        session: Session,
+        build_conversation: Callable[[Session], ConversationPort],
         event_sequencer: AgentEventSequencer | None = None,
     ) -> None:
-        if session is None and session_id is None:
-            raise TypeError("Conversation Port requires a Session or Session ID")
-        if session is not None and session_id is not None:
-            raise TypeError("Conversation Port cannot receive both a Session and Session ID")
         self._session = session
-        self._session_id = session.session_id if session is not None else session_id
         self._build_conversation = build_conversation
         self._delegate: ConversationPort | None = None
         self._active_delegate: ConversationPort | None = None
@@ -39,9 +33,7 @@ class SwitchableConversationPort:
 
     @property
     def session_id(self) -> str:
-        session_id = self._session_id
-        assert session_id is not None
-        return session_id
+        return self.session.session_id
 
     @property
     def session(self) -> Session:
@@ -50,18 +42,16 @@ class SwitchableConversationPort:
             raise RuntimeError("This Conversation Port has no Session authority")
         return session
 
-    def switch_session(self, session: Session | str) -> None:
+    def switch_session(self, session: Session) -> None:
         if self._close_task is not None:
             raise RuntimeError("Conversation Port is closed")
         if self._active_delegate is not None:
             raise RuntimeError("Cannot switch Session during an active foreground turn")
-        session_id = session.session_id if isinstance(session, Session) else session
-        if session_id == self.session_id:
+        if session.session_id == self.session_id:
             return
         if self._session is not None:
             self._previous_sessions.append(self._session)
-        self._session = session if isinstance(session, Session) else None
-        self._session_id = session_id
+        self._session = session
         self._delegate = None
 
     async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
@@ -71,9 +61,7 @@ class SwitchableConversationPort:
             raise RuntimeError("A foreground turn is already active")
         delegate = self._delegate
         if delegate is None:
-            delegate = self._build_conversation(
-                self._session if self._session is not None else self.session_id
-            )
+            delegate = self._build_conversation(self.session)
             self._delegate = delegate
             self._owned_delegates.append(delegate)
         self._active_delegate = delegate

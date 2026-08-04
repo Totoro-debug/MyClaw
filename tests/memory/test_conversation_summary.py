@@ -179,7 +179,6 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
     assert "Second question." not in request.messages[0].content
     assert "future_field" not in request.messages[0].content
     assert (await summaries.after(0, 10))[0].content == "First turn summary."
-    assert not summaries.pending_directory.exists()
 
 
 @pytest.mark.asyncio
@@ -256,7 +255,6 @@ async def test_repeated_consolidation_advances_cursor_once_per_appended_summary(
     assert isinstance(second_request.messages[0], UserModelMessage)
     assert "Question one." not in second_request.messages[0].content
     assert "Question two." in second_request.messages[0].content
-    assert not summaries.pending_directory.exists()
 
 
 @pytest.mark.asyncio
@@ -280,7 +278,6 @@ async def test_summary_append_failure_keeps_cursor_without_journal(
         "output_tokens": 9,
         "total_tokens": 37,
     }
-    assert not summaries.pending_directory.exists()
 
 
 @pytest.mark.asyncio
@@ -307,7 +304,6 @@ async def test_oversized_system_prompt_fails_without_summary_or_cursor_progress(
     assert provider.complete_requests == []
     assert session.last_consolidated == 0
     assert not summaries.path.exists()
-    assert not summaries.pending_directory.exists()
 
 
 @pytest.mark.asyncio
@@ -358,7 +354,6 @@ async def test_empty_summary_response_is_model_failure_without_cursor_progress(
         "total_tokens": 37,
     }
     assert not summaries.path.exists()
-    assert not summaries.pending_directory.exists()
 
 
 @pytest.mark.asyncio
@@ -378,7 +373,6 @@ async def test_summary_provider_failure_preserves_user_visible_model_error(
     assert raised.value.error.message == "PRIVATE FAILURE"
     assert session.last_consolidated == 0
     assert not summaries.path.exists()
-    assert not summaries.pending_directory.exists()
 
 
 @pytest.mark.asyncio
@@ -410,7 +404,6 @@ async def test_active_conversation_prepares_summary_before_chat_request(
     assert "First question." not in request_content
     assert "Second question." in request_content
     assert "Current question." in request_content
-    assert not summaries.pending_directory.exists()
 
 
 @pytest.mark.asyncio
@@ -448,7 +441,6 @@ async def test_summary_failure_is_not_rewritten_by_silent_session_persistence_fa
     assert persistence_attempts == [state.sessions_directory / f"{session.session_id}.jsonl"]
     assert provider.stream_requests == []
     assert not summaries.path.exists()
-    assert not summaries.pending_directory.exists()
 
 
 @pytest.mark.parametrize(

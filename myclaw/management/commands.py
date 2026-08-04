@@ -12,10 +12,10 @@ from myclaw.management.service import (
     ManagementError,
     ResumeResult,
     RuntimeStatus,
+    SessionListingEntry,
     SessionListingReport,
 )
 from myclaw.memory.memory_task import MemoryTaskResult
-from myclaw.session.records import SessionSummary
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 
@@ -39,7 +39,7 @@ class ManagementCommandResult:
 
     handled: bool
     output: str | None
-    resume_sessions: tuple[SessionSummary, ...] | None = None
+    resume_sessions: tuple[SessionListingEntry, ...] | None = None
 
 
 class ManagementCommandDispatcher:

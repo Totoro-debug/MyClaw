@@ -63,10 +63,8 @@ from myclaw.session.conversation import (
     ChatModelSettings,
     StreamingConversationPort,
 )
-from myclaw.session.records import ConversationSession
 from myclaw.session.session import Session
 from myclaw.session.session_resume import SwitchableConversationPort
-from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool
 from myclaw.tools.files.file_tools import (
@@ -143,7 +141,6 @@ class PreparedReplRuntime:
     """An in-memory Session identity and its injectable REPL composition."""
 
     conversation: SwitchableConversationPort
-    sessions: JsonlSessionStore
     management_dispatcher: ManagementDispatcher
     scheduled_work_coordinator: ScheduledWorkCoordinator
     _shell: SubprocessShellBoundary | None
@@ -293,9 +290,7 @@ class _DeferredConversationPort:
         self,
         *,
         provider: ModelProvider,
-        session: Session | None = None,
-        sessions: JsonlSessionStore | None = None,
-        session_id: str | None = None,
+        session: Session,
         settings: ChatModelSettings,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
@@ -306,17 +301,9 @@ class _DeferredConversationPort:
         history_preparer: Callable[[Any], Awaitable[Any]] | None = None,
         before_submit: Callable[[], Awaitable[None]] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
-        workspace_state: WorkspaceState | None = None,
     ) -> None:
-        if session is None:
-            if sessions is None or session_id is None:
-                raise TypeError("Legacy Conversation Port requires sessions and session_id")
-        elif sessions is not None or session_id is not None:
-            raise TypeError("Active Conversation Port cannot receive a Session Store or ID")
         self._provider = provider
         self._session = session
-        self._sessions = sessions
-        self._session_id = session.session_id if session is not None else session_id
         self._settings = settings
         self._now = now
         self._new_uuid = new_uuid
@@ -326,7 +313,6 @@ class _DeferredConversationPort:
         self._history_preparer = history_preparer
         self._before_submit = before_submit
         self._on_foreground_terminal = on_foreground_terminal
-        self._workspace_state = workspace_state
         self._externalize_result = externalize_result
         self._delegate: ConversationPort | None = None
         self._close_task: asyncio.Task[None] | None = None
@@ -347,14 +333,7 @@ class _DeferredConversationPort:
         self._active_task = active
         self._active_done = active_done
         title_log_ready = asyncio.Event()
-        correlation: AbstractContextManager[None] = logger.contextualize(
-            session_id=self._session_id
-        )
-        if self._session is not None:
-            correlation = session_log(self._session)
-        elif self._workspace_state is not None:
-            assert self._session_id is not None
-            correlation = session_log(self._workspace_state, self._session_id)
+        correlation: AbstractContextManager[None] = session_log(self._session)
         with correlation:
             try:
                 if self._before_submit is not None:
@@ -363,39 +342,20 @@ class _DeferredConversationPort:
                     raise RuntimeError("Conversation Port is closed")
                 delegate = self._delegate
                 if delegate is None:
-                    if self._session is not None:
-                        delegate = StreamingConversationPort(
-                            provider=self._provider,
-                            session=self._session,
-                            settings=self._settings,
-                            now=self._now,
-                            new_uuid=self._new_uuid,
-                            system_prompt=self._system_prompt,
-                            title_prompt=self._title_prompt,
-                            tool_gateway=self._tool_gateway,
-                            history_preparer=self._history_preparer,
-                            externalize_result=self._externalize_result,
-                            workspace_state=self._workspace_state,
-                            title_log_ready=title_log_ready.wait,
-                        )
-                    else:
-                        assert self._sessions is not None
-                        assert self._session_id is not None
-                        delegate = StreamingConversationPort(
-                            provider=self._provider,
-                            sessions=self._sessions,
-                            session_id=self._session_id,
-                            settings=self._settings,
-                            now=self._now,
-                            new_uuid=self._new_uuid,
-                            system_prompt=self._system_prompt,
-                            title_prompt=self._title_prompt,
-                            tool_gateway=self._tool_gateway,
-                            history_preparer=self._history_preparer,
-                            externalize_result=self._externalize_result,
-                            workspace_state=self._workspace_state,
-                            title_log_ready=title_log_ready.wait,
-                        )
+                    delegate = StreamingConversationPort(
+                        provider=self._provider,
+                        session=self._session,
+                        settings=self._settings,
+                        now=self._now,
+                        new_uuid=self._new_uuid,
+                        system_prompt=self._system_prompt,
+                        title_prompt=self._title_prompt,
+                        tool_gateway=self._tool_gateway,
+                        history_preparer=self._history_preparer,
+                        externalize_result=self._externalize_result,
+                        workspace_state=self._session.workspace_state,
+                        title_log_ready=title_log_ready.wait,
+                    )
                     self._delegate = delegate
                 async for event in delegate.submit(text):
                     if event.type in {"turn_completed", "turn_failed", "turn_cancelled"}:
@@ -515,11 +475,6 @@ def _prepare_repl_runtime(
     workspace_state.initialize(agent_home_root=agent_home.path)
     long_term_memory = workspace_state.long_term_memory_path.read_text(encoding="utf-8")
     memory_store = WorkspaceFileMemoryStore(workspace_state)
-    sessions = JsonlSessionStore(
-        workspace_state=workspace_state,
-        now=now,
-        new_uuid=new_uuid,
-    )
     session = Session.create(
         workspace_state,
         now=now,
@@ -626,21 +581,19 @@ def _prepare_repl_runtime(
         )
     )
 
-    def scheduled_work_gateway_for(session_id: str) -> ToolGateway:
+    def scheduled_work_gateway_for(active_session: Session) -> ToolGateway:
         return _build_tool_gateway(
-            workspace_state=workspace_state,
+            session=active_session,
             agent_home=agent_home,
-            session_id=session_id,
             web_search=configured_web_search,
             web_fetch=configured_web_fetch,
             shell=configured_shell,
             scheduled_work=scheduled_work_tool,
         )
 
-    def externalize_result_for(session_id: str) -> ToolResultExternalizer:
+    def externalize_result_for(active_session: Session) -> ToolResultExternalizer:
         return _build_tool_result_externalizer(
-            workspace_state=workspace_state,
-            session_id=session_id,
+            session=active_session,
             max_tool_result_chars=configuration.runtime.max_tool_result_chars,
         )
 
@@ -719,7 +672,6 @@ def _prepare_repl_runtime(
                 session=active_session,
                 max_tool_result_chars=configuration.runtime.max_tool_result_chars,
             ),
-            workspace_state=workspace_state,
         )
 
     conversation = SwitchableConversationPort(
@@ -729,13 +681,12 @@ def _prepare_repl_runtime(
     )
     status_service = RuntimeStatusService(
         session=session,
-        sessions=sessions,
         resolved_chat=current_foreground_chat_status,
-        next_input=lambda current_session: _runtime_status_input(
-            current_session,
+        next_input=lambda active_session: _runtime_status_input(
+            active_session,
             system_prompt=system_prompt,
             current_time=now(),
-            session_id=_runtime_status_session_id(current_session),
+            session_id=active_session.session_id,
             tool_schemas=tool_gateway.schemas,
         ),
         monotonic=monotonic_now,
@@ -758,7 +709,6 @@ def _prepare_repl_runtime(
     )
     return PreparedReplRuntime(
         conversation=conversation,
-        sessions=sessions,
         management_dispatcher=management_dispatcher,
         scheduled_work_coordinator=scheduled_work_coordinator,
         _shell=owned_shell,
@@ -773,32 +723,19 @@ def _prepare_repl_runtime(
 def _build_tool_gateway(
     *,
     agent_home: AgentHome,
-    session: Session | None = None,
-    workspace_state: WorkspaceState | None = None,
-    session_id: str | None = None,
+    session: Session,
     web_search: WebSearchBoundary | None,
     web_fetch: WebFetchBoundary | None,
     shell: ShellBoundary | None,
     scheduled_work: CreateScheduledWorkTool,
 ) -> ToolGateway:
-    if session is not None:
-        if workspace_state is not None or session_id is not None:
-            raise TypeError("Active Tool Gateway requires only a Session")
-        resolved_workspace_state = session.workspace_state
-        resolved_session_id = session.session_id
-    else:
-        if workspace_state is None or session_id is None:
-            raise TypeError("Legacy Tool Gateway requires Workspace State and Session ID")
-        resolved_workspace_state = workspace_state
-        resolved_session_id = session_id
-    workspace = resolved_workspace_state.workspace
+    workspace_state = session.workspace_state
+    workspace = workspace_state.workspace
     gateway = ToolGateway()
     security = Security(
         workspace=workspace,
         agent_home=agent_home.path,
-        artifact_directory=(
-            resolved_workspace_state.sessions_directory / "artifacts" / resolved_session_id
-        ),
+        artifact_directory=(workspace_state.sessions_directory / "artifacts" / session.session_id),
     )
     tools: list[BaseTool] = [
         ReadFileTool(security=security),
@@ -820,23 +757,13 @@ def _build_tool_gateway(
 
 def _build_tool_result_externalizer(
     *,
-    session: Session | None = None,
-    workspace_state: WorkspaceState | None = None,
-    session_id: str | None = None,
+    session: Session,
     max_tool_result_chars: int,
 ) -> ToolResultExternalizer:
-    if session is not None:
-        if workspace_state is not None or session_id is not None:
-            raise TypeError("Active Tool Artifact externalizer requires only a Session")
-    elif workspace_state is None or session_id is None:
-        raise TypeError("Legacy Tool Artifact externalizer requires Workspace State and Session ID")
-
     def externalize(result: ToolResult) -> ToolResult:
         return externalize_tool_result(
             result,
-            workspace_state=workspace_state,
             session=session,
-            session_id=session_id,
             max_tool_result_chars=max_tool_result_chars,
         )
 
@@ -853,33 +780,22 @@ def _resolved_chat_status(router: ModelRouter) -> ResolvedChatStatus:
 
 
 def _runtime_status_input(
-    session: Session | ConversationSession,
+    session: Session,
     *,
     system_prompt: str,
     current_time: datetime,
     session_id: str,
     tool_schemas: tuple[OpenAIToolSchema, ...],
 ) -> RuntimeStatusInput:
-    if isinstance(session, Session):
-        retained_messages = tuple(
-            json.dumps(
-                model_message.to_dict(),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            for message in session.messages[session.last_consolidated :]
-            if (model_message := model_message_from_session(message)) is not None
+    retained_messages = tuple(
+        json.dumps(
+            model_message.to_dict(),
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
-    else:
-        retained_messages = tuple(
-            json.dumps(
-                model_message.to_dict(),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            for message in session.short_term_messages
-            if (model_message := model_message_from_session(message)) is not None
-        )
+        for message in session.messages[session.last_consolidated :]
+        if (model_message := model_message_from_session(message)) is not None
+    )
     return RuntimeStatusInput(
         system_prompt=system_prompt,
         retained_messages=retained_messages,
@@ -896,12 +812,6 @@ def _runtime_status_input(
             session_id=session_id,
         ),
     )
-
-
-def _runtime_status_session_id(session: Session | ConversationSession) -> str:
-    if isinstance(session, Session):
-        return session.session_id
-    return session.metadata.id
 
 
 async def _await_shared_shutdown(task: asyncio.Task[None]) -> None:

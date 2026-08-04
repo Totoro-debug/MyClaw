@@ -25,9 +25,7 @@ from myclaw.provider.models import (
 )
 from myclaw.schedule.records import ScheduledWork
 from myclaw.session.conversation import ChatModelSettings
-from myclaw.session.identifiers import make_session_id
-from myclaw.session.records import ConversationSession
-from myclaw.session.session_store import JsonlSessionStore
+from myclaw.session.session import Session
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.shell.shell_policy import ShellRequest
 from myclaw.tools.shell.shell_process import SubprocessShellBoundary
@@ -38,6 +36,10 @@ from tests.fixtures import ScriptedFakeProvider, StreamScript, persist_scheduled
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 NOW = datetime(2026, 7, 13, 0, 30, tzinfo=timezone(timedelta(hours=8)))
+
+
+def _session_id() -> str:
+    return f"20260713-003000-000000_{uuid4()}"
 
 
 class BlockingSchedulerClock:
@@ -280,7 +282,7 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
     baseline = asyncio.all_tasks()
     log_capture = capture_diagnostics()
     state = WorkspaceState(Workspace.from_path(workspace))
-    ambient_session_id = make_session_id(NOW, uuid4())
+    ambient_session_id = _session_id()
 
     try:
         with session_log(state, ambient_session_id):
@@ -458,7 +460,7 @@ async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
     await process.communicate_started.wait()
     log_capture = capture_diagnostics()
     state = WorkspaceState(Workspace.from_path(workspace))
-    ambient_session_id = make_session_id(NOW, uuid4())
+    ambient_session_id = _session_id()
 
     try:
         with session_log(state, ambient_session_id):
@@ -705,7 +707,7 @@ async def test_deferred_conversation_does_not_construct_after_close_during_pre_s
         before_started.set()
         await release_before.wait()
 
-    async def preserve_history(session: ConversationSession) -> ConversationSession:
+    async def preserve_history(session: Session) -> Session:
         return session
 
     async def submit() -> list[str]:
@@ -713,12 +715,7 @@ async def test_deferred_conversation_does_not_construct_after_close_during_pre_s
 
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
-    metadata = sessions.prepare()
+    session = Session.create(WorkspaceState(Workspace.from_path(workspace)), now=lambda: NOW)
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -736,8 +733,7 @@ async def test_deferred_conversation_does_not_construct_after_close_during_pre_s
     )
     conversation = _DeferredConversationPort(
         provider=provider,
-        sessions=sessions,
-        session_id=metadata.id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=1024,
@@ -786,7 +782,7 @@ async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_p
             before_started.set()
             await release_first_before.wait()
 
-    async def preserve_history(session: ConversationSession) -> ConversationSession:
+    async def preserve_history(session: Session) -> Session:
         return session
 
     async def submit(text: str) -> list[str]:
@@ -794,12 +790,7 @@ async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_p
 
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
-    metadata = sessions.prepare()
+    session = Session.create(WorkspaceState(Workspace.from_path(workspace)), now=lambda: NOW)
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -817,8 +808,7 @@ async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_p
     )
     conversation = _DeferredConversationPort(
         provider=provider,
-        sessions=sessions,
-        session_id=metadata.id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=1024,
@@ -873,7 +863,7 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
             before_started.set()
             await release_before.wait()
 
-    async def preserve_history(session: ConversationSession) -> ConversationSession:
+    async def preserve_history(session: Session) -> Session:
         return session
 
     async def submit(text: str) -> list[str]:
@@ -881,12 +871,7 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
 
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
-    metadata = sessions.prepare()
+    session = Session.create(WorkspaceState(Workspace.from_path(workspace)), now=lambda: NOW)
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -915,8 +900,7 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
     )
     conversation = _DeferredConversationPort(
         provider=provider,
-        sessions=sessions,
-        session_id=metadata.id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=1024,

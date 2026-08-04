@@ -1,5 +1,6 @@
 import json
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import AssistantModelMessage
+from myclaw.session.session import Session
 from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
 from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.security import Security
@@ -47,6 +49,15 @@ def _workspace_state(workspace: Path) -> WorkspaceState:
 def _artifact_directory(workspace: Path, session_id: str = SESSION_ID) -> Path:
     state = WorkspaceState(Workspace.from_path(workspace))
     return state.sessions_directory / "artifacts" / session_id
+
+
+def _artifact_session(state: WorkspaceState) -> Session:
+    return Session._create_with_id(
+        state,
+        SESSION_ID,
+        datetime(2026, 7, 13, 4, tzinfo=UTC),
+        title="Artifact test",
+    )
 
 
 def _create_directory_alias(alias: Path, target: Path) -> None:
@@ -221,8 +232,7 @@ def test_tool_artifact_publication_denies_an_external_directory_alias(
     with pytest.raises(ArtifactWriteError):
         externalize_tool_result(
             result,
-            workspace_state=workspace_state,
-            session_id=SESSION_ID,
+            session=_artifact_session(workspace_state),
             max_tool_result_chars=1,
         )
 
@@ -255,15 +265,13 @@ def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
 
     externalize_tool_result(
         first,
-        workspace_state=workspace_state,
-        session_id=SESSION_ID,
+        session=_artifact_session(workspace_state),
         max_tool_result_chars=1,
     )
     with pytest.raises(ArtifactWriteError):
         externalize_tool_result(
             second,
-            workspace_state=workspace_state,
-            session_id=SESSION_ID,
+            session=_artifact_session(workspace_state),
             max_tool_result_chars=1,
         )
 
@@ -288,8 +296,7 @@ def test_tool_artifact_externalization_returns_a_new_immutable_result(
 
     projected = externalize_tool_result(
         original,
-        workspace_state=workspace_state,
-        session_id=SESSION_ID,
+        session=_artifact_session(workspace_state),
         max_tool_result_chars=1,
     )
 
@@ -463,7 +470,7 @@ async def test_read_file_denies_an_aliased_long_term_memory_location(
 
 
 @pytest.mark.asyncio
-async def test_read_file_allows_the_current_session_artifact_reference(
+async def test_read_file_allows_the_active_session_artifact_reference(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -486,7 +493,7 @@ async def test_read_file_allows_the_current_session_artifact_reference(
 
 
 @pytest.mark.asyncio
-async def test_read_file_denies_an_aliased_current_session_artifact_directory(
+async def test_read_file_denies_an_aliased_active_session_artifact_directory(
     agent_home: Path,
     workspace: Path,
 ) -> None:

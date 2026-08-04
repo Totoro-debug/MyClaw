@@ -15,7 +15,7 @@ from myclaw.agent.events import (
     TextDeltaPayload,
     TurnFailedPayload,
 )
-from myclaw.session.records import SessionSummary
+from myclaw.management.service import SessionListingEntry
 
 
 class ReplInput(Protocol):
@@ -100,7 +100,7 @@ class ManagementDispatchResult(Protocol):
     def output(self) -> str | None: ...
 
     @property
-    def resume_sessions(self) -> tuple[SessionSummary, ...] | None: ...
+    def resume_sessions(self) -> tuple[SessionListingEntry, ...] | None: ...
 
 
 class ManagementDispatcher(Protocol):
@@ -242,7 +242,7 @@ def _clear_current_task_cancellation() -> None:
 
 async def _choose_resume_session(
     *,
-    sessions: tuple[SessionSummary, ...],
+    sessions: tuple[SessionListingEntry, ...],
     input_reader: ReplInput,
     writer: ProgressiveWriter,
     management_dispatcher: ManagementDispatcher,

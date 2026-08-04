@@ -8,7 +8,7 @@ from uuid import UUID
 
 from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ModelUsage
-from myclaw.session.identifiers import require_session_id
+from myclaw.session.session import Session
 from myclaw.tools.models import ToolResultStatus
 from myclaw.utils.validation import require_aware_datetime, require_nonnegative_int, require_uuid4
 
@@ -44,6 +44,7 @@ class TextDeltaPayload:
             msg = "delta must not be empty"
             raise ValueError(msg)
 
+
 @dataclass(frozen=True, slots=True)
 class ToolStartedPayload:
     tool_call_id: str
@@ -52,6 +53,7 @@ class ToolStartedPayload:
 
     def __post_init__(self) -> None:
         _require_summary(self.summary, field="summary")
+
 
 @dataclass(frozen=True, slots=True)
 class ToolCompletedPayload:
@@ -62,6 +64,7 @@ class ToolCompletedPayload:
 
     def __post_init__(self) -> None:
         _require_summary(self.summary, field="summary")
+
 
 @dataclass(frozen=True, slots=True)
 class TurnCompletedPayload:
@@ -88,8 +91,9 @@ class BackgroundCompletedPayload:
     summary: str
 
     def __post_init__(self) -> None:
-        require_session_id(self.session_id)
+        Session._require_id(self.session_id)
         _require_summary(self.summary, field="summary")
+
 
 type AgentEventPayload = (
     TurnStartedPayload
@@ -132,6 +136,7 @@ class AgentEvent:
         if not isinstance(self.payload, expected_payload):
             msg = f"payload does not match event type {self.type}"
             raise ValueError(msg)
+
 
 class ConversationPort(Protocol):
     """Submit user input and emit ordered Agent Events."""

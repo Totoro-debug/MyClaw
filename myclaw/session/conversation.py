@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, cast
+from typing import Any
 from uuid import UUID, uuid4
 
 from loguru import logger
@@ -28,10 +28,7 @@ from myclaw.provider.models import (
     ReasoningEffort,
     UserModelMessage,
 )
-from myclaw.session.records import MetadataUpdate, UserSessionMessage
 from myclaw.session.session import Session
-from myclaw.session.session_store import SessionStore
-from myclaw.session.session_titles import normalize_session_title
 from myclaw.tools.tool_gateway import ToolGateway
 
 __all__ = ["ChatModelSettings", "StreamingConversationPort", "model_message_from_session"]
@@ -55,9 +52,7 @@ class StreamingConversationPort:
         self,
         *,
         provider: ModelProvider,
-        session: Session | None = None,
-        sessions: SessionStore | None = None,
-        session_id: str | None = None,
+        session: Session,
         settings: ChatModelSettings,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
@@ -70,15 +65,8 @@ class StreamingConversationPort:
         workspace_state: WorkspaceState | None = None,
         title_log_ready: Callable[[], Awaitable[object]] | None = None,
     ) -> None:
-        if session is None:
-            if sessions is None or session_id is None:
-                raise TypeError("Legacy Conversation Port requires sessions and session_id")
-        elif sessions is not None or session_id is not None:
-            raise TypeError("Session Conversation Port cannot receive a SessionStore or ID")
         self._provider = provider
         self._session = session
-        self._sessions = cast(SessionStore, sessions)
-        self._session_id = session.session_id if session is not None else cast(str, session_id)
         self._settings = settings
         self._now = now
         self._new_uuid = new_uuid
@@ -97,8 +85,6 @@ class StreamingConversationPort:
             lane="foreground",
             provider=provider,
             session=session,
-            sessions=sessions,
-            session_id=session_id,
             settings=settings,
             now=now,
             new_uuid=new_uuid,
@@ -154,35 +140,19 @@ class StreamingConversationPort:
         finally:
             await payloads.aclose()
 
-    def _start_title_for_first_user(
-        self,
-        published: Session | UserSessionMessage,
-    ) -> None:
+    def _start_title_for_first_user(self, published: Session) -> None:
         if self._title_prompt is None or self._title_task is not None:
             return
-        if isinstance(published, Session):
-            if len(published.messages) != 1:
-                return
-            first_message = published.messages[0]
-            content = first_message.get("content")
-            if first_message.get("role") != "user" or not isinstance(content, str):
-                return
-            title_task = asyncio.create_task(
-                self._run_active_title_task(
-                    session=published,
-                    first_user_content=content,
-                    request_id=self._title_new_uuid(),
-                )
-            )
-            title_task.add_done_callback(_consume_task_exception)
-            self._title_task = title_task
+        if len(published.messages) != 1:
             return
-        user_message = published
+        first_message = published.messages[0]
+        content = first_message.get("content")
+        if first_message.get("role") != "user" or not isinstance(content, str):
+            return
         title_task = asyncio.create_task(
-            self._run_title_task(
-                session_id=self._session_id,
-                first_user_id=user_message.id,
-                first_user_content=user_message.content,
+            self._run_active_title_task(
+                session=published,
+                first_user_content=content,
                 request_id=self._title_new_uuid(),
             )
         )
@@ -219,74 +189,10 @@ class StreamingConversationPort:
                     "Session title task failed type={}", type(error).__name__
                 )
 
-    async def _run_title_task(
-        self,
-        *,
-        session_id: str,
-        first_user_id: str,
-        first_user_content: str,
-        request_id: UUID,
-    ) -> None:
-        if self._title_log_ready is not None:
-            await self._title_log_ready()
-        correlation = (
-            session_log(self._workspace_state, session_id)
-            if self._workspace_state is not None
-            else logger.contextualize(session_id=session_id)
-        )
-        with correlation:
-            await self._run_title_task_inner(
-                session_id=session_id,
-                first_user_id=first_user_id,
-                first_user_content=first_user_content,
-                request_id=request_id,
-            )
-
-    async def _run_title_task_inner(
-        self,
-        *,
-        session_id: str,
-        first_user_id: str,
-        first_user_content: str,
-        request_id: UUID,
-    ) -> None:
-        try:
-            await self._generate_title_for_first_user(
-                session_id=session_id,
-                first_user_id=first_user_id,
-                first_user_content=first_user_content,
-                request_id=request_id,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            logger.opt(exception=error).error(
-                "Session title task failed type={}", type(error).__name__
-            )
-            raise
-
-    async def _generate_title_for_first_user(
-        self,
-        *,
-        session_id: str,
-        first_user_id: str,
-        first_user_content: str,
-        request_id: UUID,
-    ) -> None:
-        session = await self._sessions.load(session_id)
-        if not session.messages or session.messages[0].id != first_user_id:
-            return
-        await self._generate_title(
-            session_id=session_id,
-            first_user_content=first_user_content,
-            request_id=request_id,
-        )
-
     async def _generate_title(
         self,
         *,
-        session: Session | None = None,
-        session_id: str | None = None,
+        session: Session,
         first_user_content: str,
         request_id: UUID,
     ) -> None:
@@ -296,7 +202,7 @@ class StreamingConversationPort:
             request_id=request_id,
             route="chat",
             system_prompt=self._title_prompt or "",
-            messages=(UserModelMessage(content=normalize_session_title(first_user_content)),),
+            messages=(UserModelMessage(content=Session._normalize_title(first_user_content)),),
             tools=(),
             stream=True,
             model=self._settings.model,
@@ -317,9 +223,11 @@ class StreamingConversationPort:
                 if model_event.response.message.tool_calls:
                     fallback_reason = "tool_calls"
                 else:
-                    generated = normalize_session_title(model_event.response.message.content)
+                    generated = Session._normalize_title_candidate(
+                        model_event.response.message.content
+                    )
                     if generated:
-                        title_candidate = model_event.response.message.content
+                        title_candidate = generated
                         fallback_reason = None
                     else:
                         fallback_reason = "empty_title"
@@ -342,26 +250,11 @@ class StreamingConversationPort:
                 fallback_reason,
             )
         try:
-            if session is not None:
-                if session_id is not None:
-                    raise TypeError("Active title generation cannot receive a Session ID")
-                token_delta = (
-                    None if usage_delta is None else {"model_calls": 1, **usage_delta.to_dict()}
-                )
-                session.update_metadata(title=title_candidate, usage_delta=token_delta)
-                session.persist()
-            else:
-                if session_id is None:
-                    raise TypeError("Legacy title generation requires a Session ID")
-                title = normalize_session_title(title_candidate) or "Untitled session"
-                await self._sessions.update_metadata(
-                    session_id,
-                    MetadataUpdate(
-                        title=title,
-                        updated_at=self._persisted_now(),
-                        usage_delta=usage_delta,
-                    ),
-                )
+            token_delta = (
+                None if usage_delta is None else {"model_calls": 1, **usage_delta.to_dict()}
+            )
+            session.update_metadata(title=title_candidate, usage_delta=token_delta)
+            session.persist()
         except (OSError, UnicodeError, ValueError) as failure:
             _log_title_persistence_failure(failure, operation="metadata_update")
 
@@ -394,10 +287,6 @@ class StreamingConversationPort:
                 title.cancel()
             if title is not None:
                 await asyncio.gather(title, return_exceptions=True)
-
-    def _persisted_now(self) -> datetime:
-        value = self._now()
-        return value.replace(microsecond=value.microsecond // 1000 * 1000)
 
 
 async def _close_provider_stream(stream: AsyncIterator[ModelStreamEvent] | None) -> None:

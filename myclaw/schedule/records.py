@@ -5,7 +5,7 @@ from datetime import datetime
 
 from croniter import croniter  # type: ignore[import-untyped]
 
-from myclaw.session.identifiers import require_session_id
+from myclaw.session.session import Session
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_aware_datetime, require_uuid4_string
 
@@ -43,7 +43,7 @@ class ScheduledWork:
         if not isinstance(self.enabled, bool):
             msg = "enabled must be a boolean"
             raise ValueError(msg)
-        require_session_id(self.session_id)
+        Session._require_id(self.session_id)
 
     def to_dict(self) -> dict[str, object]:
         return {

@@ -48,8 +48,8 @@ def test_foundation_modules_do_not_import_domain_modules(root: Path) -> None:
     assert violations == []
 
 
-def test_tools_do_not_depend_on_provider_or_session_records() -> None:
-    forbidden = {"myclaw.provider", "myclaw.session.records"}
+def test_tools_do_not_depend_on_provider() -> None:
+    forbidden = {"myclaw.provider"}
     violations = [
         f"{path.relative_to(PROJECT_ROOT)}:{line} imports {module}"
         for path in _python_files(PACKAGE_ROOT / "tools")

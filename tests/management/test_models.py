@@ -3,11 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from myclaw.management.service import RuntimeStatus
-from myclaw.session.records import (
-    CumulativeUsage,
-    SessionSummary,
-)
+from myclaw.management.service import RuntimeStatus, SessionListingEntry
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 
@@ -22,12 +18,12 @@ def test_runtime_status_exposes_the_documented_management_fields() -> None:
         context_used_percent=2.1,
         session_message_count=12,
         consolidation_cursor=4,
-        cumulative_usage=CumulativeUsage(
-            model_calls=5,
-            input_tokens=6100,
-            output_tokens=900,
-            total_tokens=7000,
-        ),
+        cumulative_usage={
+            "model_calls": 5,
+            "input_tokens": 6100,
+            "output_tokens": 900,
+            "total_tokens": 7000,
+        },
     )
 
     assert status.to_dict() == {
@@ -58,12 +54,12 @@ def test_runtime_status_rejects_negative_or_boolean_counters() -> None:
         context_used_percent=2.1,
         session_message_count=12,
         consolidation_cursor=4,
-        cumulative_usage=CumulativeUsage(
-            model_calls=5,
-            input_tokens=6100,
-            output_tokens=900,
-            total_tokens=7000,
-        ),
+        cumulative_usage={
+            "model_calls": 5,
+            "input_tokens": 6100,
+            "output_tokens": 900,
+            "total_tokens": 7000,
+        },
     )
 
     with pytest.raises(ValueError, match="uptime_seconds"):
@@ -73,7 +69,7 @@ def test_runtime_status_rejects_negative_or_boolean_counters() -> None:
 
 
 def test_session_summary_exposes_only_picker_fields_and_validates_message_count() -> None:
-    summary = SessionSummary(
+    summary = SessionListingEntry(
         id="20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000",
         title="MyClaw implementation",
         created_at=datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET),

@@ -5,7 +5,6 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Final
 
-from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.session.session import Session
 from myclaw.tools.artifacts import ArtifactReference, encode_artifact_tool_call_id
 from myclaw.tools.models import ToolResult
@@ -26,23 +25,13 @@ class ArtifactWriteError(Exception):
 def externalize_tool_result(
     result: ToolResult,
     *,
-    session: Session | None = None,
-    workspace_state: WorkspaceState | None = None,
-    session_id: str | None = None,
+    session: Session,
     max_tool_result_chars: int,
     write_text: ArtifactWriter | None = None,
 ) -> ToolResult:
     """Externalize one oversized successful result without lifecycle ownership."""
-    if session is not None:
-        if workspace_state is not None or session_id is not None:
-            raise TypeError("Active Tool Artifact externalization requires only a Session")
-        resolved_workspace_state = session.workspace_state
-        resolved_session_id = session.session_id
-    else:
-        if workspace_state is None or session_id is None:
-            raise TypeError("Legacy Tool Artifact externalization requires Workspace State and ID")
-        resolved_workspace_state = workspace_state
-        resolved_session_id = session_id
+    resolved_workspace_state = session.workspace_state
+    resolved_session_id = session.session_id
     if result.status != "success" or len(result.content) <= max_tool_result_chars:
         return result
 

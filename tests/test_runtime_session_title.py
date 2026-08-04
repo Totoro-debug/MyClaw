@@ -24,9 +24,7 @@ LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
 SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
-USER_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
-ASSISTANT_UUID = UUID("a3bb189e-8bf9-4c4b-ae4a-c6699f6f7e34")
 
 
 class RuntimeTitleProvider:
@@ -75,7 +73,7 @@ async def test_prepared_runtime_uses_an_isolated_chat_stream_for_session_title(
         configuration=ConfigLoader(home).load(),
         provider_factory=lambda _: provider,
         now=clock.now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
         retry_clock=clock,
     )
 

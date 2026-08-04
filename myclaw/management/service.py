@@ -13,9 +13,8 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ConfigView
 from myclaw.errors import ErrorInfo
 from myclaw.memory.memory_task import MemoryStore, MemoryTaskResult
-from myclaw.session.identifiers import require_session_id
-from myclaw.session.records import ConversationSession, CumulativeUsage, SessionSummary
 from myclaw.session.session import Session
+from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_nonnegative_int, require_nonnegative_number
 
 
@@ -24,10 +23,40 @@ class _ManualMemoryManager(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class SessionListingEntry:
+    """The fields needed to render one resumable Conversation Session."""
+
+    id: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    message_count: int
+
+    def __post_init__(self) -> None:
+        Session._require_id(self.id, field="id")
+        if not self.title or " ".join(self.title.split()) != self.title or len(self.title) > 60:
+            raise ValueError("title is not normalized")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+        if self.updated_at.tzinfo is None or self.updated_at.utcoffset() is None:
+            raise ValueError("updated_at must be timezone-aware")
+        require_nonnegative_int(self.message_count, field="message_count")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "created_at": format_rfc3339_milliseconds(self.created_at),
+            "updated_at": format_rfc3339_milliseconds(self.updated_at),
+            "message_count": self.message_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class SessionListingReport:
     """Valid current-format Sessions and the entries skipped during listing."""
 
-    sessions: tuple[SessionSummary, ...]
+    sessions: tuple[SessionListingEntry, ...]
     skipped_count: int
 
     def __post_init__(self) -> None:
@@ -37,12 +66,6 @@ class SessionListingReport:
             or self.skipped_count < 0
         ):
             raise ValueError("skipped_count must be a nonnegative integer")
-
-
-class _CurrentSessionStore(Protocol):
-    """Legacy status-only seam retained until the old contract is retired."""
-
-    async def current_session(self, session_id: str) -> ConversationSession: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +111,7 @@ class RuntimeStatus:
     context_used_percent: float
     session_message_count: int
     consolidation_cursor: int
-    cumulative_usage: CumulativeUsage
+    cumulative_usage: dict[str, int]
 
     def __post_init__(self) -> None:
         require_nonnegative_int(self.uptime_seconds, field="uptime_seconds")
@@ -108,7 +131,7 @@ class RuntimeStatus:
             "context_used_percent": self.context_used_percent,
             "session_message_count": self.session_message_count,
             "consolidation_cursor": self.consolidation_cursor,
-            "cumulative_usage": self.cumulative_usage.to_dict(),
+            "cumulative_usage": dict(self.cumulative_usage),
         }
 
 
@@ -119,7 +142,7 @@ class ResumeResult:
     session_id: str
 
     def __post_init__(self) -> None:
-        require_session_id(self.session_id)
+        Session._require_id(self.session_id)
 
 
 def estimate_input_tokens(status_input: RuntimeStatusInput) -> int:
@@ -140,90 +163,32 @@ class RuntimeStatusService:
     def __init__(
         self,
         *,
-        session: Session | Callable[[], Session] | None = None,
-        sessions: _CurrentSessionStore | None = None,
-        session_id: str | Callable[[], str] | None = None,
+        session: Session | Callable[[], Session],
         resolved_chat: Callable[[], ResolvedChatStatus],
-        next_input: Callable[[Session | ConversationSession], RuntimeStatusInput],
+        next_input: Callable[[Session], RuntimeStatusInput],
         monotonic: Callable[[], float],
         version: str = __version__,
     ) -> None:
-        self._session: Callable[[], Session] | None
-        self._initial_session: Callable[[], Session] | None
-        self._sessions: _CurrentSessionStore | None
-        self._session_id: Callable[[], str] | None
-        if session is not None:
-            if isinstance(session, Session):
-                self._session = lambda: session
-            else:
-                self._session = session
-            self._initial_session = self._session
-            self._sessions = sessions
-            if session_id is None:
-                self._session_id = None
-            elif isinstance(session_id, str):
-                self._session_id = lambda: session_id
-            else:
-                self._session_id = session_id
+        self._session: Callable[[], Session]
+        if isinstance(session, Session):
+            self._session = lambda: session
         else:
-            if sessions is None or session_id is None:
-                raise TypeError("Legacy status requires a Session Store and Session ID")
-            self._session = None
-            self._initial_session = None
-            self._sessions = sessions
-            if isinstance(session_id, str):
-                self._session_id = lambda: session_id
-            else:
-                self._session_id = session_id
+            self._session = session
         self._resolved_chat = resolved_chat
         self._next_input = next_input
         self._monotonic = monotonic
         self._started_at = monotonic()
         self._version = version
 
-    def use_session(self, session: Session | str) -> None:
+    def use_session(self, session: Session) -> None:
         """Make the selected Session the status authority."""
-        if isinstance(session, Session):
-            self._session = lambda: session
-            self._session_id = None
-            return
-        session_id = session
-        require_session_id(session_id)
-        initial_session = self._initial_session
-        if initial_session is not None and initial_session().session_id == session_id:
-            self._session = initial_session
-            return
-        if self._sessions is None:
-            raise RuntimeError("Legacy Session status is unavailable")
-        self._session = None
-        self._session_id = lambda: session_id
+        self._session = lambda: session
 
     async def status(self) -> RuntimeStatus:
         """Return all required runtime and current-session status fields."""
-        active_session = self._session
-        if active_session is not None:
-            session = active_session()
-            resolved = self._resolved_chat()
-            estimated = estimate_input_tokens(self._next_input(session))
-            uptime = max(0, int(self._monotonic() - self._started_at))
-            return RuntimeStatus(
-                version=self._version,
-                chat_model=resolved.chat_model,
-                uptime_seconds=uptime,
-                estimated_input_tokens=estimated,
-                context_window=resolved.context_window,
-                context_used_percent=estimated / resolved.context_window * 100,
-                session_message_count=len(session.messages),
-                consolidation_cursor=session.last_consolidated,
-                cumulative_usage=_active_session_usage(session),
-            )
-        sessions = self._sessions
-        session_id = self._session_id
-        assert sessions is not None
-        assert session_id is not None
-        persisted_session = await sessions.current_session(session_id())
+        session = self._session()
         resolved = self._resolved_chat()
-        estimated = estimate_input_tokens(self._next_input(persisted_session))
+        estimated = estimate_input_tokens(self._next_input(session))
         uptime = max(0, int(self._monotonic() - self._started_at))
         return RuntimeStatus(
             version=self._version,
@@ -232,13 +197,13 @@ class RuntimeStatusService:
             estimated_input_tokens=estimated,
             context_window=resolved.context_window,
             context_used_percent=estimated / resolved.context_window * 100,
-            session_message_count=len(persisted_session.messages),
-            consolidation_cursor=persisted_session.metadata.consolidation_cursor,
-            cumulative_usage=persisted_session.metadata.cumulative_usage,
+            session_message_count=len(session.messages),
+            consolidation_cursor=session.last_consolidated,
+            cumulative_usage=_active_session_usage(session),
         )
 
 
-def _active_session_usage(session: Session) -> CumulativeUsage:
+def _active_session_usage(session: Session) -> dict[str, int]:
     value = session.metadata.get("token_usage")
     if not isinstance(value, dict):
         raise ValueError("Active Session token usage is malformed")
@@ -246,12 +211,7 @@ def _active_session_usage(session: Session) -> CumulativeUsage:
     usage = {field: value.get(field) for field in fields}
     if any(isinstance(item, bool) or not isinstance(item, int) for item in usage.values()):
         raise ValueError("Active Session token usage is malformed")
-    return CumulativeUsage(
-        model_calls=cast(int, usage["model_calls"]),
-        input_tokens=cast(int, usage["input_tokens"]),
-        output_tokens=cast(int, usage["output_tokens"]),
-        total_tokens=cast(int, usage["total_tokens"]),
-    )
+    return {field: cast(int, usage[field]) for field in fields}
 
 
 class ManagementError(Exception):
@@ -327,7 +287,7 @@ class ManagementViewService:
                 ErrorInfo("persistence_error", "Runtime status could not be read.")
             ) from error
 
-    async def resumable_sessions(self) -> tuple[SessionSummary, ...]:
+    async def resumable_sessions(self) -> tuple[SessionListingEntry, ...]:
         """Return only valid Sessions belonging to this runtime's Workspace."""
         return (await self.resumable_listing()).sessions
 
@@ -338,7 +298,7 @@ class ManagementViewService:
             raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
         if not workspace_state.sessions_directory.exists():
             return SessionListingReport(sessions=(), skipped_count=0)
-        summaries: list[SessionSummary] = []
+        summaries: list[SessionListingEntry] = []
         skipped_count = 0
         try:
             paths = tuple(workspace_state.sessions_directory.glob("*.jsonl"))
@@ -358,7 +318,7 @@ class ManagementViewService:
                 skipped_count += 1
                 continue
             summaries.append(
-                SessionSummary(
+                SessionListingEntry(
                     id=session.session_id,
                     title=_session_title(session),
                     created_at=session.created_at,

@@ -2,7 +2,7 @@ import asyncio
 import subprocess
 import sys
 from collections import deque
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -27,7 +27,7 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.session.session_store import JsonlSessionStore
+from myclaw.session.session import Session
 from myclaw.terminal.repl import ConsoleProgressiveWriter, ConsoleReplInput, run_repl
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
@@ -35,10 +35,20 @@ LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
 SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
-USER_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
-ASSISTANT_UUID = UUID("a3bb189e-8bf9-4c4b-ae4a-c6699f6f7e34")
 SECOND_SESSION_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
+
+
+def _session(
+    workspace: Path,
+    now: Callable[[], datetime],
+    new_uuid: Callable[[], UUID],
+) -> Session:
+    return Session.create(
+        WorkspaceState(Workspace.from_path(workspace)),
+        now=now,
+        new_uuid=new_uuid,
+    )
 
 
 class ScriptedReplInput:
@@ -188,17 +198,11 @@ async def test_repl_without_nonblank_user_input_leaves_prepared_session_in_memor
     home = AgentHome(agent_home)
     home.initialize()
     clock = FakeClock(NOW)
-    store = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=clock.now,
-        new_uuid=iter((SESSION_UUID,)).__next__,
-    )
-    session = store.prepare()
+    session = _session(workspace, clock.now, iter((SESSION_UUID,)).__next__)
     provider = ScriptedFakeProvider()
     conversation = StreamingConversationPort(
         provider=provider,
-        sessions=store,
-        session_id=session.id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=1024,
@@ -217,7 +221,7 @@ async def test_repl_without_nonblank_user_input_leaves_prepared_session_in_memor
         writer=writer,
     )
 
-    assert not store.path_for(session.id).parent.exists()
+    assert not (workspace / ".myclaw" / "sessions").exists()
     assert provider.stream_requests == []
     assert provider.complete_requests == []
     assert writer.operations == []
@@ -236,17 +240,11 @@ async def test_repl_exit_and_quit_ignore_case_and_whitespace_without_materializi
         ("\tQuIt\n", SECOND_SESSION_UUID),
     ):
         clock = FakeClock(NOW)
-        store = JsonlSessionStore(
-            workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-            now=clock.now,
-            new_uuid=iter((session_uuid,)).__next__,
-        )
-        session = store.prepare()
+        session = _session(workspace, clock.now, iter((session_uuid,)).__next__)
         provider = ScriptedFakeProvider()
         conversation = StreamingConversationPort(
             provider=provider,
-            sessions=store,
-            session_id=session.id,
+            session=session,
             settings=ChatModelSettings(
                 model="test-model",
                 max_output=1024,
@@ -267,7 +265,7 @@ async def test_repl_exit_and_quit_ignore_case_and_whitespace_without_materializi
 
         assert provider.stream_requests == []
         assert provider.complete_requests == []
-        assert not store.path_for(session.id).exists()
+        assert not (workspace / ".myclaw" / "sessions").exists()
         assert writer.operations == []
 
 
@@ -279,12 +277,7 @@ async def test_repl_writes_each_text_delta_progressively_then_finishes_once(
     home = AgentHome(agent_home)
     home.initialize()
     clock = FakeClock(NOW)
-    store = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=clock.now,
-        new_uuid=iter((SESSION_UUID,)).__next__,
-    )
-    session = store.prepare()
+    session = _session(workspace, clock.now, iter((SESSION_UUID,)).__next__)
     response = ModelResponse(
         message=AssistantModelMessage(content="I will inspect the files."),
         usage=ModelUsage(input_tokens=120, output_tokens=24, total_tokens=144),
@@ -303,8 +296,7 @@ async def test_repl_writes_each_text_delta_progressively_then_finishes_once(
     )
     conversation = StreamingConversationPort(
         provider=provider,
-        sessions=store,
-        session_id=session.id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=1024,
@@ -313,7 +305,7 @@ async def test_repl_writes_each_text_delta_progressively_then_finishes_once(
             timeout_seconds=30,
         ),
         now=clock.now,
-        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=iter((TURN_UUID, REQUEST_UUID)).__next__,
     )
     writer = RecordingProgressiveWriter()
 
@@ -338,12 +330,7 @@ async def test_ctrl_c_during_stream_persists_partial_and_repl_runs_the_next_turn
     home = AgentHome(agent_home)
     home.initialize()
     clock = FakeClock(NOW)
-    store = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=clock.now,
-        new_uuid=iter((SESSION_UUID,)).__next__,
-    )
-    session = store.prepare()
+    session = _session(workspace, clock.now, iter((SESSION_UUID,)).__next__)
     second_response = ModelResponse(
         message=AssistantModelMessage(content="Second turn completed."),
         usage=ModelUsage(input_tokens=14, output_tokens=4, total_tokens=18),
@@ -362,8 +349,7 @@ async def test_ctrl_c_during_stream_persists_partial_and_repl_runs_the_next_turn
     )
     conversation = StreamingConversationPort(
         provider=provider,
-        sessions=store,
-        session_id=session.id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=1024,
@@ -375,13 +361,9 @@ async def test_ctrl_c_during_stream_persists_partial_and_repl_runs_the_next_turn
         new_uuid=iter(
             (
                 TURN_UUID,
-                USER_UUID,
                 REQUEST_UUID,
-                ASSISTANT_UUID,
                 UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
                 UUID("16fd2706-8baf-433b-82eb-8c7fada847da"),
-                UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e"),
-                UUID("b3f37212-6f3a-4a1b-8d2e-78ab3f9c4567"),
             )
         ).__next__,
     )
@@ -399,10 +381,8 @@ async def test_ctrl_c_during_stream_persists_partial_and_repl_runs_the_next_turn
         ("delta", "Second turn completed."),
         ("finish", ""),
     ]
-    reloaded = await store.load(session.id)
     assert [
-        (message.role, getattr(message, "status", None), message.content)
-        for message in reloaded.messages
+        (message["role"], message.get("status"), message["content"]) for message in session.messages
     ] == [
         ("user", None, "First turn."),
         ("assistant", "interrupted", "Partial first turn"),
@@ -449,17 +429,11 @@ async def test_task_cancellation_during_foreground_is_cleared_before_next_input(
 
     home = AgentHome(agent_home)
     home.initialize()
-    store = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=iter((SESSION_UUID,)).__next__,
-    )
-    session = store.prepare()
+    session = _session(workspace, lambda: NOW, iter((SESSION_UUID,)).__next__)
     provider = BlockingProvider()
     conversation = StreamingConversationPort(
         provider=provider,
-        sessions=store,
-        session_id=session.id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=1024,
@@ -468,7 +442,7 @@ async def test_task_cancellation_during_foreground_is_cleared_before_next_input(
             timeout_seconds=30,
         ),
         now=lambda: NOW,
-        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=iter((TURN_UUID, REQUEST_UUID)).__next__,
     )
     input_reader = FirstThenExitInput()
     running = asyncio.create_task(
@@ -501,12 +475,7 @@ async def test_repl_dispatches_handled_management_output_and_converses_on_unknow
     state = WorkspaceState(Workspace.from_path(workspace))
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     clock = FakeClock(NOW)
-    store = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=clock.now,
-        new_uuid=iter((SESSION_UUID,)).__next__,
-    )
-    session = store.prepare()
+    session = _session(workspace, clock.now, iter((SESSION_UUID,)).__next__)
     response = ModelResponse(
         message=AssistantModelMessage(content="Ordinary slash input received."),
         usage=ModelUsage(input_tokens=5, output_tokens=4, total_tokens=9),
@@ -524,8 +493,7 @@ async def test_repl_dispatches_handled_management_output_and_converses_on_unknow
     )
     conversation = StreamingConversationPort(
         provider=provider,
-        sessions=store,
-        session_id=session.id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=1024,
@@ -534,7 +502,7 @@ async def test_repl_dispatches_handled_management_output_and_converses_on_unknow
             timeout_seconds=30,
         ),
         now=clock.now,
-        new_uuid=iter((TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=iter((TURN_UUID, REQUEST_UUID)).__next__,
     )
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
@@ -566,7 +534,7 @@ async def test_repl_dispatches_handled_management_output_and_converses_on_unknow
             "content": (
                 "<runtime_context>\n"
                 "current_time: 2026-07-11T15:30:12.123+08:00\n"
-                f"session_id: {session.id}\n"
+                f"session_id: {session.session_id}\n"
                 "</runtime_context>\n\n"
                 "<user_input>\n"
                 "/unknown\n"
@@ -574,8 +542,7 @@ async def test_repl_dispatches_handled_management_output_and_converses_on_unknow
             ),
         }
     ]
-    reloaded = await store.load(session.id)
-    assert [(message.role, message.content) for message in reloaded.messages] == [
+    assert [(message["role"], message["content"]) for message in session.messages] == [
         ("user", "/unknown"),
         ("assistant", "Ordinary slash input received."),
     ]

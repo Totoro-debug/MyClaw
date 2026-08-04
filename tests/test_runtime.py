@@ -30,9 +30,6 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.schedule.records import ScheduledWork
-from myclaw.session.records import (
-    UserSessionMessage,
-)
 from myclaw.session.session import Session
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.web.web_search import WebSearchResult
@@ -48,16 +45,10 @@ LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
 SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
-USER_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
-ASSISTANT_UUID = UUID("a3bb189e-8bf9-4c4b-ae4a-c6699f6f7e34")
-TOOL_UUID = UUID("11111111-1111-4111-8111-111111111111")
 FINAL_REQUEST_UUID = UUID("a8098c1a-f86e-4f33-8a28-25f602f8e603")
-FINAL_ASSISTANT_UUID = UUID("67e55044-10b1-426f-9247-bb680e5fe0c8")
 TURN_TWO_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
-USER_TWO_UUID = UUID("16fd2706-8baf-433b-82eb-8c7fada847da")
 REQUEST_TWO_UUID = UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e")
-ASSISTANT_TWO_UUID = UUID("b3f37212-6f3a-4a1b-8d2e-78ab3f9c4567")
 
 
 def _session_log_text(workspace: Path, session_id: str) -> str:
@@ -188,7 +179,7 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
         configuration=ConfigLoader(home).load(),
         provider_factory=lambda _: provider,
         now=clock.now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
         retry_clock=clock,
     )
 
@@ -322,12 +313,8 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
             (
                 SESSION_UUID,
                 TURN_UUID,
-                USER_UUID,
                 REQUEST_UUID,
-                ASSISTANT_UUID,
-                TOOL_UUID,
                 FINAL_REQUEST_UUID,
-                FINAL_ASSISTANT_UUID,
             )
         ).__next__,
     )
@@ -589,12 +576,12 @@ async def test_prepared_repl_defers_injected_provider_factory_until_first_nonbla
         configuration=configuration,
         provider_factory=provider_factory,
         now=clock.now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
     )
 
     assert factory_calls == []
-    assert runtime.sessions.directory == workspace / ".myclaw" / "sessions"
-    assert not runtime.sessions.path_for(runtime.session_id).exists()
+    session_path = workspace / ".myclaw" / "sessions" / f"{runtime.session_id}.jsonl"
+    assert not session_path.exists()
 
     writer = RecordingWriter()
     await runtime.run(
@@ -650,7 +637,7 @@ async def test_prepared_repl_uses_the_chat_model_route(
         configuration=configuration,
         provider_factory=provider_factory,
         now=FakeClock(NOW).now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
     )
 
     await runtime.run(
@@ -717,7 +704,7 @@ async def test_prepared_repl_routes_transient_provider_failures_through_one_retr
         configuration=configuration,
         provider_factory=lambda _: provider,
         now=clock.now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
         retry_clock=clock,
     )
     writer = RecordingWriter()
@@ -791,7 +778,7 @@ async def test_prepared_repl_status_reports_the_actual_fallback_route_and_sessio
         configuration=configuration,
         provider_factory=provider_factory,
         now=clock.now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
         retry_clock=clock,
     )
     writer = RecordingWriter()
@@ -847,13 +834,8 @@ async def test_runtime_status_estimate_omits_a_pure_error_assistant(
         now=FakeClock(NOW).now,
         new_uuid=iter((TURN_TWO_UUID,)).__next__,
     )
-    user = UserSessionMessage(
-        id=str(USER_UUID),
-        created_at=NOW,
-        content="Keep the next context stable.",
-    )
-    first.session.add_message("user", user.content)
-    second.session.add_message("user", user.content)
+    first.session.add_message("user", "Keep the next context stable.")
+    second.session.add_message("user", "Keep the next context stable.")
     second.session.add_message(
         "assistant",
         "",
@@ -900,13 +882,8 @@ async def test_runtime_status_estimate_includes_the_interrupted_history_marker(
         now=FakeClock(NOW).now,
         new_uuid=iter((TURN_TWO_UUID,)).__next__,
     )
-    user = UserSessionMessage(
-        id=str(USER_UUID),
-        created_at=NOW,
-        content="Keep the interrupted context stable.",
-    )
-    interrupted.session.add_message("user", user.content)
-    projected.session.add_message("user", user.content)
+    interrupted.session.add_message("user", "Keep the interrupted context stable.")
+    projected.session.add_message("user", "Keep the interrupted context stable.")
     interrupted.session.add_message(
         "assistant",
         "Partial first turn.",
@@ -1027,13 +1004,9 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
             (
                 SESSION_UUID,
                 TURN_UUID,
-                USER_UUID,
                 REQUEST_UUID,
-                ASSISTANT_UUID,
                 TURN_TWO_UUID,
-                USER_TWO_UUID,
                 REQUEST_TWO_UUID,
-                ASSISTANT_TWO_UUID,
             )
         ).__next__,
     )

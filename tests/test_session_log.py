@@ -13,18 +13,12 @@ from loguru import logger
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.logging.session import session_log, without_session_log
-from myclaw.session.identifiers import make_session_id
 
 windows_only = pytest.mark.skipif(os.name != "nt", reason="requires native Windows paths")
 
 
 def _session_id() -> str:
-    return make_session_id(
-        __import__("datetime").datetime(
-            2026, 8, 2, 12, 0, tzinfo=__import__("datetime").timezone.utc
-        ),
-        uuid4(),
-    )
+    return f"20260802-120000-000000_{uuid4()}"
 
 
 def _state(tmp_path: Path) -> WorkspaceState:

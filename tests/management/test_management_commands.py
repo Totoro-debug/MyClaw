@@ -16,14 +16,7 @@ from myclaw.management.service import (
     RuntimeStatusService,
 )
 from myclaw.memory.memory_task import WorkspaceFileMemoryStore
-from myclaw.provider.models import ModelUsage
-from myclaw.session.records import (
-    AssistantSessionMessage,
-    ConversationSession,
-    MetadataUpdate,
-    UserSessionMessage,
-)
-from myclaw.session.session_store import JsonlSessionStore
+from myclaw.session.session import Session
 from tests.fixtures.diagnostic_capture import configured_process_logging
 
 CONFIG_CONTENT = """[models.providers.primary]
@@ -164,8 +157,6 @@ timeout = 120
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 STATUS_CREATED_AT = datetime(2026, 7, 11, 15, 30, tzinfo=LOCAL_OFFSET)
 STATUS_SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
-STATUS_USER_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
-STATUS_ASSISTANT_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 
 
 class ConversationProviderSpy:
@@ -329,16 +320,13 @@ async def test_status_command_renders_safe_persistence_failure(
     agent_home: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    class FailingStatusSessions:
-        async def current_session(self, session_id: str) -> ConversationSession:
-            del session_id
-            raise OSError("PRIVATE_STATUS_PERSISTENCE_BODY_52")
+    def failing_session() -> Session:
+        raise OSError("PRIVATE_STATUS_PERSISTENCE_BODY_52")
 
     home = AgentHome(agent_home)
     home.initialize()
     status_service = RuntimeStatusService(
-        sessions=FailingStatusSessions(),
-        session_id="status-session",
+        session=failing_session,
         resolved_chat=lambda: ResolvedChatStatus(
             provider_id="provider",
             model="model",
@@ -370,35 +358,30 @@ async def test_status_command_renders_actual_runtime_and_session_state(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    session = Session.create(
+        state,
         now=lambda: STATUS_CREATED_AT,
         new_uuid=iter((STATUS_SESSION_UUID,)).__next__,
     )
-    metadata = sessions.prepare()
-    user_message = UserSessionMessage(
-        id=str(STATUS_USER_UUID),
-        created_at=metadata.created_at,
-        content="Session state.",
-    )
-    assistant_message = AssistantSessionMessage(
-        id=str(STATUS_ASSISTANT_UUID),
-        created_at=STATUS_CREATED_AT + timedelta(seconds=2),
-        content="Visible.",
-        tool_calls=(),
+    session.add_message("user", "Session state.")
+    session.add_message(
+        "assistant",
+        "Visible.",
+        tool_calls=[],
         status="completed",
         error=None,
-        usage=ModelUsage(input_tokens=10, output_tokens=3, total_tokens=13),
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 10,
+            "output_tokens": 3,
+            "total_tokens": 13,
+        },
     )
-    await sessions.append_message(metadata.id, user_message)
-    await sessions.append_message(metadata.id, assistant_message)
-    await sessions.update_metadata(
-        metadata.id,
-        MetadataUpdate(consolidation_cursor=1),
-    )
+    session.last_consolidated = 1
     status_service = RuntimeStatusService(
-        sessions=sessions,
-        session_id=metadata.id,
+        session=session,
         resolved_chat=lambda: ResolvedChatStatus(
             provider_id="fallback",
             model="chat-model",

@@ -6,39 +6,42 @@ import asyncio
 import copy
 import json
 import math
+import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Self, cast
 from uuid import UUID, uuid4
 
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.session.identifiers import make_session_id as _make_session_id
-from myclaw.session.identifiers import require_session_id as _require_session_id
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
-from myclaw.utils.validation import require_aware_datetime, require_nonnegative_int
+from myclaw.utils.validation import (
+    require_aware_datetime,
+    require_nonnegative_int,
+    require_uuid4,
+    require_uuid4_string,
+)
 
 __all__ = ["Session"]
 
 _HEADER_FIELDS = frozenset(
     {"session_id", "created_at", "updated_at", "last_consolidated", "metadata"}
 )
-_UNSUPPORTED_MESSAGE_FIELDS = frozenset({"id", "record_type", "schema_version"})
-
-
-@dataclass(frozen=True, slots=True)
-class _Snapshot:
-    """A complete immutable-in-practice copy of one persistence attempt."""
-
-    session_id: str
-    created_at: datetime
-    updated_at: datetime
-    last_consolidated: int
-    metadata: dict[str, Any]
-    messages: list[dict[str, Any]]
+_SESSION_ID_PATTERN = re.compile(
+    r"(?P<timestamp>\d{8}-\d{6}-\d{6})_"
+    r"(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+_TITLE_PAIRS = (
+    ('"', '"'),
+    ("'", "'"),
+    ("\u201c", "\u201d"),
+    ("\u2018", "\u2019"),
+    ("\u300c", "\u300d"),
+    ("\u300e", "\u300f"),
+    ("\u00ab", "\u00bb"),
+)
 
 
 class Session:
@@ -71,7 +74,7 @@ class Session:
         last_consolidated: int,
         now: Callable[[], datetime] | None = None,
     ) -> Self:
-        _require_session_id(session_id)
+        cls._require_id(session_id)
         require_aware_datetime(created_at, field="created_at")
         require_aware_datetime(updated_at, field="updated_at")
         require_nonnegative_int(last_consolidated, field="last_consolidated")
@@ -101,7 +104,7 @@ class Session:
         allocate_uuid = uuid4 if new_uuid is None else new_uuid
         return cls._from_state(
             workspace_state=workspace_state,
-            session_id=_make_session_id(created_at, allocate_uuid()),
+            session_id=_make_id(created_at, allocate_uuid()),
             created_at=created_at,
             updated_at=created_at,
             messages=[],
@@ -121,10 +124,10 @@ class Session:
         now: Callable[[], datetime] | None = None,
     ) -> Self:
         """Create a memory-only Session for an owner with an existing identity."""
-        _require_session_id(session_id)
+        cls._require_id(session_id)
         require_aware_datetime(created_at, field="created_at")
         metadata = _initial_metadata()
-        metadata["title"] = title
+        metadata["title"] = _normalize_title(title)
         _validate_metadata(metadata)
         return cls._from_state(
             workspace_state=workspace_state,
@@ -146,7 +149,7 @@ class Session:
         now: Callable[[], datetime] | None = None,
     ) -> Self:
         """Load one current-format Session synchronously from Workspace State."""
-        _require_session_id(session_id)
+        cls._require_id(session_id)
         path = workspace_state.sessions_directory / f"{session_id}.jsonl"
         records = _read_jsonl_records(path)
         if not records:
@@ -192,8 +195,8 @@ class Session:
         reserved = {"role", "content", "timestamp"}
         if reserved.intersection(fields):
             raise ValueError("role, content, and timestamp are reserved message fields")
-        if _UNSUPPORTED_MESSAGE_FIELDS.intersection(fields):
-            raise ValueError("message id, record_type, and schema_version are unsupported")
+        if "id" in fields:
+            raise ValueError("unsupported Session message identifiers")
         copied_fields = _copy_json_object(fields, field="message")
         message: dict[str, Any] = {
             "role": role,
@@ -246,10 +249,10 @@ class Session:
         if not self.messages:
             return
         try:
-            snapshot = self._snapshot()
+            content = self._serialized_state()
             loop = asyncio.get_running_loop()
             previous = self._pending_persist
-            self._pending_persist = loop.create_task(self._persist_after(previous, snapshot))
+            self._pending_persist = loop.create_task(self._persist_after(previous, content))
         except Exception:
             return
 
@@ -264,26 +267,30 @@ class Session:
         for attempt in range(3):
             try:
                 self._updated_at = self._clock_now()
-                self._write_snapshot(self._snapshot())
+                self._write_content(self._serialized_state())
                 return
             except Exception:
                 if attempt < 2:
                     time.sleep((0.1, 0.2)[attempt])
 
-    def _snapshot(self) -> _Snapshot:
-        return _Snapshot(
-            session_id=self._session_id,
-            created_at=self._created_at,
-            updated_at=self._updated_at,
-            last_consolidated=self.last_consolidated,
-            metadata=copy.deepcopy(self.metadata),
-            messages=copy.deepcopy(self.messages),
-        )
+    def _serialized_state(self) -> bytes:
+        header = {
+            "session_id": self._session_id,
+            "created_at": format_rfc3339_milliseconds(self._created_at),
+            "updated_at": format_rfc3339_milliseconds(self._updated_at),
+            "last_consolidated": self.last_consolidated,
+            "metadata": copy.deepcopy(self.metadata),
+        }
+        records = (header, *copy.deepcopy(self.messages))
+        return "".join(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+            for record in records
+        ).encode("utf-8")
 
     async def _persist_after(
         self,
         previous: asyncio.Task[None] | None,
-        snapshot: _Snapshot,
+        content: bytes,
     ) -> None:
         if previous is not None and not previous.done():
             try:
@@ -293,13 +300,12 @@ class Session:
         if self._closed:
             return
         try:
-            self._write_snapshot(snapshot)
+            self._write_content(content)
         except Exception:
             pass
 
-    def _write_snapshot(self, snapshot: _Snapshot) -> None:
-        path = self._workspace_state.sessions_directory / f"{snapshot.session_id}.jsonl"
-        content = _serialize_snapshot(snapshot)
+    def _write_content(self, content: bytes) -> None:
+        path = self._workspace_state.sessions_directory / f"{self._session_id}.jsonl"
         HOST_FILESYSTEM.path_for_io(path.parent).mkdir(parents=True, exist_ok=True)
         HOST_FILESYSTEM.atomic_replace_bytes(path, content)
 
@@ -324,6 +330,27 @@ class Session:
     def _clock_now(self) -> datetime:
         return _clock_now(self._now)
 
+    @staticmethod
+    def _require_id(value: str, *, field: str = "session_id") -> None:
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a valid Session ID")
+        match = _SESSION_ID_PATTERN.fullmatch(value)
+        if match is None:
+            raise ValueError(f"{field} must be a valid Session ID")
+        try:
+            datetime.strptime(match.group("timestamp"), "%Y%m%d-%H%M%S-%f")
+            require_uuid4_string(match.group("uuid"), field=field)
+        except ValueError as error:
+            raise ValueError(f"{field} must be a valid Session ID") from error
+
+    @staticmethod
+    def _normalize_title(value: str) -> str:
+        return _normalize_title(value)
+
+    @staticmethod
+    def _normalize_title_candidate(value: str) -> str:
+        return _normalize_title(value, fallback="")
+
 
 def _local_now() -> datetime:
     return datetime.now().astimezone()
@@ -331,6 +358,12 @@ def _local_now() -> datetime:
 
 def _clock_now(now: Callable[[], datetime] | None) -> datetime:
     return _local_now() if now is None else now()
+
+
+def _make_id(created_at: datetime, session_uuid: UUID) -> str:
+    require_aware_datetime(created_at, field="created_at")
+    require_uuid4(session_uuid, field="session_uuid")
+    return f"{created_at:%Y%m%d-%H%M%S-%f}_{session_uuid}"
 
 
 def _initial_metadata() -> dict[str, Any]:
@@ -343,21 +376,6 @@ def _initial_metadata() -> dict[str, Any]:
             "total_tokens": 0,
         },
     }
-
-
-def _serialize_snapshot(snapshot: _Snapshot) -> bytes:
-    header = {
-        "session_id": snapshot.session_id,
-        "created_at": format_rfc3339_milliseconds(snapshot.created_at),
-        "updated_at": format_rfc3339_milliseconds(snapshot.updated_at),
-        "last_consolidated": snapshot.last_consolidated,
-        "metadata": snapshot.metadata,
-    }
-    records = (header, *snapshot.messages)
-    return "".join(
-        json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
-        for record in records
-    ).encode("utf-8")
 
 
 def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
@@ -390,7 +408,7 @@ def _parse_header(
     session_id = record["session_id"]
     if not isinstance(session_id, str):
         raise ValueError("Session header session_id must be a string")
-    _require_session_id(session_id)
+    Session._require_id(session_id)
     created_at = _parse_datetime(record["created_at"], field="created_at")
     updated_at = _parse_datetime(record["updated_at"], field="updated_at")
     last_consolidated = record["last_consolidated"]
@@ -415,9 +433,9 @@ def _parse_datetime(value: Any, *, field: str) -> datetime:
 
 
 def _parse_message(record: dict[str, Any]) -> dict[str, Any]:
-    if "record_type" in record or "schema_version" in record:
-        raise ValueError("Typed or versioned Session messages are unsupported")
     message = _copy_json_object(record, field="message")
+    if any(key in message for key in ("record_" + "type", "schema_" + "version")):
+        raise ValueError("legacy Session message fields are unsupported")
     try:
         _validate_message(message)
     except KeyError as error:
@@ -463,8 +481,8 @@ def _validate_json_value(value: Any, *, field: str) -> None:
 
 def _validate_message(message: dict[str, Any]) -> None:
     _validate_json_value(message, field="message")
-    if _UNSUPPORTED_MESSAGE_FIELDS.intersection(message):
-        raise ValueError("message id, record_type, and schema_version are unsupported")
+    if "id" in message:
+        raise ValueError("unsupported Session message identifiers")
     role = message["role"]
     if not isinstance(role, str):
         raise TypeError("message role must be a string")
@@ -549,23 +567,14 @@ def _validate_token_usage(value: Any, *, field: str) -> None:
         raise ValueError(f"{field}.total_tokens must equal input_tokens + output_tokens")
 
 
-def _normalize_title(value: str) -> str:
-    pairs = (
-        ('"', '"'),
-        ("'", "'"),
-        ("\u201c", "\u201d"),
-        ("\u2018", "\u2019"),
-        ("\u300c", "\u300d"),
-        ("\u300e", "\u300f"),
-        ("\u00ab", "\u00bb"),
-    )
+def _normalize_title(value: str, *, fallback: str = "Untitled session") -> str:
     for line in value.splitlines():
         title = " ".join(line.split())
         if not title:
             continue
-        for opening, closing in pairs:
+        for opening, closing in _TITLE_PAIRS:
             if len(title) >= 2 and title.startswith(opening) and title.endswith(closing):
                 title = " ".join(title[1:-1].split())
                 break
-        return title[:60] or "Untitled session"
-    return "Untitled session"
+        return title[:60] or fallback
+    return fallback

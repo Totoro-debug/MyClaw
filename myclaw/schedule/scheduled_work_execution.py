@@ -19,7 +19,6 @@ from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ModelProvider, ReasoningEffort
 from myclaw.schedule.records import ScheduledWork
 from myclaw.session.session import Session
-from myclaw.session.session_titles import normalize_session_title
 from myclaw.tools.tool_gateway import ToolGateway
 
 _SESSION_FAILURE = ErrorInfo(
@@ -62,8 +61,8 @@ class ScheduledWorkRunner:
         settings: ScheduledWorkModelSettings,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
-        tool_gateway_for: Callable[[str], ToolGateway],
-        externalize_result_for: Callable[[str], ToolResultExternalizer] | None = None,
+        tool_gateway_for: Callable[[Session], ToolGateway],
+        externalize_result_for: Callable[[Session], ToolResultExternalizer] | None = None,
     ) -> None:
         self._provider = provider
         if workspace_state is None:
@@ -122,7 +121,7 @@ class ScheduledWorkRunner:
             session.close()
 
     async def _run_once(self, task: ScheduledWork, session: Session) -> ScheduledWorkRunResult:
-        gateway = self._tool_gateway_for(session.session_id)
+        gateway = self._tool_gateway_for(session)
         system_prompt = chat_system_prompt(
             workspace=self._workspace.path,
             long_term_memory=self._long_term_memory,
@@ -146,7 +145,7 @@ class ScheduledWorkRunner:
             externalize_result=(
                 None
                 if self._externalize_result_for is None
-                else self._externalize_result_for(session.session_id)
+                else self._externalize_result_for(session)
             ),
             on_terminal_failure=capture_terminal_failure,
         )
@@ -178,6 +177,6 @@ class ScheduledWorkRunner:
             self._workspace_state,
             task.session_id,
             task.created_at,
-            title=normalize_session_title(task.title),
+            title=task.title,
             now=self._now,
         )

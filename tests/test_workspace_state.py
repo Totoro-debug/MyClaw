@@ -157,7 +157,7 @@ def test_copying_a_complete_workspace_retains_its_workspace_state(
     state.initialize(agent_home_root=agent_home)
     state.long_term_memory_path.write_bytes(b"# Portable memory\n")
     session = state.sessions_directory / "portable-session.jsonl"
-    session.write_bytes(b'{"record_type":"portable-test"}\n')
+    session.write_bytes(b'{"portable_test":true}\n')
     copied_workspace = tmp_path / "copied-workspace"
 
     shutil.copytree(workspace, copied_workspace)

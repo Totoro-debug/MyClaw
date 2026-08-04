@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Final
 from urllib.parse import quote, unquote
 
-from myclaw.session.identifiers import require_session_id
+from myclaw.session.session import Session
 from myclaw.utils.validation import require_nonnegative_int
 
 _WINDOWS_RESERVED_BASENAMES: Final = frozenset(
@@ -35,7 +35,7 @@ class ArtifactReference:
         if len(parts) != 3 or parts[0] != "artifacts":
             msg = "path must match the persisted artifact path contract"
             raise ValueError(msg)
-        require_session_id(parts[1])
+        Session._require_id(parts[1])
         filename = parts[2]
         if not filename.endswith(".txt"):
             msg = "artifact filename must end with .txt"

@@ -1,6 +1,7 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -27,9 +28,7 @@ from myclaw.provider.models import (
     ToolModelMessage,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.session.records import ToolSessionMessage
 from myclaw.session.session import Session
-from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.models import (
     ModelToolCall,
     ToolResult,
@@ -40,7 +39,7 @@ from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
-SESSION_ID = "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000"
+SESSION_ID = "20260711-153012-123000_550e8400-e29b-41d4-a716-446655440000"
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=timezone(timedelta(hours=8)))
 
 
@@ -94,12 +93,21 @@ def _artifact_directory(*, workspace: Path, session_id: str) -> Path:
     return _long_path(state.sessions_directory / "artifacts" / session_id)
 
 
+def _session(state: WorkspaceState) -> Session:
+    return Session.create(
+        state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
+    )
+
+
 def test_runtime_externalizes_only_success_results_over_the_configured_threshold(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     AgentHome(agent_home).initialize()
     workspace_state = _workspace_state(workspace)
+    session = _session(workspace_state)
     exact_result = "a" * 2000
     expected_preview = "b" * 2000
     oversized_result = expected_preview + "!"
@@ -120,15 +128,13 @@ def test_runtime_externalizes_only_success_results_over_the_configured_threshold
 
     exact_projected = externalize_tool_result(
         exact,
-        workspace_state=workspace_state,
-        session_id=SESSION_ID,
+        session=session,
         max_tool_result_chars=2000,
     )
     assert not (workspace_state.sessions_directory / "artifacts").exists()
     oversized_projected = externalize_tool_result(
         oversized,
-        workspace_state=workspace_state,
-        session_id=SESSION_ID,
+        session=session,
         max_tool_result_chars=2000,
     )
 
@@ -153,9 +159,6 @@ def test_active_session_is_the_only_tool_artifact_workspace_authority(
     workspace: Path,
 ) -> None:
     workspace_state = _workspace_state(workspace)
-    other_workspace = workspace.parent / "other-workspace"
-    other_workspace.mkdir()
-    other_state = _workspace_state(other_workspace)
     session = Session.create(
         workspace_state,
         now=lambda: NOW,
@@ -178,14 +181,6 @@ def test_active_session_is_the_only_tool_artifact_workspace_authority(
     assert projected.artifact is not None
     own_artifact = workspace_state.sessions_directory / projected.artifact.path
     assert own_artifact.read_text(encoding="utf-8") == "oversized"
-    assert not (other_state.sessions_directory / "artifacts").exists()
-    with pytest.raises(TypeError, match="requires only a Session"):
-        externalize_tool_result(
-            result,
-            session=session,
-            workspace_state=other_state,
-            max_tool_result_chars=1,
-        )
 
 
 @pytest.mark.asyncio
@@ -284,12 +279,8 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
     home = AgentHome(agent_home)
     home.initialize()
     clock = FakeClock(NOW)
-    store = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=clock.now,
-        new_uuid=uuid4,
-    )
-    session = store.prepare()
+    state = _workspace_state(workspace)
+    session = Session.create(state, now=clock.now, new_uuid=uuid4)
     raw_result = "private-oversized-result-" * 100
     private_write_detail = "private-artifact-adapter-detail"
 
@@ -332,8 +323,7 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
     gateway.register_tools((tool,))
     conversation = StreamingConversationPort(
         provider=provider,
-        sessions=store,
-        session_id=session.id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=4096,
@@ -346,15 +336,14 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
         tool_gateway=gateway,
         externalize_result=lambda result: externalize_tool_result(
             result,
-            workspace_state=store.workspace_state,
-            session_id=session.id,
+            session=session,
             max_tool_result_chars=2000,
             write_text=unavailable_artifact_boundary,
         ),
     )
     capture = capture_diagnostics()
 
-    with capture.session(session.id):
+    with capture.session(session.session_id):
         events = [event async for event in conversation.submit("Inspect the result")]
     capture.close()
 
@@ -364,13 +353,14 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
         "tool_completed",
         "turn_completed",
     ]
-    reloaded = await store.load(session.id)
-    tool_message = reloaded.messages[2]
-    assert isinstance(tool_message, ToolSessionMessage)
-    assert tool_message.content == "inspect result could not be stored."
-    assert tool_message.status == "error"
-    assert tool_message.artifact is None
-    persisted_content = _long_path(store.path_for(session.id)).read_text(encoding="utf-8")
+    tool_message = session.messages[2]
+    assert tool_message["content"] == "inspect result could not be stored."
+    assert tool_message["status"] == "error"
+    assert tool_message["artifact"] is None
+    await asyncio.sleep(0)
+    persisted_content = _long_path(
+        state.sessions_directory / f"{session.session_id}.jsonl"
+    ).read_text(encoding="utf-8")
     assert "private-oversized-result" not in persisted_content
     assert private_write_detail not in persisted_content
     second_request = provider.stream_requests[1]
@@ -380,7 +370,7 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
     assert model_tool_message.content == "inspect result could not be stored."
     artifact_directory = _artifact_directory(
         workspace=workspace,
-        session_id=session.id,
+        session_id=session.session_id,
     )
     assert list(artifact_directory.iterdir()) == []
     content = capture.text
@@ -417,8 +407,7 @@ def test_invalid_empty_tool_call_id_fails_before_writing_an_artifact(
     with pytest.raises(ArtifactWriteError):
         externalize_tool_result(
             result,
-            workspace_state=_workspace_state(workspace),
-            session_id=SESSION_ID,
+            session=_session(_workspace_state(workspace)),
             max_tool_result_chars=1,
             write_text=lambda path, content: writes.append((path, content)),
         )
@@ -441,8 +430,7 @@ def test_windows_reserved_tool_call_id_uses_canonical_safe_filename(
     )
     result = externalize_tool_result(
         original,
-        workspace_state=_workspace_state(workspace),
-        session_id=SESSION_ID,
+        session=_session(_workspace_state(workspace)),
         max_tool_result_chars=1,
         write_text=lambda path, content: writes.append((path, content)),
     )
@@ -480,8 +468,7 @@ def test_same_session_artifacts_are_workspace_isolated_and_legacy_bytes_are_unto
                 content=content,
                 artifact=None,
             ),
-            workspace_state=state,
-            session_id=SESSION_ID,
+            session=_session(state),
             max_tool_result_chars=1,
         )
 

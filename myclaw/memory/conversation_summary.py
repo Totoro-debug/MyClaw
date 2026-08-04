@@ -24,18 +24,12 @@ from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelProvider, ModelRequest, ReasoningEffort, UserModelMessage
-from myclaw.session.identifiers import require_session_id
-from myclaw.session.records import (
-    MetadataUpdate,
-)
 from myclaw.session.session import Session
-from myclaw.session.session_store import SessionStore
 from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
-type UnlinkFile = Callable[[Path], None]
 
 
 class SummaryStore(Protocol):
@@ -44,110 +38,6 @@ class SummaryStore(Protocol):
     async def append(self, content: str, timestamp: datetime) -> SummaryEntry: ...
 
     async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]: ...
-
-
-def _unlink_file(path: Path) -> None:
-    path.unlink()
-
-
-@dataclass(frozen=True, slots=True)
-class _PendingConsolidation:
-    session_id: str
-    old_cursor: int
-    new_cursor: int
-    summary: SummaryEntry
-
-    def __post_init__(self) -> None:
-        require_session_id(self.session_id)
-        for field, value in (
-            ("old_cursor", self.old_cursor),
-            ("new_cursor", self.new_cursor),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"{field} must be a nonnegative integer")
-        if self.new_cursor <= self.old_cursor:
-            raise ValueError("new_cursor must advance beyond old_cursor")
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "session_id": self.session_id,
-            "old_cursor": self.old_cursor,
-            "new_cursor": self.new_cursor,
-            "summary_index": self.summary.index,
-            "timestamp": format_rfc3339_milliseconds(self.summary.timestamp),
-            "content": self.summary.content,
-        }
-
-    @classmethod
-    def from_bytes(cls, content: bytes) -> _PendingConsolidation:
-        loaded: object = json.loads(content.decode("utf-8"))
-        if not isinstance(loaded, dict) or set(loaded) != {
-            "session_id",
-            "old_cursor",
-            "new_cursor",
-            "summary_index",
-            "timestamp",
-            "content",
-        }:
-            raise ValueError("consolidation journal has an invalid schema")
-        session_id = loaded["session_id"]
-        old_cursor = loaded["old_cursor"]
-        new_cursor = loaded["new_cursor"]
-        summary_index = loaded["summary_index"]
-        timestamp = loaded["timestamp"]
-        summary_content = loaded["content"]
-        if not isinstance(session_id, str):
-            raise ValueError("journal session_id must be a string")
-        if not isinstance(timestamp, str):
-            raise ValueError("journal timestamp must be a string")
-        if not isinstance(summary_content, str):
-            raise ValueError("journal content must be a string")
-        if isinstance(summary_index, bool) or not isinstance(summary_index, int):
-            raise ValueError("journal summary_index must be an integer")
-        parsed_timestamp = datetime.fromisoformat(timestamp)
-        if format_rfc3339_milliseconds(parsed_timestamp) != timestamp:
-            raise ValueError("journal timestamp must use canonical RFC 3339 milliseconds")
-        if isinstance(old_cursor, bool) or not isinstance(old_cursor, int):
-            raise ValueError("journal old_cursor must be an integer")
-        if isinstance(new_cursor, bool) or not isinstance(new_cursor, int):
-            raise ValueError("journal new_cursor must be an integer")
-        return cls(
-            session_id=session_id,
-            old_cursor=old_cursor,
-            new_cursor=new_cursor,
-            summary=SummaryEntry(
-                index=summary_index,
-                timestamp=parsed_timestamp,
-                content=summary_content,
-            ),
-        )
-
-
-class ConsolidationSessionStore(SessionStore, Protocol):
-    workspace_state: WorkspaceState
-
-    async def recover_consolidation_cursor(
-        self,
-        session_id: str,
-        *,
-        old_cursor: int,
-        new_cursor: int,
-    ) -> None: ...
-
-
-class ConsolidatingSummaryStore(SummaryStore, Protocol):
-    async def commit_consolidation(
-        self,
-        *,
-        sessions: ConsolidationSessionStore,
-        session_id: str,
-        old_cursor: int,
-        new_cursor: int,
-        content: str,
-        timestamp: datetime,
-    ) -> SummaryEntry: ...
-
-    async def recover_pending(self, sessions: ConsolidationSessionStore) -> int: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,15 +59,12 @@ class WorkspaceJsonlSummaryStore:
         workspace_state: WorkspaceState,
         *,
         replace_bytes: AtomicReplaceBytes = HOST_FILESYSTEM.atomic_replace_bytes,
-        unlink_file: UnlinkFile = _unlink_file,
     ) -> None:
         self.workspace_state = workspace_state
         self._state_root = workspace_state.path.resolve(strict=True)
         self._memory_directory = workspace_state.memory_directory
         self.path = workspace_state.memory_directory / "summary.jsonl"
-        self.pending_directory = workspace_state.memory_directory / "pending-consolidations"
         self._replace_bytes = replace_bytes
-        self._unlink_file = unlink_file
         self._lock = asyncio.Lock()
 
     async def append(self, content: str, timestamp: datetime) -> SummaryEntry:
@@ -190,68 +77,6 @@ class WorkspaceJsonlSummaryStore:
     async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]:
         async with self._lock:
             return self._entries()[cursor : cursor + limit]
-
-    async def commit_consolidation(
-        self,
-        *,
-        sessions: ConsolidationSessionStore,
-        session_id: str,
-        old_cursor: int,
-        new_cursor: int,
-        content: str,
-        timestamp: datetime,
-    ) -> SummaryEntry:
-        async with self._lock:
-            self._require_matching_session_store(sessions)
-            next_index = len(self._entries()) + 1
-            entry = SummaryEntry(index=next_index, timestamp=timestamp, content=content)
-            journal = _PendingConsolidation(
-                session_id=session_id,
-                old_cursor=old_cursor,
-                new_cursor=new_cursor,
-                summary=entry,
-            )
-            self.pending_directory.mkdir(exist_ok=True)
-            pending_root = self._require_pending_directory()
-            journal_path = self.pending_directory / f"{session_id}.json"
-            if journal_path.exists() or journal_path.is_symlink():
-                HOST_FILESYSTEM.require_owned_regular_file(journal_path, within=pending_root)
-            self._replace_bytes(
-                journal_path,
-                json.dumps(journal.to_dict(), ensure_ascii=False, separators=(",", ":")).encode(
-                    "utf-8"
-                ),
-            )
-            HOST_FILESYSTEM.require_owned_regular_file(journal_path, within=pending_root)
-            self._append_exact(entry)
-            await sessions.update_metadata(
-                session_id,
-                MetadataUpdate(consolidation_cursor=new_cursor),
-            )
-            self._unlink_file(journal_path)
-            return entry
-
-    async def recover_pending(self, sessions: ConsolidationSessionStore) -> int:
-        async with self._lock:
-            self._require_matching_session_store(sessions)
-            if not self.pending_directory.exists() and not self.pending_directory.is_symlink():
-                return 0
-            pending_root = self._require_pending_directory()
-            recovered_count = 0
-            for journal_path in sorted(self.pending_directory.glob("*.json")):
-                HOST_FILESYSTEM.require_owned_regular_file(journal_path, within=pending_root)
-                journal = _PendingConsolidation.from_bytes(journal_path.read_bytes())
-                if journal_path.stem != journal.session_id:
-                    raise ValueError("journal file name must match session_id")
-                self._append_exact(journal.summary)
-                await sessions.recover_consolidation_cursor(
-                    journal.session_id,
-                    old_cursor=journal.old_cursor,
-                    new_cursor=journal.new_cursor,
-                )
-                self._unlink_file(journal_path)
-                recovered_count += 1
-            return recovered_count
 
     def _append_exact(self, entry: SummaryEntry) -> None:
         entries = self._entries()
@@ -305,19 +130,9 @@ class WorkspaceJsonlSummaryStore:
             )
         return tuple(entries)
 
-    def _require_matching_session_store(self, sessions: ConsolidationSessionStore) -> None:
-        if sessions.workspace_state != self.workspace_state:
-            raise ValueError("Consolidation Session store belongs to another Workspace State")
-
     def _require_memory_directory(self) -> Path:
         return HOST_FILESYSTEM.require_owned_directory(
             self._memory_directory, within=self._state_root
-        )
-
-    def _require_pending_directory(self) -> Path:
-        self._require_memory_directory()
-        return HOST_FILESYSTEM.require_owned_directory(
-            self.pending_directory, within=self._state_root
         )
 
 

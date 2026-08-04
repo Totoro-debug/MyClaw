@@ -622,21 +622,11 @@ def test_load_current_five_field_jsonl_preserves_json_native_extensions(
 @pytest.mark.parametrize(
     "records",
     [
-        [{"record_type": "metadata", "schema_version": 1}],
         [_header(extra=True)],
         [_header(session_id=OTHER_SESSION_ID)],
         [_header(created_at="2026-07-11T15:30:12")],
         [_header(last_consolidated=-1)],
         [_header(metadata={"title": "Project review", "token_usage": {}})],
-        [
-            _header(),
-            {
-                "record_type": "message",
-                "role": "user",
-                "content": "legacy",
-                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
-            },
-        ],
         [
             _header(),
             {

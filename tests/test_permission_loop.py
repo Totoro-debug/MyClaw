@@ -16,8 +16,7 @@ from myclaw.provider.models import (
     ToolModelMessage,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.session.records import ToolSessionMessage
-from myclaw.session.session_store import JsonlSessionStore
+from myclaw.session.session import Session
 from myclaw.tools.files.file_tools import EditFileTool, WriteFileTool
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.tool_gateway import ToolGateway
@@ -33,12 +32,9 @@ async def test_foreground_mutations_are_refused_without_a_permission_pause(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
-    session = sessions.prepare()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    session = Session.create(state, now=lambda: NOW, new_uuid=uuid4)
     target = workspace / "notes.txt"
     target.write_text("before", encoding="utf-8")
     calls = (
@@ -91,8 +87,7 @@ async def test_foreground_mutations_are_refused_without_a_permission_pause(
     gateway.register_tools((WriteFileTool(), EditFileTool()))
     conversation = StreamingConversationPort(
         provider=provider,
-        sessions=sessions,
-        session_id=session.id,
+        session=session,
         settings=ChatModelSettings(
             model="test-model",
             max_output=1024,
@@ -117,11 +112,8 @@ async def test_foreground_mutations_are_refused_without_a_permission_pause(
     ]
     assert not (workspace / "created.txt").exists()
     assert target.read_text(encoding="utf-8") == "before"
-    persisted = await sessions.load(session.id)
-    tool_messages = [
-        message for message in persisted.messages if isinstance(message, ToolSessionMessage)
-    ]
-    assert [message.status for message in tool_messages] == ["refused", "refused"]
+    tool_messages = [message for message in session.messages if message["role"] == "tool"]
+    assert [message["status"] for message in tool_messages] == ["refused", "refused"]
     follow_up = provider.stream_requests[1]
     assert isinstance(follow_up, ModelRequest)
     model_results = [

@@ -128,10 +128,6 @@ async def test_runtime_routes_turn_title_status_and_close_through_one_active_ses
     assert [message["role"] for message in session.messages] == ["user", "assistant"]
     assert session.metadata["title"] == "Untitled session"
 
-    async def fail_store_read(_session_id: str) -> object:
-        raise AssertionError("status must not read the current Session from the Store")
-
-    monkeypatch.setattr(runtime.sessions, "current_session", fail_store_read)
     status_result = await runtime.management_dispatcher.dispatch("/status")
     assert status_result.output is not None
     status = json.loads(status_result.output)
@@ -208,6 +204,46 @@ async def test_runtime_rejects_tool_call_title_and_counts_its_usage(
         "input_tokens": 8,
         "output_tokens": 4,
         "total_tokens": 12,
+    }
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_empty_generated_title_uses_the_first_user_fallback(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = RuntimeProvider(
+        (
+            ModelResponse(
+                message=AssistantModelMessage(content="First response."),
+                usage=ModelUsage(input_tokens=5, output_tokens=2, total_tokens=7),
+                finish_reason="stop",
+            ),
+        ),
+        title_response=ModelResponse(
+            message=AssistantModelMessage(content="\n\t  "),
+            usage=ModelUsage(input_tokens=3, output_tokens=1, total_tokens=4),
+            finish_reason="stop",
+        ),
+    )
+    runtime = _runtime(agent_home, workspace, provider)
+
+    events = [
+        event async for event in runtime.conversation.submit("  Meaningful first question.  ")
+    ]
+    for _ in range(100):
+        if runtime.session.metadata["token_usage"]["model_calls"] == 2:
+            break
+        await asyncio.sleep(0)
+
+    assert events[-1].type == "turn_completed"
+    assert runtime.session.metadata["title"] == "Meaningful first question."
+    assert runtime.session.metadata["token_usage"] == {
+        "model_calls": 2,
+        "input_tokens": 8,
+        "output_tokens": 3,
+        "total_tokens": 11,
     }
     await runtime.close()
 

@@ -16,8 +16,7 @@ from myclaw.management.service import (
     RuntimeStatusService,
 )
 from myclaw.memory.memory_task import WorkspaceFileMemoryStore
-from myclaw.session.records import CumulativeUsage
-from myclaw.session.session_store import JsonlSessionStore
+from myclaw.session.session import Session
 
 CONFIG_WITH_PLAINTEXT_KEYS = """# User Configuration remains source-preserved.
 [models.providers.primary]
@@ -181,16 +180,16 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    session = Session.create(
+        state,
         now=lambda: CREATED_AT,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
-    metadata = sessions.prepare()
     monotonic = iter((100.0, 112.9)).__next__
     status_service = RuntimeStatusService(
-        sessions=sessions,
-        session_id=metadata.id,
+        session=session,
         resolved_chat=lambda: ResolvedChatStatus(
             provider_id="primary",
             model="model-id",
@@ -217,10 +216,10 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
         context_used_percent=40.0,
         session_message_count=0,
         consolidation_cursor=0,
-        cumulative_usage=CumulativeUsage(
-            model_calls=0,
-            input_tokens=0,
-            output_tokens=0,
-            total_tokens=0,
-        ),
+        cumulative_usage={
+            "model_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        },
     )
