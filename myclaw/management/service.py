@@ -2,10 +2,13 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime
 from typing import Protocol, cast
 
+from loguru import logger
+
 from myclaw import __version__
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ConfigView
 from myclaw.errors import ErrorInfo
@@ -13,22 +16,33 @@ from myclaw.memory.memory_task import MemoryStore, MemoryTaskResult
 from myclaw.session.identifiers import require_session_id
 from myclaw.session.records import ConversationSession, CumulativeUsage, SessionSummary
 from myclaw.session.session import Session
-from myclaw.session.session_store import SessionListingReport
 from myclaw.utils.validation import require_nonnegative_int, require_nonnegative_number
-
-
-class _CurrentSessionStore(Protocol):
-    async def current_session(self, session_id: str) -> ConversationSession: ...
 
 
 class _ManualMemoryManager(Protocol):
     async def run_manual(self) -> MemoryTaskResult: ...
 
 
-class _ResumableSessionStore(_CurrentSessionStore, Protocol):
-    async def load(self, session_id: str) -> ConversationSession: ...
+@dataclass(frozen=True, slots=True)
+class SessionListingReport:
+    """Valid current-format Sessions and the entries skipped during listing."""
 
-    async def scan_for_workspace(self, workspace: Path) -> SessionListingReport: ...
+    sessions: tuple[SessionSummary, ...]
+    skipped_count: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.skipped_count, bool)
+            or not isinstance(self.skipped_count, int)
+            or self.skipped_count < 0
+        ):
+            raise ValueError("skipped_count must be a nonnegative integer")
+
+
+class _CurrentSessionStore(Protocol):
+    """Legacy status-only seam retained until the old contract is retired."""
+
+    async def current_session(self, session_id: str) -> ConversationSession: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,8 +181,13 @@ class RuntimeStatusService:
         self._started_at = monotonic()
         self._version = version
 
-    def use_session(self, session_id: str) -> None:
-        """Select legacy Store-backed status only after the existing resume flow switches."""
+    def use_session(self, session: Session | str) -> None:
+        """Make the selected Session the status authority."""
+        if isinstance(session, Session):
+            self._session = lambda: session
+            self._session_id = None
+            return
+        session_id = session
         require_session_id(session_id)
         initial_session = self._initial_session
         if initial_session is not None and initial_session().session_id == session_id:
@@ -251,17 +270,17 @@ class ManagementViewService:
         agent_home: AgentHome,
         *,
         status_service: RuntimeStatusService | None = None,
-        sessions: _ResumableSessionStore | None = None,
-        workspace: Path | None = None,
-        switch_session: Callable[[str], None] | None = None,
+        workspace_state: WorkspaceState | None = None,
+        switch_session: Callable[[Session], None] | None = None,
+        now: Callable[[], datetime] | None = None,
         memory_manager: _ManualMemoryManager | None = None,
         memory_store: MemoryStore | None = None,
     ) -> None:
         self._config = ConfigLoader(agent_home)
         self._status_service = status_service
-        self._sessions = sessions
-        self._workspace = workspace
+        self._workspace_state = workspace_state
         self._switch_session = switch_session
+        self._now = now
         self._memory_manager = memory_manager
         self._memory_store = memory_store
 
@@ -314,18 +333,59 @@ class ManagementViewService:
 
     async def resumable_listing(self) -> SessionListingReport:
         """Return one atomic Session picker result including skipped diagnostics."""
-        if self._sessions is None or self._workspace is None:
+        workspace_state = self._workspace_state
+        if workspace_state is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
+        if not workspace_state.sessions_directory.exists():
+            return SessionListingReport(sessions=(), skipped_count=0)
+        summaries: list[SessionSummary] = []
+        skipped_count = 0
         try:
-            return await self._sessions.scan_for_workspace(self._workspace)
+            paths = tuple(workspace_state.sessions_directory.glob("*.jsonl"))
         except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Conversation Sessions could not be listed.")
             ) from error
+        for path in paths:
+            try:
+                session = Session.load(workspace_state, path.stem, now=self._now)
+            except (OSError, UnicodeError, ValueError) as error:
+                logger.opt(exception=error).warning(
+                    "Skipped corrupt or unreadable Conversation Session entry path={} type={}",
+                    path,
+                    type(error).__name__,
+                )
+                skipped_count += 1
+                continue
+            summaries.append(
+                SessionSummary(
+                    id=session.session_id,
+                    title=_session_title(session),
+                    created_at=session.created_at,
+                    updated_at=session.updated_at,
+                    message_count=len(session.messages),
+                )
+            )
+        return SessionListingReport(
+            sessions=tuple(
+                sorted(
+                    summaries,
+                    key=lambda summary: (
+                        summary.updated_at,
+                        summary.created_at,
+                        summary.id,
+                    ),
+                    reverse=True,
+                )
+            ),
+            skipped_count=skipped_count,
+        )
 
     async def resume(self, session_id: str) -> ResumeResult:
         """Revalidate and select one Session from the current Workspace."""
-        if self._sessions is None or self._switch_session is None:
+        workspace_state = self._workspace_state
+        switch_session = self._switch_session
+        if workspace_state is None or switch_session is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
         sessions = await self.resumable_sessions()
         if session_id not in {summary.id for summary in sessions}:
@@ -336,7 +396,7 @@ class ManagementViewService:
                 )
             )
         try:
-            session = await self._sessions.load(session_id)
+            session = Session.load(workspace_state, session_id, now=self._now)
         except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo(
@@ -344,5 +404,12 @@ class ManagementViewService:
                     "The selected Conversation Session could not be loaded.",
                 )
             ) from error
-        self._switch_session(session.metadata.id)
-        return ResumeResult(session_id=session.metadata.id)
+        switch_session(session)
+        return ResumeResult(session_id=session.session_id)
+
+
+def _session_title(session: Session) -> str:
+    title = session.metadata.get("title")
+    if not isinstance(title, str):
+        raise ValueError("Session title is malformed")
+    return title

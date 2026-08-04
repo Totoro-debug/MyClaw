@@ -53,7 +53,7 @@ from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkRunner,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.session.records import AssistantSessionMessage
+from myclaw.session.session import Session
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.terminal.repl import run_repl
@@ -445,7 +445,7 @@ async def test_scheduler_refreshes_persisted_work_and_ignores_disabled_records(
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -528,7 +528,7 @@ async def test_scheduler_retries_after_a_store_load_failure(
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -596,7 +596,7 @@ async def test_scheduler_store_failure_does_not_borrow_an_active_session_sink(
     )
     runner = ScheduledWorkRunner(
         provider=ScriptedFakeProvider(),
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -665,7 +665,7 @@ async def test_scheduler_continues_after_one_scheduled_run_fails(
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -739,7 +739,7 @@ async def test_scheduler_consumes_an_unhandled_scheduled_run_after_it_is_logged(
 
     runner = ScheduledWorkRunner(
         provider=UnexpectedFailureProvider(),
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -814,7 +814,7 @@ async def test_scheduler_close_cancels_and_awaits_running_scheduled_work(
     provider = CancellableThenSuccessfulCompletionProvider()
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -890,7 +890,7 @@ async def test_scheduled_work_scheduler_records_a_distinct_shutdown_cleanup_fail
 
     runner = ScheduledWorkRunner(
         provider=CleanupFailingProvider(),
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -964,7 +964,7 @@ async def test_scheduler_shutdown_failure_does_not_enter_any_session_log(
 
     runner = ScheduledWorkRunner(
         provider=CleanupFailingProvider(),
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -1065,7 +1065,7 @@ async def test_completed_scheduled_work_publishes_one_background_event(
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -1106,8 +1106,8 @@ async def test_completed_scheduled_work_publishes_one_background_event(
     assert payload.session_id == TASK_SESSION_ID
     assert payload.status == "completed"
     assert payload.summary == "No open risks were found."
-    session = await sessions.load(TASK_SESSION_ID)
-    assert [message.role for message in session.messages] == ["user", "assistant"]
+    session = Session.load(sessions.workspace_state, TASK_SESSION_ID)
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
     assert not (agent_home / "logs").exists()
 
 
@@ -1133,7 +1133,7 @@ async def test_failed_scheduled_work_keeps_outcomes_and_logs_to_owning_session(
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="PRIVATE LONG-TERM MEMORY",
         settings=ScheduledWorkModelSettings(
@@ -1167,13 +1167,12 @@ async def test_failed_scheduled_work_keeps_outcomes_and_logs_to_owning_session(
     assert isinstance(event.payload, BackgroundCompletedPayload)
     assert event.payload.status == "failed"
     assert event.payload.summary == "PRIVATE SAFE MODEL FAILURE"
-    session = await sessions.load(TASK_SESSION_ID)
-    assert [message.role for message in session.messages] == ["user", "assistant"]
+    session = Session.load(sessions.workspace_state, TASK_SESSION_ID)
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
     persisted_failure = session.messages[-1]
-    assert isinstance(persisted_failure, AssistantSessionMessage)
-    assert persisted_failure.error is not None
-    assert persisted_failure.error.code == result.error.code
-    assert persisted_failure.error.message == result.error.message
+    assert persisted_failure["error"] is not None
+    assert persisted_failure["error"]["code"] == result.error.code
+    assert persisted_failure["error"]["message"] == result.error.message
     content = (state.logs_directory / f"{TASK_SESSION_ID}.log").read_text(encoding="utf-8")
     assert content.count("Scheduled Work failed code=model_failed") == 1
     assert "ModelCallError" in content
@@ -1208,7 +1207,7 @@ async def test_session_log_initialization_failure_is_fail_open_for_later_tasks(
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -1247,16 +1246,15 @@ async def test_session_log_initialization_failure_is_fail_open_for_later_tasks(
     assert first.content == "First task preserved."
     assert isinstance(first_event.payload, BackgroundCompletedPayload)
     assert first_event.payload.status == "completed"
-    first_session = await sessions.load(first_task.session_id)
-    assert first_session.messages[-1].content == "First task preserved."
+    first_session = Session.load(sessions.workspace_state, first_task.session_id)
+    assert first_session.messages[-1]["content"] == "First task preserved."
     assert second.status == "failed"
     assert second.error == ErrorInfo(code="model_failed", message="Second task failed safely.")
     assert isinstance(second_event.payload, BackgroundCompletedPayload)
     assert second_event.payload.status == "failed"
-    second_session = await sessions.load(second_task.session_id)
+    second_session = Session.load(sessions.workspace_state, second_task.session_id)
     persisted_failure = second_session.messages[-1]
-    assert isinstance(persisted_failure, AssistantSessionMessage)
-    assert persisted_failure.error is not None
+    assert persisted_failure["error"] is not None
     content = (state.logs_directory / f"{second_task.session_id}.log").read_text(encoding="utf-8")
     assert content.count("Scheduled Work failed code=model_failed") == 1
 
@@ -1284,7 +1282,7 @@ async def test_background_event_publication_failure_is_recorded_once(
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -1355,7 +1353,7 @@ async def test_failed_scheduled_work_publishes_safe_event_and_does_not_stop_anot
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -1419,7 +1417,7 @@ async def test_overlapping_trigger_of_the_same_scheduled_work_is_skipped(
     provider = BlockingCompletionProvider("Only one run completed.")
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -1464,8 +1462,8 @@ async def test_overlapping_trigger_of_the_same_scheduled_work_is_skipped(
     event = await events.next_background_event()
     assert event.turn_id == RUN_UUID
     assert len(provider.complete_requests) == 1
-    session = await sessions.load(task.session_id)
-    assert [message.role for message in session.messages] == ["user", "assistant"]
+    session = Session.load(sessions.workspace_state, task.session_id)
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(events.next_background_event(), timeout=0.01)
     assert not (agent_home / "logs").exists()
@@ -1487,7 +1485,7 @@ async def test_cancelled_scheduled_work_emits_no_event_and_can_be_retriggered(
     provider = CancellableThenSuccessfulCompletionProvider()
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -1548,7 +1546,7 @@ async def test_different_scheduled_work_runs_concurrently_and_events_follow_comp
     provider = ConcurrentCompletionProvider()
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -1604,10 +1602,10 @@ async def test_different_scheduled_work_runs_concurrently_and_events_follow_comp
         RUN_UUID,
         "Weekly project review",
     )
-    first_session = await sessions.load(first_task.session_id)
-    second_session = await sessions.load(second_task.session_id)
-    assert first_session.messages[-1].content == "First finished second."
-    assert second_session.messages[-1].content == "Second finished first."
+    first_session = Session.load(sessions.workspace_state, first_task.session_id)
+    second_session = Session.load(sessions.workspace_state, second_task.session_id)
+    assert first_session.messages[-1]["content"] == "First finished second."
+    assert second_session.messages[-1]["content"] == "Second finished first."
 
 
 @pytest.mark.asyncio
@@ -1623,7 +1621,7 @@ async def test_different_session_logs_remain_isolated_when_one_run_settles_first
     provider = ConcurrentDiagnosticProvider()
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(

@@ -28,12 +28,7 @@ from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkModelSettings,
     ScheduledWorkRunner,
 )
-from myclaw.session.records import (
-    AssistantSessionMessage,
-    ConversationSession,
-    ToolSessionMessage,
-    UserSessionMessage,
-)
+from myclaw.session.session import Session
 from myclaw.session.session_store import JsonlSessionStore
 from myclaw.tools.base import BaseTool
 from myclaw.tools.files.file_tools import (
@@ -177,155 +172,6 @@ def _artifact_directory(*, workspace: Path, session_id: str) -> Path:
     return state.sessions_directory / "artifacts" / session_id
 
 
-class LoadFailingSessionStore(JsonlSessionStore):
-    def __init__(
-        self,
-        *,
-        workspace_state: WorkspaceState,
-        now: Callable[[], datetime],
-        new_uuid: Callable[[], UUID],
-        fail_on_load: int,
-    ) -> None:
-        super().__init__(
-            workspace_state=workspace_state,
-            now=now,
-            new_uuid=new_uuid,
-        )
-        self._fail_on_load = fail_on_load
-        self._load_calls = 0
-
-    async def load(self, session_id: str) -> ConversationSession:
-        self._load_calls += 1
-        if self._load_calls == self._fail_on_load:
-            raise OSError("private load failure")
-        return await super().load(session_id)
-
-
-class ToolAppendFailingSessionStore(JsonlSessionStore):
-    async def append_message(
-        self,
-        session_id: str,
-        message: AssistantSessionMessage | ToolSessionMessage | UserSessionMessage,
-    ) -> None:
-        if isinstance(message, ToolSessionMessage):
-            raise OSError("injected pre-write Tool append failure")
-        await super().append_message(session_id, message)
-
-
-class IndeterminateToolAppendSessionStore(JsonlSessionStore):
-    def __init__(
-        self,
-        *,
-        workspace_state: WorkspaceState,
-        now: Callable[[], datetime],
-        new_uuid: Callable[[], UUID],
-    ) -> None:
-        super().__init__(
-            workspace_state=workspace_state,
-            now=now,
-            new_uuid=new_uuid,
-        )
-        self._fail_reconciliation_load = False
-
-    async def append_message(
-        self,
-        session_id: str,
-        message: AssistantSessionMessage | ToolSessionMessage | UserSessionMessage,
-    ) -> None:
-        if isinstance(message, ToolSessionMessage):
-            self._fail_reconciliation_load = True
-            raise OSError("injected indeterminate Tool append failure")
-        await super().append_message(session_id, message)
-
-    async def load(self, session_id: str) -> ConversationSession:
-        if self._fail_reconciliation_load:
-            self._fail_reconciliation_load = False
-            raise OSError("injected reconciliation load failure")
-        return await super().load(session_id)
-
-
-class BlockingToolAppendSessionStore(JsonlSessionStore):
-    def __init__(
-        self,
-        *,
-        workspace_state: WorkspaceState,
-        now: Callable[[], datetime],
-        new_uuid: Callable[[], UUID],
-    ) -> None:
-        super().__init__(
-            workspace_state=workspace_state,
-            now=now,
-            new_uuid=new_uuid,
-        )
-        self.tool_append_started = asyncio.Event()
-
-    async def append_message(
-        self,
-        session_id: str,
-        message: AssistantSessionMessage | ToolSessionMessage | UserSessionMessage,
-    ) -> None:
-        if isinstance(message, ToolSessionMessage):
-            self.tool_append_started.set()
-            await asyncio.Future()
-        await super().append_message(session_id, message)
-
-
-class EffectThenBlockToolAppendSessionStore(JsonlSessionStore):
-    def __init__(
-        self,
-        *,
-        workspace_state: WorkspaceState,
-        now: Callable[[], datetime],
-        new_uuid: Callable[[], UUID],
-    ) -> None:
-        super().__init__(
-            workspace_state=workspace_state,
-            now=now,
-            new_uuid=new_uuid,
-        )
-        self.tool_message_written = asyncio.Event()
-
-    async def append_message(
-        self,
-        session_id: str,
-        message: AssistantSessionMessage | ToolSessionMessage | UserSessionMessage,
-    ) -> None:
-        await super().append_message(session_id, message)
-        if isinstance(message, ToolSessionMessage):
-            self.tool_message_written.set()
-            await asyncio.Future()
-
-
-class ToolPublicationBaseError(BaseException):
-    pass
-
-
-class EffectThenRaiseToolAppendSessionStore(JsonlSessionStore):
-    def __init__(
-        self,
-        *,
-        failure: BaseException,
-        workspace_state: WorkspaceState,
-        now: Callable[[], datetime],
-        new_uuid: Callable[[], UUID],
-    ) -> None:
-        super().__init__(
-            workspace_state=workspace_state,
-            now=now,
-            new_uuid=new_uuid,
-        )
-        self._failure = failure
-
-    async def append_message(
-        self,
-        session_id: str,
-        message: AssistantSessionMessage | ToolSessionMessage | UserSessionMessage,
-    ) -> None:
-        await super().append_message(session_id, message)
-        if isinstance(message, ToolSessionMessage):
-            raise self._failure
-
-
 @pytest.mark.asyncio
 async def test_first_scheduled_work_trigger_persists_a_complete_cron_turn(
     agent_home: Path,
@@ -351,7 +197,7 @@ async def test_first_scheduled_work_trigger_persists_a_complete_cron_turn(
     task = _task()
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory=long_term_memory,
         settings=ScheduledWorkModelSettings(
@@ -373,18 +219,18 @@ async def test_first_scheduled_work_trigger_persists_a_complete_cron_turn(
 
     await runner.run(task)
 
-    session = await sessions.load(task.session_id)
-    assert session.metadata.id == task.session_id
-    assert session.metadata.title == task.title
-    assert session.metadata.created_at == task.created_at.replace(microsecond=123000)
+    session = Session.load(sessions.workspace_state, task.session_id)
+    assert session.session_id == task.session_id
+    assert session.metadata["title"] == task.title
+    assert session.created_at == task.created_at.replace(microsecond=123000)
     assert len(session.messages) == 2
     user, assistant = session.messages
-    assert isinstance(user, UserSessionMessage)
-    assert user.content == task.prompt
-    assert isinstance(assistant, AssistantSessionMessage)
-    assert assistant.content == "No open risks were found."
-    assert assistant.status == "completed"
-    assert assistant.usage == _usage()
+    assert user["role"] == "user"
+    assert user["content"] == task.prompt
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == "No open risks were found."
+    assert assistant["status"] == "completed"
+    assert assistant["token_usage"] == {"model_calls": 1, **_usage().to_dict()}
 
     assert len(provider.complete_requests) == 1
     request = provider.complete_requests[0]
@@ -429,7 +275,7 @@ async def test_repeated_scheduled_work_triggers_reuse_the_task_session_history(
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -461,8 +307,8 @@ async def test_repeated_scheduled_work_triggers_reuse_the_task_session_history(
     await runner.run(task)
     await runner.run(task)
 
-    session = await sessions.load(task.session_id)
-    assert [message.role for message in session.messages] == [
+    session = Session.load(sessions.workspace_state, task.session_id)
+    assert [message["role"] for message in session.messages] == [
         "user",
         "assistant",
         "user",
@@ -518,7 +364,7 @@ async def test_scheduled_work_auto_refuses_ask_tools_and_completes_the_agent_tur
     task = _task()
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -549,17 +395,16 @@ async def test_scheduled_work_auto_refuses_ask_tools_and_completes_the_agent_tur
     await runner.run(task)
 
     assert not (workspace / "scheduled.txt").exists()
-    session = await sessions.load(task.session_id)
-    assert [message.role for message in session.messages] == [
+    session = Session.load(sessions.workspace_state, task.session_id)
+    assert [message["role"] for message in session.messages] == [
         "user",
         "assistant",
         "tool",
         "assistant",
     ]
     tool_result = session.messages[2]
-    assert isinstance(tool_result, ToolSessionMessage)
-    assert tool_result.tool_call_id == call.id
-    assert tool_result.status == "refused"
+    assert tool_result["tool_call_id"] == call.id
+    assert tool_result["status"] == "refused"
     assert len(provider.complete_requests) == 2
     follow_up = provider.complete_requests[1]
     assert isinstance(follow_up, ModelRequest)
@@ -571,7 +416,7 @@ async def test_scheduled_work_auto_refuses_ask_tools_and_completes_the_agent_tur
     follow_up_tool = follow_up.messages[-1]
     assert isinstance(follow_up_tool, ToolModelMessage)
     assert follow_up_tool.tool_call_id == call.id
-    assert follow_up_tool.content == tool_result.content
+    assert follow_up_tool.content == tool_result["content"]
 
 
 @pytest.mark.asyncio
@@ -616,7 +461,7 @@ async def test_scheduled_work_commits_a_published_oversized_tool_result(
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -647,16 +492,15 @@ async def test_scheduled_work_commits_a_published_oversized_tool_result(
     outcome = await runner.run(_task())
 
     assert outcome.status == "completed"
-    session = await sessions.load(TASK_SESSION_ID)
-    assert [message.role for message in session.messages] == [
+    session = Session.load(sessions.workspace_state, TASK_SESSION_ID)
+    assert [message["role"] for message in session.messages] == [
         "user",
         "assistant",
         "tool",
         "assistant",
     ]
     tool_message = session.messages[2]
-    assert isinstance(tool_message, ToolSessionMessage)
-    assert tool_message.artifact is not None
+    assert tool_message["artifact"] is not None
     artifact_path = _long_path(
         _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
         / "call_scheduled_artifact.txt"
@@ -689,7 +533,7 @@ async def test_model_failure_is_persisted_without_stopping_the_next_scheduled_wo
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -734,15 +578,15 @@ async def test_model_failure_is_persisted_without_stopping_the_next_scheduled_wo
     assert completed.status == "completed"
     assert completed.content == "The other task completed."
     assert completed.error is None
-    failed_session = await sessions.load(failed_task.session_id)
+    failed_session = Session.load(sessions.workspace_state, failed_task.session_id)
     failed_assistant = failed_session.messages[-1]
-    assert isinstance(failed_assistant, AssistantSessionMessage)
-    assert failed_assistant.status == "error"
-    assert failed_assistant.error is not None
-    assert failed_assistant.error.code == "model_failed"
-    assert failed_assistant.error.message == "Safe cron failure."
-    completed_session = await sessions.load(completed_task.session_id)
-    assert completed_session.messages[-1].role == "assistant"
+    assert failed_assistant["status"] == "error"
+    assert failed_assistant["error"] == {
+        "code": "model_failed",
+        "message": "Safe cron failure.",
+    }
+    completed_session = Session.load(sessions.workspace_state, completed_task.session_id)
+    assert completed_session.messages[-1]["role"] == "assistant"
 
 
 @pytest.mark.asyncio
@@ -772,7 +616,7 @@ async def test_scheduled_work_records_one_terminal_failure_with_task_session_con
     )
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="PRIVATE LONG-TERM MEMORY",
         settings=ScheduledWorkModelSettings(
@@ -841,7 +685,7 @@ async def test_scheduled_work_records_an_unhandled_terminal_exception_once(
     provider = ScriptedFakeProvider(completions=(RuntimeError("technical cron execution failure"),))
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -879,922 +723,17 @@ async def test_scheduled_work_records_an_unhandled_terminal_exception_once(
 
 
 @pytest.mark.asyncio
-async def test_session_publication_failure_is_isolated_from_the_next_scheduled_work(
+async def test_cancelling_a_running_scheduled_tool_repairs_session_history(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    publication_calls = 0
-
-    def fail_first_publication(path: Path, content: bytes) -> None:
-        nonlocal publication_calls
-        publication_calls += 1
-        if publication_calls == 1:
-            raise OSError("private disk failure detail")
-        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
-
     state = WorkspaceState(Workspace.from_path(workspace))
     state.initialize(agent_home_root=agent_home)
-    sessions = JsonlSessionStore(
-        workspace_state=state,
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-        replace_bytes=fail_first_publication,
-    )
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="First result was fully generated."),
-                usage=_usage(),
-                finish_reason="stop",
-            ),
-            ModelResponse(
-                message=AssistantModelMessage(content="Second task remained isolated."),
-                usage=_usage(),
-                finish_reason="stop",
-            ),
-        )
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter(
-            (
-                USER_UUID,
-                REQUEST_UUID,
-                ASSISTANT_UUID,
-                USER_TWO_UUID,
-                REQUEST_TWO_UUID,
-                ASSISTANT_TWO_UUID,
-            )
-        ).__next__,
-        tool_gateway_for=lambda session_id: _tool_gateway(
-            agent_home=agent_home,
-            workspace_state=sessions.workspace_state,
-            session_id=session_id,
-        ),
-    )
-    failed_task = _task()
-    completed_task = replace(
-        failed_task,
-        id="11111111-1111-4111-8111-111111111111",
-        title="Independent task",
-        prompt="Run independently.",
-        session_id="20260712-220000-123000_22222222-2222-4222-8222-222222222222",
-    )
-    events = RuntimeEventBroker()
-    coordinator = ScheduledWorkCoordinator(
-        runner=runner,
-        events=events,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-        workspace_state=state,
-    )
-
-    failed = await coordinator.trigger(failed_task)
-    completed = await coordinator.trigger(completed_task)
-    await events.next_background_event()
-    await events.next_background_event()
-
-    assert failed.status == "failed"
-    assert failed.error is not None
-    assert failed.error.code == "persistence_error"
-    assert "private disk failure detail" not in failed.error.message
-    assert completed.status == "completed"
-    first_session = await sessions.load(failed_task.session_id)
-    assert [message.role for message in first_session.messages] == ["user", "assistant"]
-    assert first_session.messages[-1].content == "First result was fully generated."
-    second_session = await sessions.load(completed_task.session_id)
-    assert second_session.messages[-1].content == "Second task remained isolated."
-    content = (state.logs_directory / f"{failed_task.session_id}.log").read_text(encoding="utf-8")
-    assert content.count(" ERROR ") == 1
-    assert "myclaw.schedule.scheduled_work_execution:run:" in content
-    assert "Scheduled Work failed code=persistence_error" in content
-    assert "OSError: private disk failure detail" in content
-    assert failed_task.prompt not in content
-    assert "First result was fully generated." not in content
-
-
-@pytest.mark.asyncio
-async def test_corrupt_task_session_is_isolated_before_the_model_call(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-    )
-    failed_task = _task()
-    corrupt_path = sessions.path_for(failed_task.session_id)
-    io_path = HOST_FILESYSTEM.path_for_io(corrupt_path)
-    io_path.parent.mkdir(parents=True)
-    io_path.write_text("{not valid session json}\n", encoding="utf-8")
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="Independent task completed."),
-                usage=_usage(),
-                finish_reason="stop",
-            ),
-        )
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter((USER_UUID, USER_TWO_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
-        tool_gateway_for=lambda session_id: _tool_gateway(
-            agent_home=agent_home,
-            workspace_state=sessions.workspace_state,
-            session_id=session_id,
-        ),
-    )
-    completed_task = replace(
-        failed_task,
-        id="11111111-1111-4111-8111-111111111111",
-        title="Independent task",
-        prompt="Run independently.",
-        session_id="20260712-220000-123000_22222222-2222-4222-8222-222222222222",
-    )
-
-    failed = await runner.run(failed_task)
-    completed = await runner.run(completed_task)
-
-    assert failed.status == "failed"
-    assert failed.error == ErrorInfo(
-        code="persistence_error",
-        message="Scheduled Work Session could not be updated.",
-    )
-    assert completed.status == "completed"
-    assert len(provider.complete_requests) == 1
-    assert io_path.read_text(encoding="utf-8") == "{not valid session json}\n"
-
-
-@pytest.mark.asyncio
-async def test_tool_result_publication_failure_is_isolated_from_the_next_task(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    publication_calls = 0
-
-    def fail_tool_publication(path: Path, content: bytes) -> None:
-        nonlocal publication_calls
-        publication_calls += 1
-        if publication_calls == 2:
-            raise OSError("private tool publication failure")
-        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
-
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-        replace_bytes=fail_tool_publication,
-    )
-    call = ModelToolCall(
-        id="call_refused_write",
-        name="write_file",
-        arguments='{"path":"blocked.txt","content":"must not be written"}',
-    )
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="Trying a write.", tool_calls=(call,)),
-                usage=_usage(),
-                finish_reason="tool_calls",
-            ),
-            ModelResponse(
-                message=AssistantModelMessage(content="Independent task completed."),
-                usage=_usage(),
-                finish_reason="stop",
-            ),
-        )
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter(
-            (
-                USER_UUID,
-                REQUEST_UUID,
-                ASSISTANT_UUID,
-                USER_TWO_UUID,
-                REQUEST_TWO_UUID,
-                ASSISTANT_TWO_UUID,
-                FINAL_RUNTIME_UUID,
-            )
-        ).__next__,
-        tool_gateway_for=lambda session_id: _tool_gateway(
-            agent_home=agent_home,
-            workspace_state=sessions.workspace_state,
-            session_id=session_id,
-        ),
-    )
-    failed_task = _task()
-    completed_task = replace(
-        failed_task,
-        id="11111111-1111-4111-8111-111111111111",
-        title="Independent task",
-        prompt="Run independently.",
-        session_id="20260712-220000-123000_22222222-2222-4222-8222-222222222222",
-    )
-
-    failed = await runner.run(failed_task)
-    completed = await runner.run(completed_task)
-
-    assert failed.status == "failed"
-    assert failed.error is not None
-    assert failed.error.code == "persistence_error"
-    assert "private tool publication failure" not in failed.error.message
-    assert completed.status == "completed"
-    failed_session = await sessions.load(failed_task.session_id)
-    assert [message.role for message in failed_session.messages] == [
-        "user",
-        "assistant",
-        "tool",
-    ]
-    assert not (workspace / "blocked.txt").exists()
-
-
-@pytest.mark.asyncio
-async def test_scheduled_work_commits_an_artifact_after_effect_then_raise_publication(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    publication_calls = 0
-
-    def fail_tool_metadata_publication(path: Path, content: bytes) -> None:
-        nonlocal publication_calls
-        publication_calls += 1
-        if publication_calls == 2:
-            raise OSError("injected metadata publication failure")
-        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
-
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-        replace_bytes=fail_tool_metadata_publication,
-    )
-    raw_result = "DURABLE SCHEDULED ARTIFACT"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
-    call = ModelToolCall(
-        id="call_effect_then_raise_artifact",
-        name="read_file",
-        arguments='{"path":"large.txt"}',
-    )
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
-                usage=_usage(),
-                finish_reason="tool_calls",
-            ),
-        )
-    )
-    gateway = ObservingToolGateway()
-    _tool_gateway(
-        agent_home=agent_home,
-        workspace_state=sessions.workspace_state,
-        session_id=TASK_SESSION_ID,
-        gateway=gateway,
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
-        tool_gateway_for=lambda _: gateway,
-        externalize_result_for=_externalizer_for(
-            workspace=workspace,
-            max_tool_result_chars=1,
-        ),
-    )
-
-    outcome = await runner.run(_task())
-
-    assert outcome.status == "failed"
-    assert outcome.error == ErrorInfo(
-        code="persistence_error",
-        message="Scheduled Work Session could not be updated.",
-    )
-    session = await sessions.load(TASK_SESSION_ID)
-    assert [message.role for message in session.messages] == ["user", "assistant", "tool"]
-    tool_message = session.messages[-1]
-    assert isinstance(tool_message, ToolSessionMessage)
-    assert tool_message.id == str(USER_TWO_UUID)
-    assert tool_message.artifact is not None
-    artifact_path = _long_path(
-        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
-        / "call_effect_then_raise_artifact.txt"
-    )
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-
-
-@pytest.mark.asyncio
-async def test_scheduled_work_leaves_an_orphan_artifact_when_tool_message_was_not_written(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    sessions = ToolAppendFailingSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-    )
-    raw_result = "UNPUBLISHED SCHEDULED ARTIFACT"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
-    call = ModelToolCall(
-        id="call_unpublished_artifact",
-        name="read_file",
-        arguments='{"path":"large.txt"}',
-    )
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
-                usage=_usage(),
-                finish_reason="tool_calls",
-            ),
-        )
-    )
-    gateway = ObservingToolGateway()
-    _tool_gateway(
-        agent_home=agent_home,
-        workspace_state=sessions.workspace_state,
-        session_id=TASK_SESSION_ID,
-        gateway=gateway,
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
-        tool_gateway_for=lambda _: gateway,
-        externalize_result_for=_externalizer_for(
-            workspace=workspace,
-            max_tool_result_chars=1,
-        ),
-    )
-
-    outcome = await runner.run(_task())
-
-    assert outcome.status == "failed"
-    assert outcome.error is not None
-    assert outcome.error.code == "persistence_error"
-    session = await sessions.load(TASK_SESSION_ID)
-    assert [message.role for message in session.messages] == ["user", "assistant"]
-    artifact_path = _long_path(
-        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
-        / "call_unpublished_artifact.txt"
-    )
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-
-
-@pytest.mark.asyncio
-async def test_scheduled_work_preserves_an_artifact_when_publication_is_indeterminate(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    sessions = IndeterminateToolAppendSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-    )
-    raw_result = "INDETERMINATE SCHEDULED ARTIFACT"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
-    call = ModelToolCall(
-        id="call_indeterminate_artifact",
-        name="read_file",
-        arguments='{"path":"large.txt"}',
-    )
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
-                usage=_usage(),
-                finish_reason="tool_calls",
-            ),
-        )
-    )
-    gateway = ObservingToolGateway()
-    _tool_gateway(
-        agent_home=agent_home,
-        workspace_state=sessions.workspace_state,
-        session_id=TASK_SESSION_ID,
-        gateway=gateway,
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
-        tool_gateway_for=lambda _: gateway,
-        externalize_result_for=_externalizer_for(
-            workspace=workspace,
-            max_tool_result_chars=1,
-        ),
-    )
-
-    outcome = await runner.run(_task())
-
-    assert outcome.status == "failed"
-    assert outcome.error is not None
-    assert outcome.error.code == "persistence_error"
-    with pytest.raises(OSError, match="injected reconciliation load failure"):
-        await sessions.load(TASK_SESSION_ID)
-    session = await sessions.load(TASK_SESSION_ID)
-    assert [message.role for message in session.messages] == ["user", "assistant"]
-    artifact_path = _long_path(
-        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
-        / "call_indeterminate_artifact.txt"
-    )
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-
-
-@pytest.mark.asyncio
-async def test_cancelling_scheduled_tool_publication_leaves_an_orphan_artifact(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    sessions = BlockingToolAppendSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-    )
-    raw_result = "CANCELLED SCHEDULED ARTIFACT"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
-    call = ModelToolCall(
-        id="call_cancelled_artifact",
-        name="read_file",
-        arguments='{"path":"large.txt"}',
-    )
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
-                usage=_usage(),
-                finish_reason="tool_calls",
-            ),
-        )
-    )
-    gateway = ObservingToolGateway()
-    _tool_gateway(
-        agent_home=agent_home,
-        workspace_state=sessions.workspace_state,
-        session_id=TASK_SESSION_ID,
-        gateway=gateway,
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
-        tool_gateway_for=lambda _: gateway,
-        externalize_result_for=_externalizer_for(
-            workspace=workspace,
-            max_tool_result_chars=1,
-        ),
-    )
-    execution = asyncio.create_task(runner.run(_task()))
-    await asyncio.wait_for(sessions.tool_append_started.wait(), timeout=1)
-
-    execution.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await execution
-
-    session = await sessions.load(TASK_SESSION_ID)
-    assert [message.role for message in session.messages] == ["user", "assistant"]
-    artifact_path = _long_path(
-        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
-        / "call_cancelled_artifact.txt"
-    )
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-
-
-@pytest.mark.asyncio
-async def test_cancelling_after_scheduled_tool_publication_commits_the_durable_artifact(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    sessions = EffectThenBlockToolAppendSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-    )
-    raw_result = "DURABLE CANCELLED SCHEDULED ARTIFACT"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
-    call = ModelToolCall(
-        id="call_effect_then_cancel_artifact",
-        name="read_file",
-        arguments='{"path":"large.txt"}',
-    )
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
-                usage=_usage(),
-                finish_reason="tool_calls",
-            ),
-        )
-    )
-    gateway = ObservingToolGateway()
-    _tool_gateway(
-        agent_home=agent_home,
-        workspace_state=sessions.workspace_state,
-        session_id=TASK_SESSION_ID,
-        gateway=gateway,
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
-        tool_gateway_for=lambda _: gateway,
-        externalize_result_for=_externalizer_for(
-            workspace=workspace,
-            max_tool_result_chars=1,
-        ),
-    )
-    execution = asyncio.create_task(runner.run(_task()))
-    await asyncio.wait_for(sessions.tool_message_written.wait(), timeout=1)
-
-    execution.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await execution
-
-    session = await sessions.load(TASK_SESSION_ID)
-    assert [message.role for message in session.messages] == ["user", "assistant", "tool"]
-    tool_message = session.messages[-1]
-    assert isinstance(tool_message, ToolSessionMessage)
-    assert tool_message.artifact is not None
-    artifact_path = _long_path(
-        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
-        / "call_effect_then_cancel_artifact.txt"
-    )
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-
-
-@pytest.mark.asyncio
-async def test_scheduled_tool_publication_preserves_a_primary_base_exception(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    failure = ToolPublicationBaseError("primary publication failure")
-    sessions = EffectThenRaiseToolAppendSessionStore(
-        failure=failure,
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-    )
-    raw_result = "DURABLE BASE EXCEPTION ARTIFACT"
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
-    call = ModelToolCall(
-        id="call_base_exception_artifact",
-        name="read_file",
-        arguments='{"path":"large.txt"}',
-    )
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="Inspecting.", tool_calls=(call,)),
-                usage=_usage(),
-                finish_reason="tool_calls",
-            ),
-        )
-    )
-    gateway = ObservingToolGateway()
-    _tool_gateway(
-        agent_home=agent_home,
-        workspace_state=sessions.workspace_state,
-        session_id=TASK_SESSION_ID,
-        gateway=gateway,
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
-        tool_gateway_for=lambda _: gateway,
-        externalize_result_for=_externalizer_for(
-            workspace=workspace,
-            max_tool_result_chars=1,
-        ),
-    )
-
-    with pytest.raises(ToolPublicationBaseError) as raised:
-        await runner.run(_task())
-
-    assert raised.value is failure
-    session = await sessions.load(TASK_SESSION_ID)
-    assert [message.role for message in session.messages] == ["user", "assistant", "tool"]
-    tool_message = session.messages[-1]
-    assert isinstance(tool_message, ToolSessionMessage)
-    assert tool_message.artifact is not None
-    artifact_path = _long_path(
-        _artifact_directory(workspace=workspace, session_id=TASK_SESSION_ID)
-        / "call_base_exception_artifact.txt"
-    )
-    assert artifact_path.read_text(encoding="utf-8") == raw_result
-
-
-@pytest.mark.asyncio
-async def test_model_error_publication_failure_becomes_a_persistence_outcome(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    publication_calls = 0
-
-    def fail_error_publication(path: Path, content: bytes) -> None:
-        nonlocal publication_calls
-        publication_calls += 1
-        if publication_calls == 1:
-            raise OSError("private model error publication failure")
-        HOST_FILESYSTEM.atomic_replace_bytes(path, content)
-
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-        replace_bytes=fail_error_publication,
-    )
-    provider = ScriptedFakeProvider(
-        completions=(
-            ModelCallError(ErrorInfo(code="model_failed", message="Safe model failure.")),
-            ModelResponse(
-                message=AssistantModelMessage(content="Independent task completed."),
-                usage=_usage(),
-                finish_reason="stop",
-            ),
-        )
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter(
-            (
-                USER_UUID,
-                REQUEST_UUID,
-                ASSISTANT_UUID,
-                USER_TWO_UUID,
-                REQUEST_TWO_UUID,
-                ASSISTANT_TWO_UUID,
-            )
-        ).__next__,
-        tool_gateway_for=lambda session_id: _tool_gateway(
-            agent_home=agent_home,
-            workspace_state=sessions.workspace_state,
-            session_id=session_id,
-        ),
-    )
-    failed_task = _task()
-    completed_task = replace(
-        failed_task,
-        id="11111111-1111-4111-8111-111111111111",
-        title="Independent task",
-        prompt="Run independently.",
-        session_id="20260712-220000-123000_22222222-2222-4222-8222-222222222222",
-    )
-
-    failed = await runner.run(failed_task)
-    completed = await runner.run(completed_task)
-
-    assert failed.status == "failed"
-    assert failed.error is not None
-    assert failed.error.code == "persistence_error"
-    assert "private model error publication failure" not in failed.error.message
-    assert completed.status == "completed"
-    failed_session = await sessions.load(failed_task.session_id)
-    failed_assistant = failed_session.messages[-1]
-    assert isinstance(failed_assistant, AssistantSessionMessage)
-    assert failed_assistant.status == "error"
-    assert failed_assistant.error is not None
-    assert failed_assistant.error.code == "model_failed"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("fail_on_load", "include_tool_turn", "failed_roles", "provider_request_count"),
-    [
-        (1, False, ["user"], 1),
-        (2, True, ["user", "assistant", "tool"], 2),
-    ],
-    ids=("first-load", "post-tool-load"),
-)
-async def test_session_load_failure_is_isolated_at_every_cron_loop_boundary(
-    fail_on_load: int,
-    include_tool_turn: bool,
-    failed_roles: list[str],
-    provider_request_count: int,
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    sessions = LoadFailingSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-        fail_on_load=fail_on_load,
-    )
-    call = ModelToolCall(
-        id="call_load_boundary",
-        name="write_file",
-        arguments='{"path":"blocked.txt","content":"must not be written"}',
-    )
-    first_response = ModelResponse(
-        message=AssistantModelMessage(content="Trying a write.", tool_calls=(call,)),
-        usage=_usage(),
-        finish_reason="tool_calls",
-    )
-    final_response = ModelResponse(
-        message=AssistantModelMessage(content="Independent task completed."),
-        usage=_usage(),
-        finish_reason="stop",
-    )
-    provider = ScriptedFakeProvider(
-        completions=(first_response, final_response) if include_tool_turn else (final_response,)
-    )
-    runner = ScheduledWorkRunner(
-        provider=provider,
-        sessions=sessions,
-        workspace=workspace,
-        long_term_memory="# Long-term Memory\n",
-        settings=ScheduledWorkModelSettings(
-            model="cron-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=45,
-        ),
-        now=lambda: NOW,
-        new_uuid=iter(
-            (
-                USER_UUID,
-                REQUEST_UUID,
-                ASSISTANT_UUID,
-                USER_TWO_UUID,
-                REQUEST_TWO_UUID,
-                ASSISTANT_TWO_UUID,
-                FINAL_RUNTIME_UUID,
-            )
-        ).__next__,
-        tool_gateway_for=lambda session_id: _tool_gateway(
-            agent_home=agent_home,
-            workspace_state=sessions.workspace_state,
-            session_id=session_id,
-        ),
-    )
-    failed_task = _task()
-    completed_task = replace(
-        failed_task,
-        id="11111111-1111-4111-8111-111111111111",
-        title="Independent task",
-        prompt="Run independently.",
-        session_id="20260712-220000-123000_22222222-2222-4222-8222-222222222222",
-    )
-
-    failed = await runner.run(failed_task)
-    completed = await runner.run(completed_task)
-
-    assert failed.status == "failed"
-    assert failed.error is not None
-    assert failed.error.code == "persistence_error"
-    assert "private load failure" not in failed.error.message
-    assert completed.status == "completed"
-    assert len(provider.complete_requests) == provider_request_count
-    failed_session = await sessions.load(failed_task.session_id)
-    assert [message.role for message in failed_session.messages] == failed_roles
-
-
-@pytest.mark.asyncio
-async def test_cancelling_a_running_scheduled_tool_repairs_history_without_closing_provider(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=lambda: USER_UUID,
-    )
     shell = BlockingShellBoundary()
     call = ModelToolCall(
-        id="call_pwd",
+        id="call_scheduled_shell",
         name="shell",
         arguments='{"command":"pwd","timeout":60}',
     )
@@ -1802,18 +741,17 @@ async def test_cancelling_a_running_scheduled_tool_repairs_history_without_closi
         completions=(
             ModelResponse(
                 message=AssistantModelMessage(
-                    content="Checking the Workspace.", tool_calls=(call,)
+                    content="Checking the Workspace.",
+                    tool_calls=(call,),
                 ),
                 usage=_usage(),
                 finish_reason="tool_calls",
             ),
         )
     )
-    task = _task()
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
-        workspace=workspace,
+        workspace_state=state,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
             model="cron-model",
@@ -1823,30 +761,137 @@ async def test_cancelling_a_running_scheduled_tool_repairs_history_without_closi
             timeout_seconds=45,
         ),
         now=lambda: NOW,
-        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID, USER_TWO_UUID)).__next__,
+        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
         tool_gateway_for=lambda session_id: _tool_gateway(
             agent_home=agent_home,
-            workspace_state=sessions.workspace_state,
+            workspace_state=state,
             session_id=session_id,
             shell=shell,
         ),
     )
-    execution = asyncio.create_task(runner.run(task))
+
+    execution = asyncio.create_task(runner.run(_task()))
     await asyncio.wait_for(shell.started.wait(), timeout=1)
 
     execution.cancel()
     with pytest.raises(asyncio.CancelledError):
         await execution
 
-    assert shell.cancelled is True
+    assert shell.cancelled
     assert provider.closed is False
-    session = await sessions.load(task.session_id)
-    assert [message.role for message in session.messages] == ["user", "assistant", "tool"]
+    session = Session.load(state, TASK_SESSION_ID)
+    assert [message["role"] for message in session.messages] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
     cancelled_tool = session.messages[-1]
-    assert isinstance(cancelled_tool, ToolSessionMessage)
-    assert cancelled_tool.tool_call_id == call.id
-    assert cancelled_tool.status == "error"
-    assert cancelled_tool.content == "Scheduled Work tool call cancelled."
+    assert cancelled_tool["status"] == "error"
+    assert cancelled_tool["content"] == "Scheduled Work tool call cancelled."
+
+
+@pytest.mark.asyncio
+async def test_corrupt_task_session_is_rejected_without_a_legacy_reader(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.sessions_directory.mkdir(parents=True)
+    task = _task()
+    path = state.sessions_directory / f"{task.session_id}.jsonl"
+    path.write_text('{"record_type":"metadata","schema_version":1}\n', encoding="utf-8")
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="must not run"),
+                usage=_usage(),
+                finish_reason="stop",
+            ),
+        )
+    )
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        workspace_state=state,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID)).__next__,
+        tool_gateway_for=lambda _: ToolGateway(),
+    )
+
+    outcome = await runner.run(task)
+
+    assert outcome.status == "failed"
+    assert outcome.error == ErrorInfo(
+        code="persistence_error",
+        message="Scheduled Work Session could not be updated.",
+    )
+    assert provider.complete_requests == []
+    assert path.read_text(encoding="utf-8") == '{"record_type":"metadata","schema_version":1}\n'
+
+
+@pytest.mark.asyncio
+async def test_scheduled_persistence_fault_does_not_change_terminal_outcome(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Completed despite persistence failure."),
+                usage=_usage(),
+                finish_reason="stop",
+            ),
+        )
+    )
+    closed: list[str] = []
+    original_close = Session.close
+
+    def fail_snapshot(_session: Session, _snapshot: object) -> None:
+        raise OSError("injected task Session persistence failure")
+
+    def track_close(session: Session) -> None:
+        closed.append(session.session_id)
+        original_close(session)
+
+    monkeypatch.setattr(Session, "_write_snapshot", fail_snapshot)
+    monkeypatch.setattr(Session, "close", track_close)
+    task = _task()
+    runner = ScheduledWorkRunner(
+        provider=provider,
+        workspace_state=state,
+        long_term_memory="# Long-term Memory\n",
+        settings=ScheduledWorkModelSettings(
+            model="cron-model",
+            max_output=1024,
+            temperature=0.1,
+            reasoning_effort=None,
+            timeout_seconds=45,
+        ),
+        now=lambda: NOW,
+        new_uuid=iter((USER_UUID, REQUEST_UUID, ASSISTANT_UUID)).__next__,
+        tool_gateway_for=lambda _: ToolGateway(),
+    )
+
+    outcome = await runner.run(task)
+    await asyncio.sleep(0)
+
+    assert outcome.status == "completed"
+    assert outcome.content == "Completed despite persistence failure."
+    assert closed == [task.session_id]
+    assert not (state.sessions_directory / f"{task.session_id}.jsonl").exists()
 
 
 @pytest.mark.asyncio
@@ -1874,7 +919,7 @@ async def test_scheduled_work_uses_a_normalized_task_specific_session_title(
     task = replace(_task(), title=long_title)
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -1896,8 +941,8 @@ async def test_scheduled_work_uses_a_normalized_task_specific_session_title(
     result = await runner.run(task)
 
     assert result.status == "completed"
-    session = await sessions.load(task.session_id)
-    assert session.metadata.title == "A" * 60
+    session = Session.load(sessions.workspace_state, task.session_id)
+    assert session.metadata["title"] == "A" * 60
 
 
 @pytest.mark.asyncio
@@ -1976,16 +1021,15 @@ async def test_runtime_scheduled_work_uses_current_workspace_context_and_tool_ca
     assert str(state.workspace.path) in request.system_prompt
     assert workspace_memory in request.system_prompt
     assert "Legacy Agent Home Memory" not in request.system_prompt
-    session = await runtime.sessions.load(task.session_id)
-    assert [message.role for message in session.messages] == [
+    session = Session.load(state, task.session_id)
+    assert [message["role"] for message in session.messages] == [
         "user",
         "assistant",
         "tool",
         "assistant",
     ]
     tool_message = session.messages[2]
-    assert isinstance(tool_message, ToolSessionMessage)
-    assert tool_message.artifact is not None
+    assert tool_message["artifact"] is not None
     artifact_path = (
         state.sessions_directory
         / "artifacts"
@@ -2031,7 +1075,7 @@ async def test_scheduled_tool_failure_is_safe_history_and_the_turn_can_finish(
     task = _task()
     runner = ScheduledWorkRunner(
         provider=provider,
-        sessions=sessions,
+        workspace_state=sessions.workspace_state,
         workspace=workspace,
         long_term_memory="# Long-term Memory\n",
         settings=ScheduledWorkModelSettings(
@@ -2063,12 +1107,11 @@ async def test_scheduled_tool_failure_is_safe_history_and_the_turn_can_finish(
     result = await runner.run(task)
 
     assert result.status == "completed"
-    session = await sessions.load(task.session_id)
+    session = Session.load(sessions.workspace_state, task.session_id)
     tool_result = session.messages[2]
-    assert isinstance(tool_result, ToolSessionMessage)
-    assert tool_result.status == "error"
-    assert "private subprocess failure" not in tool_result.content
-    assert session.messages[-1].content == "The check failed safely."
+    assert tool_result["status"] == "error"
+    assert "private subprocess failure" not in tool_result["content"]
+    assert session.messages[-1]["content"] == "The check failed safely."
 
 
 @pytest.mark.asyncio
@@ -2126,12 +1169,11 @@ async def test_runtime_scheduled_work_refuses_recursive_task_creation(
 
     assert result.status == "completed"
     assert scheduled_work_path.read_bytes() == persisted_before
-    session = await runtime.sessions.load(task.session_id)
+    session = Session.load(state, task.session_id)
     recursive_result = session.messages[2]
-    assert isinstance(recursive_result, ToolSessionMessage)
-    assert recursive_result.name == "create_scheduled_work"
-    assert recursive_result.status == "refused"
-    assert recursive_result.content == (
+    assert recursive_result["name"] == "create_scheduled_work"
+    assert recursive_result["status"] == "refused"
+    assert recursive_result["content"] == (
         "Scheduled Work creation is unavailable because confirmation is not implemented."
     )
 

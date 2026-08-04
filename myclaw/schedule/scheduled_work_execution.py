@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal
 from uuid import UUID
 
 from loguru import logger
@@ -14,11 +14,11 @@ from myclaw.agent.events import TurnCompletedPayload, TurnFailedPayload
 from myclaw.agent.prompts import chat_system_prompt, render_tool_guidance
 from myclaw.agent.turn import AgentTurn, ToolResultExternalizer
 from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ModelProvider, ReasoningEffort
 from myclaw.schedule.records import ScheduledWork
-from myclaw.session.records import SessionMetadata
-from myclaw.session.session_store import SessionStore
+from myclaw.session.session import Session
 from myclaw.session.session_titles import normalize_session_title
 from myclaw.tools.tool_gateway import ToolGateway
 
@@ -26,18 +26,6 @@ _SESSION_FAILURE = ErrorInfo(
     code="persistence_error",
     message="Scheduled Work Session could not be updated.",
 )
-
-
-class ScheduledWorkSessionStore(SessionStore, Protocol):
-    """Session operations needed when a task owns its identity before first trigger."""
-
-    def prepare_with_id(
-        self,
-        *,
-        session_id: str,
-        title: str,
-        created_at: datetime,
-    ) -> SessionMetadata: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,8 +56,8 @@ class ScheduledWorkRunner:
         self,
         *,
         provider: ModelProvider,
-        sessions: ScheduledWorkSessionStore,
-        workspace: Path,
+        workspace_state: WorkspaceState | None = None,
+        workspace: Path | None = None,
         long_term_memory: str,
         settings: ScheduledWorkModelSettings,
         now: Callable[[], datetime],
@@ -78,8 +66,14 @@ class ScheduledWorkRunner:
         externalize_result_for: Callable[[str], ToolResultExternalizer] | None = None,
     ) -> None:
         self._provider = provider
-        self._sessions = sessions
-        self._workspace = Workspace.from_path(workspace)
+        if workspace_state is None:
+            if workspace is None:
+                raise TypeError("Scheduled Work requires Workspace State or a Workspace path")
+            workspace_state = WorkspaceState(Workspace.from_path(workspace))
+        elif workspace is not None and workspace_state.workspace != Workspace.from_path(workspace):
+            raise ValueError("Workspace State does not match the Scheduled Work Workspace")
+        self._workspace_state = workspace_state
+        self._workspace = workspace_state.workspace
         self._long_term_memory = long_term_memory
         self._settings = settings
         self._now = now
@@ -89,7 +83,23 @@ class ScheduledWorkRunner:
 
     async def run(self, task: ScheduledWork) -> ScheduledWorkRunResult:
         try:
-            result = await self._run_once(task)
+            session = self._load_or_create_session(task)
+        except FileNotFoundError:
+            session = self._create_session(task)
+        except (OSError, UnicodeError, ValueError) as error:
+            result = ScheduledWorkRunResult(
+                status="failed",
+                content="",
+                error=_SESSION_FAILURE,
+                diagnostic=error,
+            )
+            logger.opt(exception=error).error(
+                "Scheduled Work failed code={}", _SESSION_FAILURE.code
+            )
+            return result
+
+        try:
+            result = await self._run_once(task, session)
         except asyncio.CancelledError:
             raise
         except BaseException as error:
@@ -98,30 +108,21 @@ class ScheduledWorkRunner:
                 raise
             logger.opt(exception=error).error("Scheduled Work crashed")
             raise
-        if result.status == "failed":
-            code = result.error.code if result.error is not None else "unknown"
-            if result.diagnostic is None:
-                logger.error("Scheduled Work failed code={}", code)
-            else:
-                logger.opt(exception=result.diagnostic).error("Scheduled Work failed code={}", code)
-        return result
+        else:
+            if result.status == "failed":
+                code = result.error.code if result.error is not None else "unknown"
+                if result.diagnostic is None:
+                    logger.error("Scheduled Work failed code={}", code)
+                else:
+                    logger.opt(exception=result.diagnostic).error(
+                        "Scheduled Work failed code={}", code
+                    )
+            return result
+        finally:
+            session.close()
 
-    async def _run_once(self, task: ScheduledWork) -> ScheduledWorkRunResult:
-        try:
-            self._sessions.prepare_with_id(
-                session_id=task.session_id,
-                title=normalize_session_title(task.title),
-                created_at=task.created_at,
-            )
-        except (OSError, UnicodeError, ValueError) as error:
-            return ScheduledWorkRunResult(
-                status="failed",
-                content="",
-                error=_SESSION_FAILURE,
-                diagnostic=error,
-            )
-
-        gateway = self._tool_gateway_for(task.session_id)
+    async def _run_once(self, task: ScheduledWork, session: Session) -> ScheduledWorkRunResult:
+        gateway = self._tool_gateway_for(session.session_id)
         system_prompt = chat_system_prompt(
             workspace=self._workspace.path,
             long_term_memory=self._long_term_memory,
@@ -136,8 +137,7 @@ class ScheduledWorkRunner:
         turn = AgentTurn(
             lane="scheduled_work",
             provider=self._provider,
-            sessions=self._sessions,
-            session_id=task.session_id,
+            session=session,
             settings=self._settings,
             now=self._now,
             new_uuid=self._new_uuid,
@@ -146,7 +146,7 @@ class ScheduledWorkRunner:
             externalize_result=(
                 None
                 if self._externalize_result_for is None
-                else self._externalize_result_for(task.session_id)
+                else self._externalize_result_for(session.session_id)
             ),
             on_terminal_failure=capture_terminal_failure,
         )
@@ -165,3 +165,19 @@ class ScheduledWorkRunner:
                     diagnostic=terminal_diagnostic,
                 )
         raise AssertionError("Agent turn ended without a terminal payload")
+
+    def _load_or_create_session(self, task: ScheduledWork) -> Session:
+        return Session.load(
+            self._workspace_state,
+            task.session_id,
+            now=self._now,
+        )
+
+    def _create_session(self, task: ScheduledWork) -> Session:
+        return Session._create_with_id(
+            self._workspace_state,
+            task.session_id,
+            task.created_at,
+            title=normalize_session_title(task.title),
+            now=self._now,
+        )

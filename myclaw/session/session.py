@@ -111,6 +111,33 @@ class Session:
         )
 
     @classmethod
+    def _create_with_id(
+        cls,
+        workspace_state: WorkspaceState,
+        session_id: str,
+        created_at: datetime,
+        *,
+        title: str,
+        now: Callable[[], datetime] | None = None,
+    ) -> Self:
+        """Create a memory-only Session for an owner with an existing identity."""
+        _require_session_id(session_id)
+        require_aware_datetime(created_at, field="created_at")
+        metadata = _initial_metadata()
+        metadata["title"] = title
+        _validate_metadata(metadata)
+        return cls._from_state(
+            workspace_state=workspace_state,
+            session_id=session_id,
+            created_at=created_at,
+            updated_at=created_at,
+            messages=[],
+            metadata=metadata,
+            last_consolidated=0,
+            now=now,
+        )
+
+    @classmethod
     def load(
         cls,
         workspace_state: WorkspaceState,

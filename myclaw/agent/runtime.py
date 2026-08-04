@@ -143,7 +143,6 @@ class PreparedReplRuntime:
     """An in-memory Session identity and its injectable REPL composition."""
 
     conversation: SwitchableConversationPort
-    session: Session
     sessions: JsonlSessionStore
     management_dispatcher: ManagementDispatcher
     scheduled_work_coordinator: ScheduledWorkCoordinator
@@ -157,6 +156,10 @@ class PreparedReplRuntime:
     @property
     def session_id(self) -> str:
         return self.conversation.session_id
+
+    @property
+    def session(self) -> Session:
+        return self.conversation.session
 
     async def start(self) -> None:
         self._lifetime.begin()
@@ -641,15 +644,10 @@ def _prepare_repl_runtime(
             max_tool_result_chars=configuration.runtime.max_tool_result_chars,
         )
 
-    active_externalize_result = _build_tool_result_externalizer(
-        session=session,
-        max_tool_result_chars=configuration.runtime.max_tool_result_chars,
-    )
-
     resolved_cron = configuration.resolve_route("cron")
     scheduled_work_runner = ScheduledWorkRunner(
         provider=router,
-        sessions=sessions,
+        workspace_state=workspace_state,
         workspace=Path(workspace_identity.path),
         long_term_memory=long_term_memory,
         settings=ScheduledWorkModelSettings(
@@ -697,26 +695,10 @@ def _prepare_repl_runtime(
             else foreground_chat_status
         )
 
-    def conversation_for(session_id: str) -> ConversationPort:
-        if session_id == session.session_id:
-            return _DeferredConversationPort(
-                provider=router,
-                session=session,
-                settings=settings,
-                now=now,
-                new_uuid=new_uuid,
-                system_prompt=system_prompt,
-                title_prompt=session_title_prompt(),
-                tool_gateway=tool_gateway,
-                history_preparer=summary_manager.prepare,
-                on_foreground_terminal=capture_foreground_chat_status,
-                externalize_result=active_externalize_result,
-                workspace_state=workspace_state,
-            )
+    def conversation_for(active_session: Session) -> ConversationPort:
         session_tool_gateway = _build_tool_gateway(
-            workspace_state=workspace_state,
+            session=active_session,
             agent_home=agent_home,
-            session_id=session_id,
             web_search=configured_web_search,
             web_fetch=configured_web_fetch,
             shell=configured_shell,
@@ -724,21 +706,24 @@ def _prepare_repl_runtime(
         )
         return _DeferredConversationPort(
             provider=router,
-            sessions=sessions,
-            session_id=session_id,
+            session=active_session,
             settings=settings,
             now=now,
             new_uuid=new_uuid,
             system_prompt=system_prompt,
             title_prompt=session_title_prompt(),
             tool_gateway=session_tool_gateway,
+            history_preparer=summary_manager.prepare,
             on_foreground_terminal=capture_foreground_chat_status,
-            externalize_result=externalize_result_for(session_id),
+            externalize_result=_build_tool_result_externalizer(
+                session=active_session,
+                max_tool_result_chars=configuration.runtime.max_tool_result_chars,
+            ),
             workspace_state=workspace_state,
         )
 
     conversation = SwitchableConversationPort(
-        session_id=session.session_id,
+        session=session,
         build_conversation=conversation_for,
         event_sequencer=background_events,
     )
@@ -756,24 +741,23 @@ def _prepare_repl_runtime(
         monotonic=monotonic_now,
     )
 
-    def switch_session(session_id: str) -> None:
-        conversation.switch_session(session_id)
-        status_service.use_session(session_id)
+    def switch_session(selected_session: Session) -> None:
+        conversation.switch_session(selected_session)
+        status_service.use_session(conversation.session)
 
     management_dispatcher = ManagementCommandDispatcher(
         ManagementViewService(
             agent_home,
             status_service=status_service,
-            sessions=sessions,
-            workspace=Path(workspace_identity.path),
+            workspace_state=workspace_state,
             switch_session=switch_session,
+            now=now,
             memory_manager=memory_manager,
             memory_store=memory_store,
         )
     )
     return PreparedReplRuntime(
         conversation=conversation,
-        session=session,
         sessions=sessions,
         management_dispatcher=management_dispatcher,
         scheduled_work_coordinator=scheduled_work_coordinator,

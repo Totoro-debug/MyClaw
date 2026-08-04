@@ -8,10 +8,14 @@ from loguru import logger
 
 from myclaw.config.config import ConfigView
 from myclaw.logging.session import without_session_log
-from myclaw.management.service import ManagementError, ResumeResult, RuntimeStatus
+from myclaw.management.service import (
+    ManagementError,
+    ResumeResult,
+    RuntimeStatus,
+    SessionListingReport,
+)
 from myclaw.memory.memory_task import MemoryTaskResult
 from myclaw.session.records import SessionSummary
-from myclaw.session.session_store import SessionListingReport
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 

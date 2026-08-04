@@ -1,9 +1,9 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -29,13 +29,11 @@ from myclaw.provider.models import (
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.records import (
-    AssistantSessionMessage,
-    ConversationSession,
-    MetadataUpdate,
     UserSessionMessage,
 )
+from myclaw.session.session import Session
 from myclaw.session.session_resume import SwitchableConversationPort
-from myclaw.session.session_store import JsonlSessionStore, SessionListingReport
+from myclaw.session.session_store import JsonlSessionStore
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
@@ -65,6 +63,28 @@ SECOND_REQUEST_UUID = UUID("33333333-3333-4333-8333-333333333333")
 SECOND_ASSISTANT_UUID = UUID("44444444-4444-4444-8444-444444444444")
 
 
+def _current_session(
+    state: WorkspaceState,
+    session_uuid: UUID,
+    *,
+    now: datetime = NOW,
+    title: str | None = None,
+) -> Session:
+    session = Session.create(
+        state,
+        now=lambda: now,
+        new_uuid=lambda: session_uuid,
+    )
+    if title is not None:
+        session.update_metadata(title=title)
+    return session
+
+
+def _persist_session(session: Session) -> Session:
+    session.close()
+    return session
+
+
 @pytest.mark.asyncio
 async def test_session_picker_lists_only_current_workspace_with_stable_summaries(
     agent_home: Path,
@@ -73,70 +93,36 @@ async def test_session_picker_lists_only_current_workspace_with_stable_summaries
     home = AgentHome(agent_home)
     home.initialize()
     clock = FakeClock(NOW)
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=clock.now,
-        new_uuid=iter((OLDER_SESSION_UUID, NEWER_SESSION_UUID)).__next__,
-    )
-    older = sessions.prepare()
-    await sessions.append_message(
-        older.id,
-        UserSessionMessage(
-            id=str(FIRST_USER_UUID),
-            created_at=clock.now(),
-            content="Older workspace conversation.",
-        ),
-    )
-    await sessions.update_metadata(older.id, MetadataUpdate(title="Older title"))
+    state = WorkspaceState(Workspace.from_path(workspace))
+    older = _current_session(state, OLDER_SESSION_UUID, title="Older title")
+    older.add_message("user", "Older workspace conversation.")
+    _persist_session(older)
 
     clock.advance(30)
-    newer = sessions.prepare()
-    await sessions.append_message(
-        newer.id,
-        UserSessionMessage(
-            id=str(SECOND_USER_UUID),
-            created_at=clock.now(),
-            content="Newer workspace conversation.",
-        ),
-    )
-    await sessions.append_message(
-        newer.id,
-        UserSessionMessage(
-            id=str(THIRD_USER_UUID),
-            created_at=clock.now(),
-            content="One more message.",
-        ),
-    )
-    await sessions.update_metadata(newer.id, MetadataUpdate(title="Newer title"))
+    newer = _current_session(state, NEWER_SESSION_UUID, now=clock.now(), title="Newer title")
+    newer.add_message("user", "Newer workspace conversation.")
+    newer.add_message("user", "One more message.")
+    _persist_session(newer)
 
     other_workspace = workspace.parent / "other-workspace"
-    other_sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(other_workspace)),
-        now=clock.now,
-        new_uuid=iter((OTHER_WORKSPACE_SESSION_UUID,)).__next__,
-    )
-    other = other_sessions.prepare()
-    await other_sessions.append_message(
-        other.id,
-        UserSessionMessage(
-            id=str(FIRST_USER_UUID),
-            created_at=clock.now(),
-            content="Must not leak into the current Workspace.",
-        ),
-    )
+    other_state = WorkspaceState(Workspace.from_path(other_workspace))
+    other = _current_session(other_state, OTHER_WORKSPACE_SESSION_UUID, now=clock.now())
+    other.add_message("user", "Must not leak into the current Workspace.")
+    _persist_session(other)
 
-    summaries = (await sessions.scan_for_workspace(workspace)).sessions
+    management = ManagementViewService(home, workspace_state=state)
+    summaries = (await management.resumable_listing()).sessions
 
     assert [summary.to_dict() for summary in summaries] == [
         {
-            "id": newer.id,
+            "id": newer.session_id,
             "title": "Newer title",
             "created_at": "2026-07-11T15:30:42.123+08:00",
             "updated_at": "2026-07-11T15:30:42.123+08:00",
             "message_count": 2,
         },
         {
-            "id": older.id,
+            "id": older.session_id,
             "title": "Older title",
             "created_at": "2026-07-11T15:30:12.123+08:00",
             "updated_at": "2026-07-11T15:30:12.123+08:00",
@@ -152,53 +138,39 @@ async def test_session_picker_skips_corrupt_sessions_without_modifying_them(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=iter(
+    state = WorkspaceState(Workspace.from_path(workspace))
+    prepared = [
+        _current_session(state, session_uuid, title="Valid title" if index == 0 else None)
+        for index, session_uuid in enumerate(
             (
                 OLDER_SESSION_UUID,
                 CORRUPT_METADATA_UUID,
                 CORRUPT_MIDDLE_UUID,
                 CORRUPT_TAIL_UUID,
             )
-        ).__next__,
-    )
-
-    prepared = [sessions.prepare() for _ in range(4)]
-    for index, metadata in enumerate(prepared):
-        await sessions.append_message(
-            metadata.id,
-            UserSessionMessage(
-                id=str(
-                    (
-                        FIRST_USER_UUID,
-                        SECOND_USER_UUID,
-                        THIRD_USER_UUID,
-                        OTHER_WORKSPACE_SESSION_UUID,
-                    )[index]
-                ),
-                created_at=NOW,
-                content=f"Session {index}.",
-            ),
         )
-    await sessions.update_metadata(prepared[0].id, MetadataUpdate(title="Valid title"))
+    ]
+    for index, session in enumerate(prepared):
+        session.add_message("user", f"Session {index}.")
+        _persist_session(session)
 
-    metadata_path = sessions.path_for(prepared[1].id)
-    metadata_path.write_bytes(b'{"record_type":"metadata"}\n')
-    middle_path = sessions.path_for(prepared[2].id)
+    metadata_path = state.sessions_directory / f"{prepared[1].session_id}.jsonl"
+    metadata_path.write_bytes(b'{"session_id":"broken"}\n')
+    middle_path = state.sessions_directory / f"{prepared[2].session_id}.jsonl"
     middle_lines = middle_path.read_bytes().splitlines(keepends=True)
     middle_path.write_bytes(middle_lines[0] + b"not-json\n" + b"".join(middle_lines[1:]))
-    tail_path = sessions.path_for(prepared[3].id)
-    tail_path.write_bytes(tail_path.read_bytes() + b'{"record_type":"message"\n')
+    tail_path = state.sessions_directory / f"{prepared[3].session_id}.jsonl"
+    tail_path.write_bytes(tail_path.read_bytes() + b'{"role":"user"\n')
     corrupt_snapshots = {
         path: path.read_bytes() for path in (metadata_path, middle_path, tail_path)
     }
 
-    summaries = (await sessions.scan_for_workspace(workspace)).sessions
+    summaries = (
+        await ManagementViewService(home, workspace_state=state).resumable_listing()
+    ).sessions
 
     assert [(summary.id, summary.title) for summary in summaries] == [
-        (prepared[0].id, "Valid title")
+        (prepared[0].session_id, "Valid title")
     ]
     assert {path: path.read_bytes() for path in corrupt_snapshots} == corrupt_snapshots
 
@@ -210,21 +182,15 @@ async def test_management_listing_warns_once_for_each_skipped_session_entry(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
-    )
-    valid = sessions.prepare()
-    await sessions.append_message(
-        valid.id,
-        UserSessionMessage(id=str(FIRST_USER_UUID), created_at=NOW, content="Valid history."),
-    )
-    corrupt_path = sessions.directory / f"{CORRUPT_METADATA_UUID}.jsonl"
+    state = WorkspaceState(Workspace.from_path(workspace))
+    valid = _current_session(state, OLDER_SESSION_UUID)
+    valid.add_message("user", "Valid history.")
+    _persist_session(valid)
+    corrupt_path = state.sessions_directory / f"{CORRUPT_METADATA_UUID}.jsonl"
     corrupt_path.write_text("persisted content must stay private\n", encoding="utf-8")
-    unreadable_path = sessions.directory / f"{CORRUPT_MIDDLE_UUID}.jsonl"
+    unreadable_path = state.sessions_directory / f"{CORRUPT_MIDDLE_UUID}.jsonl"
     unreadable_path.mkdir()
-    management = ManagementViewService(home, sessions=sessions, workspace=workspace)
+    management = ManagementViewService(home, workspace_state=state)
 
     log_capture = capture_diagnostics()
     try:
@@ -232,7 +198,7 @@ async def test_management_listing_warns_once_for_each_skipped_session_entry(
     finally:
         log_capture.close()
 
-    assert [summary.id for summary in listing.sessions] == [valid.id]
+    assert [summary.id for summary in listing.sessions] == [valid.session_id]
     assert listing.skipped_count == 2
     content = log_capture.text
     assert content.count(" WARNING ") == 2
@@ -248,28 +214,33 @@ async def test_unavailable_session_listing_renders_error_without_terminal_duplic
     agent_home: Path,
     workspace: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
 
-    class FailingListingStore:
-        async def scan_for_workspace(self, candidate: Path) -> SessionListingReport:
-            del candidate
-            raise OSError("session directory unavailable")
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.sessions_directory.mkdir(parents=True)
+    (state.sessions_directory / f"{OLDER_SESSION_UUID}.jsonl").touch()
 
-        async def load(self, session_id: str) -> ConversationSession:
-            raise AssertionError(f"Unexpected Session load: {session_id}")
+    def fail_load(
+        _cls: type[Session],
+        /,
+        _state: WorkspaceState,
+        _session_id: str,
+        **_kwargs: object,
+    ) -> Session:
+        raise OSError("session directory unavailable")
 
-        async def current_session(self, session_id: str) -> ConversationSession:
-            raise AssertionError(f"Unexpected current Session read: {session_id}")
+    monkeypatch.setattr(Session, "load", classmethod(fail_load))
 
-    dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, sessions=FailingListingStore(), workspace=workspace)
-    )
+    dispatcher = ManagementCommandDispatcher(ManagementViewService(home, workspace_state=state))
     with configured_process_logging():
         result = await dispatcher.dispatch("/resume")
 
-    assert result.output == "persistence_error: Conversation Sessions could not be listed."
+    assert result.output == (
+        "Warning: Skipped 1 corrupt Conversation Session.\nNo resumable Conversation Sessions."
+    )
     assert capsys.readouterr().err == ""
     assert not (workspace / ".myclaw" / "logs").exists()
 
@@ -279,45 +250,43 @@ async def test_resume_load_failure_renders_safe_output_without_terminal_duplicat
     agent_home: Path,
     workspace: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    persisted = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
-    )
-    target = persisted.prepare()
-    await persisted.append_message(
-        target.id,
-        UserSessionMessage(
-            id=str(FIRST_USER_UUID),
-            created_at=NOW,
-            content="Persisted resume content must stay private.",
-        ),
-    )
+    state = WorkspaceState(Workspace.from_path(workspace))
+    target = _current_session(state, OLDER_SESSION_UUID)
+    target.add_message("user", "Persisted resume content must stay private.")
+    _persist_session(target)
+    original_load = Session.load
+    load_calls = 0
 
-    class FailingResumeLoadStore:
-        async def scan_for_workspace(self, candidate: Path) -> SessionListingReport:
-            return await persisted.scan_for_workspace(candidate)
-
-        async def load(self, session_id: str) -> ConversationSession:
-            del session_id
+    def fail_second_load(
+        cls: type[Session],
+        workspace_state: WorkspaceState,
+        session_id: str,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ) -> Session:
+        nonlocal load_calls
+        load_calls += 1
+        if load_calls == 2:
             raise OSError("resume target disappeared")
+        if now is None:
+            return original_load(workspace_state, session_id)
+        return original_load(workspace_state, session_id, now=now)
 
-        async def current_session(self, session_id: str) -> ConversationSession:
-            return await persisted.current_session(session_id)
+    monkeypatch.setattr(Session, "load", classmethod(fail_second_load))
 
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(
             home,
-            sessions=FailingResumeLoadStore(),
-            workspace=workspace,
-            switch_session=lambda _session_id: None,
+            workspace_state=state,
+            switch_session=lambda _session: None,
         )
     )
     with configured_process_logging():
-        result = await dispatcher.resume(target.id)
+        result = await dispatcher.resume(target.session_id)
 
     assert (
         result.output == "persistence_error: The selected Conversation Session could not be loaded."
@@ -335,36 +304,28 @@ async def test_session_switch_failure_is_terminal_only_without_a_session_log(
     home = AgentHome(agent_home)
     home.initialize()
     state = WorkspaceState(Workspace.from_path(workspace))
-    sessions = JsonlSessionStore(
-        workspace_state=state,
-        now=lambda: NOW,
-        new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
-    )
-    target = sessions.prepare()
-    await sessions.append_message(
-        target.id,
-        UserSessionMessage(id=str(FIRST_USER_UUID), created_at=NOW, content="Private history."),
-    )
+    target = _current_session(state, OLDER_SESSION_UUID)
+    target.add_message("user", "Private history.")
+    _persist_session(target)
 
-    def fail_switch(_session_id: str) -> None:
+    def fail_switch(_session: Session) -> None:
         raise RuntimeError("session switch failed")
 
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(
             home,
-            sessions=sessions,
-            workspace=workspace,
+            workspace_state=state,
             switch_session=fail_switch,
         )
     )
-    with configured_process_logging(), session_log(state, target.id):
+    with configured_process_logging(), session_log(state, target.session_id):
         with pytest.raises(RuntimeError, match="session switch failed"):
-            await dispatcher.resume(target.id)
+            await dispatcher.resume(target.session_id)
 
     assert capsys.readouterr().err == (
         "Management command failed command=/resume type=RuntimeError\n"
     )
-    assert not (state.logs_directory / f"{target.id}.log").exists()
+    assert not (state.logs_directory / f"{target.session_id}.log").exists()
 
 
 @pytest.mark.asyncio
@@ -512,26 +473,6 @@ class BlockingTurnProvider:
         return None
 
 
-class CoordinatedListingStore:
-    def __init__(self, delegate: JsonlSessionStore) -> None:
-        self._delegate = delegate
-        self.current_listing_ready = asyncio.Event()
-        self.release_current_listing = asyncio.Event()
-
-    async def current_session(self, session_id: str) -> ConversationSession:
-        return await self._delegate.current_session(session_id)
-
-    async def load(self, session_id: str) -> ConversationSession:
-        return await self._delegate.load(session_id)
-
-    async def scan_for_workspace(self, workspace: Path) -> SessionListingReport:
-        listing = await self._delegate.scan_for_workspace(workspace)
-        if Workspace.from_path(workspace) == self._delegate.workspace:
-            self.current_listing_ready.set()
-            await self.release_current_listing.wait()
-        return listing
-
-
 @pytest.mark.asyncio
 async def test_switchable_conversation_close_stops_delegates_from_every_selected_session(
     agent_home: Path,
@@ -539,20 +480,15 @@ async def test_switchable_conversation_close_stops_delegates_from_every_selected
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=iter((OLDER_SESSION_UUID, NEWER_SESSION_UUID)).__next__,
-    )
-    first = sessions.prepare()
-    second = sessions.prepare()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    first = _current_session(state, OLDER_SESSION_UUID)
+    second = _current_session(state, NEWER_SESSION_UUID)
     provider = DelayedResumeTitleProvider()
 
-    def conversation_for(session_id: str) -> StreamingConversationPort:
+    def conversation_for(active_session: Session) -> StreamingConversationPort:
         return StreamingConversationPort(
             provider=provider,
-            sessions=sessions,
-            session_id=session_id,
+            session=active_session,
             settings=ChatModelSettings(
                 model="test-model",
                 max_output=1024,
@@ -563,14 +499,15 @@ async def test_switchable_conversation_close_stops_delegates_from_every_selected
             now=lambda: NOW,
             new_uuid=lambda: REQUEST_UUID,
             title_prompt=session_title_prompt(),
+            workspace_state=state,
         )
 
     conversation = SwitchableConversationPort(
-        session_id=first.id,
+        session=first,
         build_conversation=conversation_for,
     )
     _ = [event async for event in conversation.submit("Start the first title.")]
-    conversation.switch_session(second.id)
+    conversation.switch_session(second)
     _ = [event async for event in conversation.submit("Start the second title.")]
     for _ in range(100):
         if provider.title_request_count == 2:
@@ -583,7 +520,7 @@ async def test_switchable_conversation_close_stops_delegates_from_every_selected
 
 
 @pytest.mark.asyncio
-async def test_switchable_conversation_close_settles_every_selected_adapter() -> None:
+async def test_switchable_conversation_close_settles_every_selected_adapter(tmp_path: Path) -> None:
     class ClosingConversation:
         def __init__(self, *, fail: bool = False) -> None:
             self._fail = fail
@@ -605,13 +542,16 @@ async def test_switchable_conversation_close_settles_every_selected_adapter() ->
 
     first = ClosingConversation(fail=True)
     second = ClosingConversation()
-    delegates = {"first": first, "second": second}
+    state = WorkspaceState(Workspace.from_path(tmp_path))
+    first_session = _current_session(state, OLDER_SESSION_UUID)
+    second_session = _current_session(state, NEWER_SESSION_UUID)
+    delegates = {first_session.session_id: first, second_session.session_id: second}
     conversation = SwitchableConversationPort(
-        session_id="first",
-        build_conversation=delegates.__getitem__,
+        session=first_session,
+        build_conversation=lambda session: delegates[session.session_id],
     )
     _ = [event async for event in conversation.submit("first")]
-    conversation.switch_session("second")
+    conversation.switch_session(second_session)
     _ = [event async for event in conversation.submit("second")]
 
     with pytest.raises(RuntimeError, match="first adapter close failed"):
@@ -630,36 +570,23 @@ async def test_repl_resume_continues_target_history_and_switches_runtime_status(
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     clock = FakeClock(NOW)
-    historical_store = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=clock.now,
-        new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
+    state = WorkspaceState(Workspace.from_path(workspace))
+    historical = _current_session(state, OLDER_SESSION_UUID, title="Friday deployment")
+    historical.add_message("user", "Remember the deployment decision.")
+    historical.add_message(
+        "assistant",
+        "Deploy on Friday.",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 8,
+            "output_tokens": 4,
+            "total_tokens": 12,
+        },
     )
-    historical = historical_store.prepare()
-    await historical_store.append_message(
-        historical.id,
-        UserSessionMessage(
-            id=str(FIRST_USER_UUID),
-            created_at=clock.now(),
-            content="Remember the deployment decision.",
-        ),
-    )
-    await historical_store.append_message(
-        historical.id,
-        AssistantSessionMessage(
-            id=str(SECOND_USER_UUID),
-            created_at=clock.now(),
-            content="Deploy on Friday.",
-            tool_calls=(),
-            status="completed",
-            error=None,
-            usage=ModelUsage(input_tokens=8, output_tokens=4, total_tokens=12),
-        ),
-    )
-    await historical_store.update_metadata(
-        historical.id,
-        MetadataUpdate(title="Friday deployment"),
-    )
+    _persist_session(historical)
     response = ModelResponse(
         message=AssistantModelMessage(content="The Friday decision is still current."),
         usage=ModelUsage(input_tokens=15, output_tokens=7, total_tokens=22),
@@ -711,7 +638,7 @@ async def test_repl_resume_continues_target_history_and_switches_runtime_status(
         "line",
         "Resumable sessions:\n1. Friday deployment | 2026-07-11T15:30:12.123+08:00 | 2 messages",
     )
-    assert writer.operations[1] == ("line", f"Resumed session {historical.id}.")
+    assert writer.operations[1] == ("line", f"Resumed session {historical.session_id}.")
     assert writer.operations[2:4] == [
         ("delta", "The Friday decision is still current."),
         ("finish", ""),
@@ -736,7 +663,7 @@ async def test_repl_resume_continues_target_history_and_switches_runtime_status(
             "content": (
                 "<runtime_context>\n"
                 "current_time: 2026-07-11T15:30:12.123+08:00\n"
-                f"session_id: {historical.id}\n"
+                f"session_id: {historical.session_id}\n"
                 "</runtime_context>\n\n"
                 "<user_input>\n"
                 "Continue from that decision.\n"
@@ -744,15 +671,67 @@ async def test_repl_resume_continues_target_history_and_switches_runtime_status(
             ),
         },
     ]
-    target = await runtime.sessions.load(historical.id)
-    assert runtime.session_id == historical.id
-    assert [(message.role, message.content) for message in target.messages] == [
+    target = Session.load(state, historical.session_id)
+    assert runtime.session_id == historical.session_id
+    assert [(message["role"], message["content"]) for message in target.messages] == [
         ("user", "Remember the deployment decision."),
         ("assistant", "Deploy on Friday."),
         ("user", "Continue from that decision."),
         ("assistant", "The Friday decision is still current."),
     ]
-    assert not runtime.sessions.path_for(startup_session_id).exists()
+    assert not (state.sessions_directory / f"{startup_session_id}.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_resuming_current_session_keeps_status_on_the_live_authority(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    state = WorkspaceState(Workspace.from_path(workspace))
+    response = ModelResponse(
+        message=AssistantModelMessage(content="Current authority updated."),
+        usage=ModelUsage(input_tokens=5, output_tokens=2, total_tokens=7),
+        finish_reason="stop",
+    )
+    provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(ModelCompleted(response=response),)),)
+    )
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    authority = runtime.session
+    authority.add_message("user", "Existing current history.")
+    authority.persist()
+    path = state.sessions_directory / f"{authority.session_id}.jsonl"
+    for _ in range(100):
+        if path.exists():
+            break
+        await asyncio.sleep(0)
+
+    resumed = await runtime.management_dispatcher.resume(authority.session_id)
+    events = [event async for event in runtime.conversation.submit("Continue current history.")]
+    status_result = await runtime.management_dispatcher.dispatch("/status")
+
+    assert resumed.output == f"Resumed session {authority.session_id}."
+    assert runtime.session is authority
+    assert events[-1].type == "turn_completed"
+    status = json.loads(status_result.output or "")
+    assert status["session_message_count"] == 3
+    assert status["cumulative_usage"] == {
+        "model_calls": 1,
+        "input_tokens": 5,
+        "output_tokens": 2,
+        "total_tokens": 7,
+    }
+    await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -762,23 +741,16 @@ async def test_picker_rejects_unsupported_metadata_and_message_record_types(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=iter((OLDER_SESSION_UUID, CORRUPT_METADATA_UUID, CORRUPT_MIDDLE_UUID)).__next__,
-    )
-    prepared = [sessions.prepare() for _ in range(3)]
-    for index, metadata in enumerate(prepared):
-        await sessions.append_message(
-            metadata.id,
-            UserSessionMessage(
-                id=str((FIRST_USER_UUID, SECOND_USER_UUID, THIRD_USER_UUID)[index]),
-                created_at=NOW,
-                content=f"Record contract {index}.",
-            ),
-        )
+    state = WorkspaceState(Workspace.from_path(workspace))
+    prepared = [
+        _current_session(state, session_uuid)
+        for session_uuid in (OLDER_SESSION_UUID, CORRUPT_METADATA_UUID, CORRUPT_MIDDLE_UUID)
+    ]
+    for index, session in enumerate(prepared):
+        session.add_message("user", f"Record contract {index}.")
+        _persist_session(session)
 
-    unsupported_metadata_path = sessions.path_for(prepared[1].id)
+    unsupported_metadata_path = state.sessions_directory / f"{prepared[1].session_id}.jsonl"
     unsupported_lines = unsupported_metadata_path.read_text(encoding="utf-8").splitlines()
     unsupported_metadata = json.loads(unsupported_lines[0])
     unsupported_metadata["schema_version"] = 2
@@ -789,7 +761,7 @@ async def test_picker_rejects_unsupported_metadata_and_message_record_types(
         + "\n",
         encoding="utf-8",
     )
-    wrong_message_path = sessions.path_for(prepared[2].id)
+    wrong_message_path = state.sessions_directory / f"{prepared[2].session_id}.jsonl"
     wrong_message_lines = wrong_message_path.read_text(encoding="utf-8").splitlines()
     wrong_message = json.loads(wrong_message_lines[1])
     wrong_message["record_type"] = "metadata"
@@ -801,9 +773,11 @@ async def test_picker_rejects_unsupported_metadata_and_message_record_types(
         path: path.read_bytes() for path in (unsupported_metadata_path, wrong_message_path)
     }
 
-    summaries = (await sessions.scan_for_workspace(workspace)).sessions
+    summaries = (
+        await ManagementViewService(home, workspace_state=state).resumable_listing()
+    ).sessions
 
-    assert [summary.id for summary in summaries] == [prepared[0].id]
+    assert [summary.id for summary in summaries] == [prepared[0].session_id]
     assert {path: path.read_bytes() for path in corrupt_snapshots} == corrupt_snapshots
 
 
@@ -816,28 +790,23 @@ async def test_resume_command_aggregates_corrupt_session_warning(
     home = AgentHome(agent_home)
     home.initialize()
     state = WorkspaceState(Workspace.from_path(workspace))
-    sessions = JsonlSessionStore(
-        workspace_state=state,
-        now=lambda: NOW,
-        new_uuid=iter((OLDER_SESSION_UUID, CORRUPT_METADATA_UUID, CORRUPT_MIDDLE_UUID)).__next__,
-    )
-    prepared = [sessions.prepare() for _ in range(3)]
-    for index, metadata in enumerate(prepared):
-        await sessions.append_message(
-            metadata.id,
-            UserSessionMessage(
-                id=str((FIRST_USER_UUID, SECOND_USER_UUID, THIRD_USER_UUID)[index]),
-                created_at=NOW,
-                content=f"Picker item {index}.",
-            ),
+    prepared = [
+        _current_session(
+            state,
+            session_uuid,
+            title="Valid picker item" if index == 0 else None,
         )
-    await sessions.update_metadata(prepared[0].id, MetadataUpdate(title="Valid picker item"))
-    sessions.path_for(prepared[1].id).write_bytes(b"not metadata\n")
-    sessions.path_for(prepared[2].id).write_bytes(b'{"broken":\n')
-    dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, sessions=sessions, workspace=workspace)
-    )
-    with configured_process_logging(), session_log(state, prepared[0].id):
+        for index, session_uuid in enumerate(
+            (OLDER_SESSION_UUID, CORRUPT_METADATA_UUID, CORRUPT_MIDDLE_UUID)
+        )
+    ]
+    for index, session in enumerate(prepared):
+        session.add_message("user", f"Picker item {index}.")
+        _persist_session(session)
+    (state.sessions_directory / f"{prepared[1].session_id}.jsonl").write_bytes(b"not metadata\n")
+    (state.sessions_directory / f"{prepared[2].session_id}.jsonl").write_bytes(b'{"broken":\n')
+    dispatcher = ManagementCommandDispatcher(ManagementViewService(home, workspace_state=state))
+    with configured_process_logging(), session_log(state, prepared[0].session_id):
         result = await dispatcher.dispatch("/resume")
 
     assert result.output == (
@@ -846,9 +815,9 @@ async def test_resume_command_aggregates_corrupt_session_warning(
         "1. Valid picker item | 2026-07-11T15:30:12.123+08:00 | 1 message"
     )
     assert result.resume_sessions is not None
-    assert [session.id for session in result.resume_sessions] == [prepared[0].id]
+    assert [session.id for session in result.resume_sessions] == [prepared[0].session_id]
     assert capsys.readouterr().err == ""
-    assert not (state.logs_directory / f"{prepared[0].id}.log").exists()
+    assert not (state.logs_directory / f"{prepared[0].session_id}.log").exists()
 
 
 @pytest.mark.asyncio
@@ -860,44 +829,26 @@ async def test_concurrent_resume_listings_keep_their_own_corruption_diagnostics(
     home.initialize()
     other_workspace = workspace.parent / "other-workspace"
     other_workspace.mkdir()
-    persisted = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=iter((OLDER_SESSION_UUID, CORRUPT_METADATA_UUID)).__next__,
-    )
-    valid = persisted.prepare()
-    corrupt = persisted.prepare()
-    await persisted.append_message(
-        valid.id,
-        UserSessionMessage(
-            id=str(FIRST_USER_UUID),
-            created_at=NOW,
-            content="Valid concurrent picker item.",
-        ),
-    )
-    await persisted.update_metadata(valid.id, MetadataUpdate(title="Concurrent picker item"))
-    await persisted.append_message(
-        corrupt.id,
-        UserSessionMessage(
-            id=str(SECOND_USER_UUID),
-            created_at=NOW,
-            content="Will become corrupt.",
-        ),
-    )
-    persisted.path_for(corrupt.id).write_bytes(b"corrupt metadata\n")
-    coordinated = CoordinatedListingStore(persisted)
+    state = WorkspaceState(Workspace.from_path(workspace))
+    valid = _current_session(state, OLDER_SESSION_UUID, title="Concurrent picker item")
+    valid.add_message("user", "Valid concurrent picker item.")
+    _persist_session(valid)
+    corrupt = _current_session(state, CORRUPT_METADATA_UUID)
+    corrupt.add_message("user", "Will become corrupt.")
+    _persist_session(corrupt)
+    (state.sessions_directory / f"{corrupt.session_id}.jsonl").write_bytes(b"corrupt metadata\n")
     current_dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, sessions=coordinated, workspace=workspace)
+        ManagementViewService(home, workspace_state=state)
     )
     other_dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, sessions=coordinated, workspace=other_workspace)
+        ManagementViewService(
+            home,
+            workspace_state=WorkspaceState(Workspace.from_path(other_workspace)),
+        )
     )
 
-    current_listing = asyncio.create_task(current_dispatcher.dispatch("/resume"))
-    await asyncio.wait_for(coordinated.current_listing_ready.wait(), timeout=1)
+    current_result = await current_dispatcher.dispatch("/resume")
     other_result = await other_dispatcher.dispatch("/resume")
-    coordinated.release_current_listing.set()
-    current_result = await asyncio.wait_for(current_listing, timeout=1)
 
     assert current_result.output == (
         "Warning: Skipped 1 corrupt Conversation Session.\n"
@@ -978,12 +929,11 @@ async def test_legacy_agent_home_session_is_not_resumable(
     legacy_io_path.parent.mkdir(parents=True)
     legacy_io_path.write_text(metadata.to_json_line() + message.to_json_line(), encoding="utf-8")
     legacy_bytes = legacy_io_path.read_bytes()
-    switched: list[str] = []
+    switched: list[Session] = []
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(
             home,
-            sessions=sessions,
-            workspace=workspace,
+            workspace_state=state,
             switch_session=switched.append,
         )
     )
@@ -1003,24 +953,19 @@ async def test_legacy_agent_home_session_is_not_resumable(
 async def test_resuming_from_a_nonempty_session_preserves_its_complete_history(
     agent_home: Path,
     workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    target_store = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW - timedelta(minutes=5),
-        new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
+    state = WorkspaceState(Workspace.from_path(workspace))
+    target = _current_session(
+        state,
+        OLDER_SESSION_UUID,
+        now=NOW - timedelta(minutes=5),
     )
-    target = target_store.prepare()
-    await target_store.append_message(
-        target.id,
-        UserSessionMessage(
-            id=str(FIRST_USER_UUID),
-            created_at=NOW - timedelta(minutes=5),
-            content="Target history.",
-        ),
-    )
+    target.add_message("user", "Target history.")
+    _persist_session(target)
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,
@@ -1030,16 +975,34 @@ async def test_resuming_from_a_nonempty_session_preserves_its_complete_history(
         new_uuid=iter((NEWER_SESSION_UUID,)).__next__,
     )
     original_session_id = runtime.session_id
-    runtime.session.add_message("user", "Original nonempty history.")
+    original_session = runtime.session
+    original_session.add_message("user", "Original nonempty history.")
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+    write_attempts: list[Path] = []
 
-    result = await runtime.management_dispatcher.resume(target.id)
+    def fail_first_snapshot(target_path: Path, _content: bytes) -> None:
+        write_attempts.append(target_path)
+        monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", replace)
+        raise OSError("injected ordinary persistence failure")
 
-    assert result.output == f"Resumed session {target.id}."
-    assert runtime.session.session_id == original_session_id
-    assert [message["content"] for message in runtime.session.messages] == [
-        "Original nonempty history."
-    ]
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_first_snapshot)
+    original_session.persist()
+    for _ in range(100):
+        if write_attempts:
+            break
+        await asyncio.sleep(0)
+    original_path = state.sessions_directory / f"{original_session_id}.jsonl"
+    assert write_attempts == [original_path]
+    assert not original_path.exists()
+
+    result = await runtime.management_dispatcher.resume(target.session_id)
+
+    assert result.output == f"Resumed session {target.session_id}."
+    assert runtime.session.session_id == target.session_id
+    assert [message["content"] for message in runtime.session.messages] == ["Target history."]
     await runtime.close()
+    preserved = Session.load(state, original_session_id)
+    assert [message["content"] for message in preserved.messages] == ["Original nonempty history."]
 
 
 @pytest.mark.asyncio
@@ -1050,24 +1013,15 @@ async def test_late_title_stays_with_original_and_resumed_session_is_not_retitle
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    target_store = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW - timedelta(minutes=5),
-        new_uuid=iter((OLDER_SESSION_UUID,)).__next__,
+    state = WorkspaceState(Workspace.from_path(workspace))
+    target = _current_session(
+        state,
+        OLDER_SESSION_UUID,
+        now=NOW - timedelta(minutes=5),
+        title="Existing target title",
     )
-    target = target_store.prepare()
-    await target_store.append_message(
-        target.id,
-        UserSessionMessage(
-            id=str(FIRST_USER_UUID),
-            created_at=NOW - timedelta(minutes=5),
-            content="Existing target history.",
-        ),
-    )
-    await target_store.update_metadata(
-        target.id,
-        MetadataUpdate(title="Existing target title"),
-    )
+    target.add_message("user", "Existing target history.")
+    _persist_session(target)
     provider = DelayedResumeTitleProvider()
 
     def provider_factory(configuration: ProviderConfiguration) -> ModelProvider:
@@ -1096,27 +1050,28 @@ async def test_late_title_stays_with_original_and_resumed_session_is_not_retitle
     )
     _ = [event async for event in runtime.conversation.submit("Create the original title.")]
     await asyncio.wait_for(provider.title_started.wait(), timeout=1)
+    original_session = runtime.session
 
-    resume_result = await runtime.management_dispatcher.resume(target.id)
+    resume_result = await runtime.management_dispatcher.resume(target.session_id)
     provider.release_title.set()
     for _ in range(100):
-        if runtime.session.metadata["title"] == "Late original title":
+        if original_session.metadata["title"] == "Late original title":
             break
         await asyncio.sleep(0)
 
     _ = [event async for event in runtime.conversation.submit("Continue the existing target.")]
 
-    resumed = await runtime.sessions.load(target.id)
-    assert resume_result.output == f"Resumed session {target.id}."
-    assert runtime.session.metadata["title"] == "Late original title"
-    assert resumed.metadata.title == "Existing target title"
+    assert resume_result.output == f"Resumed session {target.session_id}."
+    assert original_session.metadata["title"] == "Late original title"
+    assert runtime.session.metadata["title"] == "Existing target title"
     assert provider.title_request_count == 1
-    assert [(message.role, message.content) for message in resumed.messages] == [
+    await runtime.close()
+    resumed = Session.load(state, target.session_id)
+    assert [(message["role"], message["content"]) for message in resumed.messages] == [
         ("user", "Existing target history."),
         ("user", "Continue the existing target."),
         ("assistant", "Target answer."),
     ]
-    await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -1205,13 +1160,9 @@ async def test_active_turn_rejects_session_switch_and_keeps_cancellation_on_orig
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    sessions = JsonlSessionStore(
-        workspace_state=WorkspaceState(Workspace.from_path(workspace)),
-        now=lambda: NOW,
-        new_uuid=iter((OLDER_SESSION_UUID, NEWER_SESSION_UUID)).__next__,
-    )
-    session_a = sessions.prepare()
-    session_b = sessions.prepare()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    session_a = _current_session(state, OLDER_SESSION_UUID)
+    session_b = _current_session(state, NEWER_SESSION_UUID)
     provider_a = BlockingTurnProvider("A should be cancelled.")
     provider_b = ScriptedFakeProvider(
         streams=(
@@ -1229,8 +1180,10 @@ async def test_active_turn_rejects_session_switch_and_keeps_cancellation_on_orig
         )
     )
     uuids = {
-        session_a.id: iter((TURN_UUID, FIRST_USER_UUID, REQUEST_UUID, NEW_ASSISTANT_UUID)).__next__,
-        session_b.id: iter(
+        session_a.session_id: iter(
+            (TURN_UUID, FIRST_USER_UUID, REQUEST_UUID, NEW_ASSISTANT_UUID)
+        ).__next__,
+        session_b.session_id: iter(
             (
                 SECOND_TURN_UUID,
                 SECOND_USER_UUID,
@@ -1240,12 +1193,13 @@ async def test_active_turn_rejects_session_switch_and_keeps_cancellation_on_orig
         ).__next__,
     }
 
-    def build_port(session_id: str) -> StreamingConversationPort:
-        provider: ModelProvider = provider_a if session_id == session_a.id else provider_b
+    def build_port(active_session: Session) -> StreamingConversationPort:
+        provider: ModelProvider = (
+            provider_a if active_session.session_id == session_a.session_id else provider_b
+        )
         return StreamingConversationPort(
             provider=provider,
-            sessions=sessions,
-            session_id=session_id,
+            session=active_session,
             settings=ChatModelSettings(
                 model="test-model",
                 max_output=1024,
@@ -1254,11 +1208,12 @@ async def test_active_turn_rejects_session_switch_and_keeps_cancellation_on_orig
                 timeout_seconds=30,
             ),
             now=lambda: NOW,
-            new_uuid=uuids[session_id],
+            new_uuid=uuids[active_session.session_id],
+            workspace_state=state,
         )
 
     conversation = SwitchableConversationPort(
-        session_id=session_a.id,
+        session=session_a,
         build_conversation=build_port,
     )
 
@@ -1269,18 +1224,18 @@ async def test_active_turn_rejects_session_switch_and_keeps_cancellation_on_orig
     await asyncio.wait_for(provider_a.started.wait(), timeout=1)
     try:
         with pytest.raises(RuntimeError, match="active foreground turn"):
-            conversation.switch_session(session_b.id)
+            conversation.switch_session(session_b)
 
-        assert conversation.session_id == session_a.id
+        assert conversation.session_id == session_a.session_id
         await conversation.cancel_active_turn()
         assert await asyncio.wait_for(active_a, timeout=1) == [
             "turn_started",
             "turn_cancelled",
         ]
 
-        conversation.switch_session(session_b.id)
+        conversation.switch_session(session_b)
         assert await collect("Start B.") == ["turn_started", "turn_completed"]
-        assert conversation.session_id == session_b.id
+        assert conversation.session_id == session_b.session_id
     finally:
         provider_a.release.set()
         if not active_a.done():
