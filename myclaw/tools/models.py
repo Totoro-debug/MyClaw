@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from myclaw.tools.artifacts import ArtifactReference
+from myclaw.tools.confirmation import ToolConfirmationMetadata
 
 type ToolResultStatus = Literal["success", "error", "refused"]
 
@@ -29,12 +30,16 @@ class ToolResult:
     status: ToolResultStatus
     content: str
     artifact: ArtifactReference | None
+    confirmation: ToolConfirmationMetadata | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "tool_call_id": self.tool_call_id,
             "name": self.name,
             "status": self.status,
             "content": self.content,
             "artifact": None if self.artifact is None else self.artifact.to_dict(),
         }
+        if self.confirmation is not None:
+            result["confirmation"] = self.confirmation.to_dict()
+        return result

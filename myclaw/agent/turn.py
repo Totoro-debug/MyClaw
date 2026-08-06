@@ -219,6 +219,7 @@ class AgentTurn:
                                     status="error",
                                     content=message,
                                     artifact=None,
+                                    confirmation=raw_result.confirmation,
                                 )
 
                             self._add_session_tool(result)
@@ -369,13 +370,18 @@ class AgentTurn:
     def _add_session_tool(self, result: ToolResult) -> None:
         session = self._session
         assert session is not None
+        fields: dict[str, object] = {
+            "tool_call_id": result.tool_call_id,
+            "name": result.name,
+            "status": result.status,
+            "artifact": None if result.artifact is None else result.artifact.to_dict(),
+        }
+        if result.confirmation is not None:
+            fields["confirmation"] = result.confirmation.to_dict()
         session.add_message(
             "tool",
             result.content,
-            tool_call_id=result.tool_call_id,
-            name=result.name,
-            status=result.status,
-            artifact=None if result.artifact is None else result.artifact.to_dict(),
+            **fields,
         )
 
     def _persist_session_once(self) -> None:

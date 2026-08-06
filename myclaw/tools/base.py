@@ -6,6 +6,7 @@ import inspect
 from typing import ClassVar, final, get_type_hints
 
 from myclaw.tools.schema import OpenAIToolSchema, ToolSchema
+from myclaw.utils.json_types import JsonObject
 
 
 class BaseTool:
@@ -49,6 +50,10 @@ class BaseTool:
         if return_annotation is not str:
             msg = "Concrete Tool execute() must declare a string return"
             raise TypeError(msg)
+
+    def prepare(self, arguments: JsonObject) -> JsonObject:
+        """Select the effective declared arguments before coercion and validation."""
+        return arguments
 
     @final
     def to_schema(self) -> OpenAIToolSchema:
