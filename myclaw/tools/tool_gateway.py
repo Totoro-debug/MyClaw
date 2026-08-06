@@ -1,11 +1,12 @@
 """Tool Gateway for registered capabilities and normalized results."""
 
 import asyncio
+import inspect
 import json
 import math
 import re
 from collections.abc import Awaitable, Callable
-from copy import deepcopy
+from copy import copy, deepcopy
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -29,6 +30,7 @@ from myclaw.utils.validation import require_uuid4
 
 type Sleep = Callable[[float], Awaitable[None]]
 type Confirmation = ToolConfirmationChannel | ConfirmationRequester
+type ConfirmationObserver = Callable[[ConfirmationRequest], Awaitable[None] | None]
 
 _DECIMAL_INTEGER = re.compile(r"^[+-]?[0-9]+$")
 
@@ -46,6 +48,7 @@ class ToolGateway:
         confirmation_channel: Confirmation | None = None,
         turn_id: UUID | None = None,
         new_uuid: Callable[[], UUID] = uuid4,
+        on_confirmation_requested: ConfirmationObserver | None = None,
     ) -> None:
         if confirmation is not None and confirmation_channel is not None:
             raise ValueError("Provide only one confirmation channel")
@@ -61,6 +64,7 @@ class ToolGateway:
         self._confirmation = confirmation if confirmation is not None else confirmation_channel
         self._turn_id = turn_id
         self._new_uuid = new_uuid
+        self._on_confirmation_requested = on_confirmation_requested
 
     def register_tools(self, tools: tuple[BaseTool, ...]) -> None:
         """Register and cache one stable annotation-driven Tool Catalog."""
@@ -83,6 +87,23 @@ class ToolGateway:
     def schemas(self) -> tuple[OpenAIToolSchema, ...]:
         """Return a defensive snapshot of the registered OpenAI Tool schemas."""
         return tuple(deepcopy(schema) for schema in self._schemas)
+
+    def for_run(
+        self,
+        *,
+        confirmation: Confirmation | None,
+        on_confirmation_requested: ConfirmationObserver | None = None,
+    ) -> "ToolGateway":
+        """Bind a detached Gateway view to one Agent Run."""
+        bound = copy(self)
+        bound._confirmation = confirmation
+        channel_turn_id = getattr(confirmation, "turn_id", None)
+        if isinstance(channel_turn_id, UUID):
+            bound._turn_id = channel_turn_id
+        bound._on_confirmation_requested = on_confirmation_requested
+        bound._schemas = tuple(deepcopy(schema) for schema in self._schemas)
+        bound._parameter_schemas = deepcopy(self._parameter_schemas)
+        return bound
 
     async def call(self, tool_call: ModelToolCall) -> ToolResult:
         """Parse, prepare, refuse, execute, and normalize one Tool call."""
@@ -141,6 +162,7 @@ class ToolGateway:
                     message="Tool confirmation is unavailable.",
                     confirmation=ToolConfirmationMetadata(request=request, decision=None),
                 )
+            await self._notify_confirmation_requested(request)
             decision = await self._request_confirmation(request)
             metadata = ToolConfirmationMetadata(request=request, decision=decision)
             if decision == "declined":
@@ -157,6 +179,14 @@ class ToolGateway:
             )
 
         return await self._execute(tool_call, tool, normalized, confirmation=None)
+
+    async def _notify_confirmation_requested(self, request: ConfirmationRequest) -> None:
+        observer = self._on_confirmation_requested
+        if observer is None:
+            return
+        result = observer(request)
+        if inspect.isawaitable(result):
+            await result
 
     def _confirmation_prompt(
         self,
