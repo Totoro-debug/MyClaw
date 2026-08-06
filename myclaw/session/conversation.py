@@ -60,6 +60,11 @@ class StreamingConversationPort:
         title_new_uuid: Callable[[], UUID] = uuid4,
         tool_gateway: ToolGateway | None = None,
         history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
+        memory_snapshot: Callable[[], str] | None = None,
+        system_prompt_for_memory: Callable[[str], str] | None = None,
+        history_preparer_for_memory: (
+            Callable[[str], Callable[[Session], Awaitable[Session]]] | None
+        ) = None,
         externalize_result: ToolResultExternalizer | None = None,
         workspace_state: WorkspaceState | None = None,
         title_log_ready: Callable[[], Awaitable[object]] | None = None,
@@ -71,8 +76,13 @@ class StreamingConversationPort:
         self._new_uuid = new_uuid
         self._title_prompt = title_prompt
         self._title_new_uuid = title_new_uuid
+        self._tool_gateway = tool_gateway
+        self._externalize_result = externalize_result
         self._workspace_state = workspace_state
         self._title_log_ready = title_log_ready
+        self._memory_snapshot = memory_snapshot
+        self._system_prompt_for_memory = system_prompt_for_memory
+        self._history_preparer_for_memory = history_preparer_for_memory
         self._title_task: asyncio.Task[None] | None = None
         self._next_event_id = 0
         self._foreground_active = False
@@ -80,20 +90,8 @@ class StreamingConversationPort:
         self._active_turn_done: asyncio.Event | None = None
         self._cancel_requested = False
         self._close_task: asyncio.Task[None] | None = None
-        self._turn = AgentTurn(
-            lane="foreground",
-            provider=provider,
-            session=session,
-            settings=settings,
-            now=now,
-            new_uuid=new_uuid,
-            system_prompt=system_prompt,
-            tool_gateway=tool_gateway,
-            history_preparer=history_preparer,
-            after_user_published=self._start_title_for_first_user,
-            cancel_requested=lambda: self._cancel_requested,
-            externalize_result=externalize_result,
-        )
+        self._system_prompt = system_prompt
+        self._history_preparer = history_preparer
 
     async def submit(self, text: str) -> AsyncGenerator[AgentEvent, None]:
         if self._close_task is not None:
@@ -123,8 +121,33 @@ class StreamingConversationPort:
                 self._foreground_active = False
 
     async def _submit_turn(self, text: str) -> AsyncGenerator[AgentEvent, None]:
+        memory_snapshot = (
+            None if self._memory_snapshot is None else self._memory_snapshot()
+        )
+        system_prompt = self._system_prompt
+        history_preparer = self._history_preparer
+        if memory_snapshot is not None:
+            if self._system_prompt_for_memory is None:
+                raise RuntimeError("Memory snapshot requires a System Prompt factory")
+            system_prompt = self._system_prompt_for_memory(memory_snapshot)
+            if self._history_preparer_for_memory is not None:
+                history_preparer = self._history_preparer_for_memory(memory_snapshot)
+        turn = AgentTurn(
+            lane="foreground",
+            provider=self._provider,
+            session=self._session,
+            settings=self._settings,
+            now=self._now,
+            new_uuid=self._new_uuid,
+            system_prompt=system_prompt,
+            tool_gateway=self._tool_gateway,
+            history_preparer=history_preparer,
+            after_user_published=self._start_title_for_first_user,
+            cancel_requested=lambda: self._cancel_requested,
+            externalize_result=self._externalize_result,
+        )
         turn_id = self._new_uuid()
-        payloads = self._turn.run(text)
+        payloads = turn.run(text)
         try:
             async for payload in payloads:
                 event = AgentEvent(

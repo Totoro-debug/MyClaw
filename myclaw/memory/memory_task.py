@@ -31,6 +31,21 @@ from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.validation import require_nonnegative_int
 
 
+class RuntimeMemory:
+    """Hold the Runtime-local Long-term Memory snapshot."""
+
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    def snapshot(self) -> str:
+        """Return the immutable text captured by the caller."""
+        return self._content
+
+    def replace(self, content: str) -> None:
+        """Publish a later snapshot without a persistence failure path."""
+        self._content = content
+
+
 class MemoryStore(Protocol):
     """Persist Long-term Memory and its Summary Cursor."""
 
@@ -110,9 +125,16 @@ class MemoryEditFileTool(BaseTool):
     new_text: Annotated[str, ToolParam(description="Replacement text.")]
     replace_all: Annotated[bool, ToolParam(description="Replace every exact match.")] = False
 
-    def __init__(self, *, memory: MemoryStore, long_term_path: Path) -> None:
+    def __init__(
+        self,
+        *,
+        memory: MemoryStore,
+        long_term_path: Path,
+        runtime_memory: RuntimeMemory | None = None,
+    ) -> None:
         self._memory = memory
         self._long_term_path = long_term_path
+        self._runtime_memory = runtime_memory
 
     async def execute(
         self,
@@ -143,6 +165,8 @@ class MemoryEditFileTool(BaseTool):
             raise ToolError("Long-term Memory must be a regular Workspace State file.") from error
         except (OSError, UnicodeError, ValueError) as error:
             raise ToolError("Long-term Memory could not be updated.") from error
+        if self._runtime_memory is not None:
+            self._runtime_memory.replace(replacement)
         return "Long-term Memory updated."
 
 
@@ -248,6 +272,7 @@ class MemoryManager:
         long_term_path: Path,
         settings: MemoryTaskModelSettings,
         batch_size: int,
+        runtime_memory: RuntimeMemory | None = None,
     ) -> None:
         self._provider = provider
         self._summaries = summaries
@@ -263,7 +288,11 @@ class MemoryManager:
         self._tools.register_tools(
             (
                 MemoryReadFileTool(memory=memory, long_term_path=long_term_path),
-                MemoryEditFileTool(memory=memory, long_term_path=long_term_path),
+                MemoryEditFileTool(
+                    memory=memory,
+                    long_term_path=long_term_path,
+                    runtime_memory=runtime_memory,
+                ),
             )
         )
         self._running = False
@@ -325,6 +354,22 @@ class MemoryManager:
                 memory_updated=False,
                 cursor=cursor,
             )
+        new_cursor = pending[-1].index
+        try:
+            await self._memory.write_summary_cursor(new_cursor)
+        except (OSError, UnicodeError, ValueError) as error:
+            self._capture_terminal_failure(error)
+            return MemoryTaskResult(
+                status="Memory Task failed.",
+                processed_count=0,
+                memory_updated=False,
+                cursor=cursor,
+                error=ErrorInfo(
+                    code="persistence_error",
+                    message="Summary Cursor could not be updated.",
+                ),
+            )
+        self._running_cursor = new_cursor
         messages: list[ModelMessage] = [
             UserModelMessage(
                 content=memory_task_input(cursor=cursor, summaries=pending),
@@ -353,7 +398,7 @@ class MemoryManager:
                     status="Memory Task failed.",
                     processed_count=0,
                     memory_updated=memory_updated,
-                    cursor=cursor,
+                    cursor=new_cursor,
                     error=failure.error,
                 )
             messages.append(response.message)
@@ -373,26 +418,11 @@ class MemoryManager:
                         status="Memory Task failed.",
                         processed_count=0,
                         memory_updated=memory_updated,
-                        cursor=cursor,
+                        cursor=new_cursor,
                         error=ErrorInfo(code="tool_failed", message=tool_result.content),
                     )
                 if tool_call.name == "edit_file":
                     memory_updated = True
-        new_cursor = pending[-1].index
-        try:
-            await self._memory.write_summary_cursor(new_cursor)
-        except (OSError, UnicodeError, ValueError) as error:
-            self._capture_terminal_failure(error)
-            return MemoryTaskResult(
-                status="Memory Task failed.",
-                processed_count=0,
-                memory_updated=memory_updated,
-                cursor=cursor,
-                error=ErrorInfo(
-                    code="persistence_error",
-                    message="Summary Cursor could not be updated.",
-                ),
-            )
         count = len(pending)
         noun = "summary" if count == 1 else "summaries"
         outcome = "updated" if memory_updated else "unchanged"

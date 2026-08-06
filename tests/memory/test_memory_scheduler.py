@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from uuid import uuid4
@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 import myclaw.utils.scheduler as scheduler_module
+from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -31,6 +32,7 @@ from myclaw.provider.models import (
     ModelProvider,
     ModelRequest,
     ModelResponse,
+    ModelStreamEvent,
     ModelUsage,
 )
 from myclaw.tools.models import ModelToolCall
@@ -202,7 +204,7 @@ async def test_periodic_memory_task_does_not_borrow_a_foreground_session_log(
         code="model_failed",
         message="PRIVATE PERIODIC OUTPUT",
     )
-    assert result.cursor == 0
+    assert result.cursor == 1
     assert capsys.readouterr().err == "Memory Task failed code=model_failed\n"
     assert not (state.logs_directory / f"{SESSION_ID}.log").exists()
     await router.close()
@@ -525,7 +527,7 @@ def test_production_scheduler_clock_uses_the_rule_bearing_system_timezone(
 
 
 @pytest.mark.asyncio
-async def test_periodic_memory_edit_is_visible_on_disk_but_chat_uses_the_startup_snapshot(
+async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -596,8 +598,8 @@ async def test_periodic_memory_edit_is_visible_on_disk_but_chat_uses_the_startup
     first_chat = provider.stream_requests[0]
     assert isinstance(first_chat, ModelRequest)
     assert memory_view.output == updated_memory
-    assert startup_memory in first_chat.system_prompt
-    assert updated_memory not in first_chat.system_prompt
+    assert startup_memory not in first_chat.system_prompt
+    assert updated_memory in first_chat.system_prompt
     assert legacy_path.read_bytes() == legacy_memory
 
     restarted_provider = ScriptedFakeProvider(
@@ -618,6 +620,96 @@ async def test_periodic_memory_edit_is_visible_on_disk_but_chat_uses_the_startup
     restarted_chat = restarted_provider.stream_requests[0]
     assert isinstance(restarted_chat, ModelRequest)
     assert updated_memory in restarted_chat.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=Path.home() / ".myclaw")
+    startup_memory = state.long_term_memory_path.read_text(encoding="utf-8")
+    updated_memory = startup_memory.replace(
+        "## User Preference\n",
+        "## User Preference\n\nPrefers concise status reports.\n",
+    )
+    (agent_home / "config.toml").write_text(
+        VALID_CONFIG.replace(
+            "[tools.shell]\nenabled = true",
+            "[tools.shell]\nenabled = false",
+        ),
+        encoding="utf-8",
+    )
+    summaries = WorkspaceJsonlSummaryStore(state)
+    await summaries.append("The user prefers concise status reports.", NOW)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class SnapshotProvider(ScriptedFakeProvider):
+        async def stream(self, request: object) -> AsyncIterator[ModelStreamEvent]:
+            if isinstance(request, ModelRequest) and request.system_prompt == session_title_prompt():
+                raise ModelCallError(
+                    ErrorInfo(code="model_failed", message="No title response was scripted.")
+                )
+            self.stream_requests.append(request)
+            request_count = len(self.stream_requests)
+            if request_count == 1:
+                first_started.set()
+                await release_first.wait()
+            yield ModelCompleted(response=_response(f"Answer {request_count}."))
+
+    provider = SnapshotProvider(
+        completions=(
+            _response(
+                "",
+                tool_calls=(
+                    ModelToolCall(
+                        id="edit-memory",
+                        name="edit_file",
+                        arguments=json.dumps(
+                            {
+                                "path": str(state.long_term_memory_path),
+                                "old_text": startup_memory,
+                                "new_text": updated_memory,
+                            }
+                        ),
+                    ),
+                ),
+            ),
+            _response("Memory updated."),
+        )
+    )
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+
+    async def collect_first_turn() -> None:
+        _ = [event async for event in runtime.conversation.submit("First input.")]
+
+    first_turn = asyncio.create_task(collect_first_turn())
+    await first_started.wait()
+    dream = await runtime.management_dispatcher.dispatch("/dream")
+    assert dream.output is not None
+    assert updated_memory == state.long_term_memory_path.read_text(encoding="utf-8")
+    release_first.set()
+    await first_turn
+    _ = [event async for event in runtime.conversation.submit("Second input.")]
+    await runtime.close()
+
+    first_chat = provider.stream_requests[0]
+    second_chat = provider.stream_requests[1]
+    assert isinstance(first_chat, ModelRequest)
+    assert isinstance(second_chat, ModelRequest)
+    assert "Prefers concise status reports." not in first_chat.system_prompt
+    assert "Prefers concise status reports." in second_chat.system_prompt
 
 
 @pytest.mark.asyncio
@@ -680,11 +772,11 @@ async def test_periodic_failure_is_isolated_and_all_periodic_results_stay_silent
     await _wait_until(lambda: clock.sleeps == [5 * 60])
     clock.advance(5 * 60)
     await _wait_until(lambda: len(provider.complete_requests) == 1)
-    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 0
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
 
     await _wait_until(lambda: clock.sleeps == [5 * 60, 60 * 60])
     clock.advance(60 * 60)
-    await _wait_until(lambda: len(provider.complete_requests) == 2)
+    await asyncio.sleep(0)
     exit_repl.set()
     await repl
 
@@ -735,12 +827,19 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
     capture.close()
 
     assert cancelled.is_set()
+    assert await WorkspaceFileMemoryStore(_state(home)).read_summary_cursor() == 1
     assert asyncio.all_tasks() == existing_tasks
     assert not (agent_home / "logs").exists()
     with pytest.raises(RuntimeError, match="scheduler is closed"):
         scheduler.start()
     recovered = await manager.run_manual()
-    assert recovered.cursor == 1
+    assert recovered == MemoryTaskResult(
+        status="No pending summaries",
+        processed_count=0,
+        memory_updated=False,
+        cursor=1,
+    )
+    assert len(provider.complete_requests) == 1
 
 
 @pytest.mark.asyncio
@@ -765,13 +864,15 @@ async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
                 raise RuntimeError("technical Memory Task cleanup failure") from cancellation
             raise AssertionError("cleanup test wait returned unexpectedly")
 
+    provider = CleanupFailingProvider()
+    manager = _manager(
+        home=home,
+        provider=provider,
+        summaries=summaries,
+    )
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=_manager(
-            home=home,
-            provider=CleanupFailingProvider(),
-            summaries=summaries,
-        ),
+        manager=manager,
         schedule="0 * * * *",
         clock=clock,
     )
@@ -784,3 +885,12 @@ async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
 
     assert capsys.readouterr().err == "Memory Task scheduler cleanup failed\n"
     assert not state.logs_directory.exists()
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
+    recovered = await manager.run_manual()
+    assert recovered == MemoryTaskResult(
+        status="No pending summaries",
+        processed_count=0,
+        memory_updated=False,
+        cursor=1,
+    )
+    assert len(provider.complete_requests) == 1

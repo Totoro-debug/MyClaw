@@ -164,16 +164,24 @@ class ConversationSummaryManager:
         self._now = now
         self._new_uuid = new_uuid
 
-    async def prepare(self, session: Session) -> Session:
+    async def prepare(
+        self,
+        session: Session,
+        *,
+        system_prompt: str | None = None,
+    ) -> Session:
         with without_session_log():
-            return await self._prepare(session)
+            return await self._prepare(session, system_prompt=system_prompt)
 
-    async def _prepare(self, session: Session) -> Session:
+    async def _prepare(self, session: Session, *, system_prompt: str | None) -> Session:
         short_term = _short_term_messages(session)
         available_input = self._chat_context_window - self._chat_max_output
+        effective_system_prompt = (
+            self._chat_system_prompt if system_prompt is None else system_prompt
+        )
         system_tokens = estimate_input_tokens(
             RuntimeStatusInput(
-                system_prompt=self._chat_system_prompt,
+                system_prompt=effective_system_prompt,
                 retained_messages=(),
                 tool_definitions=(),
                 runtime_context="",
@@ -186,7 +194,12 @@ class ConversationSummaryManager:
                     message="Long-term Memory and system context exceed the chat input budget.",
                 )
             )
-        token_triggered = estimate_input_tokens(self._chat_input(session)) >= available_input
+        token_triggered = (
+            estimate_input_tokens(
+                self._chat_input(session, system_prompt=effective_system_prompt)
+            )
+            >= available_input
+        )
         message_triggered = len(short_term) >= self._message_threshold
         if not token_triggered and not message_triggered:
             return session
@@ -245,7 +258,12 @@ class ConversationSummaryManager:
                 )
             ) from error
 
-    def _chat_input(self, session: Session) -> RuntimeStatusInput:
+    def _chat_input(
+        self,
+        session: Session,
+        *,
+        system_prompt: str,
+    ) -> RuntimeStatusInput:
         short_term = _short_term_messages(session)
         current_user_index = _last_user_index(short_term)
         retained: list[str] = []
@@ -276,7 +294,7 @@ class ConversationSummaryManager:
             json.dumps(tool, ensure_ascii=False, separators=(",", ":")) for tool in self._tools
         )
         return RuntimeStatusInput(
-            system_prompt=self._chat_system_prompt,
+            system_prompt=system_prompt,
             retained_messages=tuple(retained),
             tool_definitions=tool_definitions,
             runtime_context="",

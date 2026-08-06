@@ -22,6 +22,7 @@ from myclaw.memory.memory_task import (
     MemoryReadFileTool,
     MemoryTaskModelSettings,
     MemoryTaskResult,
+    RuntimeMemory,
     WorkspaceFileMemoryStore,
 )
 from myclaw.provider.errors import ModelCallError
@@ -117,6 +118,16 @@ async def test_memory_store_atomically_replaces_exact_long_term_memory(
 
     assert await WorkspaceFileMemoryStore(_state(home)).read_long_term() == replacement
     assert (_state(home).long_term_memory_path).read_bytes() == replacement.encode("utf-8")
+
+
+def test_runtime_memory_keeps_snapshots_immutable_and_replaces_without_failure() -> None:
+    memory = RuntimeMemory("before")
+
+    first_snapshot = memory.snapshot()
+    memory.replace("after")
+
+    assert first_snapshot == "before"
+    assert memory.snapshot() == "after"
 
 
 def test_memory_tools_export_common_schemas_with_zero_retries(agent_home: Path) -> None:
@@ -269,7 +280,7 @@ async def test_manual_memory_task_does_not_borrow_a_foreground_session_log(
         code="model_failed",
         message="PRIVATE PROVIDER OUTPUT",
     )
-    assert result.cursor == 0
+    assert result.cursor == 1
     assert capsys.readouterr().err == "Memory Task failed code=model_failed\n"
     assert not (state.logs_directory / f"{SESSION_ID}.log").exists()
     await router.close()
@@ -327,7 +338,44 @@ async def test_memory_task_without_an_edit_advances_the_summary_cursor(
 
 
 @pytest.mark.asyncio
-async def test_memory_task_exact_edit_updates_long_term_memory_then_advances_cursor(
+async def test_memory_task_advances_the_summary_cursor_before_model_work(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
+    await summaries.append("A pending summary.", NOW)
+    memory = WorkspaceFileMemoryStore(_state(home))
+
+    class CursorObservingProvider(ScriptedFakeProvider):
+        async def complete(self, request: object) -> ModelResponse:
+            assert await memory.read_summary_cursor() == 1
+            return await super().complete(request)
+
+    provider = CursorObservingProvider(completions=(_response("No update needed."),))
+    manager = MemoryManager(
+        provider=provider,
+        summaries=summaries,
+        memory=memory,
+        long_term_path=_state(home).long_term_memory_path,
+        settings=MemoryTaskModelSettings(
+            model="memory-model",
+            max_output=512,
+            temperature=0.0,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        batch_size=10,
+    )
+
+    result = await manager.run_manual()
+
+    assert result.cursor == 1
+    assert await memory.read_summary_cursor() == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_task_preadvances_summary_cursor_before_exact_edit(
     agent_home: Path,
 ) -> None:
     home = AgentHome(agent_home)
@@ -453,7 +501,7 @@ async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
         status="Memory Task failed.",
         processed_count=0,
         memory_updated=False,
-        cursor=0,
+        cursor=1,
         error=ErrorInfo(
             code="tool_failed",
             message="Memory Tasks may access only Long-term Memory.",
@@ -463,11 +511,11 @@ async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
     request = provider.complete_requests[0]
     assert isinstance(request, ModelRequest)
     assert secret not in json.dumps(request.to_dict())
-    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 0
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
 
 
 @pytest.mark.asyncio
-async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
+async def test_required_memory_edit_failure_keeps_the_advanced_summary_cursor(
     agent_home: Path,
 ) -> None:
     home = AgentHome(agent_home)
@@ -479,9 +527,12 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
     original_memory = memory_path.read_bytes()
 
     def fail_replace(_target: Path, _content: str) -> None:
-        raise OSError("injected atomic replacement failure")
+        if _target == memory_path:
+            raise OSError("injected atomic replacement failure")
+        HOST_FILESYSTEM.atomic_replace_text(_target, _content)
 
     memory = WorkspaceFileMemoryStore(state, replace_text=fail_replace)
+    runtime_memory = RuntimeMemory("cached memory")
     provider = ScriptedFakeProvider(
         completions=(
             _response(
@@ -517,6 +568,7 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
             timeout_seconds=30,
         ),
         batch_size=10,
+        runtime_memory=runtime_memory,
     )
     capture = capture_diagnostics()
 
@@ -527,14 +579,15 @@ async def test_required_memory_edit_failure_does_not_advance_summary_cursor(
         status="Memory Task failed.",
         processed_count=0,
         memory_updated=False,
-        cursor=0,
+        cursor=1,
         error=ErrorInfo(
             code="tool_failed",
             message="Long-term Memory could not be updated.",
         ),
     )
     assert memory_path.read_bytes() == original_memory
-    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 0
+    assert runtime_memory.snapshot() == "cached memory"
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
     content = capture.text
     event_text = capture.event_text
     assert content.count(" ERROR ") == 1
@@ -635,7 +688,7 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
         status="Memory Task failed.",
         processed_count=0,
         memory_updated=False,
-        cursor=0,
+        cursor=1,
         error=ErrorInfo(
             code="tool_failed",
             message="Long-term Memory must be a regular Workspace State file.",
@@ -650,7 +703,7 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
     )
     assert secret not in model_payload
     assert outside.read_text(encoding="utf-8") == secret
-    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 0
+    assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
 
 
 @pytest.mark.asyncio
@@ -700,7 +753,7 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
         status="Memory Task is already running.",
         processed_count=0,
         memory_updated=False,
-        cursor=0,
+        cursor=1,
         error=ErrorInfo(
             code="memory_task_running",
             message="A Memory Task is already running.",
@@ -758,7 +811,7 @@ async def test_overlapping_manual_memory_task_ignores_a_corrupt_cursor(
         code="memory_task_running",
         message="A Memory Task is already running.",
     )
-    assert overlapping.cursor == 0
+    assert overlapping.cursor == 1
     assert len(provider.complete_requests) == 1
     assert first.cursor == 1
 
@@ -841,7 +894,7 @@ async def test_runtime_dream_uses_memory_route_with_static_default_fallback(
 
 
 @pytest.mark.asyncio
-async def test_dream_command_renders_model_failure_without_advancing_cursor(
+async def test_dream_command_renders_model_failure_after_advancing_cursor(
     agent_home: Path,
 ) -> None:
     home = AgentHome(agent_home)
@@ -876,9 +929,15 @@ async def test_dream_command_renders_model_failure_without_advancing_cursor(
 
     assert result.handled is True
     assert result.output == (
-        "model_failed: Memory model failed.\nprocessed_count: 0\nmemory_updated: false\ncursor: 0"
+        "model_failed: Memory model failed.\nprocessed_count: 0\nmemory_updated: false\ncursor: 1"
     )
-    assert await memory.read_summary_cursor() == 0
+    assert await memory.read_summary_cursor() == 1
+
+    retry = await memory_manager.run_manual()
+
+    assert retry.status == "No pending summaries"
+    assert retry.cursor == 1
+    assert len(provider.complete_requests) == 1
 
 
 @pytest.mark.asyncio
@@ -926,6 +985,7 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
         "cursor: 0"
     )
     assert await WorkspaceFileMemoryStore(_state(home)).read_summary_cursor() == 0
+    assert provider.complete_requests == []
     content = capture.text
     assert content.count(" ERROR ") == 1
     assert "Memory Task failed code=persistence_error" in content

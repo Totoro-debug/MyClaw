@@ -60,11 +60,13 @@ class ScheduledWorkRunner:
         new_uuid: Callable[[], UUID],
         tool_gateway_for: Callable[[Session], ToolGateway],
         externalize_result_for: Callable[[Session], ToolResultExternalizer] | None = None,
+        memory_snapshot: Callable[[], str] | None = None,
     ) -> None:
         self._provider = provider
         self._workspace_state = workspace_state
         self._workspace = workspace_state.workspace
         self._long_term_memory = long_term_memory
+        self._memory_snapshot = memory_snapshot
         self._settings = settings
         self._now = now
         self._new_uuid = new_uuid
@@ -72,6 +74,11 @@ class ScheduledWorkRunner:
         self._externalize_result_for = externalize_result_for
 
     async def run(self, task: ScheduledWork) -> ScheduledWorkRunResult:
+        long_term_memory = (
+            self._long_term_memory
+            if self._memory_snapshot is None
+            else self._memory_snapshot()
+        )
         try:
             session = self._load_or_create_session(task)
         except FileNotFoundError:
@@ -89,7 +96,7 @@ class ScheduledWorkRunner:
             return result
 
         try:
-            result = await self._run_once(task, session)
+            result = await self._run_once(task, session, long_term_memory)
         except asyncio.CancelledError:
             raise
         except BaseException as error:
@@ -111,11 +118,16 @@ class ScheduledWorkRunner:
         finally:
             session.close()
 
-    async def _run_once(self, task: ScheduledWork, session: Session) -> ScheduledWorkRunResult:
+    async def _run_once(
+        self,
+        task: ScheduledWork,
+        session: Session,
+        long_term_memory: str,
+    ) -> ScheduledWorkRunResult:
         gateway = self._tool_gateway_for(session)
         system_prompt = chat_system_prompt(
             workspace=self._workspace.path,
-            long_term_memory=self._long_term_memory,
+            long_term_memory=long_term_memory,
             tool_guidance=render_tool_guidance(gateway.schemas),
         )
         terminal_diagnostic: BaseException | None = None

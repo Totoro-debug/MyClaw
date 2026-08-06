@@ -41,6 +41,7 @@ from myclaw.memory.memory_scheduler import MemoryTaskScheduler
 from myclaw.memory.memory_task import (
     MemoryManager,
     MemoryTaskModelSettings,
+    RuntimeMemory,
     WorkspaceFileMemoryStore,
 )
 from myclaw.provider.model_router import Jitter, ModelRouter, RetryClock
@@ -298,6 +299,11 @@ class _DeferredConversationPort:
         tool_gateway: ToolGateway,
         on_foreground_terminal: Callable[[], None],
         history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
+        memory_snapshot: Callable[[], str] | None = None,
+        system_prompt_for_memory: Callable[[str], str] | None = None,
+        history_preparer_for_memory: (
+            Callable[[str], Callable[[Session], Awaitable[Session]]] | None
+        ) = None,
         before_submit: Callable[[], Awaitable[None]] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
     ) -> None:
@@ -310,6 +316,9 @@ class _DeferredConversationPort:
         self._title_prompt = title_prompt
         self._tool_gateway = tool_gateway
         self._history_preparer = history_preparer
+        self._memory_snapshot = memory_snapshot
+        self._system_prompt_for_memory = system_prompt_for_memory
+        self._history_preparer_for_memory = history_preparer_for_memory
         self._before_submit = before_submit
         self._on_foreground_terminal = on_foreground_terminal
         self._externalize_result = externalize_result
@@ -351,6 +360,9 @@ class _DeferredConversationPort:
                         title_prompt=self._title_prompt,
                         tool_gateway=self._tool_gateway,
                         history_preparer=self._history_preparer,
+                        memory_snapshot=self._memory_snapshot,
+                        system_prompt_for_memory=self._system_prompt_for_memory,
+                        history_preparer_for_memory=self._history_preparer_for_memory,
                         externalize_result=self._externalize_result,
                         workspace_state=self._session.workspace_state,
                         title_log_ready=title_log_ready.wait,
@@ -473,6 +485,7 @@ def _prepare_repl_runtime(
     workspace_state = WorkspaceState(workspace_identity)
     workspace_state.initialize(agent_home_root=agent_home.path)
     long_term_memory = workspace_state.long_term_memory_path.read_text(encoding="utf-8")
+    runtime_memory = RuntimeMemory(long_term_memory)
     memory_store = WorkspaceFileMemoryStore(workspace_state)
     session = Session.create(
         workspace_state,
@@ -528,11 +541,16 @@ def _prepare_repl_runtime(
         shell=configured_shell,
         scheduled_work=scheduled_work_tool,
     )
-    system_prompt = chat_system_prompt(
-        workspace=workspace_identity.path,
-        long_term_memory=long_term_memory,
-        tool_guidance=render_tool_guidance(tool_gateway.schemas),
-    )
+    tool_guidance = render_tool_guidance(tool_gateway.schemas)
+
+    def system_prompt_for(memory_snapshot: str) -> str:
+        return chat_system_prompt(
+            workspace=workspace_identity.path,
+            long_term_memory=memory_snapshot,
+            tool_guidance=tool_guidance,
+        )
+
+    system_prompt = system_prompt_for(runtime_memory.snapshot())
     resolved_memory = configuration.resolve_route("memory")
     summaries = WorkspaceJsonlSummaryStore(workspace_state)
     summary_manager = ConversationSummaryManager(
@@ -566,6 +584,7 @@ def _prepare_repl_runtime(
             timeout_seconds=resolved_memory.route.timeout,
         ),
         batch_size=configuration.memory.batch_size,
+        runtime_memory=runtime_memory,
     )
     scheduler_clock = (
         memory_scheduler_clock
@@ -596,11 +615,25 @@ def _prepare_repl_runtime(
             max_tool_result_chars=configuration.runtime.max_tool_result_chars,
         )
 
+    def history_preparer_for(
+        memory_snapshot: str,
+    ) -> Callable[[Session], Awaitable[Session]]:
+        prompt = system_prompt_for(memory_snapshot)
+
+        async def prepare(active_session: Session) -> Session:
+            return await summary_manager.prepare(
+                active_session,
+                system_prompt=prompt,
+            )
+
+        return prepare
+
     resolved_cron = configuration.resolve_route("cron")
     scheduled_work_runner = ScheduledWorkRunner(
         provider=router,
         workspace_state=workspace_state,
         long_term_memory=long_term_memory,
+        memory_snapshot=runtime_memory.snapshot,
         settings=ScheduledWorkModelSettings(
             model=resolved_cron.route.model,
             max_output=resolved_cron.route.max_output,
@@ -665,6 +698,9 @@ def _prepare_repl_runtime(
             title_prompt=session_title_prompt(),
             tool_gateway=session_tool_gateway,
             history_preparer=summary_manager.prepare,
+            memory_snapshot=runtime_memory.snapshot,
+            system_prompt_for_memory=system_prompt_for,
+            history_preparer_for_memory=history_preparer_for,
             on_foreground_terminal=capture_foreground_chat_status,
             externalize_result=_build_tool_result_externalizer(
                 session=active_session,
@@ -682,7 +718,7 @@ def _prepare_repl_runtime(
         resolved_chat=current_foreground_chat_status,
         next_input=lambda active_session: _runtime_status_input(
             active_session,
-            system_prompt=system_prompt,
+            system_prompt=system_prompt_for(runtime_memory.snapshot()),
             current_time=now(),
             session_id=active_session.session_id,
             tool_schemas=tool_gateway.schemas,
