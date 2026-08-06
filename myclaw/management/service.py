@@ -113,6 +113,7 @@ class RuntimeStatus:
     session_message_count: int
     last_consolidated: int
     cumulative_usage: dict[str, int]
+    schedule: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         require_nonnegative_int(self.uptime_seconds, field="uptime_seconds")
@@ -123,7 +124,7 @@ class RuntimeStatus:
         require_nonnegative_int(self.last_consolidated, field="last_consolidated")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "version": self.version,
             "chat_model": self.chat_model,
             "uptime_seconds": self.uptime_seconds,
@@ -134,6 +135,9 @@ class RuntimeStatus:
             "last_consolidated": self.last_consolidated,
             "cumulative_usage": dict(self.cumulative_usage),
         }
+        if self.schedule is not None:
+            result["schedule"] = dict(self.schedule)
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +172,7 @@ class RuntimeStatusService:
         resolved_chat: Callable[[], ResolvedChatStatus],
         next_input: Callable[[Session], RuntimeStatusInput],
         monotonic: Callable[[], float],
+        schedule_status: Callable[[], dict[str, object]] | None = None,
         version: str = __version__,
     ) -> None:
         self._session: Callable[[], Session]
@@ -178,6 +183,7 @@ class RuntimeStatusService:
         self._resolved_chat = resolved_chat
         self._next_input = next_input
         self._monotonic = monotonic
+        self._schedule_status = schedule_status
         self._started_at = monotonic()
         self._version = version
 
@@ -201,6 +207,11 @@ class RuntimeStatusService:
             session_message_count=len(session.messages),
             last_consolidated=session.last_consolidated,
             cumulative_usage=_active_session_usage(session),
+            schedule=(
+                None
+                if self._schedule_status is None
+                else dict(self._schedule_status())
+            ),
         )
 
 

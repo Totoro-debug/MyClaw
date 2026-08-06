@@ -55,6 +55,9 @@ class BaseTool:
         """Select the effective declared arguments before coercion and validation."""
         return arguments
 
+    def confirmation_finished(self) -> None:
+        """Release invocation-local state after confirmation reaches a terminal path."""
+
     @final
     def to_schema(self) -> OpenAIToolSchema:
         """Generate a detached OpenAI Function Calling schema."""

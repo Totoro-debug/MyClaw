@@ -362,6 +362,32 @@ def test_installed_myclaw_reports_unsafe_workspace_state_without_traceback(
     assert not (agent_home / "logs").exists()
 
 
+def test_installed_myclaw_reports_corrupt_schedule_state_without_traceback(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    agent_home.mkdir(parents=True)
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    state_path = workspace / ".myclaw"
+    state_path.mkdir()
+    schedule_path = state_path / "schedule.json"
+    schedule_path.write_text("{corrupt", encoding="utf-8")
+
+    result = run_installed_myclaw(agent_home, workspace=workspace)
+
+    assert result.returncode == 1
+    assert result.stdout.count("schedule_state_error") == 1
+    assert (
+        "Schedule state could not be loaded. Repair or move the file, then start MyClaw again."
+        in result.stdout
+    )
+    assert f"Path: {schedule_path}" in result.stdout
+    assert "{corrupt" not in result.stdout + result.stderr
+    assert "Traceback" not in result.stdout + result.stderr
+    assert result.stderr == ""
+    assert not (state_path / "logs").exists()
+
+
 def test_installed_myclaw_rejects_user_home_workspace_without_traceback(
     agent_home: Path,
 ) -> None:

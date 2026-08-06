@@ -10,7 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Literal, NoReturn, Protocol
 
-from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
+from myclaw.errors import ErrorInfo
 from myclaw.schedule.model import JobStatus, ScheduleJob, ScheduleJobState
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.validation import require_nonnegative_int, require_uuid4_string
@@ -23,15 +24,16 @@ class ScheduleStoreError(RuntimeError):
     """Base error for the Schedule Store boundary."""
 
 
-class ScheduleStateError(ScheduleStoreError):
+class ScheduleStateError(ScheduleStoreError, WorkspaceStateError):
     """Raised when the Workspace Schedule document cannot be loaded strictly."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        super().__init__(
-            "Schedule state could not be loaded. Repair or move the file, then start MyClaw "
-            f"again. Path: {path}"
+        self.error = ErrorInfo(
+            "schedule_state_error",
+            "Schedule state could not be loaded. Repair or move the file, then start MyClaw again.",
         )
+        Exception.__init__(self, self.error.message)
 
 
 class ScheduleStoreFaultedError(ScheduleStoreError):

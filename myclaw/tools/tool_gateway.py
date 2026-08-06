@@ -146,8 +146,9 @@ class ToolGateway:
                 return _refused_result(tool_call, message=reason)
 
         try:
-            prompt = self._confirmation_prompt(tool, normalized)
+            prompt = await self._confirmation_prompt(tool, normalized)
         except Exception as error:
+            tool.confirmation_finished()
             message = (
                 error.message
                 if isinstance(error, ToolError)
@@ -155,28 +156,31 @@ class ToolGateway:
             )
             return _error_result(tool_call, message=message)
         if prompt is not None:
-            request = self._confirmation_request(tool_call, prompt)
-            if self._confirmation is None:
-                return _refused_result(
+            try:
+                request = self._confirmation_request(tool_call, prompt)
+                if self._confirmation is None:
+                    return _refused_result(
+                        tool_call,
+                        message="Tool confirmation is unavailable.",
+                        confirmation=ToolConfirmationMetadata(request=request, decision=None),
+                    )
+                await self._notify_confirmation_requested(request)
+                decision = await self._request_confirmation(request)
+                metadata = ToolConfirmationMetadata(request=request, decision=decision)
+                if decision == "declined":
+                    return _refused_result(
+                        tool_call,
+                        message="Tool confirmation was declined.",
+                        confirmation=metadata,
+                    )
+                return await self._execute_after_approval(
                     tool_call,
-                    message="Tool confirmation is unavailable.",
-                    confirmation=ToolConfirmationMetadata(request=request, decision=None),
-                )
-            await self._notify_confirmation_requested(request)
-            decision = await self._request_confirmation(request)
-            metadata = ToolConfirmationMetadata(request=request, decision=decision)
-            if decision == "declined":
-                return _refused_result(
-                    tool_call,
-                    message="Tool confirmation was declined.",
+                    tool,
+                    normalized,
                     confirmation=metadata,
                 )
-            return await self._execute_after_approval(
-                tool_call,
-                tool,
-                normalized,
-                confirmation=metadata,
-            )
+            finally:
+                tool.confirmation_finished()
 
         return await self._execute(tool_call, tool, normalized, confirmation=None)
 
@@ -188,7 +192,7 @@ class ToolGateway:
         if inspect.isawaitable(result):
             await result
 
-    def _confirmation_prompt(
+    async def _confirmation_prompt(
         self,
         tool: BaseTool,
         normalized: JsonObject,
@@ -199,6 +203,8 @@ class ToolGateway:
         if provider is None:
             return None
         prompt = cast(Callable[..., object], provider)(**normalized)
+        if inspect.isawaitable(prompt):
+            prompt = await prompt
         if prompt is not None and not isinstance(prompt, ConfirmationPrompt):
             raise TypeError("Tool confirmation hook must return a ConfirmationPrompt or None")
         return prompt

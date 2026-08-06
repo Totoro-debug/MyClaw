@@ -16,6 +16,7 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
             "config_parse_error",
             "config_invalid",
             "persistence_error",
+            "schedule_state_error",
             "route_unavailable",
             "provider_auth_error",
             "provider_rate_limited",
