@@ -66,6 +66,11 @@ class WorkspaceState:
         return self.path / "scheduled-work.json"
 
     @property
+    def schedule_path(self) -> Path:
+        """Canonical Schedule Job state path."""
+        return self.path / "schedule.json"
+
+    @property
     def long_term_memory_path(self) -> Path:
         return self.memory_directory / "memory.md"
 

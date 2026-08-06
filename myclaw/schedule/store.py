@@ -1,0 +1,336 @@
+"""Workspace-owned strict Schedule Job state and mutation boundary."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
+from typing import Literal, NoReturn, Protocol
+
+from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.schedule.model import JobStatus, ScheduleJob, ScheduleJobState
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
+from myclaw.utils.validation import require_nonnegative_int, require_uuid4_string
+
+StoreHealth = Literal["available", "faulted"]
+ReplaceText = Callable[[Path, str], None]
+
+
+class ScheduleStoreError(RuntimeError):
+    """Base error for the Schedule Store boundary."""
+
+
+class ScheduleStateError(ScheduleStoreError):
+    """Raised when the Workspace Schedule document cannot be loaded strictly."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        super().__init__(
+            "Schedule state could not be loaded. Repair or move the file, then start MyClaw "
+            f"again. Path: {path}"
+        )
+
+
+class ScheduleStoreFaultedError(ScheduleStoreError):
+    """Raised when a Runtime-local Store has latched a mutation failure."""
+
+
+class ScheduleStaleRemovalError(ScheduleStoreError):
+    """Raised when the confirmed public Job snapshot changed before removal."""
+
+
+class ScheduleStore(Protocol):
+    """Public Store seam used by Schedule management and execution."""
+
+    @property
+    def path(self) -> Path: ...
+
+    @property
+    def health(self) -> StoreHealth: ...
+
+    @property
+    def revision(self) -> int: ...
+
+    async def snapshot(self) -> tuple[ScheduleJob, ...]: ...
+
+    async def public_snapshot(self) -> tuple[ScheduleJob, ...]: ...
+
+    async def add_user_job(self, job: ScheduleJob) -> ScheduleJob: ...
+
+    async def remove_user_job(
+        self,
+        job_id: str,
+        *,
+        expected: ScheduleJob | None = None,
+    ) -> bool: ...
+
+    async def commit_terminal(
+        self,
+        job_id: str,
+        *,
+        finished_at_ms: int,
+        status: JobStatus,
+        error: str | None = None,
+        now_ms: int | None = None,
+    ) -> ScheduleJob | None: ...
+
+    async def wait_for_change(self, revision: int) -> int: ...
+
+
+class WorkspaceScheduleStore:
+    """Strict, copy-on-write Schedule state for one Runtime and Workspace."""
+
+    def __init__(
+        self,
+        workspace_state: WorkspaceState,
+        *,
+        replace_text: ReplaceText | None = None,
+    ) -> None:
+        self.workspace_state = workspace_state
+        self.path = workspace_state.schedule_path
+        self._state_path = workspace_state.path
+        workspace_root = Path(workspace_state.workspace.path).resolve(strict=True)
+        try:
+            self._state_root = HOST_FILESYSTEM.require_owned_directory(
+                self._state_path,
+                within=workspace_root,
+            )
+            self._jobs = self._load_once()
+        except ScheduleStateError:
+            raise
+        except (OSError, UnicodeError, TypeError, ValueError) as error:
+            raise ScheduleStateError(self.path) from error
+        self._replace_text = (
+            HOST_FILESYSTEM.atomic_replace_text if replace_text is None else replace_text
+        )
+        self._condition = asyncio.Condition()
+        self._revision = 0
+        self._faulted = False
+
+    @property
+    def health(self) -> StoreHealth:
+        return "faulted" if self._faulted else "available"
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    async def snapshot(self) -> tuple[ScheduleJob, ...]:
+        async with self._condition:
+            return copy.deepcopy(self._jobs)
+
+    async def public_snapshot(self) -> tuple[ScheduleJob, ...]:
+        async with self._condition:
+            public_jobs = sorted(
+                (job for job in self._jobs if job.source == "user"),
+                key=lambda job: job.job_id,
+            )
+            return tuple(copy.deepcopy(job) for job in public_jobs)
+
+    async def add_user_job(self, job: ScheduleJob) -> ScheduleJob:
+        if job.source != "user":
+            raise ValueError("public Schedule mutations can add only user Jobs")
+        return await self._add_job(job)
+
+    async def add_system_job(self, job: ScheduleJob) -> ScheduleJob:
+        if job.source != "system":
+            raise ValueError("internal Schedule mutations can add only system Jobs")
+        return await self._add_job(job)
+
+    async def _add_job(self, job: ScheduleJob) -> ScheduleJob:
+        if not isinstance(job, ScheduleJob):
+            raise TypeError("job must be a ScheduleJob")
+        if job.created_at_ms != job.updated_at_ms:
+            raise ValueError("new Schedule Job timestamps must be equal")
+        if job.state != ScheduleJobState():
+            raise ValueError("new Schedule Job state must be empty")
+        async with self._condition:
+            self._ensure_available()
+            if any(existing.job_id == job.job_id for existing in self._jobs):
+                raise ValueError("Schedule Job ID already exists")
+            candidate = (*self._jobs, copy.deepcopy(job))
+            self._publish_locked(candidate)
+            return copy.deepcopy(job)
+
+    async def remove_user_job(
+        self,
+        job_id: str,
+        *,
+        expected: ScheduleJob | None = None,
+    ) -> bool:
+        return await self._remove(job_id, expected=expected, user_only=True)
+
+    async def remove_job(
+        self,
+        job_id: str,
+        *,
+        expected: ScheduleJob | None = None,
+    ) -> bool:
+        return await self._remove(job_id, expected=expected, user_only=False)
+
+    async def commit_terminal(
+        self,
+        job_id: str,
+        *,
+        finished_at_ms: int,
+        status: JobStatus,
+        error: str | None = None,
+        now_ms: int | None = None,
+    ) -> ScheduleJob | None:
+        require_uuid4_string(job_id, field="job_id")
+        require_nonnegative_int(finished_at_ms, field="finished_at_ms")
+        commit_now = finished_at_ms if now_ms is None else now_ms
+        require_nonnegative_int(commit_now, field="now_ms")
+        terminal_state = ScheduleJobState(
+            last_finished_at_ms=finished_at_ms,
+            last_status=status,
+            last_error=error,
+        )
+        async with self._condition:
+            self._ensure_available()
+            current = next((job for job in self._jobs if job.job_id == job_id), None)
+            if current is None:
+                return None
+            updated = replace(
+                current,
+                state=terminal_state,
+                updated_at_ms=max(current.updated_at_ms, commit_now),
+            )
+            candidate = tuple(updated if job.job_id == job_id else job for job in self._jobs)
+            self._publish_locked(candidate)
+            return copy.deepcopy(updated)
+
+    async def wait_for_change(self, revision: int) -> int:
+        require_nonnegative_int(revision, field="revision")
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: self._revision != revision or self._faulted
+            )
+            return self._revision
+
+    def _load_once(self) -> tuple[ScheduleJob, ...]:
+        try:
+            self.path.lstat()
+        except FileNotFoundError:
+            return ()
+        owned_path = HOST_FILESYSTEM.require_owned_regular_file(
+            self.path,
+            within=self._state_root,
+        )
+        content = owned_path.read_text(encoding="utf-8")
+        return _parse_document(content)
+
+    async def _remove(
+        self,
+        job_id: str,
+        *,
+        expected: ScheduleJob | None,
+        user_only: bool,
+    ) -> bool:
+        require_uuid4_string(job_id, field="job_id")
+        async with self._condition:
+            self._ensure_available()
+            current = next((job for job in self._jobs if job.job_id == job_id), None)
+            if current is None or (user_only and current.source != "user"):
+                return False
+            if expected is not None:
+                if expected.source != "user" or _public_job_key(current) != _public_job_key(expected):
+                    raise ScheduleStaleRemovalError("Schedule Job changed before removal")
+            candidate = tuple(job for job in self._jobs if job.job_id != job_id)
+            self._publish_locked(candidate)
+            return True
+
+    def _ensure_available(self) -> None:
+        if self._faulted:
+            raise ScheduleStoreFaultedError("Schedule Store is faulted")
+
+    def _publish_locked(self, candidate: tuple[ScheduleJob, ...]) -> None:
+        try:
+            encoded = _serialize_document(candidate)
+            if _parse_document(encoded) != candidate:
+                raise ValueError("Schedule mutation did not produce canonical state")
+            self._require_write_location()
+            self._replace_text(self.path, encoded)
+        except Exception:
+            self._faulted = True
+            self._condition.notify_all()
+            raise
+        self._jobs = copy.deepcopy(candidate)
+        self._revision += 1
+        self._condition.notify_all()
+
+    def _require_write_location(self) -> None:
+        workspace_root = Path(self.workspace_state.workspace.path).resolve(strict=True)
+        self._state_root = HOST_FILESYSTEM.require_owned_directory(
+            self._state_path,
+            within=workspace_root,
+        )
+        try:
+            self.path.lstat()
+        except FileNotFoundError:
+            return
+        HOST_FILESYSTEM.require_owned_regular_file(self.path, within=self._state_root)
+
+
+def _parse_document(content: str) -> tuple[ScheduleJob, ...]:
+    try:
+        loaded: object = json.loads(
+            content,
+            object_pairs_hook=_object_from_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, RecursionError, UnicodeError, ValueError) as error:
+        raise ValueError("Schedule state is not valid strict JSON") from error
+    if not isinstance(loaded, list):
+        raise ValueError("Schedule state root must be a JSON array")
+    jobs: list[ScheduleJob] = []
+    seen: set[str] = set()
+    for value in loaded:
+        if not isinstance(value, dict):
+            raise ValueError("Schedule state entries must be JSON objects")
+        job = ScheduleJob.from_dict(value)
+        if job.job_id in seen:
+            raise ValueError("Schedule state contains duplicate Job IDs")
+        seen.add(job.job_id)
+        jobs.append(job)
+    if [job.to_dict() for job in jobs] != loaded:
+        raise ValueError("Schedule state contains non-canonical values")
+    return tuple(jobs)
+
+
+def _serialize_document(jobs: tuple[ScheduleJob, ...]) -> str:
+    return json.dumps(
+        [job.to_dict() for job in jobs],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _object_from_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Schedule state contains duplicate object keys")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant {value}")
+
+
+def _public_job_key(job: ScheduleJob) -> tuple[object, ...]:
+    return (job.job_id, job.message, tuple(job.schedule.to_dict().items()))
+
+
+__all__ = [
+    "ScheduleStaleRemovalError",
+    "ScheduleStateError",
+    "ScheduleStore",
+    "ScheduleStoreError",
+    "ScheduleStoreFaultedError",
+    "WorkspaceScheduleStore",
+]
