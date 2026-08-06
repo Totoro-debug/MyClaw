@@ -479,7 +479,7 @@ async def test_foreground_model_failure_keeps_event_safe_without_log_redaction(
         message="The model request failed.",
     )
     content = _session_log_text(workspace, runtime.session_id)
-    assert content.count("Agent Turn failed code=model_failed type=ModelCallError") == 1
+    assert content.count("Agent Run failed code=model_failed type=ModelCallError") == 1
     assert "Traceback (most recent call last):" in content
     assert "ModelCallError: The model request failed." in content
     assert private_input not in content

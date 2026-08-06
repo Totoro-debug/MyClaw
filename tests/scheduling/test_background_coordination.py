@@ -24,6 +24,7 @@ from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkRunResult,
 )
 from myclaw.terminal.repl import run_repl
+from myclaw.tools.confirmation import ConfirmationDecision
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 NOW = datetime(2026, 8, 4, 11, 0, 0, tzinfo=LOCAL_TIMEZONE)
@@ -191,6 +192,9 @@ class _ForegroundConversation:
 
     async def cancel_active_turn(self) -> None:
         return None
+
+    def respond_to_confirmation(self, confirmation_id: UUID, decision: ConfirmationDecision) -> None:
+        del confirmation_id, decision
 
 
 @pytest.mark.asyncio

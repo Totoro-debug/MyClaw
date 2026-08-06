@@ -60,6 +60,20 @@ def test_tools_do_not_depend_on_provider() -> None:
     assert violations == []
 
 
+@pytest.mark.parametrize(
+    "path",
+    [PACKAGE_ROOT / "agent" / "events.py", PACKAGE_ROOT / "terminal" / "repl.py"],
+)
+def test_user_facing_agent_event_boundary_does_not_import_tool_confirmation(path: Path) -> None:
+    violations = [
+        f"{path.relative_to(PROJECT_ROOT)}:{line} imports {module}"
+        for module, line in _imports(path)
+        if module == "myclaw.tools.confirmation"
+    ]
+
+    assert violations == []
+
+
 def test_package_initializers_do_not_create_aggregate_import_entries() -> None:
     violations: list[str] = []
     for path in _python_files(PACKAGE_ROOT):

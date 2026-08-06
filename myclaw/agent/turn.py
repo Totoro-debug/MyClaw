@@ -530,7 +530,7 @@ def _log_persistence_failure(failure: Exception, *, operation: str) -> None:
     )
 
 
-def _log_artifact_failure(failure: ArtifactWriteError, *, tool_name: str) -> None:
+def _log_artifact_failure(failure: Exception, *, tool_name: str) -> None:
     logger.opt(exception=failure).error(
         "Tool Artifact persistence failed code=persistence_error tool={} type={}",
         tool_name,

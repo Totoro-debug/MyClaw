@@ -196,6 +196,9 @@ class _RecordingConversation:
     async def cancel_active_turn(self) -> None:
         self.cancelled = True
 
+    def respond_to_confirmation(self, confirmation_id: UUID, decision: str) -> None:
+        del confirmation_id, decision
+
     async def close(self) -> None:
         self.closed = True
 

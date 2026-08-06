@@ -12,7 +12,7 @@ from uuid import UUID
 
 from loguru import logger
 
-from myclaw.agent.events import AgentEvent, ConversationPort
+from myclaw.agent.events import AgentEvent, ConfirmationDecision, ConversationPort
 from myclaw.agent.prompts import (
     chat_system_prompt,
     render_tool_guidance,
@@ -394,6 +394,12 @@ class _DeferredConversationPort:
             return
         active.cancel()
 
+    def respond_to_confirmation(self, confirmation_id: UUID, decision: ConfirmationDecision) -> None:
+        delegate = self._delegate
+        if delegate is None:
+            raise ValueError("No foreground confirmation request is pending")
+        delegate.respond_to_confirmation(confirmation_id, decision)
+
     async def close(self) -> None:
         task = self._close_task
         if task is None:
@@ -404,11 +410,16 @@ class _DeferredConversationPort:
     async def _close_delegate(self) -> None:
         active = self._active_task
         active_done = self._active_done
+        delegate = self._delegate
         if active is not None and active is not asyncio.current_task() and not active.done():
-            active.cancel()
+            if delegate is None:
+                active.cancel()
+            else:
+                await delegate.cancel_active_turn()
+                if not active.done() and not active.cancelling():
+                    active.cancel()
         if active_done is not None:
             await active_done.wait()
-        delegate = self._delegate
         if delegate is None:
             return
         close = getattr(delegate, "close", None)
@@ -498,6 +509,7 @@ def _prepare_repl_runtime(
         temperature=configured_chat.temperature,
         reasoning_effort=configured_chat.reasoning_effort,
         timeout_seconds=configured_chat.timeout,
+        context_window=configured_chat.context_window,
     )
     router = ModelRouter(
         configuration=configuration,

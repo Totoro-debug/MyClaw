@@ -8,11 +8,37 @@ from uuid import UUID, uuid4
 
 from loguru import logger
 
-from myclaw.agent.events import AgentEvent
+from myclaw.agent.events import (
+    AgentEvent,
+    AgentEventPayload,
+    AgentEventType,
+    ConfirmationDecision,
+    ConfirmationRequestedPayload,
+    TextDeltaPayload,
+    ToolCompletedPayload,
+    ToolStartedPayload,
+    TurnCancelledPayload,
+    TurnCompletedPayload,
+    TurnFailedPayload,
+    TurnStartedPayload,
+)
+from myclaw.agent.run import (
+    AgentRun,
+    AgentRunCancelledPayload,
+    AgentRunCompletedPayload,
+    AgentRunConfirmationRequestedPayload,
+    AgentRunFailedPayload,
+    AgentRunInterface,
+    AgentRunModelSettings,
+    AgentRunPayload,
+    AgentRunStartedPayload,
+    AgentRunTextDeltaPayload,
+    AgentRunToolCompletedPayload,
+    AgentRunToolStartedPayload,
+)
 from myclaw.agent.turn import (
-    AgentTurn,
     ToolResultExternalizer,
-    agent_turn_event_type,
+    _log_artifact_failure,
     model_message_from_session,
 )
 from myclaw.agent.workspace_state import WorkspaceState
@@ -28,6 +54,7 @@ from myclaw.provider.models import (
     UserModelMessage,
 )
 from myclaw.session.session import Session
+from myclaw.tools.confirmation import ConfirmationChannel
 from myclaw.tools.tool_gateway import ToolGateway
 
 __all__ = ["ChatModelSettings", "StreamingConversationPort", "model_message_from_session"]
@@ -42,6 +69,7 @@ class ChatModelSettings:
     temperature: float
     reasoning_effort: ReasoningEffort | None
     timeout_seconds: int
+    context_window: int = 0
 
 
 class StreamingConversationPort:
@@ -59,6 +87,7 @@ class StreamingConversationPort:
         title_prompt: str | None = None,
         title_new_uuid: Callable[[], UUID] = uuid4,
         tool_gateway: ToolGateway | None = None,
+        agent_run: AgentRunInterface | None = None,
         history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
         memory_snapshot: Callable[[], str] | None = None,
         system_prompt_for_memory: Callable[[str], str] | None = None,
@@ -83,6 +112,7 @@ class StreamingConversationPort:
         self._memory_snapshot = memory_snapshot
         self._system_prompt_for_memory = system_prompt_for_memory
         self._history_preparer_for_memory = history_preparer_for_memory
+        self._agent_run = agent_run
         self._title_task: asyncio.Task[None] | None = None
         self._next_event_id = 0
         self._foreground_active = False
@@ -92,6 +122,7 @@ class StreamingConversationPort:
         self._close_task: asyncio.Task[None] | None = None
         self._system_prompt = system_prompt
         self._history_preparer = history_preparer
+        self._confirmation: ConfirmationChannel | None = None
 
     async def submit(self, text: str) -> AsyncGenerator[AgentEvent, None]:
         if self._close_task is not None:
@@ -105,7 +136,7 @@ class StreamingConversationPort:
         turn_done = asyncio.Event()
         self._active_turn_done = turn_done
         self._cancel_requested = False
-        turn = self._submit_turn(text)
+        turn = self._submit_turn(text, self._new_uuid())
         try:
             async for event in turn:
                 yield event
@@ -120,47 +151,75 @@ class StreamingConversationPort:
                 self._cancel_requested = False
                 self._foreground_active = False
 
-    async def _submit_turn(self, text: str) -> AsyncGenerator[AgentEvent, None]:
-        memory_snapshot = (
-            None if self._memory_snapshot is None else self._memory_snapshot()
+    async def _submit_turn(self, text: str, turn_id: UUID) -> AsyncGenerator[AgentEvent, None]:
+        confirmation = ConfirmationChannel(turn_id)
+        self._confirmation = confirmation
+        agent_run = self._agent_run
+        if agent_run is None:
+            agent_run = AgentRun(
+                provider=self._provider,
+                settings=AgentRunModelSettings(
+                    model=self._settings.model,
+                    max_output=self._settings.max_output,
+                    temperature=self._settings.temperature,
+                    reasoning_effort=self._settings.reasoning_effort,
+                    timeout_seconds=self._settings.timeout_seconds,
+                    context_window=self._settings.context_window,
+                ),
+                now=self._now,
+                new_uuid=self._new_uuid,
+                system_prompt=self._system_prompt,
+                tool_gateway=self._tool_gateway,
+                externalize_result=self._externalize_result,
+                memory_snapshot=self._memory_snapshot,
+                system_prompt_for_memory=self._system_prompt_for_memory,
+                history_preparer=self._history_preparer,
+                history_preparer_for_memory=self._history_preparer_for_memory,
+                after_user_published=self._start_title_for_first_user,
+                on_terminal_failure=_log_terminal_failure,
+                on_artifact_failure=lambda error, tool_name: _log_artifact_failure(
+                    error,
+                    tool_name=tool_name,
+                ),
+                cancel_requested=lambda: self._cancel_requested,
+            )
+            self._agent_run = agent_run
+        payloads = agent_run.run_agent(
+            self._session,
+            text,
+            route="chat",
+            stream=True,
+            confirmation=confirmation,
         )
-        system_prompt = self._system_prompt
-        history_preparer = self._history_preparer
-        if memory_snapshot is not None:
-            if self._system_prompt_for_memory is None:
-                raise RuntimeError("Memory snapshot requires a System Prompt factory")
-            system_prompt = self._system_prompt_for_memory(memory_snapshot)
-            if self._history_preparer_for_memory is not None:
-                history_preparer = self._history_preparer_for_memory(memory_snapshot)
-        turn = AgentTurn(
-            lane="foreground",
-            provider=self._provider,
-            session=self._session,
-            settings=self._settings,
-            now=self._now,
-            new_uuid=self._new_uuid,
-            system_prompt=system_prompt,
-            tool_gateway=self._tool_gateway,
-            history_preparer=history_preparer,
-            after_user_published=self._start_title_for_first_user,
-            cancel_requested=lambda: self._cancel_requested,
-            externalize_result=self._externalize_result,
-        )
-        turn_id = self._new_uuid()
-        payloads = turn.run(text)
         try:
             async for payload in payloads:
+                event_type, event_payload = _map_agent_run_payload(payload)
                 event = AgentEvent(
-                    type=agent_turn_event_type(payload),
+                    type=event_type,
                     event_id=self._next_event_id,
                     turn_id=turn_id,
                     created_at=self._now(),
-                    payload=payload,
+                    payload=event_payload,
                 )
                 self._next_event_id += 1
                 yield event
         finally:
-            await payloads.aclose()
+            close = getattr(payloads, "aclose", None)
+            if close is not None:
+                await close()
+            confirmation.close()
+            if self._confirmation is confirmation:
+                self._confirmation = None
+
+    def respond_to_confirmation(
+        self,
+        confirmation_id: UUID,
+        decision: ConfirmationDecision,
+    ) -> None:
+        confirmation = self._confirmation
+        if confirmation is None:
+            raise ValueError("No foreground confirmation request is pending")
+        confirmation.respond_to_confirmation(confirmation_id, decision)
 
     def _start_title_for_first_user(self, published: Session) -> None:
         if self._title_prompt is None or self._title_task is not None:
@@ -281,6 +340,9 @@ class StreamingConversationPort:
         if task is None or task.done():
             return
         self._cancel_requested = True
+        confirmation = self._confirmation
+        if confirmation is not None:
+            confirmation.close()
         if task is not asyncio.current_task():
             task.cancel()
 
@@ -322,3 +384,55 @@ async def _close_provider_stream(stream: AsyncIterator[ModelStreamEvent] | None)
 def _consume_task_exception(task: asyncio.Future[None]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _map_agent_run_payload(payload: AgentRunPayload) -> tuple[AgentEventType, AgentEventPayload]:
+    if isinstance(payload, AgentRunStartedPayload):
+        return "turn_started", TurnStartedPayload()
+    if isinstance(payload, AgentRunTextDeltaPayload):
+        return "text_delta", TextDeltaPayload(delta=payload.delta)
+    if isinstance(payload, AgentRunToolStartedPayload):
+        return "tool_started", ToolStartedPayload(
+            tool_call_id=payload.tool_call_id,
+            tool_name=payload.tool_name,
+            summary=payload.summary,
+        )
+    if isinstance(payload, AgentRunConfirmationRequestedPayload):
+        request = payload.request
+        return "confirmation_requested", ConfirmationRequestedPayload(
+            confirmation_id=request.confirmation_id,
+            turn_id=request.turn_id,
+            tool_call_id=request.tool_call_id,
+            tool_name=request.tool_name,
+            summary=request.summary,
+            details=request.details,
+            warnings=request.warnings,
+        )
+    if isinstance(payload, AgentRunToolCompletedPayload):
+        return "tool_completed", ToolCompletedPayload(
+            tool_call_id=payload.tool_call_id,
+            tool_name=payload.tool_name,
+            status=payload.status,
+            summary=payload.summary,
+        )
+    if isinstance(payload, AgentRunCompletedPayload):
+        return "turn_completed", TurnCompletedPayload(content=payload.content, usage=payload.usage)
+    if isinstance(payload, AgentRunFailedPayload):
+        return "turn_failed", TurnFailedPayload(error=payload.error)
+    if isinstance(payload, AgentRunCancelledPayload):
+        return "turn_cancelled", TurnCancelledPayload(partial_content=payload.partial_content)
+    raise TypeError("Unsupported Agent Run payload")
+
+
+def _log_terminal_failure(error: BaseException) -> None:
+    if isinstance(error, ModelCallError):
+        logger.opt(exception=error).error(
+            "Agent Run failed code={} type={}",
+            error.error.code,
+            type(error).__name__,
+        )
+        return
+    logger.opt(exception=error).error(
+        "Agent Run failed code=model_failed type={}",
+        type(error).__name__,
+    )

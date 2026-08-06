@@ -3,8 +3,9 @@
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from typing import Protocol
+from uuid import UUID
 
-from myclaw.agent.events import AgentEvent, ConversationPort
+from myclaw.agent.events import AgentEvent, ConfirmationDecision, ConversationPort
 from myclaw.session.session import Session
 
 
@@ -76,6 +77,12 @@ class SwitchableConversationPort:
     async def cancel_active_turn(self) -> None:
         if self._active_delegate is not None:
             await self._active_delegate.cancel_active_turn()
+
+    def respond_to_confirmation(self, confirmation_id: UUID, decision: ConfirmationDecision) -> None:
+        delegate = self._active_delegate
+        if delegate is None:
+            raise ValueError("No foreground confirmation request is pending")
+        delegate.respond_to_confirmation(confirmation_id, decision)
 
     async def close(self) -> None:
         task = self._close_task

@@ -184,6 +184,12 @@ class AgentRun:
         history_preparer_for_route: (
             Callable[[AgentRunRoute], Callable[[Session], Awaitable[Session]] | None] | None
         ) = None,
+        history_preparer_for_memory: (
+            Callable[[str], Callable[[Session], Awaitable[Session]] | None] | None
+        ) = None,
+        after_user_published: Callable[[Session], None] | None = None,
+        on_terminal_failure: Callable[[BaseException], None] | None = None,
+        on_artifact_failure: Callable[[Exception, str], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
         if tool_gateway is not None and tool_gateway_for is not None:
@@ -192,10 +198,13 @@ class AgentRun:
             summary_preparer is not None
             or history_preparer is not None
             or history_preparer_for_route is not None
+            or history_preparer_for_memory is not None
         ):
             raise ValueError("Provide only one Summary preparer source")
         if summary_preparer is not None and (
-            history_preparer is not None or history_preparer_for_route is not None
+            history_preparer is not None
+            or history_preparer_for_route is not None
+            or history_preparer_for_memory is not None
         ):
             raise ValueError("Provide only one Summary preparer source")
         self._provider = provider
@@ -213,6 +222,10 @@ class AgentRun:
         self._summary_preparer = summary_preparer
         self._history_preparer = history_preparer
         self._history_preparer_for_route = history_preparer_for_route
+        self._history_preparer_for_memory = history_preparer_for_memory
+        self._after_user_published = after_user_published
+        self._on_terminal_failure = on_terminal_failure
+        self._on_artifact_failure = on_artifact_failure
         self._cancel_requested = cancel_requested or (lambda: False)
 
     def run_agent(
@@ -258,6 +271,7 @@ class AgentRun:
             settings = self._route_settings(route)
             provider = self._route_provider(route)
             system_prompt = self._system_prompt
+            memory: str | None = None
             if self._memory_snapshot is not None:
                 memory = self._memory_snapshot()
                 if self._system_prompt_for_memory is None:
@@ -288,6 +302,8 @@ class AgentRun:
             started_emitted = True
             session.add_message("user", input)
             user_published = True
+            if self._after_user_published is not None:
+                self._after_user_published(session)
             current_user = session.messages[-1]
             if self._cancel_requested():
                 cancelled_content = "".join(partial_content)
@@ -299,12 +315,16 @@ class AgentRun:
                 return
             while True:
                 partial_content.clear()
+                history_preparer = self._history_preparer
+                if memory is not None and self._history_preparer_for_memory is not None:
+                    history_preparer = self._history_preparer_for_memory(memory)
                 prepared_session = await self._prepare_summary(
                     session,
                     route,
                     settings,
                     system_prompt,
                     frozen_tools,
+                    history_preparer=history_preparer,
                 )
                 if prepared_session is not session:
                     raise RuntimeError("Conversation Summary replaced the active Session")
@@ -472,6 +492,7 @@ class AgentRun:
                 terminal_emitted = True
                 yield AgentRunCancelledPayload(partial_content=cancelled_content)
                 return
+            self._capture_terminal_failure(failure)
             self._repair_failed(session, pending_tool_calls)
             if user_published:
                 self._safe_add_failed_assistant(session, partial_content, stream, failure)
@@ -487,6 +508,7 @@ class AgentRun:
             await _close_iterator(events)
             events = None
             generic_failure = _model_failure()
+            self._capture_terminal_failure(generic_failure)
             self._repair_failed(session, pending_tool_calls)
             if user_published:
                 self._safe_add_failed_assistant(session, partial_content, stream, generic_failure)
@@ -498,6 +520,33 @@ class AgentRun:
             terminal_emitted = True
             yield AgentRunFailedPayload(error=generic_failure.error)
             return
+        except asyncio.CancelledError:
+            await _close_iterator(events)
+            events = None
+            if self._cancel_requested():
+                cancelled_content = "".join(partial_content)
+                persisted = self._repair_cancelled(
+                    session,
+                    partial_content,
+                    pending_tool_calls,
+                    persisted=persisted,
+                )
+                if not started_emitted:
+                    yield AgentRunStartedPayload()
+                    started_emitted = True
+                terminal_emitted = True
+                yield AgentRunCancelledPayload(partial_content=cancelled_content)
+                return
+            try:
+                self._repair_cancelled(
+                    session,
+                    partial_content,
+                    pending_tool_calls,
+                    persisted=persisted,
+                )
+            except BaseException:
+                pass
+            raise
         except BaseException:
             await _close_iterator(events)
             if not terminal_emitted:
@@ -511,6 +560,10 @@ class AgentRun:
                 except BaseException:
                     pass
             raise
+
+    def _capture_terminal_failure(self, failure: BaseException) -> None:
+        if self._on_terminal_failure is not None:
+            self._on_terminal_failure(failure)
 
     def _route_provider(self, route: AgentRunRoute) -> ModelProvider:
         if isinstance(self._provider, Mapping):
@@ -574,6 +627,7 @@ class AgentRun:
         settings: AgentRunModelSettings,
         system_prompt: str,
         tools: tuple[OpenAIToolSchema, ...],
+        history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
     ) -> Session:
         if self._summary_preparer_for_route is not None:
             return await self._summary_preparer_for_route(
@@ -586,7 +640,7 @@ class AgentRun:
             )
         if self._summary_preparer is not None:
             return await self._summary_preparer(session, route)
-        preparer = self._history_preparer
+        preparer = history_preparer
         if self._history_preparer_for_route is not None:
             preparer = self._history_preparer_for_route(route)
         if preparer is None:
@@ -678,7 +732,9 @@ class AgentRun:
     ) -> ToolResult:
         try:
             result = externalize_result(result)
-        except Exception:
+        except Exception as failure:
+            if self._on_artifact_failure is not None:
+                self._on_artifact_failure(failure, result.name)
             result = ToolResult(
                 tool_call_id=result.tool_call_id,
                 name=result.name,

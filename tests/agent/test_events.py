@@ -6,6 +6,7 @@ import pytest
 
 from myclaw.agent.events import (
     AgentEvent,
+    ConfirmationRequestedPayload,
     TextDeltaPayload,
     ToolStartedPayload,
 )
@@ -35,4 +36,29 @@ def test_agent_events_reject_invalid_envelopes_payload_pairs_and_summaries() -> 
             tool_call_id="call_123",
             tool_name="read_file",
             summary="x" * 241,
+        )
+
+    confirmation = ConfirmationRequestedPayload(
+        confirmation_id=UUID("16fd2706-8baf-4334-8c7f-ada847da0314"),
+        turn_id=valid.turn_id,
+        tool_call_id="call_confirm",
+        tool_name="schedule",
+        summary="Add a Schedule Job",
+        details={"message": "Remember this"},
+        warnings=("This changes Workspace State.",),
+    )
+    AgentEvent(
+        type="confirmation_requested",
+        event_id=4,
+        turn_id=valid.turn_id,
+        created_at=valid.created_at,
+        payload=confirmation,
+    )
+    with pytest.raises(ValueError, match="turn_id does not match"):
+        AgentEvent(
+            type="confirmation_requested",
+            event_id=4,
+            turn_id=UUID("0f8fad5b-d9cb-469f-a165-70867728950e"),
+            created_at=valid.created_at,
+            payload=confirmation,
         )

@@ -1,7 +1,8 @@
 """Typed Agent Events emitted through the Conversation Port."""
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol
 from uuid import UUID
@@ -10,12 +11,16 @@ from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ModelUsage
 from myclaw.session.session import Session
 from myclaw.tools.models import ToolResultStatus
+from myclaw.utils.json_types import JsonObject
 from myclaw.utils.validation import require_aware_datetime, require_nonnegative_int, require_uuid4
+
+type ConfirmationDecision = Literal["approved", "declined"]
 
 type AgentEventType = Literal[
     "turn_started",
     "text_delta",
     "tool_started",
+    "confirmation_requested",
     "tool_completed",
     "turn_completed",
     "turn_failed",
@@ -53,6 +58,50 @@ class ToolStartedPayload:
 
     def __post_init__(self) -> None:
         _require_summary(self.summary, field="summary")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ConfirmationRequestedPayload:
+    confirmation_id: UUID
+    turn_id: UUID
+    tool_call_id: str
+    tool_name: str
+    summary: str
+    _details: JsonObject = field(repr=False)
+    warnings: tuple[str, ...] = ()
+
+    def __init__(
+        self,
+        *,
+        confirmation_id: UUID,
+        turn_id: UUID,
+        tool_call_id: str,
+        tool_name: str,
+        summary: str,
+        details: JsonObject,
+        warnings: tuple[str, ...] = (),
+    ) -> None:
+        require_uuid4(confirmation_id, field="confirmation_id")
+        require_uuid4(turn_id, field="turn_id")
+        _require_summary(summary, field="summary")
+        if not isinstance(details, dict):
+            raise TypeError("details must be a JSON object")
+        if not isinstance(warnings, (tuple, list)) or any(
+            not isinstance(item, str) for item in warnings
+        ):
+            raise TypeError("warnings must be a sequence of strings")
+        object.__setattr__(self, "confirmation_id", confirmation_id)
+        object.__setattr__(self, "turn_id", turn_id)
+        object.__setattr__(self, "tool_call_id", tool_call_id)
+        object.__setattr__(self, "tool_name", tool_name)
+        object.__setattr__(self, "summary", summary)
+        object.__setattr__(self, "_details", deepcopy(details))
+        object.__setattr__(self, "warnings", tuple(warnings))
+
+    @property
+    def details(self) -> JsonObject:
+        """Return a detached view of the normalized operation details."""
+        return deepcopy(self._details)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +148,7 @@ type AgentEventPayload = (
     TurnStartedPayload
     | TextDeltaPayload
     | ToolStartedPayload
+    | ConfirmationRequestedPayload
     | ToolCompletedPayload
     | TurnCompletedPayload
     | TurnFailedPayload
@@ -110,6 +160,7 @@ _EVENT_PAYLOAD_TYPES: dict[AgentEventType, type[object]] = {
     "turn_started": TurnStartedPayload,
     "text_delta": TextDeltaPayload,
     "tool_started": ToolStartedPayload,
+    "confirmation_requested": ConfirmationRequestedPayload,
     "tool_completed": ToolCompletedPayload,
     "turn_completed": TurnCompletedPayload,
     "turn_failed": TurnFailedPayload,
@@ -136,9 +187,24 @@ class AgentEvent:
         if not isinstance(self.payload, expected_payload):
             msg = f"payload does not match event type {self.type}"
             raise ValueError(msg)
+        if (
+            isinstance(self.payload, ConfirmationRequestedPayload)
+            and self.payload.turn_id != self.turn_id
+        ):
+            raise ValueError("confirmation payload turn_id does not match event turn_id")
 
 
-class ConversationPort(Protocol):
+class ConfirmationResponsePort(Protocol):
+    """Respond to one pending Tool Confirmation without creating a user message."""
+
+    def respond_to_confirmation(
+        self,
+        confirmation_id: UUID,
+        decision: ConfirmationDecision,
+    ) -> None: ...
+
+
+class ConversationPort(ConfirmationResponsePort, Protocol):
     """Submit user input and emit ordered Agent Events."""
 
     def submit(self, text: str) -> AsyncIterator[AgentEvent]: ...
