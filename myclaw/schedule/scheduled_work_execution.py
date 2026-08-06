@@ -27,7 +27,7 @@ _SESSION_FAILURE = ErrorInfo(
 
 @dataclass(frozen=True, slots=True)
 class ScheduledWorkModelSettings:
-    """Resolved provider-neutral settings for the cron Model Route."""
+    """Resolved provider-neutral settings for the schedule Model Route."""
 
     model: str
     max_output: int

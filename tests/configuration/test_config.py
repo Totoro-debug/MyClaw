@@ -55,7 +55,7 @@ temperature = 0.2
 reasoning_effort = "medium"
 timeout = 120
 
-[models.routes.cron]
+[models.routes.schedule]
 provider_id = "openai-local"
 model = "replace-with-a-model-id"
 context_window = 200000
@@ -108,6 +108,56 @@ context_window = 8192
 max_output = 1024
 temperature = 0
 timeout = 30
+"""
+
+PROJECTED_CONFIG = """unexpected = true
+
+[runtime]
+max_tool_result_chars = 60000
+ignored_runtime_field = true
+
+[models]
+ignored_models_field = true
+
+[models.providers.primary]
+protocol = "openai-compatible"
+base_url = "https://models.example/v1"
+api_key = "minimal-secret"
+models = ["small-model"]
+ignored_provider_field = true
+
+[models.routes.default]
+provider_id = "primary"
+model = "small-model"
+context_window = 8192
+max_output = 1024
+temperature = 0
+timeout = 30
+ignored_route_field = true
+
+[models.routes.cron]
+this_legacy_route_is_ignored = true
+
+[models.routes.future]
+this_undefined_route_is_ignored = true
+"""
+
+SCHEDULE_ROUTE = """
+
+[models.providers.schedule-provider]
+protocol = "openai-compatible"
+base_url = "https://schedule.example/v1"
+api_key = "schedule-secret"
+models = ["schedule-model"]
+
+[models.routes.schedule]
+provider_id = "schedule-provider"
+model = "schedule-model"
+context_window = 100000
+max_output = 4096
+temperature = 0.1
+reasoning_effort = "high"
+timeout = 90
 """
 
 REDACTION_CONFIG = """# User Configuration
@@ -287,7 +337,7 @@ def test_generated_configuration_scaffolds_one_provider_and_all_model_routes(
     )
 
     routes = models.routes
-    assert set(routes) == {"default", "chat", "memory", "cron"}
+    assert set(routes) == {"default", "chat", "memory", "schedule"}
     for route in routes.values():
         assert (
             route.provider_id,
@@ -306,6 +356,66 @@ def test_generated_configuration_scaffolds_one_provider_and_all_model_routes(
             "medium",
             120,
         )
+
+
+def test_configuration_projects_undefined_fields_and_legacy_routes(agent_home: Path) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(PROJECTED_CONFIG, encoding="utf-8")
+
+    configuration = loader.load_for_startup()
+
+    assert set(configuration.models.routes) == {"default"}
+    assert set(configuration.models.providers) == {"primary"}
+    assert configuration.runtime.max_tool_result_chars == 60000
+
+
+def test_startup_gate_does_not_resolve_provider_or_model_usability(agent_home: Path) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    content = VALID_CONFIG.replace('protocol = "anthropic"', 'protocol = "future-protocol"')
+    loader.path.write_text(content, encoding="utf-8")
+
+    configuration = loader.load_for_startup()
+
+    assert configuration.models.routes["default"].provider_id == "anthropic-default"
+
+
+def test_schedule_route_resolves_directly_and_falls_back_to_default_when_unusable(
+    agent_home: Path,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(VALID_CONFIG + SCHEDULE_ROUTE, encoding="utf-8")
+    configuration = loader.load()
+
+    resolved = configuration.resolve_route("schedule")
+
+    assert (
+        resolved.requested_route,
+        resolved.selected_route,
+        resolved.provider.provider_id,
+        resolved.route.model,
+        resolved.used_default,
+    ) == ("schedule", "schedule", "schedule-provider", "schedule-model", False)
+
+    loader.path.write_text(
+        (VALID_CONFIG + SCHEDULE_ROUTE).replace(
+            'protocol = "openai-compatible"', 'protocol = "future-protocol"', 1
+        ),
+        encoding="utf-8",
+    )
+    configuration = loader.load()
+
+    fallback = configuration.resolve_route("schedule")
+
+    assert (
+        fallback.requested_route,
+        fallback.selected_route,
+        fallback.provider.provider_id,
+        fallback.route.model,
+        fallback.used_default,
+    ) == ("schedule", "default", "anthropic-default", "claude-model", True)
 
 
 def test_failed_startup_generation_leaves_no_partial_configuration(
@@ -423,7 +533,7 @@ def test_config_view_returns_safe_parse_error_and_conservatively_redacted_raw_te
     assert "second-plaintext-key" not in view.error.message
 
 
-def test_config_view_keeps_schema_invalid_configuration_inspectable(agent_home: Path) -> None:
+def test_config_view_keeps_undefined_configuration_inspectable(agent_home: Path) -> None:
     loader = ConfigLoader(AgentHome(agent_home))
     loader.ensure_default()
     content = REDACTION_CONFIG.replace(
@@ -443,7 +553,7 @@ def test_config_view_keeps_schema_invalid_configuration_inspectable(agent_home: 
 
 @pytest.mark.parametrize(
     ("content", "field"),
-    [
+    (
         (VALID_CONFIG + "\n[unexpected]\nvalue = true\n", "unexpected"),
         (
             VALID_CONFIG.replace(
@@ -479,11 +589,36 @@ def test_config_view_keeps_schema_invalid_configuration_inspectable(agent_home: 
             VALID_CONFIG.replace("timeout = 120", "timeout = 120\nunknown = true"),
             "models.routes.default.unknown",
         ),
-        (VALID_CONFIG.replace("routes.default", "routes.summary"), "models.routes.summary"),
         (
-            VALID_CONFIG.replace("providers.anthropic-default", "providers.Bad_ID"),
-            "models.providers.Bad_ID",
+            VALID_CONFIG + "\n[models.routes.cron]\nlegacy = true\n",
+            "models.routes.cron",
         ),
+        (
+            VALID_CONFIG + "\n[models.routes.future]\nfuture = true\n",
+            "models.routes.future",
+        ),
+    ),
+)
+def test_config_view_reports_undefined_fields(
+    agent_home: Path,
+    content: str,
+    field: str,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(content, encoding="utf-8")
+
+    view = loader.view()
+
+    assert view.error is not None
+    assert view.error.code == "config_invalid"
+    assert field in view.error.message
+    assert "sk-ant-secret" not in view.redacted_content
+
+
+@pytest.mark.parametrize(
+    ("content", "field"),
+    [
         (
             VALID_CONFIG.replace("max_tool_result_chars = 60000", "max_tool_result_chars = true"),
             "runtime.max_tool_result_chars",

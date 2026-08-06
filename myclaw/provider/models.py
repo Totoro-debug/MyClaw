@@ -9,7 +9,7 @@ from myclaw.tools.models import ModelToolCall
 from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.utils.validation import require_nonnegative_int, require_uuid4
 
-type ModelRoute = Literal["default", "chat", "memory", "cron"]
+type ModelRoute = Literal["default", "chat", "memory", "schedule"]
 type ReasoningEffort = Literal["low", "medium", "high"]
 type FinishReason = Literal["stop", "tool_calls", "length", "cancelled"]
 

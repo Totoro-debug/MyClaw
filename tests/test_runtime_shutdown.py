@@ -1224,7 +1224,7 @@ async def test_runtime_interrupt_keeps_background_work_alive_and_exit_settles_it
                     usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
                     finish_reason="stop",
                 )
-            assert request.route == "cron"
+            assert request.route == "schedule"
             self._background_calls += 1
             if self._background_calls == 1:
                 self.first_background_started.set()

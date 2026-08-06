@@ -15,7 +15,7 @@ from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ConfigError, ConfigLoader, ProviderConfiguration
+from myclaw.config.config import ConfigLoader, ProviderConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.logging.process import configure_process_logging
 from myclaw.provider.errors import ModelCallError
@@ -921,7 +921,8 @@ async def test_runtime_status_estimate_includes_the_interrupted_history_marker(
     )
 
 
-def test_prepared_repl_rejects_an_unusable_default_even_when_chat_is_usable(
+@pytest.mark.asyncio
+async def test_prepared_repl_defers_an_unusable_default_until_route_use(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -935,18 +936,62 @@ def test_prepared_repl_rejects_an_unusable_default_even_when_chat_is_usable(
     (agent_home / "config.toml").write_text(content, encoding="utf-8")
     configuration = ConfigLoader(home).load()
 
-    with pytest.raises(ConfigError) as raised:
-        prepare_repl_runtime(
-            agent_home=home,
-            workspace=workspace,
-            configuration=configuration,
-            provider_factory=unexpected_provider_factory,
-            now=FakeClock(NOW).now,
-            new_uuid=iter((SESSION_UUID,)).__next__,
-        )
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=unexpected_provider_factory,
+        now=FakeClock(NOW).now,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
 
-    assert raised.value.error.code == "route_unavailable"
-    assert "chat-secret" not in str(raised.value)
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_prepared_repl_uses_the_effective_fallback_route_budget(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    content = CHAT_ROUTE_CONFIG.replace(
+        'protocol = "openai-compatible"',
+        'protocol = "future-protocol"',
+        1,
+    ).replace(
+        "context_window = 100000\nmax_output = 4096",
+        "context_window = 1024\nmax_output = 1023",
+    )
+    (agent_home / "config.toml").write_text(content, encoding="utf-8")
+    response = ModelResponse(
+        message=AssistantModelMessage(content="Fallback budget used."),
+        usage=ModelUsage(input_tokens=3, output_tokens=3, total_tokens=6),
+        finish_reason="stop",
+    )
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(events=(ModelCompleted(response=response),)),
+            StreamScript(events=(ModelCompleted(response=response),)),
+        )
+    )
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=FakeClock(NOW).now,
+        new_uuid=uuid4,
+    )
+
+    events = [event async for event in runtime.conversation.submit("Use the fallback budget.")]
+    await runtime.close()
+
+    assert [event.type for event in events] == ["turn_started", "turn_completed"]
+    assert provider.stream_requests
+    for request in provider.stream_requests:
+        assert isinstance(request, ModelRequest)
+        assert request.model == "claude-model"
 
 
 @pytest.mark.asyncio

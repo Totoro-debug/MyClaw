@@ -144,7 +144,7 @@ temperature = 0.2
 reasoning_effort = "medium"
 timeout = 120
 
-[models.routes.cron]
+[models.routes.schedule]
 provider_id = "openai-local"
 model = "replace-with-a-model-id"
 context_window = 200000
@@ -234,7 +234,7 @@ async def test_config_command_renders_safe_persistence_failure(
 
 
 @pytest.mark.asyncio
-async def test_config_command_keeps_schema_invalid_source_inspectable(
+async def test_config_command_keeps_undefined_source_inspectable(
     agent_home: Path,
 ) -> None:
     home = AgentHome(agent_home)

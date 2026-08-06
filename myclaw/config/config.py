@@ -23,7 +23,7 @@ DEFAULT_CONFIG_TEMPLATE: Final = load_template("default-config.md")
 type ReasoningEffort = Literal["low", "medium", "high"]
 
 _PROVIDER_ID_PATTERN: Final = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-_ROUTE_NAMES: Final = frozenset({"default", "chat", "memory", "cron"})
+_ROUTE_NAMES: Final = frozenset({"default", "chat", "memory", "schedule"})
 _API_KEY_FIELD_PATTERN: Final = re.compile(r"api[-_]?key", flags=re.IGNORECASE)
 _TOML_KEY_SEGMENT_PATTERN: Final = r"""(?:[a-z0-9_-]+|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*')"""
 
@@ -138,10 +138,20 @@ class UserConfiguration:
     tools: ToolsConfiguration
     models: ModelsConfiguration
 
+    def configured_route(self, requested_route: str) -> RouteConfiguration:
+        """Return structural settings without evaluating provider usability."""
+        _require_supported_route(requested_route)
+        route = self.models.routes.get(requested_route)
+        if route is not None:
+            return route
+        default = self.models.routes.get("default")
+        if default is None:
+            raise _route_unavailable_error(self.models)
+        return default
+
     def resolve_route(self, requested_route: str) -> ResolvedModelRoute:
         """Resolve a Model Route, falling back to a usable default when permitted."""
-        if requested_route not in _ROUTE_NAMES:
-            _invalid("models.routes", "was requested with an unsupported route name")
+        _require_supported_route(requested_route)
 
         candidate = _usable_route(self.models, requested_route)
         selected_route = requested_route
@@ -149,13 +159,7 @@ class UserConfiguration:
             candidate = _usable_route(self.models, "default")
             selected_route = "default"
         if candidate is None:
-            message = "Default Model Route is unavailable."
-            if "default" not in self.models.routes:
-                message = (
-                    "Default Model Route is missing. "
-                    "Add [models.routes.default] to User Configuration."
-                )
-            raise ConfigError(ErrorInfo("route_unavailable", message))
+            raise _route_unavailable_error(self.models)
         provider, route = candidate
         return ResolvedModelRoute(
             requested_route=requested_route,
@@ -204,6 +208,20 @@ def _reject_unknown(table: Mapping[str, object], allowed: set[str], prefix: str)
     if unknown:
         field = f"{prefix}.{unknown[0]}" if prefix else unknown[0]
         _invalid(field, "is not recognized")
+
+
+def _require_supported_route(requested_route: str) -> None:
+    if requested_route not in _ROUTE_NAMES:
+        _invalid("models.routes", "was requested with an unsupported route name")
+
+
+def _route_unavailable_error(models: ModelsConfiguration) -> ConfigError:
+    message = "Default Model Route is unavailable."
+    if "default" not in models.routes:
+        message = (
+            "Default Model Route is missing. Add [models.routes.default] to User Configuration."
+        )
+    return ConfigError(ErrorInfo("route_unavailable", message))
 
 
 def _string(value: object, field: str, *, nonempty: bool = False) -> str:
@@ -308,7 +326,6 @@ def _redact_unparsed_content(content: str) -> str:
 
 def _parse_runtime(document: Mapping[str, object]) -> RuntimeConfiguration:
     table = _table(document.get("runtime", {}), "runtime")
-    _reject_unknown(table, {"max_tool_result_chars"}, "runtime")
     return RuntimeConfiguration(
         max_tool_result_chars=_integer(
             table.get("max_tool_result_chars", 50_000),
@@ -321,11 +338,6 @@ def _parse_runtime(document: Mapping[str, object]) -> RuntimeConfiguration:
 
 def _parse_memory(document: Mapping[str, object]) -> MemoryConfiguration:
     table = _table(document.get("memory", {}), "memory")
-    _reject_unknown(
-        table,
-        {"consolidation_message_threshold", "batch_size", "schedule"},
-        "memory",
-    )
     schedule = _string(table.get("schedule", "0 * * * *"), "memory.schedule")
     if len(schedule.split()) != 5 or not croniter.is_valid(schedule):
         _invalid("memory.schedule", "must be a valid five-field cron expression")
@@ -348,12 +360,10 @@ def _parse_memory(document: Mapping[str, object]) -> MemoryConfiguration:
 
 def _parse_tools(document: Mapping[str, object]) -> ToolsConfiguration:
     table = _table(document.get("tools", {}), "tools")
-    _reject_unknown(table, {"web", "shell"}, "tools")
 
     def parse_tool(name: str) -> ToolConfiguration:
         field = f"tools.{name}"
         tool = _table(table.get(name, {}), field)
-        _reject_unknown(tool, {"enabled"}, field)
         return ToolConfiguration(enabled=_boolean(tool.get("enabled", True), f"{field}.enabled"))
 
     return ToolsConfiguration(web=parse_tool("web"), shell=parse_tool("shell"))
@@ -364,7 +374,6 @@ def _parse_provider(provider_id: str, value: object) -> ProviderConfiguration:
     if not _PROVIDER_ID_PATTERN.fullmatch(provider_id):
         _invalid(prefix, "must use a lowercase kebab-case provider ID")
     table = _table(value, prefix)
-    _reject_unknown(table, {"protocol", "base_url", "api_key", "models"}, prefix)
     models_value = _required(table, "models", f"{prefix}.models")
     if not isinstance(models_value, list):
         _invalid(f"{prefix}.models", "must be an array of unique nonempty model IDs")
@@ -389,19 +398,6 @@ def _parse_route(route_name: str, value: object) -> RouteConfiguration:
     if route_name not in _ROUTE_NAMES:
         _invalid(prefix, "is not a supported Model Route")
     table = _table(value, prefix)
-    _reject_unknown(
-        table,
-        {
-            "provider_id",
-            "model",
-            "context_window",
-            "max_output",
-            "temperature",
-            "reasoning_effort",
-            "timeout",
-        },
-        prefix,
-    )
     provider_id = _string(
         _required(table, "provider_id", f"{prefix}.provider_id"),
         f"{prefix}.provider_id",
@@ -458,7 +454,6 @@ def _parse_route(route_name: str, value: object) -> RouteConfiguration:
 def _parse_models(document: Mapping[str, object]) -> ModelsConfiguration:
     models_value = document.get("models", {})
     table = _table(models_value, "models")
-    _reject_unknown(table, {"providers", "routes"}, "models")
     provider_tables = _table(table.get("providers", {}), "models.providers")
     route_tables = _table(table.get("routes", {}), "models.routes")
     providers = {
@@ -466,7 +461,9 @@ def _parse_models(document: Mapping[str, object]) -> ModelsConfiguration:
         for provider_id, provider in provider_tables.items()
     }
     routes = {
-        route_name: _parse_route(route_name, route) for route_name, route in route_tables.items()
+        route_name: _parse_route(route_name, route)
+        for route_name, route in route_tables.items()
+        if route_name in _ROUTE_NAMES
     }
     return ModelsConfiguration(
         providers=MappingProxyType(providers),
@@ -475,13 +472,64 @@ def _parse_models(document: Mapping[str, object]) -> ModelsConfiguration:
 
 
 def _parse_configuration(document: dict[str, object]) -> UserConfiguration:
-    _reject_unknown(document, {"runtime", "memory", "tools", "models"}, "")
     return UserConfiguration(
         runtime=_parse_runtime(document),
         memory=_parse_memory(document),
         tools=_parse_tools(document),
         models=_parse_models(document),
     )
+
+
+def _validate_defined_fields(document: Mapping[str, object]) -> None:
+    """Preserve strict config-inspection diagnostics without changing startup projection."""
+    _reject_unknown(document, {"runtime", "memory", "tools", "models"}, "")
+
+    runtime = _table(document.get("runtime", {}), "runtime")
+    _reject_unknown(runtime, {"max_tool_result_chars"}, "runtime")
+
+    memory = _table(document.get("memory", {}), "memory")
+    _reject_unknown(
+        memory,
+        {"consolidation_message_threshold", "batch_size", "schedule"},
+        "memory",
+    )
+
+    tools = _table(document.get("tools", {}), "tools")
+    _reject_unknown(tools, {"web", "shell"}, "tools")
+    for tool_name in ("web", "shell"):
+        field = f"tools.{tool_name}"
+        tool = _table(tools.get(tool_name, {}), field)
+        _reject_unknown(tool, {"enabled"}, field)
+
+    models = _table(document.get("models", {}), "models")
+    _reject_unknown(models, {"providers", "routes"}, "models")
+    providers = _table(models.get("providers", {}), "models.providers")
+    for provider_id, value in providers.items():
+        prefix = f"models.providers.{provider_id}"
+        if not _PROVIDER_ID_PATTERN.fullmatch(provider_id):
+            _invalid(prefix, "must use a lowercase kebab-case provider ID")
+        provider = _table(value, prefix)
+        _reject_unknown(provider, {"protocol", "base_url", "api_key", "models"}, prefix)
+
+    routes = _table(models.get("routes", {}), "models.routes")
+    for route_name, value in routes.items():
+        prefix = f"models.routes.{route_name}"
+        if route_name not in _ROUTE_NAMES:
+            _invalid(prefix, "is not a supported Model Route")
+        route = _table(value, prefix)
+        _reject_unknown(
+            route,
+            {
+                "provider_id",
+                "model",
+                "context_window",
+                "max_output",
+                "temperature",
+                "reasoning_effort",
+                "timeout",
+            },
+            prefix,
+        )
 
 
 class ConfigLoader:
@@ -524,7 +572,14 @@ class ConfigLoader:
                     )
                 )
             configuration = self.load()
-            configuration.resolve_route("default")
+            if "default" not in configuration.models.routes:
+                raise ConfigError(
+                    ErrorInfo(
+                        "route_unavailable",
+                        "Default Model Route is missing. "
+                        "Add [models.routes.default] to User Configuration.",
+                    )
+                )
             return configuration
         except OSError as error:
             raise ConfigError(
@@ -551,6 +606,7 @@ class ConfigLoader:
         document = _table(loaded, "configuration")
         error: ErrorInfo | None = None
         try:
+            _validate_defined_fields(document)
             _parse_configuration(document)
         except ConfigError as config_error:
             error = config_error.error

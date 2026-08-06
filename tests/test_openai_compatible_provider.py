@@ -304,8 +304,8 @@ async def test_stream_aggregates_fragmented_tool_calls_with_mixed_content() -> N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["memory", "cron"])
-async def test_complete_normalizes_memory_and_cron_responses(route: ModelRoute) -> None:
+@pytest.mark.parametrize("route", ["memory", "schedule"])
+async def test_complete_normalizes_memory_and_schedule_responses(route: ModelRoute) -> None:
     response = SimpleNamespace(
         choices=[
             SimpleNamespace(

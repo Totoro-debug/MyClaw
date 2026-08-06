@@ -323,7 +323,7 @@ class AgentTurn:
                 messages.append(model_message)
         return ModelRequest(
             request_id=self._new_uuid(),
-            route="chat" if self._lane == "foreground" else "cron",
+            route="chat" if self._lane == "foreground" else "schedule",
             system_prompt=self._system_prompt,
             messages=tuple(messages),
             tools=() if self._tool_gateway is None else self._tool_gateway.schemas,

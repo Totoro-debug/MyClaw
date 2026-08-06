@@ -257,7 +257,7 @@ def test_installed_config_command_shows_safe_malformed_configuration(
     assert not (workspace / ".myclaw").exists()
 
 
-def test_installed_config_command_keeps_schema_invalid_content_inspectable(
+def test_installed_config_command_keeps_undefined_content_inspectable(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -301,7 +301,7 @@ def test_installed_myclaw_passes_valid_configuration_gate(
     assert tree == (".gitignore", "memory/", "memory/memory.md", "sessions/")
 
 
-def test_installed_myclaw_stops_on_parse_schema_and_default_failures(
+def test_installed_myclaw_stops_only_on_parse_failure(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -321,19 +321,13 @@ def test_installed_myclaw_stops_on_parse_schema_and_default_failures(
     config_path.write_text(EXPECTED_DEFAULT_CONFIG, encoding="utf-8")
     default_result = run_installed_myclaw(agent_home, workspace=workspace)
 
-    assert (parse_result.returncode, schema_result.returncode, default_result.returncode) == (
-        2,
-        2,
-        2,
-    )
+    assert (parse_result.returncode, schema_result.returncode, default_result.returncode) == (2, 0, 0)
     assert "config_parse_error" in parse_result.stdout
-    assert "config_invalid" in schema_result.stdout
-    assert "route_unavailable" in default_result.stdout
-    assert all(
-        "configuration gate passed" not in result.stdout
-        for result in (parse_result, schema_result, default_result)
-    )
-    assert not (workspace / ".myclaw").exists()
+    assert "config_invalid" not in schema_result.stdout
+    assert "configuration gate passed" not in parse_result.stdout
+    assert "configuration gate passed" in schema_result.stdout
+    assert "configuration gate passed" in default_result.stdout
+    assert (workspace / ".myclaw").exists()
     combined_output = "".join(
         result.stdout + result.stderr for result in (parse_result, schema_result, default_result)
     )

@@ -47,7 +47,7 @@ temperature = 0.2
 reasoning_effort = "medium"
 timeout = 120
 
-[models.routes.cron]
+[models.routes.schedule]
 provider_id = "openai-local"
 model = "replace-with-a-model-id"
 context_window = 200000

@@ -23,7 +23,7 @@ from myclaw.agent.turn import ToolResultExternalizer, model_message_from_session
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ProviderConfiguration, UserConfiguration
+from myclaw.config.config import ProviderConfiguration, RouteConfiguration, UserConfiguration
 from myclaw.logging.session import session_log, without_session_log
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import (
@@ -480,7 +480,6 @@ def _prepare_repl_runtime(
     shell: ShellBoundary | None = None,
 ) -> PreparedReplRuntime:
     """Prepare a Session and defer provider construction until conversational input."""
-    configuration.resolve_route("default")
     workspace_identity = Workspace.from_path(workspace)
     workspace_state = WorkspaceState(workspace_identity)
     workspace_state.initialize(agent_home_root=agent_home.path)
@@ -492,13 +491,13 @@ def _prepare_repl_runtime(
         now=now,
         new_uuid=new_uuid,
     )
-    resolved = configuration.resolve_route("chat")
+    configured_chat = configuration.configured_route("chat")
     settings = ChatModelSettings(
-        model=resolved.route.model,
-        max_output=resolved.route.max_output,
-        temperature=resolved.route.temperature,
-        reasoning_effort=resolved.route.reasoning_effort,
-        timeout_seconds=resolved.route.timeout,
+        model=configured_chat.model,
+        max_output=configured_chat.max_output,
+        temperature=configured_chat.temperature,
+        reasoning_effort=configured_chat.reasoning_effort,
+        timeout_seconds=configured_chat.timeout,
     )
     router = ModelRouter(
         configuration=configuration,
@@ -551,37 +550,39 @@ def _prepare_repl_runtime(
         )
 
     system_prompt = system_prompt_for(runtime_memory.snapshot())
-    resolved_memory = configuration.resolve_route("memory")
+    configured_memory = configuration.configured_route("memory")
     summaries = WorkspaceJsonlSummaryStore(workspace_state)
-    summary_manager = ConversationSummaryManager(
-        provider=router,
-        summaries=summaries,
-        settings=SummaryModelSettings(
-            model=resolved_memory.route.model,
-            max_output=resolved_memory.route.max_output,
-            temperature=resolved_memory.route.temperature,
-            reasoning_effort=resolved_memory.route.reasoning_effort,
-            timeout_seconds=resolved_memory.route.timeout,
-        ),
-        chat_context_window=resolved.route.context_window,
-        chat_max_output=resolved.route.max_output,
-        consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
-        chat_system_prompt=system_prompt,
-        tools=tool_gateway.schemas,
-        now=now,
-        new_uuid=new_uuid,
-    )
+
+    def summary_manager_for(chat_route: RouteConfiguration) -> ConversationSummaryManager:
+        return ConversationSummaryManager(
+            provider=router,
+            summaries=summaries,
+            settings=SummaryModelSettings(
+                model=configured_memory.model,
+                max_output=configured_memory.max_output,
+                temperature=configured_memory.temperature,
+                reasoning_effort=configured_memory.reasoning_effort,
+                timeout_seconds=configured_memory.timeout,
+            ),
+            chat_context_window=chat_route.context_window,
+            chat_max_output=chat_route.max_output,
+            consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
+            chat_system_prompt=system_prompt,
+            tools=tool_gateway.schemas,
+            now=now,
+            new_uuid=new_uuid,
+        )
     memory_manager = MemoryManager(
         provider=router,
         summaries=summaries,
         memory=memory_store,
         long_term_path=workspace_state.long_term_memory_path,
         settings=MemoryTaskModelSettings(
-            model=resolved_memory.route.model,
-            max_output=resolved_memory.route.max_output,
-            temperature=resolved_memory.route.temperature,
-            reasoning_effort=resolved_memory.route.reasoning_effort,
-            timeout_seconds=resolved_memory.route.timeout,
+            model=configured_memory.model,
+            max_output=configured_memory.max_output,
+            temperature=configured_memory.temperature,
+            reasoning_effort=configured_memory.reasoning_effort,
+            timeout_seconds=configured_memory.timeout,
         ),
         batch_size=configuration.memory.batch_size,
         runtime_memory=runtime_memory,
@@ -621,25 +622,26 @@ def _prepare_repl_runtime(
         prompt = system_prompt_for(memory_snapshot)
 
         async def prepare(active_session: Session) -> Session:
-            return await summary_manager.prepare(
+            effective_chat = configuration.resolve_route("chat").route
+            return await summary_manager_for(effective_chat).prepare(
                 active_session,
                 system_prompt=prompt,
             )
 
         return prepare
 
-    resolved_cron = configuration.resolve_route("cron")
+    configured_schedule = configuration.configured_route("schedule")
     scheduled_work_runner = ScheduledWorkRunner(
         provider=router,
         workspace_state=workspace_state,
         long_term_memory=long_term_memory,
         memory_snapshot=runtime_memory.snapshot,
         settings=ScheduledWorkModelSettings(
-            model=resolved_cron.route.model,
-            max_output=resolved_cron.route.max_output,
-            temperature=resolved_cron.route.temperature,
-            reasoning_effort=resolved_cron.route.reasoning_effort,
-            timeout_seconds=resolved_cron.route.timeout,
+            model=configured_schedule.model,
+            max_output=configured_schedule.max_output,
+            temperature=configured_schedule.temperature,
+            reasoning_effort=configured_schedule.reasoning_effort,
+            timeout_seconds=configured_schedule.timeout,
         ),
         now=now,
         new_uuid=new_uuid,
@@ -697,7 +699,7 @@ def _prepare_repl_runtime(
             system_prompt=system_prompt,
             title_prompt=session_title_prompt(),
             tool_gateway=session_tool_gateway,
-            history_preparer=summary_manager.prepare,
+            history_preparer=history_preparer_for(runtime_memory.snapshot()),
             memory_snapshot=runtime_memory.snapshot,
             system_prompt_for_memory=system_prompt_for,
             history_preparer_for_memory=history_preparer_for,
