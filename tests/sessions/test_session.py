@@ -9,7 +9,7 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.session.session import Session
+from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -17,6 +17,7 @@ CREATED_AT = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
 UPDATED_AT = CREATED_AT + timedelta(seconds=5)
 SESSION_ID = "20260711-153012-123000_550e8400-e29b-41d4-a716-446655440000"
 OTHER_SESSION_ID = "20260711-153012-123000_6fa459ea-ee8a-4ca4-894e-db77e160355e"
+SCHEDULE_JOB_ID = "6fa459ea-ee8a-4ca4-894e-db77e160355e"
 ZERO_USAGE = {
     "model_calls": 0,
     "input_tokens": 0,
@@ -93,6 +94,61 @@ def test_create_starts_a_memory_only_session_with_private_identity_generation(
 
     with pytest.raises(TypeError, match=r"Session\.create\(\) or Session\.load\(\)"):
         Session()
+
+
+def test_create_schedule_session_uses_a_lazy_isolated_storage_partition(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+
+    session = Session.create(
+        state,
+        partition=SessionStoragePartition.SCHEDULE,
+        job_id=SCHEDULE_JOB_ID,
+        now=lambda: CREATED_AT,
+    )
+
+    assert session.session_id == f"schedule_{SCHEDULE_JOB_ID}"
+    assert session.storage_partition is SessionStoragePartition.SCHEDULE
+    assert session.storage_directory == state.schedule_sessions_directory
+    assert session.artifact_directory == (
+        state.schedule_sessions_directory / "artifacts" / session.session_id
+    )
+    assert not state.schedule_sessions_directory.exists()
+
+    session.add_message("user", "Run the scheduled task.")
+    session.close()
+
+    assert (state.schedule_sessions_directory / f"{session.session_id}.jsonl").exists()
+    assert not (state.sessions_directory / f"{session.session_id}.jsonl").exists()
+    loaded = Session.load(state, session.session_id)
+    assert loaded.storage_partition is SessionStoragePartition.SCHEDULE
+    assert loaded.messages == session.messages
+
+
+@pytest.mark.parametrize(
+    "job_id",
+    [
+        "6FA459EA-EE8A-4CA4-894E-DB77E160355E",
+        "550e8400-e29b-11d4-a716-446655440000",
+        "not-a-uuid",
+    ],
+)
+def test_schedule_session_requires_a_canonical_uuid4_job_id(
+    agent_home: Path,
+    workspace: Path,
+    job_id: str,
+) -> None:
+    state = _state(workspace, agent_home)
+
+    with pytest.raises(ValueError, match="canonical UUID4"):
+        Session.create(
+            state,
+            partition=SessionStoragePartition.SCHEDULE,
+            job_id=job_id,
+            now=lambda: CREATED_AT,
+        )
 
 
 @pytest.mark.asyncio

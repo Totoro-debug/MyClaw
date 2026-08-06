@@ -16,7 +16,7 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ModelProvider, ReasoningEffort
 from myclaw.schedule.records import ScheduledWork
-from myclaw.session.session import Session
+from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.tools.tool_gateway import ToolGateway
 
 _SESSION_FAILURE = ErrorInfo(
@@ -160,6 +160,7 @@ class ScheduledWorkRunner:
         return Session.load(
             self._workspace_state,
             task.session_id,
+            partition=_session_partition(task),
             now=self._now,
         )
 
@@ -169,5 +170,12 @@ class ScheduledWorkRunner:
             task.session_id,
             task.created_at,
             title=task.title,
+            partition=_session_partition(task),
             now=self._now,
         )
+
+
+def _session_partition(task: ScheduledWork) -> SessionStoragePartition:
+    if task.session_id.startswith("schedule_"):
+        return SessionStoragePartition.SCHEDULE
+    return SessionStoragePartition.FOREGROUND

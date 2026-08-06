@@ -28,7 +28,7 @@ from myclaw.provider.models import (
     ToolModelMessage,
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
-from myclaw.session.session import Session
+from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.tools.models import (
     ModelToolCall,
     ToolResult,
@@ -153,6 +153,44 @@ def test_runtime_externalizes_only_success_results_over_the_configured_threshold
     artifact_directory = _artifact_directory(workspace=workspace, session_id=SESSION_ID)
     assert sorted(path.name for path in artifact_directory.iterdir()) == ["call_over.txt"]
     assert (artifact_directory / "call_over.txt").read_text(encoding="utf-8") == oversized_result
+
+
+def test_schedule_session_externalizes_artifacts_in_its_own_partition(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    AgentHome(agent_home).initialize()
+    workspace_state = _workspace_state(workspace)
+    session = Session.create(
+        workspace_state,
+        partition=SessionStoragePartition.SCHEDULE,
+        job_id=SESSION_ID.split("_", maxsplit=1)[1],
+        now=lambda: NOW,
+    )
+    result = ToolResult(
+        tool_call_id="call_schedule_artifact",
+        name="inspect",
+        status="success",
+        content="oversized schedule result",
+        artifact=None,
+    )
+
+    projected = externalize_tool_result(
+        result,
+        session=session,
+        max_tool_result_chars=1,
+    )
+
+    assert projected.artifact is not None
+    assert (session.artifact_directory / "call_schedule_artifact.txt").read_text(
+        encoding="utf-8"
+    ) == result.content
+    assert not (
+        workspace_state.sessions_directory
+        / "artifacts"
+        / session.session_id
+        / "call_schedule_artifact.txt"
+    ).exists()
 
 
 def test_active_session_is_the_only_tool_artifact_workspace_authority(

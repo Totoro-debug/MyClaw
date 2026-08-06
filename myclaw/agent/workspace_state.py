@@ -52,6 +52,11 @@ class WorkspaceState:
         return self.path / "sessions"
 
     @property
+    def schedule_sessions_directory(self) -> Path:
+        """Dedicated, lazily-created storage for Schedule Sessions."""
+        return self.path / "schedule-sessions"
+
+    @property
     def logs_directory(self) -> Path:
         """Canonical, lazily-created Workspace-owned Session Log directory."""
         return self.path / "logs"
@@ -66,14 +71,28 @@ class WorkspaceState:
 
     def existing_sessions_directory(self) -> Path | None:
         """Return the validated sessions directory without materializing state."""
+        return self._existing_sessions_directory(self.sessions_directory)
+
+    def existing_schedule_sessions_directory(self) -> Path | None:
+        """Return the validated Schedule Session directory without materializing state."""
+        return self._existing_sessions_directory(self.schedule_sessions_directory)
+
+    def _existing_sessions_directory(self, path: Path) -> Path | None:
         workspace_root = self._owned_workspace_root()
         state_root = self._existing_owned_directory(self.path, within=workspace_root)
         if state_root is None:
             return None
-        return self._existing_owned_directory(self.sessions_directory, within=state_root)
+        return self._existing_owned_directory(path, within=state_root)
 
     def prepare_sessions_directory(self) -> Path:
         """Lazily prepare and validate the owned sessions directory for writes."""
+        return self._prepare_sessions_directory(self.sessions_directory)
+
+    def prepare_schedule_sessions_directory(self) -> Path:
+        """Lazily prepare and validate the owned Schedule Session directory for writes."""
+        return self._prepare_sessions_directory(self.schedule_sessions_directory)
+
+    def _prepare_sessions_directory(self, path: Path) -> Path:
         workspace_root = self._owned_workspace_root()
         state_path = HOST_FILESYSTEM.path_for_io(self.path)
         if not _path_entry_exists(state_path):
@@ -83,7 +102,7 @@ class WorkspaceState:
             within=workspace_root,
         )
 
-        sessions_path = HOST_FILESYSTEM.path_for_io(self.sessions_directory)
+        sessions_path = HOST_FILESYSTEM.path_for_io(path)
         if not _path_entry_exists(sessions_path):
             sessions_path.mkdir(exist_ok=True)
         return HOST_FILESYSTEM.require_owned_directory(sessions_path, within=state_root)

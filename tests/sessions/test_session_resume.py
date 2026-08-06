@@ -14,7 +14,7 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import ManagementViewService
 from myclaw.provider.models import ModelUsage
-from myclaw.session.session import Session
+from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.terminal.repl import run_repl
 
@@ -57,6 +57,30 @@ async def test_resume_listing_returns_current_workspace_sessions_in_update_order
     assert [item.id for item in listing.sessions] == [newer.session_id, older.session_id]
     assert [item.title for item in listing.sessions] == ["Newest session", "Older session"]
     assert [item.message_count for item in listing.sessions] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_resume_listing_excludes_schedule_session_partition(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = _state(workspace, agent_home)
+    schedule = Session.create(
+        state,
+        partition=SessionStoragePartition.SCHEDULE,
+        job_id=str(FIRST_UUID),
+        now=lambda: NOW,
+    )
+    schedule.add_message("user", "Background work")
+    schedule.close()
+
+    listing = await ManagementViewService(home, workspace_state=state).resumable_listing()
+
+    assert listing.sessions == ()
+    assert listing.skipped_count == 0
+    assert Session.load(state, schedule.session_id).messages == schedule.messages
 
 
 @pytest.mark.asyncio

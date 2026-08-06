@@ -10,6 +10,7 @@ import re
 import time
 from collections.abc import Callable
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Self, cast
 from uuid import UUID, uuid4
@@ -24,7 +25,15 @@ from myclaw.utils.validation import (
     require_uuid4_string,
 )
 
-__all__ = ["Session"]
+__all__ = ["Session", "SessionStoragePartition"]
+
+
+class SessionStoragePartition(StrEnum):
+    """The Workspace-owned storage partition used by one Conversation Session."""
+
+    FOREGROUND = "foreground"
+    SCHEDULE = "schedule"
+
 
 _HEADER_FIELDS = frozenset(
     {"session_id", "created_at", "updated_at", "last_consolidated", "metadata"}
@@ -32,6 +41,10 @@ _HEADER_FIELDS = frozenset(
 _SESSION_ID_PATTERN = re.compile(
     r"(?P<timestamp>\d{8}-\d{6}-\d{6})_"
     r"(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+_SCHEDULE_SESSION_ID_PATTERN = re.compile(
+    r"schedule_(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})"
 )
 _TITLE_PAIRS = (
     ('"', '"'),
@@ -49,6 +62,9 @@ class Session:
 
     _workspace_state: WorkspaceState
     _session_id: str
+    _storage_partition: SessionStoragePartition
+    _storage_directory: Path
+    _artifact_directory: Path
     _created_at: datetime
     _updated_at: datetime
     _now: Callable[[], datetime] | None
@@ -72,15 +88,19 @@ class Session:
         messages: list[dict[str, Any]],
         metadata: dict[str, Any],
         last_consolidated: int,
+        partition: SessionStoragePartition | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> Self:
-        cls._require_id(session_id)
+        resolved_partition = _resolve_partition(session_id, partition)
         require_aware_datetime(created_at, field="created_at")
         require_aware_datetime(updated_at, field="updated_at")
         require_nonnegative_int(last_consolidated, field="last_consolidated")
         session = object.__new__(cls)
         session._workspace_state = workspace_state
         session._session_id = session_id
+        session._storage_partition = resolved_partition
+        session._storage_directory = _storage_directory(workspace_state, resolved_partition)
+        session._artifact_directory = session._storage_directory / "artifacts" / session_id
         session._created_at = created_at
         session._updated_at = updated_at
         session._now = now
@@ -98,20 +118,51 @@ class Session:
         *,
         now: Callable[[], datetime] | None = None,
         new_uuid: Callable[[], UUID] | None = None,
+        partition: SessionStoragePartition = SessionStoragePartition.FOREGROUND,
+        job_id: UUID | str | None = None,
     ) -> Self:
-        """Create a memory-only Session with a new local timestamp-plus-UUID4 ID."""
+        """Create a memory-only Session in the requested storage partition."""
         created_at = _clock_now(now)
-        allocate_uuid = uuid4 if new_uuid is None else new_uuid
+        resolved_partition = _coerce_partition(partition)
+        if resolved_partition is SessionStoragePartition.SCHEDULE:
+            if job_id is None:
+                raise ValueError("Schedule Session requires a canonical UUID4 job_id")
+            session_id = cls.schedule_session_id(job_id)
+        else:
+            if job_id is not None:
+                raise ValueError("job_id is only valid for Schedule Sessions")
+            allocate_uuid = uuid4 if new_uuid is None else new_uuid
+            session_id = _make_id(created_at, allocate_uuid())
         return cls._from_state(
             workspace_state=workspace_state,
-            session_id=_make_id(created_at, allocate_uuid()),
+            session_id=session_id,
             created_at=created_at,
             updated_at=created_at,
             messages=[],
             metadata=_initial_metadata(),
             last_consolidated=0,
+            partition=resolved_partition,
             now=now,
         )
+
+    @classmethod
+    def create_schedule(
+        cls,
+        workspace_state: WorkspaceState,
+        job_id: UUID | str,
+        *,
+        now: Callable[[], datetime] | None = None,
+        title: str = "Untitled session",
+    ) -> Self:
+        """Create a memory-only Schedule Session derived from one Job UUID4."""
+        session = cls.create(
+            workspace_state,
+            now=now,
+            partition=SessionStoragePartition.SCHEDULE,
+            job_id=job_id,
+        )
+        session.update_metadata(title=title)
+        return session
 
     @classmethod
     def _create_with_id(
@@ -121,10 +172,11 @@ class Session:
         created_at: datetime,
         *,
         title: str,
+        partition: SessionStoragePartition | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> Self:
         """Create a memory-only Session for an owner with an existing identity."""
-        cls._require_id(session_id)
+        resolved_partition = _resolve_partition(session_id, partition)
         require_aware_datetime(created_at, field="created_at")
         metadata = _initial_metadata()
         metadata["title"] = _normalize_title(title)
@@ -137,6 +189,7 @@ class Session:
             messages=[],
             metadata=metadata,
             last_consolidated=0,
+            partition=resolved_partition,
             now=now,
         )
 
@@ -146,13 +199,14 @@ class Session:
         workspace_state: WorkspaceState,
         session_id: str,
         *,
+        partition: SessionStoragePartition | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> Self:
         """Load one current-format Session synchronously from Workspace State."""
-        cls._require_id(session_id)
-        sessions_directory = workspace_state.existing_sessions_directory()
+        resolved_partition = _resolve_partition(session_id, partition)
+        sessions_directory = _existing_sessions_directory(workspace_state, resolved_partition)
         if sessions_directory is None:
-            raise FileNotFoundError(workspace_state.sessions_directory)
+            raise FileNotFoundError(_storage_directory(workspace_state, resolved_partition))
         path = sessions_directory / f"{session_id}.jsonl"
         owned_path = HOST_FILESYSTEM.require_owned_regular_file(
             path,
@@ -177,12 +231,25 @@ class Session:
             messages=messages,
             metadata=metadata,
             last_consolidated=last_consolidated,
+            partition=resolved_partition,
             now=now,
         )
 
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def storage_partition(self) -> SessionStoragePartition:
+        return self._storage_partition
+
+    @property
+    def storage_directory(self) -> Path:
+        return self._storage_directory
+
+    @property
+    def artifact_directory(self) -> Path:
+        return self._artifact_directory
 
     @property
     def created_at(self) -> datetime:
@@ -315,7 +382,10 @@ class Session:
             pass
 
     def _write_content(self, content: bytes) -> None:
-        sessions_directory = self._workspace_state.prepare_sessions_directory()
+        if self._storage_partition is SessionStoragePartition.FOREGROUND:
+            sessions_directory = self._workspace_state.prepare_sessions_directory()
+        else:
+            sessions_directory = self._workspace_state.prepare_schedule_sessions_directory()
         path = sessions_directory / f"{self._session_id}.jsonl"
         io_path = HOST_FILESYSTEM.path_for_io(path)
         try:
@@ -351,18 +421,49 @@ class Session:
     def _clock_now(self) -> datetime:
         return _clock_now(self._now)
 
-    @staticmethod
-    def _require_id(value: str, *, field: str = "session_id") -> None:
+    @classmethod
+    def schedule_session_id(cls, job_id: UUID | str) -> str:
+        """Return the canonical Schedule Session ID for one Job UUID4."""
+        if isinstance(job_id, UUID):
+            require_uuid4(job_id, field="job_id")
+            canonical = str(job_id)
+        elif isinstance(job_id, str):
+            require_uuid4_string(job_id, field="job_id")
+            canonical = job_id
+        else:
+            raise ValueError("job_id must be a canonical UUID4")
+        return f"schedule_{canonical}"
+
+    @classmethod
+    def _require_id(
+        cls,
+        value: str,
+        *,
+        field: str = "session_id",
+        partition: SessionStoragePartition | None = None,
+    ) -> None:
         if not isinstance(value, str):
             raise ValueError(f"{field} must be a valid Session ID")
-        match = _SESSION_ID_PATTERN.fullmatch(value)
+        resolved_partition = _coerce_partition(partition) if partition is not None else None
+        if resolved_partition is SessionStoragePartition.FOREGROUND or (
+            resolved_partition is None and _SCHEDULE_SESSION_ID_PATTERN.fullmatch(value) is None
+        ):
+            match = _SESSION_ID_PATTERN.fullmatch(value)
+            if match is None:
+                raise ValueError(f"{field} must be a valid Session ID")
+            try:
+                datetime.strptime(match.group("timestamp"), "%Y%m%d-%H%M%S-%f")
+                require_uuid4_string(match.group("uuid"), field=field)
+            except ValueError as error:
+                raise ValueError(f"{field} must be a valid Session ID") from error
+            return
+        match = _SCHEDULE_SESSION_ID_PATTERN.fullmatch(value)
         if match is None:
-            raise ValueError(f"{field} must be a valid Session ID")
+            raise ValueError(f"{field} must be a valid Schedule Session ID")
         try:
-            datetime.strptime(match.group("timestamp"), "%Y%m%d-%H%M%S-%f")
             require_uuid4_string(match.group("uuid"), field=field)
         except ValueError as error:
-            raise ValueError(f"{field} must be a valid Session ID") from error
+            raise ValueError(f"{field} must be a valid Schedule Session ID") from error
 
     @staticmethod
     def _normalize_title(value: str) -> str:
@@ -375,6 +476,51 @@ class Session:
 
 def _local_now() -> datetime:
     return datetime.now().astimezone()
+
+
+def _coerce_partition(value: SessionStoragePartition | str) -> SessionStoragePartition:
+    if isinstance(value, SessionStoragePartition):
+        return value
+    try:
+        return SessionStoragePartition(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("unknown Session storage partition") from error
+
+
+def _resolve_partition(
+    session_id: str,
+    partition: SessionStoragePartition | str | None,
+) -> SessionStoragePartition:
+    if not isinstance(session_id, str):
+        raise ValueError("session_id must be a valid Session ID")
+    if partition is None:
+        resolved = (
+            SessionStoragePartition.SCHEDULE
+            if _SCHEDULE_SESSION_ID_PATTERN.fullmatch(session_id) is not None
+            else SessionStoragePartition.FOREGROUND
+        )
+    else:
+        resolved = _coerce_partition(partition)
+    Session._require_id(session_id, partition=resolved)
+    return resolved
+
+
+def _storage_directory(
+    workspace_state: WorkspaceState,
+    partition: SessionStoragePartition,
+) -> Path:
+    if partition is SessionStoragePartition.FOREGROUND:
+        return workspace_state.sessions_directory
+    return workspace_state.schedule_sessions_directory
+
+
+def _existing_sessions_directory(
+    workspace_state: WorkspaceState,
+    partition: SessionStoragePartition,
+) -> Path | None:
+    if partition is SessionStoragePartition.FOREGROUND:
+        return workspace_state.existing_sessions_directory()
+    return workspace_state.existing_schedule_sessions_directory()
 
 
 def _clock_now(now: Callable[[], datetime] | None) -> datetime:

@@ -13,7 +13,7 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ConfigView
 from myclaw.errors import ErrorInfo
 from myclaw.memory.memory_task import MemoryStore, MemoryTaskResult
-from myclaw.session.session import Session
+from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_nonnegative_int, require_nonnegative_number
@@ -34,7 +34,7 @@ class SessionListingEntry:
     message_count: int
 
     def __post_init__(self) -> None:
-        Session._require_id(self.id, field="id")
+        Session._require_id(self.id, field="id", partition=SessionStoragePartition.FOREGROUND)
         if not self.title or " ".join(self.title.split()) != self.title or len(self.title) > 60:
             raise ValueError("title is not normalized")
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
@@ -143,7 +143,7 @@ class ResumeResult:
     session_id: str
 
     def __post_init__(self) -> None:
-        Session._require_id(self.session_id)
+        Session._require_id(self.session_id, partition=SessionStoragePartition.FOREGROUND)
 
 
 def estimate_input_tokens(status_input: RuntimeStatusInput) -> int:
@@ -310,7 +310,12 @@ class ManagementViewService:
             ) from error
         for path in paths:
             try:
-                session = Session.load(workspace_state, path.stem, now=self._now)
+                session = Session.load(
+                    workspace_state,
+                    path.stem,
+                    partition=SessionStoragePartition.FOREGROUND,
+                    now=self._now,
+                )
             except (OSError, UnicodeError, ValueError) as error:
                 logger.opt(exception=error).warning(
                     "Skipped corrupt or unreadable Conversation Session entry path={} type={}",
@@ -358,7 +363,12 @@ class ManagementViewService:
                 )
             )
         try:
-            session = Session.load(workspace_state, session_id, now=self._now)
+            session = Session.load(
+                workspace_state,
+                session_id,
+                partition=SessionStoragePartition.FOREGROUND,
+                now=self._now,
+            )
         except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo(

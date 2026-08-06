@@ -44,6 +44,11 @@ class ScheduledWork:
             msg = "enabled must be a boolean"
             raise ValueError(msg)
         Session._require_id(self.session_id)
+        if self.session_id.startswith("schedule_"):
+            expected_session_id = Session.schedule_session_id(self.id)
+            if self.session_id != expected_session_id:
+                msg = "Schedule Session ID must be derived from the Job UUID4"
+                raise ValueError(msg)
 
     def to_dict(self) -> dict[str, object]:
         return {

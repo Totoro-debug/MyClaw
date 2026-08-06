@@ -53,14 +53,15 @@ def externalize_tool_result(
         workspace_root = io_workspace.resolve(strict=True)
         io_state = HOST_FILESYSTEM.path_for_io(resolved_workspace_state.path)
         state_root = HOST_FILESYSTEM.require_owned_directory(io_state, within=workspace_root)
-        io_sessions = HOST_FILESYSTEM.path_for_io(resolved_workspace_state.sessions_directory)
+        io_sessions = HOST_FILESYSTEM.path_for_io(session.storage_directory)
+        io_sessions.mkdir(exist_ok=True)
         sessions_root = HOST_FILESYSTEM.require_owned_directory(io_sessions, within=state_root)
-        artifacts_directory = io_sessions / "artifacts"
+        artifacts_directory = HOST_FILESYSTEM.path_for_io(session.artifact_directory.parent)
         artifacts_directory.mkdir(exist_ok=True)
         artifacts_root = HOST_FILESYSTEM.require_owned_directory(
             artifacts_directory, within=sessions_root
         )
-        io_directory = artifacts_directory / resolved_session_id
+        io_directory = HOST_FILESYSTEM.path_for_io(session.artifact_directory)
         io_directory.mkdir(exist_ok=True)
         HOST_FILESYSTEM.require_owned_directory(io_directory, within=artifacts_root)
         artifact_path = io_directory / f"{encoded_tool_call_id}.txt"

@@ -90,6 +90,35 @@ async def test_scheduled_work_persists_a_complete_session_turn(
 
 
 @pytest.mark.asyncio
+async def test_schedule_session_is_persisted_in_the_schedule_partition(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    task = ScheduledWork(
+        id=TASK_ID,
+        title="Weekly project review",
+        cron="0 9 * * 1",
+        prompt="Review the current project and summarize open risks.",
+        created_at=NOW - timedelta(hours=1),
+        enabled=True,
+        session_id=f"schedule_{TASK_ID}",
+    )
+    response = ModelResponse(
+        message=AssistantModelMessage(content="Scheduled result."),
+        usage=ModelUsage(input_tokens=8, output_tokens=2, total_tokens=10),
+        finish_reason="stop",
+    )
+    runner = _runner(state, ScriptedFakeProvider(completions=(response,)))
+
+    result = await runner.run(task)
+
+    assert result.status == "completed"
+    assert (state.schedule_sessions_directory / f"schedule_{TASK_ID}.jsonl").exists()
+    assert not (state.sessions_directory / f"schedule_{TASK_ID}.jsonl").exists()
+
+
+@pytest.mark.asyncio
 async def test_scheduled_work_preserves_tool_call_relationships(
     agent_home: Path,
     workspace: Path,

@@ -31,6 +31,19 @@ def test_scheduled_work_exports_the_exact_seven_key_record() -> None:
     }
 
 
+def test_schedule_session_id_must_be_derived_from_the_job_uuid() -> None:
+    with pytest.raises(ValueError, match="derived from the Job UUID4"):
+        ScheduledWork(
+            id="550e8400-e29b-41d4-a716-446655440000",
+            title="Project review",
+            cron="0 9 * * 1",
+            prompt="Review the project.",
+            created_at=datetime(2026, 7, 11, 16, tzinfo=LOCAL_OFFSET),
+            enabled=True,
+            session_id="schedule_6fa459ea-ee8a-4ca4-894e-db77e160355e",
+        )
+
+
 def test_scheduled_work_rejects_values_outside_the_record_contract() -> None:
     valid = ScheduledWork(
         id="550e8400-e29b-41d4-a716-446655440000",

@@ -76,6 +76,19 @@ def test_session_log_directory_is_lazy_and_filters_records(tmp_path: Path) -> No
     assert "info" not in content
 
 
+def test_schedule_session_log_uses_the_shared_workspace_log_partition(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    session_id = f"schedule_{uuid4()}"
+
+    with session_log(state, session_id):
+        logger.warning("scheduled warning")
+
+    assert "scheduled warning" in (state.logs_directory / f"{session_id}.log").read_text(
+        encoding="utf-8"
+    )
+    assert not state.schedule_sessions_directory.exists()
+
+
 def test_session_log_contexts_do_not_cross_write(tmp_path: Path) -> None:
     state = _state(tmp_path)
     first, second = _session_id(), _session_id()

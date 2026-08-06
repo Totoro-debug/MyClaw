@@ -733,7 +733,7 @@ def _build_tool_gateway(
     security = Security(
         workspace=workspace,
         agent_home=agent_home.path,
-        artifact_directory=(workspace_state.sessions_directory / "artifacts" / session.session_id),
+        artifact_directory=session.artifact_directory,
     )
     tools: list[BaseTool] = [
         ReadFileTool(security=security),

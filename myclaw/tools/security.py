@@ -26,6 +26,7 @@ class Security:
         # would make a pre-existing symlink or junction target part of the trusted
         # read scope.
         self._artifact_directory = HOST_FILESYSTEM.path_for_io(artifact_directory).absolute()
+        self._artifact_root = self._artifact_directory.parent
         self._session_id = artifact_directory.name
 
     def resolve_read_path(self, requested: str) -> Path:
@@ -41,7 +42,7 @@ class Security:
                 candidate = self._long_term_memory
             elif candidate.parts and candidate.parts[0] == "artifacts":
                 artifact_alias = True
-                candidate = self._workspace_state / "sessions" / candidate
+                candidate = self._artifact_root.joinpath(*candidate.parts[1:])
             else:
                 candidate = self._workspace / candidate
         else:
