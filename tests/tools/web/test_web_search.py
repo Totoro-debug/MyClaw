@@ -652,7 +652,6 @@ async def test_conversation_catalog_omits_web_search_when_web_tools_are_disabled
         "write_file",
         "edit_file",
         "shell",
-        "create_scheduled_work",
         "schedule",
     ]
     assert search.calls == []
@@ -707,6 +706,5 @@ async def test_conversation_catalog_includes_builtin_web_search_when_enabled(
         "web_search",
         "web_fetch",
         "shell",
-        "create_scheduled_work",
         "schedule",
     ]

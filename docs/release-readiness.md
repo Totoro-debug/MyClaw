@@ -22,8 +22,8 @@ rewriting that historical Windows-only decision.
 - Agent Home remains host-local and owns User Configuration. Legacy Agent Home Runtime
   Log files remain untouched and are no longer opened by MyClaw.
 - Workspace State remains `<workspace>/.myclaw/` and owns Conversation Session history,
-  Conversation Summary, Long-term Memory, Scheduled Work, Tool Artifacts, and Session
-  Logs. Active Session format and lifecycle follow ADR-0009: JSON-native state, strict
+  Conversation Summary, Long-term Memory, Schedule state and Jobs, Tool Artifacts, and
+  Session Logs. Active Session format and lifecycle follow ADR-0009: JSON-native state, strict
   five-field header, complete atomic JSONL snapshots, ordered async `persist()`, and
   bounded synchronous `close()`.
 

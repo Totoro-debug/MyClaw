@@ -413,7 +413,7 @@ async def test_artifact_boundary_failure_becomes_safe_tool_error_without_raw_fal
     assert list(artifact_directory.iterdir()) == []
     content = capture.text
     event_text = capture.event_text
-    records = [line for line in content.splitlines() if "myclaw.agent.turn:" in line]
+    records = [line for line in content.splitlines() if "myclaw.agent.run:" in line]
     assert len(records) == 1
     assert " ERROR " in records[0]
     assert (

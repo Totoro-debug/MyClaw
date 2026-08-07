@@ -62,10 +62,6 @@ class WorkspaceState:
         return self.path / "logs"
 
     @property
-    def scheduled_work_path(self) -> Path:
-        return self.path / "scheduled-work.json"
-
-    @property
     def schedule_path(self) -> Path:
         """Canonical Schedule Job state path."""
         return self.path / "schedule.json"

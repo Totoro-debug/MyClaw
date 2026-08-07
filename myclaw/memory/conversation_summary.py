@@ -16,7 +16,7 @@ from myclaw.agent.prompts import (
     conversation_summary_prompt,
     current_user_input,
 )
-from myclaw.agent.turn import model_message_from_session
+from myclaw.agent.run import model_message_from_session
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log

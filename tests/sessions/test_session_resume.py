@@ -276,15 +276,16 @@ async def test_switchable_port_closes_every_delegate_and_preserves_previous_hist
 
     conversation = SwitchableConversationPort(session=first, build_conversation=build)
 
-    _ = [event async for event in conversation.submit("First turn")]
+    first_events = [event async for event in conversation.submit("First turn")]
     conversation.switch_session(second)
-    _ = [event async for event in conversation.submit("Second turn")]
+    second_events = [event async for event in conversation.submit("Second turn")]
     await conversation.close()
 
     assert built_for == [first, second]
     assert delegates[first.session_id].closed
     assert delegates[second.session_id].closed
     assert Session.load(state, first.session_id).messages == first.messages
+    assert [event.event_id for event in first_events + second_events] == [0, 1, 2, 3]
 
 
 @pytest.mark.asyncio

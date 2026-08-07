@@ -18,7 +18,7 @@
 - 主对话通过 chat Model Route streaming，支持多轮、工具调用、取消与持久化。
 - 当前 Workspace 的 session 可以恢复，异常、中断和大工具结果不会破坏历史。
 - 长对话可以压缩为 Conversation Summary，Memory Task 可以按规则更新 Long-term Memory。
-- Scheduled Work 只在 runtime 存活期间运行，结果写入任务 session，并在合适时机提示 REPL。
+- Schedule Jobs 只在 runtime 存活期间运行，结果写入 Schedule Session，不发送 Agent Event 或通知。
 - 所有 required tests 使用 fake provider、fake tool、临时 Agent Home 和临时 Workspace 通过，不依赖真实模型 API。
 
 ## 2. 实施原则
@@ -43,7 +43,7 @@ myclaw/
   management/          # Management models/Port、service 与命令分发
   memory/              # Summary records、Memory models/ports、任务与 scheduler
   provider/            # Model models/Port、Router、errors 与 Provider adapters
-  schedule/            # Scheduled Work records、持久化、执行与后台协调
+  schedule/            # Schedule model、state、Tool 与 Service
   session/             # active Session、Conversation 与 resume
   terminal/            # Typer CLI、REPL 与 foreground interrupts
   tools/
@@ -61,7 +61,7 @@ tests/
   management/          # Management Port 行为
   memory/              # Conversation Summary 与 Memory Task
   provider/            # Provider-neutral models
-  scheduling/          # Scheduled Work persistence 与执行
+  scheduling/          # Schedule state、Tool 与 Service 行为
   sessions/            # Conversation、active Session、resume 与 title
   tools/               # files、shell、web 与 artifact 行为
   utils/               # 时间格式与 Session identifier 行为
@@ -93,7 +93,7 @@ Persistence adapters -> Workspace State paths and atomic persistence helpers
 | Phase 4 | 文件工具、权限、tool loop 和 artifact 完整 | Phase 3 |
 | Phase 5 | 真实 providers、Shell 和 Web 接入 | Phase 4 |
 | Phase 6 | 三层 Memory System 完整 | Phase 5 |
-| Phase 7 | Scheduled Work 与后台生命周期完整 | Phase 6 |
+| Phase 7 | Schedule Jobs、共享 Agent Run 与 Runtime 生命周期完整 | Phase 6 |
 | Phase 8 | 全量验收、真实冒烟与发布准备 | Phase 7 |
 
 Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI、真实 session 文件和可替换的模型边界。Phase 3 至 Phase 5 完成主 Agent 闭环。Phase 6 至 Phase 7 加入后台能力。Phase 8 只做收敛，不承接新的产品范围。
@@ -110,7 +110,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 1. 确定 Python 最低版本、构建后端、依赖管理方式和 `src/` 布局，配置 `myclaw` console script。
 2. 加入 Typer、Rich、TOML/schema、async 测试、cron、HTTP、Anthropic SDK 和 OpenAI SDK 的依赖；锁定兼容版本范围。
-3. 定义核心值对象和 typed contracts：Agent Event、model message/tool call、model usage、normalized tool result、permission decision、JSON-native Session state、summary entry、scheduled work state。
+3. 定义核心值对象和 typed contracts：Agent Event、Agent Run、model message/tool call、model usage、normalized tool result、permission decision、JSON-native Session state、summary entry、Schedule state。
 4. 定义 Conversation Port、Management Port、active Session、Model Provider、Summary Store、Memory Store 和 Tool 接口的最小方法集合。
 5. 确认所有时间字段格式、local timezone 语义、UUID 形式、错误分类和用户可见错误映射。
 6. 建立 `pytest`、async 测试支持、lint、format、type check 和覆盖率命令；提供 fake clock、scripted fake provider、fake tool、临时 Agent Home/Workspace fixtures。
@@ -120,7 +120,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 - `config.toml` 的完整字段名、类型、默认值、范围以及未知字段策略。
 - session metadata 与 user/assistant/tool JSONL 的精确 schema，包括 interrupted/error 和 artifact reference 的表达。
-- Scheduled Work 根 JSON 文件名；当前需求只确定“Agent Home 根目录的 JSON 数组文件”。
+- Schedule state 根 JSON 文件名为 `schedule.json`；legacy scheduled-work state 原样保留且不读取、不迁移、不删除。
 - 内置 file tools 的名称和参数 schema，以及哪些 Agent Home 路径允许主 Agent 读取。
 - Shell 极小只读 allowlist 的精确命令和参数判定规则。
 - WebSearch 的实际后端、凭据和 normalized result schema。
@@ -169,7 +169,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ### 实现任务
 
-1. 实现 Model Router，只接受 default/chat/memory/cron；具体 route 缺失或不可用时 fallback default。
+1. 实现 Model Router，只接受 default/chat/memory/schedule；具体 route 缺失或不可用时 fallback default。
 2. 实现统一 model request/stream event/response/usage/error contract，以及固定最多 5 次的 retry coordinator。
 3. retry 仅处理明确的临时 provider/model 错误，使用可注入 clock 的指数退避，并尊重 retry-after；取消和永久错误不得重试。
 4. 实现 active Session：延迟物化、严格五字段 header、JSON-native message dictionaries、完整 atomic JSONL replacement、ordered async `persist()` 和 bounded synchronous `close()`。
@@ -220,21 +220,21 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ### 实现任务
 
-1. 实现 Tool Catalog、参数 schema 校验、tool resolution、Permission Policy、execution context 与 normalized result。
+1. 实现 Tool Catalog、参数 schema 校验、tool resolution、Tool Confirmation 与 normalized result。
 2. Runtime Core 支持 assistant content 与 tool calls 共存，按协议持久化 assistant/tool messages，并继续模型循环直到 final output。
-3. 实现 tool activity 和 permission request Agent Events；默认只显示工具名与状态摘要，不泄露完整参数/结果。
-4. 实现 file read/list/search，以及需要确认的 create/write/edit；路径在操作前规范化并检查 symlink/reparse 后的真实边界。
-5. 主 Agent 对 config、memory、sessions、summary、cursor 和 Scheduled Work 内部文件的写入一律拒绝；越界直接 deny，不升级为 ask。
-6. 前台 ask 阻塞当前 turn；接受不增加独立 history；拒绝转换为对应 tool result。后台 execution context 的 ask 自动拒绝。
-7. 工具异常、参数错误、拒绝和取消都转换为 tool result；Tool Gateway 不做 retry。
+3. 实现 tool activity 和 `confirmation_requested` Agent Events；默认只显示工具名与状态摘要，不泄露完整参数/结果。
+4. 实现 file read/list/search，并固定拒绝 Workspace create/write/edit；路径在操作前规范化并检查 symlink/reparse 后的真实边界。
+5. 主 Agent 对 config、memory、sessions、summary、cursor 和 Schedule state 内部文件的写入一律拒绝；越界 fail closed，不升级为 confirmation。
+6. Schedule add/remove 的前台 Tool Confirmation 阻塞当前 Agent Run；批准或拒绝不增加独立 history，非交互 Schedule Agent Run 自动拒绝。其他 refused capability 不进入确认流程。
+7. 工具异常、参数错误和拒绝都转换为 tool result；Tool Gateway 执行 concrete Tool 声明的有界 retry，取消继续向上传播。
 8. 超过 `max_tool_result_chars` 的原始结果原子写入 Tool Artifact，session 保存引用和截断 preview。
 9. 中断时保留已完成 messages，并把未完成 tool calls 物化为 tool error results，使 session 可恢复。
 
 ### 测试与退出条件
 
-- file allow/ask/deny 矩阵完整覆盖 Workspace、允许读取的 Agent Home、内部写保护、`..`、symlink/reparse 和不存在目标的父目录。
+- file allow/refused/error 矩阵完整覆盖 Workspace、允许读取的状态别名、内部写保护、`..`、symlink/reparse 和不存在目标的父目录。
 - tool call 参数错误和执行失败只执行一次；assistant/tool 关联 ID 可完整恢复。
-- 接受、拒绝、后台自动拒绝的事件和 session 历史符合要求。
+- Schedule confirmation 接受、拒绝、非交互自动拒绝的事件和 session 历史符合要求。
 - 阈值边界、artifact 路径、原始内容、preview、atomicity 和随 session 恢复均通过测试。
 - streaming 中断和 tool execution 中断后，JSONL 仍是合法、语义完整的对话。
 
@@ -248,18 +248,18 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 1. 使用官方 Anthropic SDK 实现 adapter，转换 streaming text、tool use、usage、timeout、retry-after 和错误类别。
 2. 使用官方 OpenAI SDK 实现 openai-compatible adapter，支持 required base URL、streaming、tool calls、usage 和错误转换。
-3. provider 不支持 reasoning effort 时静默忽略；chat 强制 streaming，memory/cron 允许非 streaming。
-4. 实现 Shell tool：配置 enablement、Workspace cwd、60-600 秒 timeout、固定只读 allowlist和内置 ask/deny；安全终止超时/取消的子进程。
+3. provider 不支持 reasoning effort 时静默忽略；chat 强制 streaming，memory/schedule 允许非 streaming。
+4. 实现 Shell tool：配置 enablement、Workspace cwd、60-600 秒 timeout、固定只读 allowlist和非 allowlist refusal；安全终止超时/取消的子进程。
 5. 实现 WebSearch adapter 和 normalized results；配置关闭时不进入 catalog。
 6. 实现 WebFetch：仅公网 HTTP(S)、DNS/IP 校验、阻止 localhost/private/link-local、每次 redirect 重新校验、最多 5 次跳转、响应大小/超时限制。
-7. web/shell enablement 同时作用于前台 chat 和 Scheduled Work 的 catalog 组装。
+7. web/shell enablement 同时作用于前台 chat 和 Schedule Jobs 的 catalog 组装。
 8. 增加可选的手工真实 API smoke tests，必须通过环境标志显式启用，默认测试套件仍完全离线。
 
 ### 测试与退出条件
 
 - 用 fake SDK/client contract tests 覆盖两类 adapter 的 stream、mixed content/tool calls、usage、timeout、retryable/permanent error。
 - 验证 route 层负责 5 次 model retry，而 adapter 与 Tool Gateway 不重复 retry。
-- Shell 覆盖 allowlist、ask、deny、cwd 边界、timeout 下限/上限、超时和 Ctrl+C 的进程清理。
+- Shell 覆盖 allowlist、refusal、cwd 边界、timeout 下限/上限、超时和 Ctrl+C 的进程清理。
 - WebFetch 覆盖直接私网、DNS 解析到私网、公开 URL 重定向到私网、循环/超过 5 次重定向。
 - 至少各完成一次 Anthropic 与 OpenAI-compatible 的人工 streaming 冒烟；若无凭据，记录为发布前待执行项，不让单元测试依赖凭据。
 
@@ -291,31 +291,30 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 - Summary Cursor 在 no update、edit success、edit failure 下严格按规则推进。
 - batch size、手工/周期不重入、受限 edit 路径、runtime cache 与磁盘视图差异均有 integration tests。
 
-## 12. Phase 7：Scheduled Work 与完整 Runtime 生命周期
+## 12. Phase 7：Schedule Jobs 与完整 Runtime 生命周期
 
 ### 目标
 
-完成自然语言定时任务、任务专属 session、后台执行与前台事件协调，并收口 asyncio 生命周期。
+完成自然语言 Schedule Job、Schedule Session、共享 Agent Run 与 Schedule Service 生命周期，并收口 asyncio 资源关闭。
 
 ### 实现任务
 
-1. 实现 Scheduled Work JSON array store、schema 校验和原子 rewrite；容忍单条无效记录并提供可诊断错误策略。
-2. 实现创建工具：字段为 id、title、cron、prompt、created_at、enabled、session_id，新任务固定 enabled=true，持久化前必须确认。
-3. 创建时只验证 cron/schema，不静态拒绝未来可能需要 disabled web/shell 的任务。
-4. 每个任务创建并复用 task-specific Conversation Session；trigger 时追加 prompt 为 user message，通过 cron route 执行完整 Agent turn并保存 final assistant。
-5. cron turn 注入 Long-term Memory，使用与主 Agent一致的 tool catalog enablement；后台 ask 自动拒绝。
-6. 每个 task 在单 runtime 内加运行态 guard；重叠 trigger 跳过，不实现跨进程去重。
-7. runtime 启动两个 scheduler；前台 turn、Memory Task、Scheduled Work 均由明确的 task ownership 管理。
-8. Scheduled Work 完成时发 Agent Event；若前台正在 streaming，通知排队到前台结束后，结果正文仍以 session 为真相源。
+1. 实现 `schedule.json` strict array Store、schema 校验、copy-on-write 与 atomic replacement；损坏 state 在 scheduler/REPL 前阻止启动。
+2. 实现 `schedule` Tool 的 add/list/remove：支持 at/every/cron，add/remove 通过 Tool Confirmation，list 只返回 user Job。
+3. 每个 Job 创建并复用 `schedule_<job_id>` Schedule Session，首次产生消息时写入 `schedule-sessions/` 分区。
+4. 每次触发通过共享 Agent Run 的 `schedule` route 执行，注入启动时 Memory snapshot，保存完整 Session history。
+5. 每个 Job 在单 runtime 内加运行态 guard；重叠 trigger 跳过，不实现跨进程去重。
+6. runtime 启动 Memory scheduler 与唯一 Schedule Service；前台 Conversation 和 Schedule Job 共享资源关闭顺序。
+7. Schedule Service 不发 Agent Event、completion prompt 或 notification；结果以 Schedule Session 为真相源。
 9. Ctrl+C 只取消当前前台 turn；`exit`/`quit` 立即取消并 await 全部后台任务，关闭 provider/HTTP/子进程资源。
 10. 明确异常隔离：单个后台任务失败不能终止 REPL 或 scheduler loop，失败写入对应 task session。
 
 ### 测试与退出条件
 
-- 创建确认接受后只写一次，拒绝和后台 ask 不写；JSON array 的并发写在单 runtime 内串行。
-- 本地时区 trigger、task session 归属、cron route/fallback、Long-term Memory 注入和 final result 持久化正确。
-- 同 task 不重入，不同 task 可并发；多 runtime 不协调的行为不被测试成强保证。
-- 前台 streaming 期间后台完成提示不穿插文本，前台结束后按队列显示。
+- 创建确认接受后只写一次，拒绝和非交互 confirmation refusal 不写；JSON array 的并发写在单 runtime 内串行。
+- at/every/cron trigger、Schedule Session 归属、schedule route/fallback、Long-term Memory snapshot 和 final result 持久化正确。
+- 同 Job 不重入，不同 Job 可并发；多 runtime 不协调的行为不被测试成强保证。
+- legacy scheduled-work state 无论内容或 path type 都保持原样，且不被读取、检测、迁移或删除。
 - Ctrl+C、正常退出、异常退出路径没有遗留 asyncio tasks；退出时后台取消不会破坏已有文件。
 
 ## 13. Phase 8：全量验收、加固与发布准备
@@ -330,7 +329,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 2. 在 Windows x64 发布候选上运行完整测试，重点核对路径、原子 replace、subprocess cancellation 和终端中断行为。
 3. 执行安全复核：路径穿越与 symlink、Agent Home 内部写保护、Shell policy、SSRF/redirect、secret redaction、artifact 泄露面。
 4. 执行故障注入：磁盘写失败、损坏 JSONL/TOML/JSON、provider 连续失败、网络超时、取消发生在 stream/tool/metadata update 各阶段。
-5. 执行 REPL 手工验收：首次配置、streaming、确认/拒绝、resume、长对话 consolidation、`/dream`、后台任务提示和退出清理。
+5. 执行 REPL 手工验收：首次配置、streaming、Schedule 确认/拒绝、resume、长对话 consolidation、`/dream`、Schedule 静默后台执行和退出清理。
 6. 补齐安装、配置、Agent Home 文件说明、已知限制和故障排查文档；明确 API key 是 plaintext 风险。
 7. 确认打包元数据、版本展示、license、console entry point 和干净环境安装。
 8. 输出首版已知风险：多 REPL 重复调度、同 session 跨进程并发、Long-term Memory 无大小上限、artifact 不自动清理。
@@ -378,12 +377,12 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 | WebFetch DNS/redirect 检查不完整 | SSRF 访问本机或内网 | 每跳解析和校验，限制 scheme、redirect 次数、响应大小和 timeout |
 | 配置/错误输出泄露 API key | 终端历史或 CI log 泄密 | 结构化脱敏 + parse-failure 文本脱敏 + 错误快照测试 |
 | Long-term Memory 无首版大小上限 | system prompt 超预算导致 chat 失败 | 按需求显式报配置/记忆过大错误，不静默裁剪 memory |
-| 后台通知与前台 streaming 竞争 | 终端输出交错、难以阅读 | 单一 UI event consumer，前台 streaming 期间缓冲后台完成事件 |
+| Schedule Job 与前台 streaming 竞争 | 共享资源关闭或 Session 写入顺序错误 | Schedule Service 不向 Conversation Port 发送事件，结果只保留在 Schedule Session |
 | 测试依赖 wall clock 或真实网络 | 慢、flaky、无法离线 | fake clock、fake provider、fake HTTP transport，真实 smoke 独立运行 |
 
 ## 16. 明确不进入首版的工作
 
-以下事项不得作为“顺手优化”加入任何 Phase：one-shot 对话、daemon/系统服务、HTTP/IPC、跨进程锁或调度去重、MCP、subagent、多 Agent 编排、用户配置 identity、profiles、session 管理扩展、Scheduled Work 管理命令、Agent Home 或 Workspace 级全局 Runtime Log、SQLite/向量数据库、Long-term Memory 相关性筛选或大小上限、可扩展 Shell allowlist、密钥链或环境变量 key reference、artifact 自动清理、notification adapter、非交互 status，以及 nanobot 等宽 provider registry。
+以下事项不得作为“顺手优化”加入任何 Phase：one-shot 对话、daemon/系统服务、HTTP/IPC、跨进程锁或调度去重、MCP、subagent、多 Agent 编排、用户配置 identity、profiles、session 管理扩展、独立 Schedule CLI、Job 修改/pause/resume/run-now、Agent Home 或 Workspace 级全局 Runtime Log、SQLite/向量数据库、Long-term Memory 相关性筛选或大小上限、可扩展 Shell allowlist、密钥链或环境变量 key reference、artifact 自动清理、notification adapter、非交互 status，以及 nanobot 等宽 provider registry。
 
 如确需其中任一能力，应先进入下一版本需求与 ADR，不应延后当前 Phase 的退出条件。
 

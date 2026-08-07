@@ -19,8 +19,12 @@ from myclaw.agent.prompts import (
     runtime_context,
     session_title_prompt,
 )
-from myclaw.agent.run import AgentRun, AgentRunModelSettings
-from myclaw.agent.turn import ToolResultExternalizer, model_message_from_session
+from myclaw.agent.run import (
+    AgentRun,
+    AgentRunModelSettings,
+    ToolResultExternalizer,
+    model_message_from_session,
+)
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
@@ -47,19 +51,6 @@ from myclaw.memory.memory_task import (
 )
 from myclaw.provider.model_router import Jitter, ModelRouter, RetryClock
 from myclaw.provider.models import ModelProvider
-from myclaw.schedule.background_coordination import (
-    RuntimeEventBroker,
-    ScheduledWorkCoordinator,
-    ScheduledWorkScheduler,
-)
-from myclaw.schedule.scheduled_work import (
-    CreateScheduledWorkTool,
-    WorkspaceJsonScheduledWorkStore,
-)
-from myclaw.schedule.scheduled_work_execution import (
-    ScheduledWorkModelSettings,
-    ScheduledWorkRunner,
-)
 from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.schedule.tool import ScheduleTool
@@ -105,10 +96,10 @@ class _RuntimeSchedulerOwner:
 
     def __init__(
         self,
-        factory: Callable[[], MemoryTaskScheduler | ScheduledWorkScheduler],
+        factory: Callable[[], MemoryTaskScheduler | ScheduleService],
     ) -> None:
         self._factory = factory
-        self._active: MemoryTaskScheduler | ScheduledWorkScheduler | None = None
+        self._active: MemoryTaskScheduler | ScheduleService | None = None
 
     def start(self) -> None:
         scheduler = self._active
@@ -147,11 +138,8 @@ class PreparedReplRuntime:
     conversation: SwitchableConversationPort
     management_dispatcher: ManagementDispatcher
     schedule_service: ScheduleService
-    scheduled_work_coordinator: ScheduledWorkCoordinator
     _shell: SubprocessShellBoundary | None
     _memory_scheduler: _RuntimeSchedulerOwner
-    _scheduled_work_scheduler: _RuntimeSchedulerOwner
-    _background_events: RuntimeEventBroker
     _router: ModelRouter
     _lifetime: _RuntimeLifetime
 
@@ -178,7 +166,6 @@ class PreparedReplRuntime:
         with without_session_log():
             try:
                 self._memory_scheduler.start()
-                self._scheduled_work_scheduler.start()
                 self.schedule_service.start()
             except BaseException as error:
                 logger.opt(exception=error).error(
@@ -211,7 +198,6 @@ class PreparedReplRuntime:
                     input_reader=input_reader,
                     writer=writer,
                     management_dispatcher=dispatcher,
-                    background_events=self._background_events,
                     shutdown_requested=self._lifetime.shutdown_requested,
                 )
             except BaseException as primary_error:
@@ -249,17 +235,11 @@ class PreparedReplRuntime:
         with without_session_log():
             failures: list[BaseException] = []
             try:
-                self._background_events.close()
-            except BaseException as error:
-                failures.append(error)
-
-            try:
                 await self.schedule_service.close()
             except BaseException as error:
                 failures.append(error)
 
             shutdowns: list[Awaitable[object]] = [
-                self._scheduled_work_scheduler.close(),
                 self._memory_scheduler.close(),
                 self.conversation.close(),
             ]
@@ -455,7 +435,6 @@ def prepare_repl_runtime(
     retry_clock: RetryClock | None = None,
     retry_jitter: Jitter | None = None,
     memory_scheduler_clock: SchedulerClock | None = None,
-    scheduled_work_scheduler_clock: SchedulerClock | None = None,
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     web_search: WebSearchBoundary | None = None,
@@ -474,7 +453,6 @@ def prepare_repl_runtime(
             retry_clock=retry_clock,
             retry_jitter=retry_jitter,
             memory_scheduler_clock=memory_scheduler_clock,
-            scheduled_work_scheduler_clock=scheduled_work_scheduler_clock,
             schedule_scheduler_clock=schedule_scheduler_clock,
             monotonic_now=monotonic_now,
             web_search=web_search,
@@ -501,7 +479,6 @@ def _prepare_repl_runtime(
     retry_clock: RetryClock | None = None,
     retry_jitter: Jitter | None = None,
     memory_scheduler_clock: SchedulerClock | None = None,
-    scheduled_work_scheduler_clock: SchedulerClock | None = None,
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     web_search: WebSearchBoundary | None = None,
@@ -562,8 +539,6 @@ def _prepare_repl_runtime(
         configured_shell if isinstance(configured_shell, SubprocessShellBoundary) else None
     )
     schedule_tool = ScheduleTool(store=schedule_store, now=now, new_uuid=new_uuid)
-    scheduled_work_store = WorkspaceJsonScheduledWorkStore(workspace_state)
-    scheduled_work_tool = CreateScheduledWorkTool()
     tool_gateway = _build_tool_gateway(
         agent_home=agent_home,
         session=session,
@@ -571,7 +546,6 @@ def _prepare_repl_runtime(
         web_fetch=configured_web_fetch,
         shell=configured_shell,
         schedule=schedule_tool,
-        scheduled_work=scheduled_work_tool,
     )
     tool_guidance = render_tool_guidance(tool_gateway.schemas)
 
@@ -633,7 +607,7 @@ def _prepare_repl_runtime(
         )
     )
 
-    def scheduled_work_gateway_for(active_session: Session) -> ToolGateway:
+    def schedule_gateway_for(active_session: Session) -> ToolGateway:
         return _build_tool_gateway(
             session=active_session,
             agent_home=agent_home,
@@ -641,7 +615,6 @@ def _prepare_repl_runtime(
             web_fetch=configured_web_fetch,
             shell=configured_shell,
             schedule=schedule_tool,
-            scheduled_work=scheduled_work_tool,
         )
 
     def externalize_result_for(active_session: Session) -> ToolResultExternalizer:
@@ -692,7 +665,7 @@ def _prepare_repl_runtime(
         now=now,
         new_uuid=new_uuid,
         system_prompt=system_prompt,
-        tool_gateway_for=scheduled_work_gateway_for,
+        tool_gateway_for=schedule_gateway_for,
         externalize_result_for=externalize_result_for,
         memory_snapshot=runtime_memory.snapshot,
         system_prompt_for_memory=system_prompt_for,
@@ -708,43 +681,6 @@ def _prepare_repl_runtime(
         agent_run=schedule_agent_run,
         workspace_state=workspace_state,
         clock=schedule_clock,
-    )
-    scheduled_work_runner = ScheduledWorkRunner(
-        provider=router,
-        workspace_state=workspace_state,
-        long_term_memory=long_term_memory,
-        memory_snapshot=runtime_memory.snapshot,
-        settings=ScheduledWorkModelSettings(
-            model=configured_schedule.model,
-            max_output=configured_schedule.max_output,
-            temperature=configured_schedule.temperature,
-            reasoning_effort=configured_schedule.reasoning_effort,
-            timeout_seconds=configured_schedule.timeout,
-        ),
-        now=now,
-        new_uuid=new_uuid,
-        tool_gateway_for=scheduled_work_gateway_for,
-        externalize_result_for=externalize_result_for,
-    )
-    background_events = RuntimeEventBroker()
-    scheduled_work_coordinator = ScheduledWorkCoordinator(
-        runner=scheduled_work_runner,
-        events=background_events,
-        now=now,
-        new_uuid=new_uuid,
-        workspace_state=workspace_state,
-    )
-    scheduled_scheduler_clock = (
-        scheduled_work_scheduler_clock
-        if scheduled_work_scheduler_clock is not None
-        else AsyncioSchedulerClock(now=now)
-    )
-    scheduled_work_scheduler = _RuntimeSchedulerOwner(
-        lambda: ScheduledWorkScheduler(
-            store=scheduled_work_store,
-            coordinator=scheduled_work_coordinator,
-            clock=scheduled_scheduler_clock,
-        )
     )
     foreground_chat_status: ResolvedChatStatus | None = None
 
@@ -767,7 +703,6 @@ def _prepare_repl_runtime(
             web_fetch=configured_web_fetch,
             shell=configured_shell,
             schedule=schedule_tool,
-            scheduled_work=scheduled_work_tool,
         )
         return _DeferredConversationPort(
             provider=router,
@@ -792,7 +727,6 @@ def _prepare_repl_runtime(
     conversation = SwitchableConversationPort(
         session=session,
         build_conversation=conversation_for,
-        event_sequencer=background_events,
     )
     status_service = RuntimeStatusService(
         session=session,
@@ -827,11 +761,8 @@ def _prepare_repl_runtime(
         conversation=conversation,
         management_dispatcher=management_dispatcher,
         schedule_service=schedule_service,
-        scheduled_work_coordinator=scheduled_work_coordinator,
         _shell=owned_shell,
         _memory_scheduler=memory_scheduler,
-        _scheduled_work_scheduler=scheduled_work_scheduler,
-        _background_events=background_events,
         _router=router,
         _lifetime=_RuntimeLifetime(),
     )
@@ -845,7 +776,6 @@ def _build_tool_gateway(
     web_fetch: WebFetchBoundary | None,
     shell: ShellBoundary | None,
     schedule: ScheduleTool | None = None,
-    scheduled_work: CreateScheduledWorkTool | None = None,
 ) -> ToolGateway:
     workspace_state = session.workspace_state
     workspace = workspace_state.workspace
@@ -868,8 +798,6 @@ def _build_tool_gateway(
         tools.append(WebFetchTool(fetcher=web_fetch))
     if shell is not None:
         tools.append(ShellTool(workspace=Path(workspace.path), boundary=shell))
-    if scheduled_work is not None:
-        tools.append(scheduled_work)
     if schedule is not None:
         tools.append(schedule)
     gateway.register_tools(tuple(tools))

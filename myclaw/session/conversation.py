@@ -1,4 +1,4 @@
-"""Command-line Conversation adapter over the Runtime Core Agent turn."""
+"""Command-line Conversation adapter over the Runtime Core Agent Run."""
 
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
@@ -35,8 +35,6 @@ from myclaw.agent.run import (
     AgentRunTextDeltaPayload,
     AgentRunToolCompletedPayload,
     AgentRunToolStartedPayload,
-)
-from myclaw.agent.turn import (
     ToolResultExternalizer,
     _log_artifact_failure,
     model_message_from_session,
@@ -73,7 +71,7 @@ class ChatModelSettings:
 
 
 class StreamingConversationPort:
-    """Expose one foreground Agent turn as ordered Agent Events."""
+    """Expose one foreground Agent Run as ordered Agent Events."""
 
     def __init__(
         self,

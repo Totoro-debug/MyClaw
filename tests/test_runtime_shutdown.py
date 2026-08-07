@@ -23,7 +23,6 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.schedule.records import ScheduledWork
 from myclaw.session.conversation import ChatModelSettings
 from myclaw.session.session import Session
 from myclaw.tools.models import ModelToolCall
@@ -32,7 +31,7 @@ from myclaw.tools.shell.shell_process import SubprocessShellBoundary
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.tools.web.web_fetch import PublicWebFetchBoundary
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider, StreamScript, persist_scheduled_work
+from tests.fixtures import ScriptedFakeProvider, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 NOW = datetime(2026, 7, 13, 0, 30, tzinfo=timezone(timedelta(hours=8)))
@@ -50,6 +49,9 @@ class BlockingSchedulerClock:
     def now(self) -> datetime:
         return NOW
 
+    def monotonic(self) -> float:
+        return 0.0
+
     async def sleep(self, seconds: float) -> None:
         del seconds
         self.sleep_started.set()
@@ -59,38 +61,12 @@ class BlockingSchedulerClock:
             self.sleep_stopped.set()
 
 
-class AdvancingSchedulerClock:
-    def __init__(self, current: datetime) -> None:
-        self._current = current
-        self.sleeps: list[float] = []
-        self._sleeping = asyncio.Event()
-        self._release = asyncio.Event()
-
-    def now(self) -> datetime:
-        return self._current
-
-    async def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-        self._sleeping.set()
-        await self._release.wait()
-        self._release.clear()
-        self._sleeping.clear()
-
-    async def advance(self, seconds: float) -> None:
-        await asyncio.wait_for(self._sleeping.wait(), timeout=1)
-        previous_sleep_count = len(self.sleeps)
-        self._current += timedelta(seconds=seconds)
-        self._release.set()
-        for _ in range(100):
-            await asyncio.sleep(0)
-            if len(self.sleeps) > previous_sleep_count:
-                return
-        raise AssertionError("Scheduled Work scheduler did not resume sleeping")
-
-
 class FailingSchedulerClock:
     def now(self) -> datetime:
-        raise RuntimeError("scheduled scheduler failed to start")
+        raise RuntimeError("Schedule Service clock failed to start")
+
+    def monotonic(self) -> float:
+        return 0.0
 
     async def sleep(self, seconds: float) -> None:
         del seconds
@@ -241,12 +217,12 @@ async def test_partial_scheduler_start_failure_closes_the_started_memory_loop(
         now=lambda: NOW,
         new_uuid=uuid4,
         memory_scheduler_clock=memory_clock,
-        scheduled_work_scheduler_clock=FailingSchedulerClock(),
+        schedule_scheduler_clock=FailingSchedulerClock(),
     )
     baseline = asyncio.all_tasks()
 
     try:
-        with pytest.raises(RuntimeError, match="scheduled scheduler failed to start"):
+        with pytest.raises(RuntimeError, match="Schedule Service clock failed to start"):
             await runtime.run(input_reader=UnusedInput(), writer=SilentWriter())
         await asyncio.sleep(0)
 
@@ -277,7 +253,7 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
         now=lambda: NOW,
         new_uuid=uuid4,
         memory_scheduler_clock=BlockingSchedulerClock(),
-        scheduled_work_scheduler_clock=FailingSchedulerClock(),
+        schedule_scheduler_clock=FailingSchedulerClock(),
     )
     baseline = asyncio.all_tasks()
     log_capture = capture_diagnostics()
@@ -286,7 +262,7 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
 
     try:
         with session_log(state, ambient_session_id):
-            with pytest.raises(RuntimeError, match="scheduled scheduler failed to start"):
+            with pytest.raises(RuntimeError, match="Schedule Service clock failed to start"):
                 await runtime.start()
         await asyncio.sleep(0)
     finally:
@@ -1101,7 +1077,7 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
         now=lambda: NOW,
         new_uuid=uuid4,
         memory_scheduler_clock=memory_clock,
-        scheduled_work_scheduler_clock=scheduled_clock,
+        schedule_scheduler_clock=scheduled_clock,
     )
     input_reader = ControlledInput()
     signals = SignalSetter()
@@ -1166,207 +1142,3 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
     assert " ERROR " not in content
     assert "cancel" not in content.lower()
     assert "shutdown failed" not in content.lower()
-
-
-@pytest.mark.asyncio
-async def test_runtime_interrupt_keeps_background_work_alive_and_exit_settles_it_before_provider(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    from types import FrameType
-
-    from myclaw.terminal.interrupts import (
-        ForegroundInterruptController,
-        SignalDisposition,
-    )
-
-    order: list[str] = []
-
-    class LifetimeProvider:
-        def __init__(self) -> None:
-            self.foreground_started = asyncio.Event()
-            self.foreground_stopped = asyncio.Event()
-            self.first_background_started = asyncio.Event()
-            self.first_background_release = asyncio.Event()
-            self.first_background_completed = asyncio.Event()
-            self.first_background_cancelled = asyncio.Event()
-            self.second_background_started = asyncio.Event()
-            self.second_background_stopped = asyncio.Event()
-            self.stream_requests: list[ModelRequest] = []
-            self.complete_requests: list[ModelRequest] = []
-            self._background_calls = 0
-            self.closed = False
-
-        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-            self.stream_requests.append(request)
-            if request.system_prompt == session_title_prompt():
-                yield ModelCompleted(
-                    response=ModelResponse(
-                        message=AssistantModelMessage(content="Runtime lifetime"),
-                        usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-                        finish_reason="stop",
-                    )
-                )
-                return
-            self.foreground_started.set()
-            try:
-                yield TextDelta(delta="Foreground active.")
-                await asyncio.Event().wait()
-            finally:
-                order.append("foreground-finally")
-                self.foreground_stopped.set()
-
-        async def complete(self, request: ModelRequest) -> ModelResponse:
-            self.complete_requests.append(request)
-            if request.system_prompt == session_title_prompt():
-                return ModelResponse(
-                    message=AssistantModelMessage(content="Runtime lifetime"),
-                    usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-                    finish_reason="stop",
-                )
-            assert request.route == "schedule"
-            self._background_calls += 1
-            if self._background_calls == 1:
-                self.first_background_started.set()
-                try:
-                    await self.first_background_release.wait()
-                except asyncio.CancelledError:
-                    self.first_background_cancelled.set()
-                    raise
-                order.append("first-background-completed")
-                self.first_background_completed.set()
-                return ModelResponse(
-                    message=AssistantModelMessage(content="First background completed."),
-                    usage=ModelUsage(input_tokens=2, output_tokens=2, total_tokens=4),
-                    finish_reason="stop",
-                )
-            assert self._background_calls == 2
-            self.second_background_started.set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                order.append("second-background-finally")
-                self.second_background_stopped.set()
-            raise AssertionError("second background work must be cancelled on exit")
-
-        async def close(self) -> None:
-            order.append("provider-close")
-            self.closed = True
-
-    class ExitAfterInterruptInput:
-        def __init__(self) -> None:
-            self._calls = 0
-            self.waiting_for_exit = asyncio.Event()
-            self.release_exit = asyncio.Event()
-
-        async def read(self) -> str:
-            self._calls += 1
-            if self._calls == 1:
-                return "Keep background work alive."
-            self.waiting_for_exit.set()
-            await self.release_exit.wait()
-            return "exit"
-
-    def previous_handler(signum: int, frame: FrameType | None) -> None:
-        del signum, frame
-
-    class SignalSetter:
-        def __init__(self) -> None:
-            self.current: SignalDisposition = previous_handler
-
-        def __call__(self, signum: int, handler: SignalDisposition) -> SignalDisposition:
-            assert signum > 0
-            previous = self.current
-            self.current = handler
-            return previous
-
-    home = AgentHome(agent_home)
-    home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
-    state.initialize(agent_home_root=Path.home() / ".myclaw")
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
-    provider = LifetimeProvider()
-    memory_clock = BlockingSchedulerClock()
-    scheduled_clock = AdvancingSchedulerClock(NOW)
-    runtime = prepare_repl_runtime(
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _configuration: provider,
-        now=scheduled_clock.now,
-        new_uuid=uuid4,
-        memory_scheduler_clock=memory_clock,
-        scheduled_work_scheduler_clock=scheduled_clock,
-    )
-    first_task = ScheduledWork(
-        id="11111111-1111-4111-8111-111111111111",
-        title="First lifetime task",
-        cron="31 0 * * *",
-        prompt="Run the first background task.",
-        created_at=NOW,
-        enabled=True,
-        session_id=("20260713-003000-000000_33333333-3333-4333-8333-333333333333"),
-    )
-    persist_scheduled_work(state.path, (first_task,))
-    input_reader = ExitAfterInterruptInput()
-    signals = SignalSetter()
-    interrupts = ForegroundInterruptController(
-        loop=asyncio.get_running_loop(),
-        cancel_foreground=runtime.conversation.cancel_active_turn,
-        set_signal=signals,
-    )
-    interrupts.install()
-    baseline = asyncio.all_tasks()
-    running = asyncio.create_task(runtime.run(input_reader=input_reader, writer=SilentWriter()))
-    try:
-        await asyncio.wait_for(provider.foreground_started.wait(), timeout=1)
-        await scheduled_clock.advance(60)
-        await asyncio.wait_for(provider.first_background_started.wait(), timeout=1)
-
-        handler = signals.current
-        assert callable(handler)
-        handler(2, None)
-        await asyncio.wait_for(input_reader.waiting_for_exit.wait(), timeout=1)
-
-        assert provider.foreground_stopped.is_set()
-        assert not provider.first_background_cancelled.is_set()
-        assert not provider.first_background_completed.is_set()
-        provider.first_background_release.set()
-        await asyncio.wait_for(provider.first_background_completed.wait(), timeout=1)
-
-        second_task = ScheduledWork(
-            id="22222222-2222-4222-8222-222222222222",
-            title="Second lifetime task",
-            cron="32 0 * * *",
-            prompt="Run the second background task.",
-            created_at=scheduled_clock.now(),
-            enabled=True,
-            session_id=("20260713-003100-000000_44444444-4444-4444-8444-444444444444"),
-        )
-        persist_scheduled_work(state.path, (first_task, second_task))
-        await scheduled_clock.advance(60)
-        await asyncio.wait_for(provider.second_background_started.wait(), timeout=1)
-
-        input_reader.release_exit.set()
-        await asyncio.wait_for(running, timeout=2)
-    finally:
-        provider.first_background_release.set()
-        input_reader.release_exit.set()
-        if not running.done():
-            await runtime.close()
-        await asyncio.gather(running, return_exceptions=True)
-        await interrupts.close()
-        interrupts.restore()
-
-    await asyncio.sleep(0)
-    assert provider.second_background_stopped.is_set()
-    assert provider.closed
-    assert order.index("first-background-completed") < order.index("second-background-finally")
-    assert order.index("second-background-finally") < order.index("provider-close")
-    assert asyncio.all_tasks() == baseline

@@ -12,9 +12,9 @@
 
 - 用户运行 `myclaw` 进入长驻前台 REPL。
 - 每个有效 REPL 启动准备一个新的 Workspace-scoped Conversation Session；未发送用户消息就退出时不持久化空 session。
-- Runtime Core 通过 Conversation Port、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界编排 Agent turn。
+- Runtime Core 通过 Conversation Port、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界编排 Agent Run。
 - Agent Home 固定为 `~/.myclaw/`，采用 file-first persistence。
-- REPL 支持 streaming、后台 Memory Task、Scheduled Work、session resume 和管理 slash commands；当前 Tool contract 不实现用户确认。
+- REPL 支持 streaming、后台 Memory Task、Schedule Jobs、session resume 和管理 slash commands；Schedule Job add/remove 使用独立 Tool Confirmation，其余 capability 仍遵循各自的 fail-closed policy。
 - 首版非交互管理只支持 `myclaw config`，不支持 one-shot 对话。
 
 ## User Stories
@@ -44,17 +44,17 @@
 23. 作为个人用户，我想原始 session 消息仍保留，所以摘要不会破坏历史可追溯性。
 24. 作为个人用户，我想长期记忆只在模型判断需要时更新，所以不会每次后台任务都产生无意义修改。
 25. 作为个人用户，我想文件读取、列举和搜索默认可用，所以 Agent 能理解 Workspace。
-26. 作为个人用户，我想当前版本直接拒绝文件新建和编辑，所以缺少确认流程时 Agent 不会静默修改项目。
+26. 作为个人用户，我想当前版本直接拒绝文件新建和编辑，所以 Agent 不会静默修改项目。
 27. 作为个人用户，我想 Shell 只默认放行极小内置只读命令列表，所以命令执行有清晰安全边界。
 28. 作为个人用户，我想 WebSearch 和 WebFetch 默认可用，所以 Agent 能访问公网资料。
 29. 作为个人用户，我想 WebFetch 阻止本地和私有网络，所以本机及内网服务不会被默认访问。
 30. 作为个人用户，我想大型工具结果存为 Tool Artifact，所以 session 和上下文不会被大结果撑爆。
 31. 作为个人用户，我想 Tool Artifact 随 session 保留，所以恢复旧 session 时仍能读取完整结果。
-32. 作为个人用户，我想已持久化的自然语言 Scheduled Work 继续运行，所以现有计划不会因 Tool 架构迁移失效。
-33. 作为个人用户，我想当前版本拒绝创建 Scheduled Work，所以缺少确认流程时不会误创建持久化任务。
-34. 作为个人用户，我想 Scheduled Work 使用任务专属 session，所以定时任务不污染当前会话。
-35. 作为个人用户，我想 Scheduled Work 完成后在当前 REPL 空闲时提示，所以后台结果不会打断前台 streaming。
-36. 作为个人用户，我想分别配置 default、chat、memory、cron 模型，所以不同任务可使用不同模型。
+32. 作为个人用户，我想通过自然语言创建 at、every 或 cron Schedule Job，所以无需手写状态文件。
+33. 作为个人用户，我想 Schedule Job 使用专属 Session，所以定时任务不污染当前会话。
+34. 作为个人用户，我想 Schedule Job 运行结果留在其 Session 中，所以后台结果不会打断前台 streaming。
+35. 作为个人用户，我想 Schedule Job 与前台使用同一个 Agent Run，所以模型、Tool、Summary 和 Artifact 语义一致。
+36. 作为个人用户，我想分别配置 default、chat、memory、schedule 模型，所以不同任务可使用不同模型。
 37. 作为个人用户，我想具体 route 不可用时 fallback 到 default，所以系统有统一兜底。
 38. 作为个人用户，我想支持 Anthropic 和 OpenAI-compatible provider，所以可以使用不同模型服务。
 39. 作为个人用户，我想首次运行自动生成配置模板，所以能知道需要填写哪些内容。
@@ -77,7 +77,7 @@
 - 运行 `myclaw` 不带参数直接进入 REPL。
 - 首版没有 one-shot 对话命令、detached daemon、HTTP server 或 IPC server。
 - 每个 REPL invocation 创建一个独立 runtime。
-- 用户消息进入前台队列并串行执行；Memory Task 和 Scheduled Work 在同一 runtime 内异步运行。
+- 用户消息进入前台队列并串行执行；Memory Task 和 Schedule Jobs 在同一 runtime 内异步运行。
 - Ctrl+C 只取消当前前台 turn。
 - 输入 `exit` 或 `quit`（忽略前后空白、大小写不敏感）退出 REPL并立即取消后台任务。
 - 多个 REPL 可在同一 Workspace 运行，但首版不做跨进程协调；每个 runtime 独立启动后台调度器。
@@ -107,9 +107,9 @@
 - Long-term Memory 位于 `<workspace>/.myclaw/memory/memory.md`。
 - Conversation Summary 位于 `<workspace>/.myclaw/memory/summary.jsonl`。
 - Summary Cursor 是纯文本文件 `<workspace>/.myclaw/memory/.cursor`。
-- Scheduled Work 定义保存在 Workspace State 根目录的 `scheduled-work.json` JSON 数组文件中。
+- Schedule state 保存在 Workspace State 根目录的 `schedule.json` 严格 JSON 数组文件中；Schedule Session 使用独立的 `schedule-sessions/` 分区。
 - Long-term Memory 缺失时，runtime 启动会创建包含 User Info、User Preference、Project Fact、Lesson 四个空分区的模板。
-- Conversation Summary、Summary Cursor、Scheduled Work 等运行态文件按需创建。
+- Conversation Summary、Summary Cursor、Schedule state 和 Schedule Session 文件按需创建；legacy scheduled-work state 原样保留且不读取、不迁移、不删除。
 
 ### Workspace and sessions
 
@@ -146,8 +146,8 @@
 - Cutoff 向后推进到下一个 user message；如果不存在，则回退到最近的前一个 user message。保留后缀必须从 user message 开始。
 - 摘要生成使用 memory route，具体 route 不可用时 fallback default；fallback 也失败则当前 chat 请求失败。
 - 生成 Conversation Summary 时不注入 Long-term Memory。
-- Long-term Memory 是单个 Markdown 文件，完整注入 chat 和 cron 系统提示词，不做相关性筛选，也不设首版大小上限。
-- Long-term Memory 在 runtime 启动时加载并缓存；Memory Task 修改后，新的 chat 注入要等 runtime 重启生效。
+- Long-term Memory 是单个 Markdown 文件，完整注入 chat 和 Schedule Job 系统提示词，不做相关性筛选，也不设首版大小上限。
+- Long-term Memory 在 runtime 启动时加载并缓存；Memory Task 修改后，新的 Agent Run 使用刷新后的快照，正在运行的 Agent Run 保留启动时快照。
 - `/memory` 读取磁盘最新内容，不读取 runtime 缓存。
 - Memory Task 使用系统本地时区 cron，默认每小时一次。
 - Memory Task 的 `batch_size` 是全局配置，默认 10。
@@ -162,10 +162,10 @@
 
 ### Model routing and providers
 
-- Route 名称严格固定为 `default`、`chat`、`memory`、`cron`；未知 route 是配置错误。
+- Route 名称严格固定为 `default`、`chat`、`memory`、`schedule`；其它 route table 按未定义字段投影掉。
 - `chat` 用于主对话和 Session title。
 - `memory` 用于 Conversation Summary 和 Memory Task。
-- `cron` 用于 Scheduled Work。
+- `schedule` 用于 Schedule Jobs。
 - 具体 route 缺失或不可用时总是 fallback 到 `default`。
 - `default` 不可用时，REPL 启动失败。
 - 每个 route 配置 provider_id、model、context_window、max_output、temperature、reasoning_effort、timeout。
@@ -176,7 +176,7 @@
 - 首版 protocol 只支持 `anthropic` 与 `openai-compatible`。
 - 未知 protocol 的 provider 被忽略；引用它的 route 视为不可用并执行 fallback。
 - Anthropic adapter 使用官方 Anthropic SDK；OpenAI-compatible adapter 使用官方 OpenAI SDK。
-- chat route 的每次输出都必须 streaming；memory 和 cron 不要求 streaming。
+- chat route 的每次输出都必须 streaming；schedule 不要求 streaming。
 
 ### User Configuration
 
@@ -186,7 +186,7 @@
 - Tool enablement 使用 `[tools.web] enabled = true` 与 `[tools.shell] enabled = true`，两者默认启用。
 - User Configuration 只控制 web/shell enablement；Tool 的 fail-closed 安全与 refusal 规则是内置行为，不对用户开放。
 - 配置严格拒绝未知顶层 table、未知已知-schema 字段和未知 route；未知 protocol provider 仍按既定规则忽略。
-- 配置缺失时，只创建一个 ID 为 `openai-local` 的 OpenAI-compatible provider 模板（base URL、API key 和 model list 为空），并为 `default`、`chat`、`memory`、`cron` 创建显式但不可用的 route 待填写段；四个 route 初始都引用 `openai-local`。随后退出并提示用户替换 Provider、model 和模型限制，或删除不需要定制的具体 route 以回退到 default；旧配置完全缺少 default route 时，错误消息必须指出 `[models.routes.default]`。
+- 配置缺失时，只创建一个 ID 为 `openai-local` 的 OpenAI-compatible provider 模板（base URL、API key 和 model list 为空），并为 `default`、`chat`、`memory`、`schedule` 创建显式但不可用的 route 待填写段；四个 route 初始都引用 `openai-local`。随后退出并提示用户替换 Provider、model 和模型限制，或删除不需要定制的具体 route 以回退到 default；旧配置完全缺少 default route 时，错误消息必须指出 `[models.routes.default]`。
 - OpenAI-compatible provider 模板的 base_url 为空；所有 provider 的有效配置都要求 base_url。
 - `myclaw config` 在配置缺失时创建默认配置并显示脱敏内容。
 - 配置无法解析、模型配置不完整或 default route 不可用时，`myclaw` 启动 REPL 直接退出并显示用户可见错误。
@@ -196,16 +196,16 @@
 
 - 所有 capability 都是具体 `BaseTool`；Runtime Core 在启动时注入稳定依赖并将完整 Tool Catalog 一次性注册到 Tool Gateway。
 - `BaseTool.to_schema()` 从直接公开注解、显式 required、默认值和 `ToolParam` 生成 OpenAI Function Calling schema；Model Request 保存缓存的 typed snapshot，Anthropic adapter 在内部转换。
-- `ToolGateway.call()` 是唯一公开入口，负责 raw JSON 解析、参数 projection/安全转换/schema 校验、显式 refusal、执行、有界重试和扁平 Tool Result 封装；没有 per-call execution context 或 approval flag。
-- `ModelToolCall.arguments` 保留原始 JSON string；Tool Result 仅含 call ID、name、status、content 和可选 artifact，不含 nested error。
+- `ToolGateway.call()` 是唯一公开入口，负责 raw JSON 解析、参数 projection/安全转换/schema 校验、显式 refusal、Tool Confirmation、执行、有界重试和扁平 Tool Result 封装；没有 per-call execution context 或 approval flag。
+- `ModelToolCall.arguments` 保留原始 JSON string；Tool Result 仅含 call ID、name、status、content 和可选 artifact/confirmation metadata，不含 nested error。
 - WebSearch/WebFetch 各允许 2 次重试，其余内置 Tool 为 0；取消继续向上传播。Tool Gateway 不设置统一 timeout、不持久化结果、不创建 artifact。
 - 公共路径与网络边界由注入的 `Security` 实现，capability-specific 规则保留在具体 Tool。
 - Tool Gateway 不序列化前台和后台工具调用。
 - File read/list/search 默认 allow。
 - Workspace 内新建文件和编辑已有文件固定 refused。
-- 主 Agent 不可编辑 config、memory、Session、Summary、Summary Cursor、Scheduled Work 等 Workspace State 或 Agent Home 内部文件。
+- 主 Agent 不可编辑 config、memory、Session、Summary、Summary Cursor、Schedule state 等 Workspace State 或 Agent Home 内部文件。
 - File access 越过 Workspace 和允许的 Agent Home 范围时 fail closed。
-- Shell 与 Web 可由配置启用/禁用；开关同时适用于前台 chat 和 Scheduled Work。
+- Shell 与 Web 可由配置启用/禁用；开关同时适用于前台 chat 和 Schedule Jobs。
 - Shell cwd 可指定，但必须位于 Workspace 内。
 - Shell timeout 由模型请求，代码强制限制在 60–600 秒。
 - Shell allowlist 只接受 `pwd`、`git status`、`git status --short`、`git diff --stat`、`git diff --name-only` 五种精确命令形状，用户不能扩展；其他命令在前台和后台均 refused。
@@ -213,7 +213,7 @@
 - WebSearch 无额外首版限制，使用无凭据的内置 adapter，首选 DuckDuckGo；实际后端不进入持久化配置契约。
 - WebFetch 阻止 localhost、私有网段和 link-local 地址。
 - WebFetch 最多跟随 5 次重定向，并对每个目标重新执行地址检查。
-- 当前没有 permission request event、pending confirmation state 或调用恢复流程；危险操作在执行前直接写 refused Tool Result。
+- Schedule add/remove 在前台通过 `confirmation_requested` Agent Event 和 Conversation Port 的独立 response interface 完成一次性确认；非交互 Schedule Agent Run 收到普通 refused Tool Result。File write/edit、非 allowlist Shell 和其他被禁止的 capability 不升级为确认。
 
 ### Tool Artifacts
 
@@ -225,21 +225,18 @@
 - Artifact 随 session 保留，首版不自动清理。
 - Artifact 没有 commit、rollback、callback 或 ownership lifecycle；写入后若 Session persistence 失败，允许留下 orphan file。
 
-### Scheduled Work
+### Schedule
 
-- Scheduled Work 是自然语言 Agent 任务，不是 shell cron job。
-- 定义存储为 Workspace State 根 JSON 数组的元素，字段为 id、title、cron、prompt、created_at、enabled、session_id。
-- 新任务固定 `enabled=true`；首版没有 task 管理命令修改或删除任务。
-- 当前 `create_scheduled_work` 固定 refused，在分配 ID 或写 store 前结束；已持久化任务照常执行。
-- 创建时不静态分析未来是否需要已禁用的 web/shell。
-- Cron 使用系统本地时区。
-- 每个任务使用 task-specific Conversation Session。
-- 触发时将任务 prompt 写为 user message，注入 Long-term Memory，使用 cron route 执行，最终结果写 assistant message。
-- 同一任务在单 runtime 内不重入；上一轮仍运行时跳过该次触发。
-- 不做跨进程协调，因此多个 REPL runtime 可能重复触发同一任务。
-- 任务只在 runtime 活着时触发。
-- 结果写入任务 session；REPL 连接时通过 Agent Event 提示。若前台正在 streaming，提示排队到前台 turn 完成后显示。
-- 首版不实现 notification adapter。
+- Schedule Job 是自然语言 Agent 任务，不是 shell cron job。
+- Schedule state 是 Workspace-owned 的严格 JSON 数组，字段为 `job_id`、`source`、`message`、`schedule`、`state`、`created_at_ms` 和 `updated_at_ms`。
+- Schedule 支持 `at`、`every` 和 `cron`；Cron Job 固化 IANA timezone，at 使用带 UTC offset 的绝对时间。
+- User Job 通过 `schedule` Tool 的 add、list、remove action 管理；add 和 remove 需要 Tool Confirmation。
+- 每个 Job 使用由 `schedule_<job_id>` 派生的 Schedule Session，并使用专属 `schedule-sessions/` 分区；该 Session 不出现在 `/resume`。
+- Schedule Service 是唯一的 Job dispatcher，所有触发都通过共享 Agent Run 使用 `schedule` route，结果保留在 Schedule Session。
+- 同一 Job 在单 runtime 内不重入；不同 Job 可并发；不做跨进程协调，因此多个 runtime 可能重复触发。
+- Schedule 只在 runtime 存活时运行，不发送 Agent Event、完成提示或通知。
+- legacy scheduled-work state 原样保留且永不读取、检测、迁移、重命名或删除。
+- 损坏的 Schedule state 在 scheduler 和 REPL 启动前以 `schedule_state_error`、修复提示和路径阻止 Runtime 启动。
 
 ## Testing Decisions
 
@@ -275,14 +272,14 @@
 - File 默认权限、内部文件写保护和越界拒绝。
 - Shell allowlist、Workspace cwd 校验、60–600 秒 timeout 校验。
 - WebSearch enablement、WebFetch 私网阻止、重定向复检和 5 次上限。
-- Foreground write/edit、Scheduled Work 创建和非 allowlist Shell 固定 refused。
+- Foreground write/edit 和非 allowlist Shell 固定 refused；Schedule add/remove 通过 Tool Confirmation 授权。
 - Tool Artifact 的阈值、路径、原始内容、preview 和原子写入。
 - Tool Gateway raw arguments、projection/coercion/refusal、bounded retry、cancellation 和扁平结果。
 
 ### Required provider and CLI tests
 
 - Anthropic 和 OpenAI-compatible fake adapters 的 streaming、tool_calls、timeout 和错误转换。
-- chat route 必须 streaming；memory/cron 可非 streaming。
+- chat route 必须 streaming；schedule 可非 streaming。
 - route fallback、未知 route、未知 protocol provider 和 default unusable。
 - 模型固定 5 次指数退避 retry 和 retry-after。
 - 首次运行生成配置并退出。
@@ -299,14 +296,14 @@
 - channel-first bot 平台。
 - one-shot 对话命令或 one-shot runtime。
 - detached daemon、系统服务、HTTP 或 IPC server。
-- 多 REPL、同 session、Memory Task、Scheduled Work 的跨进程协调或锁。
+- 多 REPL、同 session、Memory Task、Schedule Job 的跨进程协调或锁。
 - 微服务拆分。
 - MCP 工具扩展。
 - subagent/spawn 或多 Agent 编排。
 - 用户可配置 identity/system prompt。
 - Agent profiles、session overrides、per-chat settings。
 - Session list/view/delete/rename 管理命令。
-- Scheduled Work list/view/delete/pause/resume/run-now 管理命令。
+- 独立 Schedule CLI、Job 修改、pause/resume/run-now 管理命令。
 - Agent Home 或 Workspace 级全局 Runtime Log；按 Session 归属的 Session Log 由 ADR-0008 约束。
 - SQLite、混合数据库或向量数据库记忆。
 - Long-term Memory 相关性筛选或大小上限。
@@ -323,7 +320,7 @@
 
 - ADR 0001 记录 file-first local persistence。
 - ADR 0002 记录固定 Agent Home `~/.myclaw/`。
-- ADR 0003 记录 Shell 的 Workspace cwd、长期确认边界及首版不提供 OS 级 sandbox；Issue #38 暂时拒绝全部非 allowlist 命令，直到另行设计确认流程。
+- ADR 0003 记录 Shell 的 Workspace cwd、长期确认边界及首版不提供 OS 级 sandbox；Issue #38 暂时拒绝全部非 allowlist 命令，直到另行设计 Shell 专用确认流程。
 - `docs/myclaw-runtime-contracts.md` 是已接受的首版 schema、Port、事件和错误契约。
 - `CONTEXT.md` 是最终 canonical language；本 PRD 的实现术语应与其保持一致。
 - GitHub issue：<https://github.com/Totoro-debug/myclaw/issues/1>；本文件仍是需求的本地 canonical source。

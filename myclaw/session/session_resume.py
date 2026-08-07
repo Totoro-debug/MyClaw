@@ -2,15 +2,11 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from typing import Protocol
+from dataclasses import replace
 from uuid import UUID
 
 from myclaw.agent.events import AgentEvent, ConfirmationDecision, ConversationPort
 from myclaw.session.session import Session
-
-
-class AgentEventSequencer(Protocol):
-    def sequence_foreground(self, event: AgentEvent) -> AgentEvent: ...
 
 
 class SwitchableConversationPort:
@@ -21,7 +17,6 @@ class SwitchableConversationPort:
         *,
         session: Session,
         build_conversation: Callable[[Session], ConversationPort],
-        event_sequencer: AgentEventSequencer | None = None,
     ) -> None:
         self._session = session
         self._build_conversation = build_conversation
@@ -29,7 +24,7 @@ class SwitchableConversationPort:
         self._active_delegate: ConversationPort | None = None
         self._owned_delegates: list[ConversationPort] = []
         self._previous_sessions: list[Session] = []
-        self._event_sequencer = event_sequencer
+        self._next_event_id = 0
         self._close_task: asyncio.Task[None] | None = None
 
     @property
@@ -68,8 +63,9 @@ class SwitchableConversationPort:
         self._active_delegate = delegate
         try:
             async for event in delegate.submit(text):
-                sequencer = self._event_sequencer
-                yield event if sequencer is None else sequencer.sequence_foreground(event)
+                sequenced = replace(event, event_id=self._next_event_id)
+                self._next_event_id += 1
+                yield sequenced
         finally:
             if self._active_delegate is delegate:
                 self._active_delegate = None

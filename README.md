@@ -33,7 +33,7 @@ including when the configuration is invalid.
 ## Configure
 
 The generated file contains runtime, memory, Tool, and Provider defaults plus editable
-scaffolds for the `default`, `chat`, `memory`, and `cron` Model Routes. It contains one
+scaffolds for the `default`, `chat`, `memory`, and `schedule` Model Routes. It contains one
 `openai-compatible` Provider scaffold. Complete that Provider, then replace the
 generated route values using a supported model. A minimal working configuration can
 keep only the `default` route:
@@ -57,9 +57,10 @@ timeout = 120
 
 Providers use either `anthropic` or `openai-compatible` protocol. The `chat` route is
 used for conversations and Session titles, `memory` for summaries and Memory Tasks,
-and `cron` for Scheduled Work. Remove any purpose-specific route table to fall back to
-`default`; Provider model IDs must also appear in that Provider's `models` array. The
-schema is strict: unknown tables or fields are configuration errors.
+and `schedule` for Schedule Jobs. Remove any purpose-specific route table to fall back to
+`default`; Provider model IDs must also appear in that Provider's `models` array. Startup
+projects undefined tables and fields away, including old route tables; `myclaw config`
+reports them while displaying the redacted source.
 
 `api_key` values are plaintext at rest in `config.toml`. MyClaw redacts keys from
 configuration views and user-visible errors, but v0.1 has no environment-variable
@@ -78,10 +79,11 @@ plus these built-in management commands:
 - `/memory`: show the latest Long-term Memory file.
 - `/dream`: process pending Conversation Summaries now.
 
-Use `exit` or `quit` to shut down. Ctrl+C cancels the active foreground turn while
-the REPL remains available. File changes and non-automatic Shell commands require
-foreground confirmation; background work refuses operations that would require a
-prompt.
+Use `exit` or `quit` to shut down. Ctrl+C cancels the active foreground Agent Run
+while the REPL remains available. Schedule Job add/remove operations require
+foreground confirmation. Workspace file changes and non-allowlisted Shell commands
+are refused; noninteractive Schedule Agent Runs also refuse confirmation-required
+operations.
 
 ## Persistent State
 
@@ -101,7 +103,7 @@ the reserved `.myclaw` directory beneath that Workspace:
 ```text
 <workspace>/.myclaw/
   .gitignore
-  scheduled-work.json
+  schedule.json
   memory/
     memory.md
     summary.jsonl
@@ -109,16 +111,18 @@ the reserved `.myclaw` directory beneath that Workspace:
   sessions/
     <session_id>.jsonl
     artifacts/<session_id>/<encoded_tool_call_id>.txt
+  schedule-sessions/
+    <schedule_session_id>.jsonl
   logs/
     <session_id>.log
 ```
 
 Valid REPL startup creates only the Workspace State root, `.gitignore`, `memory/`,
-`sessions/`, and `memory/memory.md`; `logs/` is created lazily by an explicit Session
-context when a WARNING or ERROR is emitted. Summary, Summary Cursor, Scheduled Work,
-Session, and Artifact files remain on demand. Old non-global Agent Home data is ignored
-and is never migrated or deleted. Back up each Workspace State directory with its
-Workspace; do not edit active Session, Summary, Summary Cursor, or Scheduled Work files.
+`sessions/`, and `memory/memory.md`; `logs/` and `schedule-sessions/` are created lazily
+by their owning Session operations. Schedule state, Summary, Summary Cursor, Session,
+and Artifact files remain on demand. Old non-global Agent Home data is ignored and is
+never migrated or deleted. Back up each Workspace State directory with its Workspace;
+do not edit active Session, Summary, Summary Cursor, or Schedule state files.
 
 Each foreground Runtime has one active Conversation Session. Its in-memory messages
 are ordinary JSON-compatible dictionaries and its metadata is a JSON-compatible

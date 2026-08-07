@@ -363,7 +363,7 @@ MyClaw 已经接近推荐分层：
 4. **继续把语义、权限和安全校验放在宿主。**
    - Schema 只处理纯数据形状。
    - Permission Policy 必须在执行前读取已经结构校验过的参数。
-   - 路径解析、Workspace/Agent Home 边界、文件身份、Scheduled Work 状态等仍由领域代码负责。
+   - 路径解析、Workspace/Agent Home 边界、文件身份、Schedule state 等仍由领域代码负责。
 
 5. **为未来 MCP 扩展 `output_schema`，但不要提前引入完整 MCP runtime。**
    - 如果 Tool 结果以后需要跨进程复用，再让 `ToolDefinition` 可选携带 `output_schema`。

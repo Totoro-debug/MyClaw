@@ -9,7 +9,6 @@ from uuid import UUID
 
 from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ModelUsage
-from myclaw.session.session import Session
 from myclaw.tools.models import ToolResultStatus
 from myclaw.utils.json_types import JsonObject
 from myclaw.utils.validation import require_aware_datetime, require_nonnegative_int, require_uuid4
@@ -25,7 +24,6 @@ type AgentEventType = Literal[
     "turn_completed",
     "turn_failed",
     "turn_cancelled",
-    "background_completed",
 ]
 
 
@@ -131,19 +129,6 @@ class TurnCancelledPayload:
     partial_content: str
 
 
-@dataclass(frozen=True, slots=True)
-class BackgroundCompletedPayload:
-    kind: str
-    title: str
-    session_id: str
-    status: str
-    summary: str
-
-    def __post_init__(self) -> None:
-        Session._require_id(self.session_id)
-        _require_summary(self.summary, field="summary")
-
-
 type AgentEventPayload = (
     TurnStartedPayload
     | TextDeltaPayload
@@ -153,7 +138,6 @@ type AgentEventPayload = (
     | TurnCompletedPayload
     | TurnFailedPayload
     | TurnCancelledPayload
-    | BackgroundCompletedPayload
 )
 
 _EVENT_PAYLOAD_TYPES: dict[AgentEventType, type[object]] = {
@@ -165,7 +149,6 @@ _EVENT_PAYLOAD_TYPES: dict[AgentEventType, type[object]] = {
     "turn_completed": TurnCompletedPayload,
     "turn_failed": TurnFailedPayload,
     "turn_cancelled": TurnCancelledPayload,
-    "background_completed": BackgroundCompletedPayload,
 }
 
 

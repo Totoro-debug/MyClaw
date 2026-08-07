@@ -6,14 +6,16 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, ClassVar, Literal, Protocol
+from typing import Any, ClassVar, Literal, Protocol, cast
 from uuid import UUID
 
-from myclaw.agent.prompts import current_user_input
-from myclaw.agent.turn import model_message_from_session
+from loguru import logger
+
+from myclaw.agent.prompts import current_user_input, interrupted_assistant_content
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
+    AssistantModelMessage,
     ModelCompleted,
     ModelMessage,
     ModelProvider,
@@ -22,6 +24,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ReasoningEffort,
     TextDelta,
+    ToolModelMessage,
     UserModelMessage,
 )
 from myclaw.session.session import Session
@@ -36,6 +39,7 @@ from myclaw.tools.tool_gateway import ToolGateway
 
 type AgentRunRoute = Literal["chat", "schedule"]
 type ConfirmationChannel = ToolConfirmationChannel | ConfirmationRequester
+type ToolResultExternalizer = Callable[[ToolResult], ToolResult]
 
 
 @dataclass(frozen=True, slots=True)
@@ -877,6 +881,60 @@ async def _close_iterator(iterator: AsyncIterator[object] | None) -> None:
         await close()
     except BaseException:
         pass
+
+
+def _log_artifact_failure(failure: Exception, *, tool_name: str) -> None:
+    logger.opt(exception=failure).error(
+        "Tool Artifact persistence failed code=persistence_error tool={} type={}",
+        tool_name,
+        type(failure).__name__,
+    )
+
+
+def model_message_from_session(
+    message: dict[str, Any],
+) -> UserModelMessage | AssistantModelMessage | ToolModelMessage | None:
+    """Project persisted conversation history into the next provider request."""
+    role = message.get("role")
+    if role == "user":
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise TypeError("Session user content must be a string")
+        return UserModelMessage(content=content)
+    if role == "assistant":
+        content = message.get("content")
+        tool_calls = message.get("tool_calls")
+        status = message.get("status")
+        if not isinstance(content, str) or not isinstance(tool_calls, list):
+            raise TypeError("Session assistant message is malformed")
+        projected_tool_calls = tuple(
+            ModelToolCall(
+                id=tool_call["id"],
+                name=tool_call["name"],
+                arguments=tool_call["arguments"],
+            )
+            for tool_call in tool_calls
+        )
+        if status == "error" and not content and not projected_tool_calls:
+            return None
+        if status == "interrupted":
+            return AssistantModelMessage(
+                content=interrupted_assistant_content(content),
+                tool_calls=projected_tool_calls,
+            )
+        return AssistantModelMessage(content=content, tool_calls=projected_tool_calls)
+    if role == "tool":
+        tool_call_id = message.get("tool_call_id")
+        name = message.get("name")
+        content = message.get("content")
+        if not all(isinstance(value, str) for value in (tool_call_id, name, content)):
+            raise TypeError("Session tool message is malformed")
+        return ToolModelMessage(
+            tool_call_id=cast(str, tool_call_id),
+            name=cast(str, name),
+            content=cast(str, content),
+        )
+    raise TypeError("Unsupported Session message role")
 
 
 __all__ = [

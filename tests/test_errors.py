@@ -33,7 +33,6 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
             "tool_refused",
             "tool_failed",
             "memory_task_running",
-            "scheduled_work_invalid",
         }
     )
     error = ErrorInfo(

@@ -38,7 +38,7 @@ def test_initialization_rejects_workspace_beneath_agent_home_without_reading_leg
     legacy_files = {
         agent_home / "memory" / "memory.md": b"legacy memory\r\n",
         agent_home / "sessions" / "legacy-session.jsonl": b"legacy session\r\n",
-        agent_home / "scheduled-work.json": b"legacy scheduled work\r\n",
+        agent_home / "obsolete-state.json": b"legacy obsolete state\r\n",
         agent_home / "sessions" / "artifacts" / "legacy" / "tool.txt": b"legacy artifact\r\n",
     }
     for path, content in legacy_files.items():

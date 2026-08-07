@@ -7,7 +7,7 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.turn import model_message_from_session
+from myclaw.agent.run import model_message_from_session
 from myclaw.tools.base import BaseTool
 from myclaw.tools.confirmation import (
     ConfirmationChannel,

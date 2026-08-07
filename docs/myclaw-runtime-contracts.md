@@ -9,7 +9,7 @@
 - 产品行为来源：`docs/myclaw-personal-agent-prd.md`
 - 实施顺序来源：`docs/myclaw-implementation-plan.md`
 
-本文把已确认的产品行为细化为可直接实现的类型、文件 schema 和代码边界。来自 canonical 文档的行为与 D01-D16 已于 2026-07-11 一并接受；Issue #38 于 2026-07-27 收缩了 Tool 契约，Issue #69 于 2026-08-01 用 host adapter 取代 Windows-only 实现约束，本文对应章节以这些已批准规格为准。后续变更必须先更新本契约及受影响的 PRD/ADR。
+本文把已确认的产品行为细化为可直接实现的类型、文件 schema 和代码边界。来自 canonical 文档的行为与 D01-D16 已于 2026-07-11 一并接受；Issue #38 于 2026-07-27 收缩了 file/Shell Tool 契约，Issue #69 于 2026-08-01 用 host adapter 取代 Windows-only 实现约束，Issue #104 随后为 Schedule add/remove 引入独立 Tool Confirmation 和共享 Agent Run。本文对应章节以这些已批准规格为准。后续变更必须先更新本契约及受影响的 PRD/ADR。
 
 本文不新增 one-shot、daemon、HTTP/IPC、MCP、subagent、跨进程协调、用户可配置安全策略或用户自定义 identity。
 
@@ -17,7 +17,7 @@
 
 ### 1.1 兼容性
 
-- `config.toml`、Session JSONL、Summary JSONL、Summary Cursor、Long-term Memory、Scheduled Work JSON 和 Tool Artifact 是持久化契约。
+- `config.toml`、Session JSONL、Summary JSONL、Summary Cursor、Long-term Memory、Schedule JSON 和 Tool Artifact 是持久化契约。
 - Session JSONL 的第一行是当前严格 header，后续行是 JSON-native message dictionaries；不包含 schema version 或 line type marker。
 - 旧 Session schema unsupported；不提供 migration、compatibility reader、lazy upgrade 或 version dispatch。
 - summary JSONL 必须严格保持 `index`、`timestamp`、`content` 三个字段，因此不增加版本字段。
@@ -43,7 +43,7 @@
 
 - UUID 均使用小写、带连字符的 UUID4。
 - Session ID 使用 `<local_timestamp>_<uuid4>`：`YYYYMMDD-HHMMSS-ffffff_550e8400-e29b-41d4-a716-446655440000`。
-- Scheduled Work ID 和 turn ID 使用 UUID4；Conversation Session message dictionaries 没有通用 message ID。
+- Schedule Job ID 和 turn ID 使用 UUID4；Conversation Session message dictionaries 没有通用 message ID。
 - provider 返回的 tool call ID 原样保存在 message 中，不在业务层重新命名。
 - Tool Artifact 文件名使用 tool call ID 的 UTF-8 percent-encoding，通常为 `safe="-_."`；Windows 保留 basename（`CON`、`PRN`、`AUX`、`NUL`、`COM1`-`COM9`、`LPT1`-`LPT9`）全量编码，避免保留名以及 `/`、`\\`、`:` 等字符破坏路径；逻辑路径仍对应原 tool call ID。
 
@@ -54,7 +54,7 @@
 | D01 | Python 最低版本为 3.12，采用 `pyproject.toml` + 根目录 `myclaw/` 包布局 | asyncio、typing 和 timezone 能力成熟，降低兼容分支 | 实施计划 |
 | D02 | 配置 schema 严格校验未知字段；未知 provider protocol 仍按 PRD 忽略 | 尽早暴露拼写错误，同时保留既定 fallback 语义 | PRD 可补充 |
 | D03 | memory message threshold 默认 `40` 条 | 足够早地覆盖长会话，又不会在短对话频繁摘要 | PRD 可补充 |
-| D04 | Scheduled Work 文件名为 `scheduled-work.json` | 与 canonical term 一致，避免含糊的 `tasks.json` | PRD/ADR 0002 |
+| D04 | Schedule state 文件名为 `schedule.json` | 与 canonical Schedule module 一致，legacy state 不参与升级 | PRD/Issue #116 |
 | D05 | Session title 最长 `60` 个 Unicode code points | picker 可读且不需要终端宽度参与持久化 | PRD 可补充 |
 | D06 | Summary index 从 `1` 开始，缺失 `.cursor` 等价于 `0` | cursor 语义是“已处理到的最大 index”，直观且易恢复 | PRD 可补充 |
 | D07 | model retry 的“最多 5 次”解释为每个逻辑 model call 最多 `5 attempts`，不是首次调用后再重试 5 次 | 限制最坏延迟和费用，与英文 canonical 的 five attempts 一致 | PRD |
@@ -80,7 +80,7 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
 
 <workspace>/.myclaw/
   .gitignore
-  scheduled-work.json
+  schedule.json
   memory/
     memory.md
     summary.jsonl
@@ -90,11 +90,13 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
     artifacts/
       <session_id>/
         <encoded_tool_call_id>.txt
+  schedule-sessions/
+    <schedule_session_id>.jsonl
   logs/
     <session_id>.log
 ```
 
-已确定：Agent Home 拥有 User Configuration；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 REPL 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`scheduled-work.json`、Session、artifacts 和 `logs/` 按需创建。`myclaw config` 不初始化 Workspace State。
+已确定：Agent Home 拥有 User Configuration；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 REPL 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`schedule.json`、Session、artifacts、`schedule-sessions/` 和 `logs/` 按需创建。legacy scheduled-work state 原样保留且不读取、不检测、不迁移、不重命名或删除。`myclaw config` 不初始化 Workspace State。
 
 `memory.md` 初始内容固定为：
 
@@ -189,7 +191,7 @@ max_output = 8192
 temperature = 0.2
 timeout = 120
 
-[models.routes.cron]
+[models.routes.schedule]
 provider_id = "anthropic-default"
 model = "model-id"
 context_window = 200000
@@ -198,7 +200,7 @@ temperature = 0.2
 timeout = 120
 ```
 
-`models.routes.chat`、`models.routes.memory` 和 `models.routes.cron` 均可省略，省略时使用 default。`reasoning_effort` 可省略。
+`models.routes.chat`、`models.routes.memory` 和 `models.routes.schedule` 均可省略，省略时使用 default。`reasoning_effort` 可省略。
 
 ### 4.2 字段规则
 
@@ -213,7 +215,7 @@ timeout = 120
 | `base_url` | absolute HTTP(S) URL | 所有可用 provider 必填、非空 |
 | `api_key` | string | plaintext；可为空模板值，不可用于可用 route |
 | `models` | unique string array | 模板可空；可用 route 引用的 model 必须存在 |
-| route name | table key | 仅 `default`、`chat`、`memory`、`cron` |
+| route name | table key | 仅 `default`、`chat`、`memory`、`schedule` |
 | `provider_id` | string | 必填，必须引用可用 provider |
 | `model` | string | 必填，必须在 provider catalog 中 |
 | `context_window` | integer，`1024..10000000` | 必填 |
@@ -224,11 +226,11 @@ timeout = 120
 | `tools.web.enabled` | boolean | 默认 `true` |
 | `tools.shell.enabled` | boolean | 默认 `true` |
 
-严格拒绝未知顶层 table、未知已知-schema 字段和未知 route name。未知 protocol provider 按 canonical 要求忽略；如果 default 因此不可用，REPL 启动失败。
+启动时将未知顶层 table、未知字段和未知 route table 投影掉；`myclaw config` 仍报告这些未定义字段。未知 protocol provider 按 canonical 要求忽略；如果 default 因此不可用，REPL 启动失败。
 
 ### 4.3 首次生成模板
 
-缺少 `config.toml` 时，生成模板包含 runtime、memory、tools、一个 ID 为 `openai-local` 的 OpenAI-compatible provider template，以及 `default`、`chat`、`memory`、`cron` 四个显式但不可用的 route scaffold。Provider 的 `base_url`、`api_key` 和 `models` 均为空。四个 route 初始都指向 `openai-local`，model 使用待替换值，并提供完整的模型限制字段；用户可删除不需要定制的具体 route，使其回退到 default。生成后 `myclaw` 退出，`myclaw config` 则显示脱敏模板；旧配置完全缺少 default route 时，启动错误指出 `[models.routes.default]`。
+缺少 `config.toml` 时，生成模板包含 runtime、memory、tools、一个 ID 为 `openai-local` 的 OpenAI-compatible provider template，以及 `default`、`chat`、`memory`、`schedule` 四个显式但不可用的 route scaffold。Provider 的 `base_url`、`api_key` 和 `models` 均为空。四个 route 初始都指向 `openai-local`，model 使用待替换值，并提供完整的模型限制字段；用户可删除不需要定制的具体 route，使其回退到 default。生成后 `myclaw` 退出，`myclaw config` 则显示脱敏模板；旧配置完全缺少 default route 时，启动错误指出 `[models.routes.default]`。
 
 ### 4.4 脱敏
 
@@ -250,7 +252,7 @@ timeout = 120
 规则：
 
 - `last_consolidated` 是从 `0` 开始的 message boundary，表示前多少条 Session messages 已被 Conversation Summary 覆盖；Short-term Memory 是 `messages[last_consolidated:]`。Conversation Summary 直接赋值，不调用 cursor-specific method，也不通过 journal 与 Session snapshot 协调。
-- `metadata` 当前拥有 `title` 与 `token_usage`；`token_usage` 包含主 chat、Tool loop、title、Conversation Summary 和与当前 Session 直接相关的辅助调用。Memory Task 不接收 Conversation Session；Scheduled Work 的模型调用计入其 task-specific Session，不计入当前前台 Session。
+- `metadata` 当前拥有 `title` 与 `token_usage`；`token_usage` 包含主 chat、Tool loop、title、Conversation Summary 和与当前 Session 直接相关的辅助调用。Memory Task 不接收 Conversation Session；Schedule Job 的模型调用计入其 Schedule Session，不计入当前前台 Session。
 - `total_tokens` 必须等于 `input_tokens + output_tokens`。provider 未返回某项时该项为 `0`，不得用估算值混入实际 usage。
 - 每次成功持久化都是完整 compact UTF-8 JSONL atomic replacement，header 与所有 message lines 一起提交；不存在逐消息写入或 metadata-only rewrite。
 - 当前 header 必须恰好包含 `session_id`、`created_at`、`updated_at`、`last_consolidated`、`metadata`。旧 schema unsupported，不 migration、不 version dispatch。
@@ -363,48 +365,60 @@ is accepted by ADR-0009 and does not provide cross-process coordination.
 ### 6.4 Long-term Memory cache
 
 - runtime startup 原子创建缺失模板并读取一次，保存 immutable string snapshot。
-- chat 和 cron 的 System Prompt 使用该 snapshot。
+- chat 和 schedule 的 System Prompt 使用该 snapshot。
 - `/memory` 和 Memory Task 每次读取磁盘最新文件。
-- Memory Task 成功编辑后不刷新 runtime snapshot；下一次 runtime 启动才生效。
+- Memory Task 成功编辑后刷新 runtime snapshot；正在运行的 Agent Run 保持启动时快照。
 - system-level prompt 超过 route context budget 时返回 `memory_context_too_large`，不得裁剪 Long-term Memory。
 
-## 7. Scheduled Work 契约
+## 7. Schedule 契约
 
-固定文件名：`<workspace>/.myclaw/scheduled-work.json`。
+固定文件名：`<workspace>/.myclaw/schedule.json`。legacy
+`scheduled-work.json` 无论内容或 path type 都不读取、不检测、不迁移、不重命名或删除。
 
-顶层必须是 JSON array；空状态可以由文件缺失或 `[]` 表示。记录示例：
+顶层必须是严格 JSON array；文件缺失或 `[]` 表示空状态。每条 Job 恰好包含：
+`job_id`、`source`、`message`、`schedule`、`state`、`created_at_ms` 和 `updated_at_ms`。
 
 ```json
 [
   {
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "title": "Weekly project review",
-    "cron": "0 9 * * 1",
-    "prompt": "Review the current project and summarize open risks.",
-    "created_at": "2026-07-11T16:00:00.000+08:00",
-    "enabled": true,
-    "session_id": "20260711-160000-000000_550e8400-e29b-41d4-a716-446655440000"
+    "job_id": "550e8400-e29b-41d4-a716-446655440000",
+    "source": "user",
+    "message": "Review the current project and summarize open risks.",
+    "schedule": {
+      "kind": "cron",
+      "at_time": null,
+      "every_seconds": null,
+      "cron_expr": "0 9 * * 1",
+      "timezone": "Asia/Shanghai"
+    },
+    "state": {
+      "last_finished_at_ms": null,
+      "last_status": null,
+      "last_error": null
+    },
+    "created_at_ms": 1783776000000,
+    "updated_at_ms": 1783776000000
   }
 ]
 ```
 
 规则：
 
-- 首版 record 恰好包含 canonical 七个字段，不增加 `last_run_at`、`next_run_at` 或运行状态。
-- `title`、`prompt` 非空；title 最长 120 字符，prompt 最长 20000 字符。
-- `cron` 是合法 5-field cron，不接受 seconds 或 timezone field。
-- `enabled` 创建时必须为 `true`。
-- `session_id` 在创建记录时分配；session 文件在首次 trigger 写入 user message 时才创建。
-- store update 在单 runtime lock 内执行整体 JSON array 原子 rewrite。
-- 单条 record 非法使整个文件配置无效，scheduler 不启动；REPL 主对话仍可运行并通过 `/status` 显示 scheduler error。不得静默丢弃非法任务。
-- 当前 Tool contract 固定拒绝创建 Scheduled Work；拒绝时不分配持久化 record。
-- task-specific Conversation Session 使用当前 `Session` JSONL shape；每次 trigger 把 prompt user message 和最终 assistant/Tool history 加入该 `Session`，并在 terminal work 后按完整 snapshot lifecycle 持久化。
+- `source` 只能是 `user` 或 `system`；System Job 不进入公开 list/remove。
+- `schedule.kind` 只能是 `at`、`every` 或 `cron`；未选择的 schedule 字段必须显式为 `null`。
+- `at` 使用带 UTC offset 的 RFC 3339 毫秒时间；`every` 使用正整数秒；`cron` 使用规范五字段表达式和规范 IANA timezone。
+- `state` 只记录 `never-run`、`latest-ok` 或 `latest-error` 允许的字段组合；running、next run 和 history 不持久化。
+- 解析拒绝重复 object key、非 canonical 值、非法 schedule/state、重复 Job ID 和非精确 field set；任何损坏都阻止 Runtime 启动并输出 `schedule_state_error` 与路径。
+- Store 在 Runtime-local lock 内构造 immutable candidate，严格序列化后通过同目录 atomic replacement 发布；写失败保留旧 authority 并 fault Store。
+- User Job 的 add/remove 由 `schedule` Tool 通过 Tool Confirmation 管理，list 返回按 `job_id` 排序的规范化公开定义。
+- 每次触发通过共享 Agent Run 的 `schedule` route 运行；Schedule Session ID 派生为 `schedule_<job_id>`，Session 首次产生消息时才落盘到 `schedule-sessions/`。
+- Schedule Service 在一个 dispatcher 中处理动态变更、at/every/cron、重叠跳过、不同 Job 并发和 Runtime shutdown；不发送 Agent Event 或通知。
 
 ## 8. Prompt、Runtime Context 与预算
 
-### 8.1 Chat 与 cron System Prompt
+### 8.1 Chat 与 Schedule System Prompt
 
-chat 和 cron 的 system-level context 按以下固定顺序组装：
+chat 和 schedule 的 system-level context 按以下固定顺序组装：
 
 1. 内置 identity prompt，其中包含 normalized absolute Workspace。
 2. 完整的 runtime-startup Long-term Memory snapshot，以明确的 `<long_term_memory>` delimiter 包裹。
@@ -414,7 +428,7 @@ User Configuration 不得插入或替换 identity/system prompt。缓存的 Open
 
 ### 8.2 当前 user input 的 Runtime Context
 
-发给 chat/cron model 的当前 user message临时转换为：
+发给 chat/schedule model 的当前 user message临时转换为：
 
 ```text
 <runtime_context>
@@ -430,14 +444,14 @@ session_id: <session_id>
 - session JSONL 只保存 raw user content，不保存上述 wrapper。
 - 历史 user messages 不重复添加新的 Runtime Context。
 - Workspace 已在 identity prompt 中，不在每轮 wrapper 重复。
-- Scheduled Work 可额外加入 `scheduled_work_id`；Memory Task 使用专门 prompt，不伪装成 chat user input。
+- Schedule Job 不额外注入旧任务 ID 字段；Memory Task 使用专门 prompt，不伪装成 chat user input。
 
 ### 8.3 专用 prompts
 
 - Session title：只接收规范化后的首条 user content，不注入 Long-term Memory、tools 或 conversation history。
 - Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory 或 Tool Catalog。
 - Memory Task：接收 Summary Cursor 后的 batch 和四分区维护规则，并只暴露 restricted memory tools。
-- Scheduled Work：使用 chat/cron system composition，把 task prompt 作为 task-specific Conversation Session 的普通 user message。
+- Schedule Job：使用 chat/schedule system composition，把 Job message 作为 Schedule Session 的普通 user message。
 
 prompt 文本存放在独立、可版本追踪的 package resources；测试断言组成部分和是否注入，不锁死整段自然语言文案。
 
@@ -461,9 +475,9 @@ logical purpose -> requested route -> usable route config -> provider adapter
                     +-----------------------> default route
 ```
 
-- route purpose 是 `default | chat | memory | cron`。
-- chat 用于主对话和 title；memory 用于 summary 和 Memory Task；cron 用于 Scheduled Work。
-- chat request 必须调用 streaming provider contract；memory/cron 可调用 complete contract。
+- route purpose 是 `default | chat | memory | schedule`。
+- chat 用于主对话和 title；memory 用于 summary 和 Memory Task；schedule 用于 Schedule Jobs。
+- chat request 必须调用 streaming provider contract；memory/schedule 可调用 complete contract。
 - requested route 与 default 指向同一配置时只尝试一次。
 - default 不可用时 runtime startup 失败。
 
@@ -481,7 +495,7 @@ logical purpose -> requested route -> usable route config -> provider adapter
 ```python
 ModelRequest(
     request_id: UUID,
-    route: Literal["default", "chat", "memory", "cron"],
+    route: Literal["default", "chat", "memory", "schedule"],
     system_prompt: str,
     messages: tuple[ModelMessage, ...],
     tools: tuple[OpenAIToolSchema, ...],
@@ -546,7 +560,7 @@ adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不
 ```
 
 - `event_id` 是 runtime 内单调递增 integer，仅用于排序，不持久化。
-- `turn_id` 对 background lifecycle 事件可为对应 background run ID。
+- `turn_id` 标识当前前台 Agent Run。
 - CLI 只依赖 event，不读取 session、tool 或 provider 对象。
 
 ### 10.2 Event types
@@ -556,13 +570,13 @@ adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不
 | `turn_started` | `{}` | 前台 turn 接受并开始 |
 | `text_delta` | `{delta}` | chat streaming 文本 |
 | `tool_started` | `{tool_call_id, tool_name, summary}` | 不含完整 arguments |
+| `confirmation_requested` | `{confirmation_id, turn_id, tool_call_id, tool_name, summary, details, warnings}` | 等待当前前台 Agent Run 的一次性确认 |
 | `tool_completed` | `{tool_call_id, tool_name, status, summary}` | 不含完整 raw result |
 | `turn_completed` | `{content, usage}` | 一个 turn 恰好一个终态 |
 | `turn_failed` | `{error}` | 安全的用户可见错误 |
 | `turn_cancelled` | `{partial_content}` | Ctrl+C 终态 |
-| `background_completed` | `{kind, title, session_id, status, summary}` | Scheduled Work 空闲提示；Memory Task 周期运行不发 |
 
-事件状态 summary 最长 240 字符。tool argument 和 raw result 不进入普通 tool activity event。当前契约没有 permission request event 或等待确认状态。
+事件状态 summary 最长 240 字符。tool argument 和 raw result 不进入普通 tool activity event。Tool Confirmation 的规范化 details 只出现在 `confirmation_requested`，确认回复不进入 Session message。
 
 ### 10.3 Conversation Port
 
@@ -572,10 +586,16 @@ adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不
 class ConversationPort(Protocol):
     def submit(self, text: str) -> AsyncIterator[AgentEvent]: ...
     async def cancel_active_turn(self) -> None: ...
+    def respond_to_confirmation(
+        self,
+        confirmation_id: UUID,
+        decision: Literal["approved", "declined"],
+    ) -> None: ...
 ```
 
 - 同一 port 同时只允许一个 foreground `submit`；REPL 自身串行化输入。
 - Conversation Port 不接受 session ID、route、provider 或 tool catalog 参数。
+- confirmation response 只绑定当前 Agent Run 的一个 confirmation identity；wrong、late 或 duplicate response 被拒绝。
 
 ### 10.4 Management Port
 
@@ -650,7 +670,7 @@ ToolResult(
 - Workspace 内 write/edit：refused。
 - Workspace State 的 `memory/memory.md`：main catalog read allow，write/edit refused；Memory Task 专用 edit Tool 仅允许精确文件。
 - 当前 session 的 artifact directory：read allow，write/edit refused。
-- `config.toml`、Session JSONL、Summary、Summary Cursor、Scheduled Work JSON 和其他 Workspace State 内部路径：main file Tools read/write/edit 均 fail closed；这些内容只通过对应 Port 或 domain interface 暴露。
+- `config.toml`、Session JSONL、Summary、Summary Cursor、Schedule JSON、legacy scheduled-work state 和其他 Workspace State 内部路径：main file Tools read/write/edit 均 fail closed；这些内容只通过对应 Port 或 domain interface 暴露。
 - 其他路径：fail closed，不升级为 confirmation。
 
 路径检查必须基于解析后的目标和最近存在父目录，防止 `..`、symlink、junction/reparse point 越界。拒绝访问 device file、named pipe 和非普通文件。
@@ -715,22 +735,26 @@ git diff --name-only
 - HTML 转为可读 text；其他 textual media 保留 text；二进制返回 unsupported media error。
 - `tools.web.enabled=false` 时 `web_search` 和 `web_fetch` 都不进入 catalog。
 
-### 11.6 Scheduled Work tool
+### 11.6 Schedule Tool
 
 ```json
 {
-  "name": "create_scheduled_work",
+  "name": "schedule",
   "arguments": {
-    "title": "Weekly project review",
-    "cron": "0 9 * * 1",
-    "prompt": "Review the project and summarize open risks."
+    "action": "add",
+    "message": "Review the project and summarize open risks.",
+    "cron_expr": "0 9 * * 1",
+    "timezone": "Asia/Shanghai"
   }
 }
 ```
 
-- 当前 foreground 与 Scheduled Work catalog 中调用均固定 refused，不分配 ID、不写 store，也不进入重试。
-- 未来确认设计恢复创建能力后，成功执行才生成 id、created_at、enabled 和 session_id，并原子更新 store。
-- 创建时不分析 prompt 未来是否需要 disabled tools。
+- `action` 必须精确为 `add`、`list` 或 `remove`。
+- `add` 按 `every_seconds`、`cron_expr`、`at_time` 顺序选择 schedule，并在确认前展示规范化 operation；未选择字段不参与校验。
+- `list` 不需要确认，只返回 user Job，按 canonical `job_id` 排序且不分页。
+- `remove` 需要确认并冻结公开 Job snapshot；Job 已变化时返回 changed-before-removal，不删除 Session 或 Artifact。
+- add/remove 的 UUID 只在批准后分配；拒绝确认不写 Schedule state。
+- 非交互 Schedule Agent Run 对需要确认的 Tool 返回普通 refusal，不悬挂等待。
 
 ### 11.7 Tool Artifact
 
@@ -754,7 +778,7 @@ Artifact 写失败时整个 tool result 为 `error`，不得把超阈值 raw con
 
 ## 12. Fail-closed capability 矩阵
 
-| Capability | Foreground | Scheduled Work | Memory Task |
+| Capability | Foreground | Schedule Job | Memory Task |
 | --- | --- | --- | --- |
 | Workspace read/list/search | allow | allow | 不在 catalog |
 | Workspace write/edit | refused | refused | 不在 catalog |
@@ -765,10 +789,10 @@ Artifact 写失败时整个 tool result 为 `error`，不得把超阈值 raw con
 | Shell allowlist | allow | allow | 不在 catalog |
 | 其他 Shell | refused | refused | 不在 catalog |
 | WebSearch/WebFetch | allow if enabled | allow if enabled | 不在 catalog |
-| Create Scheduled Work | refused | refused | 不在 catalog |
+| Schedule add/list/remove | confirmation/list | confirmation/list | 不在 catalog |
 | Workspace/Agent Home 之外 | refused/error | refused/error | refused/error |
 
-当前 Tool 契约没有 centralized Permission Policy、`ask`、approval flag 或 execution context。危险 capability 在执行前返回 `refused`；无效参数、越界访问和执行失败返回 message-only `error`。Tool Result 不携带 error code 或嵌套 `ErrorInfo`。
+当前 Tool 契约没有 centralized Permission Policy、`ask`、approval flag 或 execution context。Schedule add/remove 使用一次性 Tool Confirmation；矩阵中标为 refused 的 capability 不升级为确认。无效参数、越界访问和执行失败返回 message-only `error`。Tool Result 不携带 error code 或嵌套 `ErrorInfo`，可携带通用 confirmation metadata。
 
 ## 13. Error Contract
 
@@ -783,7 +807,7 @@ ErrorInfo(
 )
 ```
 
-`ErrorInfo` 仍用于 model、assistant turn 和 service-level error contract，不用于 `ToolError` 或 Tool Result。`ToolError` 只有安全的 message；cause、traceback、SDK response body 不写 Tool message 或 Agent Event，但在拥有明确 Session 的 MyClaw 边界可进入 Session Log。Session Log 不执行主动脱敏。
+`ErrorInfo` 仍用于 model、Agent Run 和 service-level error contract，不用于 `ToolError` 或 Tool Result。`ToolError` 只有安全的 message；cause、traceback、SDK response body 不写 Tool message 或 Agent Event，但在拥有明确 Session 的 MyClaw 边界可进入 Session Log。Session Log 不执行主动脱敏。
 
 ### 13.2 稳定 code
 
@@ -809,7 +833,7 @@ ErrorInfo(
 | `tool_refused` | service-level Tool refusal projection | 否 |
 | `tool_failed` | 工具执行失败 | 否 |
 | `memory_task_running` | Memory Task 不重入 | 否 |
-| `scheduled_work_invalid` | cron/record 无效 | 否 |
+| `schedule_state_error` | Schedule state 损坏或不安全 | 否 |
 
 CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 REPL 继续时不退出进程。
 
@@ -895,7 +919,7 @@ Phase 0 应先把以下内容固化为 fixtures/snapshots：
 - 当前 Session header 与 user/assistant/tool message shape 的 exact-key assertion。
 - 完成、中断、model failure、tool failure 后的完整 Session JSONL snapshots，以及 ordered async persist 和 bounded close。
 - summary schema exact-key assertion、index/cursor 起点和 batch 行为。
-- Scheduled Work JSON exact-key assertion。
+- Schedule model strict round-trip、Schedule state strict-load、legacy state untouched 和 atomic mutation。
 - 全部 Agent Event payload schema 与事件顺序。
 - Model Provider scripted transcript：text deltas、tool call deltas、usage、retry-after、timeout、cancellation。
 - Tool fail-closed matrix、file path boundary、Shell exact allowlist 和 WebFetch redirect/IP cases。
@@ -905,4 +929,4 @@ Phase 0 应先把以下内容固化为 fixtures/snapshots：
 
 ## 17. 确认记录
 
-D01-D16 已于 2026-07-11 全部接受，Tool 契约由 Issue #38 于 2026-07-27 更新，Session snapshot 契约由 ADR-0009 于 2026-08-04 接受。ADR-0001 对 Session lifecycle 的旧条款已部分 superseded，ADR-0002 的非全局布局由 ADR-0005 superseded；非 allowlist Shell 暂时直接拒绝的行为是对 ADR-0003 前台确认规则的已批准临时偏离。本文 schema 是 Python 类型、持久化实现与 contract fixtures 的直接输入。
+D01-D16 已于 2026-07-11 全部接受，file/Shell Tool 契约由 Issue #38 于 2026-07-27 更新，Session snapshot 契约由 ADR-0009 于 2026-08-04 接受，Schedule 与 Tool Confirmation 契约由 Issue #104 更新。ADR-0001 对 Session lifecycle 的旧条款已部分 superseded，ADR-0002 的非全局布局由 ADR-0005 superseded；非 allowlist Shell 暂时直接拒绝的行为是对 ADR-0003 前台确认规则的已批准临时偏离。本文 schema 是 Python 类型、持久化实现与 contract fixtures 的直接输入。

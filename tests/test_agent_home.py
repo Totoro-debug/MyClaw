@@ -28,7 +28,7 @@ def test_repeated_initialization_preserves_all_legacy_state_bytes(agent_home: Pa
         agent_home / "memory" / ".cursor": b"not-a-cursor\n",
         agent_home / "sessions" / "legacy" / "session.jsonl": b"invalid session\xff",
         agent_home / "sessions" / "legacy" / "artifacts" / "result.txt": b"artifact",
-        agent_home / "scheduled-work.json": b"invalid scheduled work\xff",
+        agent_home / "obsolete-state.json": b"invalid obsolete state\xff",
     }
     for path, content in legacy_files.items():
         path.parent.mkdir(parents=True, exist_ok=True)

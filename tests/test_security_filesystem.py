@@ -613,7 +613,7 @@ async def test_list_files_filters_nested_agent_home_state_by_read_scope(
         "memory/.cursor",
         "sessions/workspace/session.jsonl",
         f"sessions/legacy-workspace-slug/artifacts/{OTHER_SESSION_ID}/other.txt",
-        "scheduled-work.json",
+        "schedule.json",
     )
     for relative in protected_paths:
         target = _long_path(agent_home / relative)
@@ -651,7 +651,7 @@ async def test_search_files_filters_nested_agent_home_state_by_read_scope(
         "memory/summary.jsonl",
         "sessions/workspace/session.jsonl",
         f"sessions/legacy-workspace-slug/artifacts/{OTHER_SESSION_ID}/other.txt",
-        "scheduled-work.json",
+        "schedule.json",
     )
     for relative in protected_paths:
         target = _long_path(agent_home / relative)

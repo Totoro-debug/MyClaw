@@ -29,7 +29,6 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.schedule.records import ScheduledWork
 from myclaw.session.session import Session
 from myclaw.tools.models import ModelToolCall
 from myclaw.tools.web.web_search import WebSearchResult
@@ -100,12 +99,6 @@ class RecordingWriter:
         self.operations.append(("line", content))
 
 
-class SessionLogEmittingProvider(ScriptedFakeProvider):
-    async def complete(self, request: object) -> ModelResponse:
-        logger.warning("Scheduled Tool Gateway recovery code=tool_failed")
-        return await super().complete(request)
-
-
 class SensitiveFailingWebSearch:
     async def search(self, query: str, max_results: int) -> tuple[WebSearchResult, ...]:
         del max_results
@@ -153,6 +146,97 @@ class BlockingSessionLogProvider:
 
 
 @pytest.mark.asyncio
+async def test_runtime_leaves_legacy_schedule_state_untouched(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    (workspace / ".myclaw").mkdir()
+    legacy_path = (workspace / ".myclaw" / "scheduled-work.json").resolve()
+    legacy_path.write_text("[]", encoding="utf-8")
+    reads: list[Path] = []
+    original_read_text = Path.read_text
+
+    def observe_legacy_reads(
+        path: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+    ) -> str:
+        if path.resolve() == legacy_path:
+            reads.append(path)
+        return original_read_text(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", observe_legacy_reads)
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=lambda _: ScriptedFakeProvider(),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    try:
+        await runtime.start()
+        await asyncio.sleep(0)
+    finally:
+        await runtime.close()
+
+    assert reads == []
+    assert legacy_path.read_text(encoding="utf-8") == "[]"
+
+
+@pytest.mark.parametrize("legacy_kind", ("file", "directory"))
+@pytest.mark.asyncio
+async def test_runtime_ignores_legacy_schedule_state_path_types(
+    agent_home: Path,
+    workspace: Path,
+    legacy_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    (workspace / ".myclaw").mkdir()
+    legacy_path = (workspace / ".myclaw" / "scheduled-work.json").resolve()
+    if legacy_kind == "file":
+        legacy_path.write_bytes(b"legacy state")
+    else:
+        legacy_path.mkdir()
+    lstat_calls: list[Path] = []
+    original_lstat = Path.lstat
+
+    def observe_legacy_lstat(path: Path) -> object:
+        if path == legacy_path:
+            lstat_calls.append(path)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", observe_legacy_lstat)
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=lambda _: ScriptedFakeProvider(),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    try:
+        await runtime.start()
+        await asyncio.sleep(0)
+    finally:
+        await runtime.close()
+
+    assert lstat_calls == []
+    assert legacy_path.is_file() is (legacy_kind == "file")
+    assert legacy_path.is_dir() is (legacy_kind == "directory")
+    if legacy_kind == "file":
+        assert legacy_path.read_bytes() == b"legacy state"
+
+@pytest.mark.asyncio
 async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_session(
     agent_home: Path,
     workspace: Path,
@@ -192,7 +276,7 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
     records = [
         line
         for line in content.splitlines()
-        if "myclaw.agent.turn:" in line or "myclaw.session.conversation:" in line
+        if "myclaw.session.conversation:" in line
     ]
     assert len(records) == 2
     assert "ModelCallError: The model request failed." in content
@@ -485,57 +569,6 @@ async def test_foreground_model_failure_keeps_event_safe_without_log_redaction(
     assert private_input not in content
     assert "RAW_PROVIDER_BODY auth=PRIVATE_MODEL_CREDENTIAL" in content
     assert terminal_output == ""
-
-
-@pytest.mark.asyncio
-async def test_prepared_runtime_correlates_scheduled_work_with_its_session(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    clock = FakeClock(NOW)
-    provider = SessionLogEmittingProvider(
-        completions=(
-            ModelResponse(
-                message=AssistantModelMessage(content="Scheduled result."),
-                usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
-                finish_reason="stop",
-            ),
-        )
-    )
-    runtime = prepare_repl_runtime(
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _: provider,
-        now=clock.now,
-        new_uuid=uuid4,
-        retry_clock=clock,
-    )
-    task = ScheduledWork(
-        id="11111111-1111-4111-8111-111111111111",
-        title="Session Log correlation",
-        cron="0 9 * * *",
-        prompt="private scheduled prompt",
-        created_at=NOW,
-        enabled=True,
-        session_id="20260711-153012-123000_22222222-2222-4222-8222-222222222222",
-    )
-
-    outcome = await runtime.scheduled_work_coordinator.trigger(task)
-
-    assert outcome.status == "completed"
-    content = _session_log_text(workspace, task.session_id)
-    records = [
-        line
-        for line in content.splitlines()
-        if "Scheduled Tool Gateway recovery code=tool_failed" in line
-    ]
-    assert len(records) == 1
-    assert "tests.test_runtime:complete:" in records[0]
-    assert task.prompt not in content
 
 
 @pytest.mark.asyncio
