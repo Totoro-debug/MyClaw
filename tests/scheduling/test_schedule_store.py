@@ -153,6 +153,34 @@ async def test_write_failure_keeps_old_snapshot_and_latches_fault(
 
 
 @pytest.mark.asyncio
+async def test_write_failure_leaves_the_last_complete_document_for_restart(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    initial = _job()
+    healthy = WorkspaceScheduleStore(state)
+    await healthy.add_user_job(initial)
+    document_before_failure = state.schedule_path.read_bytes()
+
+    def fail_replace(path: Path, content: str) -> None:
+        del path, content
+        raise OSError("injected replacement failure")
+
+    failing = WorkspaceScheduleStore(state, replace_text=fail_replace)
+    with pytest.raises(OSError, match="injected replacement failure"):
+        await failing.commit_terminal(
+            initial.job_id,
+            finished_at_ms=20,
+            status="ok",
+            now_ms=20,
+        )
+
+    assert state.schedule_path.read_bytes() == document_before_failure
+    restarted = WorkspaceScheduleStore(state)
+    assert await restarted.snapshot() == (initial,)
+
+
+@pytest.mark.asyncio
 async def test_public_removal_treats_a_system_job_as_missing(workspace: Path) -> None:
     store = WorkspaceScheduleStore(_state(workspace))
     system_job = _job(SYSTEM_ID, source="system", message="Internal run.")

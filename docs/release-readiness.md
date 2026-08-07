@@ -1,12 +1,14 @@
-# MyClaw Host-Neutral Release Readiness
+# MyClaw Schedule Release Readiness
 
 Status: **READY**
 
 This is the current evidence index for GitHub issues
-[#69](https://github.com/Totoro-debug/myclaw/issues/69) and the final Session
-architecture gate [#92](https://github.com/Totoro-debug/myclaw/issues/92). The active platform decision
-is [ADR-0007](adr/0007-use-host-adapters.md), which supersedes ADR-0006 without
-rewriting that historical Windows-only decision.
+[#69](https://github.com/Totoro-debug/myclaw/issues/69), the final Session
+architecture gate [#92](https://github.com/Totoro-debug/myclaw/issues/92), and the
+Schedule end-to-end gate [#117](https://github.com/Totoro-debug/myclaw/issues/117),
+which completes parent issue [#104](https://github.com/Totoro-debug/myclaw/issues/104).
+The active platform decision is [ADR-0007](adr/0007-use-host-adapters.md), which
+supersedes ADR-0006 without rewriting that historical Windows-only decision.
 
 ## Release Contract
 
@@ -26,6 +28,10 @@ rewriting that historical Windows-only decision.
   Session Logs. Active Session format and lifecycle follow ADR-0009: JSON-native state, strict
   five-field header, complete atomic JSONL snapshots, ordered async `persist()`, and
   bounded synchronous `close()`.
+- Schedule Jobs use the shared Agent Run through one dispatcher. Add/list/remove,
+  confirmation, at/every/cron timing, Schedule Session ownership, Summary/Memory
+  behavior, fault recovery, and shutdown are covered through the Runtime composition
+  seam documented in [Windows x64 validation](release/windows-validation.md).
 
 ## Delivery Evidence
 
@@ -36,8 +42,9 @@ rewriting that historical Windows-only decision.
 | Active Session | JSONL replacement, lazy materialization, snapshot ordering, silent failure, close retry, and status vocabulary | PASS |
 | Session Log | Workspace path safety, routing, rotation, retention, terminal behavior, failure isolation, and drain suites | PASS |
 | Shell lifecycle | Direct argv, trusted Git, Windows Job, POSIX process group, cancellation, and shutdown suites | PASS |
-| CLI and package | Direct Typer entry, universal tag, clean installation, dependency check, and Unicode smoke | PASS |
-| Complete Windows gate | Full warning-strict pytest, Ruff, strict Mypy, artifact rebuild, and final clean install | PASS |
+| Schedule and shared Agent Run | Runtime composition E2E plus Schedule model, Store, Tool, Service, Session, Summary, and Memory suites | PASS |
+| CLI and package | Direct Typer entry, clean universal tag, clean installation, dependency check, and Unicode smoke | PASS |
+| Complete Windows gate | Full warning-strict pytest, repository Ruff lint, strict Mypy, clean artifact rebuild, and final clean install | PASS |
 
 Artifact identity, host details, exact commands, and final counts are recorded in
 [Windows x64 validation](release/windows-validation.md).
@@ -69,5 +76,7 @@ Artifact identity, host details, exact commands, and final counts are recorded i
 - Legacy Agent Home Runtime Log files remain untouched, byte-for-byte, and are never
   updated by the packaged application.
 
-Every required Windows gate passed for the final universal-wheel candidate. Native
-macOS validation remains outstanding and is not implied by this release evidence.
+Every required Windows gate passed for the issue-117 universal-wheel candidate.
+Native macOS validation remains outstanding and is not implied by this release
+evidence. The exact Schedule acceptance matrix and artifact identity are recorded
+in [Windows x64 validation](release/windows-validation.md).

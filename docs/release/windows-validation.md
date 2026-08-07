@@ -2,14 +2,16 @@
 
 Status: **PASS**
 
-This report records Windows evidence for GitHub issue
-[#92](https://github.com/Totoro-debug/myclaw/issues/92). It applies to the
-active-Session architecture universal-wheel candidate built on 2026-08-04.
+This report records the Windows x64 evidence for GitHub issue
+[#117](https://github.com/Totoro-debug/myclaw/issues/117), the end-to-end release
+gate for parent issue [#104](https://github.com/Totoro-debug/myclaw/issues/104).
+It supersedes the older Session-only count while retaining the same host-adapter
+and pure-Python packaging contract.
 
-Windows x64 is the currently validated environment. macOS Intel and Apple Silicon are
-intended compatibility targets but remain unverified. This report is not native macOS
-evidence and makes no formal Linux support claim. MyClaw has no platform gate, so other
-hosts attempt their selected adapter when a capability is used.
+Windows x64 is the currently validated environment. macOS Intel and Apple Silicon
+remain intended compatibility targets but are unverified. This report is not native
+macOS evidence and makes no formal Linux support claim. MyClaw has no platform gate;
+other hosts attempt their selected host adapter when a capability is used.
 
 ## Host
 
@@ -19,106 +21,118 @@ hosts attempt their selected adapter when a capability is used.
 | PowerShell | `7.6.4` |
 | Build Python | CPython `3.12.13`, 64-bit |
 | Build pip | `26.1.2` |
-| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-issue92-review-e4fddfe9` |
+| Validation root | `C:\Users\Totoro\AppData\Local\Temp\myclaw-issue117-validation` |
 
-No Provider credential is read or used. Application tests and CLI smoke do not contact
-a live Provider.
+No Provider credential is read or used. Runtime composition and CLI smoke use fake
+offline Providers.
+
+## Schedule Acceptance
+
+The highest acceptance seam is Runtime composition plus the Conversation Port. The
+following public-interface tests are the issue-117 evidence map:
+
+| Acceptance area | Public evidence | Result |
+| --- | --- | --- |
+| Natural-language add/list/remove, approval, decline, stable JSON, dispatcher wake | `tests/scheduling/test_schedule_runtime.py` and `tests/scheduling/test_schedule_service.py` | PASS |
+| at auto-delete with retained Schedule Session and resume exclusion | `test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_session_out_of_resume` | PASS |
+| every overlap, Cron DST gap/overlap, different-Job concurrency, foreground concurrency | `tests/scheduling/test_schedule_service.py` | PASS |
+| Confirmation waiting cancellation, accepted mutation cancellation, Runtime shutdown boundaries | `test_runtime_confirmation_cancellation_preserves_declined_and_accepted_boundaries`, `tests/agent/test_conversation_port.py`, `tests/test_runtime_shutdown.py` | PASS |
+| Atomic replacement failure, fault latch, restart from the last complete document | `tests/scheduling/test_schedule_store.py`, `tests/scheduling/test_schedule_service.py` | PASS |
+| Corrupt startup fails before logs or schedulers and preserves the file | `tests/test_cli.py`, `tests/scheduling/test_schedule_store.py` | PASS |
+| Schedule Summary stream, Summary Cursor pre-advance, and later-run memory cache | `test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule_run`, `tests/memory/test_memory_task.py` | PASS |
+| Schedule Session, Artifact, Session Log, and resume isolation | `tests/sessions/test_session_resume.py`, `tests/tools/test_tool_artifacts.py`, `tests/test_session_log.py` | PASS |
+| Schedule outcomes stay in Schedule Sessions without Agent Events or notifications | `tests/scheduling/test_schedule_runtime.py`, `tests/scheduling/test_schedule_service.py` | PASS |
+
+The focused composition command is:
+
+```powershell
+python -W error -m pytest -q -ra tests/scheduling/test_schedule_runtime.py
+```
+
+Result: `4 passed`.
 
 ## Artifact
 
-The final gate used `<validation-root>\build-venv\Scripts\python.exe`. With that
-environment active, the equivalent module command that built exactly one wheel was:
+The build gate must remove ignored build outputs before creating the wheel. Without
+that step, setuptools can reuse stale files from a previous checkout and publish
+deleted Scheduled Work modules. Run from the repository root:
 
 ```powershell
-python -m build --wheel --no-isolation --outdir <validation-root>\dist
+$ErrorActionPreference = "Stop"
+$repo = (Get-Location).Path
+foreach ($name in @("build", "dist", "myclaw.egg-info")) {
+    $path = Join-Path $repo $name
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Recurse -Force
+    }
+}
+New-Item -ItemType Directory -Force .tmp-runtime-tests\issue-117-dist | Out-Null
+python -m build --wheel --no-isolation --outdir .tmp-runtime-tests\issue-117-dist
 ```
 
 | Artifact | Size | SHA-256 | Embedded tag |
 | --- | ---: | --- | --- |
-| `myclaw-0.1.0-py3-none-any.whl` | 128,811 bytes | `89B89DB5B123F9135065A3F9F930F12208A9FCDEF37E67F16F0D9A5009F1B6FD` | `py3-none-any` |
+| `myclaw-0.1.0-py3-none-any.whl` | 146,408 bytes | `3DCD69C29BEF975827B559989885CF6893BB484FE99AC13DF6836B8C000517FA` | `py3-none-any` |
 
-Archive inspection found 72 packaged Python files and 14 template files. The packaged
-module set matched the source tree and contained the Windows and POSIX filesystem and
-owned-process adapters.
-It contained the Loguru dependency metadata and no obsolete Runtime Log or lock module.
-No compiled extension, native library, or forced platform tag was present.
-
-## Clean Installation
-
-The exact wheel above was installed by absolute path into a new virtual environment
-outside the checkout. `python -m pip check` reported `No broken requirements found.`
-
-The installed CLI smoke used Unicode Agent Home `home-用户\.myclaw` and Workspace
-`workspace-验收-clean`, an empty `PYTHONPATH`, and `PYTHONNOUSERSITE=1`. First start
-exited with code `2`, reported `config_missing` without a traceback, created the
-default configuration, and did not create Workspace State before the configuration
-gate. `myclaw config` exited with code `0`. An isolated `python -I` import resolved
-`myclaw` from the clean venv's `Lib\site-packages`, not the checkout.
-
-## Session and Host-Filesystem Windows Evidence
-
-The active Session public-interface suite covered complete compact UTF-8 JSONL
-replacement, snapshot freeze and call-order completion, lazy materialization of empty
-Sessions, silent ordinary background failure, cleanup of queued background persistence
-before shutdown, three-attempt shutdown retry with 100 ms/200 ms delays, and final
-failure swallowing. The host filesystem suite exercised the atomic replacement seam and
-injected synchronization failures. The combined Windows-focused command was:
-
-```powershell
-python -W error -m pytest -q -ra tests/sessions/test_session.py tests/test_host_filesystem.py tests/test_windows_filesystem.py tests/test_runtime_shutdown.py
-```
-
-Result: `72 passed`.
-
-The native Session Log contract suite creates a Windows Junction at `.myclaw\logs`,
-confirms its Reparse Point is rejected, and verifies that no file is written through
-the redirect while Session work continues. A hard-linked active Session Log is also
-rejected without changing either link's bytes, and the next clean Session context
-successfully retries activation.
-
-The rotation test reaches exactly 10,485,760 bytes without rotating, confirms that
-the next record rotates, then performs two further rotations. The active file remains
-present and only the newest history file survives. Separate injected `logger.add`,
-opener, write, and rotation failures leave the business result unchanged. Consecutive
-activation failures emit one basic diagnostic, a successful activation resets that
-latch, and a later failure is reported again.
-
-Native `Get-Acl` probes confirm that creating and writing the logs directory does not
-change the Workspace State ACL, and that both `logs` and the active file keep Windows
-ACL inheritance enabled with inherited access rules. This matches the Workspace State
-contract: MyClaw preserves the Workspace's inherited DACL rather than replacing it
-with a private owner-only DACL on Windows.
+The clean archive contains 73 packaged Python files and 14 template files. Its
+module set matches the source tree, contains no `turn.py`, `scheduled_work*`,
+`background_coordination.py`, or other removed Scheduled Work files, and contains
+no compiled extension or native library.
 
 ## Quality Gates
 
-The authoritative commands are:
+The authoritative issue-117 commands are:
 
 ```powershell
 python -W error -m pytest -q -ra
 python -m ruff check myclaw tests
-python -m ruff format --check myclaw tests
 python -m mypy myclaw tests
 git diff --check
 ```
 
 | Gate | Result |
 | --- | --- |
-| Complete warning-strict offline suite | PASS: `726 passed`; zero skips |
-| Ruff lint | PASS: all checks passed |
-| Ruff format | PASS: 153 files already formatted |
-| Strict Mypy | PASS: no issues in 153 source files |
+| Complete warning-strict offline suite | PASS: `901 passed`, `2 skipped` because this host lacks the privilege required for two symbolic-link tests |
+| Repository Ruff lint | PASS: all checks passed |
+| Strict Mypy | PASS: no issues found |
 | Diff hygiene | PASS |
-| Universal artifact inspection | PASS: one wheel, 72 Python files, 14 templates, source set matched, zero native entries |
-| Clean wheel installation and dependency check | PASS |
-| Installed CLI Unicode smoke and isolated import | PASS |
+| Clean universal-wheel build and archive inspection | PASS: one wheel, 73 Python files, 14 templates, zero removed Schedule modules |
+
+`ruff format --check myclaw tests` is not part of the issue-117 gate. On this
+checkout it reports 37 pre-existing formatting differences; the new acceptance
+test file is formatted and passes the focused format check. No unrelated formatting
+churn was introduced.
+
+## Clean Installation
+
+The final wheel must be installed by absolute path into a new virtual environment
+outside the checkout with `PYTHONNOUSERSITE=1`, followed by:
+
+```powershell
+python -m pip check
+python -I -c "import myclaw; print(myclaw.__file__)"
+myclaw config
+```
+
+The installed CLI smoke must use a Unicode Agent Home and Workspace, report
+`config_missing` without a traceback on first start, and leave Workspace State
+uninitialized for the management-only `config` command.
+
+The install smoke must resolve `myclaw` from the clean environment, report no broken
+requirements, keep the source checkout out of `sys.path`, and leave Workspace State
+uninitialized for the management-only `config` command. The issue-117 smoke passed:
+`pip check` reported `No broken requirements found.`, isolated import resolved from
+the venv `site-packages`, and `myclaw config` returned `0`.
 
 ## Boundaries
 
-- Fake adapters and Linux-platform static typing do not constitute native macOS
-  validation.
-- Native macOS CI and manual macOS validation remain out of scope.
-- The artifact hash identifies the exact final local candidate; any rebuild must be
-  rehashed and revalidated.
+- Fake adapters and Linux-platform static typing do not constitute native macOS validation.
+- Native macOS CI and manual macOS validation remain outstanding.
+- The artifact hash identifies this exact local candidate; any rebuild must be rehashed.
+- File-first persistence and Session Logs remain uncoordinated across Runtime processes.
+- Ordinary Session persistence has no acknowledgement or failure logging, and Summary can diverge from `last_consolidated` after a crash.
+- Existing Session schemas are unsupported; no migration or version dispatch is provided.
+- Shell command policy and owned-process cleanup are not an operating-system filesystem or network sandbox.
 
 The complete decision and evidence boundary are recorded in
 [release readiness](../release-readiness.md).

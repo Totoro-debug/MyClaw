@@ -33,6 +33,27 @@ def test_release_evidence_builds_and_smokes_one_universal_wheel_on_windows() -> 
     assert "installed CLI" in evidence
 
 
+def test_schedule_issue_release_evidence_requires_clean_build_and_public_e2e_matrix() -> None:
+    evidence = (ROOT / "docs" / "release" / "windows-validation.md").read_text(encoding="utf-8")
+    for generated_path in ("build", "dist", "myclaw.egg-info"):
+        assert generated_path in evidence
+    for acceptance_term in (
+        "Natural-language add/list/remove",
+        "at auto-delete",
+        "every overlap",
+        "Confirmation waiting cancellation",
+        "Atomic replacement failure",
+        "Corrupt startup",
+        "Schedule Summary stream",
+        "without Agent Events",
+    ):
+        assert acceptance_term in evidence
+    assert "test_schedule_runtime.py" in evidence
+    assert "zero removed Schedule modules" in evidence
+    assert "python -m ruff check myclaw tests" in evidence
+    assert "python -m mypy myclaw tests" in evidence
+
+
 def test_active_code_has_no_platform_support_gate() -> None:
     production = "\n".join(
         path.read_text(encoding="utf-8") for path in sorted((ROOT / "myclaw").rglob("*.py"))
