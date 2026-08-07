@@ -9,7 +9,9 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
+from zoneinfo import ZoneInfo
 
+from croniter import croniter  # type: ignore[import-untyped]
 from loguru import logger
 
 from myclaw.agent.run import (
@@ -52,7 +54,7 @@ class ScheduleServiceStatus:
 
 
 class ScheduleService:
-    """Dispatch due at and every Jobs through the shared Agent Run boundary."""
+    """Dispatch due at, every, and cron Jobs through the shared Agent Run boundary."""
 
     def __init__(
         self,
@@ -71,6 +73,9 @@ class ScheduleService:
         self._active_job_ids: set[str] = set()
         self._consumed_at_jobs: set[str] = set()
         self._every_deadlines: dict[str, _EveryDeadline] = {}
+        self._cron_cursors: dict[str, _CronCursor] = {}
+        self._last_wall_timestamp: float | None = None
+        self._last_monotonic: float | None = None
         self._closing = asyncio.Event()
         self._close_task: asyncio.Task[None] | None = None
         self._faulted = False
@@ -114,6 +119,7 @@ class ScheduleService:
         results = await asyncio.gather(*owned, return_exceptions=True)
         self._active_job_ids.clear()
         self._every_deadlines.clear()
+        self._cron_cursors.clear()
         for result in results:
             if isinstance(result, BaseException) and not isinstance(
                 result,
@@ -132,7 +138,11 @@ class ScheduleService:
                 jobs = await self._store.snapshot()
                 current = self._clock.now()
                 current_monotonic = self._clock.monotonic()
+                forward_jump = self._record_clock_sample(current, current_monotonic)
                 self._sync_every_deadlines(jobs, current, current_monotonic)
+                self._sync_cron_cursors(jobs, current)
+                if forward_jump:
+                    self._skip_missed_cron_occurrences(jobs, current)
                 due = sorted(
                     (
                         job
@@ -143,6 +153,7 @@ class ScheduleService:
                             current,
                             current_monotonic,
                             self._every_deadlines,
+                            self._cron_cursors,
                         )
                     ),
                     key=lambda job: job.job_id,
@@ -159,6 +170,7 @@ class ScheduleService:
                     current,
                     current_monotonic,
                     self._every_deadlines,
+                    self._cron_cursors,
                 )
                 revision = await self._wait_for_wake(delay, revision)
         except asyncio.CancelledError:
@@ -172,17 +184,16 @@ class ScheduleService:
 
     def _reserve(self, job: ScheduleJob) -> None:
         if job.job_id in self._active_job_ids:
-            if job.schedule.kind == "every":
-                self._consume_every_occurrence(job)
+            if self._consume_recurring_occurrence(job):
                 logger.warning(
-                    "Schedule Job occurrence skipped while active job_id={} kind=every",
+                    "Schedule Job occurrence skipped while active job_id={} kind={}",
                     job.job_id,
+                    job.schedule.kind,
                 )
             return
         if job.job_id in self._consumed_at_jobs:
             return
-        if job.schedule.kind == "every":
-            self._consume_every_occurrence(job)
+        self._consume_recurring_occurrence(job)
         self._active_job_ids.add(job.job_id)
         if job.schedule.kind == "at":
             self._consumed_at_jobs.add(job.job_id)
@@ -229,6 +240,81 @@ class ScheduleService:
             anchor_ms=deadline.anchor_ms,
             deadline=deadline.deadline + every_seconds,
         )
+
+    def _consume_recurring_occurrence(self, job: ScheduleJob) -> bool:
+        if job.schedule.kind == "every":
+            self._consume_every_occurrence(job)
+            return True
+        if job.schedule.kind == "cron":
+            self._consume_cron_occurrence(job)
+            return True
+        return False
+
+    def _record_clock_sample(self, current: datetime, monotonic: float) -> bool:
+        wall_timestamp = _instant_timestamp(current)
+        last_wall_timestamp = self._last_wall_timestamp
+        last_monotonic = self._last_monotonic
+        self._last_wall_timestamp = wall_timestamp
+        self._last_monotonic = monotonic
+        if last_wall_timestamp is None or last_monotonic is None:
+            return False
+        return wall_timestamp - last_wall_timestamp > monotonic - last_monotonic + 1.0
+
+    def _sync_cron_cursors(
+        self,
+        jobs: tuple[ScheduleJob, ...],
+        current: datetime,
+    ) -> None:
+        active_ids: set[str] = set()
+        for job in jobs:
+            if job.schedule.kind != "cron":
+                continue
+            active_ids.add(job.job_id)
+            cron_expr = job.schedule.cron_expr
+            timezone = job.schedule.timezone
+            if cron_expr is None or timezone is None:
+                raise ValueError("cron Schedule must define cron_expr and timezone")
+            existing = self._cron_cursors.get(job.job_id)
+            if existing is not None and (
+                existing.created_at_ms == job.created_at_ms
+                and existing.cron_expr == cron_expr
+                and existing.timezone == timezone
+            ):
+                continue
+            self._cron_cursors[job.job_id] = _new_cron_cursor(
+                cron_expr,
+                timezone,
+                current,
+                created_at_ms=job.created_at_ms,
+            )
+        for job_id in tuple(self._cron_cursors):
+            if job_id not in active_ids:
+                del self._cron_cursors[job_id]
+
+    def _skip_missed_cron_occurrences(
+        self,
+        jobs: tuple[ScheduleJob, ...],
+        current: datetime,
+    ) -> None:
+        current_timestamp = _instant_timestamp(current)
+        for job in jobs:
+            if job.schedule.kind != "cron":
+                continue
+            cursor = self._cron_cursors.get(job.job_id)
+            if cursor is None:
+                continue
+            while _instant_timestamp(cursor.next_occurrence) < current_timestamp:
+                self._consume_cron_occurrence(job)
+                logger.warning(
+                    "Schedule Job Cron occurrence skipped after wall-clock jump job_id={}",
+                    job.job_id,
+                )
+
+    def _consume_cron_occurrence(self, job: ScheduleJob) -> None:
+        cursor = self._cron_cursors.get(job.job_id)
+        if cursor is None:
+            raise ValueError("Cron Schedule cursor is not initialized")
+        cursor.next_occurrence = _next_cron_occurrence(cursor)
 
     async def _wait_for_wake(self, delay: float, revision: int) -> int:
         sleep_task = asyncio.create_task(self._clock.sleep(min(60.0, max(0.0, delay))))
@@ -403,6 +489,7 @@ def _is_due(
     current: datetime,
     current_monotonic: float,
     every_deadlines: dict[str, _EveryDeadline],
+    cron_cursors: dict[str, _CronCursor],
 ) -> bool:
     if job.schedule.kind == "at":
         at_time = job.schedule.at_datetime
@@ -410,6 +497,11 @@ def _is_due(
     if job.schedule.kind == "every":
         deadline = every_deadlines.get(job.job_id)
         return deadline is not None and current_monotonic >= deadline.deadline
+    if job.schedule.kind == "cron":
+        cursor = cron_cursors.get(job.job_id)
+        return cursor is not None and _instant_timestamp(
+            cursor.next_occurrence
+        ) <= _instant_timestamp(current)
     return False
 
 
@@ -418,6 +510,7 @@ def _next_delay(
     current: datetime,
     current_monotonic: float,
     every_deadlines: dict[str, _EveryDeadline],
+    cron_cursors: dict[str, _CronCursor],
 ) -> float:
     future: list[float] = []
     for job in jobs:
@@ -429,6 +522,12 @@ def _next_delay(
             deadline = every_deadlines.get(job.job_id)
             if deadline is not None and deadline.deadline > current_monotonic:
                 future.append(deadline.deadline - current_monotonic)
+        elif job.schedule.kind == "cron":
+            cursor = cron_cursors.get(job.job_id)
+            if cursor is not None:
+                delay = _instant_timestamp(cursor.next_occurrence) - _instant_timestamp(current)
+                if delay > 0:
+                    future.append(delay)
     return min(future, default=60.0)
 
 
@@ -455,6 +554,67 @@ def _epoch_milliseconds(value: datetime) -> int:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("Schedule Service clock must be timezone-aware")
     return int((value - datetime(1970, 1, 1, tzinfo=UTC)).total_seconds() * 1000)
+
+
+@dataclass(slots=True)
+class _CronCursor:
+    created_at_ms: int
+    cron_expr: str
+    timezone: str
+    zone: ZoneInfo
+    iterator: croniter
+    next_occurrence: datetime
+
+
+def _new_cron_cursor(
+    cron_expr: str,
+    timezone: str,
+    current: datetime,
+    *,
+    created_at_ms: int,
+) -> _CronCursor:
+    zone = ZoneInfo(timezone)
+    iterator = croniter(cron_expr, current.astimezone(zone))
+    cursor = _CronCursor(
+        created_at_ms=created_at_ms,
+        cron_expr=cron_expr,
+        timezone=timezone,
+        zone=zone,
+        iterator=iterator,
+        next_occurrence=current,
+    )
+    cursor.next_occurrence = _next_cron_occurrence(cursor)
+    return cursor
+
+
+def _next_cron_occurrence(cursor: _CronCursor) -> datetime:
+    while True:
+        candidate = cursor.iterator.get_next(datetime)
+        if not isinstance(candidate, datetime) or candidate.tzinfo is None:
+            raise ValueError("Cron library returned a naive occurrence")
+        local_candidate = candidate.astimezone(cursor.zone)
+        matches_expression = croniter.match(
+            cursor.cron_expr,
+            local_candidate.replace(tzinfo=None),
+        )
+        if matches_expression and _local_time_exists(local_candidate, cursor.zone):
+            return candidate
+
+
+def _instant_timestamp(value: datetime) -> float:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Schedule Service clock must be timezone-aware")
+    return value.timestamp()
+
+
+def _local_time_exists(value: datetime, zone: ZoneInfo) -> bool:
+    naive = value.replace(tzinfo=None)
+    for fold in (0, 1):
+        candidate = naive.replace(tzinfo=zone, fold=fold)
+        round_trip = candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None)
+        if round_trip == naive:
+            return True
+    return False
 
 
 async def _close_payloads(payloads: object | None) -> None:

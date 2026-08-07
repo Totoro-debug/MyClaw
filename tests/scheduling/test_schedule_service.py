@@ -227,6 +227,336 @@ async def test_overdue_at_runs_once_through_shared_agent_run_and_deletes_definit
 
 
 @pytest.mark.asyncio
+async def test_cron_startup_ignores_match_at_startup_boundary(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Run this.",
+        schedule=JobSchedule.cron("0 8 * * *", "America/New_York"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    await store.add_user_job(job)
+    clock = ControlledClock(START)
+    agent_run = RecordingAgentRun()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=clock,
+    )
+
+    service.start()
+    await clock.wait_started.wait()
+    assert agent_run.calls == []
+
+    clock.advance(24 * 60 * 60 - 60)
+    await asyncio.sleep(0)
+    assert agent_run.calls == []
+    clock.advance(60)
+    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+    await service.close()
+    saved = (await store.snapshot())[0]
+    assert saved.state.last_status == "ok"
+    assert saved.state.last_finished_at_ms == int(clock.now().timestamp() * 1000)
+
+
+@pytest.mark.asyncio
+async def test_cron_startup_skips_an_overdue_match_until_the_next_one(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Run this.",
+        schedule=JobSchedule.cron("0 * * * *", "UTC"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    await store.add_user_job(job)
+    clock = ControlledClock(START + timedelta(minutes=30))
+    agent_run = RecordingAgentRun()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=clock,
+    )
+
+    service.start()
+    await clock.wait_started.wait()
+    assert agent_run.calls == []
+    clock.advance(30 * 60)
+    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cron_spring_gap_skips_the_nonexistent_local_time(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Run this.",
+        schedule=JobSchedule.cron("30 2 * * *", "America/New_York"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    await store.add_user_job(job)
+    start = datetime(2026, 3, 8, 6, 0, tzinfo=UTC)
+    clock = ControlledClock(start)
+    agent_run = RecordingAgentRun()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=clock,
+    )
+
+    service.start()
+    await clock.wait_started.wait()
+    clock.advance(2 * 60 * 60)
+    await asyncio.sleep(0)
+    assert agent_run.calls == []
+
+    clock.advance(22 * 60 * 60 + 30 * 60)
+    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cron_fall_overlap_runs_both_absolute_instants(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Run this.",
+        schedule=JobSchedule.cron("30 1 * * *", "America/New_York"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    await store.add_user_job(job)
+    clock = ControlledClock(datetime(2026, 11, 1, 4, 0, tzinfo=UTC))
+    agent_run = RecordingAgentRun()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=clock,
+    )
+
+    service.start()
+    await clock.wait_started.wait()
+    clock.advance(90 * 60)
+    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+
+    clock.advance(60 * 60)
+    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cron_forward_wall_jump_skips_missed_occurrences(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Run this.",
+        schedule=JobSchedule.cron("0 * * * *", "UTC"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    await store.add_user_job(job)
+    clock = ControlledClock(START)
+    agent_run = RecordingAgentRun()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=clock,
+    )
+
+    service.start()
+    await clock.wait_started.wait()
+    clock.jump_wall(2 * 60 * 60)
+    clock.advance(60)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert agent_run.calls == []
+
+    clock.advance(59 * 60)
+    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cron_backward_wall_jump_does_not_repeat_an_absolute_occurrence(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Run this.",
+        schedule=JobSchedule.cron("0 * * * *", "UTC"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    await store.add_user_job(job)
+    clock = ControlledClock(START)
+    agent_run = RecordingAgentRun()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=clock,
+    )
+
+    service.start()
+    await clock.wait_started.wait()
+    clock.advance(60 * 60)
+    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+
+    clock.jump_wall(-30 * 60)
+    clock.advance(30 * 60)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(agent_run.calls) == 1
+
+    clock.advance(60 * 60)
+    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cron_active_overlap_consumes_the_skipped_occurrence(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Run this.",
+        schedule=JobSchedule.cron("* * * * *", "UTC"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    await store.add_user_job(job)
+    clock = ControlledClock(START)
+    agent_run = RecordingAgentRun(block=True)
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=clock,
+    )
+
+    service.start()
+    await clock.wait_started.wait()
+    clock.wait_started.clear()
+    clock.advance(60)
+    await agent_run.started.wait()
+    await clock.wait_started.wait()
+    clock.wait_started.clear()
+
+    clock.advance(60)
+    await _wait_until(clock.wait_started.is_set)
+    assert len(agent_run.calls) == 1
+
+    agent_run.block = False
+    agent_run.release.set()
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+    assert len(agent_run.calls) == 1
+
+    clock.advance(60)
+    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cron_failure_waits_for_the_next_match_without_retry(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Run this.",
+        schedule=JobSchedule.cron("* * * * *", "UTC"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    await store.add_user_job(job)
+
+    class FailedRun(RecordingAgentRun):
+        def run_agent(
+            self,
+            session: Session,
+            input: str,
+            route: str,
+            stream: bool,
+            confirmation: object | None = None,
+        ) -> AsyncIterator[AgentRunPayload]:
+            del confirmation
+
+            async def run() -> AsyncIterator[AgentRunPayload]:
+                self.calls.append((session, input, route, stream))
+                self.started.set()
+                yield AgentRunStartedPayload()
+                yield AgentRunFailedPayload(
+                    error=ErrorInfo(code="model_failed", message="The model request failed.")
+                )
+
+            return run()
+
+    clock = ControlledClock(START)
+    agent_run = FailedRun()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=clock,
+    )
+
+    service.start()
+    await clock.wait_started.wait()
+    clock.advance(60)
+    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+    saved = (await store.snapshot())[0]
+    assert saved.state.last_status == "error"
+    assert saved.state.last_error == "The model request failed."
+
+    clock.advance(30)
+    await asyncio.sleep(0)
+    assert len(agent_run.calls) == 1
+    clock.advance(30)
+    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_overdue_every_commits_completion_and_restarts_interval_from_finish(
     workspace: Path,
     agent_home: Path,
