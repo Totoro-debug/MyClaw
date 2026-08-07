@@ -7,7 +7,7 @@ import inspect
 from collections.abc import AsyncIterator
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
 
 from loguru import logger
@@ -32,6 +32,8 @@ class ScheduleClock(Protocol):
 
     def now(self) -> datetime: ...
 
+    def monotonic(self) -> float: ...
+
     async def sleep(self, seconds: float) -> None: ...
 
 
@@ -50,7 +52,7 @@ class ScheduleServiceStatus:
 
 
 class ScheduleService:
-    """Dispatch due at Jobs through the shared Agent Run boundary."""
+    """Dispatch due at and every Jobs through the shared Agent Run boundary."""
 
     def __init__(
         self,
@@ -68,6 +70,7 @@ class ScheduleService:
         self._run_tasks: set[asyncio.Task[None]] = set()
         self._active_job_ids: set[str] = set()
         self._consumed_at_jobs: set[str] = set()
+        self._every_deadlines: dict[str, _EveryDeadline] = {}
         self._closing = asyncio.Event()
         self._close_task: asyncio.Task[None] | None = None
         self._faulted = False
@@ -81,6 +84,7 @@ class ScheduleService:
         current = self._clock.now()
         if current.tzinfo is None or current.utcoffset() is None:
             raise ValueError("Schedule Service clock must be timezone-aware")
+        self._clock.monotonic()
         self._loop_task = asyncio.create_task(self._dispatch())
 
     async def close(self) -> None:
@@ -109,6 +113,7 @@ class ScheduleService:
         owned = (() if loop_task is None else (loop_task,)) + running
         results = await asyncio.gather(*owned, return_exceptions=True)
         self._active_job_ids.clear()
+        self._every_deadlines.clear()
         for result in results:
             if isinstance(result, BaseException) and not isinstance(
                 result,
@@ -126,13 +131,19 @@ class ScheduleService:
                     return
                 jobs = await self._store.snapshot()
                 current = self._clock.now()
+                current_monotonic = self._clock.monotonic()
+                self._sync_every_deadlines(jobs, current, current_monotonic)
                 due = sorted(
                     (
                         job
                         for job in jobs
-                        if job.schedule.kind == "at"
-                        and job.job_id not in self._consumed_at_jobs
-                        and _is_due(job, current)
+                        if job.job_id not in self._consumed_at_jobs
+                        and _is_due(
+                            job,
+                            current,
+                            current_monotonic,
+                            self._every_deadlines,
+                        )
                     ),
                     key=lambda job: job.job_id,
                 )
@@ -143,7 +154,12 @@ class ScheduleService:
                     await asyncio.sleep(0)
                     continue
 
-                delay = _next_delay(jobs, current)
+                delay = _next_delay(
+                    jobs,
+                    current,
+                    current_monotonic,
+                    self._every_deadlines,
+                )
                 revision = await self._wait_for_wake(delay, revision)
         except asyncio.CancelledError:
             raise
@@ -155,13 +171,64 @@ class ScheduleService:
             )
 
     def _reserve(self, job: ScheduleJob) -> None:
-        if job.job_id in self._active_job_ids or job.job_id in self._consumed_at_jobs:
+        if job.job_id in self._active_job_ids:
+            if job.schedule.kind == "every":
+                self._consume_every_occurrence(job)
+                logger.warning(
+                    "Schedule Job occurrence skipped while active job_id={} kind=every",
+                    job.job_id,
+                )
             return
+        if job.job_id in self._consumed_at_jobs:
+            return
+        if job.schedule.kind == "every":
+            self._consume_every_occurrence(job)
         self._active_job_ids.add(job.job_id)
-        self._consumed_at_jobs.add(job.job_id)
+        if job.schedule.kind == "at":
+            self._consumed_at_jobs.add(job.job_id)
         task = asyncio.create_task(self._run_job(job))
         self._run_tasks.add(task)
         task.add_done_callback(self._run_finished)
+
+    def _sync_every_deadlines(
+        self,
+        jobs: tuple[ScheduleJob, ...],
+        current: datetime,
+        current_monotonic: float,
+    ) -> None:
+        active_ids: set[str] = set()
+        for job in jobs:
+            if job.schedule.kind != "every":
+                continue
+            active_ids.add(job.job_id)
+            anchor_ms = _every_anchor_ms(job)
+            existing = self._every_deadlines.get(job.job_id)
+            if existing is not None:
+                if existing.anchor_ms == anchor_ms:
+                    continue
+                # A finishing run fixes its monotonic deadline before the Store publishes
+                # the matching wall-clock anchor. Keep that mapping while the run is active.
+                if job.job_id in self._active_job_ids:
+                    continue
+            due_at = _every_due_at(job, anchor_ms)
+            delay = max(0.0, (due_at - current).total_seconds())
+            self._every_deadlines[job.job_id] = _EveryDeadline(
+                anchor_ms=anchor_ms,
+                deadline=current_monotonic + delay,
+            )
+        for job_id in tuple(self._every_deadlines):
+            if job_id not in active_ids:
+                del self._every_deadlines[job_id]
+
+    def _consume_every_occurrence(self, job: ScheduleJob) -> None:
+        deadline = self._every_deadlines.get(job.job_id)
+        every_seconds = job.schedule.every_seconds
+        if deadline is None or every_seconds is None:
+            return
+        self._every_deadlines[job.job_id] = _EveryDeadline(
+            anchor_ms=deadline.anchor_ms,
+            deadline=deadline.deadline + every_seconds,
+        )
 
     async def _wait_for_wake(self, delay: float, revision: int) -> int:
         sleep_task = asyncio.create_task(self._clock.sleep(min(60.0, max(0.0, delay))))
@@ -245,9 +312,11 @@ class ScheduleService:
                         job.job_id,
                         type(error).__name__,
                     )
-            if terminal is not None:
-                await self._commit_terminal(job, terminal, terminal_error)
-            self._active_job_ids.discard(job.job_id)
+            try:
+                if terminal is not None:
+                    await self._commit_terminal(job, terminal, terminal_error)
+            finally:
+                self._active_job_ids.discard(job.job_id)
 
     async def _commit_terminal(
         self,
@@ -255,7 +324,26 @@ class ScheduleService:
         terminal: Literal["ok", "error"],
         error: str | None,
     ) -> None:
-        operation = asyncio.create_task(self._remove_at_job(job))
+        finished_at_ms = _epoch_milliseconds(self._clock.now())
+        if job.schedule.kind == "every":
+            every_seconds = job.schedule.every_seconds
+            if every_seconds is None:
+                raise ValueError("every Schedule Job must define every_seconds")
+            self._every_deadlines[job.job_id] = _EveryDeadline(
+                anchor_ms=finished_at_ms,
+                deadline=self._clock.monotonic() + every_seconds,
+            )
+        operation = asyncio.create_task(
+            self._remove_at_job(job)
+            if job.schedule.kind == "at"
+            else self._store.commit_terminal(
+                job.job_id,
+                finished_at_ms=finished_at_ms,
+                status=terminal,
+                error=error,
+                now_ms=finished_at_ms,
+            )
+        )
         cancellation: asyncio.CancelledError | None = None
         while not operation.done():
             try:
@@ -304,22 +392,69 @@ class ScheduleService:
             )
 
 
-def _is_due(job: ScheduleJob, current: datetime) -> bool:
-    at_time = job.schedule.at_datetime
-    if at_time is None:
-        return False
-    return current >= at_time
+@dataclass(frozen=True, slots=True)
+class _EveryDeadline:
+    anchor_ms: int
+    deadline: float
 
 
-def _next_delay(jobs: tuple[ScheduleJob, ...], current: datetime) -> float:
-    future = [
-        (job.schedule.at_datetime - current).total_seconds()
-        for job in jobs
-        if job.schedule.kind == "at"
-        and job.schedule.at_datetime is not None
-        and job.schedule.at_datetime > current
-    ]
+def _is_due(
+    job: ScheduleJob,
+    current: datetime,
+    current_monotonic: float,
+    every_deadlines: dict[str, _EveryDeadline],
+) -> bool:
+    if job.schedule.kind == "at":
+        at_time = job.schedule.at_datetime
+        return at_time is not None and current >= at_time
+    if job.schedule.kind == "every":
+        deadline = every_deadlines.get(job.job_id)
+        return deadline is not None and current_monotonic >= deadline.deadline
+    return False
+
+
+def _next_delay(
+    jobs: tuple[ScheduleJob, ...],
+    current: datetime,
+    current_monotonic: float,
+    every_deadlines: dict[str, _EveryDeadline],
+) -> float:
+    future: list[float] = []
+    for job in jobs:
+        if job.schedule.kind == "at":
+            at_time = job.schedule.at_datetime
+            if at_time is not None and at_time > current:
+                future.append((at_time - current).total_seconds())
+        elif job.schedule.kind == "every":
+            deadline = every_deadlines.get(job.job_id)
+            if deadline is not None and deadline.deadline > current_monotonic:
+                future.append(deadline.deadline - current_monotonic)
     return min(future, default=60.0)
+
+
+def _every_anchor_ms(job: ScheduleJob) -> int:
+    return (
+        job.state.last_finished_at_ms
+        if job.state.last_finished_at_ms is not None
+        else job.created_at_ms
+    )
+
+
+def _every_due_at(job: ScheduleJob, anchor_ms: int) -> datetime:
+    every_seconds = job.schedule.every_seconds
+    if every_seconds is None:
+        raise ValueError("every Schedule Job must define every_seconds")
+    return _datetime_from_epoch_milliseconds(anchor_ms) + timedelta(seconds=every_seconds)
+
+
+def _datetime_from_epoch_milliseconds(value: int) -> datetime:
+    return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=value)
+
+
+def _epoch_milliseconds(value: datetime) -> int:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Schedule Service clock must be timezone-aware")
+    return int((value - datetime(1970, 1, 1, tzinfo=UTC)).total_seconds() * 1000)
 
 
 async def _close_payloads(payloads: object | None) -> None:

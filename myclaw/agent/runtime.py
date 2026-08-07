@@ -60,7 +60,7 @@ from myclaw.schedule.scheduled_work_execution import (
     ScheduledWorkModelSettings,
     ScheduledWorkRunner,
 )
-from myclaw.schedule.service import ScheduleService
+from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.schedule.tool import ScheduleTool
 from myclaw.session.conversation import (
@@ -456,7 +456,7 @@ def prepare_repl_runtime(
     retry_jitter: Jitter | None = None,
     memory_scheduler_clock: SchedulerClock | None = None,
     scheduled_work_scheduler_clock: SchedulerClock | None = None,
-    schedule_scheduler_clock: SchedulerClock | None = None,
+    schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     web_search: WebSearchBoundary | None = None,
     web_fetch: WebFetchBoundary | None = None,
@@ -502,7 +502,7 @@ def _prepare_repl_runtime(
     retry_jitter: Jitter | None = None,
     memory_scheduler_clock: SchedulerClock | None = None,
     scheduled_work_scheduler_clock: SchedulerClock | None = None,
-    schedule_scheduler_clock: SchedulerClock | None = None,
+    schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     web_search: WebSearchBoundary | None = None,
     web_fetch: WebFetchBoundary | None = None,

@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Callable
 from datetime import datetime
+from time import monotonic
 from typing import Protocol
 
 from tzlocal import get_localzone
@@ -23,6 +24,9 @@ class AsyncioSchedulerClock:
 
     def now(self) -> datetime:
         return self._now().astimezone(self._timezone)
+
+    def monotonic(self) -> float:
+        return monotonic()
 
     async def sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
