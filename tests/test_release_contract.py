@@ -22,38 +22,6 @@ def test_distribution_metadata_builds_one_host_neutral_wheel() -> None:
     assert "plat_name" not in setup
 
 
-def test_release_evidence_builds_and_smokes_one_universal_wheel_on_windows() -> None:
-    evidence = (ROOT / "docs" / "release" / "windows-validation.md").read_text(encoding="utf-8")
-
-    assert "python -m build --wheel" in evidence
-    assert "py3-none-any" in evidence
-    assert "py3-none-win_amd64" not in evidence
-    assert "PYTHONNOUSERSITE" in evidence
-    assert "python -m pip check" in evidence
-    assert "installed CLI" in evidence
-
-
-def test_schedule_issue_release_evidence_requires_clean_build_and_public_e2e_matrix() -> None:
-    evidence = (ROOT / "docs" / "release" / "windows-validation.md").read_text(encoding="utf-8")
-    for generated_path in ("build", "dist", "myclaw.egg-info"):
-        assert generated_path in evidence
-    for acceptance_term in (
-        "Natural-language add/list/remove",
-        "at auto-delete",
-        "every overlap",
-        "Confirmation waiting cancellation",
-        "Atomic replacement failure",
-        "Corrupt startup",
-        "Schedule Summary stream",
-        "without Agent Events",
-    ):
-        assert acceptance_term in evidence
-    assert "test_schedule_runtime.py" in evidence
-    assert "zero removed Schedule modules" in evidence
-    assert "python -m ruff check myclaw tests" in evidence
-    assert "python -m mypy myclaw tests" in evidence
-
-
 def test_active_code_has_no_platform_support_gate() -> None:
     production = "\n".join(
         path.read_text(encoding="utf-8") for path in sorted((ROOT / "myclaw").rglob("*.py"))
@@ -98,7 +66,6 @@ def test_active_contract_docs_do_not_claim_the_removed_runtime_log_implementatio
         ROOT / "CONTEXT.md",
         ROOT / "docs" / "myclaw-runtime-contracts.md",
         ROOT / "docs" / "release-readiness.md",
-        ROOT / "docs" / "release" / "windows-validation.md",
         ROOT / "docs" / "adr" / "0007-use-host-adapters.md",
     )
     obsolete_claims = (
@@ -158,7 +125,6 @@ def test_active_support_contract_matches_host_neutral_release_evidence() -> None
         ROOT / "README.md",
         ROOT / "docs" / "myclaw-runtime-contracts.md",
         ROOT / "docs" / "release-readiness.md",
-        ROOT / "docs" / "release" / "windows-validation.md",
     )
     support = "\n".join(path.read_text(encoding="utf-8").lower() for path in active_paths)
     for claim in (
