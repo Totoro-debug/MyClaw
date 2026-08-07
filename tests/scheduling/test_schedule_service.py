@@ -37,6 +37,7 @@ from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider
+from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 OTHER_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
@@ -470,27 +471,35 @@ async def test_cron_active_overlap_consumes_the_skipped_occurrence(
         workspace_state=state,
         clock=clock,
     )
+    capture = capture_diagnostics()
 
-    service.start()
-    await clock.wait_started.wait()
-    clock.wait_started.clear()
-    clock.advance(60)
-    await agent_run.started.wait()
-    await clock.wait_started.wait()
-    clock.wait_started.clear()
+    try:
+        service.start()
+        await clock.wait_started.wait()
+        clock.wait_started.clear()
+        clock.advance(60)
+        await agent_run.started.wait()
+        await clock.wait_started.wait()
+        clock.wait_started.clear()
 
-    clock.advance(60)
-    await _wait_until(clock.wait_started.is_set)
-    assert len(agent_run.calls) == 1
+        clock.advance(60)
+        await _wait_until(clock.wait_started.is_set)
+        assert len(agent_run.calls) == 1
 
-    agent_run.block = False
-    agent_run.release.set()
-    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
-    assert len(agent_run.calls) == 1
+        agent_run.block = False
+        agent_run.release.set()
+        await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+        assert len(agent_run.calls) == 1
 
-    clock.advance(60)
-    await _wait_until(lambda: len(agent_run.calls) == 2)
-    await service.close()
+        clock.advance(60)
+        await _wait_until(lambda: len(agent_run.calls) == 2)
+        await service.close()
+    finally:
+        capture.close()
+
+    assert capture.event_text.count("Schedule Job occurrence skipped while active") == 1
+    session_log_text = (state.logs_directory / f"{job.session_id}.log").read_text(encoding="utf-8")
+    assert session_log_text.count("Schedule Job occurrence skipped while active") == 1
 
 
 @pytest.mark.asyncio
@@ -935,6 +944,41 @@ async def test_remove_before_reservation_prevents_the_at_run(
 
 
 @pytest.mark.asyncio
+async def test_due_candidates_are_revalidated_before_reservation(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = _job()
+    await store.add_user_job(job)
+    original_reserve_due = store.reserve_due
+
+    async def remove_before_reservation(
+        candidates: tuple[ScheduleJob, ...],
+    ) -> tuple[ScheduleJob, ...]:
+        await store.remove_user_job(job.job_id, expected=job)
+        return await original_reserve_due(candidates)
+
+    monkeypatch.setattr(store, "reserve_due", remove_before_reservation)
+    agent_run = RecordingAgentRun()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=ControlledClock(START),
+    )
+
+    service.start()
+    await asyncio.sleep(0)
+    await service.close()
+
+    assert agent_run.calls == []
+    assert await store.snapshot() == ()
+
+
+@pytest.mark.asyncio
 async def test_remove_after_reservation_allows_the_current_run_without_resurrection(
     workspace: Path,
     agent_home: Path,
@@ -959,6 +1003,75 @@ async def test_remove_after_reservation_allows_the_current_run_without_resurrect
     await service.close()
 
     assert len(agent_run.calls) == 1
+    assert await store.snapshot() == ()
+    assert service.status_snapshot().status == "available"
+
+
+@pytest.mark.asyncio
+async def test_terminal_at_removal_does_not_delete_a_replacement_job(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = _job()
+    await store.add_user_job(job)
+    agent_run = RecordingAgentRun(block=True)
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=ControlledClock(START),
+    )
+    service.start()
+    await agent_run.started.wait()
+
+    await store.remove_user_job(job.job_id, expected=job)
+    replacement = ScheduleJob(
+        job_id=job.job_id,
+        message="Replacement run.",
+        schedule=job.schedule,
+        created_at_ms=2,
+        updated_at_ms=2,
+    )
+    await store.add_user_job(replacement)
+    agent_run.release.set()
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+    await service.close()
+
+    assert await store.snapshot() == (replacement,)
+    assert service.status_snapshot().status == "available"
+
+
+@pytest.mark.asyncio
+async def test_system_at_job_is_deleted_after_terminal_completion(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Run this.",
+        schedule=JobSchedule.at("2026-08-07T11:59:00.000+00:00"),
+        created_at_ms=1,
+        updated_at_ms=1,
+        source="system",
+    )
+    await store.add_system_job(job)
+    agent_run = RecordingAgentRun()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=ControlledClock(START),
+    )
+
+    service.start()
+    await agent_run.started.wait()
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+    await service.close()
+
     assert await store.snapshot() == ()
     assert service.status_snapshot().status == "available"
 
@@ -1008,9 +1121,181 @@ async def test_every_terminal_store_fault_preserves_previous_state_and_faults_se
 
     def fail_replace(path: Path, content: str) -> None:
         del path, content
-        raise OSError("injected terminal replacement failure")
+        raise OSError("PRIVATE_TERMINAL_STORE_BODY")
 
     store = WorkspaceScheduleStore(state, replace_text=fail_replace)
+    agent_run = RecordingAgentRun()
+    capture = capture_diagnostics()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=ControlledClock(START),
+    )
+
+    try:
+        service.start()
+        await agent_run.started.wait()
+        await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+        await service.close()
+    finally:
+        capture.close()
+
+    assert await store.snapshot() == (job,)
+    assert store.health == "faulted"
+    assert service.status_snapshot().to_dict() == {
+        "status": "faulted",
+        "active_job_count": 0,
+    }
+    assert capture.event_text.count("Schedule terminal update failed") == 1
+    assert "PRIVATE_TERMINAL_STORE_BODY" not in capture.text
+    session_log_text = (state.logs_directory / f"{job.session_id}.log").read_text(encoding="utf-8")
+    assert session_log_text.count("Schedule terminal update failed") == 1
+    assert "PRIVATE_TERMINAL_STORE_BODY" not in session_log_text
+
+
+@pytest.mark.asyncio
+async def test_safe_agent_failure_logs_one_warning_without_failure_message(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    await store.add_user_job(_job())
+
+    class FailedRun(RecordingAgentRun):
+        def run_agent(
+            self,
+            session: Session,
+            input: str,
+            route: str,
+            stream: bool,
+            confirmation: object | None = None,
+        ) -> AsyncIterator[AgentRunPayload]:
+            del confirmation
+
+            async def run() -> AsyncIterator[AgentRunPayload]:
+                self.calls.append((session, input, route, stream))
+                self.started.set()
+                yield AgentRunStartedPayload()
+                yield AgentRunFailedPayload(
+                    error=ErrorInfo(
+                        code="model_failed",
+                        message="PRIVATE_AGENT_FAILURE_MESSAGE",
+                    )
+                )
+
+            return run()
+
+    agent_run = FailedRun()
+    capture = capture_diagnostics()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=ControlledClock(START),
+    )
+
+    try:
+        service.start()
+        await agent_run.started.wait()
+        await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+        await service.close()
+    finally:
+        capture.close()
+
+    assert capture.event_text.count("Schedule Job failed") == 1
+    assert "code=model_failed" in capture.event_text
+    assert "PRIVATE_AGENT_FAILURE_MESSAGE" not in capture.text
+    session_log_text = (state.logs_directory / f"{_job().session_id}.log").read_text(
+        encoding="utf-8"
+    )
+    assert session_log_text.count("Schedule Job failed") == 1
+    assert "code=model_failed" in session_log_text
+    assert "PRIVATE_AGENT_FAILURE_MESSAGE" not in session_log_text
+
+
+@pytest.mark.asyncio
+async def test_one_job_exception_does_not_stop_other_due_jobs(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    await store.add_user_job(_job())
+    await store.add_user_job(_job(job_id=OTHER_UUID))
+
+    class FirstRunRaises(RecordingAgentRun):
+        def __init__(self) -> None:
+            super().__init__()
+            self.second_started = asyncio.Event()
+
+        def run_agent(
+            self,
+            session: Session,
+            input: str,
+            route: str,
+            stream: bool,
+            confirmation: object | None = None,
+        ) -> AsyncIterator[AgentRunPayload]:
+            del confirmation
+
+            async def run() -> AsyncIterator[AgentRunPayload]:
+                self.calls.append((session, input, route, stream))
+                if len(self.calls) == 1:
+                    raise RuntimeError("PRIVATE_JOB_EXCEPTION_BODY")
+                self.second_started.set()
+                yield AgentRunStartedPayload()
+                yield AgentRunCompletedPayload(
+                    content="Done.",
+                    usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                )
+
+            return run()
+
+    agent_run = FirstRunRaises()
+    capture = capture_diagnostics()
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,
+        workspace_state=state,
+        clock=ControlledClock(START),
+    )
+
+    try:
+        service.start()
+        await agent_run.second_started.wait()
+        await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+        await service.close()
+    finally:
+        capture.close()
+
+    assert len(agent_run.calls) == 2
+    assert await store.snapshot() == ()
+    assert service.status_snapshot().status == "available"
+    assert "PRIVATE_JOB_EXCEPTION_BODY" not in capture.text
+
+
+@pytest.mark.asyncio
+async def test_terminal_commit_keeps_job_active_until_store_operation_finishes(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
+    await store.add_user_job(job)
+    original_commit_terminal = store.commit_terminal
+    commit_started = asyncio.Event()
+    release_commit = asyncio.Event()
+
+    async def blocked_commit_terminal(*args: object, **kwargs: object) -> ScheduleJob | None:
+        commit_started.set()
+        await release_commit.wait()
+        return await original_commit_terminal(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "commit_terminal", blocked_commit_terminal)
     agent_run = RecordingAgentRun()
     service = ScheduleService(
         store=store,
@@ -1021,15 +1306,12 @@ async def test_every_terminal_store_fault_preserves_previous_state_and_faults_se
 
     service.start()
     await agent_run.started.wait()
+    await commit_started.wait()
+    assert service.status_snapshot().active_job_count == 1
+
+    release_commit.set()
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
     await service.close()
-
-    assert await store.snapshot() == (job,)
-    assert store.health == "faulted"
-    assert service.status_snapshot().to_dict() == {
-        "status": "faulted",
-        "active_job_count": 0,
-    }
 
 
 @pytest.mark.asyncio

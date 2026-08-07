@@ -58,6 +58,11 @@ class ScheduleStore(Protocol):
 
     async def snapshot(self) -> tuple[ScheduleJob, ...]: ...
 
+    async def reserve_due(
+        self,
+        candidates: tuple[ScheduleJob, ...],
+    ) -> tuple[ScheduleJob, ...]: ...
+
     async def public_snapshot(self) -> tuple[ScheduleJob, ...]: ...
 
     async def add_user_job(self, job: ScheduleJob) -> ScheduleJob: ...
@@ -73,6 +78,7 @@ class ScheduleStore(Protocol):
         self,
         job_id: str,
         *,
+        expected: ScheduleJob | None = None,
         finished_at_ms: int,
         status: JobStatus,
         error: str | None = None,
@@ -123,6 +129,21 @@ class WorkspaceScheduleStore:
     async def snapshot(self) -> tuple[ScheduleJob, ...]:
         async with self._condition:
             return copy.deepcopy(self._jobs)
+
+    async def reserve_due(
+        self,
+        candidates: tuple[ScheduleJob, ...],
+    ) -> tuple[ScheduleJob, ...]:
+        """Revalidate due candidates while holding the Store authority lock."""
+        async with self._condition:
+            self._ensure_available()
+            current = {job.job_id: job for job in self._jobs}
+            reserved = tuple(
+                current[job.job_id]
+                for job in sorted(candidates, key=lambda candidate: candidate.job_id)
+                if current.get(job.job_id) == job
+            )
+            return copy.deepcopy(reserved)
 
     async def public_snapshot(self) -> tuple[ScheduleJob, ...]:
         async with self._condition:
@@ -177,6 +198,7 @@ class WorkspaceScheduleStore:
         self,
         job_id: str,
         *,
+        expected: ScheduleJob | None = None,
         finished_at_ms: int,
         status: JobStatus,
         error: str | None = None,
@@ -194,7 +216,7 @@ class WorkspaceScheduleStore:
         async with self._condition:
             self._ensure_available()
             current = next((job for job in self._jobs if job.job_id == job_id), None)
-            if current is None:
+            if current is None or (expected is not None and current != expected):
                 return None
             updated = replace(
                 current,
@@ -208,9 +230,7 @@ class WorkspaceScheduleStore:
     async def wait_for_change(self, revision: int) -> int:
         require_nonnegative_int(revision, field="revision")
         async with self._condition:
-            await self._condition.wait_for(
-                lambda: self._revision != revision or self._faulted
-            )
+            await self._condition.wait_for(lambda: self._revision != revision or self._faulted)
             return self._revision
 
     def _load_once(self) -> tuple[ScheduleJob, ...]:
@@ -239,8 +259,13 @@ class WorkspaceScheduleStore:
             if current is None or (user_only and current.source != "user"):
                 return False
             if expected is not None:
-                if expected.source != "user" or _public_job_key(current) != _public_job_key(expected):
-                    raise ScheduleStaleRemovalError("Schedule Job changed before removal")
+                if user_only:
+                    if expected.source != "user" or _public_job_key(current) != _public_job_key(
+                        expected
+                    ):
+                        raise ScheduleStaleRemovalError("Schedule Job changed before removal")
+                elif current != expected:
+                    return False
             candidate = tuple(job for job in self._jobs if job.job_id != job_id)
             self._publish_locked(candidate)
             return True

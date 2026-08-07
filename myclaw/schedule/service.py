@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
@@ -23,7 +22,7 @@ from myclaw.agent.run import (
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.logging.session import session_log
 from myclaw.schedule.model import ScheduleJob
-from myclaw.schedule.store import ScheduleStore
+from myclaw.schedule.store import ScheduleStore, ScheduleStoreFaultedError
 from myclaw.session.session import Session, SessionStoragePartition
 
 ScheduleHealth = Literal["available", "faulted"]
@@ -77,14 +76,21 @@ class ScheduleService:
         self._last_wall_timestamp: float | None = None
         self._last_monotonic: float | None = None
         self._closing = asyncio.Event()
+        self._faulted_event = asyncio.Event()
         self._close_task: asyncio.Task[None] | None = None
         self._faulted = False
+        self._dispatcher_error_logged = False
+        self._terminal_store_error_logged = False
 
     def start(self) -> None:
         """Start the single dispatcher; repeated starts are idempotent."""
         if self._close_task is not None:
             raise RuntimeError("Schedule Service is closed")
         if self._loop_task is not None:
+            return
+        if self._faulted or self._store.health == "faulted":
+            self._faulted = True
+            self._faulted_event.set()
             return
         current = self._clock.now()
         if current.tzinfo is None or current.utcoffset() is None:
@@ -125,15 +131,18 @@ class ScheduleService:
                 result,
                 asyncio.CancelledError,
             ):
-                self._faulted = True
-                logger.opt(exception=result).error("Schedule Service shutdown failed")
+                self._latch_fault()
+                logger.error(
+                    "Schedule Service shutdown failed type={}",
+                    type(result).__name__,
+                )
 
     async def _dispatch(self) -> None:
         revision = self._store.revision
         try:
             while not self._closing.is_set():
-                if self._store.health == "faulted":
-                    self._faulted = True
+                if self._faulted or self._store.health == "faulted":
+                    self._latch_fault()
                     return
                 jobs = await self._store.snapshot()
                 current = self._clock.now()
@@ -159,7 +168,8 @@ class ScheduleService:
                     key=lambda job: job.job_id,
                 )
                 if due:
-                    for job in due:
+                    reserved = await self._store.reserve_due(tuple(due))
+                    for job in reserved:
                         self._reserve(job)
                     revision = self._store.revision
                     await asyncio.sleep(0)
@@ -175,29 +185,36 @@ class ScheduleService:
                 revision = await self._wait_for_wake(delay, revision)
         except asyncio.CancelledError:
             raise
+        except ScheduleStoreFaultedError:
+            self._latch_fault()
         except Exception as error:
-            self._faulted = True
-            logger.opt(exception=error).error(
-                "Schedule Service dispatcher failed type={}",
-                type(error).__name__,
-            )
+            self._latch_fault()
+            if not self._dispatcher_error_logged:
+                self._dispatcher_error_logged = True
+                logger.error(
+                    "Schedule Service dispatcher failed type={}",
+                    type(error).__name__,
+                )
 
     def _reserve(self, job: ScheduleJob) -> None:
+        if self._faulted:
+            return
         if job.job_id in self._active_job_ids:
             if self._consume_recurring_occurrence(job):
-                logger.warning(
-                    "Schedule Job occurrence skipped while active job_id={} kind={}",
-                    job.job_id,
-                    job.schedule.kind,
-                )
+                with logger.contextualize(session_id=job.session_id):
+                    logger.warning(
+                        "Schedule Job occurrence skipped while active job_id={} kind={}",
+                        job.job_id,
+                        job.schedule.kind,
+                    )
             return
         if job.job_id in self._consumed_at_jobs:
             return
         self._consume_recurring_occurrence(job)
-        self._active_job_ids.add(job.job_id)
         if job.schedule.kind == "at":
             self._consumed_at_jobs.add(job.job_id)
         task = asyncio.create_task(self._run_job(job))
+        self._active_job_ids.add(job.job_id)
         self._run_tasks.add(task)
         task.add_done_callback(self._run_finished)
 
@@ -320,13 +337,14 @@ class ScheduleService:
         sleep_task = asyncio.create_task(self._clock.sleep(min(60.0, max(0.0, delay))))
         change_task = asyncio.create_task(self._store.wait_for_change(revision))
         close_task = asyncio.create_task(self._closing.wait())
-        tasks = (sleep_task, change_task, close_task)
+        fault_task = asyncio.create_task(self._faulted_event.wait())
+        tasks = (sleep_task, change_task, close_task, fault_task)
         try:
             done, _ = await asyncio.wait(
                 tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if close_task in done:
+            if close_task in done or fault_task in done:
                 return revision
             if change_task in done:
                 return change_task.result()
@@ -341,24 +359,23 @@ class ScheduleService:
         session: Session | None = None
         terminal: Literal["ok", "error"] | None = None
         terminal_error: str | None = None
+        terminal_code: str | None = None
         payloads: AsyncIterator[object] | None = None
-        correlation: AbstractContextManager[None] = nullcontext()
-        try:
+        with session_log(self._workspace_state, job.session_id):
             try:
-                session = Session.load(
-                    self._workspace_state,
-                    job.session_id,
-                    partition=SessionStoragePartition.SCHEDULE,
-                    now=self._clock.now,
-                )
-            except FileNotFoundError:
-                session = Session.create_schedule(
-                    self._workspace_state,
-                    job.job_id,
-                    now=self._clock.now,
-                )
-            correlation = session_log(session)
-            with correlation:
+                try:
+                    session = Session.load(
+                        self._workspace_state,
+                        job.session_id,
+                        partition=SessionStoragePartition.SCHEDULE,
+                        now=self._clock.now,
+                    )
+                except FileNotFoundError:
+                    session = Session.create_schedule(
+                        self._workspace_state,
+                        job.job_id,
+                        now=self._clock.now,
+                    )
                 payloads = self._agent_run.run_agent(
                     session,
                     job.message,
@@ -369,40 +386,55 @@ class ScheduleService:
                     if isinstance(payload, AgentRunCompletedPayload):
                         terminal = "ok"
                         terminal_error = None
+                        terminal_code = None
                     elif isinstance(payload, AgentRunFailedPayload):
                         terminal = "error"
                         terminal_error = payload.error.message
+                        terminal_code = payload.error.code
                     elif isinstance(payload, AgentRunCancelledPayload):
                         return
                 if terminal is None:
                     terminal = "error"
                     terminal_error = "Schedule Job execution failed."
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            terminal = "error"
-            terminal_error = "Schedule Job execution failed."
-            logger.opt(exception=error).error(
-                "Schedule Job execution failed job_id={} type={}",
-                job.job_id,
-                type(error).__name__,
-            )
-        finally:
-            await _close_payloads(payloads)
-            if session is not None:
-                try:
-                    session.close()
-                except Exception as error:
-                    logger.opt(exception=error).error(
-                        "Schedule Session close failed job_id={} type={}",
+                    logger.error(
+                        "Schedule Job execution failed job_id={} kind={} type={}",
                         job.job_id,
-                        type(error).__name__,
+                        job.schedule.kind,
+                        "MissingTerminalPayload",
                     )
-            try:
-                if terminal is not None:
-                    await self._commit_terminal(job, terminal, terminal_error)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                terminal = "error"
+                terminal_error = "Schedule Job execution failed."
+                logger.error(
+                    "Schedule Job execution failed job_id={} type={}",
+                    job.job_id,
+                    type(error).__name__,
+                )
             finally:
-                self._active_job_ids.discard(job.job_id)
+                await _close_payloads(payloads)
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception as error:
+                        logger.error(
+                            "Schedule Session close failed job_id={} type={}",
+                            job.job_id,
+                            type(error).__name__,
+                        )
+                try:
+                    if terminal is not None:
+                        if terminal_code is not None:
+                            logger.warning(
+                                "Schedule Job failed job_id={} kind={} code={}",
+                                job.job_id,
+                                job.schedule.kind,
+                                terminal_code,
+                            )
+                        await self._commit_terminal(job, terminal, terminal_error)
+                finally:
+                    self._active_job_ids.discard(job.job_id)
 
     async def _commit_terminal(
         self,
@@ -424,6 +456,7 @@ class ScheduleService:
             if job.schedule.kind == "at"
             else self._store.commit_terminal(
                 job.job_id,
+                expected=job,
                 finished_at_ms=finished_at_ms,
                 status=terminal,
                 error=error,
@@ -431,38 +464,43 @@ class ScheduleService:
             )
         )
         cancellation: asyncio.CancelledError | None = None
+        failure: BaseException | None = None
         while not operation.done():
             try:
                 await asyncio.shield(operation)
             except asyncio.CancelledError as caught:
                 cancellation = caught
-        try:
-            await operation
-        except Exception as failure:
-            self._faulted = True
-            logger.opt(exception=failure).error(
-                "Schedule terminal update failed job_id={} kind={} outcome={}",
-                job.job_id,
-                job.schedule.kind,
-                terminal,
-            )
-        else:
-            if terminal == "error":
-                logger.warning(
-                    "Schedule Job failed job_id={} kind={} error={}",
+            except BaseException as caught:
+                failure = caught
+                break
+        if failure is None:
+            try:
+                await operation
+            except asyncio.CancelledError as caught:
+                if cancellation is None:
+                    cancellation = caught
+            except BaseException as caught:
+                failure = caught
+        if failure is not None and not isinstance(failure, asyncio.CancelledError):
+            self._latch_fault()
+            if not self._terminal_store_error_logged:
+                self._terminal_store_error_logged = True
+                logger.error(
+                    "Schedule terminal update failed job_id={} kind={} outcome={} type={}",
                     job.job_id,
                     job.schedule.kind,
-                    error or "Schedule Job execution failed.",
+                    terminal,
+                    type(failure).__name__,
                 )
         if cancellation is not None:
             raise cancellation
 
     async def _remove_at_job(self, job: ScheduleJob) -> None:
         remove_job = getattr(self._store, "remove_job", None)
-        if job.source == "system" and callable(remove_job):
-            await remove_job(job.job_id)
+        if callable(remove_job):
+            await remove_job(job.job_id, expected=job)
             return
-        await self._store.remove_user_job(job.job_id)
+        await self._store.remove_user_job(job.job_id, expected=job)
 
     def _run_finished(self, task: asyncio.Task[None]) -> None:
         self._run_tasks.discard(task)
@@ -471,11 +509,15 @@ class ScheduleService:
         try:
             task.result()
         except Exception as error:
-            self._faulted = True
-            logger.opt(exception=error).error(
+            self._latch_fault()
+            logger.error(
                 "Schedule Job task failed type={}",
                 type(error).__name__,
             )
+
+    def _latch_fault(self) -> None:
+        self._faulted = True
+        self._faulted_event.set()
 
 
 @dataclass(frozen=True, slots=True)
