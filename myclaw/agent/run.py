@@ -28,17 +28,18 @@ from myclaw.provider.models import (
     UserModelMessage,
 )
 from myclaw.session.session import Session
-from myclaw.tools.confirmation import (
+from myclaw.tools.base import OpenAIToolSchema
+from myclaw.tools.tool_gateway import (
     ConfirmationRequest,
     ConfirmationRequester,
-    ToolConfirmationChannel,
+    ModelToolCall,
+    ToolGateway,
+    ToolResult,
+    ToolResultStatus,
 )
-from myclaw.tools.models import ModelToolCall, ToolResult, ToolResultStatus
-from myclaw.tools.schema import OpenAIToolSchema
-from myclaw.tools.tool_gateway import ToolGateway
 
 type AgentRunRoute = Literal["chat", "schedule"]
-type ConfirmationChannel = ToolConfirmationChannel | ConfirmationRequester
+type ConfirmationChannel = ConfirmationRequester
 type ToolResultExternalizer = Callable[[ToolResult], ToolResult]
 
 

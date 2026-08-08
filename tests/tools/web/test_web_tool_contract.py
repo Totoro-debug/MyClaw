@@ -4,8 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.tools.web.web_fetch import WebFetchRejected, WebFetchTool
 from myclaw.tools.web.web_search import WebSearchResult, WebSearchTool
 from tests.fixtures.diagnostic_capture import capture_diagnostics

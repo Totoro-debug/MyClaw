@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from myclaw.agent.workspace import Workspace
-from myclaw.tools.errors import ToolError
+from myclaw.tools.base import ToolError
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 

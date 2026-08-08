@@ -9,7 +9,7 @@ from uuid import UUID
 
 from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ModelUsage
-from myclaw.tools.models import ToolResultStatus
+from myclaw.tools.tool_gateway import ToolResultStatus
 from myclaw.utils.json_types import JsonObject
 from myclaw.utils.validation import require_aware_datetime, require_nonnegative_int, require_uuid4
 

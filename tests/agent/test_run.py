@@ -29,16 +29,15 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.session.session import Session
-from myclaw.tools.base import BaseTool
-from myclaw.tools.confirmation import (
+from myclaw.tools.base import BaseTool, OpenAIToolSchema
+from myclaw.tools.tool_gateway import (
     ConfirmationChannel,
     ConfirmationDecision,
     ConfirmationPrompt,
     ConfirmationRequest,
+    ModelToolCall,
+    ToolGateway,
 )
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.schema import OpenAIToolSchema
-from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import FakeTool, ScriptedFakeProvider, StreamScript
 
 NOW = datetime(2026, 7, 18, 18, 30, 12, 123456, tzinfo=timezone(timedelta(hours=8)))
@@ -68,7 +67,7 @@ class _ConfirmingTool(BaseTool):
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def confirmation_request(self, *, action: str) -> ConfirmationPrompt:
+    async def confirmation_request(self, *, action: str) -> ConfirmationPrompt:
         return ConfirmationPrompt(
             summary=f"Run {action}",
             details={"action": action},
@@ -133,7 +132,7 @@ class _BlockingConfirmationChannel(ConfirmationChannel):
         self.cancelled = asyncio.Event()
         self._release = asyncio.Event()
 
-    async def request_confirmation(
+    async def __call__(
         self,
         request: ConfirmationRequest,
     ) -> ConfirmationDecision:

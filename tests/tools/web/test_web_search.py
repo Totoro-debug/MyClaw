@@ -21,15 +21,14 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.tools.web.web_search import (
     AsyncioDuckDuckGoSearchProcessSpawner,
     DuckDuckGoSearchBoundary,
     WebSearchResult,
     WebSearchTool,
 )
-from myclaw.tools.web.web_search_worker import main as run_web_search_worker
+from myclaw.tools.web.web_search import main as run_web_search_worker
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
@@ -126,7 +125,7 @@ def test_duckduckgo_worker_writes_non_ascii_results_as_utf8_bytes(
 
     output = ByteOutput()
     monkeypatch.setattr("myclaw.tools.web.web_search.DDGS", FakeDuckDuckGo)
-    monkeypatch.setattr("myclaw.tools.web.web_search_worker.sys.stdout", output)
+    monkeypatch.setattr("myclaw.tools.web.web_search.sys.stdout", output)
 
     assert run_web_search_worker(["运行时资源", "1"]) == 0
     assert json.loads(output.buffer.getvalue().decode("utf-8")) == [

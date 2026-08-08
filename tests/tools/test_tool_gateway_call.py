@@ -7,11 +7,8 @@ from typing import Annotated, cast
 
 import pytest
 
-from myclaw.tools.base import BaseTool
-from myclaw.tools.errors import ToolError
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.schema import OpenAIToolSchema, ToolParam
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.base import BaseTool, OpenAIToolSchema, ToolError, ToolParam
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 

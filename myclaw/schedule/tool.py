@@ -19,10 +19,8 @@ from myclaw.schedule.store import (
     ScheduleStaleRemovalError,
     ScheduleStore,
 )
-from myclaw.tools.base import BaseTool
-from myclaw.tools.confirmation import ConfirmationPrompt
-from myclaw.tools.errors import ToolError
-from myclaw.tools.schema import ToolParam
+from myclaw.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.tools.tool_gateway import ConfirmationPrompt
 from myclaw.utils.json_types import JsonObject
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_uuid4_string

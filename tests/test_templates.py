@@ -18,7 +18,7 @@ from myclaw.agent.prompts import (
 )
 from myclaw.memory.records import SummaryEntry
 from myclaw.templates import load_template, render_template
-from myclaw.tools.schema import OpenAIToolSchema
+from myclaw.tools.base import OpenAIToolSchema
 
 TEMPLATE_NAMES = {
     "builtin-identity.md",

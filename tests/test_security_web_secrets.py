@@ -8,8 +8,7 @@ import pytest
 
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.tools.web.web_fetch import (
     HTTPResponseBoundary,
     PublicWebFetchBoundary,

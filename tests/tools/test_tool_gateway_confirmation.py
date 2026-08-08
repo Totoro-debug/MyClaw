@@ -8,18 +8,17 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent.run import model_message_from_session
-from myclaw.tools.base import BaseTool
-from myclaw.tools.confirmation import (
+from myclaw.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.tools.tool_gateway import (
     ConfirmationChannel,
     ConfirmationDecision,
     ConfirmationPrompt,
     ConfirmationRequest,
+    ModelToolCall,
     ToolConfirmationMetadata,
+    ToolGateway,
+    ToolResult,
 )
-from myclaw.tools.errors import ToolError
-from myclaw.tools.models import ModelToolCall, ToolResult
-from myclaw.tools.schema import ToolParam
-from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.json_types import JsonObject
 
 TURN_ID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -67,7 +66,7 @@ class _ConfirmingTool(BaseTool):
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def confirmation_request(self, *, action: str) -> ConfirmationPrompt:
+    async def confirmation_request(self, *, action: str) -> ConfirmationPrompt:
         return ConfirmationPrompt(
             summary=f"Run {action}",
             details={"action": action, "nested": {"safe": True}},
@@ -236,7 +235,7 @@ async def test_protocol_order_confirms_once_before_all_execution_attempts() -> N
         def refusal_reason(self, *, count: int) -> None:
             events.append(f"refusal:{count}")
 
-        def confirmation_request(self, *, count: int) -> ConfirmationPrompt:
+        async def confirmation_request(self, *, count: int) -> ConfirmationPrompt:
             events.append(f"confirmation:{count}")
             return ConfirmationPrompt(summary="Run ordered retry", details={"count": count})
 
@@ -301,9 +300,7 @@ async def test_cancellation_after_approval_waits_for_execution_and_returns_resul
     tool = _BlockingConfirmingTool()
     channel = ConfirmationChannel(TURN_ID)
     gateway = _gateway(tool, channel=channel)
-    task = asyncio.create_task(
-        gateway.call(_call('{"action":"commit"}', name="blocking_confirm"))
-    )
+    task = asyncio.create_task(gateway.call(_call('{"action":"commit"}', name="blocking_confirm")))
     request = await channel.next_request()
     channel.respond_to_confirmation(request.confirmation_id, "approved")
     await tool.started.wait()
@@ -353,7 +350,7 @@ async def test_confirmation_channel_rejects_wrong_binding_late_and_duplicate_res
         details={},
     )
     with pytest.raises(ValueError, match="another turn"):
-        await channel.request_confirmation(wrong_turn_request)
+        await channel(wrong_turn_request)
 
     gateway = _gateway(tool, channel=channel)
     task = asyncio.create_task(gateway.call(_call('{"action":"bound"}')))
@@ -379,7 +376,7 @@ async def test_cancelled_requests_are_not_delivered_and_close_wakes_the_host() -
         summary="Cancelled request",
         details={},
     )
-    pending = asyncio.create_task(channel.request_confirmation(request))
+    pending = asyncio.create_task(channel(request))
     await asyncio.sleep(0)
 
     pending.cancel()

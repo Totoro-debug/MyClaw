@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from typing import ClassVar, Literal, Protocol
 from uuid import UUID
 
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.schema import OpenAIToolSchema
+from myclaw.tools.base import OpenAIToolSchema
+from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.validation import require_nonnegative_int, require_uuid4
 
 type ModelRoute = Literal["default", "chat", "memory", "schedule"]

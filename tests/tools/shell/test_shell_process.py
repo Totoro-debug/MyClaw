@@ -22,19 +22,19 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
-from myclaw.tools.models import ModelToolCall
 from myclaw.tools.shell.owned_process import (
     OwnedProcess,
+    WindowsJob,
     WindowsOwnedProcessSpawner,
     default_owned_process_spawner,
 )
-from myclaw.tools.shell.shell_policy import ShellPolicyDenied, ShellRequest
-from myclaw.tools.shell.shell_process import (
+from myclaw.tools.shell.shell_tool import (
+    ShellPolicyDenied,
+    ShellRequest,
+    ShellTool,
     SubprocessShellBoundary,
 )
-from myclaw.tools.shell.shell_tool import ShellTool
-from myclaw.tools.shell.windows_job import WindowsJob
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 
@@ -92,11 +92,15 @@ async def test_windows_process_spawner_executes_argv_directly_and_assigns_the_jo
 
 
 def _windows_kernel32() -> ctypes.CDLL:
-    return ctypes.WinDLL("kernel32", use_last_error=True)
+    return cast(
+        ctypes.CDLL,
+        # WinDLL is absent from non-Windows type stubs.
+        getattr(ctypes, "WinDLL")("kernel32", use_last_error=True),  # noqa: B009
+    )
 
 
 def _windows_last_error() -> int:
-    return ctypes.get_last_error()
+    return cast(int, getattr(ctypes, "get_last_error")())  # noqa: B009
 
 
 def _windows_process_exists(pid: int) -> bool:

@@ -18,8 +18,7 @@ from myclaw.provider.models import (
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.session import Session
 from myclaw.tools.files.file_tools import EditFileTool, WriteFileTool
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=timezone(timedelta(hours=8)))

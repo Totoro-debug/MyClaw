@@ -12,10 +12,9 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import AssistantModelMessage
 from myclaw.session.session import Session
 from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
-from myclaw.tools.models import ModelToolCall, ToolResult
 from myclaw.tools.security import Security
 from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResult
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 SESSION_ID = "20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"

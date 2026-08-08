@@ -1,64 +1,129 @@
-"""Nominal base class for annotation-driven Tool capabilities."""
+"""Annotation-driven Tool declarations."""
 
 from __future__ import annotations
 
 import inspect
-from typing import ClassVar, final, get_type_hints
+from dataclasses import dataclass
+from types import NoneType, UnionType
+from typing import Annotated, ClassVar, Literal, TypedDict, Union, cast, final, get_args, get_origin
 
-from myclaw.tools.schema import OpenAIToolSchema, ToolSchema
-from myclaw.utils.json_types import JsonObject
+from myclaw.utils.json_types import JsonObject, JsonScalar
+
+_METADATA_NAMES = frozenset({"name", "description", "required", "max_retries"})
+_JSON_TYPES: dict[object, str] = {str: "string", int: "integer", bool: "boolean"}
+_CLASS_VAR_ORIGIN: object = ClassVar
+
+
+class OpenAIFunctionSchema(TypedDict):
+    """The function member of an OpenAI Function Calling Tool schema."""
+
+    name: str
+    description: str
+    parameters: JsonObject
+
+
+class OpenAIToolSchema(TypedDict):
+    """An OpenAI Function Calling schema."""
+
+    type: Literal["function"]
+    function: OpenAIFunctionSchema
+
+
+@dataclass(frozen=True, slots=True)
+class ToolParam:
+    """Optional JSON Schema metadata for one Tool parameter."""
+
+    description: str | None = None
+    min_length: int | None = None
+    max_length: int | None = None
+    minimum: int | None = None
+    maximum: int | None = None
+    format: str | None = None
+
+
+class ToolError(Exception):
+    """An expected Tool failure whose message is safe to return to the model."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
 
 
 class BaseTool:
-    """Generate one Tool schema and enforce the concrete execution shape."""
+    """Declare one annotation-driven Tool capability."""
 
     name: ClassVar[str]
     description: ClassVar[str]
     required: ClassVar[tuple[str, ...]] = ()
     max_retries: ClassVar[int] = 0
 
-    def __init_subclass__(cls, **kwargs: object) -> None:
-        super().__init_subclass__(**kwargs)
-        if "to_schema" in cls.__dict__:
-            msg = "Concrete Tools cannot override BaseTool.to_schema()"
-            raise TypeError(msg)
-        retries = getattr(cls, "max_retries", 0)
-        if isinstance(retries, bool) or not isinstance(retries, int) or not 0 <= retries <= 5:
-            msg = "Tool max_retries must be an integer from zero through five"
-            raise TypeError(msg)
-        execute = cls.__dict__.get("execute")
-        if execute is None or not inspect.iscoroutinefunction(execute):
-            msg = "Concrete Tool execute() must be asynchronous"
-            raise TypeError(msg)
-        parameters = tuple(inspect.signature(execute).parameters.values())
-        if (
-            not parameters
-            or parameters[0].name != "self"
-            or parameters[0].kind
-            not in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
-            or any(
-                parameter.kind is not inspect.Parameter.KEYWORD_ONLY for parameter in parameters[1:]
-            )
-        ):
-            msg = "Concrete Tool execute() must accept only self and keyword parameters"
-            raise TypeError(msg)
-        try:
-            return_annotation = get_type_hints(execute).get("return")
-        except (NameError, TypeError) as exc:
-            msg = "Concrete Tool execute() return annotation could not be resolved"
-            raise TypeError(msg) from exc
-        if return_annotation is not str:
-            msg = "Concrete Tool execute() must declare a string return"
-            raise TypeError(msg)
-
     def prepare(self, arguments: JsonObject) -> JsonObject:
-        """Select the effective declared arguments before coercion and validation."""
+        """Select the declared arguments used by this invocation."""
         return arguments
 
     def confirmation_finished(self) -> None:
-        """Release invocation-local state after confirmation reaches a terminal path."""
+        """Release invocation-local confirmation state."""
 
     @final
     def to_schema(self) -> OpenAIToolSchema:
         """Generate a detached OpenAI Function Calling schema."""
-        return ToolSchema.from_tool(type(self)).to_openai()
+        tool_type = type(self)
+        properties: JsonObject = {}
+        for name, annotation in inspect.get_annotations(tool_type, eval_str=True).items():
+            if (
+                name.startswith("_")
+                or name in _METADATA_NAMES
+                or get_origin(annotation) is _CLASS_VAR_ORIGIN
+            ):
+                continue
+            schema = _parameter_schema(name, annotation)
+            if name in tool_type.__dict__:
+                schema["default"] = cast(JsonScalar, tool_type.__dict__[name])
+            properties[name] = schema
+        return {
+            "type": "function",
+            "function": {
+                "name": tool_type.name,
+                "description": tool_type.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": list(tool_type.required),
+                },
+            },
+        }
+
+
+def _parameter_schema(name: str, annotation: object) -> JsonObject:
+    metadata = ToolParam()
+    if get_origin(annotation) is Annotated:
+        annotation, *extras = get_args(annotation)
+        metadata = next((item for item in extras if isinstance(item, ToolParam)), metadata)
+
+    nullable = False
+    if get_origin(annotation) in {Union, UnionType}:
+        members = get_args(annotation)
+        non_none = tuple(member for member in members if member is not NoneType)
+        if len(members) != 2 or len(non_none) != 1:
+            raise TypeError(f"Tool parameter {name} has an unsupported union")
+        annotation = non_none[0]
+        nullable = True
+
+    try:
+        json_type = _JSON_TYPES[annotation]
+    except (KeyError, TypeError) as error:
+        raise TypeError(f"Tool parameter {name} has an unsupported annotation") from error
+
+    schema: JsonObject = {"type": [json_type, "null"] if nullable else json_type}
+    for field, key in (
+        ("description", "description"),
+        ("min_length", "minLength"),
+        ("max_length", "maxLength"),
+        ("minimum", "minimum"),
+        ("maximum", "maximum"),
+        ("format", "format"),
+    ):
+        value = getattr(metadata, field)
+        if value is not None:
+            schema[key] = value
+    return schema

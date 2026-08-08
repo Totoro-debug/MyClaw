@@ -12,7 +12,7 @@ from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 if TYPE_CHECKING:
-    from myclaw.tools.schema import OpenAIToolSchema
+    from myclaw.tools.base import OpenAIToolSchema
 
 
 def current_user_input(*, content: str, current_time: datetime, session_id: str) -> str:

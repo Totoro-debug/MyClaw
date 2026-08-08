@@ -15,11 +15,9 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.shell import shell_policy
-from myclaw.tools.shell.shell_policy import ShellRequest
-from myclaw.tools.shell.shell_tool import ShellTool
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.shell import shell_tool
+from myclaw.tools.shell.shell_tool import ShellRequest, ShellTool
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.utils.host_filesystem import (
     POSIX_HOST_FILESYSTEM,
     WINDOWS_HOST_FILESYSTEM,
@@ -59,7 +57,7 @@ def test_git_capture_accepts_only_the_host_native_executable_name(
 ) -> None:
     executable = tmp_path / filename
     executable.write_bytes(b"trusted executable")
-    captured = shell_policy._capture_git_executable(
+    captured = shell_tool._capture_git_executable(
         discover=lambda _: str(executable),
         host_filesystem=host_filesystem,
     )

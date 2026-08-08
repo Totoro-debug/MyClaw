@@ -23,9 +23,7 @@ from myclaw.provider.models import (
     ToolModelMessage,
     UserModelMessage,
 )
-from myclaw.tools.base import BaseTool
-from myclaw.tools.errors import ToolError
-from myclaw.tools.schema import ToolParam
+from myclaw.tools.base import BaseTool, ToolError, ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.validation import require_nonnegative_int

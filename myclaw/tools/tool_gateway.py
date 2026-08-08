@@ -1,38 +1,226 @@
-"""Tool Gateway for registered capabilities and normalized results."""
+"""The only public Tool invocation seam."""
+
+from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import math
 import re
 from collections.abc import Awaitable, Callable
 from copy import copy, deepcopy
-from typing import cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID, uuid4
 
 from jsonschema import Draft202012Validator, FormatChecker
 from loguru import logger
 
-from myclaw.tools.base import BaseTool
-from myclaw.tools.confirmation import (
-    ConfirmationDecision,
-    ConfirmationPrompt,
-    ConfirmationRequest,
-    ConfirmationRequester,
-    ToolConfirmationChannel,
-    ToolConfirmationMetadata,
-)
-from myclaw.tools.errors import ToolError
-from myclaw.tools.models import ModelToolCall, ToolResult
-from myclaw.tools.schema import OpenAIToolSchema
+from myclaw.tools.base import BaseTool, OpenAIToolSchema, ToolError
 from myclaw.utils.json_types import JsonObject, JsonScalar, JsonValue
 from myclaw.utils.validation import require_uuid4
 
+if TYPE_CHECKING:
+    from myclaw.tools.tool_artifacts import ArtifactReference
+
 type Sleep = Callable[[float], Awaitable[None]]
-type Confirmation = ToolConfirmationChannel | ConfirmationRequester
-type ConfirmationObserver = Callable[[ConfirmationRequest], Awaitable[None] | None]
+type ConfirmationDecision = Literal["approved", "declined"]
+type ConfirmationOutcome = ConfirmationDecision | None
+type ToolResultStatus = Literal["success", "error", "refused"]
 
 _DECIMAL_INTEGER = re.compile(r"^[+-]?[0-9]+$")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmationPrompt:
+    """The normalized operation description supplied by a concrete Tool."""
+
+    summary: str
+    details: JsonObject
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.summary or len(self.summary) > 240:
+            raise ValueError("confirmation summary must contain 1 through 240 characters")
+        object.__setattr__(self, "details", deepcopy(self.details))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "summary": self.summary,
+            "details": deepcopy(self.details),
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ConfirmationRequest:
+    """One confirmation request bound to an Agent Run Tool call."""
+
+    confirmation_id: UUID
+    turn_id: UUID
+    tool_call_id: str
+    tool_name: str
+    summary: str
+    _details: JsonObject = field(repr=False)
+    warnings: tuple[str, ...] = ()
+
+    def __init__(
+        self,
+        confirmation_id: UUID,
+        turn_id: UUID,
+        tool_call_id: str,
+        tool_name: str,
+        summary: str,
+        details: JsonObject,
+        warnings: tuple[str, ...] = (),
+    ) -> None:
+        require_uuid4(confirmation_id, field="confirmation_id")
+        require_uuid4(turn_id, field="turn_id")
+        object.__setattr__(self, "confirmation_id", confirmation_id)
+        object.__setattr__(self, "turn_id", turn_id)
+        object.__setattr__(self, "tool_call_id", tool_call_id)
+        object.__setattr__(self, "tool_name", tool_name)
+        object.__setattr__(self, "summary", summary)
+        object.__setattr__(self, "_details", deepcopy(details))
+        object.__setattr__(self, "warnings", tuple(warnings))
+
+    @property
+    def details(self) -> JsonObject:
+        return deepcopy(self._details)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "confirmation_id": str(self.confirmation_id),
+            "turn_id": str(self.turn_id),
+            "tool_call_id": self.tool_call_id,
+            "tool_name": self.tool_name,
+            "summary": self.summary,
+            "details": deepcopy(self._details),
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ToolConfirmationMetadata:
+    """The request and decision carried by a Tool Result."""
+
+    request: ConfirmationRequest
+    decision: ConfirmationOutcome
+
+    def to_dict(self) -> dict[str, object]:
+        return {"request": self.request.to_dict(), "decision": self.decision}
+
+
+@dataclass(frozen=True, slots=True)
+class ModelToolCall:
+    """A provider Tool call preserving its raw JSON argument text."""
+
+    id: str
+    name: str
+    arguments: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {"id": self.id, "name": self.name, "arguments": self.arguments}
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResult:
+    """The normalized result returned by the Tool Gateway."""
+
+    tool_call_id: str
+    name: str
+    status: ToolResultStatus
+    content: str
+    artifact: ArtifactReference | None
+    confirmation: ToolConfirmationMetadata | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "tool_call_id": self.tool_call_id,
+            "name": self.name,
+            "status": self.status,
+            "content": self.content,
+            "artifact": None if self.artifact is None else self.artifact.to_dict(),
+        }
+        if self.confirmation is not None:
+            result["confirmation"] = self.confirmation.to_dict()
+        return result
+
+
+type ConfirmationRequester = Callable[[ConfirmationRequest], Awaitable[ConfirmationDecision]]
+type ConfirmationObserver = Callable[[ConfirmationRequest], None]
+
+
+class ConfirmationChannel:
+    """In-memory interactive channel bound to one Agent Run."""
+
+    def __init__(self, turn_id: UUID) -> None:
+        require_uuid4(turn_id, field="turn_id")
+        self._turn_id = turn_id
+        self._requests: asyncio.Queue[ConfirmationRequest | None] = asyncio.Queue()
+        self._pending: dict[UUID, asyncio.Future[ConfirmationDecision]] = {}
+        self._consumed: set[UUID] = set()
+        self._closed = False
+
+    @property
+    def turn_id(self) -> UUID:
+        return self._turn_id
+
+    async def __call__(self, request: ConfirmationRequest) -> ConfirmationDecision:
+        if self._closed:
+            raise RuntimeError("Confirmation channel is closed")
+        if request.turn_id != self._turn_id:
+            raise ValueError("Confirmation request belongs to another turn")
+        if request.confirmation_id in self._pending or request.confirmation_id in self._consumed:
+            raise ValueError("Confirmation request is already pending or consumed")
+
+        future: asyncio.Future[ConfirmationDecision] = asyncio.get_running_loop().create_future()
+        self._pending[request.confirmation_id] = future
+        await self._requests.put(request)
+        try:
+            try:
+                return await future
+            except asyncio.CancelledError:
+                if future.cancelled() or future.result() != "approved":
+                    raise
+                return "approved"
+        finally:
+            self._pending.pop(request.confirmation_id, None)
+            self._consumed.add(request.confirmation_id)
+
+    async def next_request(self) -> ConfirmationRequest:
+        """Return the next live request for the interactive host."""
+        while True:
+            if self._closed:
+                raise RuntimeError("Confirmation channel is closed")
+            request = await self._requests.get()
+            if request is None:
+                self._requests.put_nowait(None)
+                raise RuntimeError("Confirmation channel is closed")
+            future = self._pending.get(request.confirmation_id)
+            if future is not None and not future.done():
+                return request
+
+    def respond_to_confirmation(
+        self,
+        confirmation_id: UUID,
+        decision: ConfirmationDecision,
+    ) -> None:
+        if decision not in {"approved", "declined"}:
+            raise ValueError("confirmation decision must be approved or declined")
+        future = self._pending.get(confirmation_id)
+        if future is None or future.done():
+            raise ValueError("Confirmation response is late or unknown")
+        future.set_result(decision)
+
+    def close(self) -> None:
+        """Invalidate all pending requests without producing a decision."""
+        if self._closed:
+            return
+        self._closed = True
+        for future in self._pending.values():
+            future.cancel()
+        self._requests.put_nowait(None)
 
 
 class ToolGateway:
@@ -44,14 +232,11 @@ class ToolGateway:
         sleep: Sleep = asyncio.sleep,
         owns_terminal_failures: bool = True,
         on_terminal_failure: Callable[[Exception], None] | None = None,
-        confirmation: Confirmation | None = None,
-        confirmation_channel: Confirmation | None = None,
+        confirmation: ConfirmationRequester | None = None,
         turn_id: UUID | None = None,
         new_uuid: Callable[[], UUID] = uuid4,
         on_confirmation_requested: ConfirmationObserver | None = None,
     ) -> None:
-        if confirmation is not None and confirmation_channel is not None:
-            raise ValueError("Provide only one confirmation channel")
         if turn_id is not None:
             require_uuid4(turn_id, field="turn_id")
         self._registered = False
@@ -61,7 +246,7 @@ class ToolGateway:
         self._sleep = sleep
         self._owns_terminal_failures = owns_terminal_failures
         self._on_terminal_failure = on_terminal_failure
-        self._confirmation = confirmation if confirmation is not None else confirmation_channel
+        self._confirmation = confirmation
         self._turn_id = turn_id
         self._new_uuid = new_uuid
         self._on_confirmation_requested = on_confirmation_requested
@@ -77,10 +262,8 @@ class ToolGateway:
             for tool, schema in zip(tools, schemas, strict=True)
         }
         self._tools = {tool.name: tool for tool in tools}
-        self._schemas = tuple(deepcopy(schema) for schema in schemas)
-        self._parameter_schemas = {
-            name: deepcopy(schema) for name, schema in parameter_schemas.items()
-        }
+        self._schemas = schemas
+        self._parameter_schemas = parameter_schemas
         self._registered = True
 
     @property
@@ -91,9 +274,9 @@ class ToolGateway:
     def for_run(
         self,
         *,
-        confirmation: Confirmation | None,
+        confirmation: ConfirmationRequester | None,
         on_confirmation_requested: ConfirmationObserver | None = None,
-    ) -> "ToolGateway":
+    ) -> ToolGateway:
         """Bind a detached Gateway view to one Agent Run."""
         bound = copy(self)
         bound._confirmation = confirmation
@@ -101,76 +284,58 @@ class ToolGateway:
         if isinstance(channel_turn_id, UUID):
             bound._turn_id = channel_turn_id
         bound._on_confirmation_requested = on_confirmation_requested
-        bound._schemas = tuple(deepcopy(schema) for schema in self._schemas)
-        bound._parameter_schemas = deepcopy(self._parameter_schemas)
         return bound
 
     async def call(self, tool_call: ModelToolCall) -> ToolResult:
         """Parse, prepare, refuse, execute, and normalize one Tool call."""
         raw_arguments = tool_call.arguments
         if not isinstance(raw_arguments, str):
-            return _error_result(tool_call, message="Tool arguments could not be parsed.")
+            return _result(tool_call, "error", "Tool arguments could not be parsed.")
         try:
             parsed = json.loads(raw_arguments)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return _error_result(tool_call, message="Tool arguments could not be parsed.")
+        except json.JSONDecodeError:
+            return _result(tool_call, "error", "Tool arguments could not be parsed.")
         if not isinstance(parsed, dict):
-            return _error_result(tool_call, message="Tool arguments could not be parsed.")
+            return _result(tool_call, "error", "Tool arguments could not be parsed.")
 
         tool, normalized, correct = self._prepare(tool_call.name, parsed)
         if tool is None:
-            return _error_result(tool_call, message="The requested tool is not available.")
+            return _result(tool_call, "error", "The requested tool is not available.")
         if not correct:
-            return _error_result(
-                tool_call,
-                message=f"Invalid arguments for {tool_call.name}.",
-            )
+            return _result(tool_call, "error", f"Invalid arguments for {tool_call.name}.")
 
         refusal = getattr(tool, "refusal_reason", None)
         if refusal is not None:
             try:
                 reason = cast(Callable[..., str | None], refusal)(**normalized)
             except Exception as error:
-                message = (
-                    error.message
-                    if isinstance(error, ToolError)
-                    else f"{tool_call.name} could not complete the request."
-                )
-                return _error_result(tool_call, message=message)
+                return _result(tool_call, "error", _error_message(tool_call.name, error))
             if reason is not None:
-                if not isinstance(reason, str):
-                    return _error_result(
-                        tool_call,
-                        message=f"{tool_call.name} could not complete the request.",
-                    )
-                return _refused_result(tool_call, message=reason)
+                return _result(tool_call, "refused", reason)
 
         try:
             prompt = await self._confirmation_prompt(tool, normalized)
         except Exception as error:
             tool.confirmation_finished()
-            message = (
-                error.message
-                if isinstance(error, ToolError)
-                else f"{tool_call.name} could not complete the request."
-            )
-            return _error_result(tool_call, message=message)
+            return _result(tool_call, "error", _error_message(tool_call.name, error))
         if prompt is not None:
             try:
                 request = self._confirmation_request(tool_call, prompt)
                 if self._confirmation is None:
-                    return _refused_result(
+                    return _result(
                         tool_call,
-                        message="Tool confirmation is unavailable.",
+                        "refused",
+                        "Tool confirmation is unavailable.",
                         confirmation=ToolConfirmationMetadata(request=request, decision=None),
                     )
                 await self._notify_confirmation_requested(request)
                 decision = await self._request_confirmation(request)
                 metadata = ToolConfirmationMetadata(request=request, decision=decision)
                 if decision == "declined":
-                    return _refused_result(
+                    return _result(
                         tool_call,
-                        message="Tool confirmation was declined.",
+                        "refused",
+                        "Tool confirmation was declined.",
                         confirmation=metadata,
                     )
                 return await self._execute_after_approval(
@@ -186,11 +351,8 @@ class ToolGateway:
 
     async def _notify_confirmation_requested(self, request: ConfirmationRequest) -> None:
         observer = self._on_confirmation_requested
-        if observer is None:
-            return
-        result = observer(request)
-        if inspect.isawaitable(result):
-            await result
+        if observer is not None:
+            observer(request)
 
     async def _confirmation_prompt(
         self,
@@ -199,15 +361,12 @@ class ToolGateway:
     ) -> ConfirmationPrompt | None:
         provider = getattr(tool, "confirmation_request", None)
         if provider is None:
-            provider = getattr(tool, "confirmation", None)
-        if provider is None:
             return None
-        prompt = cast(Callable[..., object], provider)(**normalized)
-        if inspect.isawaitable(prompt):
-            prompt = await prompt
-        if prompt is not None and not isinstance(prompt, ConfirmationPrompt):
-            raise TypeError("Tool confirmation hook must return a ConfirmationPrompt or None")
-        return prompt
+        request = cast(
+            Callable[..., Awaitable[ConfirmationPrompt | None]],
+            provider,
+        )
+        return await request(**normalized)
 
     def _confirmation_request(
         self,
@@ -237,19 +396,7 @@ class ToolGateway:
         channel = self._confirmation
         if channel is None:
             raise AssertionError("confirmation channel is required")
-        if callable(channel):
-            decision = await channel(request)
-        else:
-            requester = getattr(channel, "request_confirmation", None)
-            if requester is None:
-                requester = getattr(channel, "request", None)
-            if requester is None:
-                raise TypeError("confirmation channel cannot receive a request")
-            receive = cast(
-                Callable[[ConfirmationRequest], Awaitable[ConfirmationDecision]],
-                requester,
-            )
-            decision = await receive(request)
+        decision = await channel(request)
         if decision not in {"approved", "declined"}:
             raise ValueError("confirmation channel returned an invalid decision")
         return decision
@@ -289,11 +436,14 @@ class ToolGateway:
     ) -> ToolResult:
         for attempt in range(tool.max_retries + 1):
             try:
-                execute = cast(Callable[..., Awaitable[object]], type(tool).__dict__["execute"])
-                content = await execute(tool, **deepcopy(normalized))
+                execute = cast(
+                    Callable[..., Awaitable[object]],
+                    object.__getattribute__(tool, "execute"),
+                )
+                content = await execute(**deepcopy(normalized))
                 if not isinstance(content, str):
                     raise _NonStringToolResult
-                return _success_result(tool_call, content, confirmation=confirmation)
+                return _result(tool_call, "success", content, confirmation=confirmation)
             except Exception as error:
                 attempt_number = attempt + 1
                 total_attempts = tool.max_retries + 1
@@ -317,12 +467,12 @@ class ToolGateway:
                     )
                 if self._on_terminal_failure is not None:
                     self._on_terminal_failure(error)
-                message = (
-                    error.message
-                    if isinstance(error, ToolError)
-                    else f"{tool_call.name} could not complete the request."
+                return _result(
+                    tool_call,
+                    "error",
+                    _error_message(tool_call.name, error),
+                    confirmation=confirmation,
                 )
-                return _error_result(tool_call, message=message, confirmation=confirmation)
         raise AssertionError("Tool retry budget exhausted without a terminal result")
 
     def _prepare(
@@ -334,9 +484,7 @@ class ToolGateway:
         if tool is None:
             return None, {}, False
         schema = self._parameter_schemas[name]
-        properties_value = schema.get("properties")
-        if not isinstance(properties_value, dict):
-            raise AssertionError("cached Tool parameter schema has no properties")
+        properties_value = cast(JsonObject, schema["properties"])
         projected = {
             parameter_name: deepcopy(arguments[parameter_name])
             for parameter_name in properties_value
@@ -347,24 +495,17 @@ class ToolGateway:
             effective = tool.prepare(projected)
         except Exception:
             return tool, {}, False
-        if not isinstance(effective, dict) or not all(
-            isinstance(parameter_name, str) for parameter_name in effective
-        ):
-            return tool, {}, False
-        if any(parameter_name not in projected for parameter_name in effective):
-            return tool, {}, False
         normalized: JsonObject = {}
         for parameter_name, parameter_schema_value in properties_value.items():
-            if not isinstance(parameter_schema_value, dict):
-                raise AssertionError("cached Tool parameter declaration is not an object")
+            parameter_schema = cast(JsonObject, parameter_schema_value)
             if parameter_name in effective:
                 value = effective[parameter_name]
-                valid, coerced = _coerce(value, parameter_schema_value)
+                valid, coerced = _coerce(value, parameter_schema)
                 if not valid:
                     return tool, normalized, False
                 normalized[parameter_name] = coerced
-            elif not custom_preparation and "default" in parameter_schema_value:
-                normalized[parameter_name] = deepcopy(parameter_schema_value["default"])
+            elif not custom_preparation and "default" in parameter_schema:
+                normalized[parameter_name] = deepcopy(parameter_schema["default"])
         correct = Draft202012Validator(
             schema,
             format_checker=FormatChecker(),
@@ -372,52 +513,26 @@ class ToolGateway:
         return tool, normalized, correct
 
 
-def _error_result(
+def _result(
     tool_call: ModelToolCall,
-    *,
-    message: str,
-    confirmation: ToolConfirmationMetadata | None = None,
-) -> ToolResult:
-    return ToolResult(
-        tool_call_id=tool_call.id,
-        name=tool_call.name,
-        status="error",
-        content=message,
-        artifact=None,
-        confirmation=confirmation,
-    )
-
-
-def _success_result(
-    tool_call: ModelToolCall,
+    status: ToolResultStatus,
     content: str,
-    *,
     confirmation: ToolConfirmationMetadata | None = None,
 ) -> ToolResult:
     return ToolResult(
         tool_call_id=tool_call.id,
         name=tool_call.name,
-        status="success",
+        status=status,
         content=content,
         artifact=None,
         confirmation=confirmation,
     )
 
 
-def _refused_result(
-    tool_call: ModelToolCall,
-    *,
-    message: str,
-    confirmation: ToolConfirmationMetadata | None = None,
-) -> ToolResult:
-    return ToolResult(
-        tool_call_id=tool_call.id,
-        name=tool_call.name,
-        status="refused",
-        content=message,
-        artifact=None,
-        confirmation=confirmation,
-    )
+def _error_message(tool_name: str, error: Exception) -> str:
+    if isinstance(error, ToolError):
+        return error.message
+    return f"{tool_name} could not complete the request."
 
 
 def _parameter_schema(schema: OpenAIToolSchema) -> JsonObject:
@@ -426,13 +541,7 @@ def _parameter_schema(schema: OpenAIToolSchema) -> JsonObject:
 
 def _coerce(value: JsonValue, schema: JsonObject) -> tuple[bool, JsonScalar]:
     declared = schema.get("type")
-    accepted_types: tuple[str, ...]
-    if isinstance(declared, str):
-        accepted_types = (declared,)
-    elif isinstance(declared, list) and all(isinstance(item, str) for item in declared):
-        accepted_types = tuple(item for item in declared if isinstance(item, str))
-    else:
-        raise AssertionError("generated Tool parameter has an invalid type declaration")
+    accepted_types = (declared,) if isinstance(declared, str) else tuple(cast(list[str], declared))
 
     if value is None:
         return "null" in accepted_types, None

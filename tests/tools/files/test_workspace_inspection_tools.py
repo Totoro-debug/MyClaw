@@ -11,9 +11,8 @@ from myclaw.tools.files.file_tools import (
     SearchFilesTool,
     WriteFileTool,
 )
-from myclaw.tools.models import ModelToolCall
 from myclaw.tools.security import Security
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 SESSION_ID = "20260727-120000-000000_550e8400-e29b-41d4-a716-446655440000"

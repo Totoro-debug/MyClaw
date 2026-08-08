@@ -12,8 +12,8 @@ from myclaw.provider.models import (
     ToolModelMessage,
     UserModelMessage,
 )
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.schema import OpenAIToolSchema
+from myclaw.tools.base import OpenAIToolSchema
+from myclaw.tools.tool_gateway import ModelToolCall
 
 
 def test_model_usage_serializes_to_the_exact_contract_shape() -> None:

@@ -2,7 +2,6 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
 from uuid import UUID
 
 import pytest
@@ -33,13 +32,12 @@ from myclaw.provider.models import (
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.session import Session
 from myclaw.tools.base import BaseTool
-from myclaw.tools.confirmation import (
+from myclaw.tools.tool_gateway import (
     ConfirmationPrompt,
     ConfirmationRequest,
-    ToolConfirmationChannel,
+    ModelToolCall,
+    ToolGateway,
 )
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.tool_gateway import ToolGateway
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 
 NOW = datetime(2026, 8, 7, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
@@ -78,8 +76,7 @@ class _ScriptedAgentRun(AgentRunInterface):
 
         async def payloads() -> AsyncIterator[AgentRunPayload]:
             assert confirmation is not None
-            channel = cast(ToolConfirmationChannel, confirmation)
-            pending = asyncio.create_task(channel.request_confirmation(request))
+            pending = asyncio.ensure_future(confirmation(request))
             await asyncio.sleep(0)
             yield AgentRunStartedPayload()
             yield AgentRunTextDeltaPayload(delta="Working")
@@ -113,7 +110,7 @@ class _ConfirmedTool(BaseTool):
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def confirmation_request(self, *, message: str) -> ConfirmationPrompt:
+    async def confirmation_request(self, *, message: str) -> ConfirmationPrompt:
         return ConfirmationPrompt(summary="Create a Schedule Job", details={"message": message})
 
     async def execute(self, *, message: str) -> str:
@@ -163,9 +160,7 @@ async def test_conversation_port_maps_agent_run_and_accepts_separate_confirmatio
     conversation.respond_to_confirmation(confirmation.payload.confirmation_id, "approved")
 
     assert [event.type async for event in events] == ["tool_completed", "turn_completed"]
-    assert agent_run.calls == [
-        (session, "Add a schedule.", "chat", True, agent_run.calls[0][4])
-    ]
+    assert agent_run.calls == [(session, "Add a schedule.", "chat", True, agent_run.calls[0][4])]
     await events.aclose()
 
 

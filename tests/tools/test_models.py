@@ -1,7 +1,7 @@
 import pytest
 
-from myclaw.tools.artifacts import ArtifactReference
-from myclaw.tools.models import ModelToolCall, ToolResult
+from myclaw.tools.tool_artifacts import ArtifactReference
+from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
 
 SESSION_ID = "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000"
 

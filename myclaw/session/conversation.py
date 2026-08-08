@@ -52,8 +52,7 @@ from myclaw.provider.models import (
     UserModelMessage,
 )
 from myclaw.session.session import Session
-from myclaw.tools.confirmation import ConfirmationChannel
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ConfirmationChannel, ToolGateway
 
 __all__ = ["ChatModelSettings", "StreamingConversationPort", "model_message_from_session"]
 

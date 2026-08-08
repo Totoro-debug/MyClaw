@@ -14,9 +14,7 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.schedule.tool import ScheduleTool
-from myclaw.tools.confirmation import ConfirmationChannel
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ConfirmationChannel, ModelToolCall, ToolGateway
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 OTHER_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")

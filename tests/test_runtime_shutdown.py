@@ -25,10 +25,8 @@ from myclaw.provider.models import (
 )
 from myclaw.session.conversation import ChatModelSettings
 from myclaw.session.session import Session
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.shell.shell_policy import ShellRequest
-from myclaw.tools.shell.shell_process import SubprocessShellBoundary
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.shell.shell_tool import ShellRequest, SubprocessShellBoundary
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.tools.web.web_fetch import PublicWebFetchBoundary
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript

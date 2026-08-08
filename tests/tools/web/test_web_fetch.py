@@ -18,8 +18,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.tools.web.web_fetch import (
     AioHttpWebFetchClient,
     HTTPResponseBoundary,

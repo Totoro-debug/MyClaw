@@ -10,7 +10,7 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from myclaw.tools.models import ModelToolCall
+from myclaw.tools.tool_gateway import ModelToolCall
 from tests.fixtures.provider import ScriptedFakeProvider, StreamScript
 
 

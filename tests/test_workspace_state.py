@@ -6,7 +6,7 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
-from myclaw.tools.errors import ToolError
+from myclaw.tools.base import ToolError
 from myclaw.tools.security import Security
 
 EXPECTED_MEMORY = (

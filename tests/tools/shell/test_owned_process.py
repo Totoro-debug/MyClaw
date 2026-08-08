@@ -6,13 +6,13 @@ from typing import cast
 
 import pytest
 
-import myclaw.tools.shell.windows_job as windows_job
+import myclaw.tools.shell.owned_process as owned_process
 from myclaw.tools.shell.owned_process import (
     PosixOwnedProcessSpawner,
+    WindowsJob,
     WindowsOwnedProcessSpawner,
     default_owned_process_spawner,
 )
-from myclaw.tools.shell.windows_job import WindowsJob
 
 
 def test_windows_job_rejects_a_pointer_sized_invalid_thread_snapshot(
@@ -38,7 +38,7 @@ def test_windows_job_rejects_a_pointer_sized_invalid_thread_snapshot(
     closed: list[int] = []
     job = object.__new__(WindowsJob)
     monkeypatch.setattr(job, "_close_handle", closed.append, raising=False)
-    monkeypatch.setattr(windows_job, "_windows_kernel32", FakeKernel32)
+    monkeypatch.setattr(owned_process, "_windows_kernel32", FakeKernel32)
 
     with pytest.raises(OSError, match="CreateToolhelp32Snapshot"):
         job.resume(123)

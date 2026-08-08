@@ -61,7 +61,7 @@ from myclaw.session.conversation import (
 from myclaw.session.session import Session
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
-from myclaw.tools.base import BaseTool
+from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.files.file_tools import (
     EditFileTool,
     ListFilesTool,
@@ -69,13 +69,10 @@ from myclaw.tools.files.file_tools import (
     SearchFilesTool,
     WriteFileTool,
 )
-from myclaw.tools.models import ToolResult
-from myclaw.tools.schema import OpenAIToolSchema
 from myclaw.tools.security import Security
-from myclaw.tools.shell.shell_process import SubprocessShellBoundary
-from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool
+from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool, SubprocessShellBoundary
 from myclaw.tools.tool_artifacts import externalize_tool_result
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.tool_gateway import ToolGateway, ToolResult
 from myclaw.tools.web.web_fetch import (
     AioHttpWebFetchClient,
     PublicWebFetchBoundary,

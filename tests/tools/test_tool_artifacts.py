@@ -29,12 +29,12 @@ from myclaw.provider.models import (
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.tools.models import (
+from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
+from myclaw.tools.tool_gateway import (
     ModelToolCall,
+    ToolGateway,
     ToolResult,
 )
-from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
-from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics

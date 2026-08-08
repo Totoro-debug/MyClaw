@@ -7,11 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.shell.shell_policy import ShellRequest
-from myclaw.tools.shell.shell_process import SubprocessShellBoundary
-from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.tools.shell.shell_tool import (
+    ShellBoundary,
+    ShellRequest,
+    ShellTool,
+    SubprocessShellBoundary,
+)
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 
 
 def _windows_shell_command(arguments: list[str]) -> str:
@@ -83,7 +85,7 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
         "import asyncio\n"
         "import sys\n"
         "from pathlib import Path\n"
-        "from myclaw.tools.models import ModelToolCall\n"
+        "from myclaw.tools.tool_gateway import ModelToolCall\n"
         "from myclaw.tools.shell.shell_tool import ShellTool\n"
         "from myclaw.tools.tool_gateway import ToolGateway\n"
         "class Shell:\n"

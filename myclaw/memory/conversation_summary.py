@@ -25,7 +25,7 @@ from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelProvider, ModelRequest, ReasoningEffort, UserModelMessage
 from myclaw.session.session import Session
-from myclaw.tools.schema import OpenAIToolSchema
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
 

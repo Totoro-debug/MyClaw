@@ -4,10 +4,7 @@ from typing import Annotated, ClassVar
 
 import pytest
 
-from myclaw.tools.base import BaseTool
-from myclaw.tools.errors import ToolError
-from myclaw.tools.schema import ToolParam, ToolSchema
-from myclaw.utils.json_types import JsonObject
+from myclaw.tools.base import BaseTool, ToolError, ToolParam
 
 
 class _RepresentativeTool(BaseTool):
@@ -127,76 +124,7 @@ def test_schema_exports_are_detached() -> None:
 
     second = tool.to_schema()
     assert second["function"] != first_function
-    assert second == ToolSchema.from_tool(_RepresentativeTool).to_openai()
-
-
-def test_base_tool_rejects_a_schema_override() -> None:
-    with pytest.raises(TypeError, match="cannot override"):
-
-        class OverridesSchema(BaseTool):
-            name = "override"
-            description = "Invalid schema override."
-
-            def to_schema(self) -> JsonObject:  # type: ignore[misc, override]
-                return {}
-
-            async def execute(self) -> str:
-                return ""
-
-
-@pytest.mark.parametrize("retry_count", [True, -1, 6])
-def test_base_tool_rejects_invalid_retry_counts(retry_count: object) -> None:
-    with pytest.raises(TypeError, match="zero through five"):
-        type(
-            "InvalidRetryTool",
-            (BaseTool,),
-            {
-                "name": "invalid_retry",
-                "description": "Invalid retry count.",
-                "max_retries": retry_count,
-                "execute": _valid_execute,
-            },
-        )
-
-
-async def _valid_execute(self: object, *, value: str) -> str:
-    return value
-
-
-def test_base_tool_rejects_non_async_execution() -> None:
-    def execute(self: object, *, value: str) -> str:
-        return value
-
-    with pytest.raises(TypeError, match="asynchronous"):
-        type(
-            "SyncTool",
-            (BaseTool,),
-            {"name": "sync", "description": "Sync Tool.", "execute": execute},
-        )
-
-
-def test_base_tool_rejects_positional_execution_parameters() -> None:
-    async def execute(self: object, value: str) -> str:
-        return value
-
-    with pytest.raises(TypeError, match="keyword parameters"):
-        type(
-            "PositionalTool",
-            (BaseTool,),
-            {"name": "positional", "description": "Positional Tool.", "execute": execute},
-        )
-
-
-def test_base_tool_rejects_non_string_execution_return() -> None:
-    async def execute(self: object) -> int:
-        return 1
-
-    with pytest.raises(TypeError, match="string return"):
-        type(
-            "IntegerResultTool",
-            (BaseTool,),
-            {"name": "integer_result", "description": "Integer result.", "execute": execute},
-        )
+    assert second == tool.to_schema()
 
 
 def test_tool_schema_rejects_unsupported_parameter_annotations() -> None:

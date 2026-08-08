@@ -34,7 +34,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
-from myclaw.tools.models import ModelToolCall
+from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ScriptedFakeProvider

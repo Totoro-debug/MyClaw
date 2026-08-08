@@ -21,7 +21,7 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from myclaw.session.session import Session
-from myclaw.tools.models import ModelToolCall
+from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock
 

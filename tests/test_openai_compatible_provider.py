@@ -22,8 +22,8 @@ from myclaw.provider.models import (
     UserModelMessage,
 )
 from myclaw.provider.openai_compatible import OpenAICompatibleProvider
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.schema import OpenAIToolSchema
+from myclaw.tools.base import OpenAIToolSchema
+from myclaw.tools.tool_gateway import ModelToolCall
 
 REQUEST_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 READ_FILE_SCHEMA: OpenAIToolSchema = {

@@ -3,9 +3,7 @@
 from pathlib import Path
 from typing import Annotated
 
-from myclaw.tools.base import BaseTool
-from myclaw.tools.errors import ToolError
-from myclaw.tools.schema import ToolParam
+from myclaw.tools.base import BaseTool, ToolError, ToolParam
 from myclaw.tools.security import Security
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
@@ -180,9 +178,6 @@ class WriteFileTool(BaseTool):
         del path, content
         return "Writing Workspace files is unavailable because confirmation is not implemented."
 
-    async def execute(self, *, path: str, content: str) -> str:
-        raise AssertionError("Refusal-only Tool reached execution")
-
 
 class EditFileTool(BaseTool):
     """Declare unavailable Workspace file editing."""
@@ -206,13 +201,3 @@ class EditFileTool(BaseTool):
     ) -> str:
         del path, old_text, new_text, replace_all
         return "Editing Workspace files is unavailable because confirmation is not implemented."
-
-    async def execute(
-        self,
-        *,
-        path: str,
-        old_text: str,
-        new_text: str,
-        replace_all: bool,
-    ) -> str:
-        raise AssertionError("Refusal-only Tool reached execution")

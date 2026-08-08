@@ -33,8 +33,8 @@ from myclaw.provider.models import (
     ToolModelMessage,
     UserModelMessage,
 )
-from myclaw.tools.models import ModelToolCall
-from myclaw.tools.schema import OpenAIToolSchema
+from myclaw.tools.base import OpenAIToolSchema
+from myclaw.tools.tool_gateway import ModelToolCall
 
 REQUEST_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 READ_FILE_SCHEMA: OpenAIToolSchema = {
