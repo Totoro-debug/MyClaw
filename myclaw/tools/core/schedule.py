@@ -1,26 +1,19 @@
-"""Model-visible Schedule Job management Tool."""
+"""Schedule Core Catalog Tool."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from contextvars import ContextVar
-from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, cast
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter  # type: ignore[import-untyped]
-from tzlocal import get_localzone_name
 
 from myclaw.schedule.model import JobSchedule, ScheduleJob
-from myclaw.schedule.store import (
-    ScheduleStaleRemovalError,
-    ScheduleStore,
-)
-from myclaw.tools.base import BaseTool, ToolError, ToolParam
-from myclaw.tools.tool_gateway import ConfirmationPrompt
+from myclaw.schedule.store import ScheduleStaleRemovalError, WorkspaceScheduleStore
+from myclaw.tools.base import BaseTool, ToolError, ToolParam, ToolPreparation
 from myclaw.utils.json_types import JsonObject
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_uuid4_string
@@ -31,12 +24,6 @@ _STALE_REMOVAL = "Schedule Job changed before removal. Request removal again."
 _STATE_READ_FAILED = "Schedule state could not be read."
 _STATE_UPDATE_FAILED = "Schedule state could not be updated."
 _TIMEZONE_FAILED = "Schedule timezone could not be resolved."
-
-
-@dataclass(frozen=True, slots=True)
-class _ConfirmedAdd:
-    message: str
-    schedule: JobSchedule
 
 
 class ScheduleTool(BaseTool):
@@ -78,59 +65,51 @@ class ScheduleTool(BaseTool):
     def __init__(
         self,
         *,
-        store: ScheduleStore,
-        now: Callable[[], datetime],
-        new_uuid: Callable[[], UUID] = uuid4,
+        store: WorkspaceScheduleStore,
+        scheduled_agent: bool = False,
+        now: Callable[[], datetime] | None = None,
+        new_uuid: Callable[[], UUID] | None = None,
     ) -> None:
+        if not isinstance(store, WorkspaceScheduleStore):
+            raise TypeError("Schedule Tool requires a WorkspaceScheduleStore")
+        if not isinstance(scheduled_agent, bool):
+            raise TypeError("scheduled_agent must be a boolean")
         self._store = store
-        self._now = now
-        self._new_uuid = new_uuid
-        self._confirmed_add: ContextVar[_ConfirmedAdd | None] = ContextVar(
-            "schedule_confirmed_add",
-            default=None,
-        )
-        self._confirmed_remove: ContextVar[ScheduleJob | None] = ContextVar(
-            "schedule_confirmed_remove",
-            default=None,
-        )
+        self._scheduled_agent = scheduled_agent
+        self._now: Callable[[], datetime] = (lambda: datetime.now(UTC)) if now is None else now
+        self._new_uuid: Callable[[], UUID] = uuid4 if new_uuid is None else new_uuid
 
-    def prepare(self, arguments: JsonObject) -> JsonObject:
-        """Keep only fields used by the exact action and schedule priority."""
+    async def prepare(self, arguments: JsonObject) -> ToolPreparation:
+        """Project action-relevant fields before the common preparation pipeline."""
         action = arguments.get("action")
         if not isinstance(action, str):
-            return {"action": action}
-        if action == "list":
-            return {"action": action}
-        if action == "remove":
             effective: JsonObject = {"action": action}
+        elif action == "list":
+            effective = {"action": action}
+        elif action == "remove":
+            effective = {"action": action}
             job_id = arguments.get("job_id")
             if job_id is not None:
                 effective["job_id"] = job_id
-            return effective
-        if action != "add":
-            return {"action": action}
+        elif action != "add":
+            effective = {"action": action}
+        else:
+            effective = {"action": action}
+            message = arguments.get("message")
+            if message is not None:
+                effective["message"] = message
+            for schedule_name in ("every_seconds", "cron_expr", "at_time"):
+                value = arguments.get(schedule_name)
+                if value is not None:
+                    effective[schedule_name] = value
+                    if schedule_name == "cron_expr":
+                        timezone = arguments.get("timezone")
+                        if timezone is not None:
+                            effective["timezone"] = timezone
+                    break
+        return await self._prepare_pipeline(effective)
 
-        effective = {"action": action}
-        message = arguments.get("message")
-        if message is not None:
-            effective["message"] = message
-        for schedule_name in ("every_seconds", "cron_expr", "at_time"):
-            value = arguments.get(schedule_name)
-            if value is not None:
-                effective[schedule_name] = value
-                if schedule_name == "cron_expr":
-                    timezone = arguments.get("timezone")
-                    if timezone is not None:
-                        effective["timezone"] = timezone
-                break
-        return effective
-
-    def confirmation_finished(self) -> None:
-        """Release the frozen mutation after this confirmation path settles."""
-        self._confirmed_add.set(None)
-        self._confirmed_remove.set(None)
-
-    async def confirmation_request(
+    def validate_arguments(  # type: ignore[override]
         self,
         *,
         action: str,
@@ -140,57 +119,41 @@ class ScheduleTool(BaseTool):
         timezone: str | None = None,
         at_time: str | None = None,
         job_id: str | None = None,
-    ) -> ConfirmationPrompt | None:
+    ) -> str | None:
         if action == "add":
-            normalized_message, schedule = self._normalize_add(
+            self._normalize_add(
                 message=message,
                 every_seconds=every_seconds,
                 cron_expr=cron_expr,
                 timezone=timezone,
                 at_time=at_time,
             )
-            self._confirmed_add.set(_ConfirmedAdd(normalized_message, schedule))
-            warnings: tuple[str, ...] = ()
-            if schedule.kind == "at" and schedule.at_datetime is not None:
-                if schedule.at_datetime <= self._aware_now():
-                    warnings = (
-                        "This at Schedule Job is already due and will run as soon as possible.",
-                    )
-            return ConfirmationPrompt(
-                summary="Add Schedule Job",
-                details={
-                    "action": "add",
-                    "message": normalized_message,
-                    "schedule": _public_schedule(schedule),
-                },
-                warnings=warnings,
-            )
-        if action == "remove":
-            if job_id is None:
-                raise ToolError(_INVALID_ARGUMENTS)
-            try:
-                require_uuid4_string(job_id, field="job_id")
-            except ValueError as error:
-                raise ToolError(_INVALID_ARGUMENTS) from error
-            job = await self._current_public_job(job_id)
-            if job is None:
-                raise ToolError(_NOT_FOUND)
-            self._confirmed_remove.set(job)
-            return ConfirmationPrompt(
-                summary="Remove Schedule Job",
-                details={
-                    "action": "remove",
-                    "job_id": job.job_id,
-                    "message": job.message,
-                    "schedule": _public_schedule(job.schedule),
-                },
-                warnings=(
-                    "Only the Schedule Job definition is deleted; its Conversation Session is retained.",
-                ),
-            )
+            return None
         if action == "list":
             return None
-        raise ToolError(_INVALID_ARGUMENTS)
+        if action == "remove" and job_id is not None:
+            try:
+                require_uuid4_string(job_id, field="job_id")
+            except ValueError:
+                return _INVALID_ARGUMENTS
+            return None
+        return _INVALID_ARGUMENTS
+
+    def refusal_reason(
+        self,
+        *,
+        action: str,
+        message: str | None = None,
+        every_seconds: int | None = None,
+        cron_expr: str | None = None,
+        timezone: str | None = None,
+        at_time: str | None = None,
+        job_id: str | None = None,
+    ) -> str | None:
+        del message, every_seconds, cron_expr, timezone, at_time, job_id
+        if self._scheduled_agent and action == "add":
+            return "Schedule add is unavailable in scheduled Agent context."
+        return None
 
     async def execute(
         self,
@@ -204,10 +167,13 @@ class ScheduleTool(BaseTool):
         job_id: str | None = None,
     ) -> str:
         if action == "add":
-            confirmed = self._confirmed_add.get()
-            if confirmed is None:
-                raise ToolError(_INVALID_ARGUMENTS)
-            normalized_message, schedule = confirmed.message, confirmed.schedule
+            normalized_message, schedule = self._normalize_add(
+                message=message,
+                every_seconds=every_seconds,
+                cron_expr=cron_expr,
+                timezone=timezone,
+                at_time=at_time,
+            )
             timestamp = self._epoch_milliseconds(self._aware_now())
             job = ScheduleJob(
                 job_id=str(self._new_uuid()),
@@ -224,10 +190,7 @@ class ScheduleTool(BaseTool):
 
         if action == "list":
             try:
-                jobs = sorted(
-                    await self._store.public_snapshot(),
-                    key=lambda job: job.job_id,
-                )
+                jobs = await self._store.public_snapshot()
             except Exception as error:
                 raise ToolError(_STATE_READ_FAILED) from error
             return _json_content({"jobs": [_public_job(job) for job in jobs]})
@@ -235,18 +198,22 @@ class ScheduleTool(BaseTool):
         if action == "remove":
             if job_id is None:
                 raise ToolError(_INVALID_ARGUMENTS)
-            expected = self._confirmed_remove.get()
-            if expected is None or expected.job_id != job_id:
-                raise ToolError(_INVALID_ARGUMENTS)
             try:
-                removed = await self._store.remove_user_job(job_id, expected=expected)
+                require_uuid4_string(job_id, field="job_id")
+            except ValueError as error:
+                raise ToolError(_INVALID_ARGUMENTS) from error
+            public_job = await self._current_public_job(job_id)
+            if public_job is None:
+                raise ToolError(_NOT_FOUND)
+            try:
+                removed = await self._store.remove_user_job(job_id, expected=public_job)
             except ScheduleStaleRemovalError as error:
                 raise ToolError(_STALE_REMOVAL) from error
             except Exception as error:
                 raise ToolError(_STATE_UPDATE_FAILED) from error
             if not removed:
                 raise ToolError(_STALE_REMOVAL)
-            return _json_content({"action": "remove", "job": _public_job(expected)})
+            return _json_content({"action": "remove", "job": _public_job(public_job)})
 
         raise ToolError(_INVALID_ARGUMENTS)
 
@@ -299,10 +266,7 @@ class ScheduleTool(BaseTool):
 
     def _resolve_timezone(self, value: str | None) -> str:
         if value is None:
-            try:
-                value = get_localzone_name()
-            except Exception as error:
-                raise ToolError(_TIMEZONE_FAILED) from error
+            return "UTC"
         if not isinstance(value, str):
             raise ToolError(_INVALID_ARGUMENTS)
         try:

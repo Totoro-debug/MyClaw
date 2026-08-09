@@ -8,7 +8,7 @@ import json
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, NoReturn, Protocol
+from typing import Literal, NoReturn
 
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.errors import ErrorInfo
@@ -41,51 +41,7 @@ class ScheduleStoreFaultedError(ScheduleStoreError):
 
 
 class ScheduleStaleRemovalError(ScheduleStoreError):
-    """Raised when the confirmed public Job snapshot changed before removal."""
-
-
-class ScheduleStore(Protocol):
-    """Public Store seam used by Schedule management and execution."""
-
-    @property
-    def path(self) -> Path: ...
-
-    @property
-    def health(self) -> StoreHealth: ...
-
-    @property
-    def revision(self) -> int: ...
-
-    async def snapshot(self) -> tuple[ScheduleJob, ...]: ...
-
-    async def reserve_due(
-        self,
-        candidates: tuple[ScheduleJob, ...],
-    ) -> tuple[ScheduleJob, ...]: ...
-
-    async def public_snapshot(self) -> tuple[ScheduleJob, ...]: ...
-
-    async def add_user_job(self, job: ScheduleJob) -> ScheduleJob: ...
-
-    async def remove_user_job(
-        self,
-        job_id: str,
-        *,
-        expected: ScheduleJob | None = None,
-    ) -> bool: ...
-
-    async def commit_terminal(
-        self,
-        job_id: str,
-        *,
-        expected: ScheduleJob | None = None,
-        finished_at_ms: int,
-        status: JobStatus,
-        error: str | None = None,
-        now_ms: int | None = None,
-    ) -> ScheduleJob | None: ...
-
-    async def wait_for_change(self, revision: int) -> int: ...
+    """Raised when the public Job snapshot changes before removal."""
 
 
 class WorkspaceScheduleStore:
@@ -149,7 +105,7 @@ class WorkspaceScheduleStore:
         async with self._condition:
             public_jobs = sorted(
                 (job for job in self._jobs if job.source == "user"),
-                key=lambda job: job.job_id,
+                key=lambda job: (job.created_at_ms, job.job_id),
             )
             return tuple(copy.deepcopy(job) for job in public_jobs)
 
@@ -356,7 +312,6 @@ def _public_job_key(job: ScheduleJob) -> tuple[object, ...]:
 __all__ = [
     "ScheduleStaleRemovalError",
     "ScheduleStateError",
-    "ScheduleStore",
     "ScheduleStoreError",
     "ScheduleStoreFaultedError",
     "WorkspaceScheduleStore",

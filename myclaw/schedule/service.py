@@ -22,7 +22,7 @@ from myclaw.agent.run import (
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.logging.session import session_log
 from myclaw.schedule.model import ScheduleJob
-from myclaw.schedule.store import ScheduleStore, ScheduleStoreFaultedError
+from myclaw.schedule.store import ScheduleStoreFaultedError, WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 
 ScheduleHealth = Literal["available", "faulted"]
@@ -58,7 +58,7 @@ class ScheduleService:
     def __init__(
         self,
         *,
-        store: ScheduleStore,
+        store: WorkspaceScheduleStore,
         agent_run: AgentRunInterface,
         workspace_state: WorkspaceState,
         clock: ScheduleClock,
@@ -496,11 +496,7 @@ class ScheduleService:
             raise cancellation
 
     async def _remove_at_job(self, job: ScheduleJob) -> None:
-        remove_job = getattr(self._store, "remove_job", None)
-        if callable(remove_job):
-            await remove_job(job.job_id, expected=job)
-            return
-        await self._store.remove_user_job(job.job_id, expected=job)
+        await self._store.remove_job(job.job_id, expected=job)
 
     def _run_finished(self, task: asyncio.Task[None]) -> None:
         self._run_tasks.discard(task)

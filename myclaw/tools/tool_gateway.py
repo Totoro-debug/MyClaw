@@ -376,14 +376,12 @@ class ToolGateway:
         if not correct:
             return _result(tool_call, "error", f"Invalid arguments for {tool_call.name}.")
 
-        refusal = getattr(tool, "refusal_reason", None)
-        if refusal is not None:
-            try:
-                reason = cast(Callable[..., str | None], refusal)(**normalized)
-            except Exception as error:
-                return _result(tool_call, "error", _error_message(tool_call.name, error))
-            if reason is not None:
-                return _result(tool_call, "refused", reason)
+        try:
+            reason = self._evaluate_refusal(tool, normalized)
+        except Exception as error:
+            return _result(tool_call, "error", _error_message(tool_call.name, error))
+        if reason is not None:
+            return _result(tool_call, "refused", reason)
 
         try:
             prompt = await self._confirmation_prompt(tool, normalized)
@@ -450,6 +448,15 @@ class ToolGateway:
             return _result(tool_call, "error", _generic_tool_failure(tool_call.name))
 
         normalized = preparation.arguments
+        try:
+            reason = self._evaluate_refusal(tool, normalized)
+        except ToolError as error:
+            return _result(tool_call, "error", error.message)
+        except Exception as error:
+            self._record_unexpected_failure(tool, error)
+            return _result(tool_call, "error", _generic_tool_failure(tool_call.name))
+        if reason is not None:
+            return _result(tool_call, "refused", reason)
         if preparation.safety_reason is None:
             return await self._execute_final(
                 tool_call,
@@ -472,6 +479,16 @@ class ToolGateway:
         except Exception as error:
             self._record_unexpected_failure(tool, error)
             return _result(tool_call, "error", _generic_tool_failure(tool_call.name))
+
+    @staticmethod
+    def _evaluate_refusal(tool: BaseTool, normalized: JsonObject) -> str | None:
+        refusal = getattr(tool, "refusal_reason", None)
+        if refusal is None:
+            return None
+        reason = cast(Callable[..., object], refusal)(**deepcopy(normalized))
+        if reason is not None and not isinstance(reason, str):
+            raise TypeError("Tool refusal checks must return a string reason or None")
+        return reason
 
     async def _confirm_final(
         self,

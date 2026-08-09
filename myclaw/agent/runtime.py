@@ -53,7 +53,6 @@ from myclaw.provider.model_router import Jitter, ModelRouter, RetryClock
 from myclaw.provider.models import ModelProvider
 from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
-from myclaw.schedule.tool import ScheduleTool
 from myclaw.session.conversation import (
     ChatModelSettings,
     StreamingConversationPort,
@@ -67,6 +66,7 @@ from myclaw.tools.core.glob import GlobTool
 from myclaw.tools.core.grep import GrepTool
 from myclaw.tools.core.list_dir import ListDirTool
 from myclaw.tools.core.read_file import ReadFileTool
+from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.core.write_file import WriteFileTool
 from myclaw.tools.files.file_tools import SearchFilesTool
 from myclaw.tools.security import Security
@@ -537,6 +537,12 @@ def _prepare_repl_runtime(
         configured_shell if isinstance(configured_shell, SubprocessShellBoundary) else None
     )
     schedule_tool = ScheduleTool(store=schedule_store, now=now, new_uuid=new_uuid)
+    scheduled_schedule_tool = ScheduleTool(
+        store=schedule_store,
+        scheduled_agent=True,
+        now=now,
+        new_uuid=new_uuid,
+    )
     tool_gateway = _build_tool_gateway(
         agent_home=agent_home,
         session=session,
@@ -613,7 +619,7 @@ def _prepare_repl_runtime(
             web_search=configured_web_search,
             web_fetch=configured_web_fetch,
             shell=configured_shell,
-            schedule=schedule_tool,
+            schedule=scheduled_schedule_tool,
         )
 
     def externalize_result_for(active_session: Session) -> ToolResultExternalizer:

@@ -13,7 +13,7 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.events import AgentEvent, ConfirmationDecision, ConfirmationRequestedPayload
+from myclaw.agent.events import AgentEvent
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
@@ -162,8 +162,6 @@ def _event_stream(runtime: PreparedReplRuntime, text: str) -> AsyncGenerator[Age
 async def _submit_turn(
     runtime: PreparedReplRuntime,
     text: str,
-    *,
-    decision: ConfirmationDecision | None = None,
 ) -> list[AgentEvent]:
     events = _event_stream(runtime, text)
     observed: list[AgentEvent] = []
@@ -174,11 +172,6 @@ async def _submit_turn(
             except StopAsyncIteration:
                 return observed
             observed.append(event)
-            if event.type == "confirmation_requested":
-                if decision is None:
-                    raise AssertionError("The scripted turn unexpectedly needs confirmation.")
-                payload = cast(ConfirmationRequestedPayload, event.payload)
-                runtime.conversation.respond_to_confirmation(payload.confirmation_id, decision)
     finally:
         await events.aclose()
 
@@ -189,14 +182,6 @@ async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 3.0) ->
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("Timed out waiting for Schedule acceptance state.")
         await asyncio.sleep(0)
-
-
-async def _next_event(events: AsyncIterator[AgentEvent], stage: str) -> AgentEvent:
-    try:
-        async with asyncio.timeout(1.0):
-            return await anext(events)
-    except TimeoutError as error:
-        raise AssertionError(f"Timed out at {stage}.") from error
 
 
 def _schedule_state(workspace: Path) -> WorkspaceScheduleStore:
@@ -212,7 +197,7 @@ def _tool_json(runtime: PreparedReplRuntime) -> list[dict[str, object]]:
 
 
 @pytest.mark.asyncio
-async def test_runtime_conversation_manages_schedule_jobs_with_confirmation_and_stable_results(
+async def test_runtime_conversation_manages_schedule_jobs_without_confirmation(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -223,11 +208,6 @@ async def test_runtime_conversation_manages_schedule_jobs_with_confirmation_and_
                 {"action": "add", "message": "  ship report  ", "every_seconds": 60},
             ),
             _response("Added."),
-            _schedule_tool_response(
-                "call_declined",
-                {"action": "add", "message": "declined", "every_seconds": 60},
-            ),
-            _response("Declined."),
             _schedule_tool_response("call_list", {"action": "list"}),
             _response("Listed."),
             _schedule_tool_response(
@@ -245,33 +225,16 @@ async def test_runtime_conversation_manages_schedule_jobs_with_confirmation_and_
     )
     await runtime.start()
     try:
-        added = await _submit_turn(runtime, "Schedule the report.", decision="approved")
-        assert any(event.type == "confirmation_requested" for event in added)
-        added_confirmation = next(
-            event for event in added if event.type == "confirmation_requested"
-        )
-        added_payload = cast(ConfirmationRequestedPayload, added_confirmation.payload)
-        assert added_payload.details["message"] == "ship report"
-        assert added_payload.details["schedule"] == {"type": "every", "every_seconds": 60}
+        added = await _submit_turn(runtime, "Schedule the report.")
+        assert not any(event.type == "confirmation_requested" for event in added)
 
         jobs = await _schedule_state(workspace).snapshot()
         assert len(jobs) == 1
         assert jobs[0].job_id == str(JOB_UUID)
         assert jobs[0].message == "ship report"
 
-        declined = await _submit_turn(
-            runtime, "Also schedule the declined item.", decision="declined"
-        )
-        assert any(event.type == "confirmation_requested" for event in declined)
-        assert await _schedule_state(workspace).snapshot() == jobs
-
         listed = await _submit_turn(runtime, "List my Schedule Jobs.")
         assert not any(event.type == "confirmation_requested" for event in listed)
-        assert "Tool confirmation was declined." in [
-            message["content"]
-            for message in runtime.session.messages
-            if message.get("role") == "tool"
-        ]
         results = _tool_json(runtime)
         assert results[0]["action"] == "add"
         assert results[1] == {
@@ -284,8 +247,8 @@ async def test_runtime_conversation_manages_schedule_jobs_with_confirmation_and_
             ]
         }
 
-        removed = await _submit_turn(runtime, "Remove that Schedule Job.", decision="approved")
-        assert any(event.type == "confirmation_requested" for event in removed)
+        removed = await _submit_turn(runtime, "Remove that Schedule Job.")
+        assert not any(event.type == "confirmation_requested" for event in removed)
         assert await _schedule_state(workspace).snapshot() == ()
         assert _tool_json(runtime)[-1]["action"] == "remove"
     finally:
@@ -458,90 +421,6 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
 
 
 @pytest.mark.asyncio
-async def test_runtime_confirmation_cancellation_preserves_declined_and_accepted_boundaries(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(
-        chat_responses=(
-            _schedule_tool_response(
-                "call_waiting",
-                {"action": "add", "message": "never write", "every_seconds": 60},
-            ),
-        )
-    )
-    runtime = _runtime(
-        agent_home,
-        workspace,
-        provider,
-        schedule_clock=_BlockingClock(NOW),
-    )
-    await runtime.start()
-    try:
-        events = _event_stream(runtime, "Create a job and wait for me.")
-        assert (await _next_event(events, "waiting confirmation")).type == "turn_started"
-        assert (await _next_event(events, "starting schedule tool")).type == "tool_started"
-        assert (
-            await _next_event(events, "confirmation requested")
-        ).type == "confirmation_requested"
-        await runtime.conversation.cancel_active_turn()
-        assert (await _next_event(events, "first cancellation")).type == "turn_cancelled"
-        await events.aclose()
-        assert await _schedule_state(workspace).snapshot() == ()
-    finally:
-        await runtime.close()
-
-    blocking_provider = _RuntimeProvider(
-        chat_responses=(
-            _schedule_tool_response(
-                "call_accepted",
-                {"action": "add", "message": "accepted before cancel", "every_seconds": 60},
-            ),
-        ),
-        block_chat_call=2,
-    )
-    accepted_workspace = workspace / "accepted"
-    accepted_workspace.mkdir()
-    second_runtime = _runtime(
-        agent_home,
-        accepted_workspace,
-        blocking_provider,
-        schedule_clock=_BlockingClock(NOW),
-    )
-    await second_runtime.start()
-    try:
-        confirmation_seen = asyncio.Event()
-        tool_completed = asyncio.Event()
-        observed: list[AgentEvent] = []
-
-        async def consume() -> None:
-            async for event in _event_stream(second_runtime, "Create then cancel after approval."):
-                observed.append(event)
-                if event.type == "confirmation_requested":
-                    payload = cast(ConfirmationRequestedPayload, event.payload)
-                    second_runtime.conversation.respond_to_confirmation(
-                        payload.confirmation_id, "approved"
-                    )
-                    confirmation_seen.set()
-                elif event.type == "tool_completed":
-                    tool_completed.set()
-
-        consumer = asyncio.create_task(consume())
-        await confirmation_seen.wait()
-        await tool_completed.wait()
-        await blocking_provider.chat_block_started.wait()
-        await second_runtime.conversation.cancel_active_turn()
-        await consumer
-        assert [event.type for event in observed][-1] == "turn_cancelled"
-        accepted_jobs = await _schedule_state(accepted_workspace).snapshot()
-        assert len(accepted_jobs) == 1
-        assert accepted_jobs[0].message == "accepted before cancel"
-    finally:
-        blocking_provider.release_chat.set()
-        await second_runtime.close()
-
-
-@pytest.mark.asyncio
 async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_session_out_of_resume(
     agent_home: Path,
     workspace: Path,
@@ -564,7 +443,7 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
     runtime = _runtime(agent_home, workspace, provider, schedule_clock=clock)
     await runtime.start()
     try:
-        events = await _submit_turn(runtime, "Schedule this due task.", decision="approved")
+        events = await _submit_turn(runtime, "Schedule this due task.")
         assert [event.type for event in events][-1] == "turn_completed"
         await _wait_until(
             lambda: (
