@@ -178,6 +178,9 @@ class WriteFileTool(BaseTool):
         del path, content
         return "Writing Workspace files is unavailable because confirmation is not implemented."
 
+    async def execute(self, *, path: str, content: str) -> str:
+        raise ToolError(self.refusal_reason(path=path, content=content))
+
 
 class EditFileTool(BaseTool):
     """Declare unavailable Workspace file editing."""
@@ -201,3 +204,20 @@ class EditFileTool(BaseTool):
     ) -> str:
         del path, old_text, new_text, replace_all
         return "Editing Workspace files is unavailable because confirmation is not implemented."
+
+    async def execute(
+        self,
+        *,
+        path: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool,
+    ) -> str:
+        raise ToolError(
+            self.refusal_reason(
+                path=path,
+                old_text=old_text,
+                new_text=new_text,
+                replace_all=replace_all,
+            )
+        )
