@@ -7,7 +7,7 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader
 
 EXPECTED_DEFAULT_CONFIG = """[runtime]
-max_tool_result_chars = 50000
+max_tool_result_chars = 4096
 
 [memory]
 consolidation_message_threshold = 40
@@ -471,7 +471,7 @@ def test_omitted_defaulted_configuration_fields_use_accepted_defaults(agent_home
         configuration.tools.web.enabled,
         configuration.tools.shell.enabled,
         configuration.models.routes["default"].reasoning_effort,
-    ) == (50000, 40, 10, "0 * * * *", True, True, None)
+    ) == (4096, 40, 10, "0 * * * *", True, True, None)
 
 
 def test_config_view_redacts_nonempty_provider_keys_and_preserves_complete_content(

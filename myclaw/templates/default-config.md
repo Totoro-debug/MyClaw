@@ -1,5 +1,5 @@
 [runtime]
-max_tool_result_chars = 50000
+max_tool_result_chars = 4096
 
 [memory]
 consolidation_message_threshold = 40

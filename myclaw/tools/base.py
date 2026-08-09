@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import inspect
+import re
 from abc import ABC, abstractmethod, update_abstractmethods
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from ipaddress import IPv6Address, ip_address
@@ -23,14 +25,23 @@ from typing import (
     get_origin,
     get_type_hints,
 )
+from uuid import uuid4
 
+from loguru import logger
+
+from myclaw.agent.workspace import Workspace
 from myclaw.tools.schema import Schema, ToolParam, parameter
 from myclaw.utils.json_types import JsonObject, JsonValue
+from myclaw.utils.validation import require_nonnegative_int
 
 _METADATA_NAMES = frozenset({"name", "description", "required", "max_retries", "parameters"})
 _CLASS_VAR_ORIGIN: object = ClassVar
 _MISSING = object()
 _INVALID_SCHEMA_MARKER = "__schema_declaration_invalid__"
+_ARTIFACT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_ARTIFACT_SESSION_PATTERN = re.compile(r"^[^./\\]+$")
+_DEFAULT_TRUNCATION_MARKER = "\n\n...[truncated]"
+_ARTIFACT_WRITE_FAILURE_MARKER = "\n\n...[artifact write failed; full result was not stored]"
 
 
 class OpenAIFunctionSchema(TypedDict):
@@ -111,6 +122,62 @@ class ToolPreparation:
     safety_reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactReference:
+    """A Workspace-relative reference to one persisted Tool Artifact."""
+
+    path: str
+    total_chars: int
+    preview_chars: int
+
+    def __post_init__(self) -> None:
+        parts = self.path.split("/")
+        if (
+            len(parts) != 4
+            or parts[0] != ".myclaw"
+            or parts[1] != "artifacts"
+            or not _ARTIFACT_SESSION_PATTERN.fullmatch(parts[2])
+            or not parts[3].endswith(".txt")
+            or not _ARTIFACT_ID_PATTERN.fullmatch(parts[3][:-4])
+        ):
+            raise ValueError("path must match the Workspace-relative artifact path contract")
+        require_nonnegative_int(self.total_chars, field="total_chars")
+        require_nonnegative_int(self.preview_chars, field="preview_chars")
+        if self.preview_chars > self.total_chars:
+            raise ValueError("preview_chars must not exceed total_chars")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "total_chars": self.total_chars,
+            "preview_chars": self.preview_chars,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultContent:
+    """Inline Tool content with an optional external Artifact reference."""
+
+    content: str
+    artifact: ArtifactReference | None = None
+
+
+type ArtifactWriter = Callable[[Path, str], None]
+
+
+def truncate_text(content: str, *, limit: int, marker: str = _DEFAULT_TRUNCATION_MARKER) -> str:
+    """Keep a prefix and marker within one configured character limit."""
+    if not isinstance(content, str):
+        raise TypeError("Tool result content must be a string")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("Tool result limit must be a positive integer")
+    if len(content) <= limit:
+        return content
+    if len(marker) >= limit:
+        return marker[:limit]
+    return content[: limit - len(marker)] + marker
+
+
 class BaseTool(ABC):
     """Declare one Tool and expose its model-visible parameter contract."""
 
@@ -158,6 +225,62 @@ class BaseTool(ABC):
     async def execute(self, *args: Any, **kwargs: Any) -> str:
         """Execute one already prepared Tool invocation and return text."""
         raise NotImplementedError
+
+    @staticmethod
+    def handle_result(
+        content: str,
+        *,
+        workspace: Workspace,
+        session_id: str,
+        tool_call_id: str,
+        limit: int,
+        write_text: ArtifactWriter | None = None,
+    ) -> ToolResultContent:
+        """Externalize oversized successful content beneath Workspace State."""
+        if len(content) <= limit:
+            return ToolResultContent(content=content)
+        if not isinstance(workspace, Workspace):
+            raise TypeError("Tool Artifact workspace must be a Workspace")
+        if not isinstance(session_id, str) or not _ARTIFACT_SESSION_PATTERN.fullmatch(session_id):
+            raise ValueError("Tool Artifact session ID must be a single path component")
+
+        filename = tool_call_id if _ARTIFACT_ID_PATTERN.fullmatch(tool_call_id) else str(uuid4())
+        relative_path = f".myclaw/artifacts/{session_id}/{filename}.txt"
+        artifact_path = Path(workspace.path) / Path(*relative_path.split("/"))
+        marker = f"\n\n...[truncated; full result stored at {relative_path}]"
+        preview = truncate_text(content, limit=limit, marker=marker)
+        preview_chars = max(0, len(preview) - len(marker))
+        try:
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            if write_text is None:
+                with artifact_path.open("w", encoding="utf-8", newline="") as stream:
+                    stream.write(content)
+            else:
+                write_text(artifact_path, content)
+        except Exception as error:
+            logger.opt(exception=error).error(
+                "Tool Artifact persistence failed code=persistence_error "
+                "session={} tool_call_id={} type={}",
+                session_id,
+                tool_call_id,
+                type(error).__name__,
+            )
+            return ToolResultContent(
+                content=truncate_text(
+                    content,
+                    limit=limit,
+                    marker=_ARTIFACT_WRITE_FAILURE_MARKER,
+                )
+            )
+
+        return ToolResultContent(
+            content=preview,
+            artifact=ArtifactReference(
+                path=relative_path,
+                total_chars=len(content),
+                preview_chars=preview_chars,
+            ),
+        )
 
     def prepare(self, arguments: JsonObject) -> Any:
         """Return the final asynchronous cast, validation, and safety pipeline."""
@@ -441,6 +564,8 @@ def _schema_for_annotation(
 
 
 __all__ = [
+    "ArtifactReference",
+    "ArtifactWriter",
     "BaseTool",
     "OpenAIFunctionSchema",
     "OpenAIToolSchema",
@@ -448,8 +573,10 @@ __all__ = [
     "ToolError",
     "ToolParam",
     "ToolPreparation",
+    "ToolResultContent",
     "is_public_ip",
     "normalize_public_ip",
     "parameter",
     "resolve_workspace_path",
+    "truncate_text",
 ]

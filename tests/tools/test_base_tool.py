@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import Annotated, Any, ClassVar, cast
+from uuid import UUID
 
 import pytest
 
+from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool, ToolError, ToolParam
 from myclaw.tools.schema import Object, String, parameter
 
@@ -211,3 +214,109 @@ def test_class_parameter_decorator_replaces_failed_legacy_inference() -> None:
             },
         },
     }
+
+
+def test_base_tool_result_handler_writes_a_bounded_workspace_artifact(
+    tmp_path: Path,
+) -> None:
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    workspace = Workspace.from_path(workspace_path)
+    content = "0123456789" * 80
+    limit = 160
+
+    output = _RepresentativeTool().handle_result(
+        content,
+        workspace=workspace,
+        session_id="session-1",
+        tool_call_id="call-1",
+        limit=limit,
+    )
+
+    assert output.artifact is not None
+    assert output.artifact.path == ".myclaw/artifacts/session-1/call-1.txt"
+    marker = "\n\n...[truncated; full result stored at .myclaw/artifacts/session-1/call-1.txt]"
+    assert output.content == content[: limit - len(marker)] + marker
+    assert len(output.content) == limit
+    assert output.artifact.to_dict() == {
+        "path": ".myclaw/artifacts/session-1/call-1.txt",
+        "total_chars": len(content),
+        "preview_chars": limit - len(marker),
+    }
+    assert (workspace_path / ".myclaw" / "artifacts" / "session-1" / "call-1.txt").read_text(
+        encoding="utf-8"
+    ) == content
+
+
+def test_base_tool_result_handler_keeps_exact_limit_inline_and_overwrites_targets(
+    tmp_path: Path,
+) -> None:
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    workspace = Workspace.from_path(workspace_path)
+    target = workspace_path / ".myclaw" / "artifacts" / "session-1" / "call-1.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("old", encoding="utf-8")
+
+    exact = _RepresentativeTool().handle_result(
+        "x" * 12,
+        workspace=workspace,
+        session_id="session-1",
+        tool_call_id="call-1",
+        limit=12,
+    )
+    overwritten = _RepresentativeTool().handle_result(
+        "new oversized content",
+        workspace=workspace,
+        session_id="session-1",
+        tool_call_id="call-1",
+        limit=12,
+    )
+
+    assert exact.content == "x" * 12
+    assert exact.artifact is None
+    assert overwritten.artifact is not None
+    assert target.read_text(encoding="utf-8") == "new oversized content"
+
+
+def test_base_tool_result_handler_uses_uuid_for_an_illegal_tool_call_id(
+    tmp_path: Path,
+) -> None:
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    workspace = Workspace.from_path(workspace_path)
+
+    output = _RepresentativeTool().handle_result(
+        "oversized",
+        workspace=workspace,
+        session_id="session-1",
+        tool_call_id="../unsafe id",
+        limit=4,
+    )
+
+    assert output.artifact is not None
+    artifact_name = output.artifact.path.rsplit("/", maxsplit=1)[-1].removesuffix(".txt")
+    assert UUID(artifact_name).version == 4
+    assert (workspace_path / output.artifact.path).read_text(encoding="utf-8") == ("oversized")
+
+
+def test_base_tool_result_handler_retains_success_when_artifact_write_fails(
+    tmp_path: Path,
+) -> None:
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    workspace = Workspace.from_path(workspace_path)
+    failed_target = workspace_path / ".myclaw" / "artifacts" / "session-1" / "failed.txt"
+    failed_target.mkdir(parents=True)
+
+    output = _RepresentativeTool().handle_result(
+        "private oversized result" * 4,
+        workspace=workspace,
+        session_id="session-1",
+        tool_call_id="failed",
+        limit=40,
+    )
+
+    assert output.artifact is None
+    assert len(output.content) <= 40
+    assert "artifact write failed" in output.content.lower()

@@ -462,8 +462,8 @@ async def test_runtime_active_session_keeps_artifact_and_log_correlation_when_pe
     assert tool_message["role"] == "tool"
     artifact = tool_message["artifact"]
     assert isinstance(artifact, dict)
-    assert artifact["path"] == f"artifacts/{session.session_id}/call_active_artifact.txt"
-    artifact_path = workspace / ".myclaw" / "sessions" / artifact["path"]
+    assert artifact["path"] == f".myclaw/artifacts/{session.session_id}/call_active_artifact.txt"
+    artifact_path = workspace / artifact["path"]
     assert artifact_path.read_text(encoding="utf-8") == raw_tool_result
 
     await runtime.close()

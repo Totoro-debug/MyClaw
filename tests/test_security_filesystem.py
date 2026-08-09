@@ -13,7 +13,7 @@ from myclaw.provider.models import AssistantModelMessage
 from myclaw.session.session import Session
 from myclaw.tools.files.file_tools import ListFilesTool, ReadFileTool, SearchFilesTool
 from myclaw.tools.security import Security
-from myclaw.tools.tool_artifacts import ArtifactWriteError, externalize_tool_result
+from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResult
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
@@ -27,7 +27,7 @@ def _read_file_gateway(*, agent_home: Path, workspace: Path) -> ToolGateway:
     security = Security(
         workspace=workspace_identity,
         agent_home=agent_home,
-        artifact_directory=workspace_state.sessions_directory / "artifacts" / SESSION_ID,
+        artifact_directory=workspace_state.artifacts_directory / SESSION_ID,
     )
     gateway = ToolGateway()
     gateway.register_tools(
@@ -48,7 +48,7 @@ def _workspace_state(workspace: Path) -> WorkspaceState:
 
 def _artifact_directory(workspace: Path, session_id: str = SESSION_ID) -> Path:
     state = WorkspaceState(Workspace.from_path(workspace))
-    return state.sessions_directory / "artifacts" / session_id
+    return state.artifacts_directory / session_id
 
 
 def _artifact_session(state: WorkspaceState) -> Session:
@@ -211,36 +211,34 @@ async def test_list_files_omits_hard_links_to_external_files(
     assert result.content == "local.txt"
 
 
-def test_tool_artifact_publication_denies_an_external_directory_alias(
+def test_tool_artifact_publication_uses_the_shared_workspace_state_directory(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     workspace_state = _workspace_state(workspace)
-    raw_result = "PRIVATE ARTIFACT CONTENT MUST STAY IN WORKSPACE STATE"
-    outside = workspace.parent / "outside-artifacts"
-    outside.mkdir()
-    _create_directory_alias(workspace_state.sessions_directory / "artifacts", outside)
+    raw_result = "PERSISTED ARTIFACT CONTENT"
     result = ToolResult(
-        tool_call_id="call_external_artifact_alias",
+        tool_call_id="call_workspace_artifact",
         name="read_file",
         status="success",
         content=raw_result,
         artifact=None,
     )
 
-    with pytest.raises(ArtifactWriteError):
-        externalize_tool_result(
-            result,
-            session=_artifact_session(workspace_state),
-            max_tool_result_chars=1,
-        )
+    projected = externalize_tool_result(
+        result,
+        session=_artifact_session(workspace_state),
+        max_tool_result_chars=1,
+    )
 
-    assert list(outside.iterdir()) == []
+    assert projected.artifact is not None
+    assert projected.artifact.path.startswith(".myclaw/artifacts/")
+    assert (workspace / projected.artifact.path).read_text(encoding="utf-8") == raw_result
 
 
-def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
+def test_tool_artifact_publication_overwrites_a_reused_tool_call_id(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -269,15 +267,14 @@ def test_tool_artifact_publication_never_overwrites_a_reused_tool_call_id(
         session=_artifact_session(workspace_state),
         max_tool_result_chars=1,
     )
-    with pytest.raises(ArtifactWriteError):
-        externalize_tool_result(
-            second,
-            session=_artifact_session(workspace_state),
-            max_tool_result_chars=1,
-        )
+    externalize_tool_result(
+        second,
+        session=_artifact_session(workspace_state),
+        max_tool_result_chars=1,
+    )
 
     artifact_path = _long_path(_artifact_directory(workspace) / "reused-call.txt")
-    assert artifact_path.read_text(encoding="utf-8") == first_content
+    assert artifact_path.read_text(encoding="utf-8") == second_content
 
 
 def test_tool_artifact_externalization_returns_a_new_immutable_result(
@@ -523,7 +520,7 @@ async def test_read_file_denies_an_aliased_active_session_artifact_directory(
 
 
 @pytest.mark.asyncio
-async def test_read_file_denies_other_session_and_direct_workspace_state_artifacts(
+async def test_read_file_allows_current_artifact_reference_but_denies_other_access(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -539,7 +536,7 @@ async def test_read_file_denies_other_session_and_direct_workspace_state_artifac
         ModelToolCall(
             id="call_direct_state_artifact",
             name="read_file",
-            arguments=json.dumps({"path": f".myclaw/sessions/artifacts/{SESSION_ID}/current.txt"}),
+            arguments=json.dumps({"path": f".myclaw/artifacts/{SESSION_ID}/current.txt"}),
         )
     )
     direct_absolute = await gateway.call(
@@ -557,10 +554,12 @@ async def test_read_file_denies_other_session_and_direct_workspace_state_artifac
         )
     )
 
-    assert {direct_relative.status, direct_absolute.status, other_alias.status} == {"error"}
+    assert direct_relative.status == "success"
+    assert direct_relative.content == "current artifact"
+    assert {direct_absolute.status, other_alias.status} == {"error"}
     assert all(
         result.content == "Workspace State internal files are not readable by file Tools."
-        for result in (direct_relative, direct_absolute, other_alias)
+        for result in (direct_absolute, other_alias)
     )
     assert "other artifact secret" not in str((direct_relative, direct_absolute, other_alias))
 

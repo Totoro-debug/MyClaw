@@ -16,6 +16,7 @@ from typing import Any, Self, cast
 from uuid import UUID, uuid4
 
 from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.tools.base import ArtifactReference
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import (
@@ -100,7 +101,7 @@ class Session:
         session._session_id = session_id
         session._storage_partition = resolved_partition
         session._storage_directory = _storage_directory(workspace_state, resolved_partition)
-        session._artifact_directory = session._storage_directory / "artifacts" / session_id
+        session._artifact_directory = workspace_state.artifacts_directory / session_id
         session._created_at = created_at
         session._updated_at = updated_at
         session._now = now
@@ -717,9 +718,22 @@ def _validate_tool_message(message: dict[str, Any]) -> None:
             raise ValueError(f"tool message requires {field}")
     if message["status"] not in {"success", "error", "refused"}:
         raise ValueError("tool status is not supported")
-    if "artifact" in message and message["artifact"] is not None:
-        if not isinstance(message["artifact"], dict):
+    artifact = message.get("artifact")
+    if artifact is not None:
+        if message["status"] != "success":
+            raise ValueError("only successful tool messages may contain an artifact")
+        if not isinstance(artifact, dict):
             raise ValueError("tool artifact must be an object or null")
+        if set(artifact) != {"path", "total_chars", "preview_chars"}:
+            raise ValueError("tool artifact has an invalid shape")
+        try:
+            ArtifactReference(
+                path=artifact["path"],
+                total_chars=artifact["total_chars"],
+                preview_chars=artifact["preview_chars"],
+            )
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("tool artifact is malformed") from error
 
 
 def _validate_token_usage(value: Any, *, field: str) -> None:

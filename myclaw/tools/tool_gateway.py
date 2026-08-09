@@ -10,18 +10,15 @@ import re
 from collections.abc import Awaitable, Callable
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from jsonschema import Draft202012Validator, FormatChecker
 from loguru import logger
 
-from myclaw.tools.base import BaseTool, OpenAIToolSchema, ToolError
+from myclaw.tools.base import ArtifactReference, BaseTool, OpenAIToolSchema, ToolError
 from myclaw.utils.json_types import JsonObject, JsonScalar, JsonValue
 from myclaw.utils.validation import require_uuid4
-
-if TYPE_CHECKING:
-    from myclaw.tools.tool_artifacts import ArtifactReference
 
 type Sleep = Callable[[float], Awaitable[None]]
 type ConfirmationDecision = Literal["approved", "declined"]
@@ -177,6 +174,10 @@ class ToolResult:
             raise ValueError("Tool result status is invalid")
         if not isinstance(self.content, str):
             raise TypeError("Tool result content must be a string")
+        if self.artifact is not None and not isinstance(self.artifact, ArtifactReference):
+            raise TypeError("Tool result artifact must be an ArtifactReference")
+        if self.status != "success" and self.artifact is not None:
+            raise ValueError("only successful Tool results may contain an artifact")
 
     def to_dict(self) -> dict[str, object]:
         result: dict[str, object] = {

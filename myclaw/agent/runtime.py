@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
@@ -71,7 +71,6 @@ from myclaw.tools.files.file_tools import (
 )
 from myclaw.tools.security import Security
 from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool, SubprocessShellBoundary
-from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ToolGateway, ToolResult
 from myclaw.tools.web.web_fetch import (
     AioHttpWebFetchClient,
@@ -386,7 +385,9 @@ class _DeferredConversationPort:
             return
         active.cancel()
 
-    def respond_to_confirmation(self, confirmation_id: UUID, decision: ConfirmationDecision) -> None:
+    def respond_to_confirmation(
+        self, confirmation_id: UUID, decision: ConfirmationDecision
+    ) -> None:
         delegate = self._delegate
         if delegate is None:
             raise ValueError("No foreground confirmation request is pending")
@@ -576,6 +577,7 @@ def _prepare_repl_runtime(
             now=now,
             new_uuid=new_uuid,
         )
+
     memory_manager = MemoryManager(
         provider=router,
         summaries=summaries,
@@ -807,11 +809,16 @@ def _build_tool_result_externalizer(
     max_tool_result_chars: int,
 ) -> ToolResultExternalizer:
     def externalize(result: ToolResult) -> ToolResult:
-        return externalize_tool_result(
-            result,
-            session=session,
-            max_tool_result_chars=max_tool_result_chars,
+        if result.status != "success" or len(result.content) <= max_tool_result_chars:
+            return result
+        output = BaseTool.handle_result(
+            result.content,
+            workspace=session.workspace_state.workspace,
+            session_id=session.session_id,
+            tool_call_id=result.tool_call_id,
+            limit=max_tool_result_chars,
         )
+        return replace(result, content=output.content, artifact=output.artifact)
 
     return externalize
 

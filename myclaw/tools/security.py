@@ -43,6 +43,9 @@ class Security:
             elif candidate.parts and candidate.parts[0] == "artifacts":
                 artifact_alias = True
                 candidate = self._artifact_root.joinpath(*candidate.parts[1:])
+            elif candidate.parts[:3] == (".myclaw", "artifacts", self._session_id):
+                artifact_alias = True
+                candidate = self._workspace / candidate
             else:
                 candidate = self._workspace / candidate
         else:

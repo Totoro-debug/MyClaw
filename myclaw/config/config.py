@@ -328,7 +328,7 @@ def _parse_runtime(document: Mapping[str, object]) -> RuntimeConfiguration:
     table = _table(document.get("runtime", {}), "runtime")
     return RuntimeConfiguration(
         max_tool_result_chars=_integer(
-            table.get("max_tool_result_chars", 50_000),
+            table.get("max_tool_result_chars", 4_096),
             "runtime.max_tool_result_chars",
             1000,
             1_000_000,

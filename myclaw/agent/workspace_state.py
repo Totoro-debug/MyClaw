@@ -52,6 +52,11 @@ class WorkspaceState:
         return self.path / "sessions"
 
     @property
+    def artifacts_directory(self) -> Path:
+        """Lazily-created shared Tool Artifact directory."""
+        return self.path / "artifacts"
+
+    @property
     def schedule_sessions_directory(self) -> Path:
         """Dedicated, lazily-created storage for Schedule Sessions."""
         return self.path / "schedule-sessions"
