@@ -52,7 +52,7 @@ class DirectoryEntry:
 def iter_directory_entries(root: Path, *, recursive: bool = True) -> Iterator[DirectoryEntry]:
     """Walk descendants without following directory links or ignored directories."""
     _require_directory_root(root)
-    if _is_ignored_directory_name(root.name):
+    if is_ignored_directory_name(root.name):
         return
 
     pending = [root]
@@ -73,7 +73,7 @@ def iter_directory_entries(root: Path, *, recursive: bool = True) -> Iterator[Di
             entry = _entry_from_status(child, status, root)
             if entry is None:
                 continue
-            if entry.is_directory and _is_ignored_directory_name(child.name):
+            if entry.is_directory and is_ignored_directory_name(child.name):
                 continue
             yield entry
             if recursive and entry.is_directory and not entry.is_link:
@@ -174,12 +174,14 @@ def _link_is_directory(path: Path, status: os.stat_result) -> bool:
         return False
 
 
-def _is_ignored_directory_name(name: str) -> bool:
+def is_ignored_directory_name(name: str) -> bool:
+    """Return whether one directory basename belongs to the fixed ignore set."""
     return os.path.normcase(name) in _NORMALIZED_IGNORED_DIRECTORY_NAMES
 
 
 __all__ = [
     "DirectoryEntry",
+    "is_ignored_directory_name",
     "iter_directory_entries",
     "matches_glob_pattern",
     "normalize_glob_pattern",

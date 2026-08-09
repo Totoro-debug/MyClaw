@@ -64,6 +64,7 @@ from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplIn
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.edit_file import EditFileTool
 from myclaw.tools.core.glob import GlobTool
+from myclaw.tools.core.grep import GrepTool
 from myclaw.tools.core.list_dir import ListDirTool
 from myclaw.tools.core.read_file import ReadFileTool
 from myclaw.tools.core.write_file import WriteFileTool
@@ -787,6 +788,7 @@ def _build_tool_gateway(
         ReadFileTool(workspace=workspace),
         ListDirTool(workspace=workspace),
         GlobTool(workspace=workspace),
+        GrepTool(workspace=workspace),
         SearchFilesTool(security=security),
         WriteFileTool(workspace=workspace),
         EditFileTool(workspace=workspace),
