@@ -6,14 +6,13 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from email.message import Message
 from html.parser import HTMLParser
-from ipaddress import IPv6Address, ip_address
 from typing import Annotated, Any, Protocol
 from urllib.parse import urljoin, urlsplit
 
 from aiohttp import ClientResponse, ClientSession, ClientTimeout, TCPConnector
 from aiohttp.abc import AbstractResolver, ResolveResult
 
-from myclaw.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.tools.base import BaseTool, ToolError, ToolParam, normalize_public_ip
 
 CONNECT_TIMEOUT_SECONDS = 10.0
 TOTAL_TIMEOUT_SECONDS = 30.0
@@ -438,23 +437,10 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
 
 
 def _normalize_public_ip(value: str) -> str:
-    if "%" in value:
-        raise ValueError("scoped addresses are not public WebFetch targets")
-    address = ip_address(value)
-    if isinstance(address, IPv6Address) and address.ipv4_mapped is not None:
-        address = address.ipv4_mapped
-    if (
-        not address.is_global
-        or address.is_loopback
-        or address.is_private
-        or address.is_link_local
-        or address.is_unspecified
-        or address.is_multicast
-        or address.is_reserved
-        or (isinstance(address, IPv6Address) and address.is_site_local)
-    ):
-        raise ValueError("address is not globally routable")
-    return str(address)
+    try:
+        return normalize_public_ip(value)
+    except ValueError as error:
+        raise ValueError("address is not globally routable") from error
 
 
 def _is_textual_media_type(media_type: str) -> bool:

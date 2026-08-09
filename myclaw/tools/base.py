@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod, update_abstractmethods
+from copy import deepcopy
+from dataclasses import dataclass
+from ipaddress import IPv6Address, ip_address
+from pathlib import Path
 from types import NoneType, UnionType
 from typing import (
     TYPE_CHECKING,
@@ -21,7 +25,7 @@ from typing import (
 )
 
 from myclaw.tools.schema import Schema, ToolParam, parameter
-from myclaw.utils.json_types import JsonObject
+from myclaw.utils.json_types import JsonObject, JsonValue
 
 _METADATA_NAMES = frozenset({"name", "description", "required", "max_retries", "parameters"})
 _CLASS_VAR_ORIGIN: object = ClassVar
@@ -52,6 +56,61 @@ class ToolError(Exception):
         super().__init__(message)
 
 
+def resolve_workspace_path(workspace: Path, requested: str | Path) -> Path:
+    """Resolve a requested path and reject targets outside the Workspace."""
+    if not isinstance(requested, (str, Path)):
+        raise TypeError("requested Workspace path must be a string or Path")
+    try:
+        root = Path(workspace).resolve(strict=True)
+        candidate = Path(requested)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError("Workspace path could not be resolved") from error
+    if not root.is_dir() or not resolved.is_relative_to(root):
+        raise ValueError("Workspace path resolves outside the Workspace")
+    return resolved
+
+
+def normalize_public_ip(value: str) -> str:
+    """Normalize one globally routable IPv4/IPv6 address or reject it."""
+    if not isinstance(value, str) or "%" in value:
+        raise ValueError("address is not a public IP")
+    address = ip_address(value)
+    if isinstance(address, IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if (
+        not address.is_global
+        or address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or address.is_unspecified
+        or address.is_multicast
+        or address.is_reserved
+        or (isinstance(address, IPv6Address) and address.is_site_local)
+    ):
+        raise ValueError("address is not a public IP")
+    return str(address)
+
+
+def is_public_ip(value: str) -> bool:
+    """Return whether a value is a globally routable IP address."""
+    try:
+        normalize_public_ip(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class ToolPreparation:
+    """The normalized arguments and optional safety reason for one Tool call."""
+
+    arguments: JsonObject
+    safety_reason: str | None = None
+
+
 class BaseTool(ABC):
     """Declare one Tool and expose its model-visible parameter contract."""
 
@@ -59,6 +118,7 @@ class BaseTool(ABC):
     description: ClassVar[str]
     required: ClassVar[tuple[str, ...]] = ()
     max_retries: ClassVar[int] = 0
+    confirmation_summary: ClassVar[str | None] = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -99,12 +159,58 @@ class BaseTool(ABC):
         """Execute one already prepared Tool invocation and return text."""
         raise NotImplementedError
 
-    def prepare(self, arguments: JsonObject) -> JsonObject:
-        """Temporary bridge for concrete Tools awaiting the final pipeline migration."""
-        return arguments
+    def prepare(self, arguments: JsonObject) -> Any:
+        """Return the final asynchronous cast, validation, and safety pipeline."""
+        return self._prepare_pipeline(arguments)
+
+    async def _prepare_pipeline(self, arguments: JsonObject) -> ToolPreparation:
+        casted = self.parameters.cast(arguments)
+        if not isinstance(casted, dict):
+            raise ToolError("Tool arguments must be an object.")
+        normalized: JsonObject = {}
+        for name, schema in self.parameters.properties.items():
+            if name in casted:
+                normalized[name] = cast(JsonValue, deepcopy(casted[name]))
+            elif schema.has_default:
+                normalized[name] = cast(JsonValue, schema.default)
+        errors = self.parameters.validate(normalized)
+        if errors:
+            raise ToolError("; ".join(str(error) for error in errors))
+
+        validation = self.validate_arguments(**deepcopy(normalized))
+        if inspect.isawaitable(validation):
+            validation = await validation
+        if isinstance(validation, str):
+            raise ToolError(validation)
+        if validation is False:
+            raise ToolError("Tool arguments are invalid.")
+
+        safety: object = self.check_safety(**deepcopy(normalized))
+        if inspect.isawaitable(safety):
+            safety = await safety
+        if safety is not None and not isinstance(safety, str):
+            raise TypeError("Tool safety checks must return a string reason or None")
+        return ToolPreparation(
+            arguments=normalized,
+            safety_reason=safety if isinstance(safety, str) else None,
+        )
 
     def confirmation_finished(self) -> None:
         """Temporary bridge for the current Gateway confirmation lifecycle."""
+        return None
+
+    def validate_arguments(self, **arguments: Any) -> Any:
+        """Validate normalized Tool-specific arguments before safety checks.
+
+        Concrete Tools may raise ``ToolError`` with a model-safe domain message.  The
+        default keeps the expand-phase bridge usable while later Tool migrations add
+        capability-specific validation.
+        """
+        del arguments
+
+    async def check_safety(self, **arguments: Any) -> str | None:
+        """Return a confirmation reason for an unsafe normalized invocation."""
+        del arguments
         return None
 
     @final
@@ -226,13 +332,18 @@ def _execute_annotations(execute: object) -> dict[str, object]:
         signature = inspect.signature(cast(Any, execute))
     except (TypeError, ValueError) as error:
         raise TypeError("Tool execute() signature could not be inspected") from error
+    try:
+        resolved_annotations = get_type_hints(cast(Any, execute))
+    except (NameError, TypeError) as error:
+        raise TypeError("Tool execute() annotations could not be resolved") from error
     annotations: dict[str, object] = {}
     for execute_parameter in tuple(signature.parameters.values())[1:]:
         if execute_parameter.kind is not inspect.Parameter.KEYWORD_ONLY:
             continue
-        if execute_parameter.annotation is inspect.Parameter.empty:
+        annotation = resolved_annotations.get(execute_parameter.name, execute_parameter.annotation)
+        if annotation is inspect.Parameter.empty:
             raise TypeError(f"Tool parameter {execute_parameter.name} has no annotation")
-        annotations[execute_parameter.name] = execute_parameter.annotation
+        annotations[execute_parameter.name] = annotation
     return annotations
 
 
@@ -336,5 +447,9 @@ __all__ = [
     "Schema",
     "ToolError",
     "ToolParam",
+    "ToolPreparation",
+    "is_public_ip",
+    "normalize_public_ip",
     "parameter",
+    "resolve_workspace_path",
 ]

@@ -190,7 +190,7 @@ class StreamingConversationPort:
         )
         try:
             async for payload in payloads:
-                event_type, event_payload = _map_agent_run_payload(payload)
+                event_type, event_payload = _map_agent_run_payload(payload, turn_id=turn_id)
                 event = AgentEvent(
                     type=event_type,
                     event_id=self._next_event_id,
@@ -383,7 +383,11 @@ def _consume_task_exception(task: asyncio.Future[None]) -> None:
         task.exception()
 
 
-def _map_agent_run_payload(payload: AgentRunPayload) -> tuple[AgentEventType, AgentEventPayload]:
+def _map_agent_run_payload(
+    payload: AgentRunPayload,
+    *,
+    turn_id: UUID | None = None,
+) -> tuple[AgentEventType, AgentEventPayload]:
     if isinstance(payload, AgentRunStartedPayload):
         return "turn_started", TurnStartedPayload()
     if isinstance(payload, AgentRunTextDeltaPayload):
@@ -396,9 +400,12 @@ def _map_agent_run_payload(payload: AgentRunPayload) -> tuple[AgentEventType, Ag
         )
     if isinstance(payload, AgentRunConfirmationRequestedPayload):
         request = payload.request
+        confirmation_turn_id = turn_id if turn_id is not None else request.turn_id
+        if confirmation_turn_id is None:
+            raise RuntimeError("confirmation event is missing its Agent Run turn identity")
         return "confirmation_requested", ConfirmationRequestedPayload(
             confirmation_id=request.confirmation_id,
-            turn_id=request.turn_id,
+            turn_id=confirmation_turn_id,
             tool_call_id=request.tool_call_id,
             tool_name=request.tool_name,
             summary=request.summary,
