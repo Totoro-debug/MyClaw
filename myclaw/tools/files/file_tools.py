@@ -8,46 +8,6 @@ from myclaw.tools.security import Security
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 
-class ReadFileTool(BaseTool):
-    """Read a stable UTF-8 line window from a Workspace file."""
-
-    name = "read_file"
-    description = "Read UTF-8 text lines from a file within the current Workspace."
-    required = ("path",)
-
-    path: Annotated[str, ToolParam(description="Workspace-relative or allowed readable path.")]
-    offset: Annotated[int, ToolParam(description="Zero-based first line.", minimum=0)] = 0
-    limit: Annotated[
-        int,
-        ToolParam(description="Maximum lines to return.", minimum=1, maximum=10000),
-    ] = 2000
-
-    def __init__(self, *, security: Security) -> None:
-        self._security = security
-
-    async def execute(self, *, path: str, offset: int, limit: int) -> str:
-        target = self._security.resolve_read_path(path)
-        try:
-            status = target.lstat()
-        except OSError as error:
-            raise ToolError("The requested file could not be inspected.") from error
-        if not HOST_FILESYSTEM.is_regular_file(status):
-            raise ToolError("The requested path must identify a regular file.")
-        if status.st_nlink != 1:
-            raise ToolError("The requested path must identify an unaliased regular file.")
-        try:
-            raw_content = target.read_bytes()
-        except OSError as error:
-            raise ToolError("The requested file could not be read.") from error
-        if b"\x00" in raw_content:
-            raise ToolError("The requested file contains binary NUL bytes.")
-        try:
-            lines = raw_content.decode("utf-8").splitlines()
-        except UnicodeError as error:
-            raise ToolError("The requested file is not valid UTF-8 text.") from error
-        return "\n".join(lines[offset : offset + limit])
-
-
 class ListFilesTool(BaseTool):
     """Return a stable Workspace-relative directory listing."""
 
@@ -162,62 +122,3 @@ class SearchFilesTool(BaseTool):
                 if len(matches) == max_results:
                     return "\n".join(matches)
         return "\n".join(matches)
-
-
-class WriteFileTool(BaseTool):
-    """Declare unavailable Workspace file creation."""
-
-    name = "write_file"
-    description = "Write UTF-8 text to a file within the current Workspace."
-    required = ("path", "content")
-
-    path: Annotated[str, ToolParam(description="Workspace file path.", min_length=1)]
-    content: Annotated[str, ToolParam(description="Complete UTF-8 text content.")]
-
-    def refusal_reason(self, *, path: str, content: str) -> str:
-        del path, content
-        return "Writing Workspace files is unavailable because confirmation is not implemented."
-
-    async def execute(self, *, path: str, content: str) -> str:
-        raise ToolError(self.refusal_reason(path=path, content=content))
-
-
-class EditFileTool(BaseTool):
-    """Declare unavailable Workspace file editing."""
-
-    name = "edit_file"
-    description = "Replace exact UTF-8 text in a file within the current Workspace."
-    required = ("path", "old_text", "new_text")
-
-    path: Annotated[str, ToolParam(description="Existing Workspace file path.", min_length=1)]
-    old_text: Annotated[str, ToolParam(description="Exact text to replace.", min_length=1)]
-    new_text: Annotated[str, ToolParam(description="Replacement text.")]
-    replace_all: Annotated[bool, ToolParam(description="Replace every exact match.")] = False
-
-    def refusal_reason(
-        self,
-        *,
-        path: str,
-        old_text: str,
-        new_text: str,
-        replace_all: bool,
-    ) -> str:
-        del path, old_text, new_text, replace_all
-        return "Editing Workspace files is unavailable because confirmation is not implemented."
-
-    async def execute(
-        self,
-        *,
-        path: str,
-        old_text: str,
-        new_text: str,
-        replace_all: bool,
-    ) -> str:
-        raise ToolError(
-            self.refusal_reason(
-                path=path,
-                old_text=old_text,
-                new_text=new_text,
-                replace_all=replace_all,
-            )
-        )

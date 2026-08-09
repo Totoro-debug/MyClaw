@@ -62,12 +62,12 @@ from myclaw.session.session import Session
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
+from myclaw.tools.core.edit_file import EditFileTool
+from myclaw.tools.core.read_file import ReadFileTool
+from myclaw.tools.core.write_file import WriteFileTool
 from myclaw.tools.files.file_tools import (
-    EditFileTool,
     ListFilesTool,
-    ReadFileTool,
     SearchFilesTool,
-    WriteFileTool,
 )
 from myclaw.tools.security import Security
 from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool, SubprocessShellBoundary
@@ -785,11 +785,11 @@ def _build_tool_gateway(
         artifact_directory=session.artifact_directory,
     )
     tools: list[BaseTool] = [
-        ReadFileTool(security=security),
+        ReadFileTool(workspace=workspace),
         ListFilesTool(security=security),
         SearchFilesTool(security=security),
-        WriteFileTool(),
-        EditFileTool(),
+        WriteFileTool(workspace=workspace),
+        EditFileTool(workspace=workspace),
     ]
     if web_search is not None:
         tools.append(WebSearchTool(search=web_search))

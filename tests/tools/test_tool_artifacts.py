@@ -427,7 +427,7 @@ async def test_runtime_artifact_reference_can_be_read_by_the_active_session(
     home = AgentHome(agent_home)
     home.initialize()
     raw_result = "artifact header\n" + "x" * 2100
-    (workspace / "large.txt").write_text(raw_result, encoding="utf-8")
+    (workspace / "large.txt").write_bytes(raw_result.encode("utf-8"))
     relative_path = f".myclaw/artifacts/{SESSION_ID}/call_source.txt"
     provider = ScriptedFakeProvider(
         streams=(
@@ -513,7 +513,7 @@ async def test_runtime_artifact_reference_can_be_read_by_the_active_session(
     }
     second_result = runtime.session.messages[4]
     assert second_result["status"] == "success"
-    assert second_result["content"] == "artifact header"
+    assert second_result["content"] == "artifact header\n"
     assert second_result["artifact"] is None
 
 

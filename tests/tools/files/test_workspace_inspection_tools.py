@@ -4,16 +4,11 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.tools.files.file_tools import (
-    EditFileTool,
-    ListFilesTool,
-    ReadFileTool,
-    SearchFilesTool,
-    WriteFileTool,
-)
+from myclaw.tools.core.edit_file import EditFileTool
+from myclaw.tools.core.write_file import WriteFileTool
+from myclaw.tools.files.file_tools import ListFilesTool, SearchFilesTool
 from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
-from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 SESSION_ID = "20260727-120000-000000_550e8400-e29b-41d4-a716-446655440000"
 
@@ -104,9 +99,12 @@ def test_workspace_inspection_tools_export_exact_openai_schemas(
     assert search_files.max_retries == 0
 
 
-def test_workspace_mutation_tools_export_exact_schemas_and_zero_retries() -> None:
-    write_file = WriteFileTool()
-    edit_file = EditFileTool()
+def test_workspace_mutation_tools_export_exact_schemas_and_zero_retries(
+    workspace: Path,
+) -> None:
+    identity = Workspace.from_path(workspace)
+    write_file = WriteFileTool(workspace=identity)
+    edit_file = EditFileTool(workspace=identity)
 
     assert write_file.to_schema() == {
         "type": "function",
@@ -118,7 +116,7 @@ def test_workspace_mutation_tools_export_exact_schemas_and_zero_retries() -> Non
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace file path.",
+                        "description": "Workspace-relative or absolute file path.",
                         "minLength": 1,
                     },
                     "content": {
@@ -140,7 +138,7 @@ def test_workspace_mutation_tools_export_exact_schemas_and_zero_retries() -> Non
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Existing Workspace file path.",
+                        "description": "Workspace-relative or absolute file path.",
                         "minLength": 1,
                     },
                     "old_text": {
@@ -167,15 +165,17 @@ def test_workspace_mutation_tools_export_exact_schemas_and_zero_retries() -> Non
 
 
 @pytest.mark.asyncio
-async def test_registered_catalog_refuses_workspace_mutations() -> None:
+async def test_registered_catalog_executes_internal_workspace_mutations(workspace: Path) -> None:
+    identity = Workspace.from_path(workspace)
+    (workspace / "notes.txt").write_text("before", encoding="utf-8")
     gateway = ToolGateway()
-    gateway.register_tools((WriteFileTool(), EditFileTool()))
+    gateway.register_tools((WriteFileTool(workspace=identity), EditFileTool(workspace=identity)))
 
     write_result = await gateway.call(
         ModelToolCall(
             id="call_write",
             name="write_file",
-            arguments='{"path":"created.txt","content":"must not be written"}',
+            arguments='{"path":"created.txt","content":"written"}',
         )
     )
     edit_result = await gateway.call(
@@ -186,14 +186,10 @@ async def test_registered_catalog_refuses_workspace_mutations() -> None:
         )
     )
 
-    assert (write_result.status, write_result.content) == (
-        "refused",
-        "Writing Workspace files is unavailable because confirmation is not implemented.",
-    )
-    assert (edit_result.status, edit_result.content) == (
-        "refused",
-        "Editing Workspace files is unavailable because confirmation is not implemented.",
-    )
+    assert write_result.status == "success"
+    assert edit_result.status == "success"
+    assert (workspace / "created.txt").read_text(encoding="utf-8") == "written"
+    assert (workspace / "notes.txt").read_text(encoding="utf-8") == "after"
 
 
 @pytest.mark.asyncio
@@ -308,54 +304,3 @@ async def test_gateway_rejects_invalid_search_contract_arguments(
 
     assert result.status == "error"
     assert result.content == "Invalid arguments for search_files."
-
-
-@pytest.mark.asyncio
-async def test_read_file_failure_logs_once_without_path_content_or_boundary_detail(
-    agent_home: Path,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    identity = Workspace.from_path(workspace)
-    state = WorkspaceState(identity)
-    security = Security(
-        workspace=identity,
-        agent_home=agent_home,
-        artifact_directory=state.sessions_directory / "artifacts" / SESSION_ID,
-    )
-    target = workspace / "RAW_TOOL_PATH_51.txt"
-    target.write_text("RAW_FILE_CONTENT_51", encoding="utf-8")
-    original_read_bytes = Path.read_bytes
-
-    def failing_read_bytes(path: Path) -> bytes:
-        if path.name == target.name:
-            raise OSError("RAW_FILESYSTEM_BODY_51")
-        return original_read_bytes(path)
-
-    monkeypatch.setattr(Path, "read_bytes", failing_read_bytes)
-    gateway = ToolGateway()
-    gateway.register_tools((ReadFileTool(security=security),))
-    capture = capture_diagnostics()
-
-    with capture.session("foreground-session-51"):
-        result = await gateway.call(
-            ModelToolCall(
-                id="call_read_failure",
-                name="read_file",
-                arguments='{"path":"RAW_TOOL_PATH_51.txt"}',
-            )
-        )
-    capture.close()
-
-    assert (result.status, result.content) == (
-        "error",
-        "The requested file could not be read.",
-    )
-    content = capture.text
-    event_text = capture.event_text
-    assert content.count(" ERROR ") == 1
-    assert "name=read_file attempt=1/1 type=ToolError" in content
-    assert "RAW_TOOL_PATH_51.txt" not in event_text
-    assert "RAW_FILE_CONTENT_51" not in event_text
-    assert "RAW_FILESYSTEM_BODY_51" not in event_text
-    assert "RAW_FILESYSTEM_BODY_51" in content

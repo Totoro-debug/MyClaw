@@ -42,6 +42,9 @@ _ARTIFACT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _ARTIFACT_SESSION_PATTERN = re.compile(r"^[^./\\]+$")
 _DEFAULT_TRUNCATION_MARKER = "\n\n...[truncated]"
 _ARTIFACT_WRITE_FAILURE_MARKER = "\n\n...[artifact write failed; full result was not stored]"
+_EXTERNAL_PATH_SAFETY_REASON = (
+    "The requested path resolves outside the Workspace and requires confirmation."
+)
 
 
 class OpenAIFunctionSchema(TypedDict):
@@ -67,19 +70,39 @@ class ToolError(Exception):
         super().__init__(message)
 
 
-def resolve_workspace_path(workspace: Path, requested: str | Path) -> Path:
-    """Resolve a requested path and reject targets outside the Workspace."""
+def resolve_tool_path(workspace: Workspace | Path, requested: str | Path) -> Path:
+    """Resolve a model-provided path using the current host's path semantics."""
     if not isinstance(requested, (str, Path)):
-        raise TypeError("requested Workspace path must be a string or Path")
+        raise TypeError("requested Tool path must be a string or Path")
+    if not isinstance(workspace, (Workspace, Path)):
+        raise TypeError("Tool workspace must be a Workspace or Path")
     try:
-        root = Path(workspace).resolve(strict=True)
+        workspace_path = workspace.path if isinstance(workspace, Workspace) else workspace
+        root = Path(workspace_path).resolve(strict=True)
         candidate = Path(requested)
         if not candidate.is_absolute():
             candidate = root / candidate
         resolved = candidate.resolve(strict=False)
     except (OSError, RuntimeError, ValueError) as error:
-        raise ValueError("Workspace path could not be resolved") from error
-    if not root.is_dir() or not resolved.is_relative_to(root):
+        raise ValueError(str(error)) from error
+    if not root.is_dir():
+        raise ValueError("Tool Workspace is not a directory")
+    return resolved
+
+
+def is_workspace_path(workspace: Workspace | Path, resolved: Path) -> bool:
+    """Return whether a previously resolved path remains inside the Workspace."""
+    if not isinstance(workspace, (Workspace, Path)):
+        raise TypeError("Tool workspace must be a Workspace or Path")
+    workspace_path = workspace.path if isinstance(workspace, Workspace) else workspace
+    root = Path(workspace_path).resolve(strict=True)
+    return resolved.is_relative_to(root)
+
+
+def resolve_workspace_path(workspace: Path, requested: str | Path) -> Path:
+    """Resolve a requested path and reject targets outside the Workspace."""
+    resolved = resolve_tool_path(workspace, requested)
+    if not is_workspace_path(workspace, resolved):
         raise ValueError("Workspace path resolves outside the Workspace")
     return resolved
 
@@ -225,6 +248,39 @@ class BaseTool(ABC):
     async def execute(self, *args: Any, **kwargs: Any) -> str:
         """Execute one already prepared Tool invocation and return text."""
         raise NotImplementedError
+
+    @final
+    def resolve_path_argument(
+        self,
+        *,
+        workspace: Workspace | Path,
+        requested: str | Path,
+    ) -> Path:
+        """Resolve one Tool path and map expected failures to the public result contract."""
+        try:
+            return resolve_tool_path(workspace, requested)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise self._path_resolution_error(error) from error
+
+    @final
+    def workspace_path_safety_reason(
+        self,
+        *,
+        workspace: Workspace | Path,
+        requested: str | Path,
+    ) -> str | None:
+        """Return the shared confirmation reason for a resolved external path."""
+        resolved = self.resolve_path_argument(workspace=workspace, requested=requested)
+        try:
+            contained = is_workspace_path(workspace, resolved)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise self._path_resolution_error(error) from error
+        return None if contained else _EXTERNAL_PATH_SAFETY_REASON
+
+    @final
+    def _path_resolution_error(self, error: Exception) -> ToolError:
+        operation = self.name.replace("_", " ").title()
+        return ToolError(f"{operation} path could not be resolved: {error}")
 
     @staticmethod
     def handle_result(
@@ -575,8 +631,10 @@ __all__ = [
     "ToolPreparation",
     "ToolResultContent",
     "is_public_ip",
+    "is_workspace_path",
     "normalize_public_ip",
     "parameter",
+    "resolve_tool_path",
     "resolve_workspace_path",
     "truncate_text",
 ]

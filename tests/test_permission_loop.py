@@ -17,7 +17,8 @@ from myclaw.provider.models import (
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.session import Session
-from myclaw.tools.files.file_tools import EditFileTool, WriteFileTool
+from myclaw.tools.core.edit_file import EditFileTool
+from myclaw.tools.core.write_file import WriteFileTool
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 
@@ -25,7 +26,7 @@ NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=timezone(timedelta(hours=
 
 
 @pytest.mark.asyncio
-async def test_foreground_mutations_are_refused_without_a_permission_pause(
+async def test_foreground_mutations_execute_without_a_permission_pause(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -83,7 +84,8 @@ async def test_foreground_mutations_are_refused_without_a_permission_pause(
         )
     )
     gateway = ToolGateway()
-    gateway.register_tools((WriteFileTool(), EditFileTool()))
+    identity = Workspace.from_path(workspace)
+    gateway.register_tools((WriteFileTool(workspace=identity), EditFileTool(workspace=identity)))
     conversation = StreamingConversationPort(
         provider=provider,
         session=session,
@@ -109,22 +111,16 @@ async def test_foreground_mutations_are_refused_without_a_permission_pause(
         "tool_completed",
         "turn_completed",
     ]
-    assert not (workspace / "created.txt").exists()
-    assert target.read_text(encoding="utf-8") == "before"
+    assert (workspace / "created.txt").read_text(encoding="utf-8") == "must not be written"
+    assert target.read_text(encoding="utf-8") == "after"
     tool_messages = [message for message in session.messages if message["role"] == "tool"]
-    assert [message["status"] for message in tool_messages] == ["refused", "refused"]
+    assert [message["status"] for message in tool_messages] == ["success", "success"]
     follow_up = provider.stream_requests[1]
     assert isinstance(follow_up, ModelRequest)
     model_results = [
         message for message in follow_up.messages if isinstance(message, ToolModelMessage)
     ]
     assert [(message.name, message.content) for message in model_results] == [
-        (
-            "write_file",
-            "Writing Workspace files is unavailable because confirmation is not implemented.",
-        ),
-        (
-            "edit_file",
-            "Editing Workspace files is unavailable because confirmation is not implemented.",
-        ),
+        ("write_file", "File written successfully."),
+        ("edit_file", "File edited successfully."),
     ]
