@@ -30,8 +30,10 @@ from myclaw.provider.models import (
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import (
+    ConfirmationChannel as ToolConfirmationChannel,
+)
+from myclaw.tools.tool_gateway import (
     ConfirmationRequest,
-    ConfirmationRequester,
     ModelToolCall,
     ToolGateway,
     ToolResult,
@@ -39,7 +41,7 @@ from myclaw.tools.tool_gateway import (
 )
 
 type AgentRunRoute = Literal["chat", "schedule"]
-type ConfirmationChannel = ConfirmationRequester
+type ConfirmationChannel = ToolConfirmationChannel
 type ToolResultExternalizer = Callable[[ToolResult], ToolResult]
 
 
@@ -164,7 +166,6 @@ class AgentRun:
         new_uuid: Callable[[], UUID],
         system_prompt: str = "",
         tool_gateway: ToolGateway | None = None,
-        tool_gateway_for: Callable[[Session], ToolGateway] | None = None,
         externalize_result: Callable[[ToolResult], ToolResult] | None = None,
         externalize_result_for: Callable[[Session], Callable[[ToolResult], ToolResult]]
         | None = None,
@@ -197,8 +198,6 @@ class AgentRun:
         on_artifact_failure: Callable[[Exception, str], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
-        if tool_gateway is not None and tool_gateway_for is not None:
-            raise ValueError("Provide only one Tool Gateway source")
         if summary_preparer_for_route is not None and (
             summary_preparer is not None
             or history_preparer is not None
@@ -218,7 +217,6 @@ class AgentRun:
         self._new_uuid = new_uuid
         self._system_prompt = system_prompt
         self._tool_gateway = tool_gateway
-        self._tool_gateway_for = tool_gateway_for
         self._externalize_result = externalize_result
         self._externalize_result_for = externalize_result_for
         self._memory_snapshot = memory_snapshot
@@ -263,7 +261,6 @@ class AgentRun:
         if stream != (route == "chat"):
             raise ValueError("chat Agent Runs must stream and schedule Agent Runs must not stream")
 
-        confirmation_requests: asyncio.Queue[ConfirmationRequest] = asyncio.Queue()
         partial_content: list[str] = []
         pending_tool_calls: list[ModelToolCall] = []
         persisted = False
@@ -282,20 +279,8 @@ class AgentRun:
                 if self._system_prompt_for_memory is None:
                     raise RuntimeError("Memory snapshot requires a System Prompt factory")
                 system_prompt = self._system_prompt_for_memory(memory)
-            base_gateway = (
-                self._tool_gateway_for(session)
-                if self._tool_gateway_for is not None
-                else self._tool_gateway
-            )
-            gateway = (
-                None
-                if base_gateway is None
-                else base_gateway.for_run(
-                    confirmation=confirmation,
-                    on_confirmation_requested=confirmation_requests.put_nowait,
-                )
-            )
-            frozen_tools = () if gateway is None else gateway.schemas
+            gateway = self._tool_gateway
+            frozen_tools = () if gateway is None else tuple(gateway.schemas)
             externalize_result = (
                 self._externalize_result_for(session)
                 if self._externalize_result_for is not None
@@ -406,7 +391,7 @@ class AgentRun:
                                     tool_outcomes = self._call_tool(
                                         gateway,
                                         tool_call,
-                                        confirmation_requests,
+                                        confirmation,
                                         tool_state,
                                     )
                                     try:
@@ -656,11 +641,22 @@ class AgentRun:
     async def _call_tool(
         gateway: ToolGateway,
         tool_call: ModelToolCall,
-        confirmation_requests: asyncio.Queue[ConfirmationRequest],
+        confirmation: ConfirmationChannel | None,
         state: _ToolCallState,
     ) -> AsyncGenerator[ConfirmationRequest | ToolResult, None]:
-        operation = asyncio.create_task(gateway.call(tool_call))
-        notification = asyncio.create_task(confirmation_requests.get())
+        operation = asyncio.create_task(gateway.call(tool_call, confirmation=confirmation))
+        if confirmation is None:
+            try:
+                result = await operation
+                state.result = result
+                yield result
+                return
+            finally:
+                if not operation.done():
+                    operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+
+        notification = asyncio.create_task(confirmation.next_request())
         try:
             while True:
                 done, _ = await asyncio.wait(
@@ -669,7 +665,7 @@ class AgentRun:
                 )
                 if notification in done:
                     request = notification.result()
-                    notification = asyncio.create_task(confirmation_requests.get())
+                    notification = asyncio.create_task(confirmation.next_request())
                     yield request
                     continue
                 result = operation.result()
@@ -678,6 +674,7 @@ class AgentRun:
                 return
         finally:
             if not operation.done():
+                confirmation.close()
                 operation.cancel()
             if not notification.done():
                 notification.cancel()

@@ -17,14 +17,14 @@ from myclaw.provider.models import (
 )
 from myclaw.tools.shell import shell_tool
 from myclaw.tools.shell.shell_tool import ShellRequest, ShellTool
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.host_filesystem import (
     POSIX_HOST_FILESYSTEM,
     WINDOWS_HOST_FILESYSTEM,
     HostFilesystem,
 )
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures import FakeClock, ScriptedFakeProvider, SingleToolGateway, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 SESSION_ID = "20260712-120000-000000_550e8400-e29b-41d4-a716-446655440000"
@@ -91,11 +91,9 @@ def _gateway(
     agent_home: Path,
     workspace: Path,
     shell: FakeShellBoundary,
-) -> ToolGateway:
+) -> SingleToolGateway:
     del agent_home
-    gateway = ToolGateway()
-    gateway.register_tools((ShellTool(workspace=workspace, boundary=shell),))
-    return gateway
+    return SingleToolGateway((ShellTool(workspace=workspace, boundary=shell),))
 
 
 def test_shell_exports_accurate_schema_and_zero_retries(workspace: Path) -> None:
@@ -174,8 +172,7 @@ async def test_shell_failure_log_excludes_command_and_process_output(
     workspace: Path,
 ) -> None:
     shell = FailingShellBoundary()
-    gateway = ToolGateway()
-    gateway.register_tools((ShellTool(workspace=workspace, boundary=shell),))
+    gateway = SingleToolGateway((ShellTool(workspace=workspace, boundary=shell),))
     capture = capture_diagnostics()
 
     with capture.session("foreground-shell-session-51"):
@@ -198,7 +195,7 @@ async def test_shell_failure_log_excludes_command_and_process_output(
         ShellRequest(command="git status", cwd=workspace.resolve(), timeout=60)
     ]
     assert content.count(" ERROR ") == 1
-    assert "name=shell attempt=1/1 type=OSError" in content
+    assert "Tool execution failed name=shell type=OSError" in content
     assert "git status" not in event_text
     assert "RAW_PROCESS_BODY_51" not in event_text
     assert "RAW_PROCESS_BODY_51 command=git status" in content
@@ -347,7 +344,6 @@ async def test_runtime_shell_enablement_controls_catalog_and_system_guidance(
             ),
         )
     )
-    shell = FakeShellBoundary(())
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,
@@ -355,7 +351,6 @@ async def test_runtime_shell_enablement_controls_catalog_and_system_guidance(
         provider_factory=lambda _: provider,
         now=FakeClock(NOW).now,
         new_uuid=iter(map(UUID, SESSION_UUIDS)).__next__,
-        shell=None if enabled else shell,
     )
 
     events = [event async for event in runtime.conversation.submit("Inspect the catalog.")]
@@ -367,9 +362,6 @@ async def test_runtime_shell_enablement_controls_catalog_and_system_guidance(
     guidance = request.system_prompt.split("<tool_guidance>\n", 1)[1].split("</tool_guidance>", 1)[
         0
     ]
-    assert ("shell" in names) is enabled
-    assert ("- shell:" in guidance) is enabled
-    if enabled:
-        assert "not an operating-system filesystem or network sandbox" in guidance
-        assert "confined to the Workspace" not in guidance
-    assert shell.requests == []
+    assert "shell" not in names
+    assert "exec" in names
+    assert "- exec:" in guidance

@@ -30,6 +30,7 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.session.session import Session
+from myclaw.tools.core.web_search import WebSearchTool
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.tools.web.web_search import WebSearchResult
 from tests.configuration.test_config import VALID_CONFIG
@@ -450,11 +451,11 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
 async def test_foreground_tool_diagnostics_preserve_boundary_exception_details(
     agent_home: Path,
     workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    web_enabled_config = VALID_CONFIG.replace("enabled = false", "enabled = true", 1)
-    (agent_home / "config.toml").write_text(web_enabled_config, encoding="utf-8")
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     clock = FakeClock(NOW)
     private_query = "PRIVATE_CONVERSATION_QUERY"
     provider = ScriptedFakeProvider(
@@ -492,6 +493,15 @@ async def test_foreground_tool_diagnostics_preserve_boundary_exception_details(
             ),
         )
     )
+
+    async def fail(self: WebSearchTool, *, query: str, count: int) -> str:
+        del self, count
+        raise ExceptionGroup(
+            "RAW_PROVIDER_BODY",
+            [OSError(f"query={query}"), ValueError("auth=PRIVATE_WEB_CREDENTIAL")],
+        )
+
+    monkeypatch.setattr(WebSearchTool, "execute", fail)
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,
@@ -500,7 +510,6 @@ async def test_foreground_tool_diagnostics_preserve_boundary_exception_details(
         now=clock.now,
         new_uuid=uuid4,
         retry_clock=clock,
-        web_search=SensitiveFailingWebSearch(),
     )
 
     events = [event async for event in runtime.conversation.submit(private_query)]
@@ -515,11 +524,11 @@ async def test_foreground_tool_diagnostics_preserve_boundary_exception_details(
     assert isinstance(events[2].payload, ToolCompletedPayload)
     assert events[2].payload.status == "error"
     content = _session_log_text(workspace, runtime.session_id)
-    assert content.count("Tool execution failed name=web_search") == 3
+    assert content.count("Tool execution failed name=web_search") == 1
     assert "Traceback (most recent call last):" in content
-    assert content.count("RAW_PROVIDER_BODY") >= 3
-    assert content.count(f"OSError: query={private_query}") == 3
-    assert content.count("ValueError: auth=PRIVATE_WEB_CREDENTIAL") == 3
+    assert content.count("RAW_PROVIDER_BODY") >= 1
+    assert content.count(f"OSError: query={private_query}") == 1
+    assert content.count("ValueError: auth=PRIVATE_WEB_CREDENTIAL") == 1
 
 
 @pytest.mark.asyncio
@@ -1128,7 +1137,7 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
     assert "<tool_guidance>\n- read_file:" in system_prompt
     assert "- list_dir:" in system_prompt
     assert "- glob:" in system_prompt
-    assert "- search_files:" in system_prompt
+    assert "- grep:" in system_prompt
     assert system_prompt.index(workspace_identity) < system_prompt.index(memory_block)
     assert system_prompt.index(memory_block) < system_prompt.index("<tool_guidance>")
     assert "Changed after startup" not in system_prompt

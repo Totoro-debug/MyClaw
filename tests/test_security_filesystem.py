@@ -15,14 +15,15 @@ from myclaw.tools.core.list_dir import ListDirTool
 from myclaw.tools.files.file_tools import SearchFilesTool
 from myclaw.tools.security import Security
 from myclaw.tools.tool_artifacts import externalize_tool_result
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResult
+from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
+from tests.fixtures import SingleToolGateway
 
 SESSION_ID = "20260713-040000-000000_550e8400-e29b-41d4-a716-446655440000"
 OTHER_SESSION_ID = "20260713-050000-000000_550e8400-e29b-41d4-a716-446655440000"
 
 
-def _read_file_gateway(*, agent_home: Path, workspace: Path) -> ToolGateway:
+def _read_file_gateway(*, agent_home: Path, workspace: Path) -> SingleToolGateway:
     workspace_identity = Workspace.from_path(workspace)
     workspace_state = WorkspaceState(workspace_identity)
     security = Security(
@@ -30,14 +31,12 @@ def _read_file_gateway(*, agent_home: Path, workspace: Path) -> ToolGateway:
         agent_home=agent_home,
         artifact_directory=workspace_state.artifacts_directory / SESSION_ID,
     )
-    gateway = ToolGateway()
-    gateway.register_tools(
+    return SingleToolGateway(
         (
             ListDirTool(workspace=workspace_identity),
             SearchFilesTool(security=security),
         )
     )
-    return gateway
 
 
 def _workspace_state(workspace: Path) -> WorkspaceState:

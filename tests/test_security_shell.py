@@ -13,7 +13,8 @@ from myclaw.tools.shell.shell_tool import (
     ShellTool,
     SubprocessShellBoundary,
 )
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall
+from tests.fixtures import SingleToolGateway
 
 
 def _windows_shell_command(arguments: list[str]) -> str:
@@ -42,10 +43,8 @@ class RecordingShellBoundary:
         return "must not execute"
 
 
-def _shell_gateway(*, workspace: Path, shell: ShellBoundary) -> ToolGateway:
-    gateway = ToolGateway()
-    gateway.register_tools((ShellTool(workspace=workspace, boundary=shell),))
-    return gateway
+def _shell_gateway(*, workspace: Path, shell: ShellBoundary) -> SingleToolGateway:
+    return SingleToolGateway((ShellTool(workspace=workspace, boundary=shell),))
 
 
 @pytest.mark.asyncio
@@ -87,7 +86,7 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
         "from pathlib import Path\n"
         "from myclaw.tools.tool_gateway import ModelToolCall\n"
         "from myclaw.tools.shell.shell_tool import ShellTool\n"
-        "from myclaw.tools.tool_gateway import ToolGateway\n"
+        "from tests.fixtures import SingleToolGateway\n"
         "class Shell:\n"
         "    def __init__(self): self.calls = 0\n"
         "    async def execute(self, request): self.calls += 1; return 'ran'\n"
@@ -96,14 +95,12 @@ def test_untrusted_startup_git_path_fails_closed_before_shell_execution(
         "    call = ModelToolCall(id='call_git', name='shell', "
         'arguments=\'{"command":"git status","timeout":60}\')\n'
         "    foreground_shell = Shell()\n"
-        "    foreground = ToolGateway()\n"
-        "    foreground.register_tools((ShellTool(workspace=workspace, "
+        "    foreground = SingleToolGateway((ShellTool(workspace=workspace, "
         "boundary=foreground_shell),))\n"
         "    assert (await foreground.call(call)).status == 'refused'\n"
         "    assert foreground_shell.calls == 0\n"
         "    background_shell = Shell()\n"
-        "    background = ToolGateway()\n"
-        "    background.register_tools((ShellTool(workspace=workspace, "
+        "    background = SingleToolGateway((ShellTool(workspace=workspace, "
         "boundary=background_shell),))\n"
         "    assert (await background.call(call)).status == 'refused'\n"
         "    assert background_shell.calls == 0\n"

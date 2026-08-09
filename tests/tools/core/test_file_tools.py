@@ -16,9 +16,8 @@ from myclaw.tools.tool_gateway import (
     ConfirmationRequest,
     ConfirmationRequester,
     ModelToolCall,
-    ToolConfirmationMetadata,
-    ToolGateway,
 )
+from tests.fixtures import SingleToolGateway
 
 type FileToolType = type[ReadFileTool] | type[WriteFileTool] | type[EditFileTool]
 
@@ -30,17 +29,15 @@ def _call(name: str, arguments: dict[str, object], *, call_id: str = "call_1") -
 def _gateway(
     *tools: BaseTool,
     confirmation: ConfirmationRequester | None = None,
-) -> ToolGateway:
-    gateway = ToolGateway(confirmation=confirmation)
-    gateway.register_tools(tools)
-    return gateway
+) -> SingleToolGateway:
+    return SingleToolGateway(tools, confirmation=confirmation)
 
 
 def test_gateway_exports_the_new_path_and_line_contract(workspace: Path) -> None:
     identity = Workspace.from_path(workspace)
     gateway = _gateway(ReadFileTool(workspace=identity))
 
-    assert gateway.schemas == (
+    assert tuple(gateway.schemas) == (
         {
             "type": "function",
             "function": {
@@ -229,9 +226,17 @@ async def test_external_targets_require_confirmation_and_bind_the_exact_call(
     assert "outside the Workspace" in request.reason
     assert request.details["path"] == requested
 
+    async def approve(current: ConfirmationRequest) -> ConfirmationDecision:
+        return (
+            "approved"
+            if current.tool_call_id == request.tool_call_id
+            and current.tool_name == request.tool_name
+            else "declined"
+        )
+
     approved = await gateway.call(
         call,
-        confirmation=ToolConfirmationMetadata(request=request, decision="approved"),
+        confirmation=approve,
     )
 
     assert (approved.status, approved.content) == ("success", "outside\n")

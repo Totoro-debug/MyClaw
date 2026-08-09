@@ -28,6 +28,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
+from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.tools.tool_artifacts import externalize_tool_result
@@ -37,7 +38,7 @@ from myclaw.tools.tool_gateway import (
     ToolResult,
 )
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
-from tests.fixtures import FakeClock, FakeTool, ScriptedFakeProvider, StreamScript
+from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 SESSION_ID = "20260711-153012-123000_550e8400-e29b-41d4-a716-446655440000"
@@ -236,20 +237,26 @@ async def test_scheduled_agent_run_persists_a_shared_workspace_artifact(
         job_id=SESSION_ID.split("_", maxsplit=1)[1],
         now=lambda: NOW,
     )
-    tool = FakeTool(
-        name="inspect",
-        description="Return inspection output.",
-        outcomes=("scheduled oversized result",),
+    (workspace / "scheduled-result.txt").write_text(
+        "scheduled oversized result",
+        encoding="utf-8",
     )
-    gateway = ToolGateway()
-    gateway.register_tools((tool,))
+    gateway = ToolGateway(
+        workspace=state.workspace,
+        schedule_store=WorkspaceScheduleStore(state),
+        scheduled_agent=True,
+    )
     provider = ScriptedFakeProvider(
         completions=(
             ModelResponse(
                 message=AssistantModelMessage(
                     content="",
                     tool_calls=(
-                        ModelToolCall(id="scheduled-call", name="inspect", arguments="{}"),
+                        ModelToolCall(
+                            id="scheduled-call",
+                            name="read_file",
+                            arguments='{"path":"scheduled-result.txt"}',
+                        ),
                     ),
                 ),
                 usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
@@ -533,12 +540,12 @@ async def test_artifact_write_failure_retains_success_with_a_bounded_fallback(
     def unavailable_artifact_boundary(_path: Path, _content: str) -> None:
         raise RuntimeError(private_write_detail)
 
-    tool = FakeTool(
-        name="inspect",
-        description="Return inspection output.",
-        outcomes=(raw_result,),
+    (workspace / "failed-artifact-result.txt").write_text(raw_result, encoding="utf-8")
+    tool_call = ModelToolCall(
+        id="call_failed_artifact",
+        name="read_file",
+        arguments='{"path":"failed-artifact-result.txt"}',
     )
-    tool_call = ModelToolCall(id="call_failed_artifact", name="inspect", arguments="{}")
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -565,8 +572,10 @@ async def test_artifact_write_failure_retains_success_with_a_bounded_fallback(
             ),
         )
     )
-    gateway = ToolGateway()
-    gateway.register_tools((tool,))
+    gateway = ToolGateway(
+        workspace=state.workspace,
+        schedule_store=WorkspaceScheduleStore(state),
+    )
     conversation = StreamingConversationPort(
         provider=provider,
         session=session,

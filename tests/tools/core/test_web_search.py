@@ -10,7 +10,8 @@ from ddgs.exceptions import DDGSException
 
 from myclaw.tools.base import BaseTool
 from myclaw.tools.core.web_search import WebSearchTool
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall
+from tests.fixtures import SingleToolGateway
 
 
 def _call(arguments: dict[str, object], *, call_id: str = "call_search") -> ModelToolCall:
@@ -21,10 +22,8 @@ def _call(arguments: dict[str, object], *, call_id: str = "call_search") -> Mode
     )
 
 
-def _gateway(tool: BaseTool | None = None) -> ToolGateway:
-    gateway = ToolGateway()
-    gateway.register_tools((WebSearchTool() if tool is None else tool,))
-    return gateway
+def _gateway(tool: BaseTool | None = None) -> SingleToolGateway:
+    return SingleToolGateway((WebSearchTool() if tool is None else tool,))
 
 
 class FakeDDGS:

@@ -230,17 +230,21 @@ async def test_runtime_conversation_manages_schedule_jobs_without_confirmation(
 
         jobs = await _schedule_state(workspace).snapshot()
         assert len(jobs) == 1
-        assert jobs[0].job_id == str(JOB_UUID)
+        job_id = jobs[0].job_id
         assert jobs[0].message == "ship report"
 
         listed = await _submit_turn(runtime, "List my Schedule Jobs.")
         assert not any(event.type == "confirmation_requested" for event in listed)
+        provider._responses["chat"][0] = _schedule_tool_response(
+            "call_remove",
+            {"action": "remove", "job_id": job_id},
+        )
         results = _tool_json(runtime)
         assert results[0]["action"] == "add"
         assert results[1] == {
             "jobs": [
                 {
-                    "job_id": str(JOB_UUID),
+                    "job_id": job_id,
                     "message": "ship report",
                     "schedule": {"type": "every", "every_seconds": 60},
                 }
@@ -454,8 +458,26 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
 
         assert provider.complete_requests[0].route == "schedule"
         assert provider.complete_requests[0].stream is False
+        assert [
+            definition["function"]["name"] for definition in provider.complete_requests[0].tools
+        ] == [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "glob",
+            "grep",
+            "exec",
+            "web_search",
+            "web_fetch",
+            "schedule",
+        ]
         assert await _schedule_state(workspace).snapshot() == ()
-        schedule_session_id = f"schedule_{JOB_UUID}"
+        schedule_session_paths = tuple(
+            (workspace / ".myclaw" / "schedule-sessions").glob("schedule_*.jsonl")
+        )
+        assert len(schedule_session_paths) == 1
+        schedule_session_id = schedule_session_paths[0].stem
         schedule_session = Session.load(
             WorkspaceState(Workspace.from_path(workspace)),
             schedule_session_id,

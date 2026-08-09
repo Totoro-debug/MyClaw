@@ -61,29 +61,7 @@ from myclaw.session.session import Session
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
-from myclaw.tools.core.edit_file import EditFileTool
-from myclaw.tools.core.glob import GlobTool
-from myclaw.tools.core.grep import GrepTool
-from myclaw.tools.core.list_dir import ListDirTool
-from myclaw.tools.core.read_file import ReadFileTool
-from myclaw.tools.core.schedule import ScheduleTool
-from myclaw.tools.core.write_file import WriteFileTool
-from myclaw.tools.files.file_tools import SearchFilesTool
-from myclaw.tools.security import Security
-from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool, SubprocessShellBoundary
 from myclaw.tools.tool_gateway import ToolGateway, ToolResult
-from myclaw.tools.web.web_fetch import (
-    AioHttpWebFetchClient,
-    PublicWebFetchBoundary,
-    SocketDNSResolver,
-    WebFetchBoundary,
-    WebFetchTool,
-)
-from myclaw.tools.web.web_search import (
-    DuckDuckGoSearchBoundary,
-    WebSearchBoundary,
-    WebSearchTool,
-)
 from myclaw.utils.scheduler import AsyncioSchedulerClock, SchedulerClock
 
 
@@ -134,7 +112,6 @@ class PreparedReplRuntime:
     conversation: SwitchableConversationPort
     management_dispatcher: ManagementDispatcher
     schedule_service: ScheduleService
-    _shell: SubprocessShellBoundary | None
     _memory_scheduler: _RuntimeSchedulerOwner
     _router: ModelRouter
     _lifetime: _RuntimeLifetime
@@ -243,12 +220,6 @@ class PreparedReplRuntime:
                 shutdowns.append(run_done.wait())
             results = await asyncio.gather(*shutdowns, return_exceptions=True)
             failures.extend(result for result in results if isinstance(result, BaseException))
-
-            if self._shell is not None:
-                try:
-                    await self._shell.close()
-                except BaseException as error:
-                    failures.append(error)
 
             try:
                 await self._router.close()
@@ -435,9 +406,6 @@ def prepare_repl_runtime(
     memory_scheduler_clock: SchedulerClock | None = None,
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
-    web_search: WebSearchBoundary | None = None,
-    web_fetch: WebFetchBoundary | None = None,
-    shell: ShellBoundary | None = None,
 ) -> PreparedReplRuntime:
     """Prepare one Runtime and record terminal composition failures once."""
     try:
@@ -453,9 +421,6 @@ def prepare_repl_runtime(
             memory_scheduler_clock=memory_scheduler_clock,
             schedule_scheduler_clock=schedule_scheduler_clock,
             monotonic_now=monotonic_now,
-            web_search=web_search,
-            web_fetch=web_fetch,
-            shell=shell,
         )
     except WorkspaceStateError:
         raise
@@ -479,9 +444,6 @@ def _prepare_repl_runtime(
     memory_scheduler_clock: SchedulerClock | None = None,
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
-    web_search: WebSearchBoundary | None = None,
-    web_fetch: WebFetchBoundary | None = None,
-    shell: ShellBoundary | None = None,
 ) -> PreparedReplRuntime:
     """Prepare a Session and defer provider construction until conversational input."""
     workspace_identity = Workspace.from_path(workspace)
@@ -511,45 +473,14 @@ def _prepare_repl_runtime(
         clock=retry_clock,
         jitter=retry_jitter,
     )
-    configured_web_search = (
-        (web_search if web_search is not None else DuckDuckGoSearchBoundary())
-        if configuration.tools.web.enabled
-        else None
+    tool_gateway = ToolGateway(
+        workspace=workspace_identity,
+        schedule_store=schedule_store,
     )
-    configured_web_fetch = (
-        (
-            web_fetch
-            if web_fetch is not None
-            else PublicWebFetchBoundary(
-                resolver=SocketDNSResolver(),
-                http_client=AioHttpWebFetchClient(),
-            )
-        )
-        if configuration.tools.web.enabled
-        else None
-    )
-    configured_shell = (
-        (shell if shell is not None else SubprocessShellBoundary())
-        if configuration.tools.shell.enabled
-        else None
-    )
-    owned_shell = (
-        configured_shell if isinstance(configured_shell, SubprocessShellBoundary) else None
-    )
-    schedule_tool = ScheduleTool(store=schedule_store, now=now, new_uuid=new_uuid)
-    scheduled_schedule_tool = ScheduleTool(
-        store=schedule_store,
+    scheduled_tool_gateway = ToolGateway(
+        workspace=workspace_identity,
+        schedule_store=schedule_store,
         scheduled_agent=True,
-        now=now,
-        new_uuid=new_uuid,
-    )
-    tool_gateway = _build_tool_gateway(
-        agent_home=agent_home,
-        session=session,
-        web_search=configured_web_search,
-        web_fetch=configured_web_fetch,
-        shell=configured_shell,
-        schedule=schedule_tool,
     )
     tool_guidance = render_tool_guidance(tool_gateway.schemas)
 
@@ -579,7 +510,7 @@ def _prepare_repl_runtime(
             chat_max_output=chat_route.max_output,
             consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
             chat_system_prompt=system_prompt,
-            tools=tool_gateway.schemas,
+            tools=tuple(tool_gateway.schemas),
             now=now,
             new_uuid=new_uuid,
         )
@@ -611,16 +542,6 @@ def _prepare_repl_runtime(
             clock=scheduler_clock,
         )
     )
-
-    def schedule_gateway_for(active_session: Session) -> ToolGateway:
-        return _build_tool_gateway(
-            session=active_session,
-            agent_home=agent_home,
-            web_search=configured_web_search,
-            web_fetch=configured_web_fetch,
-            shell=configured_shell,
-            schedule=scheduled_schedule_tool,
-        )
 
     def externalize_result_for(active_session: Session) -> ToolResultExternalizer:
         return _build_tool_result_externalizer(
@@ -670,7 +591,7 @@ def _prepare_repl_runtime(
         now=now,
         new_uuid=new_uuid,
         system_prompt=system_prompt,
-        tool_gateway_for=schedule_gateway_for,
+        tool_gateway=scheduled_tool_gateway,
         externalize_result_for=externalize_result_for,
         memory_snapshot=runtime_memory.snapshot,
         system_prompt_for_memory=system_prompt_for,
@@ -701,14 +622,6 @@ def _prepare_repl_runtime(
         )
 
     def conversation_for(active_session: Session) -> ConversationPort:
-        session_tool_gateway = _build_tool_gateway(
-            session=active_session,
-            agent_home=agent_home,
-            web_search=configured_web_search,
-            web_fetch=configured_web_fetch,
-            shell=configured_shell,
-            schedule=schedule_tool,
-        )
         return _DeferredConversationPort(
             provider=router,
             session=active_session,
@@ -717,7 +630,7 @@ def _prepare_repl_runtime(
             new_uuid=new_uuid,
             system_prompt=system_prompt,
             title_prompt=session_title_prompt(),
-            tool_gateway=session_tool_gateway,
+            tool_gateway=tool_gateway,
             history_preparer=history_preparer_for(runtime_memory.snapshot()),
             memory_snapshot=runtime_memory.snapshot,
             system_prompt_for_memory=system_prompt_for,
@@ -741,7 +654,7 @@ def _prepare_repl_runtime(
             system_prompt=system_prompt_for(runtime_memory.snapshot()),
             current_time=now(),
             session_id=active_session.session_id,
-            tool_schemas=tool_gateway.schemas,
+            tool_schemas=tuple(tool_gateway.schemas),
         ),
         monotonic=monotonic_now,
         schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
@@ -766,49 +679,10 @@ def _prepare_repl_runtime(
         conversation=conversation,
         management_dispatcher=management_dispatcher,
         schedule_service=schedule_service,
-        _shell=owned_shell,
         _memory_scheduler=memory_scheduler,
         _router=router,
         _lifetime=_RuntimeLifetime(),
     )
-
-
-def _build_tool_gateway(
-    *,
-    agent_home: AgentHome,
-    session: Session,
-    web_search: WebSearchBoundary | None,
-    web_fetch: WebFetchBoundary | None,
-    shell: ShellBoundary | None,
-    schedule: ScheduleTool | None = None,
-) -> ToolGateway:
-    workspace_state = session.workspace_state
-    workspace = workspace_state.workspace
-    gateway = ToolGateway()
-    security = Security(
-        workspace=workspace,
-        agent_home=agent_home.path,
-        artifact_directory=session.artifact_directory,
-    )
-    tools: list[BaseTool] = [
-        ReadFileTool(workspace=workspace),
-        ListDirTool(workspace=workspace),
-        GlobTool(workspace=workspace),
-        GrepTool(workspace=workspace),
-        SearchFilesTool(security=security),
-        WriteFileTool(workspace=workspace),
-        EditFileTool(workspace=workspace),
-    ]
-    if web_search is not None:
-        tools.append(WebSearchTool(search=web_search))
-    if web_fetch is not None:
-        tools.append(WebFetchTool(fetcher=web_fetch))
-    if shell is not None:
-        tools.append(ShellTool(workspace=Path(workspace.path), boundary=shell))
-    if schedule is not None:
-        tools.append(schedule)
-    gateway.register_tools(tuple(tools))
-    return gateway
 
 
 def _build_tool_result_externalizer(

@@ -12,7 +12,8 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.tools.core.schedule import ScheduleTool
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall
+from tests.fixtures import SingleToolGateway
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
@@ -24,10 +25,8 @@ def _store(workspace: Path, agent_home: Path) -> WorkspaceScheduleStore:
     return WorkspaceScheduleStore(state)
 
 
-def _gateway(tool: ScheduleTool) -> ToolGateway:
-    gateway = ToolGateway()
-    gateway.register_tools((tool,))
-    return gateway
+def _gateway(tool: ScheduleTool) -> SingleToolGateway:
+    return SingleToolGateway((tool,))
 
 
 def test_schema_exposes_the_three_actions_and_optional_schedule_branches(

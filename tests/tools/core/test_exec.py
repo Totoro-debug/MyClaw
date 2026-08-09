@@ -15,8 +15,8 @@ from myclaw.tools.tool_gateway import (
     ConfirmationRequest,
     ConfirmationRequester,
     ModelToolCall,
-    ToolGateway,
 )
+from tests.fixtures import SingleToolGateway
 
 
 def _call(
@@ -102,11 +102,9 @@ def _gateway(
     *,
     resolver: DNSResolverBoundary | None = None,
     confirmation: ConfirmationRequester | None = None,
-) -> ToolGateway:
+) -> SingleToolGateway:
     tool = ExecTool(workspace=Workspace.from_path(workspace), resolver=resolver)
-    gateway = ToolGateway(confirmation=confirmation)
-    gateway.register_tools((tool,))
-    return gateway
+    return SingleToolGateway((tool,), confirmation=confirmation)
 
 
 def _fake_process_factory(
@@ -261,7 +259,6 @@ async def test_exec_requests_confirmation_for_destructive_commands(
     assert len(requests) == 1
     assert requests[0].tool_call_id == "destructive"
     assert requests[0].tool_name == "exec"
-    assert requests[0].turn_id is None
     assert "destructive" in requests[0].reason.lower()
 
 

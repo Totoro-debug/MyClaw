@@ -8,7 +8,7 @@ import pytest
 
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.tools.web.web_fetch import (
     HTTPResponseBoundary,
     PublicWebFetchBoundary,
@@ -16,6 +16,7 @@ from myclaw.tools.web.web_fetch import (
     WebFetchTool,
 )
 from myclaw.tools.web.web_search import WebSearchTool
+from tests.fixtures import SingleToolGateway
 
 SCHEMA_INVALID_API_KEY_ALIAS_CONFIG = """[models.providers.primary]
 protocol = "anthropic"
@@ -482,8 +483,7 @@ async def test_web_search_gateway_hides_secret_adapter_failure_and_raw_query(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    gateway = ToolGateway()
-    gateway.register_tools((WebSearchTool(search=SecretFailingWebSearch()),))
+    gateway = SingleToolGateway((WebSearchTool(search=SecretFailingWebSearch()),))
 
     result = await gateway.call(
         ModelToolCall(
@@ -505,8 +505,7 @@ async def test_web_fetch_gateway_hides_secret_adapter_failure_and_raw_url(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    gateway = ToolGateway()
-    gateway.register_tools((WebFetchTool(fetcher=SecretFailingWebFetch()),))
+    gateway = SingleToolGateway((WebFetchTool(fetcher=SecretFailingWebFetch()),))
 
     result = await gateway.call(
         ModelToolCall(

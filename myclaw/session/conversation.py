@@ -149,7 +149,7 @@ class StreamingConversationPort:
                 self._foreground_active = False
 
     async def _submit_turn(self, text: str, turn_id: UUID) -> AsyncGenerator[AgentEvent, None]:
-        confirmation = ConfirmationChannel(turn_id)
+        confirmation = ConfirmationChannel()
         self._confirmation = confirmation
         agent_run = self._agent_run
         if agent_run is None:
@@ -400,12 +400,11 @@ def _map_agent_run_payload(
         )
     if isinstance(payload, AgentRunConfirmationRequestedPayload):
         request = payload.request
-        confirmation_turn_id = turn_id if turn_id is not None else request.turn_id
-        if confirmation_turn_id is None:
+        if turn_id is None:
             raise RuntimeError("confirmation event is missing its Agent Run turn identity")
         return "confirmation_requested", ConfirmationRequestedPayload(
             confirmation_id=request.confirmation_id,
-            turn_id=confirmation_turn_id,
+            turn_id=turn_id,
             tool_call_id=request.tool_call_id,
             tool_name=request.tool_name,
             summary=request.summary,

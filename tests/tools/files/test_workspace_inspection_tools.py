@@ -8,7 +8,8 @@ from myclaw.tools.core.edit_file import EditFileTool
 from myclaw.tools.core.write_file import WriteFileTool
 from myclaw.tools.files.file_tools import SearchFilesTool
 from myclaw.tools.security import Security
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
+from myclaw.tools.tool_gateway import ModelToolCall
+from tests.fixtures import SingleToolGateway
 
 SESSION_ID = "20260727-120000-000000_550e8400-e29b-41d4-a716-446655440000"
 
@@ -137,8 +138,9 @@ def test_workspace_mutation_tools_export_exact_schemas_and_zero_retries(
 async def test_registered_catalog_executes_internal_workspace_mutations(workspace: Path) -> None:
     identity = Workspace.from_path(workspace)
     (workspace / "notes.txt").write_text("before", encoding="utf-8")
-    gateway = ToolGateway()
-    gateway.register_tools((WriteFileTool(workspace=identity), EditFileTool(workspace=identity)))
+    gateway = SingleToolGateway(
+        (WriteFileTool(workspace=identity), EditFileTool(workspace=identity))
+    )
 
     write_result = await gateway.call(
         ModelToolCall(
@@ -168,8 +170,7 @@ async def test_gateway_prepares_defaults_nullable_glob_and_ignores_unknown_argum
 ) -> None:
     (workspace / "alpha.txt").write_text("needle one\nneedle two\n", encoding="utf-8")
     search_files = _tools(agent_home=agent_home, workspace=workspace)
-    gateway = ToolGateway()
-    gateway.register_tools((search_files,))
+    gateway = SingleToolGateway((search_files,))
 
     search = await gateway.call(
         ModelToolCall(
@@ -193,8 +194,7 @@ async def test_workspace_state_is_omitted_and_rejected_by_listing_and_search(
     state_session.parent.mkdir(parents=True)
     state_session.write_text("isolation needle private\n", encoding="utf-8")
     search_files = _tools(agent_home=agent_home, workspace=workspace)
-    gateway = ToolGateway()
-    gateway.register_tools((search_files,))
+    gateway = SingleToolGateway((search_files,))
 
     search = await gateway.call(
         ModelToolCall(
@@ -234,8 +234,7 @@ async def test_gateway_rejects_invalid_search_contract_arguments(
     arguments: str,
 ) -> None:
     search_files = _tools(agent_home=agent_home, workspace=workspace)
-    gateway = ToolGateway()
-    gateway.register_tools((search_files,))
+    gateway = SingleToolGateway((search_files,))
 
     result = await gateway.call(
         ModelToolCall(
@@ -246,4 +245,4 @@ async def test_gateway_rejects_invalid_search_contract_arguments(
     )
 
     assert result.status == "error"
-    assert result.content == "Invalid arguments for search_files."
+    assert result.content.startswith("$.")

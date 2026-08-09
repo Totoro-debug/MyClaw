@@ -19,8 +19,8 @@ from myclaw.session.conversation import ChatModelSettings, StreamingConversation
 from myclaw.session.session import Session
 from myclaw.tools.core.edit_file import EditFileTool
 from myclaw.tools.core.write_file import WriteFileTool
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
-from tests.fixtures import ScriptedFakeProvider, StreamScript
+from myclaw.tools.tool_gateway import ModelToolCall
+from tests.fixtures import ScriptedFakeProvider, SingleToolGateway, StreamScript
 
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=timezone(timedelta(hours=8)))
 
@@ -83,9 +83,10 @@ async def test_foreground_mutations_execute_without_a_permission_pause(
             ),
         )
     )
-    gateway = ToolGateway()
     identity = Workspace.from_path(workspace)
-    gateway.register_tools((WriteFileTool(workspace=identity), EditFileTool(workspace=identity)))
+    gateway = SingleToolGateway(
+        (WriteFileTool(workspace=identity), EditFileTool(workspace=identity))
+    )
     conversation = StreamingConversationPort(
         provider=provider,
         session=session,

@@ -15,8 +15,8 @@ from myclaw.tools.tool_gateway import (
     ConfirmationRequest,
     ConfirmationRequester,
     ModelToolCall,
-    ToolGateway,
 )
+from tests.fixtures import SingleToolGateway
 
 
 def _call(name: str, arguments: dict[str, object], *, call_id: str = "call_1") -> ModelToolCall:
@@ -26,10 +26,8 @@ def _call(name: str, arguments: dict[str, object], *, call_id: str = "call_1") -
 def _gateway(
     *tools: BaseTool,
     confirmation: ConfirmationRequester | None = None,
-) -> ToolGateway:
-    gateway = ToolGateway(confirmation=confirmation)
-    gateway.register_tools(tools)
-    return gateway
+) -> SingleToolGateway:
+    return SingleToolGateway(tools, confirmation=confirmation)
 
 
 @pytest.mark.asyncio

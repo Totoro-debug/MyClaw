@@ -36,9 +36,8 @@ from myclaw.tools.tool_gateway import (
     ConfirmationPrompt,
     ConfirmationRequest,
     ModelToolCall,
-    ToolGateway,
 )
-from tests.fixtures import FakeTool, ScriptedFakeProvider, StreamScript
+from tests.fixtures import FakeTool, ScriptedFakeProvider, SingleToolGateway, StreamScript
 
 NOW = datetime(2026, 7, 18, 18, 30, 12, 123456, tzinfo=timezone(timedelta(hours=8)))
 REQUEST_UUID = UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
@@ -73,20 +72,23 @@ class _ConfirmingTool(BaseTool):
             details={"action": action},
         )
 
+    async def check_safety(self, *, action: str) -> str:  # type: ignore[override]
+        return f"Confirm action: {action}"
+
     async def execute(self, *, action: str) -> str:
         self.calls.append(action)
         return f"executed:{action}"
 
 
-class _ChangingSchemaGateway(ToolGateway):
-    def __init__(self) -> None:
-        super().__init__()
+class _ChangingSchemaGateway(SingleToolGateway):
+    def __init__(self, tools: tuple[BaseTool, ...]) -> None:
+        super().__init__(tools)
         self.schema_reads: list[int] = []
 
     @property
-    def schemas(self) -> tuple[OpenAIToolSchema, ...]:
+    def schemas(self) -> list[OpenAIToolSchema]:
         self.schema_reads.append(1)
-        return super().schemas if len(self.schema_reads) == 1 else ()
+        return super().schemas if len(self.schema_reads) == 1 else []
 
 
 class _BlockingStreamProvider:
@@ -118,16 +120,21 @@ class _BlockingConfirmedTool(_ConfirmingTool):
         super().__init__()
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
 
     async def execute(self, *, action: str) -> str:
         self.started.set()
-        await self.release.wait()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
         return await super().execute(action=action)
 
 
 class _BlockingConfirmationChannel(ConfirmationChannel):
     def __init__(self) -> None:
-        super().__init__(TURN_UUID)
+        super().__init__()
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
         self._release = asyncio.Event()
@@ -136,14 +143,12 @@ class _BlockingConfirmationChannel(ConfirmationChannel):
         self,
         request: ConfirmationRequest,
     ) -> ConfirmationDecision:
-        assert request.turn_id == self.turn_id
-        self.started.set()
         try:
-            await self._release.wait()
+            self.started.set()
+            return await super().__call__(request)
         except asyncio.CancelledError:
             self.cancelled.set()
             raise
-        return "approved"
 
 
 @pytest.mark.asyncio
@@ -315,8 +320,7 @@ async def test_agent_run_keeps_tool_and_terminal_order_for_chat(
             ),
         )
     )
-    gateway = ToolGateway()
-    gateway.register_tools(
+    gateway = SingleToolGateway(
         (
             FakeTool(
                 name="read_file",
@@ -411,13 +415,9 @@ async def test_agent_run_emits_confirmation_request_before_waiting_for_approval(
             ),
         )
     )
-    channel = ConfirmationChannel(TURN_UUID)
-    gateway = ToolGateway(
-        turn_id=TURN_UUID,
-        new_uuid=lambda: CONFIRMATION_UUID,
-    )
     tool = _ConfirmingTool()
-    gateway.register_tools((tool,))
+    channel = ConfirmationChannel()
+    gateway = SingleToolGateway((tool,))
     run = AgentRun(
         provider=provider,
         settings=_settings(),
@@ -437,12 +437,10 @@ async def test_agent_run_emits_confirmation_request_before_waiting_for_approval(
     assert (await anext(events)).type == "started"
     assert (await anext(events)).type == "tool_started"
     pending_confirmation = asyncio.create_task(anext(events))
-    request = await channel.next_request()
     confirmation_payload = await pending_confirmation
     assert confirmation_payload.type == "confirmation_requested"
     assert isinstance(confirmation_payload, AgentRunConfirmationRequestedPayload)
-    assert confirmation_payload.request == request
-    channel.respond_to_confirmation(request.confirmation_id, "approved")
+    channel.respond_to_confirmation(confirmation_payload.request.confirmation_id, "approved")
 
     remaining = [payload async for payload in events]
     assert [payload.type for payload in remaining] == ["tool_completed", "completed"]
@@ -496,10 +494,9 @@ async def test_agent_run_keeps_declined_confirmation_as_refused_tool_result(
             ),
         )
     )
-    channel = ConfirmationChannel(TURN_UUID)
-    gateway = ToolGateway(turn_id=TURN_UUID, new_uuid=lambda: CONFIRMATION_UUID)
     tool = _ConfirmingTool()
-    gateway.register_tools((tool,))
+    channel = ConfirmationChannel()
+    gateway = SingleToolGateway((tool,))
     run = AgentRun(
         provider=provider,
         settings=_settings(),
@@ -518,9 +515,9 @@ async def test_agent_run_keeps_declined_confirmation_as_refused_tool_result(
     assert (await anext(events)).type == "started"
     assert (await anext(events)).type == "tool_started"
     pending_confirmation = asyncio.create_task(anext(events))
-    request = await channel.next_request()
-    assert isinstance(await pending_confirmation, AgentRunConfirmationRequestedPayload)
-    channel.respond_to_confirmation(request.confirmation_id, "declined")
+    confirmation_payload = await pending_confirmation
+    assert isinstance(confirmation_payload, AgentRunConfirmationRequestedPayload)
+    channel.respond_to_confirmation(confirmation_payload.request.confirmation_id, "declined")
 
     remaining = [payload async for payload in events]
     assert [payload.type for payload in remaining] == ["tool_completed", "completed"]
@@ -793,8 +790,7 @@ async def test_agent_run_repairs_unfinished_tool_calls_on_cooperative_cancellati
             ),
         )
     )
-    gateway = ToolGateway()
-    gateway.register_tools(
+    gateway = SingleToolGateway(
         (
             FakeTool(
                 name="read_file",
@@ -866,8 +862,7 @@ async def test_agent_run_keeps_tool_order_for_schedule_completion(
             ),
         )
     )
-    gateway = ToolGateway()
-    gateway.register_tools(
+    gateway = SingleToolGateway(
         (
             FakeTool(
                 name="read_file",
@@ -942,8 +937,7 @@ async def test_agent_run_freezes_tool_schemas_for_all_model_requests(
             ),
         )
     )
-    gateway = _ChangingSchemaGateway()
-    gateway.register_tools(
+    gateway = _ChangingSchemaGateway(
         (
             FakeTool(
                 name="read_file",
@@ -1056,8 +1050,7 @@ async def test_memory_prompt_and_tool_schema_are_frozen_before_started_is_delive
     state.initialize(agent_home_root=agent_home)
     session = Session.create(state, now=lambda: NOW)
     provider = ScriptedFakeProvider()
-    gateway = _ChangingSchemaGateway()
-    gateway.register_tools(
+    gateway = _ChangingSchemaGateway(
         (FakeTool(name="read_file", description="Read a file.", outcomes=("contents",)),)
     )
     memory_reads = 0
@@ -1117,9 +1110,8 @@ async def test_noninteractive_schedule_refusal_does_not_emit_confirmation_reques
             ),
         )
     )
-    gateway = ToolGateway(turn_id=TURN_UUID, new_uuid=lambda: CONFIRMATION_UUID)
     tool = _ConfirmingTool()
-    gateway.register_tools((tool,))
+    gateway = SingleToolGateway((tool,))
     run = AgentRun(
         provider=provider,
         settings=_settings(),
@@ -1232,8 +1224,7 @@ async def test_consumer_close_cancels_confirmation_operation_before_returning(
         )
     )
     channel = _BlockingConfirmationChannel()
-    gateway = ToolGateway(turn_id=TURN_UUID, new_uuid=lambda: CONFIRMATION_UUID)
-    gateway.register_tools((_ConfirmingTool(),))
+    gateway = SingleToolGateway((_ConfirmingTool(),))
     persist_calls = 0
 
     def persist() -> None:
@@ -1269,7 +1260,7 @@ async def test_consumer_close_cancels_confirmation_operation_before_returning(
 
 
 @pytest.mark.asyncio
-async def test_approved_tool_result_is_recorded_before_task_cancellation_propagates(
+async def test_cancellation_after_approval_propagates_to_the_running_tool(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1300,10 +1291,9 @@ async def test_approved_tool_result_is_recorded_before_task_cancellation_propaga
             ),
         )
     )
-    channel = ConfirmationChannel(TURN_UUID)
-    gateway = ToolGateway(turn_id=TURN_UUID, new_uuid=lambda: CONFIRMATION_UUID)
     tool = _BlockingConfirmedTool()
-    gateway.register_tools((tool,))
+    channel = ConfirmationChannel()
+    gateway = SingleToolGateway((tool,))
     persist_calls = 0
 
     def persist() -> None:
@@ -1329,23 +1319,32 @@ async def test_approved_tool_result_is_recorded_before_task_cancellation_propaga
     assert (await anext(events)).type == "started"
     assert (await anext(events)).type == "tool_started"
     pending_confirmation = asyncio.create_task(anext(events))
-    request = await channel.next_request()
-    assert (await pending_confirmation).type == "confirmation_requested"
-    channel.respond_to_confirmation(request.confirmation_id, "approved")
+    confirmation_payload = await pending_confirmation
+    assert confirmation_payload.type == "confirmation_requested"
+    assert isinstance(confirmation_payload, AgentRunConfirmationRequestedPayload)
+    channel.respond_to_confirmation(confirmation_payload.request.confirmation_id, "approved")
     pending_tool = asyncio.create_task(anext(events))
     await tool.started.wait()
 
     pending_tool.cancel()
-    await asyncio.sleep(0)
-    assert not pending_tool.done()
-    tool.release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await pending_tool
+    try:
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if pending_tool.done():
+                break
+        assert pending_tool.done()
+    finally:
+        tool.release.set()
+        outcomes = await asyncio.gather(pending_tool, return_exceptions=True)
 
-    assert tool.calls == ["commit"]
+    assert isinstance(outcomes[0], asyncio.CancelledError)
+    assert tool.cancelled.is_set()
+    assert tool.calls == []
     assert [message["role"] for message in session.messages] == ["user", "assistant", "tool"]
-    assert session.messages[-1]["status"] == "success"
-    assert session.messages[-1]["content"] == "executed:commit"
+    assert session.messages[-1]["status"] == "error"
+    assert session.messages[-1]["content"] == (
+        "Tool call interrupted because the turn was cancelled."
+    )
     assert persist_calls == 1
 
 
@@ -1405,8 +1404,7 @@ async def test_tool_publication_failure_repairs_provider_order_with_failure_resu
             ),
         )
     )
-    gateway = ToolGateway()
-    gateway.register_tools(
+    gateway = SingleToolGateway(
         (FakeTool(name="read_file", description="Read a file.", outcomes=("contents",)),)
     )
     original_add_message = session.add_message

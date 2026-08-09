@@ -22,8 +22,8 @@ from myclaw.tools.tool_gateway import (
     ConfirmationRequest,
     ConfirmationRequester,
     ModelToolCall,
-    ToolGateway,
 )
+from tests.fixtures import SingleToolGateway
 
 
 def _call(arguments: dict[str, object], *, call_id: str = "call_fetch") -> ModelToolCall:
@@ -163,11 +163,9 @@ def _gateway(
     jina: JinaReaderBoundary | None = None,
     http: HTTPClientBoundary | None = None,
     confirmation: ConfirmationRequester | None = None,
-) -> ToolGateway:
+) -> SingleToolGateway:
     tool = WebFetchTool(resolver=resolver, jina_reader=jina, http_client=http)
-    gateway = ToolGateway(confirmation=confirmation)
-    gateway.register_tools((tool,))
-    return gateway
+    return SingleToolGateway((tool,), confirmation=confirmation)
 
 
 @pytest.fixture(autouse=True)

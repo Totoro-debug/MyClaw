@@ -601,6 +601,79 @@ async def test_required_memory_edit_failure_keeps_the_advanced_summary_cursor(
 
 
 @pytest.mark.asyncio
+async def test_unexpected_memory_tool_failure_is_logged_once_at_the_task_boundary(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
+    await summaries.append("A pending summary.", NOW)
+    memory_path = state.long_term_memory_path
+
+    async def fail_edit(
+        self: MemoryEditFileTool,
+        *,
+        path: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool,
+    ) -> str:
+        del self, path, old_text, new_text, replace_all
+        raise RuntimeError("PRIVATE unexpected memory failure")
+
+    monkeypatch.setattr(MemoryEditFileTool, "execute", fail_edit)
+    provider = ScriptedFakeProvider(
+        completions=(
+            _response(
+                "",
+                tool_calls=(
+                    ModelToolCall(
+                        id="unexpected-edit-memory",
+                        name="edit_file",
+                        arguments=json.dumps(
+                            {
+                                "path": str(memory_path),
+                                "old_text": "## User Info\n",
+                                "new_text": "## User Info\n\nUpdated.\n",
+                            }
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    manager = MemoryManager(
+        provider=provider,
+        summaries=summaries,
+        memory=WorkspaceFileMemoryStore(state),
+        long_term_path=memory_path,
+        settings=MemoryTaskModelSettings(
+            model="memory-model",
+            max_output=512,
+            temperature=0.0,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        batch_size=10,
+    )
+    capture = capture_diagnostics()
+
+    result = await manager.run_manual()
+    capture.close()
+
+    assert result.error == ErrorInfo(
+        code="tool_failed",
+        message="edit_file could not complete the request.",
+    )
+    assert capture.text.count(" ERROR ") == 1
+    assert "Memory Task failed code=tool_failed" in capture.text
+    assert "Tool execution failed name=edit_file" not in capture.text
+    assert "RuntimeError: PRIVATE unexpected memory failure" in capture.text
+
+
+@pytest.mark.asyncio
 async def test_conversation_summary_read_failure_is_logged_only_at_memory_task_boundary(
     agent_home: Path,
 ) -> None:

@@ -6,7 +6,7 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.events import ConfirmationRequestedPayload
+from myclaw.agent.events import ConfirmationRequestedPayload, ToolCompletedPayload
 from myclaw.agent.run import (
     AgentRunCompletedPayload,
     AgentRunConfirmationRequestedPayload,
@@ -36,9 +36,8 @@ from myclaw.tools.tool_gateway import (
     ConfirmationPrompt,
     ConfirmationRequest,
     ModelToolCall,
-    ToolGateway,
 )
-from tests.fixtures import ScriptedFakeProvider, StreamScript
+from tests.fixtures import ScriptedFakeProvider, SingleToolGateway, StreamScript
 
 NOW = datetime(2026, 8, 7, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -67,7 +66,6 @@ class _ScriptedAgentRun(AgentRunInterface):
         self.calls.append((session, input, route, stream, confirmation))
         request = ConfirmationRequest(
             confirmation_id=CONFIRMATION_UUID,
-            turn_id=TURN_UUID,
             tool_call_id="call_confirm",
             tool_name="schedule",
             summary="Add a Schedule Job",
@@ -116,6 +114,9 @@ class _ConfirmedTool(BaseTool):
     async def execute(self, *, message: str) -> str:
         self.calls.append(message)
         return "job-created"
+
+    async def check_safety(self, *, message: str) -> str:  # type: ignore[override]
+        return f"Confirm Schedule Job: {message}"
 
 
 @pytest.mark.asyncio
@@ -206,8 +207,7 @@ async def test_foreground_confirmation_reply_is_not_added_as_a_session_user_mess
             ),
         )
     )
-    gateway = ToolGateway()
-    gateway.register_tools((tool,))
+    gateway = SingleToolGateway((tool,))
     ids = iter(
         (
             TURN_UUID,
@@ -284,8 +284,7 @@ async def test_cancelling_a_foreground_confirmation_emits_cancelled_and_repairs_
             ),
         )
     )
-    gateway = ToolGateway()
-    gateway.register_tools((tool,))
+    gateway = SingleToolGateway((tool,))
     ids = iter((TURN_UUID, UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")))
     conversation = StreamingConversationPort(
         provider=provider,
@@ -309,7 +308,10 @@ async def test_cancelling_a_foreground_confirmation_emits_cancelled_and_repairs_
 
     await conversation.cancel_active_turn()
 
-    assert [event.type async for event in events] == ["turn_cancelled"]
+    observed = [event async for event in events]
+    assert [event.type for event in observed] == ["tool_completed", "turn_cancelled"]
+    assert isinstance(observed[0].payload, ToolCompletedPayload)
+    assert observed[0].payload.status == "error"
     assert [message["role"] for message in session.messages] == ["user", "assistant", "tool"]
     assert session.messages[-1]["status"] == "error"
     assert tool.calls == []

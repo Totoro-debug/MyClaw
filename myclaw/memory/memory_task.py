@@ -279,11 +279,7 @@ class MemoryManager:
         self._settings = settings
         self._batch_size = batch_size
         self._failure_diagnostic: Exception | None = None
-        self._tools = ToolGateway(
-            owns_terminal_failures=False,
-            on_terminal_failure=self._capture_terminal_failure,
-        )
-        self._tools.register_tools(
+        self._tools = ToolGateway._for_memory(
             (
                 MemoryReadFileTool(memory=memory, long_term_path=long_term_path),
                 MemoryEditFileTool(
@@ -291,7 +287,8 @@ class MemoryManager:
                     long_term_path=long_term_path,
                     runtime_memory=runtime_memory,
                 ),
-            )
+            ),
+            on_failure=self._capture_terminal_failure,
         )
         self._running = False
         self._running_cursor = 0
@@ -380,7 +377,7 @@ class MemoryManager:
                 route="memory",
                 system_prompt=memory_task_prompt(long_term_path=self._long_term_path),
                 messages=tuple(messages),
-                tools=self._tools.schemas,
+                tools=tuple(self._tools.schemas),
                 stream=False,
                 model=self._settings.model,
                 max_output=self._settings.max_output,
@@ -440,9 +437,10 @@ class MemoryManager:
         if self._failure_diagnostic is None:
             logger.error("Memory Task failed code={}", result.error.code)
             return
-        logger.opt(exception=self._failure_diagnostic).error(
-            "Memory Task failed code={}", result.error.code
-        )
+        diagnostic = self._failure_diagnostic
+        logger.opt(
+            exception=(type(diagnostic), diagnostic, diagnostic.__traceback__),
+        ).error("Memory Task failed code={}", result.error.code)
 
 
 def _state_read_failure(*, cursor: int) -> MemoryTaskResult:

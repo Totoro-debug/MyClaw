@@ -17,9 +17,8 @@ from myclaw.tools.tool_gateway import (
     ConfirmationRequest,
     ConfirmationRequester,
     ModelToolCall,
-    ToolConfirmationMetadata,
-    ToolGateway,
 )
+from tests.fixtures import SingleToolGateway
 
 
 def _call(name: str, arguments: dict[str, object], *, call_id: str = "call_1") -> ModelToolCall:
@@ -29,10 +28,8 @@ def _call(name: str, arguments: dict[str, object], *, call_id: str = "call_1") -
 def _gateway(
     *tools: BaseTool,
     confirmation: ConfirmationRequester | None = None,
-) -> ToolGateway:
-    gateway = ToolGateway(confirmation=confirmation)
-    gateway.register_tools(tools)
-    return gateway
+) -> SingleToolGateway:
+    return SingleToolGateway(tools, confirmation=confirmation)
 
 
 @pytest.mark.asyncio
@@ -331,8 +328,16 @@ async def test_external_confirmation_is_bound_to_the_exact_directory_call(
     assert refused.confirmation is not None
     request = refused.confirmation.request
 
+    async def approve(current: ConfirmationRequest) -> ConfirmationDecision:
+        return (
+            "approved"
+            if current.tool_call_id == request.tool_call_id
+            and current.tool_name == request.tool_name
+            else "declined"
+        )
+
     approved = await gateway.call(
         call,
-        confirmation=ToolConfirmationMetadata(request=request, decision="approved"),
+        confirmation=approve,
     )
     assert approved.status == "success"
