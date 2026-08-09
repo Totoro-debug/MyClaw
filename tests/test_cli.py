@@ -257,6 +257,24 @@ def test_installed_config_command_shows_safe_malformed_configuration(
     assert not (workspace / ".myclaw").exists()
 
 
+def test_installed_config_command_hides_invalid_utf8_and_traceback(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    agent_home.mkdir(parents=True)
+    config_path = agent_home / "config.toml"
+    config_path.write_bytes(b'api_key = "sk-invalid-utf8-secret"\ninvalid = "\xff"\n')
+
+    result = run_installed_myclaw(agent_home, "config", workspace=workspace)
+
+    visible = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "persistence_error" in result.stdout
+    assert f"Path: {config_path}" in result.stdout
+    assert "sk-invalid-utf8-secret" not in visible
+    assert "Traceback" not in visible
+
+
 def test_installed_config_command_keeps_undefined_content_inspectable(
     agent_home: Path,
     workspace: Path,
@@ -321,7 +339,11 @@ def test_installed_myclaw_stops_only_on_parse_failure(
     config_path.write_text(EXPECTED_DEFAULT_CONFIG, encoding="utf-8")
     default_result = run_installed_myclaw(agent_home, workspace=workspace)
 
-    assert (parse_result.returncode, schema_result.returncode, default_result.returncode) == (2, 0, 0)
+    assert (parse_result.returncode, schema_result.returncode, default_result.returncode) == (
+        2,
+        0,
+        0,
+    )
     assert "config_parse_error" in parse_result.stdout
     assert "config_invalid" not in schema_result.stdout
     assert "configuration gate passed" not in parse_result.stdout

@@ -368,13 +368,7 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
     home.initialize()
     state = WorkspaceState(Workspace.from_path(workspace))
     state.initialize(agent_home_root=Path.home() / ".myclaw")
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
@@ -405,13 +399,7 @@ async def test_each_prepared_runtime_starts_a_fresh_memory_scheduler(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     clock = ControlledClock(NOW)
 
     def prepare_runtime() -> PreparedReplRuntime:
@@ -500,7 +488,7 @@ def test_production_scheduler_clock_uses_the_rule_bearing_system_timezone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     zone = SpringForwardTimezone()
-    monkeypatch.setattr(scheduler_module, "get_localzone", lambda: zone)
+    monkeypatch.setattr(scheduler_module, "_system_timezone", lambda: zone)
     instants = iter(
         (
             datetime(2026, 3, 8, 6, 50, tzinfo=UTC),
@@ -526,6 +514,42 @@ def test_production_scheduler_clock_uses_the_rule_bearing_system_timezone(
     )
 
 
+def test_standard_library_system_timezone_adapter_resolves_each_instant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_zone = SpringForwardTimezone()
+
+    def host_local(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=host_zone)
+        return value.astimezone(host_zone)
+
+    monkeypatch.setattr(scheduler_module, "_host_local", host_local)
+    instants = iter(
+        (
+            datetime(2026, 3, 8, 6, 50, tzinfo=UTC),
+            datetime(2026, 3, 8, 7, 30, tzinfo=UTC),
+        )
+    )
+    clock = AsyncioSchedulerClock(now=lambda: next(instants))
+
+    before_transition = clock.now()
+    after_transition = clock.now()
+
+    assert (before_transition.hour, before_transition.minute, before_transition.utcoffset()) == (
+        1,
+        50,
+        timedelta(hours=-5),
+    )
+    assert before_transition.dst() == timedelta(0)
+    assert (after_transition.hour, after_transition.minute, after_transition.utcoffset()) == (
+        3,
+        30,
+        timedelta(hours=-4),
+    )
+    assert after_transition.dst() == timedelta(hours=1)
+
+
 @pytest.mark.asyncio
 async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
     agent_home: Path,
@@ -544,13 +568,7 @@ async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
         "## User Preference\n",
         "## User Preference\n\nPrefers concise status reports.\n",
     )
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("The user prefers concise status reports.", NOW)
     clock = ControlledClock(NOW)
@@ -636,13 +654,7 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
         "## User Preference\n",
         "## User Preference\n\nPrefers concise status reports.\n",
     )
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("The user prefers concise status reports.", NOW)
     first_started = asyncio.Event()
@@ -650,7 +662,10 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
 
     class SnapshotProvider(ScriptedFakeProvider):
         async def stream(self, request: object) -> AsyncIterator[ModelStreamEvent]:
-            if isinstance(request, ModelRequest) and request.system_prompt == session_title_prompt():
+            if (
+                isinstance(request, ModelRequest)
+                and request.system_prompt == session_title_prompt()
+            ):
                 raise ModelCallError(
                     ErrorInfo(code="model_failed", message="No title response was scripted.")
                 )
@@ -721,13 +736,7 @@ async def test_periodic_failure_is_isolated_and_all_periodic_results_stay_silent
     home.initialize()
     state = WorkspaceState(Workspace.from_path(workspace))
     state.initialize(agent_home_root=Path.home() / ".myclaw")
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(

@@ -1,6 +1,6 @@
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -26,9 +26,7 @@ from myclaw.provider.models import (
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.conversation import ChatModelSettings
 from myclaw.session.session import Session
-from myclaw.tools.shell.shell_tool import ShellRequest, SubprocessShellBoundary
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
-from myclaw.tools.web.web_fetch import PublicWebFetchBoundary
+from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics
@@ -130,76 +128,6 @@ class ScriptedInput:
         return self._values.popleft()
 
 
-class TerminatingProcess:
-    def __init__(self) -> None:
-        self.communicate_started = asyncio.Event()
-        self._stopped = asyncio.Event()
-        self.terminated = False
-        self.waited = False
-
-    async def communicate(self) -> tuple[bytes, bytes | None]:
-        self.communicate_started.set()
-        await self._stopped.wait()
-        return b"stopped", None
-
-    async def terminate(self) -> None:
-        self.terminated = True
-        self._stopped.set()
-
-    async def wait(self) -> None:
-        self.waited = True
-
-
-class OneProcessSpawner:
-    def __init__(self, process: TerminatingProcess) -> None:
-        self._process = process
-
-    async def spawn(self, command: tuple[str, ...], *, cwd: Path) -> TerminatingProcess:
-        del command, cwd
-        return self._process
-
-
-class StaticPublicResolver:
-    async def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
-        del hostname, port
-        return ("93.184.216.34",)
-
-
-class BlockingHTTPResponse:
-    status_code = 200
-    headers: Mapping[str, str] = {"content-type": "text/plain; charset=utf-8"}
-    peer_ip: str | None = "93.184.216.34"
-
-    def __init__(self) -> None:
-        self.body_started = asyncio.Event()
-        self.closed = asyncio.Event()
-
-    async def iter_bytes(self) -> AsyncIterator[bytes]:
-        self.body_started.set()
-        await asyncio.Event().wait()
-        if False:
-            yield b""
-
-    async def close(self) -> None:
-        self.closed.set()
-
-
-class OneResponseHTTPClient:
-    def __init__(self, response: BlockingHTTPResponse) -> None:
-        self._response = response
-
-    async def get(
-        self,
-        url: str,
-        *,
-        allowed_ips: frozenset[str],
-        connect_timeout_seconds: float,
-        total_timeout_seconds: float,
-    ) -> BlockingHTTPResponse:
-        del url, allowed_ips, connect_timeout_seconds, total_timeout_seconds
-        return self._response
-
-
 @pytest.mark.asyncio
 async def test_partial_scheduler_start_failure_closes_the_started_memory_loop(
     agent_home: Path,
@@ -207,16 +135,7 @@ async def test_partial_scheduler_start_failure_closes_the_started_memory_loop(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.web]\nenabled = false",
-            "[tools.web]\nenabled = false",
-        ).replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     memory_clock = BlockingSchedulerClock()
     runtime = prepare_repl_runtime(
         agent_home=home,
@@ -247,13 +166,7 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,
@@ -292,13 +205,7 @@ async def test_normal_repl_exit_closes_the_runtime_model_provider(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -340,13 +247,7 @@ async def test_normal_eof_and_exit_shutdown_do_not_create_diagnostic_log(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,
@@ -375,13 +276,7 @@ async def test_prepared_runtime_rejects_a_second_repl_invocation(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,
@@ -400,76 +295,6 @@ async def test_prepared_runtime_rejects_a_second_repl_invocation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.skip(reason="Legacy Shell boundary injection is superseded by the fixed Exec Tool.")
-async def test_runtime_close_still_reaps_shell_when_provider_close_fails(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    class FailingCloseProvider(ScriptedFakeProvider):
-        async def close(self) -> None:
-            self.closed = True
-            raise RuntimeError("PRIVATE_PROVIDER_CLOSE_BODY_52")
-
-    home = AgentHome(agent_home)
-    home.initialize()
-    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    provider = FailingCloseProvider(
-        streams=(
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(content="Ready."),
-                            usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
-                            finish_reason="stop",
-                        )
-                    ),
-                )
-            ),
-        )
-    )
-    process = TerminatingProcess()
-    shell = SubprocessShellBoundary(spawner=OneProcessSpawner(process))
-    runtime = prepare_repl_runtime(  # type: ignore[call-arg]
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _configuration: provider,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-        shell=shell,
-    )
-    _ = [event async for event in runtime.conversation.submit("Construct the provider.")]
-    shell_execution = asyncio.create_task(
-        shell.execute(ShellRequest(command="git status", cwd=workspace, timeout=60))
-    )
-    await process.communicate_started.wait()
-    log_capture = capture_diagnostics()
-    state = WorkspaceState(Workspace.from_path(workspace))
-    ambient_session_id = _session_id()
-
-    try:
-        with session_log(state, ambient_session_id):
-            with pytest.raises(RuntimeError, match="PRIVATE_PROVIDER_CLOSE_BODY_52"):
-                await runtime.close()
-
-        assert shell_execution.done()
-        assert process.terminated
-        assert process.waited
-    finally:
-        await shell.close()
-        await asyncio.gather(shell_execution, return_exceptions=True)
-        log_capture.close()
-
-    assert not (state.logs_directory / f"{ambient_session_id}.log").exists()
-    content = log_capture.text
-    assert content.count(" ERROR ") == 1
-    marker = "Runtime shutdown failed type=RuntimeError"
-    assert content.count(marker) == 1
-    assert "RuntimeError: PRIVATE_PROVIDER_CLOSE_BODY_52" in content
-
-
-@pytest.mark.asyncio
 async def test_runtime_run_preserves_the_primary_error_when_cleanup_also_fails(
     agent_home: Path,
     workspace: Path,
@@ -481,13 +306,7 @@ async def test_runtime_run_preserves_the_primary_error_when_cleanup_also_fails(
 
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     provider = FailingCloseProvider(
         streams=(
             StreamScript(
@@ -528,13 +347,7 @@ async def test_external_runtime_close_waits_for_the_repl_and_input_to_stop(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,
@@ -561,13 +374,7 @@ async def test_writer_failure_finishes_runtime_shutdown_without_task_leaks(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -605,80 +412,6 @@ async def test_writer_failure_finishes_runtime_shutdown_without_task_leaks(
     await asyncio.sleep(0)
 
     assert provider.closed
-    assert asyncio.all_tasks() == baseline
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="Legacy Web Fetch boundary injection is superseded by the fixed Catalog.")
-async def test_runtime_close_waits_for_an_active_web_fetch_response_to_close(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.web]\nenabled = false",
-            "[tools.web]\nenabled = true",
-        ).replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
-    response = BlockingHTTPResponse()
-    fetch = PublicWebFetchBoundary(
-        resolver=StaticPublicResolver(),
-        http_client=OneResponseHTTPClient(response),
-    )
-    provider = ScriptedFakeProvider(
-        streams=(
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(
-                                content="",
-                                tool_calls=(
-                                    ModelToolCall(
-                                        id="call-web-fetch",
-                                        name="web_fetch",
-                                        arguments='{"url":"https://example.com/resource"}',
-                                    ),
-                                ),
-                            ),
-                            usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
-                            finish_reason="tool_calls",
-                        )
-                    ),
-                )
-            ),
-        )
-    )
-    runtime = prepare_repl_runtime(  # type: ignore[call-arg]
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _configuration: provider,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-        web_fetch=fetch,
-    )
-    baseline = asyncio.all_tasks()
-    running = asyncio.create_task(
-        runtime.run(
-            input_reader=ScriptedInput(("Fetch the resource.",)),
-            writer=SilentWriter(),
-        )
-    )
-    await asyncio.wait_for(response.body_started.wait(), timeout=1)
-
-    await runtime.close()
-    await asyncio.gather(running, return_exceptions=True)
-    await asyncio.sleep(0)
-
-    assert response.closed.is_set()
-    assert running.done()
     assert asyncio.all_tasks() == baseline
 
 
@@ -1070,13 +803,7 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
 
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     provider = InterruptibleProvider()
     memory_clock = BlockingSchedulerClock()
     scheduled_clock = BlockingSchedulerClock()

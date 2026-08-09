@@ -34,7 +34,7 @@ from myclaw.tools.schema import Schema, ToolParam, parameter
 from myclaw.utils.json_types import JsonObject, JsonValue
 from myclaw.utils.validation import require_nonnegative_int
 
-_METADATA_NAMES = frozenset({"name", "description", "required", "max_retries", "parameters"})
+_METADATA_NAMES = frozenset({"name", "description", "required", "parameters"})
 _CLASS_VAR_ORIGIN: object = ClassVar
 _MISSING = object()
 _INVALID_SCHEMA_MARKER = "__schema_declaration_invalid__"
@@ -138,7 +138,7 @@ def is_public_ip(value: str) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
-class ToolPreparation:
+class PreparedToolCall:
     """The normalized arguments and optional safety reason for one Tool call."""
 
     arguments: JsonObject
@@ -207,14 +207,11 @@ class BaseTool(ABC):
     name: ClassVar[str]
     description: ClassVar[str]
     required: ClassVar[tuple[str, ...]] = ()
-    max_retries: ClassVar[int] = 0
-    confirmation_summary: ClassVar[str | None] = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
         if "to_schema" in cls.__dict__:
             raise TypeError("Concrete Tools cannot override BaseTool.to_schema()")
-        _validate_retry_count(cls)
         execute = cls.__dict__.get("execute")
         if execute is not None:
             _validate_execute(execute)
@@ -338,11 +335,9 @@ class BaseTool(ABC):
             ),
         )
 
-    def prepare(self, arguments: JsonObject) -> Any:
+    @final
+    async def prepare(self, arguments: JsonObject) -> PreparedToolCall:
         """Return the final asynchronous cast, validation, and safety pipeline."""
-        return self._prepare_pipeline(arguments)
-
-    async def _prepare_pipeline(self, arguments: JsonObject) -> ToolPreparation:
         casted = self.parameters.cast(arguments)
         if not isinstance(casted, dict):
             raise ToolError("Tool arguments must be an object.")
@@ -369,14 +364,10 @@ class BaseTool(ABC):
             safety = await safety
         if safety is not None and not isinstance(safety, str):
             raise TypeError("Tool safety checks must return a string reason or None")
-        return ToolPreparation(
+        return PreparedToolCall(
             arguments=normalized,
             safety_reason=safety if isinstance(safety, str) else None,
         )
-
-    def confirmation_finished(self) -> None:
-        """Temporary bridge for the current Gateway confirmation lifecycle."""
-        return None
 
     def validate_arguments(self, **arguments: Any) -> Any:
         """Validate normalized Tool-specific arguments before safety checks.
@@ -423,12 +414,6 @@ class BaseTool(ABC):
                 "parameters": schema.to_json_schema(),
             },
         }
-
-
-def _validate_retry_count(tool_type: type[object]) -> None:
-    retries = getattr(tool_type, "max_retries", 0)
-    if isinstance(retries, bool) or not isinstance(retries, int) or not 0 <= retries <= 5:
-        raise TypeError("Tool max_retries must be an integer from zero through five")
 
 
 def _has_legacy_declaration(tool_type: type[object], execute: object) -> bool:
@@ -625,10 +610,10 @@ __all__ = [
     "BaseTool",
     "OpenAIFunctionSchema",
     "OpenAIToolSchema",
+    "PreparedToolCall",
     "Schema",
     "ToolError",
     "ToolParam",
-    "ToolPreparation",
     "ToolResultContent",
     "is_public_ip",
     "is_workspace_path",

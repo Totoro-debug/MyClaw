@@ -74,7 +74,9 @@ class SwitchableConversationPort:
         if self._active_delegate is not None:
             await self._active_delegate.cancel_active_turn()
 
-    def respond_to_confirmation(self, confirmation_id: UUID, decision: ConfirmationDecision) -> None:
+    def respond_to_confirmation(
+        self, confirmation_id: UUID, decision: ConfirmationDecision
+    ) -> None:
         delegate = self._active_delegate
         if delegate is None:
             raise ValueError("No foreground confirmation request is pending")

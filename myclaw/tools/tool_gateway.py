@@ -19,8 +19,8 @@ from myclaw.tools.base import (
     ArtifactReference,
     BaseTool,
     OpenAIToolSchema,
+    PreparedToolCall,
     ToolError,
-    ToolPreparation,
 )
 from myclaw.tools.core.edit_file import EditFileTool
 from myclaw.tools.core.exec import ExecTool
@@ -324,7 +324,7 @@ class ToolGateway:
 
         try:
             preparation = await tool.prepare(cast(JsonObject, parsed))
-            if not isinstance(preparation, ToolPreparation):
+            if not isinstance(preparation, PreparedToolCall):
                 raise TypeError("Tool preparation returned an invalid value")
         except asyncio.CancelledError:
             raise
@@ -429,9 +429,7 @@ class ToolGateway:
     ) -> ConfirmationPrompt:
         provider = getattr(tool, "confirmation_prompt", None)
         if provider is None:
-            provider = getattr(tool, "confirmation_request", None)
-        if provider is None:
-            summary = tool.confirmation_summary or f"Confirm {tool.name}"
+            summary = f"Confirm {tool.name}"
             return ConfirmationPrompt(
                 summary=summary[:240],
                 details=deepcopy(normalized),
@@ -443,7 +441,7 @@ class ToolGateway:
             prompt = await cast(Awaitable[object], prompt)
         if prompt is None:
             return ConfirmationPrompt(
-                summary=(tool.confirmation_summary or f"Confirm {tool.name}")[:240],
+                summary=f"Confirm {tool.name}"[:240],
                 details=deepcopy(normalized),
                 reason=reason,
             )

@@ -195,9 +195,7 @@ class ConversationSummaryManager:
                 )
             )
         token_triggered = (
-            estimate_input_tokens(
-                self._chat_input(session, system_prompt=effective_system_prompt)
-            )
+            estimate_input_tokens(self._chat_input(session, system_prompt=effective_system_prompt))
             >= available_input
         )
         message_triggered = len(short_term) >= self._message_threshold

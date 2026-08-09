@@ -82,11 +82,8 @@ def test_package_initializers_do_not_create_aggregate_import_entries() -> None:
     assert violations == []
 
 
-def test_host_selection_is_confined_to_the_three_native_deep_modules() -> None:
-    expected = {
-        Path("myclaw/tools/shell/owned_process.py"),
-        Path("myclaw/utils/host_filesystem.py"),
-    }
+def test_host_selection_is_confined_to_the_workspace_filesystem_adapter() -> None:
+    expected = {Path("myclaw/utils/host_filesystem.py")}
     actual = {
         path.relative_to(PROJECT_ROOT)
         for path in _python_files(PACKAGE_ROOT)
@@ -100,3 +97,20 @@ def test_host_selection_is_confined_to_the_three_native_deep_modules() -> None:
     }
 
     assert actual == expected
+
+
+def test_superseded_tool_modules_are_absent() -> None:
+    removed = (
+        Path("myclaw/tools/files/__init__.py"),
+        Path("myclaw/tools/files/file_tools.py"),
+        Path("myclaw/tools/security.py"),
+        Path("myclaw/tools/shell/__init__.py"),
+        Path("myclaw/tools/shell/owned_process.py"),
+        Path("myclaw/tools/shell/shell_tool.py"),
+        Path("myclaw/tools/web/__init__.py"),
+        Path("myclaw/tools/web/web_fetch.py"),
+        Path("myclaw/tools/web/web_search.py"),
+        Path("myclaw/tools/tool_artifacts.py"),
+    )
+
+    assert all(not (PROJECT_ROOT / path).exists() for path in removed)

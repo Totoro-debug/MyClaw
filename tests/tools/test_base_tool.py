@@ -165,6 +165,7 @@ def test_base_tool_is_abstract_and_parameter_decorator_injects_root_schema() -> 
             return text
 
     assert inspect.isabstract(BaseTool)
+    assert not hasattr(BaseTool, "_prepare_pipeline")
     assert not inspect.isabstract(DecoratedTool)
     assert DecoratedTool.parameters == declared
     assert DecoratedTool().to_schema()["function"]["parameters"] == declared.to_json_schema()

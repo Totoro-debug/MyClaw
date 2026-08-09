@@ -207,8 +207,7 @@ def test_strict_load_rejects_duplicate_keys_and_duplicate_job_ids(workspace: Pat
     assert raised.value.error.to_dict() == {
         "code": "schedule_state_error",
         "message": (
-            "Schedule state could not be loaded. Repair or move the file, then start MyClaw "
-            "again."
+            "Schedule state could not be loaded. Repair or move the file, then start MyClaw again."
         ),
         "retryable": False,
         "retry_after_seconds": None,

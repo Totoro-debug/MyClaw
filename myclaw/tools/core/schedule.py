@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import Annotated, cast
+from typing import cast
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -13,7 +13,8 @@ from croniter import croniter  # type: ignore[import-untyped]
 
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.store import ScheduleStaleRemovalError, WorkspaceScheduleStore
-from myclaw.tools.base import BaseTool, ToolError, ToolParam, ToolPreparation
+from myclaw.tools.base import BaseTool, ToolError
+from myclaw.tools.schema import Schema
 from myclaw.utils.json_types import JsonObject
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_uuid4_string
@@ -26,41 +27,85 @@ _STATE_UPDATE_FAILED = "Schedule state could not be updated."
 _TIMEZONE_FAILED = "Schedule timezone could not be resolved."
 
 
+class _ScheduleArgumentsSchema(Schema):
+    """Keep action-irrelevant Schedule fields out of schema casting."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "object",
+            properties={
+                "action": Schema.string(
+                    description="The exact action: add, list, or remove.",
+                    min_length=1,
+                ),
+                "message": Schema.string(
+                    description="The message to run for an added Schedule Job.",
+                    nullable=True,
+                    default=None,
+                ),
+                "every_seconds": Schema.integer(
+                    description="Run again this many seconds after completion.",
+                    minimum=1,
+                    nullable=True,
+                    default=None,
+                ),
+                "cron_expr": Schema.string(
+                    description="A canonical five-field Cron expression.",
+                    nullable=True,
+                    default=None,
+                ),
+                "timezone": Schema.string(
+                    description="The IANA timezone for a Cron expression.",
+                    nullable=True,
+                    default=None,
+                ),
+                "at_time": Schema.string(
+                    description="An absolute ISO time with a UTC offset.",
+                    nullable=True,
+                    default=None,
+                ),
+                "job_id": Schema.string(
+                    description="The canonical UUID4 of a Job to remove.",
+                    nullable=True,
+                    default=None,
+                ),
+            },
+            required=("action",),
+        )
+
+    def cast(self, value: object) -> object:
+        if not isinstance(value, dict):
+            return super().cast(value)
+
+        action = value.get("action")
+        projected: dict[str, object] = {"action": action}
+        if action == "remove":
+            job_id = value.get("job_id")
+            if job_id is not None:
+                projected["job_id"] = job_id
+        elif action == "add":
+            message = value.get("message")
+            if message is not None:
+                projected["message"] = message
+            for schedule_name in ("every_seconds", "cron_expr", "at_time"):
+                schedule_value = value.get(schedule_name)
+                if schedule_value is None:
+                    continue
+                projected[schedule_name] = schedule_value
+                if schedule_name == "cron_expr":
+                    timezone = value.get("timezone")
+                    if timezone is not None:
+                        projected["timezone"] = timezone
+                break
+        return super().cast(projected)
+
+
 class ScheduleTool(BaseTool):
     """Add, list, and remove user-owned Schedule Jobs."""
 
     name = "schedule"
     description = "Manage one-time and recurring Schedule Jobs."
-    required = ("action",)
-
-    action: Annotated[
-        str,
-        ToolParam(description="The exact action: add, list, or remove.", min_length=1),
-    ]
-    message: Annotated[
-        str | None,
-        ToolParam(description="The message to run for an added Schedule Job."),
-    ] = None
-    every_seconds: Annotated[
-        int | None,
-        ToolParam(description="Run again this many seconds after completion.", minimum=1),
-    ] = None
-    cron_expr: Annotated[
-        str | None,
-        ToolParam(description="A canonical five-field Cron expression."),
-    ] = None
-    timezone: Annotated[
-        str | None,
-        ToolParam(description="The IANA timezone for a Cron expression."),
-    ] = None
-    at_time: Annotated[
-        str | None,
-        ToolParam(description="An absolute ISO time with a UTC offset."),
-    ] = None
-    job_id: Annotated[
-        str | None,
-        ToolParam(description="The canonical UUID4 of a Job to remove."),
-    ] = None
+    parameters = _ScheduleArgumentsSchema()
 
     def __init__(
         self,
@@ -78,36 +123,6 @@ class ScheduleTool(BaseTool):
         self._scheduled_agent = scheduled_agent
         self._now: Callable[[], datetime] = (lambda: datetime.now(UTC)) if now is None else now
         self._new_uuid: Callable[[], UUID] = uuid4 if new_uuid is None else new_uuid
-
-    async def prepare(self, arguments: JsonObject) -> ToolPreparation:
-        """Project action-relevant fields before the common preparation pipeline."""
-        action = arguments.get("action")
-        if not isinstance(action, str):
-            effective: JsonObject = {"action": action}
-        elif action == "list":
-            effective = {"action": action}
-        elif action == "remove":
-            effective = {"action": action}
-            job_id = arguments.get("job_id")
-            if job_id is not None:
-                effective["job_id"] = job_id
-        elif action != "add":
-            effective = {"action": action}
-        else:
-            effective = {"action": action}
-            message = arguments.get("message")
-            if message is not None:
-                effective["message"] = message
-            for schedule_name in ("every_seconds", "cron_expr", "at_time"):
-                value = arguments.get(schedule_name)
-                if value is not None:
-                    effective[schedule_name] = value
-                    if schedule_name == "cron_expr":
-                        timezone = arguments.get("timezone")
-                        if timezone is not None:
-                            effective["timezone"] = timezone
-                    break
-        return await self._prepare_pipeline(effective)
 
     def validate_arguments(  # type: ignore[override]
         self,

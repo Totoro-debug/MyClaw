@@ -6,8 +6,6 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
-from myclaw.tools.base import ToolError
-from myclaw.tools.security import Security
 
 EXPECTED_MEMORY = (
     "# Long-term Memory\n\n## User Info\n\n## User Preference\n\n## Project Fact\n\n## Lesson\n"
@@ -16,6 +14,15 @@ EXPECTED_MEMORY = (
 
 def state_for(workspace: Path) -> WorkspaceState:
     return WorkspaceState(Workspace.from_path(workspace))
+
+
+def create_directory_alias(alias: Path, target: Path) -> None:
+    subprocess.run(
+        ("cmd", "/c", "mklink", "/J", str(alias), str(target)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_initialization_rejects_agent_home_as_workspace(
@@ -82,12 +89,7 @@ def test_initialization_rejects_case_and_junction_aliases_of_agent_home(
     user_home = agent_home.parent
     case_alias = Path(str(user_home).swapcase())
     junction_alias = tmp_path / "user-home-junction"
-    subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(junction_alias), str(user_home)],
-        capture_output=True,
-        check=True,
-        text=True,
-    )
+    create_directory_alias(junction_alias, user_home)
 
     for workspace in (case_alias, junction_alias):
         with pytest.raises(WorkspaceStateError):
@@ -169,22 +171,6 @@ def test_copying_a_complete_workspace_retains_its_workspace_state(
     assert not (copied_workspace / agent_home.name / "config.toml").exists()
 
 
-def test_generic_file_security_rejects_workspace_state(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    state = state_for(workspace)
-    state.initialize(agent_home_root=agent_home)
-    security = Security(
-        workspace=state.workspace,
-        agent_home=agent_home,
-        artifact_directory=state.sessions_directory / "artifacts" / "session",
-    )
-
-    with pytest.raises(ToolError, match="Workspace State"):
-        security.resolve_read_path(str(state.long_term_memory_path))
-
-
 def test_initialization_rejects_non_directory_root(
     agent_home: Path,
     workspace: Path,
@@ -208,12 +194,7 @@ def test_initialization_rejects_junction_root(
     root = workspace / ".myclaw"
     target = tmp_path / "outside-junction"
     target.mkdir()
-    subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(root), str(target)],
-        capture_output=True,
-        check=True,
-        text=True,
-    )
+    create_directory_alias(root, target)
 
     with pytest.raises(WorkspaceStateError) as captured:
         state_for(workspace).initialize(agent_home_root=agent_home)
@@ -221,3 +202,49 @@ def test_initialization_rejects_junction_root(
     assert captured.value.path == root
     assert root.is_junction()
     assert not (target / "memory").exists()
+
+
+def test_initialization_rejects_external_memory_directory_alias(
+    workspace: Path,
+) -> None:
+    state = state_for(workspace)
+    state.path.mkdir()
+    outside = workspace.parent / "outside-memory"
+    outside.mkdir()
+    create_directory_alias(state.memory_directory, outside)
+
+    with pytest.raises(WorkspaceStateError) as captured:
+        state.initialize(agent_home_root=Path.home() / ".myclaw")
+
+    assert captured.value.path == state.memory_directory
+    assert not (outside / "memory.md").exists()
+
+
+def test_initialization_rejects_external_sessions_directory_alias(
+    workspace: Path,
+) -> None:
+    state = state_for(workspace)
+    state.path.mkdir()
+    outside = workspace.parent / "outside-sessions"
+    outside.mkdir()
+    create_directory_alias(state.sessions_directory, outside)
+
+    with pytest.raises(WorkspaceStateError) as captured:
+        state.initialize(agent_home_root=Path.home() / ".myclaw")
+
+    assert captured.value.path == state.sessions_directory
+
+
+def test_initialization_rejects_hard_linked_memory_file(workspace: Path) -> None:
+    state = state_for(workspace)
+    state.memory_directory.mkdir(parents=True)
+    outside = workspace.parent / "outside-memory.md"
+    protected_content = b"outside memory must remain unchanged\n"
+    outside.write_bytes(protected_content)
+    state.long_term_memory_path.hardlink_to(outside)
+
+    with pytest.raises(WorkspaceStateError) as captured:
+        state.initialize(agent_home_root=Path.home() / ".myclaw")
+
+    assert captured.value.path == state.long_term_memory_path
+    assert outside.read_bytes() == protected_content

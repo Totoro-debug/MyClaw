@@ -66,7 +66,7 @@ class _ConfirmingTool(BaseTool):
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def confirmation_request(self, *, action: str) -> ConfirmationPrompt:
+    async def confirmation_prompt(self, *, action: str) -> ConfirmationPrompt:
         return ConfirmationPrompt(
             summary=f"Run {action}",
             details={"action": action},

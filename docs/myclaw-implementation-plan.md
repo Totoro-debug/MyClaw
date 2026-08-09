@@ -10,6 +10,12 @@
 4. `docs/adr/0002-fixed-agent-home.md`：固定 `~/.myclaw/` 与 User Configuration ownership。
 5. `docs/adr/0005-store-workspace-state-in-workspace.md` 与 `docs/adr/0009-active-session-snapshot-persistence.md`：Workspace State layout、active Session authority 和 snapshot persistence。
 
+Issue #130 supersedes the Tool sections of this historical plan. For the current
+Tool contract use `CONTEXT.md`, the `TOOL_SCHEMA` section in
+`docs/myclaw-runtime-contracts.md`, and ADR-0010; the fixed Catalog has no
+enablement configuration, Security module, generic Tool retry, Shell allowlist,
+owned-process adapter, or separate Artifact module.
+
 需求基线是提交 `d6b6e00` 及工作区中 PRD 对 GitHub issue 链接的后续更新。开始编码前应把本计划与当前 canonical 文档一起确认；后续需求变化必须先更新对应文档，再调整实现和测试。
 
 首版完成的判断标准不是“模块都已创建”，而是以下用户路径能够在隔离环境中端到端运行：
@@ -47,12 +53,10 @@ myclaw/
   session/             # active Session、Conversation 与 resume
   terminal/            # Typer CLI、REPL 与 foreground interrupts
   tools/
-    models.py          # Tool 定义、调用、结果与执行上下文
-    artifacts.py       # ArtifactReference 与文件名编码
-    ports.py           # Tool Protocol
-    files/             # Workspace 文件读写工具
-    shell/             # Shell policy、process 与 Tool adapter
-    web/               # WebSearch 与 WebFetch
+    base.py            # BaseTool、Schema-derived declarations、Artifact handling
+    schema.py          # Restricted recursive Tool Schema
+    tool_gateway.py    # Fixed Catalog and sole invocation boundary
+    core/              # Ten flat concrete Core Tools
   utils/               # JSON 类型、通用校验、时间格式与 atomic file helpers
 tests/
   agent/               # Agent Event 约束
@@ -75,7 +79,7 @@ tests/
 CLI -> Conversation Port / Management Port -> Runtime Core
 Runtime Core -> active Session / Memory Manager / Model Router / Tool Gateway
 Model Router -> Provider Adapter
-Tool Gateway -> Permission Policy / Built-in Tools / Artifact Store
+Tool Gateway -> BaseTool / Schema / fixed Core Tools
 Schedulers -> Runtime Core or Memory Manager
 Persistence adapters -> Workspace State paths and atomic persistence helpers
 ```
@@ -122,7 +126,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 - session metadata 与 user/assistant/tool JSONL 的精确 schema，包括 interrupted/error 和 artifact reference 的表达。
 - Schedule state 根 JSON 文件名为 `schedule.json`；legacy scheduled-work state 原样保留且不读取、不迁移、不删除。
 - 内置 file tools 的名称和参数 schema，以及哪些 Agent Home 路径允许主 Agent 读取。
-- Shell 极小只读 allowlist 的精确命令和参数判定规则。
+- Exec 的单次 Bash、destructive/DNS safety checks 和 Workspace cwd 规则。
 - WebSearch 的实际后端、凭据和 normalized result schema。
 - token estimate 的算法及 `/status` 中“估算 token 状态”的展示口径。
 - Session title fallback 的截断长度和 Unicode/空白处理。
@@ -216,26 +220,26 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ### 目标
 
-形成可扩展但边界固定的 agent tool loop，先交付风险较低的文件能力和统一权限/结果处理。
+形成边界固定的 agent tool loop，交付十工具 Catalog 和 BaseTool 统一结果处理。
 
 ### 实现任务
 
 1. 实现 Tool Catalog、参数 schema 校验、tool resolution、Tool Confirmation 与 normalized result。
 2. Runtime Core 支持 assistant content 与 tool calls 共存，按协议持久化 assistant/tool messages，并继续模型循环直到 final output。
 3. 实现 tool activity 和 `confirmation_requested` Agent Events；默认只显示工具名与状态摘要，不泄露完整参数/结果。
-4. 实现 file read/list/search，并固定拒绝 Workspace create/write/edit；路径在操作前规范化并检查 symlink/reparse 后的真实边界。
-5. 主 Agent 对 config、memory、sessions、summary、cursor 和 Schedule state 内部文件的写入一律拒绝；越界 fail closed，不升级为 confirmation。
-6. Schedule add/remove 的前台 Tool Confirmation 阻塞当前 Agent Run；批准或拒绝不增加独立 history，非交互 Schedule Agent Run 自动拒绝。其他 refused capability 不进入确认流程。
-7. 工具异常、参数错误和拒绝都转换为 tool result；Tool Gateway 执行 concrete Tool 声明的有界 retry，取消继续向上传播。
-8. 超过 `max_tool_result_chars` 的原始结果原子写入 Tool Artifact，session 保存引用和截断 preview。
+4. 实现固定 file Tools；路径在操作前规范化，Workspace State 与其他 Workspace 路径同样服从操作系统权限，外部目标请求确认。
+5. Exec 使用单次 Bash、Workspace cwd 和 destructive/DNS safety checks；不提供 allowlist 或 OS sandbox。
+6. Schedule add/list/remove 不请求确认；Scheduled Agent Run 拒绝 add，仍允许 list/remove。
+7. 工具异常、参数错误和拒绝都转换为 flat Tool Result；Tool Gateway 不执行 generic Tool retry，取消继续向上传播。
+8. 超过 `max_tool_result_chars` 的原始结果由 BaseTool 直接以 UTF-8 写入 `.myclaw/artifacts/<session>/<id>.txt`，session 保存引用和受限 prefix preview。
 9. 中断时保留已完成 messages，并把未完成 tool calls 物化为 tool error results，使 session 可恢复。
 
 ### 测试与退出条件
 
-- file allow/refused/error 矩阵完整覆盖 Workspace、允许读取的状态别名、内部写保护、`..`、symlink/reparse 和不存在目标的父目录。
+- file access/error 矩阵完整覆盖 Workspace（含 Workspace State）、外部确认、`..`、symlink/reparse 和不存在目标的父目录。
 - tool call 参数错误和执行失败只执行一次；assistant/tool 关联 ID 可完整恢复。
-- Schedule confirmation 接受、拒绝、非交互自动拒绝的事件和 session 历史符合要求。
-- 阈值边界、artifact 路径、原始内容、preview、atomicity 和随 session 恢复均通过测试。
+- Schedule add/list/remove 无确认、scheduled add refusal 和 session 历史符合要求。
+- 阈值边界、合法/回退 artifact 路径、原始内容、preview、写失败和随 session 恢复均通过测试。
 - streaming 中断和 tool execution 中断后，JSONL 仍是合法、语义完整的对话。
 
 ## 10. Phase 5：真实 Provider、Shell 与 Web 工具
@@ -249,17 +253,17 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 1. 使用官方 Anthropic SDK 实现 adapter，转换 streaming text、tool use、usage、timeout、retry-after 和错误类别。
 2. 使用官方 OpenAI SDK 实现 openai-compatible adapter，支持 required base URL、streaming、tool calls、usage 和错误转换。
 3. provider 不支持 reasoning effort 时静默忽略；chat 强制 streaming，memory/schedule 允许非 streaming。
-4. 实现 Shell tool：配置 enablement、Workspace cwd、60-600 秒 timeout、固定只读 allowlist和非 allowlist refusal；安全终止超时/取消的子进程。
-5. 实现 WebSearch adapter 和 normalized results；配置关闭时不进入 catalog。
+4. 实现 Exec Tool：Workspace cwd、1-600 秒 timeout、destructive/DNS checks 和单次 Bash；不提供 allowlist 或 process-tree ownership。
+5. 实现 WebSearch adapter 和 normalized results；始终属于固定 Catalog。
 6. 实现 WebFetch：仅公网 HTTP(S)、DNS/IP 校验、阻止 localhost/private/link-local、每次 redirect 重新校验、最多 5 次跳转、响应大小/超时限制。
-7. web/shell enablement 同时作用于前台 chat 和 Schedule Jobs 的 catalog 组装。
+7. 固定 Catalog 同时服务前台 chat 和 Schedule Jobs；不读取 Tool enablement 配置。
 8. 增加可选的手工真实 API smoke tests，必须通过环境标志显式启用，默认测试套件仍完全离线。
 
 ### 测试与退出条件
 
 - 用 fake SDK/client contract tests 覆盖两类 adapter 的 stream、mixed content/tool calls、usage、timeout、retryable/permanent error。
 - 验证 route 层负责 5 次 model retry，而 adapter 与 Tool Gateway 不重复 retry。
-- Shell 覆盖 allowlist、refusal、cwd 边界、timeout 下限/上限、超时和 Ctrl+C 的进程清理。
+- Exec 覆盖 cwd 边界、destructive/DNS confirmation、timeout 下限/上限、超时和 Ctrl+C 的直接进程清理。
 - WebFetch 覆盖直接私网、DNS 解析到私网、公开 URL 重定向到私网、循环/超过 5 次重定向。
 - 至少各完成一次 Anthropic 与 OpenAI-compatible 的人工 streaming 冒烟；若无凭据，记录为发布前待执行项，不让单元测试依赖凭据。
 
@@ -300,7 +304,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 ### 实现任务
 
 1. 实现 `schedule.json` strict array Store、schema 校验、copy-on-write 与 atomic replacement；损坏 state 在 scheduler/REPL 前阻止启动。
-2. 实现 `schedule` Tool 的 add/list/remove：支持 at/every/cron，add/remove 通过 Tool Confirmation，list 只返回 user Job。
+2. 实现 `schedule` Tool 的 add/list/remove：支持 at/every/cron，三种 action 不请求 Tool Confirmation，Scheduled Agent context 拒绝 add。
 3. 每个 Job 创建并复用 `schedule_<job_id>` Schedule Session，首次产生消息时写入 `schedule-sessions/` 分区。
 4. 每次触发通过共享 Agent Run 的 `schedule` route 执行，注入启动时 Memory snapshot，保存完整 Session history。
 5. 每个 Job 在单 runtime 内加运行态 guard；重叠 trigger 跳过，不实现跨进程去重。
@@ -311,7 +315,7 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 ### 测试与退出条件
 
-- 创建确认接受后只写一次，拒绝和非交互 confirmation refusal 不写；JSON array 的并发写在单 runtime 内串行。
+- add/list/remove 不等待确认且 JSON array 的并发写在单 runtime 内串行。
 - at/every/cron trigger、Schedule Session 归属、schedule route/fallback、Long-term Memory snapshot 和 final result 持久化正确。
 - 同 Job 不重入，不同 Job 可并发；多 runtime 不协调的行为不被测试成强保证。
 - legacy scheduled-work state 无论内容或 path type 都保持原样，且不被读取、检测、迁移或删除。
@@ -327,9 +331,9 @@ Phase 0 至 Phase 2 是第一条 tracer bullet；完成后已经具备真实 CLI
 
 1. 建立“48 条 User Stories -> 测试/演示”的追踪矩阵，以及“Required tests -> 测试文件”的反向索引。
 2. 在 Windows x64 发布候选上运行完整测试，重点核对路径、原子 replace、subprocess cancellation 和终端中断行为。
-3. 执行安全复核：路径穿越与 symlink、Agent Home 内部写保护、Shell policy、SSRF/redirect、secret redaction、artifact 泄露面。
+3. 执行安全复核：路径穿越与 symlink、Workspace State access、Exec destructive/DNS checks、SSRF/redirect、secret redaction、artifact 泄露面。
 4. 执行故障注入：磁盘写失败、损坏 JSONL/TOML/JSON、provider 连续失败、网络超时、取消发生在 stream/tool/metadata update 各阶段。
-5. 执行 REPL 手工验收：首次配置、streaming、Schedule 确认/拒绝、resume、长对话 consolidation、`/dream`、Schedule 静默后台执行和退出清理。
+5. 执行 REPL 手工验收：首次配置、streaming、Schedule add/list/remove、resume、长对话 consolidation、`/dream`、Schedule 静默后台执行和退出清理。
 6. 补齐安装、配置、Agent Home 文件说明、已知限制和故障排查文档；明确 API key 是 plaintext 风险。
 7. 确认打包元数据、版本展示、license、console entry point 和干净环境安装。
 8. 输出首版已知风险：多 REPL 重复调度、同 session 跨进程并发、Long-term Memory 无大小上限、artifact 不自动清理。

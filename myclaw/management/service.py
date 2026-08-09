@@ -207,11 +207,7 @@ class RuntimeStatusService:
             session_message_count=len(session.messages),
             last_consolidated=session.last_consolidated,
             cumulative_usage=_active_session_usage(session),
-            schedule=(
-                None
-                if self._schedule_status is None
-                else dict(self._schedule_status())
-            ),
+            schedule=(None if self._schedule_status is None else dict(self._schedule_status())),
         )
 
 

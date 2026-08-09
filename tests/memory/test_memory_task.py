@@ -199,7 +199,8 @@ def test_memory_tools_export_common_schemas_with_zero_retries(agent_home: Path) 
             },
         },
     }
-    assert read_tool.max_retries == edit_tool.max_retries == 0
+    assert not hasattr(read_tool, "max_retries")
+    assert not hasattr(edit_tool, "max_retries")
 
 
 @pytest.mark.asyncio
@@ -930,13 +931,7 @@ async def test_runtime_dream_uses_memory_route_with_static_default_fallback(
     home.initialize()
     state = WorkspaceState(Workspace.from_path(workspace))
     state.initialize(agent_home_root=Path.home() / ".myclaw")
-    (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
-            "[tools.shell]\nenabled = true",
-            "[tools.shell]\nenabled = false",
-        ),
-        encoding="utf-8",
-    )
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     configuration = ConfigLoader(home).load()
     summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("The user prefers concise status reports.", NOW)

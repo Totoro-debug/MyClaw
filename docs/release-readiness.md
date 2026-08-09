@@ -7,15 +7,17 @@ This is the current evidence index for GitHub issues
 architecture gate [#92](https://github.com/Totoro-debug/myclaw/issues/92), and the
 Schedule end-to-end gate [#117](https://github.com/Totoro-debug/myclaw/issues/117),
 which completes parent issue [#104](https://github.com/Totoro-debug/myclaw/issues/104).
-The active platform decision is [ADR-0007](adr/0007-use-host-adapters.md), which
-supersedes ADR-0006 without rewriting that historical Windows-only decision.
+The active Tool boundary decision is [ADR-0010](adr/0010-fixed-tool-catalog-and-base-tool-boundaries.md),
+which supersedes the affected parts of ADR-0003, ADR-0005, and ADR-0007 without
+rewriting those historical decisions.
 
 ## Release Contract
 
 - The installed command enters the Typer application directly with no platform gate,
   operating-system version check, or architecture allowlist.
 - Packaging emits exactly one pure-Python `py3-none-any` wheel containing the
-  filesystem and owned-process adapters plus the Loguru Session Log dependency.
+  filesystem adapter and direct Exec implementation plus the Loguru Session Log
+  dependency; no owned-process Tool adapter is part of the package.
 - Windows x64 is the currently validated environment.
 - macOS Intel and Apple Silicon are intended compatibility targets but remain
   unverified until the same suite and installed-wheel smoke run natively there.
@@ -41,7 +43,7 @@ supersedes ADR-0006 without rewriting that historical Windows-only decision.
 | Workspace State | Native identity, ownership, containment, redirection, and persistence suites | PASS |
 | Active Session | JSONL replacement, lazy materialization, snapshot ordering, silent failure, close retry, and status vocabulary | PASS |
 | Session Log | Workspace path safety, routing, rotation, retention, terminal behavior, failure isolation, and drain suites | PASS |
-| Shell lifecycle | Direct argv, trusted Git, Windows Job, POSIX process group, cancellation, and shutdown suites | PASS |
+| Exec lifecycle | Direct Bash, safety confirmation, cancellation, and shutdown suites | PASS |
 | Schedule and shared Agent Run | Runtime composition E2E plus Schedule model, Store, Tool, Service, Session, Summary, and Memory suites | PASS |
 | CLI and package | Direct Typer entry, clean universal tag, clean installation, dependency check, and Unicode smoke | PASS |
 | Complete Windows gate | Full warning-strict pytest, repository Ruff lint, strict Mypy, clean artifact rebuild, and final clean install | PASS |
@@ -59,8 +61,8 @@ Artifact identity, host details, exact commands, and final counts are recorded i
 - Ordinary Session persistence has no acknowledgement or failure logging; a crash can
   lose the latest turn, and Conversation Summary can diverge from `last_consolidated`.
 - Existing Session schemas are unsupported; no migration or version dispatch is provided.
-- Shell command policy and owned-process cleanup are not an operating-system
-  filesystem or network sandbox.
+- Exec command checks and direct-process cleanup are not an operating-system
+  filesystem, network, or process sandbox.
 
 ## Session Log Accepted Risks
 

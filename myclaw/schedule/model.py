@@ -29,9 +29,7 @@ _JOB_FIELDS = frozenset(
         "updated_at_ms",
     }
 )
-_SCHEDULE_FIELDS = frozenset(
-    {"kind", "at_time", "every_seconds", "cron_expr", "timezone"}
-)
+_SCHEDULE_FIELDS = frozenset({"kind", "at_time", "every_seconds", "cron_expr", "timezone"})
 _STATE_FIELDS = frozenset({"last_finished_at_ms", "last_status", "last_error"})
 _RFC3339_MILLISECONDS = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
@@ -62,7 +60,11 @@ class JobSchedule:
         if self.at_time is not None:
             raise ValueError(f"{self.kind} Schedule must not select at_time")
         if self.kind == "every":
-            if self.every_seconds is None or self.cron_expr is not None or self.timezone is not None:
+            if (
+                self.every_seconds is None
+                or self.cron_expr is not None
+                or self.timezone is not None
+            ):
                 raise ValueError("every Schedule must select only every_seconds")
             require_nonnegative_int(self.every_seconds, field="schedule.every_seconds")
             if self.every_seconds < 1:

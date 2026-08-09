@@ -108,7 +108,7 @@ class _ConfirmedTool(BaseTool):
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def confirmation_request(self, *, message: str) -> ConfirmationPrompt:
+    async def confirmation_prompt(self, *, message: str) -> ConfirmationPrompt:
         return ConfirmationPrompt(summary="Create a Schedule Job", details={"message": message})
 
     async def execute(self, *, message: str) -> str:

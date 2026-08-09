@@ -14,7 +14,7 @@
 - 每个有效 REPL 启动准备一个新的 Workspace-scoped Conversation Session；未发送用户消息就退出时不持久化空 session。
 - Runtime Core 通过 Conversation Port、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界编排 Agent Run。
 - Agent Home 固定为 `~/.myclaw/`，采用 file-first persistence。
-- REPL 支持 streaming、后台 Memory Task、Schedule Jobs、session resume 和管理 slash commands；Schedule Job add/remove 使用独立 Tool Confirmation，其余 capability 仍遵循各自的 fail-closed policy。
+- REPL 支持 streaming、后台 Memory Task、Schedule Jobs、session resume 和管理 slash commands；Schedule actions 不请求 Tool Confirmation，Exec、Web 和 Workspace 外部路径按具体目标执行一次性确认。
 - 首版非交互管理只支持 `myclaw config`，不支持 one-shot 对话。
 
 ## User Stories
@@ -32,7 +32,7 @@
 11. 作为个人用户，我想主对话始终 streaming，所以能及时看到模型输出。
 12. 作为个人用户，我想 Ctrl+C 只取消当前 turn，所以后台任务不会被误取消。
 13. 作为个人用户，我想输入 `exit` 或 `quit` 退出 REPL，所以退出行为明确。
-14. 作为个人用户，我想 `/config` 查看当前配置，所以可以确认模型和工具设置。
+14. 作为个人用户，我想 `/config` 查看当前配置，所以可以确认 runtime 和模型设置。
 15. 作为个人用户，我想 API key 在配置输出中默认脱敏，所以终端内容不会轻易泄露密钥。
 16. 作为个人用户，我想 `/status` 查看版本、chat model、运行时间、token 和 session 状态，所以可以理解当前 runtime 状况。
 17. 作为个人用户，我想 `/memory` 完整查看最新磁盘 Long-term Memory，所以可以知道 Agent 保存了什么。
@@ -44,10 +44,10 @@
 23. 作为个人用户，我想原始 session 消息仍保留，所以摘要不会破坏历史可追溯性。
 24. 作为个人用户，我想长期记忆只在模型判断需要时更新，所以不会每次后台任务都产生无意义修改。
 25. 作为个人用户，我想文件读取、列举和搜索默认可用，所以 Agent 能理解 Workspace。
-26. 作为个人用户，我想当前版本直接拒绝文件新建和编辑，所以 Agent 不会静默修改项目。
-27. 作为个人用户，我想 Shell 只默认放行极小内置只读命令列表，所以命令执行有清晰安全边界。
+26. 作为个人用户，我想 Workspace 内文件新建和编辑默认可用、外部路径精确确认，所以项目修改边界清晰可见。
+27. 作为个人用户，我想 Exec 对 destructive 命令和非公网 URL 目标请求精确确认，所以命令执行有清晰安全边界。
 28. 作为个人用户，我想 WebSearch 和 WebFetch 默认可用，所以 Agent 能访问公网资料。
-29. 作为个人用户，我想 WebFetch 阻止本地和私有网络，所以本机及内网服务不会被默认访问。
+29. 作为个人用户，我想 WebFetch 对本地、私有网络和 DNS 失败目标请求精确确认，所以这些目标不会被默认访问。
 30. 作为个人用户，我想大型工具结果存为 Tool Artifact，所以 session 和上下文不会被大结果撑爆。
 31. 作为个人用户，我想 Tool Artifact 随 session 保留，所以恢复旧 session 时仍能读取完整结果。
 32. 作为个人用户，我想通过自然语言创建 at、every 或 cron Schedule Job，所以无需手写状态文件。
@@ -63,7 +63,7 @@
 42. 作为开发者，我想 Runtime Core 只负责编排，所以具体模型、工具和存储实现可以替换。
 43. 作为开发者，我想 Conversation Port 输出 typed Agent Events，所以 CLI 只负责交互和渲染。
 44. 作为开发者，我想 Management Port 处理管理命令，所以管理操作不会伪装成聊天。
-45. 作为开发者，我想 Tool Gateway 统一解析、prepare、拒绝、执行、重试和结果封装，所以工具行为保持一致。
+45. 作为开发者，我想 Tool Gateway 统一解析、prepare、拒绝、单次执行和结果封装，所以工具行为保持一致。
 46. 作为开发者，我想 provider adapter 使用官方 SDK，所以 streaming、tool calls 和错误语义更可控。
 47. 作为开发者，我想用 fake provider 和 fake tool 测试，所以自动化测试不依赖真实 API。
 48. 作为开发者，我想首版不支持 MCP 和 subagent，所以能先稳定核心 runtime 边界。
@@ -102,7 +102,7 @@
 - Agent Home 固定为 `~/.myclaw/`，不支持覆盖或多个 profile。
 - 有效 REPL 启动在当前 Workspace 创建 `.myclaw/`、`memory/`、`sessions/` 和 Long-term Memory template；`myclaw config` 只处理 Agent Home。
 - 技术诊断按 Conversation Session 写入 Workspace-owned Session Log；不维护 Agent Home 或 Workspace 级全局 Runtime Log。
-- 所有 Workspace State 写入必须满足各自的原子性契约；Conversation Session 在 turn 完成后以完整 JSONL snapshot 一次 replacement。
+- 每种 Workspace State 写入遵守自身明确的持久化契约；只有声明 atomic replacement 的 Store 承诺原子发布，Tool Artifact 直接写入。Conversation Session 在 turn 完成后以完整 JSONL snapshot 一次 replacement。
 - User Configuration 位于 `~/.myclaw/config.toml`。
 - Long-term Memory 位于 `<workspace>/.myclaw/memory/memory.md`。
 - Conversation Summary 位于 `<workspace>/.myclaw/memory/summary.jsonl`。
@@ -157,7 +157,7 @@
 - 需要编辑且成功时推进 cursor；编辑失败时不推进。
 - Memory Task 在单 runtime 内不重入：周期触发遇到运行中任务则跳过，`/dream` 遇到运行中任务则拒绝并提示。
 - 周期 Memory Task 成功或失败都不通知 REPL；手动 `/dream` 输出摘要状态。
-- 主 Agent 可读取 Long-term Memory，但不能编辑 Long-term Memory、User Configuration 或 Agent Home 内部状态文件。
+- 主 Agent 的固定 file Tools 可访问 Workspace 内全部路径，包括 Workspace State；实际文件结果服从操作系统权限。Memory Task 仍只使用它的专用 Long-term Memory Tool。
 - Conversation Summary 在 global summary lock 内完成自己的 summary stream operation 后直接更新 active Session 的 `last_consolidated`；没有 pending journal 或启动恢复协议。crash 后 Summary 与 Session snapshot 可 divergence，且不提供跨进程协调。
 
 ### Model routing and providers
@@ -180,12 +180,11 @@
 
 ### User Configuration
 
-- TOML 顶层围绕 runtime、models、memory、tools 组织。
+- TOML 顶层围绕 runtime、models、memory 组织；Tool Catalog 不进入 User Configuration。
 - Provider 使用 `[models.providers.<provider_id>]`。
 - Route 使用 `[models.routes.<route>]`。
-- Tool enablement 使用 `[tools.web] enabled = true` 与 `[tools.shell] enabled = true`，两者默认启用。
-- User Configuration 只控制 web/shell enablement；Tool 的 fail-closed 安全与 refusal 规则是内置行为，不对用户开放。
-- 配置严格拒绝未知顶层 table、未知已知-schema 字段和未知 route；未知 protocol provider 仍按既定规则忽略。
+- User Configuration 不控制 Tool enablement；固定十工具 Catalog 始终可用。
+- Runtime loading 投影掉未知顶层 table、未知字段和未知 route；`myclaw config` 报告这些未定义字段，未知 protocol provider 仍按既定规则忽略。
 - 配置缺失时，只创建一个 ID 为 `openai-local` 的 OpenAI-compatible provider 模板（base URL、API key 和 model list 为空），并为 `default`、`chat`、`memory`、`schedule` 创建显式但不可用的 route 待填写段；四个 route 初始都引用 `openai-local`。随后退出并提示用户替换 Provider、model 和模型限制，或删除不需要定制的具体 route 以回退到 default；旧配置完全缺少 default route 时，错误消息必须指出 `[models.routes.default]`。
 - OpenAI-compatible provider 模板的 base_url 为空；所有 provider 的有效配置都要求 base_url。
 - `myclaw config` 在配置缺失时创建默认配置并显示脱敏内容。
@@ -196,32 +195,27 @@
 
 - 所有 capability 都是具体 `BaseTool`；Runtime Core 在启动时注入稳定依赖并将完整 Tool Catalog 一次性注册到 Tool Gateway。
 - `BaseTool.to_schema()` 从直接公开注解、显式 required、默认值和 `ToolParam` 生成 OpenAI Function Calling schema；Model Request 保存缓存的 typed snapshot，Anthropic adapter 在内部转换。
-- `ToolGateway.call()` 是唯一公开入口，负责 raw JSON 解析、参数 projection/安全转换/schema 校验、显式 refusal、Tool Confirmation、执行、有界重试和扁平 Tool Result 封装；没有 per-call execution context 或 approval flag。
+- `ToolGateway.call()` 是唯一公开入口，负责 raw JSON 解析、调用 BaseTool 固定 cast/Schema/参数/安全管线、一次性 Tool Confirmation、执行和扁平 Tool Result 封装；没有 dynamic registration、plugin/MCP、generic retry、per-call execution context 或 approval flag。
 - `ModelToolCall.arguments` 保留原始 JSON string；Tool Result 仅含 call ID、name、status、content 和可选 artifact/confirmation metadata，不含 nested error。
-- WebSearch/WebFetch 各允许 2 次重试，其余内置 Tool 为 0；取消继续向上传播。Tool Gateway 不设置统一 timeout、不持久化结果、不创建 artifact。
-- 公共路径与网络边界由注入的 `Security` 实现，capability-specific 规则保留在具体 Tool。
+- Tool 执行不重试，取消继续向上传播；Tool Gateway 不设置统一 timeout、不持久化结果、不持有 Workspace。
+- 没有独立 `Security` 模块；公共路径、DNS、截断和 Artifact 能力由 BaseTool 或共享 helper 提供，capability-specific 规则保留在具体 Tool。
 - Tool Gateway 不序列化前台和后台工具调用。
 - File read/list/search 默认 allow。
-- Workspace 内新建文件和编辑已有文件固定 refused。
-- 主 Agent 不可编辑 config、memory、Session、Summary、Summary Cursor、Schedule state 等 Workspace State 或 Agent Home 内部文件。
-- File access 越过 Workspace 和允许的 Agent Home 范围时 fail closed。
-- Shell 与 Web 可由配置启用/禁用；开关同时适用于前台 chat 和 Schedule Jobs。
-- Shell cwd 可指定，但必须位于 Workspace 内。
-- Shell timeout 由模型请求，代码强制限制在 60–600 秒。
-- Shell allowlist 只接受 `pwd`、`git status`、`git status --short`、`git diff --stat`、`git diff --name-only` 五种精确命令形状，用户不能扩展；其他命令在前台和后台均 refused。
-- 首版 Shell 强制 cwd 位于 Workspace，但不宣称提供 OS 级文件系统或网络隔离；固定拒绝非 allowlist 命令是 #38 对 ADR-0003 前台确认规则的已批准临时偏离。
+- Workspace 内新建文件和编辑已有文件直接执行，实际结果服从操作系统权限；解析到 Workspace 外的路径请求一次性确认。
+- Exec cwd 默认 Workspace，timeout 范围为 1–600 秒；它执行单次 Bash，没有 allowlist、persistent process 或 OS sandbox。
+- Exec 对已知 destructive 命令形状及 URL DNS/private-target 风险请求确认。
 - WebSearch 无额外首版限制，使用无凭据的内置 adapter，首选 DuckDuckGo；实际后端不进入持久化配置契约。
-- WebFetch 阻止 localhost、私有网段和 link-local 地址。
+- WebFetch 对 DNS 失败、localhost、私有网段和其他非公网地址请求一次性确认；没有确认通道或拒绝时 refused。
 - WebFetch 最多跟随 5 次重定向，并对每个目标重新执行地址检查。
-- Schedule add/remove 在前台通过 `confirmation_requested` Agent Event 和 Conversation Port 的独立 response interface 完成一次性确认；非交互 Schedule Agent Run 收到普通 refused Tool Result。File write/edit、非 allowlist Shell 和其他被禁止的 capability 不升级为确认。
+- Schedule add/list/remove 不请求确认；Scheduled Agent context 拒绝 add，但允许 list/remove。Exec、Web 和 Workspace 外部路径才使用精确绑定的一次性确认。
 
 ### Tool Artifacts
 
-- Runtime Core 只在成功工具结果超过 `max_tool_result_chars = 50000` 时外部化；error 和 refused 保持 inline。
-- Artifact 路径为 `<workspace>/.myclaw/sessions/artifacts/<session_id>/<tool_call_id>.txt`。
-- Artifact 保存原始工具结果，必须原子写入。
-- Session tool message 保存 artifact 引用和前 2000 个 Unicode code points 的截断 preview；原始 immutable Tool Result 不被修改。
-- tool call ID 含文件系统不安全字符时，Artifact 文件名使用 UTF-8 percent-encoding，逻辑 tool_call_id 保持不变。
+- BaseTool 只在成功工具结果严格超过 `max_tool_result_chars = 4096` 时外部化；error 和 refused 保持 inline。
+- Artifact 路径为 `<workspace>/.myclaw/artifacts/<session_id>/<id>.txt`；合法 ASCII call ID 直接使用，其他 ID 使用 UUID4。
+- Artifact 保存原始工具结果，直接 UTF-8 写入并允许覆盖，不执行 atomic/identity/rollback/cleanup。
+- Session tool message 保存 artifact 引用和受 4096 字符限制的 prefix-plus-marker preview；写失败保留成功状态并返回受限失败 marker。
+- 合法的 ASCII tool call ID 直接作为 Artifact 文件名；其他 ID 使用 UUID4，逻辑 `tool_call_id` 保持不变。
 - Artifact 随 session 保留，首版不自动清理。
 - Artifact 没有 commit、rollback、callback 或 ownership lifecycle；写入后若 Session persistence 失败，允许留下 orphan file。
 
@@ -230,7 +224,7 @@
 - Schedule Job 是自然语言 Agent 任务，不是 shell cron job。
 - Schedule state 是 Workspace-owned 的严格 JSON 数组，字段为 `job_id`、`source`、`message`、`schedule`、`state`、`created_at_ms` 和 `updated_at_ms`。
 - Schedule 支持 `at`、`every` 和 `cron`；Cron Job 固化 IANA timezone，at 使用带 UTC offset 的绝对时间。
-- User Job 通过 `schedule` Tool 的 add、list、remove action 管理；add 和 remove 需要 Tool Confirmation。
+- User Job 通过 `schedule` Tool 的 add、list、remove action 管理；三种 action 都不请求 Tool Confirmation，Scheduled Agent context 拒绝 add。
 - 每个 Job 使用由 `schedule_<job_id>` 派生的 Schedule Session，并使用专属 `schedule-sessions/` 分区；该 Session 不出现在 `/resume`。
 - Schedule Service 是唯一的 Job dispatcher，所有触发都通过共享 Agent Run 使用 `schedule` route，结果保留在 Schedule Session。
 - 同一 Job 在单 runtime 内不重入；不同 Job 可并发；不做跨进程协调，因此多个 runtime 可能重复触发。
@@ -269,12 +263,12 @@
 
 ### Required tool tests
 
-- File 默认权限、内部文件写保护和越界拒绝。
-- Shell allowlist、Workspace cwd 校验、60–600 秒 timeout 校验。
-- WebSearch enablement、WebFetch 私网阻止、重定向复检和 5 次上限。
-- Foreground write/edit 和非 allowlist Shell 固定 refused；Schedule add/remove 通过 Tool Confirmation 授权。
-- Tool Artifact 的阈值、路径、原始内容、preview 和原子写入。
-- Tool Gateway raw arguments、projection/coercion/refusal、bounded retry、cancellation 和扁平结果。
+- File 默认行为、Workspace State 访问、外部确认和越界处理。
+- Exec Workspace cwd、destructive/DNS confirmation 和 1–600 秒 timeout 校验。
+- Fixed Catalog WebSearch、WebFetch 私网确认、重定向复检和 5 次上限。
+- Workspace write/edit 的 OS 权限行为；Schedule add/list/remove 不请求确认，Scheduled Agent add 固定 refused。
+- Tool Artifact 的 4096 阈值、路径、原始内容、prefix preview 和直接覆盖写入。
+- Tool Gateway raw arguments、projection/coercion/refusal、cancellation 和扁平结果；Tool 执行不做 generic retry。
 
 ### Required provider and CLI tests
 
@@ -308,8 +302,8 @@
 - SQLite、混合数据库或向量数据库记忆。
 - Long-term Memory 相关性筛选或大小上限。
 - Tool Gateway 对前台和后台工具调用加全局锁。
-- 用户扩展 Shell 只读 allowlist。
-- Shell 子进程的 OS 级文件系统或网络 sandbox。
+- 用户不能扩展 Exec 的安全规则或固定 Tool Catalog。
+- Exec 子进程的 OS 级文件系统或网络 sandbox。
 - API key 环境变量引用或系统密钥链。
 - Tool Artifact 自动清理。
 - notification adapter 或系统桌面通知。
@@ -320,7 +314,7 @@
 
 - ADR 0001 记录 file-first local persistence。
 - ADR 0002 记录固定 Agent Home `~/.myclaw/`。
-- ADR 0003 记录 Shell 的 Workspace cwd、长期确认边界及首版不提供 OS 级 sandbox；Issue #38 暂时拒绝全部非 allowlist 命令，直到另行设计 Shell 专用确认流程。
+- ADR-0010 记录 Exec 的 Workspace cwd、destructive/DNS 确认边界及首版不提供 OS 级 sandbox；Exec 没有 allowlist，已知风险形状请求一次性确认。
 - `docs/myclaw-runtime-contracts.md` 是已接受的首版 schema、Port、事件和错误契约。
 - `CONTEXT.md` 是最终 canonical language；本 PRD 的实现术语应与其保持一致。
 - GitHub issue：<https://github.com/Totoro-debug/myclaw/issues/1>；本文件仍是需求的本地 canonical source。

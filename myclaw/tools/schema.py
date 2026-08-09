@@ -23,7 +23,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 @dataclass(frozen=True, slots=True)
 class ToolParam:
-    """Legacy scalar metadata retained while concrete Tools migrate to Schema."""
+    """Scalar declaration metadata used by annotation-derived Tool schemas."""
 
     description: str | None = None
     min_length: int | None = None

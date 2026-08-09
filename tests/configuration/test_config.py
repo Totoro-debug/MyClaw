@@ -14,12 +14,6 @@ consolidation_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
-[tools.web]
-enabled = true
-
-[tools.shell]
-enabled = true
-
 [models.providers.openai-local]
 protocol = "openai-compatible"
 base_url = ""
@@ -72,12 +66,6 @@ max_tool_result_chars = 60000
 consolidation_message_threshold = 50
 batch_size = 12
 schedule = "15 * * * *"
-
-[tools.web]
-enabled = false
-
-[tools.shell]
-enabled = true
 
 [models.providers.anthropic-default]
 protocol = "anthropic"
@@ -169,12 +157,6 @@ consolidation_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
-[tools.web]
-enabled = true
-
-[tools.shell]
-enabled = true
-
 [models.providers.primary]
 protocol = "anthropic"
 base_url = "https://api.anthropic.com"
@@ -204,12 +186,6 @@ max_tool_result_chars = 50000
 consolidation_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
-
-[tools.web]
-enabled = true
-
-[tools.shell]
-enabled = true
 
 [models.providers.primary]
 protocol = "anthropic"
@@ -304,6 +280,55 @@ api_key = "***REDACTED***"
 not_api_key = "not-a-provider-key"
 broken = [
 """
+
+SCHEMA_INVALID_API_KEY_ALIAS_CONFIG = """[models.providers.primary]
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+API-Key = "sk-schema-alias-secret"
+models = ["model-id"]
+
+[models.routes.default]
+provider_id = "primary"
+model = "model-id"
+context_window = 4096
+max_output = 512
+temperature = 0
+timeout = 60
+"""
+
+MALFORMED_DOTTED_API_KEY_CONFIG = """models.providers.primary.API-Key = "sk-dotted-secret"
+models.providers.primary.protocol = "anthropic"
+broken = [
+"""
+
+MALFORMED_QUOTED_DOTTED_API_KEY_CONFIG = """"models"."providers"."primary"."API-Key" = "sk-quoted-secret"
+broken = [
+"""
+
+MALFORMED_INLINE_API_KEY_CONFIG = """models = { providers = { primary = { api_key = "sk-inline-secret" } } }
+broken = [
+"""
+
+MALFORMED_INLINE_MULTILINE_API_KEY_CONFIG = '''models = { providers = { primary = { api_key = """sk-inline-line-one
+sk-inline-line-two""" } } }
+broken = [
+'''
+
+MALFORMED_INLINE_ARRAY_API_KEY_CONFIG = """models = { providers = { primary = { api_key = ["sk-inline-array-secret"] } } }
+broken = [
+"""
+
+MALFORMED_MULTILINE_ARRAY_API_KEY_CONFIG = """models.providers.primary.api_key = [
+  "sk-multiline-array-secret",
+]
+broken = [
+"""
+
+MALFORMED_MULTILINE_API_KEY_CONFIG = '''models.providers.primary.api_key = """sk-line-one
+sk-line-two"""
+models.providers.primary.protocol = "anthropic"
+broken = [
+'''
 
 
 def test_missing_configuration_is_created_exactly_once(agent_home: Path) -> None:
@@ -448,12 +473,10 @@ def test_valid_configuration_loads_as_typed_values(agent_home: Path) -> None:
         configuration.memory.consolidation_message_threshold,
         configuration.memory.batch_size,
         configuration.memory.schedule,
-        configuration.tools.web.enabled,
-        configuration.tools.shell.enabled,
         configuration.models.providers["anthropic-default"].models,
         configuration.models.routes["default"].reasoning_effort,
         configuration.models.routes["default"].timeout,
-    ) == (60000, 50, 12, "15 * * * *", False, True, ("claude-model",), "medium", 120)
+    ) == (60000, 50, 12, "15 * * * *", ("claude-model",), "medium", 120)
 
 
 def test_omitted_defaulted_configuration_fields_use_accepted_defaults(agent_home: Path) -> None:
@@ -468,10 +491,8 @@ def test_omitted_defaulted_configuration_fields_use_accepted_defaults(agent_home
         configuration.memory.consolidation_message_threshold,
         configuration.memory.batch_size,
         configuration.memory.schedule,
-        configuration.tools.web.enabled,
-        configuration.tools.shell.enabled,
         configuration.models.routes["default"].reasoning_effort,
-    ) == (4096, 40, 10, "0 * * * *", True, True, None)
+    ) == (4096, 40, 10, "0 * * * *", None)
 
 
 def test_config_view_redacts_nonempty_provider_keys_and_preserves_complete_content(
@@ -514,6 +535,125 @@ def test_config_view_redacts_multiline_api_key_in_valid_dotted_toml(agent_home: 
         pytest.fail("ConfigView leaked a multiline plaintext provider API key", pytrace=False)
     assert view.error is None
     assert view.redacted_content == EXPECTED_REDACTED_MULTILINE_DOTTED_CONFIG
+
+
+@pytest.mark.parametrize(
+    ("content", "secrets"),
+    (
+        pytest.param(
+            SCHEMA_INVALID_API_KEY_ALIAS_CONFIG,
+            ("sk-schema-alias-secret",),
+            id="schema-alias",
+        ),
+        pytest.param(
+            '[diagnostics]\nAPI_Key = "sk-nested-secret"\nmessage = "keep"\n',
+            ("sk-nested-secret",),
+            id="unknown-table",
+        ),
+        pytest.param(
+            '[diagnostics]\napi_key = ["sk-array-secret"]\nmessage = "keep"\n',
+            ("sk-array-secret",),
+            id="non-string-value",
+        ),
+        pytest.param(
+            '[[diagnostics]]\napi_key = "sk-array-table-secret"\nmessage = "keep"\n',
+            ("sk-array-table-secret",),
+            id="array-table",
+        ),
+        pytest.param(
+            r""""api\u005fkey" = "sk-valid-escaped-secret"
+""",
+            ("sk-valid-escaped-secret",),
+            id="escaped-key",
+        ),
+    ),
+)
+def test_config_view_redacts_structured_api_key_variants(
+    agent_home: Path,
+    content: str,
+    secrets: tuple[str, ...],
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(content, encoding="utf-8")
+
+    view = loader.view()
+
+    assert view.error is not None
+    assert view.error.code == "config_invalid"
+    assert all(secret not in view.redacted_content for secret in secrets)
+    assert "***REDACTED***" in view.redacted_content
+
+
+@pytest.mark.parametrize(
+    ("content", "secrets"),
+    (
+        pytest.param(
+            MALFORMED_DOTTED_API_KEY_CONFIG,
+            ("sk-dotted-secret",),
+            id="dotted",
+        ),
+        pytest.param(
+            MALFORMED_QUOTED_DOTTED_API_KEY_CONFIG,
+            ("sk-quoted-secret",),
+            id="quoted-dotted",
+        ),
+        pytest.param(
+            r""""api\u005fkey" = "sk-escaped-key-secret"
+broken = [
+""",
+            ("sk-escaped-key-secret",),
+            id="escaped-key",
+        ),
+        pytest.param(
+            r""""\u0041\U00000050\u0049\u002d\U0000004b\u0045\U00000059" = "sk-fully-escaped-secret"
+broken = [
+""",
+            ("sk-fully-escaped-secret",),
+            id="fully-escaped-key",
+        ),
+        pytest.param(
+            MALFORMED_INLINE_API_KEY_CONFIG,
+            ("sk-inline-secret",),
+            id="inline",
+        ),
+        pytest.param(
+            MALFORMED_INLINE_MULTILINE_API_KEY_CONFIG,
+            ("sk-inline-line-one", "sk-inline-line-two"),
+            id="inline-multiline",
+        ),
+        pytest.param(
+            MALFORMED_INLINE_ARRAY_API_KEY_CONFIG,
+            ("sk-inline-array-secret",),
+            id="inline-array",
+        ),
+        pytest.param(
+            MALFORMED_MULTILINE_ARRAY_API_KEY_CONFIG,
+            ("sk-multiline-array-secret",),
+            id="multiline-array",
+        ),
+        pytest.param(
+            MALFORMED_MULTILINE_API_KEY_CONFIG,
+            ("sk-line-one", "sk-line-two"),
+            id="multiline-string",
+        ),
+    ),
+)
+def test_config_view_redacts_malformed_api_key_variants(
+    agent_home: Path,
+    content: str,
+    secrets: tuple[str, ...],
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(content, encoding="utf-8")
+
+    view = loader.view()
+
+    assert view.error is not None
+    assert view.error.code == "config_parse_error"
+    assert all(secret not in view.redacted_content for secret in secrets)
+    assert "***REDACTED***" in view.redacted_content
 
 
 def test_config_view_returns_safe_parse_error_and_conservatively_redacted_raw_text(
@@ -566,11 +706,7 @@ def test_config_view_keeps_undefined_configuration_inspectable(agent_home: Path)
             VALID_CONFIG.replace("batch_size = 12", "batch_size = 12\nunknown = true"),
             "memory.unknown",
         ),
-        (VALID_CONFIG + "\n[tools.files]\nenabled = true\n", "tools.files"),
-        (
-            VALID_CONFIG.replace("enabled = false", "enabled = false\nunknown = true"),
-            "tools.web.unknown",
-        ),
+        (VALID_CONFIG + "\n[tools.web]\nenabled = true\n", "tools"),
         (
             VALID_CONFIG.replace(
                 "[models.providers.anthropic-default]",
@@ -639,7 +775,6 @@ def test_config_view_reports_undefined_fields(
             VALID_CONFIG.replace('schedule = "15 * * * *"', 'schedule = "99 99 99 99 99"'),
             "memory.schedule",
         ),
-        (VALID_CONFIG.replace("enabled = false", 'enabled = "false"'), "tools.web.enabled"),
         (
             VALID_CONFIG.replace('protocol = "anthropic"', "protocol = 1"),
             "models.providers.anthropic-default.protocol",

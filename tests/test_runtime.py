@@ -32,7 +32,6 @@ from myclaw.provider.models import (
 from myclaw.session.session import Session
 from myclaw.tools.core.web_search import WebSearchTool
 from myclaw.tools.tool_gateway import ModelToolCall
-from myclaw.tools.web.web_search import WebSearchResult
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
     FakeClock,
@@ -98,18 +97,6 @@ class RecordingWriter:
 
     async def write_line(self, content: str) -> None:
         self.operations.append(("line", content))
-
-
-class SensitiveFailingWebSearch:
-    async def search(self, query: str, max_results: int) -> tuple[WebSearchResult, ...]:
-        del max_results
-        raise ExceptionGroup(
-            "RAW_PROVIDER_BODY",
-            [
-                OSError(f"query={query}"),
-                ValueError("auth=PRIVATE_WEB_CREDENTIAL"),
-            ],
-        )
 
 
 class BlockingSessionLogProvider:
@@ -237,6 +224,7 @@ async def test_runtime_ignores_legacy_schedule_state_path_types(
     if legacy_kind == "file":
         assert legacy_path.read_bytes() == b"legacy state"
 
+
 @pytest.mark.asyncio
 async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_session(
     agent_home: Path,
@@ -274,11 +262,7 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
 
     assert [event.type for event in events] == ["turn_started", "turn_failed"]
     content = _session_log_text(workspace, runtime.session_id)
-    records = [
-        line
-        for line in content.splitlines()
-        if "myclaw.session.conversation:" in line
-    ]
+    records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 2
     assert "ModelCallError: The model request failed." in content
     assert "ModelCallError: No title response was scripted." in content

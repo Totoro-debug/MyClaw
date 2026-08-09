@@ -53,10 +53,10 @@ def fake_ddgs(monkeypatch: pytest.MonkeyPatch) -> type[FakeDDGS]:
     return FakeDDGS
 
 
-def test_web_search_schema_uses_count_and_has_no_retry() -> None:
+def test_web_search_schema_has_no_generic_retry_metadata() -> None:
     tool = WebSearchTool()
 
-    assert tool.max_retries == 0
+    assert not hasattr(tool, "max_retries")
     assert tool.to_schema() == {
         "type": "function",
         "function": {

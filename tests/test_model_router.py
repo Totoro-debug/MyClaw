@@ -12,8 +12,6 @@ from myclaw.config.config import (
     ProviderConfiguration,
     RouteConfiguration,
     RuntimeConfiguration,
-    ToolConfiguration,
-    ToolsConfiguration,
     UserConfiguration,
 )
 from myclaw.errors import (
@@ -68,10 +66,6 @@ def configuration() -> UserConfiguration:
             batch_size=10,
             schedule="0 * * * *",
         ),
-        tools=ToolsConfiguration(
-            web=ToolConfiguration(enabled=True),
-            shell=ToolConfiguration(enabled=True),
-        ),
         models=ModelsConfiguration(
             providers={provider.provider_id: provider},
             routes={"default": route},
@@ -100,7 +94,6 @@ def routed_configuration() -> UserConfiguration:
     return UserConfiguration(
         runtime=default.runtime,
         memory=default.memory,
-        tools=default.tools,
         models=ModelsConfiguration(
             providers={**default.models.providers, chat_provider.provider_id: chat_provider},
             routes={**default.models.routes, "chat": chat_route},
@@ -129,7 +122,6 @@ def memory_configuration() -> UserConfiguration:
     return UserConfiguration(
         runtime=default.runtime,
         memory=default.memory,
-        tools=default.tools,
         models=ModelsConfiguration(
             providers={**default.models.providers, memory_provider.provider_id: memory_provider},
             routes={**default.models.routes, "memory": memory_route},

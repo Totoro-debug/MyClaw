@@ -6,12 +6,6 @@ consolidation_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
-[tools.web]
-enabled = true
-
-[tools.shell]
-enabled = true
-
 [models.providers.openai-local]
 protocol = "openai-compatible"
 base_url = ""

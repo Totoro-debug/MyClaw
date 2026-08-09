@@ -91,15 +91,21 @@ def test_state_accepts_only_the_three_terminal_combinations() -> None:
         "last_status": None,
         "last_error": None,
     }
-    assert ScheduleJobState(
-        last_finished_at_ms=10,
-        last_status="ok",
-    ).to_dict()["last_error"] is None
-    assert ScheduleJobState(
-        last_finished_at_ms=10,
-        last_status="error",
-        last_error="The run failed.",
-    ).to_dict()["last_status"] == "error"
+    assert (
+        ScheduleJobState(
+            last_finished_at_ms=10,
+            last_status="ok",
+        ).to_dict()["last_error"]
+        is None
+    )
+    assert (
+        ScheduleJobState(
+            last_finished_at_ms=10,
+            last_status="error",
+            last_error="The run failed.",
+        ).to_dict()["last_status"]
+        == "error"
+    )
 
 
 def _valid_job(**changes: object) -> ScheduleJob:

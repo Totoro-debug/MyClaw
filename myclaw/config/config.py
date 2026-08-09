@@ -86,17 +86,6 @@ class MemoryConfiguration:
 
 
 @dataclass(frozen=True, slots=True)
-class ToolConfiguration:
-    enabled: bool
-
-
-@dataclass(frozen=True, slots=True)
-class ToolsConfiguration:
-    web: ToolConfiguration
-    shell: ToolConfiguration
-
-
-@dataclass(frozen=True, slots=True)
 class ProviderConfiguration:
     provider_id: str
     protocol: str
@@ -135,7 +124,6 @@ class ResolvedModelRoute:
 class UserConfiguration:
     runtime: RuntimeConfiguration
     memory: MemoryConfiguration
-    tools: ToolsConfiguration
     models: ModelsConfiguration
 
     def configured_route(self, requested_route: str) -> RouteConfiguration:
@@ -249,12 +237,6 @@ def _number(value: object, field: str, minimum: float, maximum: float) -> float:
     return float(value)
 
 
-def _boolean(value: object, field: str) -> bool:
-    if not isinstance(value, bool):
-        _invalid(field, "must be a boolean")
-    return value
-
-
 def _has_absolute_http_url(value: str) -> bool:
     if not value or any(character.isspace() for character in value):
         return False
@@ -356,17 +338,6 @@ def _parse_memory(document: Mapping[str, object]) -> MemoryConfiguration:
         ),
         schedule=schedule,
     )
-
-
-def _parse_tools(document: Mapping[str, object]) -> ToolsConfiguration:
-    table = _table(document.get("tools", {}), "tools")
-
-    def parse_tool(name: str) -> ToolConfiguration:
-        field = f"tools.{name}"
-        tool = _table(table.get(name, {}), field)
-        return ToolConfiguration(enabled=_boolean(tool.get("enabled", True), f"{field}.enabled"))
-
-    return ToolsConfiguration(web=parse_tool("web"), shell=parse_tool("shell"))
 
 
 def _parse_provider(provider_id: str, value: object) -> ProviderConfiguration:
@@ -475,14 +446,13 @@ def _parse_configuration(document: dict[str, object]) -> UserConfiguration:
     return UserConfiguration(
         runtime=_parse_runtime(document),
         memory=_parse_memory(document),
-        tools=_parse_tools(document),
         models=_parse_models(document),
     )
 
 
 def _validate_defined_fields(document: Mapping[str, object]) -> None:
     """Preserve strict config-inspection diagnostics without changing startup projection."""
-    _reject_unknown(document, {"runtime", "memory", "tools", "models"}, "")
+    _reject_unknown(document, {"runtime", "memory", "models"}, "")
 
     runtime = _table(document.get("runtime", {}), "runtime")
     _reject_unknown(runtime, {"max_tool_result_chars"}, "runtime")
@@ -493,13 +463,6 @@ def _validate_defined_fields(document: Mapping[str, object]) -> None:
         {"consolidation_message_threshold", "batch_size", "schedule"},
         "memory",
     )
-
-    tools = _table(document.get("tools", {}), "tools")
-    _reject_unknown(tools, {"web", "shell"}, "tools")
-    for tool_name in ("web", "shell"):
-        field = f"tools.{tool_name}"
-        tool = _table(tools.get(tool_name, {}), field)
-        _reject_unknown(tool, {"enabled"}, field)
 
     models = _table(document.get("models", {}), "models")
     _reject_unknown(models, {"providers", "routes"}, "models")
