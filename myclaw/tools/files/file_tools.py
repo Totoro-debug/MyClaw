@@ -8,49 +8,6 @@ from myclaw.tools.security import Security
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 
-class ListFilesTool(BaseTool):
-    """Return a stable Workspace-relative directory listing."""
-
-    name = "list_files"
-    description = "List files and directories within the current Workspace."
-
-    path: Annotated[str, ToolParam(description="Directory to list.")] = "."
-    recursive: Annotated[bool, ToolParam(description="Include nested entries.")] = False
-    max_entries: Annotated[
-        int,
-        ToolParam(description="Maximum entries to return.", minimum=1, maximum=10000),
-    ] = 1000
-
-    def __init__(self, *, security: Security) -> None:
-        self._security = security
-
-    async def execute(self, *, path: str, recursive: bool, max_entries: int) -> str:
-        target = self._security.resolve_read_path(path)
-        if not target.is_dir():
-            raise ToolError("The requested path must identify a directory.")
-
-        candidates = target.rglob("*") if recursive else target.iterdir()
-        entries: list[str] = []
-        try:
-            for candidate in candidates:
-                try:
-                    resolved = self._security.resolve_read_path(str(candidate))
-                    status = resolved.lstat()
-                except (OSError, ToolError):
-                    continue
-                is_file = HOST_FILESYSTEM.is_regular_file(status)
-                is_directory = resolved.is_dir()
-                if not (is_file or is_directory):
-                    continue
-                if is_file and status.st_nlink != 1:
-                    continue
-                relative = self._security.reported_read_path(resolved)
-                entries.append(f"{relative}/" if is_directory else relative)
-        except OSError as error:
-            raise ToolError("The requested directory could not be listed.") from error
-        return "\n".join(sorted(entries)[:max_entries])
-
-
 class SearchFilesTool(BaseTool):
     """Search UTF-8 Workspace text in stable path and line order."""
 

@@ -1,0 +1,51 @@
+"""List Dir Core Catalog Tool."""
+
+from __future__ import annotations
+
+from typing import Annotated
+
+from myclaw.agent.workspace import Workspace
+from myclaw.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.tools.core._directory import iter_directory_entries, report_path
+
+
+class ListDirTool(BaseTool):
+    """List visible files and directories beneath a directory root."""
+
+    name = "list_dir"
+    description = "List files and directories within a directory root."
+
+    path: Annotated[str, ToolParam(description="Directory root.", min_length=1)] = "."
+    recursive: Annotated[bool, ToolParam(description="Include nested entries.")] = False
+    max_entries: Annotated[
+        int,
+        ToolParam(description="Maximum entries to return.", minimum=1, maximum=10000),
+    ] = 200
+
+    def __init__(self, *, workspace: Workspace) -> None:
+        self._workspace = workspace
+
+    async def check_safety(  # type: ignore[override]
+        self,
+        *,
+        path: str,
+        recursive: bool,
+        max_entries: int,
+    ) -> str | None:
+        del recursive, max_entries
+        return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
+
+    async def execute(self, *, path: str, recursive: bool, max_entries: int) -> str:
+        target = self.resolve_path_argument(workspace=self._workspace, requested=path)
+        try:
+            entries = list(iter_directory_entries(target, recursive=recursive))
+        except OSError as error:
+            raise ToolError(f"List Dir failed: {error}") from error
+
+        reported = sorted(
+            report_path(entry, workspace=self._workspace, search_root=target) for entry in entries
+        )
+        return "\n".join(reported[:max_entries])
+
+
+__all__ = ["ListDirTool"]

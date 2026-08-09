@@ -63,12 +63,11 @@ from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.edit_file import EditFileTool
+from myclaw.tools.core.glob import GlobTool
+from myclaw.tools.core.list_dir import ListDirTool
 from myclaw.tools.core.read_file import ReadFileTool
 from myclaw.tools.core.write_file import WriteFileTool
-from myclaw.tools.files.file_tools import (
-    ListFilesTool,
-    SearchFilesTool,
-)
+from myclaw.tools.files.file_tools import SearchFilesTool
 from myclaw.tools.security import Security
 from myclaw.tools.shell.shell_tool import ShellBoundary, ShellTool, SubprocessShellBoundary
 from myclaw.tools.tool_gateway import ToolGateway, ToolResult
@@ -786,7 +785,8 @@ def _build_tool_gateway(
     )
     tools: list[BaseTool] = [
         ReadFileTool(workspace=workspace),
-        ListFilesTool(security=security),
+        ListDirTool(workspace=workspace),
+        GlobTool(workspace=workspace),
         SearchFilesTool(security=security),
         WriteFileTool(workspace=workspace),
         EditFileTool(workspace=workspace),

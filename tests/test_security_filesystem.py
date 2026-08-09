@@ -11,7 +11,8 @@ from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import AssistantModelMessage
 from myclaw.session.session import Session
-from myclaw.tools.files.file_tools import ListFilesTool, SearchFilesTool
+from myclaw.tools.core.list_dir import ListDirTool
+from myclaw.tools.files.file_tools import SearchFilesTool
 from myclaw.tools.security import Security
 from myclaw.tools.tool_artifacts import externalize_tool_result
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResult
@@ -32,7 +33,7 @@ def _read_file_gateway(*, agent_home: Path, workspace: Path) -> ToolGateway:
     gateway = ToolGateway()
     gateway.register_tools(
         (
-            ListFilesTool(security=security),
+            ListDirTool(workspace=workspace_identity),
             SearchFilesTool(security=security),
         )
     )
@@ -162,7 +163,7 @@ async def test_search_files_skips_hard_links_to_external_files(
 
 
 @pytest.mark.asyncio
-async def test_list_files_omits_hard_links_to_external_files(
+async def test_list_dir_includes_hard_links_as_visible_entries(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -176,13 +177,13 @@ async def test_list_files_omits_hard_links_to_external_files(
     result = await gateway.call(
         ModelToolCall(
             id="call_list_external_hard_link",
-            name="list_files",
+            name="list_dir",
             arguments="{}",
         )
     )
 
     assert result.status == "success"
-    assert result.content == "local.txt"
+    assert result.content == "list-alias.txt\nlocal.txt"
 
 
 def test_tool_artifact_publication_uses_the_shared_workspace_state_directory(
@@ -281,7 +282,7 @@ def test_tool_artifact_externalization_returns_a_new_immutable_result(
 
 
 @pytest.mark.asyncio
-async def test_list_files_filters_nested_agent_home_state_by_read_scope(
+async def test_list_dir_includes_nested_workspace_state_entries(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -310,13 +311,16 @@ async def test_list_files_filters_nested_agent_home_state_by_read_scope(
     result = await gateway.call(
         ModelToolCall(
             id="call_list_nested_agent_home",
-            name="list_files",
+            name="list_dir",
             arguments='{"path":".","recursive":true}',
         )
     )
 
     assert result.status == "success"
-    assert result.content == "local.txt"
+    assert ".myclaw/" in result.content
+    assert ".myclaw/config.toml" in result.content
+    assert ".myclaw/memory/memory.md" in result.content
+    assert ".myclaw/sessions/artifacts/" in result.content
 
 
 @pytest.mark.asyncio

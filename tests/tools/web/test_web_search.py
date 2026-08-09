@@ -646,7 +646,8 @@ async def test_conversation_catalog_omits_web_search_when_web_tools_are_disabled
     assert isinstance(request, ModelRequest)
     assert [schema["function"]["name"] for schema in request.tools] == [
         "read_file",
-        "list_files",
+        "list_dir",
+        "glob",
         "search_files",
         "write_file",
         "edit_file",
@@ -698,7 +699,8 @@ async def test_conversation_catalog_includes_builtin_web_search_when_enabled(
     assert isinstance(request, ModelRequest)
     assert [schema["function"]["name"] for schema in request.tools] == [
         "read_file",
-        "list_files",
+        "list_dir",
+        "glob",
         "search_files",
         "write_file",
         "edit_file",

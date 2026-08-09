@@ -1126,7 +1126,8 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
     assert workspace_identity in system_prompt
     assert memory_block in system_prompt
     assert "<tool_guidance>\n- read_file:" in system_prompt
-    assert "- list_files:" in system_prompt
+    assert "- list_dir:" in system_prompt
+    assert "- glob:" in system_prompt
     assert "- search_files:" in system_prompt
     assert system_prompt.index(workspace_identity) < system_prompt.index(memory_block)
     assert system_prompt.index(memory_block) < system_prompt.index("<tool_guidance>")

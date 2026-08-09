@@ -6,14 +6,14 @@ from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.tools.core.edit_file import EditFileTool
 from myclaw.tools.core.write_file import WriteFileTool
-from myclaw.tools.files.file_tools import ListFilesTool, SearchFilesTool
+from myclaw.tools.files.file_tools import SearchFilesTool
 from myclaw.tools.security import Security
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 
 SESSION_ID = "20260727-120000-000000_550e8400-e29b-41d4-a716-446655440000"
 
 
-def _tools(*, agent_home: Path, workspace: Path) -> tuple[ListFilesTool, SearchFilesTool]:
+def _tools(*, agent_home: Path, workspace: Path) -> SearchFilesTool:
     identity = Workspace.from_path(workspace)
     state = WorkspaceState(identity)
     security = Security(
@@ -21,45 +21,15 @@ def _tools(*, agent_home: Path, workspace: Path) -> tuple[ListFilesTool, SearchF
         agent_home=agent_home,
         artifact_directory=state.sessions_directory / "artifacts" / SESSION_ID,
     )
-    return ListFilesTool(security=security), SearchFilesTool(security=security)
+    return SearchFilesTool(security=security)
 
 
 def test_workspace_inspection_tools_export_exact_openai_schemas(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    list_files, search_files = _tools(agent_home=agent_home, workspace=workspace)
+    search_files = _tools(agent_home=agent_home, workspace=workspace)
 
-    assert list_files.to_schema() == {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": "List files and directories within the current Workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to list.",
-                        "default": ".",
-                    },
-                    "recursive": {
-                        "type": "boolean",
-                        "description": "Include nested entries.",
-                        "default": False,
-                    },
-                    "max_entries": {
-                        "type": "integer",
-                        "description": "Maximum entries to return.",
-                        "minimum": 1,
-                        "maximum": 10000,
-                        "default": 1000,
-                    },
-                },
-                "required": [],
-            },
-        },
-    }
     assert search_files.to_schema() == {
         "type": "function",
         "function": {
@@ -95,7 +65,6 @@ def test_workspace_inspection_tools_export_exact_openai_schemas(
             },
         },
     }
-    assert list_files.max_retries == 0
     assert search_files.max_retries == 0
 
 
@@ -198,17 +167,10 @@ async def test_gateway_prepares_defaults_nullable_glob_and_ignores_unknown_argum
     workspace: Path,
 ) -> None:
     (workspace / "alpha.txt").write_text("needle one\nneedle two\n", encoding="utf-8")
-    list_files, search_files = _tools(agent_home=agent_home, workspace=workspace)
+    search_files = _tools(agent_home=agent_home, workspace=workspace)
     gateway = ToolGateway()
-    gateway.register_tools((list_files, search_files))
+    gateway.register_tools((search_files,))
 
-    listing = await gateway.call(
-        ModelToolCall(
-            id="call_list_defaults",
-            name="list_files",
-            arguments='{"undeclared":"ignored"}',
-        )
-    )
     search = await gateway.call(
         ModelToolCall(
             id="call_search_nullable",
@@ -217,8 +179,6 @@ async def test_gateway_prepares_defaults_nullable_glob_and_ignores_unknown_argum
         )
     )
 
-    assert listing.status == "success"
-    assert listing.content == "alpha.txt"
     assert search.status == "success"
     assert search.content == "alpha.txt:1:needle one"
 
@@ -232,29 +192,15 @@ async def test_workspace_state_is_omitted_and_rejected_by_listing_and_search(
     state_session = workspace / ".myclaw" / "sessions" / "private.jsonl"
     state_session.parent.mkdir(parents=True)
     state_session.write_text("isolation needle private\n", encoding="utf-8")
-    list_files, search_files = _tools(agent_home=agent_home, workspace=workspace)
+    search_files = _tools(agent_home=agent_home, workspace=workspace)
     gateway = ToolGateway()
-    gateway.register_tools((list_files, search_files))
+    gateway.register_tools((search_files,))
 
-    listing = await gateway.call(
-        ModelToolCall(
-            id="call_list_workspace_state",
-            name="list_files",
-            arguments='{"path":".","recursive":true}',
-        )
-    )
     search = await gateway.call(
         ModelToolCall(
             id="call_search_workspace_state",
             name="search_files",
             arguments='{"query":"isolation needle","path":"."}',
-        )
-    )
-    direct_listing = await gateway.call(
-        ModelToolCall(
-            id="call_list_workspace_state_direct",
-            name="list_files",
-            arguments='{"path":".myclaw"}',
         )
     )
     direct_search = await gateway.call(
@@ -265,13 +211,10 @@ async def test_workspace_state_is_omitted_and_rejected_by_listing_and_search(
         )
     )
 
-    assert listing.status == "success"
-    assert listing.content == "public.txt"
     assert search.status == "success"
     assert search.content == "public.txt:1:isolation needle public"
-    assert (direct_listing.status, direct_search.status) == ("error", "error")
-    assert "Workspace State" in direct_listing.content
-    assert direct_search.content == direct_listing.content
+    assert direct_search.status == "error"
+    assert "Workspace State" in direct_search.content
 
 
 @pytest.mark.asyncio
@@ -290,7 +233,7 @@ async def test_gateway_rejects_invalid_search_contract_arguments(
     workspace: Path,
     arguments: str,
 ) -> None:
-    _, search_files = _tools(agent_home=agent_home, workspace=workspace)
+    search_files = _tools(agent_home=agent_home, workspace=workspace)
     gateway = ToolGateway()
     gateway.register_tools((search_files,))
 
