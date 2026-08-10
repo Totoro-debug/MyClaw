@@ -11,6 +11,12 @@ def test_distribution_declares_supported_loguru_release_range() -> None:
     assert "loguru>=0.7.3,<0.8" in project["dependencies"]
 
 
+def test_distribution_directly_declares_iana_timezone_database() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+    assert "tzdata>=2026.2" in project["dependencies"]
+
+
 def test_distribution_metadata_builds_one_host_neutral_wheel() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
