@@ -21,8 +21,9 @@ dependencies = [
     "loguru>=0.7.3,<0.8",
     "openai>=2.37,<3",
     "prompt-toolkit>=3.0.52,<4",
-    "rich>=13.7,<15",
+    "rich>=14.2.0,<15",
     "tomlkit>=0.13,<0.14",
+    "textual>=8.2.8,<9",
     "typer>=0.12,<1",
     "tzdata>=2026.2",
 ]
