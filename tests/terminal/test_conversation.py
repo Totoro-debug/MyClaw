@@ -9,7 +9,14 @@ from uuid import UUID
 from xml.etree import ElementTree
 
 import pytest
-from textual.events import MouseScrollRight
+from textual.events import (
+    MouseDown,
+    MouseMove,
+    MouseScrollDown,
+    MouseScrollRight,
+    MouseScrollUp,
+    MouseUp,
+)
 from textual.widgets import Markdown, TextArea
 
 from myclaw.agent.events import (
@@ -45,6 +52,8 @@ class ScriptedConversation:
         pause_after_first_delta: bool = False,
         deltas: tuple[str, ...] = ("First ", "answer."),
         completed_content: str = "First answer.",
+        deltas_by_submission: tuple[tuple[str, ...], ...] | None = None,
+        completed_contents: tuple[str, ...] | None = None,
         outcomes: tuple[Literal["completed", "cancelled", "failed"], ...] = ("completed",),
         cancelled_content: str = "",
         failure_message: str = "The turn failed.",
@@ -52,6 +61,8 @@ class ScriptedConversation:
         self.submissions: list[str] = []
         self._deltas = deltas
         self._completed_content = completed_content
+        self._deltas_by_submission = deltas_by_submission
+        self._completed_contents = completed_contents
         self._outcomes = outcomes
         self._cancelled_content = cancelled_content
         self._failure_message = failure_message
@@ -70,9 +81,26 @@ class ScriptedConversation:
     def continue_turn(self) -> None:
         self._continue_after_first_delta.set()
 
+    def pause_after_next_first_delta(self) -> None:
+        self.first_delta_emitted.clear()
+        self._continue_after_first_delta.clear()
+
     async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
         self.submissions.append(text)
-        outcome = self._outcomes[min(len(self.submissions) - 1, len(self._outcomes) - 1)]
+        submission_index = len(self.submissions) - 1
+        outcome = self._outcomes[min(submission_index, len(self._outcomes) - 1)]
+        deltas = (
+            self._deltas
+            if self._deltas_by_submission is None
+            else self._deltas_by_submission[
+                min(submission_index, len(self._deltas_by_submission) - 1)
+            ]
+        )
+        completed_content = (
+            self._completed_content
+            if self._completed_contents is None
+            else self._completed_contents[min(submission_index, len(self._completed_contents) - 1)]
+        )
         self.before_events.set()
         await self._continue_to_events.wait()
         yield AgentEvent(
@@ -82,7 +110,7 @@ class ScriptedConversation:
             created_at=NOW,
             payload=TurnStartedPayload(),
         )
-        for event_id, delta in enumerate(self._deltas, start=1):
+        for event_id, delta in enumerate(deltas, start=1):
             yield AgentEvent(
                 type="text_delta",
                 event_id=event_id,
@@ -93,7 +121,7 @@ class ScriptedConversation:
             if event_id == 1:
                 self.first_delta_emitted.set()
                 await self._continue_after_first_delta.wait()
-        event_id = len(self._deltas) + 1
+        event_id = len(deltas) + 1
         if outcome == "completed":
             yield AgentEvent(
                 type="turn_completed",
@@ -101,7 +129,7 @@ class ScriptedConversation:
                 turn_id=TURN_ID,
                 created_at=NOW,
                 payload=TurnCompletedPayload(
-                    content=self._completed_content,
+                    content=completed_content,
                     usage=ModelUsage(input_tokens=1, output_tokens=2, total_tokens=3),
                 ),
             )
@@ -143,6 +171,27 @@ class FailingConversation:
             self.closed.set()
 
 
+class BlockingConversation:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        del text
+        try:
+            self.started.set()
+            yield AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta="partial"),
+            )
+            await asyncio.Event().wait()
+        finally:
+            self.closed.set()
+
+
 class FailingMarkdownStream:
     async def write(self, markdown_fragment: str) -> None:
         del markdown_fragment
@@ -163,6 +212,17 @@ class FakeRuntime:
 
     async def close(self) -> None:
         self.close_calls += 1
+
+
+class CloseOrderingRuntime(FakeRuntime):
+    def __init__(self, conversation: BlockingConversation) -> None:
+        super().__init__(conversation)
+        self._blocking_conversation = conversation
+        self.close_saw_stream_closed = False
+
+    async def close(self) -> None:
+        self.close_saw_stream_closed = self._blocking_conversation.closed.is_set()
+        await super().close()
 
 
 def _runtime(conversation: object) -> FakeRuntime:
@@ -209,6 +269,13 @@ def _screenshot_text_nodes(app: TerminalConversationApp) -> list[tuple[str, floa
 
 def _screenshot_width(app: TerminalConversationApp) -> float:
     return float(_screenshot(app).attrib["viewBox"].split()[2])
+
+
+async def _wait_for_turn(app: TerminalConversationApp) -> None:
+    text_area = app.query_one("#conversation-input", TextArea)
+    async with asyncio.timeout(2):
+        while text_area.read_only:
+            await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -262,6 +329,7 @@ async def test_nonblank_enter_echoes_user_before_consuming_agent_events() -> Non
         finally:
             conversation.continue_to_events()
             await asyncio.wait_for(submission, timeout=1)
+            await _wait_for_turn(app)
 
 
 @pytest.mark.asyncio
@@ -285,6 +353,7 @@ async def test_text_deltas_update_one_assistant_markdown_and_completion_wins() -
         finally:
             conversation.continue_turn()
             await asyncio.wait_for(submission, timeout=1)
+            await _wait_for_turn(app)
 
         await asyncio.sleep(0.05)
         completed_text = _visible_screen_text(app)
@@ -315,6 +384,7 @@ async def test_streamed_markdown_preserves_reading_structure_and_link_urls() -> 
 
     async with app.run_test(size=(100, 40)) as pilot:
         await pilot.press(*list("read"), "enter")
+        await _wait_for_turn(app)
         await asyncio.sleep(0.1)
 
         visible_text = _visible_screen_text(app)
@@ -346,6 +416,7 @@ async def test_markdown_structure_is_visible_while_the_fenced_block_is_incomplet
         try:
             await asyncio.wait_for(conversation.first_delta_emitted.wait(), timeout=1)
             await asyncio.sleep(0.05)
+            await pilot.pause()
 
             visible_text = _visible_screen_text(app)
             assert "Heading" in visible_text
@@ -355,6 +426,7 @@ async def test_markdown_structure_is_visible_while_the_fenced_block_is_incomplet
         finally:
             conversation.continue_turn()
             await asyncio.wait_for(submission, timeout=1)
+            await _wait_for_turn(app)
 
 
 @pytest.mark.asyncio
@@ -369,6 +441,7 @@ async def test_high_frequency_deltas_do_not_delay_the_exact_terminal_content() -
 
     async with app.run_test(size=(80, 24)) as pilot:
         await asyncio.wait_for(pilot.press(*list("burst"), "enter"), timeout=5)
+        await _wait_for_turn(app)
         await asyncio.sleep(0.1)
 
         visible_text = _visible_screen_text(app)
@@ -429,6 +502,7 @@ async def test_incomplete_streamed_markdown_remains_visible_before_completion() 
         finally:
             conversation.continue_turn()
             await asyncio.wait_for(submission, timeout=1)
+            await _wait_for_turn(app)
 
         await asyncio.sleep(0.05)
         assert "documentation (https://example.com/docs)" in _visible_screen_text(app)
@@ -649,3 +723,253 @@ async def test_role_accents_remain_visible_without_terminal_color(
         assert "nocolor" in app.screen.pseudo_classes
         assert "hello│" in visible_text
         assert "│First answer." in visible_text
+
+
+@pytest.mark.asyncio
+async def test_conversation_navigation_keys_keep_input_focus() -> None:
+    content = "\n".join(f"line {index:02d} " + "x" * 30 for index in range(80))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.press(*list("navigate"), "enter")
+        await asyncio.sleep(0.1)
+        display = app.query_one("#conversation-display")
+        assert display.max_scroll_y > 0
+        assert display.is_vertical_scroll_end
+
+        await pilot.press("ctrl+home")
+        assert display.scroll_y == 0
+        assert isinstance(app.screen.focused, TextArea)
+
+        await pilot.press("pagedown")
+        assert 0 < display.scroll_y < display.max_scroll_y
+        assert isinstance(app.screen.focused, TextArea)
+
+        await pilot.press("pageup")
+        assert display.scroll_y == 0
+        assert isinstance(app.screen.focused, TextArea)
+
+        await pilot.press("ctrl+end")
+        assert display.is_vertical_scroll_end
+        assert isinstance(app.screen.focused, TextArea)
+
+
+@pytest.mark.asyncio
+async def test_mouse_scroll_keeps_input_focus_and_scrollbar_is_overflow_only() -> None:
+    content = "\n".join(f"line {index:02d} " + "x" * 30 for index in range(80))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.press(*list("scroll"), "enter")
+        await asyncio.sleep(0.1)
+        display = app.query_one("#conversation-display")
+        assert display.max_scroll_y > 0
+        assert display.vertical_scrollbar.display
+
+        await pilot._post_mouse_events([MouseScrollUp], offset=(10, 5), times=3)
+        assert display.scroll_y < display.max_scroll_y
+        assert isinstance(app.screen.focused, TextArea)
+
+        await pilot._post_mouse_events([MouseScrollUp], offset=(10, 5), times=100)
+        assert display.scroll_y == 0
+        assert isinstance(app.screen.focused, TextArea)
+
+        await pilot._post_mouse_events([MouseScrollDown], offset=(10, 5), times=100)
+        assert display.is_vertical_scroll_end
+        assert isinstance(app.screen.focused, TextArea)
+
+    empty_runtime = _runtime(ScriptedConversation())
+    empty_app = TerminalConversationApp(cast(PreparedReplRuntime, empty_runtime))
+    async with empty_app.run_test(size=(60, 20)):
+        empty_display = empty_app.query_one("#conversation-display")
+        assert not empty_display.vertical_scrollbar.display
+
+
+@pytest.mark.asyncio
+async def test_conversation_scrollbar_supports_pointer_dragging() -> None:
+    content = "\n".join(f"line {index:02d}" for index in range(100))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.press(*list("drag"), "enter")
+        await asyncio.sleep(0.1)
+        display = app.query_one("#conversation-display")
+        scrollbar = display.vertical_scrollbar
+        start = (scrollbar.region.x, scrollbar.region.bottom - 2)
+        end = (scrollbar.region.x, scrollbar.region.bottom - 5)
+
+        await pilot._post_mouse_events([MouseDown], offset=start, button=1)
+        await pilot._post_mouse_events([MouseMove], offset=end, button=1)
+        await pilot._post_mouse_events([MouseUp], offset=end, button=1)
+
+        assert display.scroll_y > 0
+        assert not display.is_vertical_scroll_end
+
+
+@pytest.mark.asyncio
+async def test_dragging_scrollbar_to_bottom_resumes_follow_mode() -> None:
+    content = "\n".join(f"line {index:02d}" for index in range(100))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.press(*list("seed"), "enter")
+        await _wait_for_turn(app)
+        display = app.query_one("#conversation-display")
+        await pilot.press("ctrl+home")
+
+        scrollbar = display.vertical_scrollbar
+        start = (scrollbar.region.x, scrollbar.region.y + 1)
+        end = (scrollbar.region.x, scrollbar.region.bottom - 2)
+        await pilot._post_mouse_events([MouseDown], offset=start, button=1)
+        await pilot._post_mouse_events([MouseMove], offset=end, button=1)
+        await pilot._post_mouse_events([MouseUp], offset=end, button=1)
+        await asyncio.sleep(0.2)
+        assert display.is_vertical_scroll_end
+
+        await pilot.press(*list("next"), "enter")
+        await _wait_for_turn(app)
+        await pilot.pause()
+
+        assert display.is_vertical_scroll_end
+        assert not app.query_one("#new-content").display
+
+
+@pytest.mark.asyncio
+async def test_historical_streaming_pauses_follow_and_exposes_new_content() -> None:
+    history = " ".join(f"history {index:02d}" for index in range(100))
+    conversation = ScriptedConversation(
+        deltas_by_submission=((history,), ("New ", "content.")),
+        completed_contents=(history, "New content."),
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.press(*list("seed"), "enter")
+
+        conversation.pause_after_next_first_delta()
+        submission = asyncio.create_task(pilot.press(*list("stream"), "enter"))
+        try:
+            await asyncio.wait_for(conversation.first_delta_emitted.wait(), timeout=1)
+            await asyncio.sleep(0.1)
+            display = app.query_one("#conversation-display")
+            assert display.max_scroll_y > 0
+            assert display.is_vertical_scroll_end
+
+            await pilot.press("ctrl+home")
+            await asyncio.sleep(0.05)
+            historical_position = display.scroll_y
+            assert historical_position == 0
+            assert not display.is_vertical_scroll_end
+
+            conversation.continue_turn()
+            await asyncio.wait_for(submission, timeout=2)
+            await _wait_for_turn(app)
+            await asyncio.sleep(0.1)
+
+            assert display.scroll_y == historical_position
+            assert not display.is_vertical_scroll_end
+            assert app.query_one("#new-content").display
+
+            await pilot.press("ctrl+end")
+            assert display.is_vertical_scroll_end
+            assert not app.query_one("#new-content").display
+        finally:
+            conversation.continue_turn()
+            if not submission.done():
+                await asyncio.wait_for(submission, timeout=2)
+            await _wait_for_turn(app)
+
+
+@pytest.mark.asyncio
+async def test_historical_resize_preserves_a_visible_message_anchor() -> None:
+    content = "\n".join(f"anchor {index:02d} " + "z" * 35 for index in range(50))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("resize"), "enter")
+        await asyncio.sleep(0.1)
+        display = app.query_one("#conversation-display")
+        await pilot.press("ctrl+home")
+        await pilot.press("pagedown")
+        await asyncio.sleep(0.05)
+        before_resize = _visible_screen_text(app)
+        anchor = next(
+            f"anchor {index:02d}" for index in range(50) if f"anchor {index:02d}" in before_resize
+        )
+
+        await pilot.resize_terminal(40, 24)
+        await asyncio.sleep(0.1)
+        after_resize = _visible_screen_text(app)
+
+        assert anchor in after_resize
+        assert not display.is_vertical_scroll_end
+
+
+@pytest.mark.asyncio
+async def test_bottom_follow_is_preserved_when_resize_reflows_content() -> None:
+    content = "\n".join(f"line {index:02d} " + "x" * 60 for index in range(80))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("resize"), "enter")
+        await _wait_for_turn(app)
+        display = app.query_one("#conversation-display")
+        assert display.is_vertical_scroll_end
+
+        await pilot.resize_terminal(40, 24)
+        await pilot.pause()
+
+        assert display.is_vertical_scroll_end
+
+
+@pytest.mark.asyncio
+async def test_historical_resize_preserves_anchor_within_one_long_message() -> None:
+    content = "\n".join(f"anchor {index:03d} " + "z" * 55 for index in range(80))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.press(*list("resize"), "enter")
+        await _wait_for_turn(app)
+        await pilot.press("ctrl+home", "pagedown", "pagedown")
+        await pilot.pause()
+        before_resize = _visible_screen_text(app)
+        visible_anchors = {
+            f"anchor {index:03d}" for index in range(80) if f"anchor {index:03d}" in before_resize
+        }
+        assert visible_anchors
+
+        await pilot.resize_terminal(25, 24)
+        await pilot.pause()
+        await asyncio.sleep(0.2)
+        after_resize = _visible_screen_text(app)
+
+        assert any(anchor in after_resize for anchor in visible_anchors)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_settles_stream_worker_before_runtime_close() -> None:
+    conversation = BlockingConversation()
+    runtime = CloseOrderingRuntime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.press(*list("block"), "enter")
+        await asyncio.wait_for(conversation.started.wait(), timeout=1)
+
+    assert conversation.closed.is_set()
+    assert runtime.close_saw_stream_closed
