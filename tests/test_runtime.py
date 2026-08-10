@@ -30,7 +30,6 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.session.session import Session
-from myclaw.tools.core.web_search import WebSearchTool
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
@@ -478,14 +477,21 @@ async def test_foreground_tool_diagnostics_preserve_boundary_exception_details(
         )
     )
 
-    async def fail(self: WebSearchTool, *, query: str, count: int) -> str:
-        del self, count
-        raise ExceptionGroup(
-            "RAW_PROVIDER_BODY",
-            [OSError(f"query={query}"), ValueError("auth=PRIVATE_WEB_CREDENTIAL")],
-        )
+    class FailingDDGS:
+        def __enter__(self) -> "FailingDDGS":
+            return self
 
-    monkeypatch.setattr(WebSearchTool, "execute", fail)
+        def __exit__(self, *errors: object) -> None:
+            del errors
+
+        def text(self, query: str, **arguments: object) -> list[dict[str, object]]:
+            del arguments
+            raise ExceptionGroup(
+                "RAW_PROVIDER_BODY",
+                [OSError(f"query={query}"), ValueError("auth=PRIVATE_WEB_CREDENTIAL")],
+            )
+
+    monkeypatch.setattr("myclaw.tools.core.web_search.DDGS", FailingDDGS)
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,

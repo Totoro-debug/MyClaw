@@ -8,7 +8,7 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent.workspace import Workspace
-from myclaw.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.tools.base import BaseTool, PreparedToolCall, ToolError, ToolParam
 from myclaw.tools.schema import Object, String, parameter
 
 
@@ -165,10 +165,47 @@ def test_base_tool_is_abstract_and_parameter_decorator_injects_root_schema() -> 
             return text
 
     assert inspect.isabstract(BaseTool)
-    assert not hasattr(BaseTool, "_prepare_pipeline")
     assert not inspect.isabstract(DecoratedTool)
     assert DecoratedTool.parameters == declared
     assert DecoratedTool().to_schema()["function"]["parameters"] == declared.to_json_schema()
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_returns_normalized_arguments_and_safety_reason() -> None:
+    observed: list[tuple[str, int, bool]] = []
+
+    class PreparingTool(BaseTool):
+        name = "preparing"
+        description = "Exercise the public preparation interface."
+        required = ("count",)
+
+        count: int
+        enabled: bool = False
+
+        def validate_arguments(  # type: ignore[override]
+            self, *, count: int, enabled: bool
+        ) -> None:
+            observed.append(("validation", count, enabled))
+
+        async def check_safety(  # type: ignore[override]
+            self, *, count: int, enabled: bool
+        ) -> str:
+            observed.append(("safety", count, enabled))
+            return "Confirmation is required."
+
+        async def execute(self, *, count: int, enabled: bool) -> str:
+            return f"{count}:{enabled}"
+
+    prepared = await PreparingTool().prepare({"count": "3"})
+
+    assert prepared == PreparedToolCall(
+        arguments={"count": 3, "enabled": False},
+        safety_reason="Confirmation is required.",
+    )
+    assert observed == [
+        ("validation", 3, False),
+        ("safety", 3, False),
+    ]
 
 
 def test_tool_without_a_declaration_or_execution_remains_abstract() -> None:

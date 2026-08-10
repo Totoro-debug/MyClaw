@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
@@ -39,30 +38,6 @@ type ConfirmationDecision = Literal["approved", "declined"]
 type ConfirmationOutcome = ConfirmationDecision | None
 type ToolResultStatus = Literal["success", "error", "refused"]
 type ConfirmationRequester = Callable[["ConfirmationRequest"], Awaitable[ConfirmationDecision]]
-
-
-@dataclass(frozen=True, slots=True)
-class ConfirmationPrompt:
-    """The normalized operation description supplied by a concrete Tool."""
-
-    summary: str
-    details: JsonObject
-    warnings: tuple[str, ...] = ()
-    reason: str = ""
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.summary, str) or not self.summary or len(self.summary) > 240:
-            raise ValueError("confirmation summary must contain 1 through 240 characters")
-        if not isinstance(self.reason, str):
-            raise TypeError("confirmation reason must be a string")
-        if not isinstance(self.details, dict):
-            raise TypeError("confirmation details must be a JSON object")
-        if not isinstance(self.warnings, (tuple, list)) or any(
-            not isinstance(item, str) for item in self.warnings
-        ):
-            raise TypeError("confirmation warnings must be a sequence of strings")
-        object.__setattr__(self, "details", deepcopy(self.details))
-        object.__setattr__(self, "warnings", tuple(self.warnings))
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -351,19 +326,13 @@ class ToolGateway:
             return await self._execute(tool_call, tool, normalized, confirmation=None)
 
         try:
-            prompt = await self._confirmation_prompt(
-                tool,
-                normalized,
-                reason=preparation.safety_reason,
-            )
             request = ConfirmationRequest(
                 confirmation_id=uuid4(),
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
                 reason=preparation.safety_reason,
-                summary=prompt.summary,
-                details=cast(JsonObject, _project_confirmation_details(prompt.details)),
-                warnings=prompt.warnings,
+                summary=f"Confirm {tool.name}"[:240],
+                details=cast(JsonObject, _project_confirmation_details(normalized)),
             )
         except asyncio.CancelledError:
             raise
@@ -419,42 +388,6 @@ class ToolGateway:
         if reason is not None and not isinstance(reason, str):
             raise TypeError("Tool refusal checks must return a string reason or None")
         return reason
-
-    async def _confirmation_prompt(
-        self,
-        tool: BaseTool,
-        normalized: JsonObject,
-        *,
-        reason: str,
-    ) -> ConfirmationPrompt:
-        provider = getattr(tool, "confirmation_prompt", None)
-        if provider is None:
-            summary = f"Confirm {tool.name}"
-            return ConfirmationPrompt(
-                summary=summary[:240],
-                details=deepcopy(normalized),
-                reason=reason,
-            )
-
-        prompt = cast(Callable[..., object], provider)(**_declared_arguments(tool, normalized))
-        if inspect.isawaitable(prompt):
-            prompt = await cast(Awaitable[object], prompt)
-        if prompt is None:
-            return ConfirmationPrompt(
-                summary=f"Confirm {tool.name}"[:240],
-                details=deepcopy(normalized),
-                reason=reason,
-            )
-        if not isinstance(prompt, ConfirmationPrompt):
-            raise TypeError("Tool confirmation hook must return a ConfirmationPrompt or None")
-        if prompt.reason:
-            return prompt
-        return ConfirmationPrompt(
-            summary=prompt.summary,
-            details=prompt.details,
-            warnings=prompt.warnings,
-            reason=reason,
-        )
 
     async def _execute(
         self,
@@ -551,7 +484,6 @@ def _result(
 __all__ = [
     "ConfirmationChannel",
     "ConfirmationDecision",
-    "ConfirmationPrompt",
     "ConfirmationRequest",
     "ConfirmationRequester",
     "ModelToolCall",

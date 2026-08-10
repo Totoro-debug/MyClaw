@@ -33,7 +33,6 @@ from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.tool_gateway import (
     ConfirmationChannel,
     ConfirmationDecision,
-    ConfirmationPrompt,
     ConfirmationRequest,
     ModelToolCall,
 )
@@ -65,12 +64,6 @@ class _ConfirmingTool(BaseTool):
 
     def __init__(self) -> None:
         self.calls: list[str] = []
-
-    async def confirmation_prompt(self, *, action: str) -> ConfirmationPrompt:
-        return ConfirmationPrompt(
-            summary=f"Run {action}",
-            details={"action": action},
-        )
 
     async def check_safety(self, *, action: str) -> str:  # type: ignore[override]
         return f"Confirm action: {action}"
@@ -440,6 +433,10 @@ async def test_agent_run_emits_confirmation_request_before_waiting_for_approval(
     confirmation_payload = await pending_confirmation
     assert confirmation_payload.type == "confirmation_requested"
     assert isinstance(confirmation_payload, AgentRunConfirmationRequestedPayload)
+    assert confirmation_payload.request.summary == "Confirm confirm_action"
+    assert confirmation_payload.request.details == {"action": "write"}
+    assert confirmation_payload.request.reason == "Confirm action: write"
+    assert confirmation_payload.request.warnings == ()
     channel.respond_to_confirmation(confirmation_payload.request.confirmation_id, "approved")
 
     remaining = [payload async for payload in events]

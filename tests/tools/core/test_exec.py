@@ -9,7 +9,8 @@ from typing import cast
 import pytest
 
 from myclaw.agent.workspace import Workspace
-from myclaw.tools.core.exec import DNSResolverBoundary, ExecTool
+from myclaw.tools.core.exec import ExecTool
+from myclaw.tools.network_safety import DNSResolver
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -100,7 +101,7 @@ class TimeoutThenSlowReapProcess(FakeProcess):
 def _gateway(
     workspace: Path,
     *,
-    resolver: DNSResolverBoundary | None = None,
+    resolver: DNSResolver | None = None,
     confirmation: ConfirmationRequester | None = None,
 ) -> SingleToolGateway:
     tool = ExecTool(workspace=Workspace.from_path(workspace), resolver=resolver)

@@ -10,13 +10,13 @@ import pytest
 from aiohttp import ClientTimeout
 
 from myclaw.tools.core.web_fetch import (
-    DNSResolverBoundary,
     HTTPClientBoundary,
     HTTPResponseBoundary,
     JinaReaderBoundary,
     JinaReaderClient,
     WebFetchTool,
 )
+from myclaw.tools.network_safety import DNSResolver
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -159,7 +159,7 @@ class FakeHTTPClient:
 
 def _gateway(
     *,
-    resolver: DNSResolverBoundary,
+    resolver: DNSResolver,
     jina: JinaReaderBoundary | None = None,
     http: HTTPClientBoundary | None = None,
     confirmation: ConfirmationRequester | None = None,

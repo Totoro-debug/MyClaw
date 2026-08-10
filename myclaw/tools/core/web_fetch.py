@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import re
-import socket
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from email.message import Message
 from html import unescape
-from ipaddress import ip_address
 from typing import Annotated, Protocol
 from urllib.parse import SplitResult, urljoin, urlsplit
 
 from aiohttp import ClientResponse, ClientSession, ClientTimeout
 
-from myclaw.tools.base import BaseTool, ToolError, ToolParam, is_public_ip, truncate_text
+from myclaw.tools.base import BaseTool, ToolError, ToolParam, truncate_text
+from myclaw.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
 
 CONNECT_TIMEOUT_SECONDS = 10.0
 TOTAL_TIMEOUT_SECONDS = 30.0
@@ -45,10 +44,6 @@ _HTML_BLOCK_TAG_PATTERN = re.compile(
 _HTML_TAG_PATTERN = re.compile(r"<[^>]*>")
 
 
-class DNSResolverBoundary(Protocol):
-    async def resolve(self, hostname: str, port: int) -> tuple[str, ...]: ...
-
-
 class JinaReaderBoundary(Protocol):
     async def fetch(self, url: str, *, output_format: str) -> str: ...
 
@@ -70,20 +65,6 @@ class HTTPClientBoundary(Protocol):
         connect_timeout_seconds: float,
         total_timeout_seconds: float,
     ) -> HTTPResponseBoundary: ...
-
-
-class SocketDNSResolver:
-    """Resolve all TCP addresses through the host event loop's DNS boundary."""
-
-    async def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
-        records = await asyncio.get_running_loop().getaddrinfo(
-            hostname,
-            port,
-            family=socket.AF_UNSPEC,
-            type=socket.SOCK_STREAM,
-            proto=socket.IPPROTO_TCP,
-        )
-        return tuple(dict.fromkeys(record[4][0] for record in records))
 
 
 class _AioHttpResponse:
@@ -185,7 +166,7 @@ class WebFetchTool(BaseTool):
     def __init__(
         self,
         *,
-        resolver: DNSResolverBoundary | None = None,
+        resolver: DNSResolver | None = None,
         jina_reader: JinaReaderBoundary | None = None,
         http_client: HTTPClientBoundary | None = None,
     ) -> None:
@@ -263,44 +244,23 @@ class WebFetchTool(BaseTool):
         if hostname is None:
             raise ToolError("Web Fetch URL must contain a hostname.")
         port = _effective_port(parsed)
-        try:
-            literal = ip_address(hostname)
-        except ValueError:
-            try:
-                answers = await self._resolver.resolve(hostname, port)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                return _TargetEvaluation(
-                    safety_reason=(
-                        "Web Fetch target DNS resolution failed and requires confirmation."
-                    ),
-                )
-            if not answers:
-                return _TargetEvaluation(
-                    safety_reason=(
-                        "Web Fetch target DNS resolution returned no addresses and requires "
-                        "confirmation."
-                    ),
-                )
-            for answer in answers:
-                if not is_public_ip(answer):
-                    return _TargetEvaluation(
-                        safety_reason=(
-                            "Web Fetch target resolves to a private or non-global address and "
-                            "requires confirmation."
-                        ),
-                    )
-            return _TargetEvaluation(safety_reason=None)
-
-        if not is_public_ip(str(literal)):
-            return _TargetEvaluation(
-                safety_reason=(
-                    "Web Fetch target uses a private or non-global address and requires "
-                    "confirmation."
-                ),
-            )
-        return _TargetEvaluation(safety_reason=None)
+        assessment = await assess_target(hostname, port, self._resolver)
+        reasons = {
+            "literal_non_global": (
+                "Web Fetch target uses a private or non-global address and requires confirmation."
+            ),
+            "dns_failure": ("Web Fetch target DNS resolution failed and requires confirmation."),
+            "dns_empty": (
+                "Web Fetch target DNS resolution returned no addresses and requires confirmation."
+            ),
+            "dns_non_global": (
+                "Web Fetch target resolves to a private or non-global address and requires "
+                "confirmation."
+            ),
+        }
+        return _TargetEvaluation(
+            safety_reason=None if assessment.risk is None else reasons[assessment.risk]
+        )
 
     async def _fetch_direct(self, url: str) -> str:
         current_url = url
@@ -454,11 +414,9 @@ __all__ = [
     "MAX_REDIRECTS",
     "TOTAL_TIMEOUT_SECONDS",
     "AioHttpWebFetchClient",
-    "DNSResolverBoundary",
     "HTTPClientBoundary",
     "HTTPResponseBoundary",
     "JinaReaderBoundary",
     "JinaReaderClient",
-    "SocketDNSResolver",
     "WebFetchTool",
 ]

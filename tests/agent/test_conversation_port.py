@@ -33,7 +33,6 @@ from myclaw.session.conversation import ChatModelSettings, StreamingConversation
 from myclaw.session.session import Session
 from myclaw.tools.base import BaseTool
 from myclaw.tools.tool_gateway import (
-    ConfirmationPrompt,
     ConfirmationRequest,
     ModelToolCall,
 )
@@ -107,9 +106,6 @@ class _ConfirmedTool(BaseTool):
 
     def __init__(self) -> None:
         self.calls: list[str] = []
-
-    async def confirmation_prompt(self, *, message: str) -> ConfirmationPrompt:
-        return ConfirmationPrompt(summary="Create a Schedule Job", details={"message": message})
 
     async def execute(self, *, message: str) -> str:
         self.calls.append(message)

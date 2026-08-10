@@ -10,7 +10,6 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.store import WorkspaceScheduleStore
-from myclaw.tools.core.read_file import ReadFileTool
 from myclaw.tools.tool_gateway import ConfirmationChannel, ModelToolCall, ToolGateway
 
 
@@ -152,11 +151,15 @@ async def test_unexpected_core_tool_failure_is_redacted(
 ) -> None:
     (workspace / "note.txt").write_text("hello", encoding="utf-8")
 
-    async def fail(*, path: str, offset: int, limit: int) -> str:
-        del path, offset, limit
-        raise RuntimeError("secret implementation detail")
+    target = workspace / "note.txt"
+    original_read_bytes = Path.read_bytes
 
-    monkeypatch.setattr(ReadFileTool, "execute", fail)
+    def fail_target_read(path: Path) -> bytes:
+        if path == target:
+            raise RuntimeError("secret implementation detail")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_target_read)
     result = await _gateway(workspace, agent_home).call(
         ModelToolCall(
             id="call_failure",

@@ -604,7 +604,6 @@ async def test_required_memory_edit_failure_keeps_the_advanced_summary_cursor(
 @pytest.mark.asyncio
 async def test_unexpected_memory_tool_failure_is_logged_once_at_the_task_boundary(
     agent_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
@@ -613,18 +612,23 @@ async def test_unexpected_memory_tool_failure_is_logged_once_at_the_task_boundar
     await summaries.append("A pending summary.", NOW)
     memory_path = state.long_term_memory_path
 
-    async def fail_edit(
-        self: MemoryEditFileTool,
-        *,
-        path: str,
-        old_text: str,
-        new_text: str,
-        replace_all: bool,
-    ) -> str:
-        del self, path, old_text, new_text, replace_all
-        raise RuntimeError("PRIVATE unexpected memory failure")
+    class FailingMemoryStore:
+        def __init__(self) -> None:
+            self._cursor = 0
 
-    monkeypatch.setattr(MemoryEditFileTool, "execute", fail_edit)
+        async def read_long_term(self) -> str:
+            return "## User Info\n"
+
+        async def replace_long_term(self, content: str) -> None:
+            del content
+            raise RuntimeError("PRIVATE unexpected memory failure")
+
+        async def read_summary_cursor(self) -> int:
+            return self._cursor
+
+        async def write_summary_cursor(self, index: int) -> None:
+            self._cursor = index
+
     provider = ScriptedFakeProvider(
         completions=(
             _response(
@@ -648,7 +652,7 @@ async def test_unexpected_memory_tool_failure_is_logged_once_at_the_task_boundar
     manager = MemoryManager(
         provider=provider,
         summaries=summaries,
-        memory=WorkspaceFileMemoryStore(state),
+        memory=FailingMemoryStore(),
         long_term_path=memory_path,
         settings=MemoryTaskModelSettings(
             model="memory-model",

@@ -5,13 +5,12 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import socket
-from ipaddress import ip_address
 from typing import Annotated, Final, Protocol
 from urllib.parse import urlsplit
 
 from myclaw.agent.workspace import Workspace
-from myclaw.tools.base import BaseTool, ToolError, ToolParam, is_public_ip, truncate_text
+from myclaw.tools.base import BaseTool, ToolError, ToolParam, truncate_text
+from myclaw.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
 
 _BASH: Final[str] = "bash"
 _OUTPUT_LIMIT: Final[int] = 4000
@@ -59,26 +58,6 @@ class ExecProcess(Protocol):
     async def wait(self) -> int: ...
 
 
-class DNSResolverBoundary(Protocol):
-    """Resolve every TCP address for one command URL."""
-
-    async def resolve(self, hostname: str, port: int) -> tuple[str, ...]: ...
-
-
-class SocketDNSResolver:
-    """Resolve command URLs through the host event loop's DNS boundary."""
-
-    async def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
-        records = await asyncio.get_running_loop().getaddrinfo(
-            hostname,
-            port,
-            family=socket.AF_UNSPEC,
-            type=socket.SOCK_STREAM,
-            proto=socket.IPPROTO_TCP,
-        )
-        return tuple(dict.fromkeys(record[4][0] for record in records))
-
-
 class ExecTool(BaseTool):
     """Run one user-confirmable command through a direct Bash login shell."""
 
@@ -93,9 +72,7 @@ class ExecTool(BaseTool):
         ToolParam(description="Execution timeout in seconds.", minimum=1, maximum=600),
     ] = 60
 
-    def __init__(
-        self, *, workspace: Workspace, resolver: DNSResolverBoundary | None = None
-    ) -> None:
+    def __init__(self, *, workspace: Workspace, resolver: DNSResolver | None = None) -> None:
         self._workspace = workspace
         self._resolver = SocketDNSResolver() if resolver is None else resolver
 
@@ -208,21 +185,18 @@ class ExecTool(BaseTool):
             port if port is not None else (443 if parsed.scheme.lower() == "https" else 80)
         )
 
-        if not is_public_ip(hostname):
-            try:
-                ip_address(hostname)
-            except ValueError:
-                try:
-                    addresses = await self._resolver.resolve(hostname, effective_port)
-                except Exception:
-                    return "An Exec URL has a DNS failure and requires confirmation."
-                if not addresses:
-                    return "An Exec URL has no DNS result and requires confirmation."
-                if any(not is_public_ip(address) for address in addresses):
-                    return "An Exec URL resolves to a private or non-global address and requires confirmation."
-            else:
-                return "An Exec URL uses a private or non-global address and requires confirmation."
-        return None
+        assessment = await assess_target(hostname, effective_port, self._resolver)
+        reasons = {
+            "literal_non_global": (
+                "An Exec URL uses a private or non-global address and requires confirmation."
+            ),
+            "dns_failure": "An Exec URL has a DNS failure and requires confirmation.",
+            "dns_empty": "An Exec URL has no DNS result and requires confirmation.",
+            "dns_non_global": (
+                "An Exec URL resolves to a private or non-global address and requires confirmation."
+            ),
+        }
+        return None if assessment.risk is None else reasons[assessment.risk]
 
 
 async def _spawn_process(*, command: str, cwd: os.PathLike[str]) -> ExecProcess:
@@ -422,4 +396,4 @@ def _matches_destructive_pattern(command: str) -> bool:
     return any(pattern.search(command) is not None for pattern in _DESTRUCTIVE_PATTERNS)
 
 
-__all__ = ["DNSResolverBoundary", "ExecProcess", "ExecTool", "SocketDNSResolver"]
+__all__ = ["ExecProcess", "ExecTool"]

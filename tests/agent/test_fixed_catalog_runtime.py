@@ -23,7 +23,7 @@ from myclaw.provider.models import (
     ModelStreamEvent,
     ModelUsage,
 )
-from myclaw.tools.core.read_file import ReadFileTool
+from myclaw.tools.core.web_fetch import JinaReaderClient
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 
@@ -185,14 +185,13 @@ async def test_runtime_cancellation_reaches_an_active_fixed_catalog_tool(
     cancelled = asyncio.Event()
     release = asyncio.Event()
 
-    async def block_read(
-        self: ReadFileTool,
+    async def block_fetch(
+        self: JinaReaderClient,
+        url: str,
         *,
-        path: str,
-        offset: int,
-        limit: int,
+        output_format: str,
     ) -> str:
-        del self, path, offset, limit
+        del self, url, output_format
         started.set()
         try:
             await release.wait()
@@ -201,22 +200,22 @@ async def test_runtime_cancellation_reaches_an_active_fixed_catalog_tool(
             raise
         return "unexpected"
 
-    monkeypatch.setattr(ReadFileTool, "execute", block_read)
+    monkeypatch.setattr(JinaReaderClient, "fetch", block_fetch)
     provider = _RuntimeProvider(
         (
             _response(
                 content="",
                 tool_call=ModelToolCall(
-                    id="call_blocking_read",
-                    name="read_file",
-                    arguments='{"path":"note.txt"}',
+                    id="call_blocking_fetch",
+                    name="web_fetch",
+                    arguments='{"url":"https://8.8.8.8/"}',
                 ),
             ),
         )
     )
     runtime = _runtime(agent_home, workspace, provider)
     turn = asyncio.create_task(
-        _drain_until_terminal(runtime.conversation.submit("Read the file."), runtime)
+        _drain_until_terminal(runtime.conversation.submit("Fetch the URL."), runtime)
     )
     try:
         await started.wait()
