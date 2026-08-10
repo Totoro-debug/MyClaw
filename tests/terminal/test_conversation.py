@@ -16,6 +16,7 @@ from textual.events import (
     MouseScrollRight,
     MouseScrollUp,
     MouseUp,
+    Paste,
 )
 from textual.widgets import Markdown, TextArea
 
@@ -330,6 +331,132 @@ async def test_nonblank_enter_echoes_user_before_consuming_agent_events() -> Non
             conversation.continue_to_events()
             await asyncio.wait_for(submission, timeout=1)
             await _wait_for_turn(app)
+
+
+@pytest.mark.asyncio
+async def test_multiline_submission_preserves_text_and_ctrl_j_inserts_a_newline() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("first line"), "ctrl+j", *list("second line"), "enter")
+        await _wait_for_turn(app)
+
+    assert conversation.submissions == ["first line\nsecond line"]
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_submission_is_ignored() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        input_area = app.query_one("#conversation-input", TextArea)
+        input_area.post_message(Paste(" \n\t ").stop())
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert conversation.submissions == []
+        assert input_area.text == " \n\t "
+
+
+@pytest.mark.asyncio
+async def test_multiline_paste_is_inserted_without_implicit_submission() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        input_area = app.query_one("#conversation-input", TextArea)
+        input_area.post_message(Paste("pasted first\npasted second").stop())
+        await pilot.pause()
+
+        assert input_area.text == "pasted first\npasted second"
+        assert conversation.submissions == []
+
+        await pilot.press("enter")
+        await _wait_for_turn(app)
+
+    assert conversation.submissions == ["pasted first\npasted second"]
+
+
+@pytest.mark.asyncio
+async def test_multiline_input_grows_to_six_rows_then_scrolls_internally() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        input_area = app.query_one("#conversation-input", TextArea)
+        input_region = app.query_one("#conversation-input-region")
+
+        input_area.post_message(Paste("\n".join(f"line {index}" for index in range(6))).stop())
+        await pilot.pause()
+        six_row_region_height = input_region.size.height
+
+        assert input_area.size.height == 6
+        assert input_area.max_scroll_y == 0
+
+        input_area.post_message(Paste("\nline 6\nline 7").stop())
+        await pilot.pause()
+
+        assert input_area.size.height == 6
+        assert input_area.max_scroll_y > 0
+        assert input_region.size.height == six_row_region_height
+
+
+@pytest.mark.asyncio
+async def test_accepted_submissions_are_recalled_only_within_the_runtime_lifetime() -> None:
+    conversation = ScriptedConversation(
+        deltas_by_submission=((), (), ()),
+        completed_contents=("", "", ""),
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("first"), "enter")
+        await _wait_for_turn(app)
+        await pilot.press(*list("second"), "enter")
+        await _wait_for_turn(app)
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        await pilot.press("up")
+        assert input_area.text == "second"
+        await pilot.press("up")
+        assert input_area.text == "first"
+        await pilot.press("down")
+        assert input_area.text == "second"
+        await pilot.press("down")
+        assert input_area.text == ""
+
+    next_runtime = _runtime(ScriptedConversation())
+    next_app = TerminalConversationApp(cast(PreparedReplRuntime, next_runtime))
+    async with next_app.run_test(size=(80, 24)) as pilot:
+        next_input = next_app.query_one("#conversation-input", TextArea)
+        await pilot.press("up")
+        assert next_input.text == ""
+
+
+@pytest.mark.asyncio
+async def test_scrolling_conversation_keeps_composer_focus_and_draft() -> None:
+    content = "\n".join(f"line {index:02d}" for index in range(80))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.press(*list("seed"), "enter")
+        await _wait_for_turn(app)
+        await pilot.press(*list("draft"))
+        await pilot._post_mouse_events([MouseScrollUp], offset=(10, 5), times=3)
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert input_area.text == "draft"
+        assert isinstance(app.screen.focused, TextArea)
 
 
 @pytest.mark.asyncio

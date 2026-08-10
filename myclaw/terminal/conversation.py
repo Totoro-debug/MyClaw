@@ -47,6 +47,42 @@ class _ConversationInput(TextArea):
             self.text_area = text_area
             self.text = text
 
+    def on_mount(self) -> None:
+        self._history: list[str] = []
+        self._history_index: int | None = None
+        self._history_draft = ""
+
+    def remember_submission(self, text: str) -> None:
+        """Keep accepted input only for this live application instance."""
+        self._history.append(text)
+        self._history_index = None
+        self._history_draft = ""
+
+    def _navigate_history(self, direction: int) -> bool:
+        if not self._history or (self.text and self._history_index is None):
+            return False
+
+        if self._history_index is None:
+            self._history_draft = self.text
+            self._history_index = len(self._history) - 1
+        else:
+            next_index = self._history_index + direction
+            if next_index < 0:
+                next_index = 0
+            if next_index >= len(self._history):
+                self._history_index = None
+                self.text = self._history_draft
+                return True
+            self._history_index = next_index
+
+        self.text = self._history[self._history_index]
+        self.move_cursor((len(self.document.lines) - 1, len(self.document.lines[-1])))
+        return True
+
+    def _leave_history(self) -> None:
+        self._history_index = None
+        self._history_draft = ""
+
     async def _on_key(self, event: Key) -> None:
         if event.key in _CONVERSATION_NAVIGATION_KEYS:
             event.stop()
@@ -57,6 +93,15 @@ class _ConversationInput(TextArea):
             event.stop()
             event.prevent_default()
             return
+        if event.key in {"up", "down"} and self._navigate_history(-1 if event.key == "up" else 1):
+            event.stop()
+            event.prevent_default()
+            return
+        if self._history_index is not None and (
+            event.is_printable
+            or event.key in {"backspace", "delete", "ctrl+backspace", "ctrl+delete", "ctrl+j"}
+        ):
+            self._leave_history()
         if event.key == "enter":
             event.stop()
             event.prevent_default()
@@ -285,9 +330,9 @@ class TerminalConversationApp(App[None]):
     }
 
     #conversation-input {
-        height: 5;
+        height: auto;
         min-height: 3;
-        max-height: 6;
+        max-height: 8;
         width: 100%;
         border-top: solid $panel;
         padding: 0 1;
@@ -333,7 +378,7 @@ class TerminalConversationApp(App[None]):
     #conversation-input-region {
         height: auto;
         min-height: 5;
-        max-height: 7;
+        max-height: 8;
         width: 100%;
     }
 
@@ -395,6 +440,7 @@ class TerminalConversationApp(App[None]):
         if not text.strip() or message.text_area.read_only:
             return
 
+        message.text_area.remember_submission(text)
         message.text_area.text = ""
         message.text_area.read_only = True
         display = self.query_one("#conversation-display", _ConversationDisplay)
