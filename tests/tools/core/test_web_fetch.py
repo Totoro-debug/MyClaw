@@ -226,7 +226,10 @@ async def test_web_fetch_uses_jina_first_for_public_targets() -> None:
 
     assert result.status == "success"
     assert result.content == "# Public page"
-    assert resolver.calls == [("public.example", 443)]
+    assert resolver.calls == [
+        ("public.example", 443),
+        ("public.example", 443),
+    ]
     assert jina.calls == [("https://public.example/page", "markdown")]
     assert http.calls == []
 
@@ -487,6 +490,74 @@ async def test_web_fetch_approved_private_target_skips_jina() -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_web_fetch_calls_keep_target_evaluations_isolated() -> None:
+    class SequencedResolver:
+        def __init__(self) -> None:
+            self._answers = iter(
+                (
+                    ("127.0.0.1",),
+                    ("93.184.216.34",),
+                    ("93.184.216.34",),
+                    ("127.0.0.1",),
+                )
+            )
+
+        async def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
+            del hostname, port
+            return next(self._answers)
+
+    jina = FakeJina()
+    FakeJina.outcomes = ["public-via-jina", "cross-call-evaluation"]
+    response = FakeResponse(
+        headers={"content-type": "text/plain"},
+        chunks=(b"confirmed-private-direct",),
+    )
+    http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
+    confirmation_requested = asyncio.Event()
+    approve_private = asyncio.Event()
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        confirmation_requested.set()
+        await approve_private.wait()
+        return "approved"
+
+    gateway = _gateway(
+        resolver=SequencedResolver(),
+        jina=jina,
+        http=http,
+        confirmation=approve,
+    )
+    private_call = asyncio.create_task(
+        gateway.call(
+            _call(
+                {"url": "https://same.example/page"},
+                call_id="call_private",
+            )
+        )
+    )
+    await confirmation_requested.wait()
+
+    public_result = await gateway.call(
+        _call(
+            {"url": "https://same.example/page"},
+            call_id="call_public",
+        )
+    )
+    approve_private.set()
+    private_result = await private_call
+
+    assert public_result.status == "success"
+    assert public_result.content == "public-via-jina"
+    assert private_result.status == "success"
+    assert private_result.content == "confirmed-private-direct"
+    assert private_result.confirmation is not None
+    assert private_result.confirmation.request.tool_call_id == "call_private"
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_web_fetch_dns_failure_requests_confirmation_and_skips_jina() -> None:
     resolver = FakeResolver(())
     resolver.failure = OSError("DNS unavailable")
@@ -588,6 +659,7 @@ async def test_web_fetch_follows_public_redirects_and_rechecks_each_target() -> 
     assert result.content == "redirected"
     assert resolver.calls == [
         ("public.example", 443),
+        ("public.example", 443),
         ("next.example", 443),
     ]
     assert [call[0] for call in http.calls] == [
@@ -623,6 +695,7 @@ async def test_web_fetch_stops_at_a_newly_unsafe_redirect_for_a_separate_call() 
     assert "http://internal.example/admin" in result.content
     assert resolver.calls == [
         ("public.example", 443),
+        ("public.example", 443),
         ("internal.example", 80),
     ]
     assert len(http.calls) == 1
@@ -651,7 +724,7 @@ async def test_web_fetch_follows_at_most_five_redirects() -> None:
     assert "redirect limit" in result.content
     assert len(http.calls) == 6
     assert all(response.closed for response in redirects)
-    assert len(resolver.calls) == 6
+    assert len(resolver.calls) == 7
 
 
 @pytest.mark.asyncio

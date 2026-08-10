@@ -173,7 +173,6 @@ class WebFetchTool(BaseTool):
         self._resolver = SocketDNSResolver() if resolver is None else resolver
         self._jina_reader = JinaReaderClient() if jina_reader is None else jina_reader
         self._http_client = AioHttpWebFetchClient() if http_client is None else http_client
-        self._evaluations: dict[str, _TargetEvaluation] = {}
 
     def validate_arguments(  # type: ignore[override]
         self,
@@ -201,14 +200,11 @@ class WebFetchTool(BaseTool):
         del format, maxChars
         normalized_url = url.strip()
         evaluation = await self._evaluate_target(normalized_url)
-        self._evaluations[normalized_url] = evaluation
         return evaluation.safety_reason
 
     async def execute(self, *, url: str, format: str, maxChars: int) -> str:
         normalized_url = url.strip()
-        evaluation = self._evaluations.pop(normalized_url, None)
-        if evaluation is None:
-            evaluation = await self._evaluate_target(normalized_url)
+        evaluation = await self._evaluate_target(normalized_url)
 
         try:
             async with asyncio.timeout(TOTAL_TIMEOUT_SECONDS):
