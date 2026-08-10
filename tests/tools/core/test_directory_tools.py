@@ -243,6 +243,62 @@ async def test_directory_links_are_reported_but_never_traversed(workspace: Path)
 
 
 @pytest.mark.asyncio
+async def test_directory_symlink_roots_are_never_traversed(workspace: Path) -> None:
+    target = workspace / "target"
+    target.mkdir()
+    (target / "inside.txt").write_text("inside", encoding="utf-8")
+    link = workspace / "linked"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"directory symlinks unavailable: {error}")
+
+    identity = Workspace.from_path(workspace)
+    list_gateway = _gateway(ListDirTool(workspace=identity))
+    glob_gateway = _gateway(GlobTool(workspace=identity))
+
+    listing = await list_gateway.call(_call("list_dir", {"path": "linked", "recursive": True}))
+    matches = await glob_gateway.call(
+        _call("glob", {"path": "linked", "pattern": "*", "head_limit": 0})
+    )
+
+    assert listing.status == "success"
+    assert listing.content == ""
+    assert matches.status == "success"
+    assert matches.content == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+async def test_directory_junction_roots_are_never_traversed(workspace: Path) -> None:
+    target = workspace / "target"
+    target.mkdir()
+    (target / "inside.txt").write_text("inside", encoding="utf-8")
+    junction = workspace / "linked"
+    created = subprocess.run(
+        ("cmd", "/c", "mklink", "/J", str(junction), str(target)),
+        capture_output=True,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"directory junctions unavailable: {created.stderr.strip()}")
+
+    identity = Workspace.from_path(workspace)
+    list_gateway = _gateway(ListDirTool(workspace=identity))
+    glob_gateway = _gateway(GlobTool(workspace=identity))
+
+    listing = await list_gateway.call(_call("list_dir", {"path": "linked", "recursive": True}))
+    matches = await glob_gateway.call(
+        _call("glob", {"path": "linked", "pattern": "*", "head_limit": 0})
+    )
+
+    assert listing.status == "success"
+    assert listing.content == ""
+    assert matches.status == "success"
+    assert matches.content == ""
+
+
+@pytest.mark.asyncio
 async def test_inaccessible_descendants_are_skipped_but_roots_fail(
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -6,7 +6,11 @@ from typing import Annotated
 
 from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool, ToolError, ToolParam
-from myclaw.tools.core._directory import iter_directory_entries, report_path
+from myclaw.tools.core._directory import (
+    iter_directory_entries,
+    report_path,
+    requested_path_has_directory_link,
+)
 
 
 class ListDirTool(BaseTool):
@@ -36,6 +40,8 @@ class ListDirTool(BaseTool):
         return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
 
     async def execute(self, *, path: str, recursive: bool, max_entries: int) -> str:
+        if requested_path_has_directory_link(self._workspace, path):
+            return ""
         target = self.resolve_path_argument(workspace=self._workspace, requested=path)
         try:
             entries = list(iter_directory_entries(target, recursive=recursive))

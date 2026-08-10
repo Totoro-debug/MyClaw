@@ -80,6 +80,30 @@ def iter_directory_entries(root: Path, *, recursive: bool = True) -> Iterator[Di
                 pending.append(child)
 
 
+def requested_path_has_directory_link(workspace: Workspace, requested: str) -> bool:
+    """Return whether a requested root crosses a directory link or reparse point."""
+    workspace_root = Path(workspace.path).resolve(strict=True)
+    path = Path(requested)
+    if not path.is_absolute():
+        path = workspace_root / path
+    current = path.absolute()
+    boundary = workspace_root if current.is_relative_to(workspace_root) else None
+
+    while boundary is None or current != boundary:
+        try:
+            status = current.lstat()
+        except OSError:
+            pass
+        else:
+            if _is_link(status) and _link_is_directory(current, status):
+                return True
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return False
+
+
 def report_path(
     entry: DirectoryEntry,
     *,
@@ -186,4 +210,5 @@ __all__ = [
     "matches_glob_pattern",
     "normalize_glob_pattern",
     "report_path",
+    "requested_path_has_directory_link",
 ]

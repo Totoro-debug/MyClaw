@@ -11,6 +11,7 @@ from myclaw.tools.core._directory import (
     matches_glob_pattern,
     normalize_glob_pattern,
     report_path,
+    requested_path_has_directory_link,
 )
 
 
@@ -75,6 +76,8 @@ class GlobTool(BaseTool):
         offset: int,
         kind: str,
     ) -> str:
+        if requested_path_has_directory_link(self._workspace, path):
+            return ""
         target = self.resolve_path_argument(workspace=self._workspace, requested=path)
         normalized_pattern = normalize_glob_pattern(pattern)
         try:
