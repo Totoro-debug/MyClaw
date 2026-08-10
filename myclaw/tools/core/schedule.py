@@ -285,11 +285,9 @@ class ScheduleTool(BaseTool):
         if not isinstance(value, str):
             raise ToolError(_INVALID_ARGUMENTS)
         try:
-            zone = ZoneInfo(value)
+            ZoneInfo(value)
         except (ZoneInfoNotFoundError, ValueError) as error:
             raise ToolError(_TIMEZONE_FAILED) from error
-        if zone.key != value:
-            raise ToolError(_TIMEZONE_FAILED)
         return value
 
     def _aware_now(self) -> datetime:

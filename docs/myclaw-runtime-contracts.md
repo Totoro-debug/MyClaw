@@ -760,15 +760,15 @@ BaseTool 在 `status == "success"` 且结果长度严格超过 `runtime.max_tool
 | Workspace read/list/search | allow | allow | 不在 catalog |
 | Workspace write/edit | allow, subject to OS permissions | allow, subject to OS permissions | 不在 catalog |
 | Long-term Memory read | allow | allow | allow |
-| Long-term Memory edit | refused | refused | allow，仅精确文件 |
+| Long-term Memory edit | allow, subject to OS permissions | allow, subject to OS permissions | allow，仅精确文件 |
 | Current-session artifact read | allow | allow | 不在 catalog |
-| Agent Home internal state read/write | refused | refused | refused，memory store 自身操作除外 |
-| Exec | allow or one-shot confirmation by concrete safety check | allow or one-shot confirmation by concrete safety check | 不在 catalog |
-| WebSearch/WebFetch | allow or one-shot confirmation by concrete target check | allow or one-shot confirmation by concrete target check | 不在 catalog |
+| Agent Home internal state read/write | 按普通 Workspace path rules | Workspace 内 allow；外部 refused/error | 不在 catalog；owned stores 自行操作 |
+| Exec | allow or one-shot confirmation by concrete safety check | allow；需要确认时 refused | 不在 catalog |
+| WebSearch/WebFetch | allow or one-shot confirmation by concrete target check | allow；需要确认时 refused | 不在 catalog |
 | Schedule add/list/remove | allow | allow, except `add` is refused | 不在 catalog |
-| Workspace 之外 | one-shot confirmation or OS error | one-shot confirmation or OS error | refused/error |
+| Workspace 之外 | one-shot confirmation or OS error | refused/error（无确认通道） | refused/error |
 
-当前 Tool 契约没有 centralized Permission Policy、`ask`、approval flag 或 invocation ContextVar。Exec、Web 和 Workspace 外部路径的确认是一次性、精确绑定到当前 normalized call 的 Tool Confirmation；Schedule actions 不确认。无效参数、越界访问和执行失败返回 message-only `error`。Tool Result 不携带 error code 或嵌套 `ErrorInfo`，可携带 confirmation metadata。
+当前 Tool 契约没有 centralized Permission Policy、`ask`、approval flag 或 invocation ContextVar。前台 Exec、Web 和 Workspace 外部路径的确认是一次性、精确绑定到当前 normalized call 的 Tool Confirmation；Schedule Agent 没有确认通道，因此需要确认的操作会被拒绝，而 Schedule actions 自身不请求确认。无效参数、越界访问和执行失败返回 message-only `error`。Tool Result 不携带 error code 或嵌套 `ErrorInfo`，可携带 confirmation metadata。
 
 ## 13. Error Contract
 

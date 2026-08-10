@@ -238,7 +238,7 @@ def test_schedule_rejects_invalid_kind_field_combinations(values: dict[str, obje
         ("0 9 * * 1", "Not/A_Timezone"),
     ],
 )
-def test_cron_schedule_requires_canonical_cron_and_iana_timezone(
+def test_cron_schedule_requires_canonical_cron_and_valid_iana_timezone(
     cron_expr: str,
     timezone: str,
 ) -> None:

@@ -288,13 +288,11 @@ def _require_canonical_cron(value: str) -> None:
 
 def _require_iana_timezone(value: str) -> None:
     if not isinstance(value, str) or not value or value != value.strip():
-        raise ValueError("schedule.timezone must be a canonical IANA timezone")
+        raise ValueError("schedule.timezone must be a valid IANA timezone")
     try:
-        zone = ZoneInfo(value)
+        ZoneInfo(value)
     except (ZoneInfoNotFoundError, ValueError) as error:
-        raise ValueError("schedule.timezone must be a canonical IANA timezone") from error
-    if zone.key != value:
-        raise ValueError("schedule.timezone must be a canonical IANA timezone")
+        raise ValueError("schedule.timezone must be a valid IANA timezone") from error
 
 
 def _require_canonical_rfc3339_milliseconds(value: str, *, field: str) -> None:

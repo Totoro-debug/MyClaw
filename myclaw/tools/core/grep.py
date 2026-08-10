@@ -100,7 +100,7 @@ class GrepTool(BaseTool):
             minimum=0,
             maximum=1000,
         ),
-    ] = 200
+    ] = 0
     offset: Annotated[
         int, ToolParam(description="Number of matches or files to skip.", minimum=0)
     ] = 0

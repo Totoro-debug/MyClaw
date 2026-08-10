@@ -140,6 +140,28 @@ async def test_add_normalizes_cron_timezone_and_at_time_without_confirmation(
 
 
 @pytest.mark.asyncio
+async def test_cron_accepts_valid_iana_timezone_alias(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    store = _store(workspace, agent_home)
+    gateway = _gateway(ScheduleTool(store=store, now=lambda: NOW, new_uuid=lambda: JOB_UUID))
+
+    result = await gateway.call(
+        ModelToolCall(
+            id="call_alias_cron",
+            name="schedule",
+            arguments=(
+                '{"action":"add","message":"Alias","cron_expr":"0 9 * * *","timezone":"US/Eastern"}'
+            ),
+        )
+    )
+
+    assert result.status == "success"
+    assert json.loads(result.content)["job"]["schedule"]["timezone"] == "US/Eastern"
+
+
+@pytest.mark.asyncio
 async def test_cron_defaults_to_utc_and_invalid_at_time_is_rejected(
     workspace: Path,
     agent_home: Path,

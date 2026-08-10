@@ -4,6 +4,7 @@ import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -197,6 +198,27 @@ async def test_grep_paginates_files_and_counts_matching_lines_not_occurrences(
     assert files.content == "b.py"
     assert counts.content == "a.py:1\nb.py:1"
     assert paged_counts.content == "b.py:1"
+
+
+@pytest.mark.asyncio
+async def test_grep_omitted_head_limit_returns_all_matches(workspace: Path) -> None:
+    target = workspace / "many.txt"
+    target.write_text(
+        "".join(f"hit {index}\n" for index in range(201)),
+        encoding="utf-8",
+    )
+    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    function = cast(dict[str, object], gateway.schemas[0]["function"])
+    parameters = cast(dict[str, object], function["parameters"])
+    properties = cast(dict[str, object], parameters["properties"])
+    head_limit = cast(dict[str, object], properties["head_limit"])
+
+    result = await gateway.call(_call("grep", {"pattern": "hit", "path": "many.txt"}))
+
+    assert head_limit["default"] == 0
+    matches = [line for line in result.content.splitlines() if line != "--"]
+    assert len(matches) == 201
+    assert matches[-1] == "many.txt:201:hit 200"
 
 
 @pytest.mark.asyncio

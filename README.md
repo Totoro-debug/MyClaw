@@ -80,10 +80,12 @@ plus these built-in management commands:
 - `/dream`: process pending Conversation Summaries now.
 
 Use `exit` or `quit` to shut down. Ctrl+C cancels the active foreground Agent Run
-while the REPL remains available. Schedule Job add/remove operations require
-foreground confirmation. Workspace file changes and non-allowlisted Shell commands
-are refused; noninteractive Schedule Agent Runs also refuse confirmation-required
-operations.
+while the REPL remains available. Schedule Tool add/list/remove operations do not
+request confirmation; Scheduled Agent Runs refuse add while permitting list/remove.
+Workspace file operations are allowed subject to operating-system permissions. Paths
+outside the Workspace, and Exec/Web targets that fail their concrete safety checks,
+require one-shot foreground confirmation; noninteractive Schedule Agent Runs refuse
+operations that require confirmation.
 
 ## Persistent State
 
@@ -171,8 +173,8 @@ per Session only, so total Workspace log usage is unbounded across Sessions.
 - A failed background Session snapshot can lose the latest in-memory turn after an
   abnormal process exit; Session persistence has no ordinary acknowledgement or failure
   logging. Conversation Summary and `last_consolidated` can diverge after a crash.
-- Approved Shell commands are not an operating-system sandbox and can affect more
-  than the Workspace according to the user's OS permissions.
+- Exec is not an operating-system sandbox. Commands run with the user's OS permissions
+  and can affect more than the Workspace.
 - Long-term Memory has no automatic size cap, and Tool Artifacts have no automatic
   cleanup policy.
 - v0.1 has no daemon, HTTP/IPC service, MCP support, subagent runtime, profiles,
