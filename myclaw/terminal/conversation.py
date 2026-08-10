@@ -8,7 +8,7 @@ from typing import Protocol, runtime_checkable
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
-from textual.events import Key, Unmount
+from textual.events import Key, Resize, Unmount
 from textual.message import Message
 from textual.widgets import Markdown, Static, TextArea
 
@@ -22,6 +22,8 @@ from myclaw.agent.events import (
 from myclaw.agent.runtime import PreparedReplRuntime
 
 __all__ = ["TerminalConversationApp", "run_terminal_conversation"]
+
+_COMPACT_MESSAGE_MAX_WIDTH = 60
 
 
 class _ConversationInput(TextArea):
@@ -56,12 +58,26 @@ class _ClosableEventStream(Protocol):
     async def aclose(self) -> None: ...
 
 
+class _ConversationDisplay(VerticalScroll):
+    """Conversation viewport that reports terminal width changes to its host."""
+
+    class Resized(Message):
+        def __init__(self, display: _ConversationDisplay, width: int) -> None:
+            super().__init__()
+            self.display = display
+            self.width = width
+
+    def on_resize(self, event: Resize) -> None:
+        self.post_message(self.Resized(self, event.size.width))
+
+
 class TerminalConversationApp(App[None]):
     """The two-region Textual application for one prepared Runtime."""
 
     CSS = """
     Screen {
         layout: vertical;
+        background: transparent;
     }
 
     #conversation-display {
@@ -69,6 +85,7 @@ class TerminalConversationApp(App[None]):
         width: 100%;
         padding: 1 2;
         scrollbar-size-vertical: 1;
+        background: transparent;
     }
 
     #conversation-input {
@@ -78,32 +95,42 @@ class TerminalConversationApp(App[None]):
         width: 100%;
         border-top: solid $panel;
         padding: 0 1;
+        background: transparent;
+    }
+
+    .message {
+        width: 72%;
+        max-width: 100%;
+        min-width: 0;
+        height: auto;
+        margin: 0 0 1 0;
+        padding: 0 1;
+        background: transparent;
+    }
+
+    .message-compact {
+        width: 100%;
     }
 
     .user-message {
-        width: 72%;
-        margin: 0 0 1 0;
-        padding: 0 1;
         text-align: right;
-        border-right: solid $accent;
+        border-right: solid $foreground;
     }
 
     .assistant-message {
-        width: 72%;
-        margin: 0 0 1 0;
-        padding: 0 1;
-        border-left: solid $accent;
+        border-left: solid $foreground;
+    }
+
+    .message-row {
+        width: 100%;
+        height: auto;
     }
 
     .user-row {
-        width: 100%;
-        height: auto;
         align: right top;
     }
 
     .assistant-row {
-        width: 100%;
-        height: auto;
         align: left top;
     }
 
@@ -121,7 +148,7 @@ class TerminalConversationApp(App[None]):
         self._runtime_started = False
 
     def compose(self) -> ComposeResult:
-        yield VerticalScroll(id="conversation-display")
+        yield _ConversationDisplay(id="conversation-display")
         yield _ConversationInput(id="conversation-input", placeholder="Message MyClaw")
 
     async def on_mount(self) -> None:
@@ -135,6 +162,12 @@ class TerminalConversationApp(App[None]):
             self._runtime_started = False
             await self._runtime.close()
 
+    @on(_ConversationDisplay.Resized)
+    def _display_resized(self, message: _ConversationDisplay.Resized) -> None:
+        compact = message.width <= _COMPACT_MESSAGE_MAX_WIDTH
+        for content in message.display.query(".message"):
+            content.set_class(compact, "message-compact")
+
     @on(_ConversationInput.Submitted)
     async def _submit_input(self, message: _ConversationInput.Submitted) -> None:
         text = message.text
@@ -143,10 +176,16 @@ class TerminalConversationApp(App[None]):
 
         message.text_area.text = ""
         message.text_area.read_only = True
-        display = self.query_one("#conversation-display", VerticalScroll)
-        row = Horizontal(classes="user-row")
+        display = self.query_one("#conversation-display", _ConversationDisplay)
+        row = Horizontal(classes="message-row user-row")
         await display.mount(row)
-        await row.mount(Static(text, markup=False, classes="user-message"))
+        await row.mount(
+            Static(
+                text,
+                markup=False,
+                classes=self._message_classes("user-message", display),
+            )
+        )
         display.scroll_end(animate=False, immediate=True)
 
         try:
@@ -194,14 +233,14 @@ class TerminalConversationApp(App[None]):
         assistant: Markdown | None,
         content: str,
     ) -> Markdown:
-        display = self.query_one("#conversation-display", VerticalScroll)
+        display = self.query_one("#conversation-display", _ConversationDisplay)
         if assistant is None:
             assistant = Markdown(
                 content,
-                classes="assistant-message",
+                classes=self._message_classes("assistant-message", display),
                 open_links=False,
             )
-            row = Horizontal(classes="assistant-row")
+            row = Horizontal(classes="message-row assistant-row")
             await display.mount(row)
             await row.mount(assistant)
         else:
@@ -210,9 +249,15 @@ class TerminalConversationApp(App[None]):
         return assistant
 
     async def _mount_status(self, content: str) -> None:
-        display = self.query_one("#conversation-display", VerticalScroll)
+        display = self.query_one("#conversation-display", _ConversationDisplay)
         await display.mount(Static(content, markup=False, classes="turn-status"))
         display.scroll_end(animate=False, immediate=True)
+
+    @staticmethod
+    def _message_classes(role: str, display: _ConversationDisplay) -> str:
+        compact = display.size.width <= _COMPACT_MESSAGE_MAX_WIDTH
+        suffix = " message-compact" if compact else ""
+        return f"message {role}{suffix}"
 
 
 def run_terminal_conversation(runtime: PreparedReplRuntime) -> None:
