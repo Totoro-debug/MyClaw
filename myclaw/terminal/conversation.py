@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
+from markdown_it import MarkdownIt
+from markdown_it.rules_core.state_core import StateCore
+from markdown_it.token import Token
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
@@ -56,6 +59,53 @@ class _ConversationInput(TextArea):
 @runtime_checkable
 class _ClosableEventStream(Protocol):
     async def aclose(self) -> None: ...
+
+
+class _MarkdownStream(Protocol):
+    async def write(self, markdown_fragment: str) -> None: ...
+
+    async def stop(self) -> None: ...
+
+
+def _make_links_visible(state: StateCore) -> None:
+    """Render Markdown links as ordinary label-and-URL text."""
+    for token in state.tokens:
+        if token.type != "inline" or token.children is None:
+            continue
+
+        children: list[Token] = []
+        link_starts: list[tuple[str, int]] = []
+        for child in token.children:
+            if child.type == "link_open":
+                href = child.attrGet("href")
+                link_starts.append((str(href) if href is not None else "", len(children)))
+                continue
+            if child.type == "link_close":
+                if link_starts:
+                    href, start = link_starts.pop()
+                    label = "".join(
+                        item.content
+                        for item in children[start:]
+                        if item.type in {"text", "code_inline"}
+                    )
+                    if href and label != href:
+                        children.append(Token("text", "", 0, content=f" ({href})"))
+                continue
+            if child.type == "image":
+                source = child.attrGet("src")
+                href = str(source) if source is not None else ""
+                alt = child.content
+                content = alt if not href else f"{alt} ({href})"
+                children.append(Token("text", "", 0, content=content))
+                continue
+            children.append(child)
+        token.children = children
+
+
+def _markdown_parser() -> MarkdownIt:
+    parser = MarkdownIt("gfm-like")
+    parser.core.ruler.after("linkify", "myclaw_visible_links", _make_links_visible)
+    return parser
 
 
 class _ConversationDisplay(VerticalScroll):
@@ -196,57 +246,71 @@ class TerminalConversationApp(App[None]):
 
     async def _consume_turn(self, events: AsyncIterator[AgentEvent]) -> None:
         assistant: Markdown | None = None
-        streamed_content = ""
+        stream: _MarkdownStream | None = None
+        streamed_fragments: list[str] = []
+        terminal_content: str | None = None
         try:
             async for event in events:
                 if event.type == "text_delta":
                     payload = event.payload
                     if not isinstance(payload, TextDeltaPayload):
                         raise TypeError("text_delta event has an invalid payload")
-                    streamed_content += payload.delta
-                    assistant = await self._update_assistant(assistant, streamed_content)
+                    streamed_fragments.append(payload.delta)
+                    if assistant is None:
+                        assistant = await self._mount_assistant()
+                        stream = Markdown.get_stream(assistant)
+                    assert stream is not None
+                    await stream.write(payload.delta)
+                    self._scroll_to_latest()
                 elif event.type == "turn_completed":
                     payload = event.payload
                     if not isinstance(payload, TurnCompletedPayload):
                         raise TypeError("turn_completed event has an invalid payload")
-                    assistant = await self._update_assistant(assistant, payload.content)
+                    terminal_content = payload.content
                 elif event.type == "turn_cancelled":
                     payload = event.payload
                     if not isinstance(payload, TurnCancelledPayload):
                         raise TypeError("turn_cancelled event has an invalid payload")
                     if payload.partial_content:
-                        assistant = await self._update_assistant(
-                            assistant,
-                            payload.partial_content,
-                        )
+                        terminal_content = payload.partial_content
                 elif event.type == "turn_failed":
                     payload = event.payload
                     if not isinstance(payload, TurnFailedPayload):
                         raise TypeError("turn_failed event has an invalid payload")
                     await self._mount_status(payload.error.message)
         finally:
-            if isinstance(events, _ClosableEventStream):
-                await events.aclose()
+            try:
+                if stream is not None:
+                    await stream.stop()
+                final_content = (
+                    terminal_content
+                    if terminal_content is not None
+                    else "".join(streamed_fragments)
+                )
+                if final_content or (assistant is not None and terminal_content is not None):
+                    if assistant is None:
+                        assistant = await self._mount_assistant()
+                    await assistant.update(final_content)
+                    self._scroll_to_latest()
+            finally:
+                if isinstance(events, _ClosableEventStream):
+                    await events.aclose()
 
-    async def _update_assistant(
-        self,
-        assistant: Markdown | None,
-        content: str,
-    ) -> Markdown:
+    async def _mount_assistant(self) -> Markdown:
         display = self.query_one("#conversation-display", _ConversationDisplay)
-        if assistant is None:
-            assistant = Markdown(
-                content,
-                classes=self._message_classes("assistant-message", display),
-                open_links=False,
-            )
-            row = Horizontal(classes="message-row assistant-row")
-            await display.mount(row)
-            await row.mount(assistant)
-        else:
-            await assistant.update(content)
-        display.scroll_end(animate=False, immediate=True)
+        assistant = Markdown(
+            classes=self._message_classes("assistant-message", display),
+            open_links=False,
+            parser_factory=_markdown_parser,
+        )
+        row = Horizontal(classes="message-row assistant-row")
+        await display.mount(row)
+        await row.mount(assistant)
         return assistant
+
+    def _scroll_to_latest(self) -> None:
+        display = self.query_one("#conversation-display", _ConversationDisplay)
+        display.scroll_end(animate=False, immediate=True)
 
     async def _mount_status(self, content: str) -> None:
         display = self.query_one("#conversation-display", _ConversationDisplay)

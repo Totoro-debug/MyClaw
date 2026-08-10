@@ -4,21 +4,25 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID
 from xml.etree import ElementTree
 
 import pytest
-from textual.widgets import TextArea
+from textual.events import MouseScrollRight
+from textual.widgets import Markdown, TextArea
 
 from myclaw.agent.events import (
     AgentEvent,
     ConversationPort,
     TextDeltaPayload,
+    TurnCancelledPayload,
     TurnCompletedPayload,
+    TurnFailedPayload,
     TurnStartedPayload,
 )
 from myclaw.agent.runtime import PreparedReplRuntime
+from myclaw.errors import ErrorInfo
 from myclaw.provider.models import ModelUsage
 from myclaw.terminal.conversation import TerminalConversationApp
 from tests.agent.test_fixed_catalog_runtime import (
@@ -39,8 +43,18 @@ class ScriptedConversation:
         *,
         pause_before_events: bool = False,
         pause_after_first_delta: bool = False,
+        deltas: tuple[str, ...] = ("First ", "answer."),
+        completed_content: str = "First answer.",
+        outcomes: tuple[Literal["completed", "cancelled", "failed"], ...] = ("completed",),
+        cancelled_content: str = "",
+        failure_message: str = "The turn failed.",
     ) -> None:
         self.submissions: list[str] = []
+        self._deltas = deltas
+        self._completed_content = completed_content
+        self._outcomes = outcomes
+        self._cancelled_content = cancelled_content
+        self._failure_message = failure_message
         self.before_events = asyncio.Event()
         self.first_delta_emitted = asyncio.Event()
         self._continue_to_events = asyncio.Event()
@@ -58,6 +72,7 @@ class ScriptedConversation:
 
     async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
         self.submissions.append(text)
+        outcome = self._outcomes[min(len(self.submissions) - 1, len(self._outcomes) - 1)]
         self.before_events.set()
         await self._continue_to_events.wait()
         yield AgentEvent(
@@ -67,36 +82,78 @@ class ScriptedConversation:
             created_at=NOW,
             payload=TurnStartedPayload(),
         )
-        yield AgentEvent(
-            type="text_delta",
-            event_id=1,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=TextDeltaPayload(delta="First "),
-        )
-        self.first_delta_emitted.set()
-        await self._continue_after_first_delta.wait()
-        yield AgentEvent(
-            type="text_delta",
-            event_id=2,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=TextDeltaPayload(delta="answer."),
-        )
-        yield AgentEvent(
-            type="turn_completed",
-            event_id=3,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=TurnCompletedPayload(
-                content="First answer.",
-                usage=ModelUsage(input_tokens=1, output_tokens=2, total_tokens=3),
-            ),
-        )
+        for event_id, delta in enumerate(self._deltas, start=1):
+            yield AgentEvent(
+                type="text_delta",
+                event_id=event_id,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta=delta),
+            )
+            if event_id == 1:
+                self.first_delta_emitted.set()
+                await self._continue_after_first_delta.wait()
+        event_id = len(self._deltas) + 1
+        if outcome == "completed":
+            yield AgentEvent(
+                type="turn_completed",
+                event_id=event_id,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TurnCompletedPayload(
+                    content=self._completed_content,
+                    usage=ModelUsage(input_tokens=1, output_tokens=2, total_tokens=3),
+                ),
+            )
+        elif outcome == "cancelled":
+            yield AgentEvent(
+                type="turn_cancelled",
+                event_id=event_id,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TurnCancelledPayload(partial_content=self._cancelled_content),
+            )
+        else:
+            yield AgentEvent(
+                type="turn_failed",
+                event_id=event_id,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TurnFailedPayload(
+                    error=ErrorInfo(code="model_failed", message=self._failure_message)
+                ),
+            )
+
+
+class FailingConversation:
+    def __init__(self) -> None:
+        self.closed = asyncio.Event()
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        del text
+        try:
+            yield AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta="partial"),
+            )
+        finally:
+            self.closed.set()
+
+
+class FailingMarkdownStream:
+    async def write(self, markdown_fragment: str) -> None:
+        del markdown_fragment
+        raise RuntimeError("markdown write failed")
+
+    async def stop(self) -> None:
+        raise RuntimeError("markdown stop failed")
 
 
 class FakeRuntime:
-    def __init__(self, conversation: ScriptedConversation) -> None:
+    def __init__(self, conversation: object) -> None:
         self.conversation = cast(ConversationPort, conversation)
         self.start_calls = 0
         self.close_calls = 0
@@ -108,7 +165,7 @@ class FakeRuntime:
         self.close_calls += 1
 
 
-def _runtime(conversation: ScriptedConversation) -> FakeRuntime:
+def _runtime(conversation: object) -> FakeRuntime:
     return FakeRuntime(conversation)
 
 
@@ -209,7 +266,10 @@ async def test_nonblank_enter_echoes_user_before_consuming_agent_events() -> Non
 
 @pytest.mark.asyncio
 async def test_text_deltas_update_one_assistant_markdown_and_completion_wins() -> None:
-    conversation = ScriptedConversation(pause_after_first_delta=True)
+    conversation = ScriptedConversation(
+        pause_after_first_delta=True,
+        completed_content="Final answer.",
+    )
     runtime = _runtime(conversation)
     app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
 
@@ -228,10 +288,235 @@ async def test_text_deltas_update_one_assistant_markdown_and_completion_wins() -
 
         await asyncio.sleep(0.05)
         completed_text = _visible_screen_text(app)
-        assert completed_text.count("First answer.") == 1
-        assert completed_text.count("First") == 1
+        assert completed_text.count("Final answer.") == 1
+        assert "First answer." not in completed_text
 
     assert runtime.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_streamed_markdown_preserves_reading_structure_and_link_urls() -> None:
+    content = (
+        "# Heading\n\n"
+        "- first item\n"
+        "- second item\n\n"
+        "> quoted text\n\n"
+        "```python\n"
+        "long_value = " + "'x'" * 30 + "\n```\n\n"
+        "[documentation](https://example.com/docs)\n"
+        "![architecture image](https://example.com/asset.png)\n"
+    )
+    conversation = ScriptedConversation(
+        deltas=tuple(content),
+        completed_content=content,
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.press(*list("read"), "enter")
+        await asyncio.sleep(0.1)
+
+        visible_text = _visible_screen_text(app)
+        assert "Heading" in visible_text
+        assert "first item" in visible_text
+        assert "second item" in visible_text
+        assert "quoted text" in visible_text
+        assert "long_value" in visible_text
+        assert "documentation (https://example.com/docs)" in visible_text
+        assert "architecture image" in visible_text
+        assert "https://example.com/asset.png" in visible_text
+        assert "@click" not in app.export_screenshot()
+
+
+@pytest.mark.asyncio
+async def test_markdown_structure_is_visible_while_the_fenced_block_is_incomplete() -> None:
+    partial = "# Heading\n\n- first item\n\n> quoted text\n\n```python\nvalue = 1"
+    content = partial + "\n```\n"
+    conversation = ScriptedConversation(
+        pause_after_first_delta=True,
+        deltas=(partial, "\n```\n"),
+        completed_content=content,
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("progress"), "enter"))
+        try:
+            await asyncio.wait_for(conversation.first_delta_emitted.wait(), timeout=1)
+            await asyncio.sleep(0.05)
+
+            visible_text = _visible_screen_text(app)
+            assert "Heading" in visible_text
+            assert "first item" in visible_text
+            assert "quoted text" in visible_text
+            assert "value=1" in visible_text
+        finally:
+            conversation.continue_turn()
+            await asyncio.wait_for(submission, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_high_frequency_deltas_do_not_delay_the_exact_terminal_content() -> None:
+    streamed_content = "draft-" * 300
+    conversation = ScriptedConversation(
+        deltas=tuple(streamed_content),
+        completed_content="# Complete\n\nExact final content.",
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await asyncio.wait_for(pilot.press(*list("burst"), "enter"), timeout=5)
+        await asyncio.sleep(0.1)
+
+        visible_text = _visible_screen_text(app)
+        assert "Complete" in visible_text
+        assert "Exact final content." in visible_text
+        assert "draft-" not in visible_text
+
+
+@pytest.mark.asyncio
+async def test_long_markdown_code_lines_remain_unwrapped_in_a_narrow_terminal() -> None:
+    code_line = "very_long_variable_name = " + "0123456789" * 8 + "TAIL"
+    content = f"```python\n{code_line}\n```"
+    conversation = ScriptedConversation(
+        deltas=tuple(content),
+        completed_content=content,
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(48, 20)) as pilot:
+        await pilot.press(*list("code"), "enter")
+        await asyncio.sleep(0.1)
+
+        nodes = [
+            (text, y)
+            for text, _, y in _screenshot_text_nodes(app)
+            if text and all(character in code_line for character in text)
+        ]
+        assert "".join(text for text, _ in nodes).startswith("very_long_variable_name")
+        assert any("0" in text for text, _ in nodes)
+        assert len({y for _, y in nodes}) == 1
+
+        assert "TAIL" not in _visible_screen_text(app)
+        await pilot._post_mouse_events([MouseScrollRight], offset=(10, 5), times=30)
+        assert "TAIL" in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_incomplete_streamed_markdown_remains_visible_before_completion() -> None:
+    content = "[documentation](https://example.com/docs)\n\n```python\nvalue = 1\n```"
+    conversation = ScriptedConversation(
+        pause_after_first_delta=True,
+        deltas=("[documentation](", "https://example.com/docs)\n\n```python\n", "value = 1\n```"),
+        completed_content=content,
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("partial"), "enter"))
+        try:
+            await asyncio.wait_for(conversation.first_delta_emitted.wait(), timeout=1)
+            await asyncio.sleep(0.05)
+
+            partial_text = _visible_screen_text(app)
+            assert "[documentation](" in partial_text
+            assert "partial" in partial_text
+        finally:
+            conversation.continue_turn()
+            await asyncio.wait_for(submission, timeout=1)
+
+        await asyncio.sleep(0.05)
+        assert "documentation (https://example.com/docs)" in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_streamed_markdown_reflows_cjk_content_after_resize() -> None:
+    content = "界" * 20
+    conversation = ScriptedConversation(
+        deltas=tuple(content),
+        completed_content=content,
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("cjk"), "enter")
+        await asyncio.sleep(0.1)
+        assert _content_text_nodes(app, content) == [content]
+
+        await pilot.resize_terminal(40, 18)
+        await asyncio.sleep(0.05)
+        narrow_lines = _content_text_nodes(app, content)
+        assert len(narrow_lines) == 2
+        assert "".join(narrow_lines) == content
+
+        await pilot.resize_terminal(80, 24)
+        await asyncio.sleep(0.05)
+        assert _content_text_nodes(app, content) == [content]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "cancelled_content", "expected_partial", "expected_status"),
+    [
+        ("cancelled", "Cancelled exact content.", "Cancelled exact content.", None),
+        ("failed", "", "draft content", "Model unavailable."),
+    ],
+)
+async def test_terminal_outcomes_settle_markdown_and_allow_a_subsequent_turn(
+    outcome: Literal["cancelled", "failed"],
+    cancelled_content: str,
+    expected_partial: str,
+    expected_status: str | None,
+) -> None:
+    conversation = ScriptedConversation(
+        deltas=("draft ", "content"),
+        completed_content="Recovered response.",
+        outcomes=(outcome, "completed"),
+        cancelled_content=cancelled_content,
+        failure_message="Model unavailable.",
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("first"), "enter")
+        await asyncio.sleep(0.05)
+        visible_text = _visible_screen_text(app)
+        assert expected_partial in visible_text
+        if expected_status is not None:
+            assert expected_status in visible_text
+
+        await pilot.press(*list("again"), "enter")
+        await asyncio.sleep(0.05)
+        assert conversation.submissions == ["first", "again"]
+        assert "Recovered response." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_markdown_failure_still_closes_the_conversation_event_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FailingConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+    markdown_stream = FailingMarkdownStream()
+    monkeypatch.setattr(
+        Markdown,
+        "get_stream",
+        classmethod(lambda cls, markdown: markdown_stream),
+    )
+
+    with pytest.raises(RuntimeError, match="markdown stop failed"):
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press(*list("fail"), "enter")
+
+    assert conversation.closed.is_set()
 
 
 @pytest.mark.asyncio
