@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from asyncio import CancelledError
+from asyncio import CancelledError, current_task
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from markdown_it import MarkdownIt
 from markdown_it.rules_core.state_core import StateCore
@@ -38,10 +38,24 @@ __all__ = ["TerminalConversationApp", "run_terminal_conversation"]
 
 _COMPACT_MESSAGE_MAX_WIDTH = 60
 _CONVERSATION_NAVIGATION_KEYS = frozenset({"pageup", "pagedown", "ctrl+home", "ctrl+end"})
+type _ControlAction = Literal["cancel_active_turn", "clear_draft", "exit"]
 
 
 class _ConversationInput(TextArea):
     """Multiline input whose ordinary Enter key submits the current draft."""
+
+    class ControlAction(Message):
+        def __init__(
+            self,
+            text_area: _ConversationInput,
+            action: _ControlAction,
+            *,
+            turn_token: object | None = None,
+        ) -> None:
+            super().__init__()
+            self.text_area = text_area
+            self.action = action
+            self.turn_token = turn_token
 
     class Submitted(Message):
         def __init__(self, text_area: _ConversationInput, text: str) -> None:
@@ -53,6 +67,7 @@ class _ConversationInput(TextArea):
         self._history: list[str] = []
         self._history_index: int | None = None
         self._history_draft = ""
+        self.active_turn_token: object | None = None
 
     def remember_submission(self, text: str) -> None:
         """Keep accepted input only for this live application instance."""
@@ -90,6 +105,23 @@ class _ConversationInput(TextArea):
             event.stop()
             event.prevent_default()
             self.app.query_one("#conversation-display", _ConversationDisplay).navigate(event.key)
+            return
+        control_action: _ControlAction | None = None
+        turn_token: object | None = None
+        if event.key == "ctrl+c":
+            if self.read_only:
+                control_action = "cancel_active_turn"
+                turn_token = self.active_turn_token
+            elif self.text:
+                control_action = "clear_draft"
+            else:
+                control_action = "exit"
+        elif event.key == "ctrl+d" and not self.text:
+            control_action = "exit"
+        if control_action is not None:
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.ControlAction(self, control_action, turn_token=turn_token))
             return
         if self.read_only:
             event.stop()
@@ -395,6 +427,14 @@ class TerminalConversationApp(App[None]):
         color: $text-muted;
     }
 
+    #turn-status {
+        display: none;
+        height: 1;
+        width: 100%;
+        padding: 0 1;
+        color: $text-muted;
+    }
+
     .turn-status {
         width: 100%;
         margin: 0 0 1 0;
@@ -409,6 +449,8 @@ class TerminalConversationApp(App[None]):
         self._keyboard_adapter = EnhancedKeyboardAdapter()
         self._runtime_started = False
         self._turn_worker: Worker[None] | None = None
+        self._cancel_requested_turn: object | None = None
+        self._closing = False
 
     def _build_driver(
         self,
@@ -430,6 +472,7 @@ class TerminalConversationApp(App[None]):
         yield _ConversationDisplay(id="conversation-display")
         yield Vertical(
             Static("New content below", id="new-content", markup=False),
+            Static("Working", id="turn-status", markup=False),
             _ConversationInput(id="conversation-input", placeholder="Message MyClaw"),
             id="conversation-input-region",
         )
@@ -441,6 +484,7 @@ class TerminalConversationApp(App[None]):
 
     async def on_unmount(self, event: Unmount) -> None:
         del event
+        self._closing = True
         if self._turn_worker is not None:
             self._turn_worker.cancel()
             with suppress(WorkerError):
@@ -461,10 +505,17 @@ class TerminalConversationApp(App[None]):
         text = message.text
         if not text.strip() or message.text_area.read_only:
             return
+        if text.strip().casefold() in {"exit", "quit"}:
+            message.text_area.text = ""
+            self.exit()
+            return
 
         message.text_area.remember_submission(text)
         message.text_area.text = ""
+        turn_token = object()
+        message.text_area.active_turn_token = turn_token
         message.text_area.read_only = True
+        self._set_working(True)
         display = self.query_one("#conversation-display", _ConversationDisplay)
         row = Horizontal(classes="message-row user-row")
         await display.mount(row)
@@ -478,28 +529,70 @@ class TerminalConversationApp(App[None]):
         display.content_changed()
 
         self._turn_worker = self.run_worker(
-            self._run_turn(text, message.text_area),
+            self._run_turn(text, message.text_area, turn_token),
             name="conversation-turn",
             group="conversation-turn",
             exclusive=True,
             exit_on_error=False,
         )
 
-    async def _run_turn(self, text: str, text_area: _ConversationInput) -> None:
+    @on(_ConversationInput.ControlAction)
+    async def _handle_control_action(self, message: _ConversationInput.ControlAction) -> None:
+        message.stop()
+        text_area = message.text_area
+        if message.action == "cancel_active_turn":
+            turn_token = message.turn_token
+            if (
+                turn_token is None
+                or turn_token is not text_area.active_turn_token
+                or self._cancel_requested_turn is turn_token
+            ):
+                return
+            self._cancel_requested_turn = turn_token
+            try:
+                await self._runtime.conversation.cancel_active_turn()
+            except Exception as error:
+                if self._cancel_requested_turn is turn_token:
+                    self._cancel_requested_turn = None
+                self._handle_exception(error)
+            return
+        if message.action == "clear_draft":
+            text_area.text = ""
+            return
+        self.exit()
+
+    async def _run_turn(
+        self,
+        text: str,
+        text_area: _ConversationInput,
+        turn_token: object,
+    ) -> None:
         try:
             await self._consume_turn(self._runtime.conversation.submit(text))
+        except CancelledError:
+            if self._closing:
+                raise
+            _clear_current_task_cancellation()
+            await self._mount_status("Turn cancelled.")
         except Exception as error:
             self._handle_exception(error)
         finally:
-            text_area.read_only = False
-            with suppress(Exception):
-                text_area.focus()
+            if text_area.active_turn_token is turn_token:
+                text_area.active_turn_token = None
+                if self._cancel_requested_turn is turn_token:
+                    self._cancel_requested_turn = None
+                self._set_working(False)
+                text_area.read_only = False
+                if not self._closing:
+                    with suppress(Exception):
+                        text_area.focus()
 
     async def _consume_turn(self, events: AsyncIterator[AgentEvent]) -> None:
         assistant: Markdown | None = None
         stream: _MarkdownStream | None = None
         streamed_fragments: list[str] = []
         terminal_content: str | None = None
+        terminal_status: str | None = None
         cancelled = False
         try:
             async for event in events:
@@ -525,11 +618,12 @@ class TerminalConversationApp(App[None]):
                         raise TypeError("turn_cancelled event has an invalid payload")
                     if payload.partial_content:
                         terminal_content = payload.partial_content
+                    terminal_status = "Turn cancelled."
                 elif event.type == "turn_failed":
                     payload = event.payload
                     if not isinstance(payload, TurnFailedPayload):
                         raise TypeError("turn_failed event has an invalid payload")
-                    await self._mount_status(payload.error.message)
+                    terminal_status = payload.error.message
         except CancelledError:
             cancelled = True
             raise
@@ -553,6 +647,8 @@ class TerminalConversationApp(App[None]):
                         assistant = await self._mount_assistant()
                     await assistant.update(final_content)
                     self._scroll_to_latest()
+                if not cancelled and terminal_status is not None:
+                    await self._mount_status(terminal_status)
             finally:
                 if isinstance(events, _ClosableEventStream):
                     try:
@@ -582,6 +678,10 @@ class TerminalConversationApp(App[None]):
         await display.mount(Static(content, markup=False, classes="turn-status"))
         self._scroll_to_latest()
 
+    def _set_working(self, working: bool) -> None:
+        with suppress(NoMatches, NoScreen, ScreenStackError):
+            self.query_one("#turn-status", Static).display = working
+
     @staticmethod
     def _message_classes(role: str, display: _ConversationDisplay) -> str:
         compact = display.size.width <= _COMPACT_MESSAGE_MAX_WIDTH
@@ -592,3 +692,11 @@ class TerminalConversationApp(App[None]):
 def run_terminal_conversation(runtime: PreparedReplRuntime) -> None:
     """Run a Terminal Conversation application around a prepared Runtime."""
     TerminalConversationApp(runtime).run()
+
+
+def _clear_current_task_cancellation() -> None:
+    task = current_task()
+    if task is None:
+        return
+    while task.cancelling():
+        task.uncancel()

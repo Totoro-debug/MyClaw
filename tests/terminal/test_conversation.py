@@ -20,7 +20,7 @@ from textual.events import (
     MouseUp,
     Paste,
 )
-from textual.widgets import Markdown, TextArea
+from textual.widgets import Markdown, Static, TextArea
 
 from myclaw.agent.events import (
     AgentEvent,
@@ -31,9 +31,16 @@ from myclaw.agent.events import (
     TurnFailedPayload,
     TurnStartedPayload,
 )
+from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedReplRuntime
 from myclaw.errors import ErrorInfo
-from myclaw.provider.models import ModelUsage
+from myclaw.provider.models import (
+    ModelCompleted,
+    ModelRequest,
+    ModelStreamEvent,
+    ModelUsage,
+    TextDelta,
+)
 from myclaw.terminal.conversation import TerminalConversationApp
 from tests.agent.test_fixed_catalog_runtime import (
     _response,
@@ -154,6 +161,94 @@ class ScriptedConversation:
                     error=ErrorInfo(code="model_failed", message=self._failure_message)
                 ),
             )
+
+
+class CancellableConversation:
+    def __init__(self) -> None:
+        self.submissions: list[str] = []
+        self.cancel_calls = 0
+        self.first_delta_emitted = asyncio.Event()
+        self._active_task: asyncio.Task[object] | None = None
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        self.submissions.append(text)
+        active_task = asyncio.current_task()
+        assert active_task is not None
+        self._active_task = active_task
+        try:
+            yield AgentEvent(
+                type="turn_started",
+                event_id=0,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TurnStartedPayload(),
+            )
+            if len(self.submissions) == 1:
+                yield AgentEvent(
+                    type="text_delta",
+                    event_id=1,
+                    turn_id=TURN_ID,
+                    created_at=NOW,
+                    payload=TextDeltaPayload(delta="partial response"),
+                )
+                self.first_delta_emitted.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    yield AgentEvent(
+                        type="turn_cancelled",
+                        event_id=2,
+                        turn_id=TURN_ID,
+                        created_at=NOW,
+                        payload=TurnCancelledPayload(partial_content="partial response"),
+                    )
+                    return
+            else:
+                yield AgentEvent(
+                    type="text_delta",
+                    event_id=1,
+                    turn_id=TURN_ID,
+                    created_at=NOW,
+                    payload=TextDeltaPayload(delta="Recovered response."),
+                )
+                yield AgentEvent(
+                    type="turn_completed",
+                    event_id=2,
+                    turn_id=TURN_ID,
+                    created_at=NOW,
+                    payload=TurnCompletedPayload(
+                        content="Recovered response.",
+                        usage=ModelUsage(input_tokens=1, output_tokens=2, total_tokens=3),
+                    ),
+                )
+        finally:
+            self._active_task = None
+
+    async def cancel_active_turn(self) -> None:
+        self.cancel_calls += 1
+        if self._active_task is not None:
+            self._active_task.cancel()
+
+
+class CancellableRuntimeProvider(_RuntimeProvider):
+    def __init__(self) -> None:
+        super().__init__(())
+        self.first_delta_emitted = asyncio.Event()
+        self._chat_calls = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        if request.system_prompt == session_title_prompt():
+            async for event in super().stream(request):
+                yield event
+            return
+        self.stream_requests.append(request)
+        self._chat_calls += 1
+        if self._chat_calls == 1:
+            yield TextDelta(delta="partial runtime response")
+            self.first_delta_emitted.set()
+            await asyncio.Event().wait()
+            return
+        yield ModelCompleted(response=_response(content="Recovered runtime response."))
 
 
 class FailingConversation:
@@ -359,6 +454,171 @@ async def test_nonblank_enter_echoes_user_before_consuming_agent_events() -> Non
             conversation.continue_to_events()
             await asyncio.wait_for(submission, timeout=1)
             await _wait_for_turn(app)
+
+
+@pytest.mark.asyncio
+async def test_active_turn_is_read_only_working_and_cancellable_before_a_later_turn() -> None:
+    conversation = CancellableConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("first"), "enter"))
+        await asyncio.wait_for(conversation.first_delta_emitted.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        working = app.query_one("#turn-status", Static)
+        assert input_area.read_only
+        assert working.display
+        assert "Working" in _visible_screen_text(app)
+
+        await pilot.press(*list("queued"), "enter")
+        assert conversation.submissions == ["first"]
+
+        await pilot.press("ctrl+c")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+        assert conversation.cancel_calls == 1
+        assert not input_area.read_only
+        assert not working.display
+        await pilot.press("ctrl+home")
+        visible_text = _visible_screen_text(app)
+        assert "partial response" in visible_text
+        assert "Turn cancelled." in visible_text
+
+        await pilot.press(*list("again"), "enter")
+        await _wait_for_turn(app)
+        assert conversation.submissions == ["first", "again"]
+        assert "Recovered response." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_repeated_active_ctrl_c_is_bound_to_one_turn_without_exiting() -> None:
+    conversation = CancellableConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("first"), "enter"))
+        await asyncio.wait_for(conversation.first_delta_emitted.wait(), timeout=1)
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        input_area.post_message(Key("ctrl+c", None))
+        input_area.post_message(Key("ctrl+c", None))
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+        assert conversation.cancel_calls == 1
+        assert app.is_running
+        assert input_area.text == ""
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_clears_an_idle_draft_without_exiting() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        input_area = app.query_one("#conversation-input", TextArea)
+        await pilot.press(*list("draft"))
+        await pilot.press("ctrl+c")
+
+        assert input_area.text == ""
+        assert app.is_running
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_on_empty_idle_input_exits() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+
+        assert not app.is_running
+
+
+@pytest.mark.asyncio
+async def test_ctrl_d_deletes_forward_when_draft_is_nonempty() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        input_area = app.query_one("#conversation-input", TextArea)
+        await pilot.press(*list("draft"))
+        input_area.move_cursor((0, 0))
+        await pilot.press("ctrl+d")
+
+        assert input_area.text == "raft"
+        assert app.is_running
+
+
+@pytest.mark.asyncio
+async def test_ctrl_d_on_empty_input_exits() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+
+        assert not app.is_running
+
+
+@pytest.mark.asyncio
+async def test_ctrl_d_during_an_active_turn_settles_stream_before_runtime_close() -> None:
+    conversation = BlockingConversation()
+    runtime = CloseOrderingRuntime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("active"), "enter"))
+        await asyncio.wait_for(conversation.started.wait(), timeout=1)
+        await pilot.press("ctrl+d")
+        await asyncio.wait_for(submission, timeout=1)
+        await pilot.pause()
+
+        assert not app.is_running
+
+    assert conversation.closed.is_set()
+    assert runtime.close_saw_stream_closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [" EXIT ", " qUiT "])
+async def test_exit_and_quit_commands_exit_without_submitting(command: str) -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list(command), "enter")
+        await pilot.pause()
+
+        assert conversation.submissions == []
+        assert not app.is_running
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["exit now", "quitter"])
+async def test_exit_like_text_is_submitted_as_an_ordinary_turn(command: str) -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list(command), "enter")
+        await _wait_for_turn(app)
+
+        assert conversation.submissions == [command]
+        assert app.is_running
 
 
 @pytest.mark.asyncio
@@ -791,6 +1051,26 @@ async def test_terminal_outcomes_settle_markdown_and_allow_a_subsequent_turn(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_partial_content_precedes_the_final_cancelled_status() -> None:
+    conversation = ScriptedConversation(
+        deltas=(),
+        outcomes=("cancelled",),
+        cancelled_content="Retained partial response.",
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("cancel"), "enter")
+        await _wait_for_turn(app)
+
+        visible_text = _visible_screen_text(app)
+        assert visible_text.index("Retained partial response.") < visible_text.index(
+            "Turn cancelled."
+        )
+
+
+@pytest.mark.asyncio
 async def test_markdown_failure_still_closes_the_conversation_event_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -822,10 +1102,38 @@ async def test_terminal_conversation_uses_the_prepared_runtime_lifecycle(
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("h", "i", "enter")
+        await _wait_for_turn(app)
 
         visible_text = _visible_screen_text(app)
         assert "hi" in visible_text
         assert "Prepared runtime answer." in visible_text
+
+    assert provider.closed
+
+
+@pytest.mark.asyncio
+async def test_prepared_runtime_cancellation_preserves_partial_and_allows_next_turn(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = CancellableRuntimeProvider()
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("first"), "enter"))
+        await asyncio.wait_for(provider.first_delta_emitted.wait(), timeout=1)
+        await pilot.press("ctrl+c")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+        visible_text = _visible_screen_text(app)
+        assert "partial runtime response" in visible_text
+        assert "Turn cancelled." in visible_text
+
+        await pilot.press(*list("again"), "enter")
+        await _wait_for_turn(app)
+        assert "Recovered runtime response." in _visible_screen_text(app)
 
     assert provider.closed
 
