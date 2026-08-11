@@ -4,12 +4,14 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import ClassVar, Literal, cast
 from uuid import UUID
 from xml.etree import ElementTree
 
 import pytest
+from textual.driver import Driver
 from textual.events import (
+    Key,
     MouseDown,
     MouseMove,
     MouseScrollDown,
@@ -215,6 +217,32 @@ class FakeRuntime:
         self.close_calls += 1
 
 
+class KeyboardLifecycleDriver(Driver):
+    operations: ClassVar[list[tuple[str, str]]] = []
+
+    def write(self, data: str) -> None:
+        self.operations.append(("write", data))
+
+    def flush(self) -> None:
+        self.operations.append(("flush", ""))
+
+    def start_application_mode(self) -> None:
+        self.write("application:start")
+        self.write("\x1b[>1u")
+        self.flush()
+
+    def disable_input(self) -> None:
+        self.operations.append(("disable_input", ""))
+
+    def stop_application_mode(self) -> None:
+        self.write("\x1b[<u")
+        self.write("application:stop")
+        self.flush()
+
+    def close(self) -> None:
+        self.operations.append(("close", ""))
+
+
 class CloseOrderingRuntime(FakeRuntime):
     def __init__(self, conversation: BlockingConversation) -> None:
         super().__init__(conversation)
@@ -344,6 +372,69 @@ async def test_multiline_submission_preserves_text_and_ctrl_j_inserts_a_newline(
         await _wait_for_turn(app)
 
     assert conversation.submissions == ["first line\nsecond line"]
+
+
+@pytest.mark.asyncio
+async def test_supported_modifier_enter_sequences_insert_newlines_without_submitting() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        input_area = app.query_one("#conversation-input", TextArea)
+        await pilot.press(*list("first line"))
+        input_area.post_message(Key("\x1b[13;66u", None))
+        await pilot.pause()
+        await pilot.press(*list("second line"))
+        input_area.post_message(Key("\x1b[13;67u", None))
+        await pilot.pause()
+        await pilot.press(*list("third line"), "enter")
+        await _wait_for_turn(app)
+
+    assert conversation.submissions == ["first line\nsecond line\nthird line"]
+
+
+@pytest.mark.asyncio
+async def test_textual_driver_lifecycle_balances_enhanced_keyboard_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KITTY_WINDOW_ID", "1")
+    KeyboardLifecycleDriver.operations = []
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+    app.driver_class = KeyboardLifecycleDriver
+
+    async def exit_when_ready(_: object) -> None:
+        app.exit()
+
+    await app.run_async(headless=False, size=(80, 24), auto_pilot=exit_when_ready)
+
+    keyboard_writes = [
+        value
+        for operation, value in KeyboardLifecycleDriver.operations
+        if operation == "write" and value in {"\x1b[>1u", "\x1b[<u"}
+    ]
+    assert keyboard_writes == ["\x1b[>1u", "\x1b[<u"]
+    assert KeyboardLifecycleDriver.operations[-1] == ("close", "")
+    assert runtime.start_calls == 1
+    assert runtime.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_enhanced_keyboard_report_does_not_break_ordinary_submission() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        input_area = app.query_one("#conversation-input", TextArea)
+        input_area.post_message(Key("\x1b[13;" + ("9" * 5000) + "u", None))
+        await pilot.pause()
+        await pilot.press(*list("still works"), "enter")
+        await _wait_for_turn(app)
+
+    assert conversation.submissions == ["still works"]
 
 
 @pytest.mark.asyncio

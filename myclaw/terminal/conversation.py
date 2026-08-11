@@ -16,6 +16,7 @@ from textual.app import App, ComposeResult, ScreenStackError
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.dom import NoScreen
+from textual.driver import Driver
 from textual.events import Key, MouseScrollDown, MouseScrollUp, Resize, Unmount
 from textual.message import Message
 from textual.scrollbar import ScrollTo
@@ -31,6 +32,7 @@ from myclaw.agent.events import (
     TurnFailedPayload,
 )
 from myclaw.agent.runtime import PreparedReplRuntime
+from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
 
 __all__ = ["TerminalConversationApp", "run_terminal_conversation"]
 
@@ -97,20 +99,23 @@ class _ConversationInput(TextArea):
             event.stop()
             event.prevent_default()
             return
+        action = EnhancedKeyboardAdapter.action_for_key(event.key)
         if self._history_index is not None and (
             event.is_printable
-            or event.key in {"backspace", "delete", "ctrl+backspace", "ctrl+delete", "ctrl+j"}
+            or event.key in {"backspace", "delete", "ctrl+backspace", "ctrl+delete"}
+            or action is not None
         ):
             self._leave_history()
-        if event.key == "enter":
-            event.stop()
-            event.prevent_default()
-            self.post_message(self.Submitted(self, self.text))
-            return
-        if event.key == "ctrl+j":
+
+        if action is EnhancedKeyboardAction.NEWLINE:
             event.stop()
             event.prevent_default()
             self.insert("\n")
+            return
+        if action is EnhancedKeyboardAction.SUBMIT:
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Submitted(self, self.text))
             return
         await super()._on_key(event)
 
@@ -401,8 +406,25 @@ class TerminalConversationApp(App[None]):
     def __init__(self, runtime: PreparedReplRuntime) -> None:
         super().__init__()
         self._runtime = runtime
+        self._keyboard_adapter = EnhancedKeyboardAdapter()
         self._runtime_started = False
         self._turn_worker: Worker[None] | None = None
+
+    def _build_driver(
+        self,
+        headless: bool,
+        inline: bool,
+        mouse: bool,
+        size: tuple[int, int] | None,
+    ) -> Driver:
+        driver = super()._build_driver(headless, inline, mouse, size)
+        if driver.is_headless:
+            return driver
+
+        # Textual has no public hook around its Kitty push/pop writes. Keep this
+        # compatibility boundary narrow and exercise it through App.run_async tests.
+        self._keyboard_adapter = EnhancedKeyboardAdapter.install_on_driver(driver)
+        return driver
 
     def compose(self) -> ComposeResult:
         yield _ConversationDisplay(id="conversation-display")
