@@ -407,6 +407,7 @@ def _map_agent_run_payload(
             turn_id=turn_id,
             tool_call_id=request.tool_call_id,
             tool_name=request.tool_name,
+            reason=request.reason,
             summary=request.summary,
             details=request.details,
             warnings=request.warnings,

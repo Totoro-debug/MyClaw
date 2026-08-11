@@ -326,13 +326,17 @@ class ToolGateway:
             return await self._execute(tool_call, tool, normalized, confirmation=None)
 
         try:
+            confirmation_details = cast(JsonObject, _project_confirmation_details(normalized))
+            if tool.name == "exec":
+                for name in ("command", "cwd", "timeout"):
+                    confirmation_details[name] = deepcopy(normalized[name])
             request = ConfirmationRequest(
                 confirmation_id=uuid4(),
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
                 reason=preparation.safety_reason,
                 summary=f"Confirm {tool.name}"[:240],
-                details=cast(JsonObject, _project_confirmation_details(normalized)),
+                details=confirmation_details,
             )
         except asyncio.CancelledError:
             raise

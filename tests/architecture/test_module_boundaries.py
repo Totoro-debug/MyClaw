@@ -60,6 +60,18 @@ def test_tools_do_not_depend_on_provider() -> None:
     assert violations == []
 
 
+def test_terminal_depends_on_ports_instead_of_tool_implementations() -> None:
+    forbidden = {"myclaw.tools"}
+    violations = [
+        f"{path.relative_to(PROJECT_ROOT)}:{line} imports {module}"
+        for path in _python_files(PACKAGE_ROOT / "terminal")
+        for module, line in _imports(path)
+        if any(module == prefix or module.startswith(f"{prefix}.") for prefix in forbidden)
+    ]
+
+    assert violations == []
+
+
 def test_package_initializers_do_not_create_aggregate_import_entries() -> None:
     violations: list[str] = []
     for path in _python_files(PACKAGE_ROOT):

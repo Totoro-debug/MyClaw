@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,10 +21,12 @@ from textual.events import (
     MouseUp,
     Paste,
 )
-from textual.widgets import Markdown, Static, TextArea
+from textual.widgets import Button, Markdown, Static, TextArea
 
 from myclaw.agent.events import (
     AgentEvent,
+    ConfirmationDecision,
+    ConfirmationRequestedPayload,
     ConversationPort,
     TextDeltaPayload,
     ToolCompletedPayload,
@@ -44,6 +47,8 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.terminal.conversation import TerminalConversationApp
+from myclaw.tools.tool_gateway import ModelToolCall
+from myclaw.utils.json_types import JsonObject
 from tests.agent.test_fixed_catalog_runtime import (
     _response,
     _RuntimeProvider,
@@ -226,6 +231,168 @@ class ToolActivityConversation:
                 usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
             ),
         )
+
+
+class ConfirmationConversation:
+    def __init__(
+        self,
+        *,
+        tool_name: str = "read_file",
+        details: dict[str, str | int] | None = None,
+        reason: str = "The requested path is outside the current Workspace.",
+        warnings: tuple[str, ...] = (),
+    ) -> None:
+        self.submissions: list[str] = []
+        self.responses: list[tuple[UUID, ConfirmationDecision]] = []
+        self.cancel_calls = 0
+        self.confirmation_requested = asyncio.Event()
+        self._decision_received = asyncio.Event()
+        self._request = ConfirmationRequestedPayload(
+            confirmation_id=UUID("16fd2706-8baf-4334-8c7f-ada847da0314"),
+            turn_id=TURN_ID,
+            tool_call_id="call-confirm",
+            tool_name=tool_name,
+            reason=reason,
+            summary=f"Confirm {tool_name}",
+            details=({"path": "outside.txt"} if details is None else cast(JsonObject, details)),
+            warnings=warnings,
+        )
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        self.submissions.append(text)
+        yield _turn_started_event(TURN_ID)
+        yield _tool_started_event(
+            TURN_ID,
+            1,
+            "call-confirm",
+            self._request.tool_name,
+            "Running",
+        )
+        self.confirmation_requested.set()
+        yield AgentEvent(
+            type="confirmation_requested",
+            event_id=2,
+            turn_id=TURN_ID,
+            created_at=NOW,
+            payload=self._request,
+        )
+        await self._decision_received.wait()
+        decision = self.responses[-1][1]
+        status: ToolActivityStatus = "success" if decision == "approved" else "refused"
+        yield _tool_completed_event(
+            TURN_ID,
+            3,
+            "call-confirm",
+            self._request.tool_name,
+            status,
+            "Finished",
+        )
+        yield _turn_completed_event(TURN_ID, 4)
+
+    def respond_to_confirmation(
+        self,
+        confirmation_id: UUID,
+        decision: ConfirmationDecision,
+    ) -> None:
+        assert confirmation_id == self._request.confirmation_id
+        self.responses.append((confirmation_id, decision))
+        self._decision_received.set()
+
+    async def cancel_active_turn(self) -> None:
+        self.cancel_calls += 1
+
+
+class DuplicateLateConfirmationConversation:
+    def __init__(self) -> None:
+        self.responses: list[tuple[UUID, ConfirmationDecision]] = []
+        self.confirmation_requested = asyncio.Event()
+        self.request = ConfirmationRequestedPayload(
+            confirmation_id=UUID("4c9b7d40-8b5d-4a17-8140-0ce4f3511ab1"),
+            turn_id=TURN_ID,
+            tool_call_id="call-stale",
+            tool_name="read_file",
+            reason="The path resolves outside the current Workspace.",
+            summary="Confirm read_file",
+            details={"path": "outside.txt"},
+        )
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        del text
+        yield _turn_started_event(TURN_ID)
+        self.confirmation_requested.set()
+        for event_id in (1, 2):
+            yield AgentEvent(
+                type="confirmation_requested",
+                event_id=event_id,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=self.request,
+            )
+        yield _turn_completed_event(TURN_ID, 3)
+
+    def respond_to_confirmation(
+        self,
+        confirmation_id: UUID,
+        decision: ConfirmationDecision,
+    ) -> None:
+        self.responses.append((confirmation_id, decision))
+        raise ValueError("Confirmation response is late or unknown")
+
+    async def cancel_active_turn(self) -> None:
+        pass
+
+
+class MultipleConfirmationConversation:
+    def __init__(self) -> None:
+        self.responses: list[tuple[UUID, ConfirmationDecision]] = []
+        self.confirmation_requested = (asyncio.Event(), asyncio.Event())
+        self.requests = (
+            ConfirmationRequestedPayload(
+                confirmation_id=UUID("b378d47d-2d73-4670-badc-844245c63c3d"),
+                turn_id=TURN_ID,
+                tool_call_id="call-first",
+                tool_name="read_file",
+                reason="First confirmation.",
+                summary="Confirm read_file",
+                details={"path": "first.txt"},
+            ),
+            ConfirmationRequestedPayload(
+                confirmation_id=UUID("3f1bb452-a8cf-4760-9cde-77b6a4b80ae9"),
+                turn_id=TURN_ID,
+                tool_call_id="call-second",
+                tool_name="write_file",
+                reason="Second confirmation.",
+                summary="Confirm write_file",
+                details={"path": "second.txt", "content": "private"},
+            ),
+        )
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        del text
+        yield _turn_started_event(TURN_ID)
+        for event_id, (requested, request) in enumerate(
+            zip(self.confirmation_requested, self.requests, strict=True),
+            start=1,
+        ):
+            requested.set()
+            yield AgentEvent(
+                type="confirmation_requested",
+                event_id=event_id,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=request,
+            )
+        yield _turn_completed_event(TURN_ID, 3)
+
+    def respond_to_confirmation(
+        self,
+        confirmation_id: UUID,
+        decision: ConfirmationDecision,
+    ) -> None:
+        self.responses.append((confirmation_id, decision))
+
+    async def cancel_active_turn(self) -> None:
+        pass
 
 
 class ToolEventSequenceConversation:
@@ -550,6 +717,16 @@ async def _wait_for_turn(app: TerminalConversationApp) -> None:
     async with asyncio.timeout(2):
         while text_area.read_only:
             await asyncio.sleep(0)
+
+
+async def _wait_for_confirmation(app: TerminalConversationApp) -> None:
+    async with asyncio.timeout(5):
+        while (
+            app.screen.id is None
+            or not app.screen.id.startswith("confirmation-")
+            or not app.screen.query(".confirmation-details")
+        ):
+            await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio
@@ -989,6 +1166,284 @@ async def test_text_deltas_update_one_assistant_markdown_and_completion_wins() -
         assert "First answer." not in completed_text
 
     assert runtime.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_confirmation_defaults_to_decline_and_shows_effective_operation() -> None:
+    conversation = ConfirmationConversation(
+        details={"path": "outside.txt", "limit": 20},
+        reason="The path resolves outside the current Workspace.",
+        warnings=("Review the target before allowing access.",),
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await pilot.pause()
+
+        visible_text = _visible_screen_text(app)
+        assert "Tool Confirmation" in visible_text
+        assert "Tool: Read File" in visible_text
+        assert "Reason: The path resolves outside the current" in visible_text
+        assert "Workspace." in visible_text
+        assert "Warning: Review the target before allowing access." in visible_text
+        assert "Path: outside.txt" in visible_text
+        assert "Limit: 20" in visible_text
+        assert '"path"' not in visible_text
+        assert app.screen.focused is app.screen.query_one("#confirmation-decline", Button)
+        assert conversation.responses == []
+
+        await pilot.press("tab")
+        assert app.screen.focused is app.screen.query_one("#confirmation-approve", Button)
+        await pilot.press("shift+tab")
+        assert app.screen.focused is app.screen.query_one("#confirmation-decline", Button)
+        await pilot.press("enter")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+    assert conversation.responses == [
+        (UUID("16fd2706-8baf-4334-8c7f-ada847da0314"), "declined"),
+    ]
+    assert conversation.cancel_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_write_confirmation_hides_content_and_unknown_details() -> None:
+    secret = "Authorization: Bearer sk-sensitive-value"
+    conversation = ConfirmationConversation(
+        tool_name="write_file",
+        details={"path": "outside.txt", "content": secret, "internal": "raw-result"},
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(42, 16)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("write"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await pilot.pause()
+
+        visible_text = _visible_screen_text(app)
+        assert str(app.screen.query_one("#confirmation-tool", Static).content) == "Tool: Write File"
+        details = [
+            str(cast(Static, item).content) for item in app.screen.query(".confirmation-details")
+        ]
+        assert "Path: outside.txt" in details
+        assert f"Content: {len(secret)} characters" in details
+        assert "sk-sensitive-value" not in visible_text
+        assert "raw-result" not in visible_text
+        assert all("sk-sensitive-value" not in detail for detail in details)
+        assert all("raw-result" not in detail for detail in details)
+
+        await pilot.press("escape")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_confirmation_redacts_url_credentials_and_query_values() -> None:
+    conversation = ConfirmationConversation(
+        tool_name="web_fetch",
+        details={
+            "url": "http://user:password@127.0.0.1/private?token=secret-value",
+            "format": "markdown",
+        },
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("fetch"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await pilot.pause()
+
+        details = [
+            str(cast(Static, item).content) for item in app.screen.query(".confirmation-details")
+        ]
+        assert "URL: http://127.0.0.1/private?<redacted>" in details
+        assert "Format: markdown" in details
+        assert all("password" not in detail for detail in details)
+        assert all("secret-value" not in detail for detail in details)
+
+        await pilot.press("escape")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+
+@pytest.mark.asyncio
+async def test_exec_confirmation_shows_exact_command_and_arrow_keys_select_approval() -> None:
+    command = 'rm -rf "build output" && printf done'
+    conversation = ConfirmationConversation(
+        tool_name="exec",
+        details={"command": command, "cwd": ".", "timeout": 45},
+        reason="The Exec command matches a known destructive operation.",
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("run"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await pilot.pause()
+
+        visible_text = _visible_screen_text(app)
+        assert f"Command: {command}" in visible_text
+        assert "CWD: ." in visible_text
+        assert "Timeout: 45" in visible_text
+        assert "The Exec command matches a known destructive operation." in visible_text
+        assert app.screen.focused is app.screen.query_one("#confirmation-decline", Button)
+
+        await pilot.press("right")
+        assert app.screen.focused is app.screen.query_one("#confirmation-approve", Button)
+        await pilot.press("enter")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+    assert conversation.responses == [
+        (UUID("16fd2706-8baf-4334-8c7f-ada847da0314"), "approved"),
+    ]
+    assert conversation.cancel_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("button_id", "decision"),
+    [
+        ("confirmation-approve", "approved"),
+        ("confirmation-decline", "declined"),
+    ],
+)
+async def test_confirmation_buttons_resolve_the_pending_tool_with_mouse(
+    button_id: str,
+    decision: ConfirmationDecision,
+) -> None:
+    conversation = ConfirmationConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await pilot.pause()
+
+        assert await pilot.click(f"#{button_id}")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+    assert conversation.responses == [
+        (UUID("16fd2706-8baf-4334-8c7f-ada847da0314"), decision),
+    ]
+    assert conversation.cancel_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ("escape", "ctrl+c"))
+async def test_confirmation_escape_and_ctrl_c_decline_only_the_pending_tool(key: str) -> None:
+    conversation = ConfirmationConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await pilot.pause()
+
+        await pilot.press(key)
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+    assert conversation.responses == [
+        (UUID("16fd2706-8baf-4334-8c7f-ada847da0314"), "declined"),
+    ]
+    assert conversation.cancel_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_clicking_outside_confirmation_keeps_it_open_without_a_decision() -> None:
+    conversation = ConfirmationConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await pilot.pause()
+
+        assert await pilot.click(offset=(1, 1))
+        await pilot.pause()
+        assert conversation.responses == []
+        assert "Tool: Read File" in _visible_screen_text(app)
+
+        await pilot.press("escape")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+    assert conversation.cancel_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_duplicate_late_confirmation_is_shown_once_and_does_not_fail_the_turn() -> None:
+    conversation = DuplicateLateConfirmationConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await pilot.pause()
+        await pilot.press("right", "enter")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+        assert "A foreground turn failed" not in _visible_screen_text(app)
+
+    assert conversation.responses == [(conversation.request.confirmation_id, "approved")]
+
+
+@pytest.mark.asyncio
+async def test_multiple_confirmations_are_resolved_in_order_with_a_fresh_safe_default() -> None:
+    conversation = MultipleConfirmationConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested[0].wait(), timeout=1)
+        await _wait_for_confirmation(app)
+        await pilot.press("right", "enter")
+
+        await asyncio.wait_for(conversation.confirmation_requested[1].wait(), timeout=1)
+        await _wait_for_confirmation(app)
+        assert app.screen.focused is app.screen.query_one("#confirmation-decline", Button)
+        await pilot.press("enter")
+
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+    assert conversation.responses == [
+        (conversation.requests[0].confirmation_id, "approved"),
+        (conversation.requests[1].confirmation_id, "declined"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_application_teardown_declines_an_open_confirmation() -> None:
+    conversation = ConfirmationConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+    submission: asyncio.Task[None]
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await pilot.pause()
+        assert conversation.responses == []
+
+    await asyncio.gather(submission, return_exceptions=True)
+    assert conversation.responses == [
+        (UUID("16fd2706-8baf-4334-8c7f-ada847da0314"), "declined"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1511,6 +1966,47 @@ async def test_terminal_conversation_uses_the_prepared_runtime_lifecycle(
         visible_text = _visible_screen_text(app)
         assert "hi" in visible_text
         assert "Prepared runtime answer." in visible_text
+
+    assert provider.closed
+
+
+@pytest.mark.asyncio
+async def test_prepared_runtime_exec_confirmation_preserves_the_exact_long_command(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    command = f'printf "{"x" * 300}" && rm -rf "build output"'
+    provider = _RuntimeProvider(
+        (
+            _response(
+                content="",
+                tool_call=ModelToolCall(
+                    id="call_long_exec",
+                    name="exec",
+                    arguments=json.dumps({"command": command, "cwd": ".", "timeout": 45}),
+                ),
+            ),
+            _response(content="The command was declined."),
+        )
+    )
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("run it"), "enter"))
+        await _wait_for_confirmation(app)
+
+        details = [
+            str(cast(Static, item).content) for item in app.screen.query(".confirmation-details")
+        ]
+        assert f"Command: {command}" in details
+        assert "CWD: ." in details
+        assert "Timeout: 45" in details
+
+        await pilot.press("escape")
+        await asyncio.wait_for(submission, timeout=2)
+        await _wait_for_turn(app)
+        assert "The command was declined." in _visible_screen_text(app)
 
     assert provider.closed
 

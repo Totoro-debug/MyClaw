@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import re
 from asyncio import CancelledError, current_task
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Literal, Protocol, runtime_checkable
+from typing import ClassVar, Literal, Protocol, cast, runtime_checkable
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from markdown_it import MarkdownIt
@@ -15,19 +16,23 @@ from markdown_it.rules_core.state_core import StateCore
 from markdown_it.token import Token
 from textual import on
 from textual.app import App, ComposeResult, ScreenStackError
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.binding import Binding
+from textual.containers import Center, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.dom import NoScreen
 from textual.driver import Driver
 from textual.events import Key, MouseScrollDown, MouseScrollUp, Resize, Unmount
 from textual.message import Message
+from textual.screen import ModalScreen
 from textual.scrollbar import ScrollTo
 from textual.widget import Widget
-from textual.widgets import Markdown, Static, TextArea
+from textual.widgets import Button, Markdown, Static, TextArea
 from textual.worker import Worker, WorkerError
 
 from myclaw.agent.events import (
     AgentEvent,
+    ConfirmationDecision,
+    ConfirmationRequestedPayload,
     TextDeltaPayload,
     ToolCompletedPayload,
     ToolStartedPayload,
@@ -377,6 +382,113 @@ class _ConversationDisplay(VerticalScroll):
             pass
 
 
+class _ToolConfirmationScreen(ModalScreen[ConfirmationDecision]):
+    """Present one normalized Tool Confirmation without leaving the conversation."""
+
+    CSS = """
+    _ToolConfirmationScreen {
+        align: center middle;
+        padding: 1 2;
+    }
+
+    #confirmation-panel {
+        width: 80%;
+        max-width: 72;
+        height: auto;
+        max-height: 90%;
+        padding: 1 2;
+        border: round $warning;
+        background: $surface;
+        overflow-y: auto;
+    }
+
+    #confirmation-heading {
+        width: 100%;
+        margin-bottom: 1;
+        text-style: bold;
+    }
+
+    #confirmation-tool,
+    #confirmation-reason,
+    .confirmation-details,
+    .confirmation-warning {
+        width: 100%;
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    .confirmation-warning {
+        color: $text-warning;
+    }
+
+    #confirmation-actions {
+        width: 100%;
+        height: auto;
+        align: center middle;
+        margin-top: 1;
+    }
+
+    #confirmation-actions Button {
+        margin: 0 1;
+        height: 3;
+    }
+    """
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("escape", "decline", "Decline", show=False),
+        Binding("ctrl+c", "decline", "Decline", show=False, priority=True),
+        Binding("left,up", "focus_decline", "Decline", show=False),
+        Binding("right,down", "focus_approve", "Approve", show=False),
+    ]
+
+    def __init__(self, request: ConfirmationRequestedPayload) -> None:
+        super().__init__(id=f"confirmation-{request.confirmation_id.hex}")
+        self._request = request
+
+    def compose(self) -> ComposeResult:
+        with Center():
+            with Vertical(id="confirmation-panel"):
+                yield Static("Tool Confirmation", id="confirmation-heading", markup=False)
+                yield Static(
+                    f"Tool: {_friendly_tool_name(self._request.tool_name)}",
+                    id="confirmation-tool",
+                    markup=False,
+                )
+                reason = self._request.reason or self._request.summary
+                yield Static(f"Reason: {reason}", id="confirmation-reason", markup=False)
+                for warning in self._request.warnings:
+                    yield Static(
+                        f"Warning: {warning}",
+                        markup=False,
+                        classes="confirmation-warning",
+                    )
+                for detail in _confirmation_detail_lines(self._request):
+                    yield Static(detail, markup=False, classes="confirmation-details")
+                with Horizontal(id="confirmation-actions"):
+                    yield Button("Decline", id="confirmation-decline")
+                    yield Button("Approve", variant="success", id="confirmation-approve")
+
+    def on_mount(self) -> None:
+        self.query_one("#confirmation-decline", Button).focus()
+
+    @on(Button.Pressed)
+    def _button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        decision: ConfirmationDecision = (
+            "approved" if event.button.id == "confirmation-approve" else "declined"
+        )
+        self.dismiss(decision)
+
+    def action_decline(self) -> None:
+        self.dismiss("declined")
+
+    def action_focus_decline(self) -> None:
+        self.query_one("#confirmation-decline", Button).focus()
+
+    def action_focus_approve(self) -> None:
+        self.query_one("#confirmation-approve", Button).focus()
+
+
 class TerminalConversationApp(App[None]):
     """The two-region Textual application for one prepared Runtime."""
 
@@ -490,6 +602,7 @@ class TerminalConversationApp(App[None]):
         self._cancel_requested_turn: object | None = None
         self._tool_rows: dict[_ToolRowKey, _ToolRowState] = {}
         self._closed_tool_turns: set[UUID] = set()
+        self._active_confirmation_id: UUID | None = None
         self._closing = False
 
     def _build_driver(
@@ -632,6 +745,7 @@ class TerminalConversationApp(App[None]):
         stream: _MarkdownStream | None = None
         streamed_fragments: list[str] = []
         observed_tool_turns: set[UUID] = set()
+        resolved_confirmations: set[UUID] = set()
         terminal_content: str | None = None
         terminal_status: str | None = None
         cancelled = False
@@ -654,6 +768,14 @@ class TerminalConversationApp(App[None]):
                         raise TypeError("tool_started event has an invalid payload")
                     observed_tool_turns.add(event.turn_id)
                     await self._show_tool_started(event.turn_id, payload)
+                elif event.type == "confirmation_requested":
+                    payload = event.payload
+                    if not isinstance(payload, ConfirmationRequestedPayload):
+                        raise TypeError("confirmation_requested event has an invalid payload")
+                    if payload.confirmation_id in resolved_confirmations:
+                        continue
+                    await self._request_confirmation(payload)
+                    resolved_confirmations.add(payload.confirmation_id)
                 elif event.type == "tool_completed":
                     payload = event.payload
                     if not isinstance(payload, ToolCompletedPayload):
@@ -724,6 +846,40 @@ class TerminalConversationApp(App[None]):
                     except BaseException:
                         if not cancelled:
                             raise
+
+    async def _request_confirmation(self, request: ConfirmationRequestedPayload) -> None:
+        if self._active_confirmation_id is not None:
+            self._respond_to_confirmation_if_pending(request.confirmation_id, "declined")
+            return
+        self._active_confirmation_id = request.confirmation_id
+        try:
+            dismissed = self.push_screen(
+                _ToolConfirmationScreen(request),
+                wait_for_dismiss=True,
+            )
+            decision = await cast(Awaitable[ConfirmationDecision | None], dismissed)
+            if decision not in {"approved", "declined"}:
+                decision = "declined"
+        except BaseException:
+            with suppress(Exception):
+                self._respond_to_confirmation_if_pending(request.confirmation_id, "declined")
+            raise
+        else:
+            self._respond_to_confirmation_if_pending(request.confirmation_id, decision)
+        finally:
+            if self._active_confirmation_id == request.confirmation_id:
+                self._active_confirmation_id = None
+
+    def _respond_to_confirmation_if_pending(
+        self,
+        confirmation_id: UUID,
+        decision: ConfirmationDecision,
+    ) -> bool:
+        try:
+            self._runtime.conversation.respond_to_confirmation(confirmation_id, decision)
+        except ValueError:
+            return False
+        return True
 
     async def _mount_assistant(self) -> Markdown:
         display = self.query_one("#conversation-display", _ConversationDisplay)
@@ -814,6 +970,137 @@ class TerminalConversationApp(App[None]):
         compact = display.size.width <= _COMPACT_MESSAGE_MAX_WIDTH
         suffix = " message-compact" if compact else ""
         return f"message {role}{suffix}"
+
+
+_FRIENDLY_INITIALISMS = {"cwd": "CWD", "id": "ID", "url": "URL"}
+
+
+def _friendly_name(name: str, *, fallback: str) -> str:
+    words = name.replace("_", " ").split()
+    return (
+        " ".join(
+            _FRIENDLY_INITIALISMS.get(word.casefold(), word[:1].upper() + word[1:])
+            for word in words
+        )
+        or fallback
+    )
+
+
+def _friendly_tool_name(tool_name: str) -> str:
+    return _friendly_name(tool_name, fallback="Tool")
+
+
+def _friendly_parameter_name(name: str) -> str:
+    return _friendly_name(name, fallback="Parameter")
+
+
+def _friendly_parameter_value(value: object) -> str:
+    if isinstance(value, dict):
+        if not value:
+            return "None"
+        return "; ".join(
+            f"{_friendly_parameter_name(str(name))}: {_friendly_parameter_value(item)}"
+            for name, item in value.items()
+        )
+    if isinstance(value, list):
+        if not value:
+            return "None"
+        return ", ".join(_friendly_parameter_value(item) for item in value)
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    return str(value)
+
+
+_VISIBLE_CONFIRMATION_PARAMETERS: dict[str, tuple[str, ...]] = {
+    "read_file": ("path", "offset", "limit"),
+    "list_dir": ("path", "recursive", "max_entries"),
+    "glob": ("pattern", "path", "kind", "head_limit", "offset"),
+    "grep": (
+        "pattern",
+        "path",
+        "glob",
+        "type",
+        "output_mode",
+        "context",
+        "head_limit",
+        "offset",
+    ),
+    "web_fetch": ("url", "format"),
+}
+
+
+def _selected_parameter_lines(
+    details: Mapping[str, object],
+    names: tuple[str, ...],
+) -> list[str]:
+    lines: list[str] = []
+    for name in names:
+        if name not in details:
+            continue
+        value = details[name]
+        if name == "url":
+            value = _safe_confirmation_url(value)
+        lines.append(f"{_friendly_parameter_name(name)}: {_friendly_parameter_value(value)}")
+    return lines
+
+
+def _text_size_line(label: str, value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    unit = "character" if len(value) == 1 else "characters"
+    return f"{label}: {len(value)} {unit}"
+
+
+def _safe_confirmation_url(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return "Invalid URL"
+    if not parsed.scheme or hostname is None:
+        return "Invalid URL"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        host = f"{host}:{port}"
+    rendered = f"{parsed.scheme}://{host}{parsed.path}"
+    if parsed.query:
+        rendered = f"{rendered}?<redacted>"
+    return rendered
+
+
+def _confirmation_detail_lines(request: ConfirmationRequestedPayload) -> tuple[str, ...]:
+    details = request.details
+    tool_name = request.tool_name.casefold()
+    if tool_name == "exec" and "command" in details:
+        lines = [f"Command: {_friendly_parameter_value(details['command'])}"]
+        for name in ("cwd", "timeout"):
+            if name in details:
+                lines.append(
+                    f"{_friendly_parameter_name(name)}: {_friendly_parameter_value(details[name])}"
+                )
+        return tuple(lines)
+    if tool_name == "write_file":
+        lines = _selected_parameter_lines(details, ("path",))
+        content_size = _text_size_line("Content", details.get("content"))
+        if content_size is not None:
+            lines.append(content_size)
+        return tuple(lines) or ("Parameters: None",)
+    if tool_name == "edit_file":
+        lines = _selected_parameter_lines(details, ("path", "replace_all"))
+        for label, name in (("Existing Text", "old_text"), ("Replacement Text", "new_text")):
+            text_size = _text_size_line(label, details.get(name))
+            if text_size is not None:
+                lines.append(text_size)
+        return tuple(lines) or ("Parameters: None",)
+    visible_names = _VISIBLE_CONFIRMATION_PARAMETERS.get(tool_name)
+    if visible_names is None:
+        return ("Parameters: Not displayed",)
+    return tuple(_selected_parameter_lines(details, visible_names)) or ("Parameters: None",)
 
 
 def _tool_row_content(status: _ToolRowStatus, tool_name: str, summary: str) -> str:

@@ -69,6 +69,7 @@ class _ScriptedAgentRun(AgentRunInterface):
             tool_name="schedule",
             summary="Add a Schedule Job",
             details={"message": "Remember this"},
+            reason="Confirm Schedule Job: Remember this",
         )
 
         async def payloads() -> AsyncIterator[AgentRunPayload]:
@@ -148,6 +149,7 @@ async def test_conversation_port_maps_agent_run_and_accepts_separate_confirmatio
     assert confirmation.payload.turn_id == TURN_UUID
     assert confirmation.payload.tool_call_id == "call_confirm"
     assert confirmation.payload.tool_name == "schedule"
+    assert confirmation.payload.reason == "Confirm Schedule Job: Remember this"
     assert confirmation.payload.summary == "Add a Schedule Job"
     assert confirmation.payload.details == {"message": "Remember this"}
     assert confirmation.payload.warnings == ()

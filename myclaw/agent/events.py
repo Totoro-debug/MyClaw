@@ -64,6 +64,7 @@ class ConfirmationRequestedPayload:
     turn_id: UUID
     tool_call_id: str
     tool_name: str
+    reason: str
     summary: str
     _details: JsonObject = field(repr=False)
     warnings: tuple[str, ...] = ()
@@ -75,6 +76,7 @@ class ConfirmationRequestedPayload:
         turn_id: UUID,
         tool_call_id: str,
         tool_name: str,
+        reason: str = "",
         summary: str,
         details: JsonObject,
         warnings: tuple[str, ...] = (),
@@ -82,6 +84,8 @@ class ConfirmationRequestedPayload:
         require_uuid4(confirmation_id, field="confirmation_id")
         require_uuid4(turn_id, field="turn_id")
         _require_summary(summary, field="summary")
+        if not isinstance(reason, str):
+            raise TypeError("reason must be a string")
         if not isinstance(details, dict):
             raise TypeError("details must be a JSON object")
         if not isinstance(warnings, (tuple, list)) or any(
@@ -92,6 +96,7 @@ class ConfirmationRequestedPayload:
         object.__setattr__(self, "turn_id", turn_id)
         object.__setattr__(self, "tool_call_id", tool_call_id)
         object.__setattr__(self, "tool_name", tool_name)
+        object.__setattr__(self, "reason", reason)
         object.__setattr__(self, "summary", summary)
         object.__setattr__(self, "_details", deepcopy(details))
         object.__setattr__(self, "warnings", tuple(warnings))

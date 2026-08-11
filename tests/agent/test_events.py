@@ -43,10 +43,12 @@ def test_agent_events_reject_invalid_envelopes_payload_pairs_and_summaries() -> 
         turn_id=valid.turn_id,
         tool_call_id="call_confirm",
         tool_name="schedule",
+        reason="Confirm Schedule Job: Remember this",
         summary="Add a Schedule Job",
         details={"message": "Remember this"},
         warnings=("This changes Workspace State.",),
     )
+    assert confirmation.reason == "Confirm Schedule Job: Remember this"
     AgentEvent(
         type="confirmation_requested",
         event_id=4,

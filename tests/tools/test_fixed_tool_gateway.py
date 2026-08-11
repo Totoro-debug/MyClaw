@@ -10,7 +10,13 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.store import WorkspaceScheduleStore
-from myclaw.tools.tool_gateway import ConfirmationChannel, ModelToolCall, ToolGateway
+from myclaw.tools.tool_gateway import (
+    ConfirmationChannel,
+    ConfirmationDecision,
+    ConfirmationRequest,
+    ModelToolCall,
+    ToolGateway,
+)
 
 
 def _gateway(workspace: Path, agent_home: Path, *, scheduled_agent: bool = False) -> ToolGateway:
@@ -141,6 +147,32 @@ async def test_confirmation_cancellation_propagates_and_invalidates_the_request(
         await task
     with pytest.raises(ValueError, match="late or unknown"):
         channel.respond_to_confirmation(request.confirmation_id, "approved")
+
+
+@pytest.mark.asyncio
+async def test_exec_confirmation_preserves_the_exact_normalized_operation(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    command = f'printf "{"x" * 300}" && rm -rf "build output"'
+    requests: list[ConfirmationRequest] = []
+
+    async def decline(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "declined"
+
+    result = await _gateway(workspace, agent_home).call(
+        ModelToolCall(
+            id="call_long_exec",
+            name="exec",
+            arguments=json.dumps({"command": command, "cwd": ".", "timeout": 45}),
+        ),
+        confirmation=decline,
+    )
+
+    assert result.status == "refused"
+    assert len(requests) == 1
+    assert requests[0].details == {"command": command, "cwd": ".", "timeout": 45}
 
 
 @pytest.mark.asyncio
