@@ -52,6 +52,8 @@ class ManagementCommandResult:
     handled: bool
     output: str | None
     resume_sessions: tuple[SessionListingEntry, ...] | None = None
+    resumed_session_id: str | None = None
+    resume_skipped_count: int = 0
 
 
 class ManagementCommandDispatcher:
@@ -100,6 +102,7 @@ class ManagementCommandDispatcher:
                 handled=True,
                 output="\n".join(lines),
                 resume_sessions=sessions,
+                resume_skipped_count=listing.skipped_count,
             )
         if command is _ManagementCommand.STATUS:
             try:
@@ -160,7 +163,10 @@ class ManagementCommandDispatcher:
             try:
                 result = await self._management.resume(session_id)
             except ManagementError as management_error:
-                output = f"{management_error.error.code}: {management_error.error.message}"
+                return ManagementCommandResult(
+                    handled=True,
+                    output=f"{management_error.error.code}: {management_error.error.message}",
+                )
             except Exception as error:
                 logger.opt(exception=error).error(
                     "Management command failed command=/resume type={}", type(error).__name__
@@ -168,4 +174,8 @@ class ManagementCommandDispatcher:
                 raise
             else:
                 output = f"Resumed session {result.session_id}."
-            return ManagementCommandResult(handled=True, output=output)
+                return ManagementCommandResult(
+                    handled=True,
+                    output=output,
+                    resumed_session_id=result.session_id,
+                )

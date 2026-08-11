@@ -27,6 +27,7 @@ from textual.screen import ModalScreen
 from textual.scrollbar import ScrollTo
 from textual.widget import Widget
 from textual.widgets import Button, Markdown, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 from textual.worker import Worker, WorkerError
 
 from myclaw.agent.events import (
@@ -41,7 +42,8 @@ from myclaw.agent.events import (
     TurnFailedPayload,
 )
 from myclaw.agent.runtime import PreparedReplRuntime
-from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS
+from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS, ManagementCommandResult
+from myclaw.management.service import SessionListingEntry
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
 
 __all__ = ["TerminalConversationApp", "run_terminal_conversation"]
@@ -226,6 +228,97 @@ class _CommandCompletion(OptionList):
         await super()._on_key(event)
 
 
+class _SessionPickerScreen(ModalScreen[str | None]):
+    """Choose one validated Conversation Session without changing it yet."""
+
+    CSS = """
+    _SessionPickerScreen {
+        align: center middle;
+        padding: 1 2;
+    }
+
+    #session-picker-panel {
+        width: 80%;
+        max-width: 72;
+        height: 80%;
+        max-height: 90%;
+        padding: 1 2;
+        border: round $panel;
+        background: $surface;
+    }
+
+    #session-picker-heading {
+        width: 100%;
+        margin-bottom: 1;
+        text-style: bold;
+    }
+
+    .session-picker-notice {
+        width: 100%;
+        margin-bottom: 1;
+        color: $text-muted;
+    }
+
+    #session-picker-options {
+        width: 100%;
+        height: 1fr;
+        min-height: 3;
+        overflow-y: auto;
+    }
+    """
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("ctrl+c", "cancel", "Cancel", show=False, priority=True),
+    ]
+
+    def __init__(
+        self,
+        sessions: tuple[SessionListingEntry, ...],
+        *,
+        skipped_count: int,
+    ) -> None:
+        super().__init__(id="session-picker")
+        self._sessions = sessions
+        self._skipped_count = skipped_count
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="session-picker-panel"):
+            yield Static("Resume Session", id="session-picker-heading", markup=False)
+            if self._skipped_count:
+                noun = "Session" if self._skipped_count == 1 else "Sessions"
+                yield Static(
+                    f"Skipped {self._skipped_count} corrupt Conversation {noun}.",
+                    markup=False,
+                    classes="session-picker-notice",
+                )
+            if not self._sessions:
+                yield Static(
+                    "No resumable Conversation Sessions.",
+                    markup=False,
+                    classes="session-picker-notice",
+                )
+            yield OptionList(
+                *(
+                    Option(_session_picker_label(session), id=session.id)
+                    for session in self._sessions
+                ),
+                id="session-picker-options",
+                markup=False,
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#session-picker-options", OptionList).focus()
+
+    @on(OptionList.OptionSelected, "#session-picker-options")
+    def _option_selected(self, message: OptionList.OptionSelected) -> None:
+        message.stop()
+        self.dismiss(message.option_id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 @runtime_checkable
 class _ClosableEventStream(Protocol):
     async def aclose(self) -> None: ...
@@ -379,6 +472,16 @@ class _ConversationDisplay(VerticalScroll):
             self.call_after_refresh(self._follow_latest)
         else:
             self._new_content = True
+        self._emit_scroll_state()
+
+    def reset_to_latest(self) -> None:
+        """Start a replaced Session at its latest persisted content."""
+        self._following = True
+        self._new_content = False
+        self._historical_anchor = None
+        self._resize_anchor = None
+        self.scroll_end(animate=False, immediate=True)
+        self.call_after_refresh(self._follow_latest)
         self._emit_scroll_state()
 
     def _follow_latest(self) -> None:
@@ -660,6 +763,7 @@ class TerminalConversationApp(App[None]):
         self._keyboard_adapter = EnhancedKeyboardAdapter()
         self._runtime_started = False
         self._turn_worker: Worker[None] | None = None
+        self._resume_worker: Worker[None] | None = None
         self._cancel_requested_turn: object | None = None
         self._tool_rows: dict[_ToolRowKey, _ToolRowState] = {}
         self._closed_tool_turns: set[UUID] = set()
@@ -710,6 +814,10 @@ class TerminalConversationApp(App[None]):
             self._turn_worker.cancel()
             with suppress(WorkerError):
                 await self._turn_worker.wait()
+        if self._resume_worker is not None:
+            self._resume_worker.cancel()
+            with suppress(WorkerError):
+                await self._resume_worker.wait()
         if self._runtime_started:
             self._runtime_started = False
             await self._runtime.close()
@@ -808,7 +916,11 @@ class TerminalConversationApp(App[None]):
     @on(_ConversationInput.Submitted)
     async def _submit_input(self, message: _ConversationInput.Submitted) -> None:
         text = message.text
-        if not text.strip() or message.text_area.read_only:
+        if (
+            not text.strip()
+            or message.text_area.read_only
+            or (self._resume_worker is not None and not self._resume_worker.is_finished)
+        ):
             return
         if text.strip().casefold() in {"exit", "quit"}:
             message.text_area.text = ""
@@ -817,11 +929,18 @@ class TerminalConversationApp(App[None]):
 
         dispatcher = self._runtime.management_dispatcher
         if dispatcher is not None:
-            result = await dispatcher.dispatch(text)
+            result = cast(ManagementCommandResult, await dispatcher.dispatch(text))
             if result.handled:
                 message.text_area.remember_submission(text)
                 message.text_area.text = ""
-                await self._mount_management_rows(text, result.output)
+                if result.resume_sessions is not None:
+                    await self._open_resume_picker(
+                        result.resume_sessions,
+                        message.text_area,
+                        skipped_count=result.resume_skipped_count,
+                    )
+                else:
+                    await self._mount_management_rows(text, result.output)
                 return
 
         message.text_area.remember_submission(text)
@@ -831,15 +950,7 @@ class TerminalConversationApp(App[None]):
         message.text_area.read_only = True
         self._set_working(True)
         display = self.query_one("#conversation-display", _ConversationDisplay)
-        row = Horizontal(classes="message-row user-row")
-        await display.mount(row)
-        await row.mount(
-            Static(
-                text,
-                markup=False,
-                classes=self._message_classes("user-message", display),
-            )
-        )
+        await self._mount_user_message(text, display)
         display.content_changed()
 
         self._turn_worker = self.run_worker(
@@ -1042,9 +1153,30 @@ class TerminalConversationApp(App[None]):
             return False
         return True
 
-    async def _mount_assistant(self) -> Markdown:
-        display = self.query_one("#conversation-display", _ConversationDisplay)
+    async def _mount_user_message(
+        self,
+        content: str,
+        display: _ConversationDisplay,
+    ) -> None:
+        row = Horizontal(classes="message-row user-row")
+        await display.mount(row)
+        await row.mount(
+            Static(
+                content,
+                markup=False,
+                classes=self._message_classes("user-message", display),
+            )
+        )
+
+    async def _mount_assistant(
+        self,
+        content: str = "",
+        display: _ConversationDisplay | None = None,
+    ) -> Markdown:
+        if display is None:
+            display = self.query_one("#conversation-display", _ConversationDisplay)
         assistant = Markdown(
+            content,
             classes=self._message_classes("assistant-message", display),
             open_links=False,
             parser_factory=_markdown_parser,
@@ -1092,14 +1224,25 @@ class TerminalConversationApp(App[None]):
         status: _ToolRowStatus,
         summary: str,
     ) -> None:
+        display = self.query_one("#conversation-display", _ConversationDisplay)
+        row = await self._mount_tool_message(tool_name, status, summary, display)
+        self._tool_rows[key] = _ToolRowState(row, tool_name, status)
+        self._scroll_to_latest()
+
+    async def _mount_tool_message(
+        self,
+        tool_name: str,
+        status: _ToolRowStatus,
+        summary: str,
+        display: _ConversationDisplay,
+    ) -> Static:
         row = Static(
             _tool_row_content(status, tool_name, summary),
             markup=False,
             classes="tool-row",
         )
-        self._tool_rows[key] = _ToolRowState(row, tool_name, status)
-        await self.query_one("#conversation-display", _ConversationDisplay).mount(row)
-        self._scroll_to_latest()
+        await display.mount(row)
+        return row
 
     async def _finish_tool_turn(self, turn_id: UUID, failure_reason: str) -> None:
         self._closed_tool_turns.add(turn_id)
@@ -1132,8 +1275,130 @@ class TerminalConversationApp(App[None]):
             )
         )
         if output is not None:
-            await display.mount(Static(output, markup=False, classes="management-row"))
+            await self._mount_management_output(output, scroll=False)
         self._scroll_to_latest()
+
+    async def _mount_management_output(self, output: str, *, scroll: bool = True) -> None:
+        display = self.query_one("#conversation-display", _ConversationDisplay)
+        await display.mount(Static(output, markup=False, classes="management-row"))
+        if scroll:
+            self._scroll_to_latest()
+
+    async def _replace_display_from_session(self, expected_session_id: str) -> bool:
+        authority = self._runtime.session
+        if authority.session_id != expected_session_id:
+            return False
+        projected_messages = tuple(
+            (message, *_persisted_role_and_content(message)) for message in authority.messages
+        )
+        if self._runtime.session is not authority:
+            return False
+
+        display = self.query_one("#conversation-display", _ConversationDisplay)
+        await display.remove_children()
+        self._tool_rows.clear()
+        self._closed_tool_turns.clear()
+        for message, role, content in projected_messages:
+            await self._mount_persisted_message(message, role, content, display)
+        display.reset_to_latest()
+        return self._runtime.session is authority
+
+    async def _mount_persisted_message(
+        self,
+        message: Mapping[str, object],
+        role: str,
+        content: str,
+        display: _ConversationDisplay,
+    ) -> None:
+        if role == "user":
+            await self._mount_user_message(content, display)
+            return
+        if role == "assistant":
+            if content:
+                await self._mount_assistant(content, display)
+            status = _persisted_assistant_status(message)
+            if status is not None:
+                await display.mount(Static(status, markup=False, classes="turn-status"))
+            return
+        if role == "tool":
+            await self._mount_tool_message(
+                cast(str, message["name"]),
+                cast(_ToolRowStatus, message["status"]),
+                content,
+                display,
+            )
+
+    async def _open_resume_picker(
+        self,
+        sessions: tuple[SessionListingEntry, ...],
+        input_area: _ConversationInput,
+        *,
+        skipped_count: int,
+    ) -> None:
+        await self.push_screen(
+            _SessionPickerScreen(sessions, skipped_count=skipped_count),
+            callback=lambda session_id: self._resume_picker_dismissed(
+                session_id,
+                input_area,
+            ),
+        )
+
+    def _resume_picker_dismissed(
+        self,
+        session_id: str | None,
+        input_area: _ConversationInput,
+    ) -> None:
+        if session_id is None:
+            with suppress(Exception):
+                input_area.focus()
+            return
+        if self._resume_worker is not None and not self._resume_worker.is_finished:
+            return
+        input_area.read_only = True
+        self._resume_worker = self.run_worker(
+            self._resume_selected_session(session_id, input_area),
+            name="resume-session",
+            group="resume-session",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+    async def _resume_selected_session(
+        self,
+        session_id: str,
+        input_area: _ConversationInput,
+    ) -> None:
+        try:
+            dispatcher = self._runtime.management_dispatcher
+            if dispatcher is None:
+                await self._mount_management_rows("/resume", "Session resume is unavailable.")
+                return
+            try:
+                result = cast(ManagementCommandResult, await dispatcher.resume(session_id))
+            except Exception:
+                await self._mount_management_rows("/resume", "Session resume failed.")
+                return
+            resumed_session_id = result.resumed_session_id
+            if resumed_session_id != session_id:
+                await self._mount_management_rows("/resume", result.output)
+                return
+            authority = self._runtime.session
+            if authority.session_id != resumed_session_id:
+                await self._mount_management_rows(
+                    "/resume",
+                    "Session resume did not select the requested Conversation Session.",
+                )
+                return
+            if not await self._replace_display_from_session(resumed_session_id):
+                await self._mount_management_rows(
+                    "/resume",
+                    "Conversation Session authority changed before display replacement.",
+                )
+        finally:
+            input_area.read_only = False
+            if not self._closing:
+                with suppress(Exception):
+                    input_area.focus()
 
     def _set_working(self, working: bool) -> None:
         with suppress(NoMatches, NoScreen, ScreenStackError):
@@ -1164,6 +1429,46 @@ def _management_command_candidates(text: str) -> tuple[str, ...]:
     if not text.startswith("/") or "\n" in text or " " in text or "\t" in text:
         return ()
     return tuple(command for command in SUPPORTED_MANAGEMENT_COMMANDS if command.startswith(text))
+
+
+def _session_picker_label(session: SessionListingEntry) -> str:
+    local_updated_at = session.updated_at.astimezone().strftime("%Y-%m-%d %H:%M")
+    return f"{session.title} | {local_updated_at}"
+
+
+def _persisted_role_and_content(message: Mapping[str, object]) -> tuple[str, str]:
+    role = message.get("role")
+    content = message.get("content")
+    if role not in {"user", "assistant", "tool"}:
+        raise TypeError("Unsupported persisted Session message role")
+    if not isinstance(content, str):
+        raise TypeError("Persisted Session message content must be a string")
+    if role == "assistant" and message.get("status") not in {
+        "completed",
+        "interrupted",
+        "error",
+    }:
+        raise TypeError("Persisted Assistant message is malformed")
+    if role == "tool" and (
+        not isinstance(message.get("name"), str)
+        or message.get("status") not in {"success", "error", "refused"}
+    ):
+        raise TypeError("Persisted Tool message is malformed")
+    return role, content
+
+
+def _persisted_assistant_status(message: Mapping[str, object]) -> str | None:
+    status = message.get("status")
+    if status == "interrupted":
+        return "Turn cancelled."
+    if status != "error":
+        return None
+    error = message.get("error")
+    if isinstance(error, dict):
+        detail = error.get("message")
+        if isinstance(detail, str) and detail:
+            return detail
+    return "Turn failed."
 
 
 def _friendly_tool_name(tool_name: str) -> str:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar, Literal, cast
@@ -21,7 +21,8 @@ from textual.events import (
     MouseUp,
     Paste,
 )
-from textual.widgets import Button, Markdown, Static, TextArea
+from textual.pilot import Pilot
+from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 
 from myclaw.agent.events import (
     AgentEvent,
@@ -39,6 +40,7 @@ from myclaw.agent.events import (
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedReplRuntime
 from myclaw.errors import ErrorInfo
+from myclaw.management.commands import ManagementCommandResult
 from myclaw.provider.models import (
     ModelCompleted,
     ModelRequest,
@@ -46,6 +48,7 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
+from myclaw.session.session import Session
 from myclaw.terminal.conversation import TerminalConversationApp
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.json_types import JsonObject
@@ -723,6 +726,23 @@ async def _wait_for_turn(app: TerminalConversationApp) -> None:
     async with asyncio.timeout(2):
         while text_area.read_only:
             await asyncio.sleep(0)
+
+
+def _constant_datetime(value: datetime) -> Callable[[], datetime]:
+    return lambda: value
+
+
+def _constant_uuid(value: UUID) -> Callable[[], UUID]:
+    return lambda: value
+
+
+async def _wait_for_session_picker(
+    app: TerminalConversationApp,
+    pilot: Pilot[None],
+) -> None:
+    async with asyncio.timeout(2):
+        while app.screen.id != "session-picker" or not app.screen.query("#session-picker-options"):
+            await pilot.pause()
 
 
 async def _wait_for_confirmation(app: TerminalConversationApp) -> None:
@@ -2505,7 +2525,6 @@ async def test_management_completion_mouse_selection_updates_the_composer() -> N
     (
         ("/config", "Path:"),
         ("/status", '"version": "0.1.0"'),
-        ("/resume", "No resumable Conversation Sessions."),
         ("/memory", "# Long-term Memory"),
         ("/dream", "No pending summaries"),
     ),
@@ -2557,7 +2576,7 @@ async def test_inexact_slash_input_reaches_the_prepared_conversation_port_unchan
 
 
 @pytest.mark.asyncio
-async def test_management_rows_remain_visible_after_a_later_command(
+async def test_empty_resume_picker_cancellation_preserves_existing_management_rows(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -2567,16 +2586,648 @@ async def test_management_rows_remain_visible_after_a_later_command(
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("/dream"), "enter")
+        await pilot.press("ctrl+home")
+        before_resume = _visible_screen_text(app)
         await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+
+        assert "No resumable Conversation Sessions." in _visible_screen_text(app)
+        await pilot.click(offset=(1, 1))
+        assert app.screen.id == "session-picker"
+        await pilot.press("escape", "ctrl+home")
+        await pilot.pause()
+
+        visible_text = _visible_screen_text(app)
+        assert visible_text == before_resume
+        assert "Command: /dream" in visible_text
+        assert "No pending summaries" in visible_text
+        assert "Command: /resume" not in visible_text
+        assert runtime.session.messages == []
+        assert provider.stream_requests == []
+
+
+@pytest.mark.asyncio
+async def test_resume_opens_a_picker_with_title_and_local_update_time(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    older = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW.replace(hour=10),
+        new_uuid=lambda: UUID("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
+    )
+    older.update_metadata(title="Older session")
+    older.add_message("user", "Older persisted question.")
+    older.close()
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
+    )
+    target.update_metadata(title="Target session")
+    target.add_message("user", "Persisted question.")
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+
+        visible_text = _visible_screen_text(app)
+        assert app.screen.id == "session-picker"
+        assert "Target session" in visible_text
+        assert visible_text.index("Target session") < visible_text.index("Older session")
+        assert target.session_id not in visible_text
+        assert older.session_id not in visible_text
+        assert target.updated_at.astimezone().strftime("%Y-%m-%d %H:%M") in visible_text
+        assert app.screen.focused is app.screen.query_one("#session-picker-options", OptionList)
+
+
+@pytest.mark.asyncio
+async def test_resume_selection_rebuilds_the_display_from_the_selected_session(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Restored session")
+    target.add_message("user", "Persisted question.")
+    target.add_message(
+        "assistant",
+        "Persisted **answer**.",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 2,
+            "output_tokens": 3,
+            "total_tokens": 5,
+        },
+    )
+    target.add_message(
+        "assistant",
+        "",
+        tool_calls=[
+            {
+                "id": "call-restored",
+                "name": "read_file",
+                "arguments": '{"api_key":"private"}',
+            },
+            {"id": "call-error", "name": "exec", "arguments": '{"command":"private"}'},
+            {"id": "call-refused", "name": "web_fetch", "arguments": '{"url":"private"}'},
+        ],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.add_message(
+        "tool",
+        "private tool result",
+        tool_call_id="call-restored",
+        name="read_file",
+        status="success",
+        artifact=None,
+    )
+    target.add_message(
+        "tool",
+        "api_key=private",
+        tool_call_id="call-error",
+        name="exec",
+        status="error",
+        artifact=None,
+    )
+    target.add_message(
+        "tool",
+        "private refusal detail",
+        tool_call_id="call-refused",
+        name="web_fetch",
+        status="refused",
+        artifact=None,
+    )
+    target.add_message(
+        "assistant",
+        "Persisted partial answer.",
+        tool_calls=[],
+        status="interrupted",
+        error={"code": "turn_cancelled", "message": "Turn interrupted by user."},
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.add_message(
+        "assistant",
+        "",
+        tool_calls=[],
+        status="error",
+        error={"code": "model_failed", "message": "Persisted model failure."},
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 0,
+            "total_tokens": 1,
+        },
+    )
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.press(*list("/status"), "enter")
+        await pilot.pause()
+        await pilot.press("ctrl+home")
+        assert "Command: /status" in _visible_screen_text(app)
+
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while (
+                runtime.session.session_id != target.session_id
+                or "Persisted question." not in _visible_screen_text(app)
+            ):
+                await pilot.pause()
+
+        visible_text = _visible_screen_text(app)
+        assert app.screen.id == "_default"
+        assert runtime.session.session_id == target.session_id
+        assert "Persisted question." in visible_text
+        assert "Persisted answer." in visible_text
+        assert "Completed: read_file" in visible_text
+        assert "Failed: exec - The operation did not complete." in visible_text
+        assert "Rejected: web_fetch" in visible_text
+        assert "Persisted partial answer." in visible_text
+        assert "Turn cancelled." in visible_text
+        assert "Persisted model failure." in visible_text
+        assert "private tool result" not in visible_text
+        assert "private refusal detail" not in visible_text
+        assert "call-restored" not in visible_text
+        assert "call-error" not in visible_text
+        assert "call-refused" not in visible_text
+        assert "api_key" not in visible_text
+        assert visible_text.index("Persisted answer.") < visible_text.index("Completed: read_file")
+        assert visible_text.index("Completed: read_file") < visible_text.index("Failed: exec")
+        assert visible_text.index("Failed: exec") < visible_text.index("Rejected: web_fetch")
+        assert visible_text.index("Rejected: web_fetch") < visible_text.index(
+            "Persisted partial answer."
+        )
+        assert "Command: /status" not in visible_text
+        assert "Command: /resume" not in visible_text
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_key", ("escape", "ctrl+c"))
+async def test_resume_picker_cancellation_and_outside_click_preserve_current_display(
+    agent_home: Path,
+    workspace: Path,
+    cancel_key: str,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    initial_session_id = runtime.session.session_id
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
+    )
+    target.update_metadata(title="Target session")
+    target.add_message("user", "Target content.")
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/status"), "enter")
+        await pilot.pause()
+        await pilot.press("ctrl+home")
+        before_resume = _visible_screen_text(app)
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+
+        await pilot.click(offset=(1, 1))
+        assert app.screen.id == "session-picker"
+        await pilot.press(cancel_key)
+        await pilot.pause()
         await pilot.press("ctrl+home")
 
         visible_text = _visible_screen_text(app)
-        assert "Command: /dream" in visible_text
-        assert "No pending summaries" in visible_text
-        assert "Command: /resume" in visible_text
-        assert "No resumable Conversation Sessions." in visible_text
-        assert runtime.session.messages == []
+        assert app.screen.id == "_default"
+        assert runtime.session.session_id == initial_session_id
+        assert visible_text == before_resume
+        assert "Command: /status" in visible_text
+        assert "Command: /resume" not in visible_text
+        assert "Target content." not in visible_text
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+
+@pytest.mark.asyncio
+async def test_resume_picker_mouse_selection_switches_to_the_clicked_session(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Mouse target")
+    target.add_message("user", "Mouse-selected content.")
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.click("#session-picker-options", offset=(4, 1))
+
+        async with asyncio.timeout(2):
+            while (
+                runtime.session.session_id != target.session_id
+                or "Mouse-selected content." not in _visible_screen_text(app)
+            ):
+                await pilot.pause()
+
+        assert runtime.session.session_id == target.session_id
+        assert "Mouse-selected content." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_resume_failure_after_a_stale_listing_preserves_the_current_display(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    initial_session_id = runtime.session.session_id
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
+    )
+    target.update_metadata(title="Stale target")
+    target.add_message("user", "Should not be restored.")
+    target.close()
+    target_path = target.storage_directory / f"{target.session_id}.jsonl"
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/status"), "enter")
+        await pilot.pause()
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        target_path.unlink()
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while "model_invalid_request:" not in _visible_screen_text(app):
+                await pilot.pause()
+        failure_text = _visible_screen_text(app)
+        await pilot.press("ctrl+home")
+
+        visible_text = _visible_screen_text(app)
+        assert runtime.session.session_id == initial_session_id
+        assert "Command: /status" in visible_text
+        assert "Should not be restored." not in visible_text
+        assert "model_invalid_request:" in failure_text
+        assert "not\nresumable." in failure_text
+
+
+@pytest.mark.asyncio
+async def test_resume_picker_scrolls_in_management_order_and_selects_by_keyboard(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    sessions: list[Session] = []
+    for index in range(24):
+        session_now = NOW.replace(minute=index)
+        session_uuid = UUID(f"00000000-0000-4000-8000-{index + 1:012x}")
+        session = Session.create(
+            runtime.session.workspace_state,
+            now=_constant_datetime(session_now),
+            new_uuid=_constant_uuid(session_uuid),
+        )
+        session.update_metadata(title=f"Session {index:02d}")
+        session.add_message("user", f"Content {index:02d}.")
+        session.close()
+        sessions.append(session)
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+
+        visible_text = _visible_screen_text(app)
+        assert visible_text.index("Session 23") < visible_text.index("Session 22")
+        options = app.screen.query_one("#session-picker-options", OptionList)
+        assert options.max_scroll_y > 0
+
+        await pilot._post_mouse_events([MouseScrollDown], offset=(40, 10), times=3)
+        await pilot.pause()
+        assert options.scroll_y > 0
+        await pilot.press(*(("down",) * 23))
+        await pilot.pause()
+        assert options.scroll_y > 0
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while runtime.session.session_id != sessions[
+                0
+            ].session_id or "Content 00." not in _visible_screen_text(app):
+                await pilot.pause()
+        assert "Content 00." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_resume_picker_reports_corrupt_entries_without_mutating_them(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Valid target")
+    target.add_message("user", "Valid restored content.")
+    target.close()
+    corrupt_path = target.storage_directory / (
+        "20260811-120000-000000_00000000-0000-0000-0000-000000000000.jsonl"
+    )
+    corrupt_content = b"{not-json\n"
+    corrupt_path.write_bytes(corrupt_content)
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+
+        visible_text = _visible_screen_text(app)
+        assert "Skipped 1 corrupt Conversation Session." in visible_text
+        assert "Valid target" in visible_text
+        assert corrupt_path.read_bytes() == corrupt_content
+
+        await pilot.press("enter")
+        async with asyncio.timeout(2):
+            while (
+                runtime.session.session_id != target.session_id
+                or "Valid restored content." not in _visible_screen_text(app)
+            ):
+                await pilot.pause()
+
+        assert corrupt_path.read_bytes() == corrupt_content
+        assert "Valid restored content." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_resume_listing_failure_preserves_session_and_existing_display(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    initial_session = runtime.session
+    original_dispatch = runtime.management_dispatcher.dispatch
+
+    async def dispatch_with_listing_failure(command: str) -> ManagementCommandResult:
+        if command == "/resume":
+            return ManagementCommandResult(
+                handled=True,
+                output="persistence_error: Conversation Sessions could not be listed.",
+            )
+        return cast(ManagementCommandResult, await original_dispatch(command))
+
+    monkeypatch.setattr(runtime.management_dispatcher, "dispatch", dispatch_with_listing_failure)
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/status"), "enter")
+        await pilot.press(*list("/resume"), "enter")
+        async with asyncio.timeout(2):
+            while "could not be listed" not in _visible_screen_text(app):
+                await pilot.pause()
+
+        failure_text = _visible_screen_text(app)
+        await pilot.press("ctrl+home")
+        visible_text = _visible_screen_text(app)
+        assert app.screen.id == "_default"
+        assert runtime.session is initial_session
+        assert "Command: /status" in visible_text
+        assert "Conversation Sessions could not be listed." in failure_text
+
+
+@pytest.mark.asyncio
+async def test_resume_requires_result_and_runtime_authority_to_agree(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    initial_session = runtime.session
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Authority target")
+    target.add_message("user", "Must not be projected without authority.")
+    target.close()
+
+    async def inconsistent_resume(session_id: str) -> ManagementCommandResult:
+        return ManagementCommandResult(
+            handled=True,
+            output=f"Resumed session {session_id}.",
+            resumed_session_id=session_id,
+        )
+
+    monkeypatch.setattr(runtime.management_dispatcher, "resume", inconsistent_resume)
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/status"), "enter")
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while "did not select" not in _visible_screen_text(app):
+                await pilot.pause()
+        failure_text = _visible_screen_text(app)
+        await pilot.press("ctrl+home")
+
+        visible_text = _visible_screen_text(app)
+        assert runtime.session is initial_session
+        assert "Command: /status" in visible_text
+        assert "Must not be projected without authority." not in visible_text
+        assert "Session resume did not select" in failure_text
+
+
+@pytest.mark.asyncio
+async def test_unexpected_resume_exception_preserves_session_display_and_interaction(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    initial_session = runtime.session
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Failing target")
+    target.add_message("user", "Must remain hidden after an exception.")
+    target.close()
+
+    async def failing_resume(session_id: str) -> ManagementCommandResult:
+        del session_id
+        raise RuntimeError("private failure detail")
+
+    monkeypatch.setattr(runtime.management_dispatcher, "resume", failing_resume)
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/status"), "enter")
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while "Session resume failed." not in _visible_screen_text(app):
+                await pilot.pause()
+        failure_text = _visible_screen_text(app)
+        input_area = app.query_one("#conversation-input", TextArea)
+        await pilot.press("ctrl+home")
+
+        visible_text = _visible_screen_text(app)
+        assert runtime.session is initial_session
+        assert app.is_running
+        assert not input_area.read_only
+        assert "Command: /status" in visible_text
+        assert "Must remain hidden after an exception." not in visible_text
+        assert "Session resume failed." in failure_text
+        assert "private failure detail" not in failure_text
+
+
+@pytest.mark.asyncio
+async def test_resume_selection_serializes_input_until_rebuild_finishes(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Delayed target")
+    target.add_message("user", "Delayed restored content.")
+    target.close()
+    resume_started = asyncio.Event()
+    continue_resume = asyncio.Event()
+    original_resume = runtime.management_dispatcher.resume
+
+    async def delayed_resume(session_id: str) -> ManagementCommandResult:
+        resume_started.set()
+        await continue_resume.wait()
+        return cast(ManagementCommandResult, await original_resume(session_id))
+
+    monkeypatch.setattr(runtime.management_dispatcher, "resume", delayed_resume)
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+        await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert input_area.read_only
+        assert app.screen.id == "_default"
+        await pilot.press(*list("racing turn"), "enter", *list("/resume"), "enter")
+        assert input_area.text == ""
         assert provider.stream_requests == []
+        assert app.screen.id == "_default"
+
+        continue_resume.set()
+        async with asyncio.timeout(2):
+            while runtime.session.session_id != target.session_id or input_area.read_only:
+                await pilot.pause()
+
+        assert "Delayed restored content." in _visible_screen_text(app)
+        await pilot.press(*list("/status"), "enter")
+        await pilot.press("ctrl+home")
+        assert "Command: /status" in _visible_screen_text(app)
+        assert provider.stream_requests == []
+
+
+@pytest.mark.asyncio
+async def test_resumed_long_history_starts_latest_and_preserves_runtime_input_history(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Long target")
+    for index in range(60):
+        target.add_message("user", f"Restored line {index:02d} " + "x" * 40)
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        display = app.query_one("#conversation-display")
+        async with asyncio.timeout(2):
+            while (
+                runtime.session.session_id != target.session_id
+                or not display.is_vertical_scroll_end
+                or "Restored line 59" not in _visible_screen_text(app)
+            ):
+                await pilot.pause()
+
+        assert "Restored line 59" in _visible_screen_text(app)
+        assert not app.query_one("#new-content").display
+        await pilot.resize_terminal(40, 20)
+        await pilot.pause()
+        assert display.is_vertical_scroll_end
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert app.screen.focused is input_area
+        await pilot.press("up")
+        assert input_area.text == "/resume"
 
 
 @pytest.mark.asyncio
