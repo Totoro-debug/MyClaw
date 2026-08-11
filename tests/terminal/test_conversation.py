@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ from uuid import UUID
 from xml.etree import ElementTree
 
 import pytest
+from textual.app import App
 from textual.driver import Driver
 from textual.events import (
     Key,
@@ -49,7 +51,11 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.session.session import Session
-from myclaw.terminal.conversation import TerminalConversationApp
+from myclaw.terminal.conversation import (
+    TerminalConversationApp,
+    TerminalConversationError,
+    run_terminal_conversation,
+)
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.json_types import JsonObject
 from tests.agent.test_fixed_catalog_runtime import (
@@ -548,6 +554,26 @@ class BlockingConversation:
             self.closed.set()
 
 
+class FailingCancellationCleanupConversation:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        del text
+        try:
+            self.started.set()
+            yield AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta="partial"),
+            )
+            await asyncio.Event().wait()
+        finally:
+            raise RuntimeError("worker cleanup failed")
+
+
 class FailingMarkdownStream:
     async def write(self, markdown_fragment: str) -> None:
         del markdown_fragment
@@ -606,6 +632,18 @@ class CloseOrderingRuntime(FakeRuntime):
     async def close(self) -> None:
         self.close_saw_stream_closed = self._blocking_conversation.closed.is_set()
         await super().close()
+
+
+class FailingStartRuntime(FakeRuntime):
+    async def start(self) -> None:
+        self.start_calls += 1
+        raise RuntimeError("runtime startup failed")
+
+
+class FailingCloseRuntime(FakeRuntime):
+    async def close(self) -> None:
+        self.close_calls += 1
+        raise RuntimeError("runtime cleanup failed")
 
 
 def _runtime(
@@ -1988,11 +2026,37 @@ async def test_markdown_failure_still_closes_the_conversation_event_stream(
         classmethod(lambda cls, markdown: markdown_stream),
     )
 
-    with pytest.raises(RuntimeError, match="markdown stop failed"):
+    with pytest.raises(RuntimeError, match="markdown write failed") as raised:
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.press(*list("fail"), "enter")
 
     assert conversation.closed.is_set()
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "markdown stop failed"
+
+
+@pytest.mark.asyncio
+async def test_runtime_cleanup_failure_does_not_mask_an_application_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FailingConversation()
+    runtime = FailingCloseRuntime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+    markdown_stream = FailingMarkdownStream()
+    monkeypatch.setattr(
+        Markdown,
+        "get_stream",
+        classmethod(lambda cls, markdown: markdown_stream),
+    )
+
+    with pytest.raises(RuntimeError, match="markdown write failed") as raised:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press(*list("fail"), "enter")
+
+    assert isinstance(raised.value.__cause__, BaseExceptionGroup)
+    cleanup_messages = {str(error) for error in raised.value.__cause__.exceptions}
+    assert cleanup_messages == {"markdown stop failed", "runtime cleanup failed"}
+    assert runtime.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -2407,6 +2471,31 @@ async def test_bottom_follow_is_preserved_when_resize_reflows_content() -> None:
 
 
 @pytest.mark.asyncio
+async def test_user_scroll_takes_over_from_rapid_resize_callbacks() -> None:
+    content = "\n".join(f"resize {index:03d} " + "x" * 70 for index in range(90))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("resize"), "enter")
+        await _wait_for_turn(app)
+        await asyncio.sleep(0.05)
+        display = app.query_one("#conversation-display")
+
+        for width, height in ((65, 20), (42, 18), (76, 22), (50, 16), (80, 24)):
+            await pilot.press("ctrl+home")
+            assert not display.is_vertical_scroll_end
+            resize = asyncio.create_task(pilot.resize_terminal(width, height))
+            await asyncio.sleep(0)
+            await pilot.press("ctrl+end")
+            await resize
+            await pilot.pause(0.01)
+            assert display.is_vertical_scroll_end
+            assert display.following
+
+
+@pytest.mark.asyncio
 async def test_historical_resize_preserves_anchor_within_one_long_message() -> None:
     content = "\n".join(f"anchor {index:03d} " + "z" * 55 for index in range(80))
     conversation = ScriptedConversation(deltas=(content,), completed_content=content)
@@ -2444,6 +2533,518 @@ async def test_shutdown_settles_stream_worker_before_runtime_close() -> None:
 
     assert conversation.closed.is_set()
     assert runtime.close_saw_stream_closed
+
+
+@pytest.mark.asyncio
+async def test_worker_cleanup_failure_still_closes_runtime_once() -> None:
+    conversation = FailingCancellationCleanupConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    with pytest.raises(RuntimeError, match="worker cleanup failed"):
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.press(*list("block"), "enter")
+            await asyncio.wait_for(conversation.started.wait(), timeout=1)
+
+    assert runtime.close_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("size", "undersized"),
+    [
+        ((19, 10), True),
+        ((20, 9), True),
+        ((20, 10), False),
+    ],
+)
+async def test_minimum_terminal_size_has_an_exact_20_by_10_boundary(
+    size: tuple[int, int],
+    undersized: bool,
+) -> None:
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(ScriptedConversation())))
+
+    async with app.run_test(size=size):
+        visible_text = _visible_screen_text(app)
+        assert ("Resize to" in visible_text) is undersized
+        assert app.query_one("#conversation-display").display is not undersized
+        assert app.query_one("#conversation-input-region").display is not undersized
+
+
+@pytest.mark.asyncio
+async def test_undersized_terminal_replaces_presentation_and_recovers_input() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(19, 9)) as pilot:
+        size_state = app.query_one("#size-insufficient", Static)
+        assert size_state.display
+        assert not app.query_one("#conversation-display").display
+        assert not app.query_one("#conversation-input-region").display
+
+        await pilot.press(*list("ignored"), "enter")
+        await pilot.pause()
+        assert conversation.submissions == []
+
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause()
+
+        assert not size_state.display
+        assert app.query_one("#conversation-display").display
+        assert app.query_one("#conversation-input-region").display
+
+        await pilot.press(*list("ready"), "enter")
+        await _wait_for_turn(app)
+
+    assert conversation.submissions == ["ready"]
+
+
+@pytest.mark.asyncio
+async def test_undersized_recovery_preserves_completion_draft_history_and_focus() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        input_area = app.query_one("#conversation-input", TextArea)
+        await pilot.press(*list("remember"), "enter")
+        await _wait_for_turn(app)
+        await pilot.press("/")
+        assert app.command_completion_visible
+
+        await pilot.resize_terminal(19, 9)
+        await pilot.press("down", "enter", *list("ignored"))
+        await pilot.pause()
+        assert input_area.text == "/"
+
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause(0.05)
+
+        assert app.command_completion_visible
+        assert "/config" in _visible_screen_text(app)
+        assert input_area.text == "/"
+        assert app.screen.focused is input_area
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        await pilot.press("up")
+        assert input_area.text == "remember"
+
+
+@pytest.mark.asyncio
+async def test_undersized_recovery_preserves_active_turn_state() -> None:
+    conversation = BlockingConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("block"), "enter")
+        await asyncio.wait_for(conversation.started.wait(), timeout=1)
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert input_area.read_only
+
+        await pilot.resize_terminal(19, 9)
+        await pilot.press(*list("ignored"), "enter", "ctrl+c")
+        await pilot.pause()
+
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause(0.05)
+
+        assert input_area.read_only
+        assert "Working" in _visible_screen_text(app)
+        assert "partial" in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_undersized_terminal_blocks_an_open_confirmation_until_recovery() -> None:
+    conversation = ConfirmationConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await pilot.pause()
+
+        await pilot.resize_terminal(19, 9)
+        await pilot.pause()
+
+        undersized_text = _visible_screen_text(app)
+        assert "Terminal window" in undersized_text
+        assert "Resize to" in undersized_text
+        assert "Tool Confirmation" not in undersized_text
+        await pilot.press("enter")
+        await pilot.pause()
+        assert conversation.responses == []
+
+        await pilot.resize_terminal(80, 24)
+        await _wait_for_confirmation(app)
+        await pilot.pause(0.05)
+
+        assert "Tool Confirmation" in _visible_screen_text(app)
+        assert app.screen.focused is app.screen.query_one("#confirmation-decline", Button)
+        await pilot.press("enter")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+    assert conversation.responses == [
+        (UUID("16fd2706-8baf-4334-8c7f-ada847da0314"), "declined"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resize_back_from_undersized_terminal_restores_historical_anchor() -> None:
+    content = "\n".join(f"anchor {index:02d} " + "z" * 35 for index in range(50))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("anchor"), "enter")
+        await _wait_for_turn(app)
+        await asyncio.sleep(0.1)
+        display = app.query_one("#conversation-display")
+        await pilot.press("ctrl+home")
+        await pilot.pause()
+        assert not display.is_vertical_scroll_end
+        before_resize = _visible_screen_text(app)
+        anchor = next(
+            f"anchor {index:02d}" for index in range(50) if f"anchor {index:02d}" in before_resize
+        )
+
+        await pilot.resize_terminal(19, 9)
+        await pilot.pause()
+        assert app.query_one("#size-insufficient", Static).display
+
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause(0.05)
+
+        assert not app.query_one("#size-insufficient", Static).display
+        assert anchor in _visible_screen_text(app)
+        assert not display.is_vertical_scroll_end
+
+
+@pytest.mark.asyncio
+async def test_resize_back_from_undersized_terminal_restores_bottom_follow() -> None:
+    content = "\n".join(f"line {index:02d} " + "x" * 50 for index in range(50))
+    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("bottom"), "enter")
+        await _wait_for_turn(app)
+        display = app.query_one("#conversation-display")
+        assert display.is_vertical_scroll_end
+
+        await pilot.resize_terminal(19, 9)
+        await pilot.pause()
+        assert app.query_one("#size-insufficient", Static).display
+
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause(0.05)
+
+        assert not app.query_one("#size-insufficient", Static).display
+        assert display.is_vertical_scroll_end
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_failure_restores_terminal_before_runtime_cleanup() -> None:
+    terminal_state = {"restored": False}
+
+    class RecordingDriver(KeyboardLifecycleDriver):
+        def start_application_mode(self) -> None:
+            terminal_state["restored"] = False
+            super().start_application_mode()
+
+        def stop_application_mode(self) -> None:
+            super().stop_application_mode()
+            terminal_state["restored"] = True
+
+    class RecordingRuntime(FailingStartRuntime):
+        def __init__(self, conversation: object) -> None:
+            super().__init__(conversation)
+            self.close_saw_terminal_restored = False
+
+        async def close(self) -> None:
+            self.close_saw_terminal_restored = terminal_state["restored"]
+            await super().close()
+
+    runtime = RecordingRuntime(ScriptedConversation())
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+    app.driver_class = RecordingDriver
+
+    with pytest.raises(RuntimeError, match="runtime startup failed"):
+        async with app.run_test(headless=False, size=(80, 24)):
+            pass
+
+    assert runtime.close_saw_terminal_restored
+
+
+@pytest.mark.asyncio
+async def test_runtime_cleanup_failure_still_restores_terminal_first() -> None:
+    terminal_state = {"restored": False}
+
+    class RecordingDriver(KeyboardLifecycleDriver):
+        def start_application_mode(self) -> None:
+            terminal_state["restored"] = False
+            super().start_application_mode()
+
+        def stop_application_mode(self) -> None:
+            super().stop_application_mode()
+            terminal_state["restored"] = True
+
+    class RecordingRuntime(FailingCloseRuntime):
+        def __init__(self, conversation: object) -> None:
+            super().__init__(conversation)
+            self.close_saw_terminal_restored = False
+
+        async def close(self) -> None:
+            self.close_saw_terminal_restored = terminal_state["restored"]
+            await super().close()
+
+    runtime = RecordingRuntime(ScriptedConversation())
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+    app.driver_class = RecordingDriver
+
+    with pytest.raises(RuntimeError, match="runtime cleanup failed"):
+        async with app.run_test(headless=False, size=(80, 24)) as pilot:
+            app.exit()
+            await pilot.pause()
+
+    assert runtime.close_saw_terminal_restored
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_and_cleanup_failure_preserves_the_start_error() -> None:
+    class FailingStartAndCloseRuntime(FakeRuntime):
+        async def start(self) -> None:
+            self.start_calls += 1
+            raise RuntimeError("runtime startup failed")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("runtime cleanup failed")
+
+    runtime = FailingStartAndCloseRuntime(ScriptedConversation())
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+    app.driver_class = KeyboardLifecycleDriver
+
+    with pytest.raises(RuntimeError, match="runtime startup failed") as raised:
+        async with app.run_test(headless=False, size=(80, 24)):
+            pass
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "runtime cleanup failed"
+    assert runtime.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_start_failure_attempts_application_mode_restore() -> None:
+    class FailingStartDriver(KeyboardLifecycleDriver):
+        def start_application_mode(self) -> None:
+            self.write("application:start")
+            self.write("\x1b[>1u")
+            self.flush()
+            raise RuntimeError("terminal startup failed")
+
+    KeyboardLifecycleDriver.operations = []
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(ScriptedConversation())))
+    app.driver_class = FailingStartDriver
+
+    with pytest.raises(RuntimeError, match="terminal startup failed"):
+        async with app.run_test(headless=False, size=(80, 24)):
+            pass
+
+    assert ("write", "application:stop") in KeyboardLifecycleDriver.operations
+
+
+@pytest.mark.asyncio
+async def test_terminal_stop_failure_still_restores_enhanced_keyboard_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KITTY_WINDOW_ID", "1")
+
+    class FailingStopDriver(KeyboardLifecycleDriver):
+        def stop_application_mode(self) -> None:
+            raise RuntimeError("terminal cleanup failed")
+
+    KeyboardLifecycleDriver.operations = []
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(ScriptedConversation())))
+    app.driver_class = FailingStopDriver
+
+    with pytest.raises(RuntimeError, match="terminal cleanup failed"):
+        async with app.run_test(headless=False, size=(80, 24)) as pilot:
+            app.exit()
+            await pilot.pause()
+
+    keyboard_writes = [
+        value
+        for operation, value in KeyboardLifecycleDriver.operations
+        if operation == "write" and value in {"\x1b[>1u", "\x1b[<u"}
+    ]
+    assert keyboard_writes == ["\x1b[>1u", "\x1b[<u"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_stop_failure_does_not_mask_an_application_body_failure() -> None:
+    class FailingStopDriver(KeyboardLifecycleDriver):
+        def stop_application_mode(self) -> None:
+            raise RuntimeError("terminal cleanup failed")
+
+    class FailingBodyApp(TerminalConversationApp):
+        async def on_mount(self) -> None:
+            await super().on_mount()
+            raise RuntimeError("application body failed")
+
+    runtime = _runtime(ScriptedConversation())
+    app = FailingBodyApp(cast(PreparedReplRuntime, runtime))
+    app.driver_class = FailingStopDriver
+
+    with pytest.raises(RuntimeError, match="application body failed") as raised:
+        async with app.run_test(headless=False, size=(80, 24)):
+            pass
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "terminal cleanup failed"
+
+
+@pytest.mark.asyncio
+async def test_partial_terminal_stop_failure_restores_all_modes_before_runtime_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KITTY_WINDOW_ID", "1")
+    terminal_state = {
+        "application_mode": False,
+        "alternate_screen": False,
+        "mouse_reporting": False,
+        "cursor_hidden": False,
+        "focus_reporting": False,
+        "bracketed_paste": False,
+        "kitty_depth": 0,
+    }
+
+    class PartialStopDriver(Driver):
+        def __init__(
+            self,
+            app: App[object],
+            *,
+            debug: bool = False,
+            mouse: bool = True,
+            size: tuple[int, int] | None = None,
+        ) -> None:
+            super().__init__(app, debug=debug, mouse=mouse, size=size)
+            self._restore_console: Callable[[], None] | None = None
+
+        def write(self, data: str) -> None:
+            transitions = {
+                "\x1b[?1049h": ("alternate_screen", True),
+                "\x1b[?1049l": ("alternate_screen", False),
+                "\x1b[?1000h": ("mouse_reporting", True),
+                "\x1b[?1000l": ("mouse_reporting", False),
+                "\x1b[?25l": ("cursor_hidden", True),
+                "\x1b[?25h": ("cursor_hidden", False),
+                "\x1b[?1004h": ("focus_reporting", True),
+                "\x1b[?1004l": ("focus_reporting", False),
+                "\x1b[?2004h": ("bracketed_paste", True),
+                "\x1b[?2004l": ("bracketed_paste", False),
+            }
+            for sequence, (name, enabled) in transitions.items():
+                if sequence in data:
+                    terminal_state[name] = enabled
+            if "\x1b[>1u" in data:
+                terminal_state["kitty_depth"] += 1
+            if "\x1b[<u" in data:
+                terminal_state["kitty_depth"] -= 1
+
+        def flush(self) -> None:
+            pass
+
+        def start_application_mode(self) -> None:
+            terminal_state["application_mode"] = True
+
+            def restore_console() -> None:
+                terminal_state["application_mode"] = False
+
+            self._restore_console = restore_console
+            for sequence in (
+                "\x1b[?1049h",
+                "\x1b[?1000h",
+                "\x1b[?25l",
+                "\x1b[?1004h",
+                "\x1b[>1u",
+                "\x1b[?2004h",
+            ):
+                self.write(sequence)
+
+        def disable_input(self) -> None:
+            self.write("\x1b[?1000l")
+
+        def stop_application_mode(self) -> None:
+            self.write("\x1b[?2004l")
+            raise RuntimeError("terminal cleanup failed")
+
+        def close(self) -> None:
+            if self._restore_console is not None:
+                self._restore_console()
+
+    class RecordingRuntime(FakeRuntime):
+        def __init__(self, conversation: object) -> None:
+            super().__init__(conversation)
+            self.close_saw_terminal_restored = False
+
+        async def close(self) -> None:
+            self.close_saw_terminal_restored = terminal_state == {
+                "application_mode": False,
+                "alternate_screen": False,
+                "mouse_reporting": False,
+                "cursor_hidden": False,
+                "focus_reporting": False,
+                "bracketed_paste": False,
+                "kitty_depth": 0,
+            }
+            await super().close()
+
+    runtime = RecordingRuntime(ScriptedConversation())
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+    app.driver_class = PartialStopDriver
+
+    with pytest.raises(RuntimeError, match="terminal cleanup failed"):
+        async with app.run_test(headless=False, size=(80, 24)) as pilot:
+            app.exit()
+            await pilot.pause()
+
+    assert runtime.close_saw_terminal_restored
+
+
+@pytest.mark.parametrize(
+    "redirected_stream",
+    ("stdin", "stdout", "stderr", "__stdin__", "__stdout__", "__stderr__"),
+)
+def test_non_tty_terminal_streams_are_rejected_before_textual_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    redirected_stream: str,
+) -> None:
+    class TerminalStream:
+        def __init__(self, interactive: bool) -> None:
+            self._interactive = interactive
+
+        def isatty(self) -> bool:
+            return self._interactive
+
+    stream_names = ("stdin", "stdout", "stderr", "__stdin__", "__stdout__", "__stderr__")
+    for stream_name in stream_names:
+        monkeypatch.setattr(sys, stream_name, TerminalStream(stream_name != redirected_stream))
+
+    def app_must_not_start(_: object) -> None:
+        raise AssertionError("Textual started for a non-TTY invocation")
+
+    monkeypatch.setattr(TerminalConversationApp, "run", app_must_not_start)
+
+    with pytest.raises(TerminalConversationError, match="interactive stdin, stdout, and stderr"):
+        run_terminal_conversation(cast(PreparedReplRuntime, object()))
 
 
 @pytest.mark.asyncio

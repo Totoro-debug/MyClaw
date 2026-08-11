@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
-from asyncio import CancelledError, current_task
-from collections.abc import AsyncIterator, Awaitable, Mapping
+import sys
+from asyncio import CancelledError, Event, current_task
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import ClassVar, Literal, Protocol, cast, runtime_checkable
+from functools import partial
+from typing import ClassVar, Final, Literal, Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -46,9 +48,16 @@ from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS, Management
 from myclaw.management.service import SessionListingEntry
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
 
-__all__ = ["TerminalConversationApp", "run_terminal_conversation"]
+__all__ = [
+    "TerminalConversationApp",
+    "TerminalConversationError",
+    "is_interactive_terminal",
+    "run_terminal_conversation",
+]
 
 _COMPACT_MESSAGE_MAX_WIDTH = 60
+_MIN_TERMINAL_WIDTH = 20
+_MIN_TERMINAL_HEIGHT = 10
 _CONVERSATION_NAVIGATION_KEYS = frozenset({"pageup", "pagedown", "ctrl+home", "ctrl+end"})
 _FAILURE_REASON_MAX_CHARS = 120
 _TOOL_NAME_MAX_CHARS = 80
@@ -60,8 +69,33 @@ _UNSAFE_TOOL_DETAIL_PATTERN = re.compile(
     r"(?:\bcall[-_][A-Za-z0-9_-]+)",
     re.IGNORECASE,
 )
+_TERMINAL_MODE_RESETS: Final = (
+    ("\x1b[?2004h", "\x1b[?2004l"),
+    ("\x1b[?1000h", "\x1b[?1000l"),
+    ("\x1b[?1003h", "\x1b[?1003l"),
+    ("\x1b[?1015h", "\x1b[?1015l"),
+    ("\x1b[?1006h", "\x1b[?1006l"),
+    ("\x1b[?1004h", "\x1b[?1004l"),
+    ("\x1b[?1049h", "\x1b[?1049l"),
+    ("\x1b[?25l", "\x1b[?25h"),
+)
 type _ControlAction = Literal["cancel_active_turn", "clear_draft", "exit"]
 type _ToolRowStatus = Literal["running", "success", "error", "refused"]
+
+
+class _DriverLifecycleHooks(Protocol):
+    write: Callable[[str], None]
+    flush: Callable[[], None]
+    start_application_mode: Callable[[], None]
+    stop_application_mode: Callable[[], None]
+
+
+class _ConsoleRestoreHooks(Protocol):
+    _restore_console: Callable[[], None] | None
+
+
+class TerminalConversationError(RuntimeError):
+    """A Terminal Conversation cannot run with the supplied terminal streams."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,16 +429,26 @@ class _ConversationDisplay(VerticalScroll):
     """Conversation viewport with bottom-following and historical navigation."""
 
     class Resized(Message):
-        def __init__(self, display: _ConversationDisplay, width: int) -> None:
+        def __init__(self, display: _ConversationDisplay, width: int, generation: int) -> None:
             super().__init__()
             self.display = display
             self.width = width
+            self.generation = generation
 
     _following = True
     _new_content = False
     _last_scroll_state: tuple[bool, bool] | None = None
     _historical_anchor: _ScrollAnchor | None = None
     _resize_anchor: _ScrollAnchor | None = None
+    _resize_generation = 0
+    _resize_seen = False
+    _size_suspended = False
+    _size_restore_pending = False
+    _resize_restore_pending = False
+    _restoring_resize = False
+    _suspended_following = True
+    _suspended_new_content = False
+    _suspended_anchor: _ScrollAnchor | None = None
 
     @property
     def following(self) -> bool:
@@ -416,47 +460,91 @@ class _ConversationDisplay(VerticalScroll):
         self._sync_after_user_scroll()
 
     def _on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
+        self._take_over_resize_restore()
         super()._on_mouse_scroll_up(event)
         self._sync_after_user_scroll()
 
     def _on_mouse_scroll_down(self, event: MouseScrollDown) -> None:
+        self._take_over_resize_restore()
         super()._on_mouse_scroll_down(event)
         self._sync_after_user_scroll()
 
     def _on_scroll_to(self, message: ScrollTo) -> None:
+        self._take_over_resize_restore()
         super()._on_scroll_to(message)
         self.call_after_refresh(self._sync_after_user_scroll)
 
     def on_resize(self, event: Resize) -> None:
-        self._resize_anchor = None if self.following else self._historical_anchor
-        self.post_message(self.Resized(self, event.size.width))
+        self._resize_generation += 1
+        if not self._size_restore_pending:
+            self._restoring_resize = False
+        first_resize = not self._resize_seen
+        self._resize_seen = True
+        if not self._size_suspended and not self._size_restore_pending:
+            self._resize_anchor = None if self.following else self._historical_anchor
+            if not first_resize:
+                self._resize_restore_pending = True
+        self.post_message(self.Resized(self, event.size.width, self._resize_generation))
 
-    def restore_resize_anchor(self) -> None:
+    def restore_resize_anchor(self, generation: int | None = None) -> None:
+        if self._size_suspended:
+            return
+        if generation is None and not (self._size_restore_pending or self._resize_restore_pending):
+            return
+        if generation is not None and generation != self._resize_generation:
+            return
+        current_generation = self._resize_generation
         anchor = self._resize_anchor
-        self._resize_anchor = None
+        self._restoring_resize = True
         if self.following:
-            self.scroll_end(animate=False, immediate=True)
-            self.call_after_refresh(self._follow_latest)
+            self.scroll_end(
+                animate=False,
+                immediate=not self._size_restore_pending,
+            )
+
+            def follow_latest(attempt: int = 0) -> None:
+                if current_generation != self._resize_generation:
+                    return
+                self.scroll_end(animate=False, immediate=True)
+                if attempt < 2:
+                    self.call_after_refresh(follow_latest, attempt + 1)
+                    return
+                self._finish_resize_restore(emit_state=True)
+
+            self.call_after_refresh(follow_latest)
             return
         if anchor is None:
+            self._finish_resize_restore()
             return
 
-        def restore() -> None:
-            if anchor.widget.parent is not self:
+        def restore(attempt: int = 0) -> None:
+            if current_generation != self._resize_generation or self._resize_anchor is not anchor:
                 return
+            if anchor.widget.parent is not self:
+                self._finish_resize_restore()
+                return
+            target = round(
+                anchor.widget.virtual_region.y
+                + anchor.relative_position * anchor.widget.virtual_region.height
+            )
             self.scroll_to(
-                y=round(
-                    anchor.widget.virtual_region.y
-                    + anchor.relative_position * anchor.widget.virtual_region.height
-                ),
+                y=target,
                 animate=False,
                 immediate=True,
             )
-            self._emit_scroll_state()
+            if attempt < 2:
+                self.call_after_refresh(restore, attempt + 1)
+                return
+            self._finish_resize_restore(emit_state=True)
 
         self.call_after_refresh(restore)
 
+    def schedule_resize_anchor_retry(self, generation: int | None = None) -> None:
+        retry_generation = self._resize_generation if generation is None else generation
+        self.set_timer(0.001, partial(self.restore_resize_anchor, retry_generation))
+
     def navigate(self, key: str) -> None:
+        self._take_over_resize_restore()
         if key == "pageup":
             page_height = max(1, self.scrollable_content_region.height)
             self.scroll_to(
@@ -479,8 +567,29 @@ class _ConversationDisplay(VerticalScroll):
             raise ValueError(f"Unsupported conversation navigation key: {key}")
         self._sync_after_user_scroll()
 
+    def _take_over_resize_restore(self) -> None:
+        if self._size_suspended or not (
+            self._size_restore_pending or self._resize_restore_pending or self._restoring_resize
+        ):
+            return
+        self._finish_resize_restore()
+        self._resize_generation += 1
+
+    def _finish_resize_restore(self, *, emit_state: bool = False) -> None:
+        self._resize_anchor = None
+        self._size_restore_pending = False
+        self._resize_restore_pending = False
+        self._restoring_resize = False
+        if emit_state:
+            self._emit_scroll_state()
+
     def content_changed(self) -> None:
         """Follow new content only while the user is at the conversation bottom."""
+        if self._size_suspended or self._size_restore_pending:
+            if not self._suspended_following:
+                self._suspended_new_content = True
+            self._emit_scroll_state()
+            return
         if self.following:
             self.scroll_end(animate=False, immediate=True)
             self.call_after_refresh(self._follow_latest)
@@ -490,10 +599,18 @@ class _ConversationDisplay(VerticalScroll):
 
     def reset_to_latest(self) -> None:
         """Start a replaced Session at its latest persisted content."""
+        if self._size_suspended:
+            self._suspended_following = True
+            self._suspended_new_content = False
+            self._suspended_anchor = None
+        self._size_restore_pending = False
+        self._resize_restore_pending = False
+        self._restoring_resize = False
         self._following = True
         self._new_content = False
         self._historical_anchor = None
         self._resize_anchor = None
+        self._resize_generation += 1
         self.scroll_end(animate=False, immediate=True)
         self.call_after_refresh(self._follow_latest)
         self._emit_scroll_state()
@@ -503,12 +620,52 @@ class _ConversationDisplay(VerticalScroll):
             self.scroll_end(animate=False, immediate=True)
 
     def _sync_after_user_scroll(self) -> None:
+        if self._size_suspended or self._restoring_resize:
+            return
+        if self._size_restore_pending:
+            self._size_restore_pending = False
+            self._resize_anchor = None
+            self._resize_generation += 1
+        elif self._resize_restore_pending:
+            self._resize_restore_pending = False
+            self._resize_anchor = None
+            self._resize_generation += 1
         self._following = self.is_vertical_scroll_end
         if self._following:
             self._new_content = False
             self._historical_anchor = None
         else:
             self._historical_anchor = self._capture_scroll_anchor()
+        self._emit_scroll_state()
+
+    def suspend_for_size(self) -> None:
+        """Freeze the visible scroll state while the normal layout is hidden."""
+        if self._size_suspended:
+            return
+        self._size_suspended = True
+        self._resize_restore_pending = False
+        self._restoring_resize = False
+        self._suspended_following = self._following
+        self._suspended_new_content = self._new_content
+        self._suspended_anchor = (
+            None if self._following else (self._resize_anchor or self._historical_anchor)
+        )
+        self._resize_anchor = self._suspended_anchor
+        self._resize_generation += 1
+
+    def resume_from_size(self) -> None:
+        """Restore the scroll state captured before the layout was hidden."""
+        if not self._size_suspended:
+            return
+        self._size_suspended = False
+        self._size_restore_pending = True
+        self._resize_restore_pending = False
+        self._restoring_resize = False
+        self._following = self._suspended_following
+        self._new_content = self._suspended_new_content
+        self._historical_anchor = self._suspended_anchor
+        self._resize_anchor = None if self._following else self._suspended_anchor
+        self._resize_generation += 1
         self._emit_scroll_state()
 
     def _capture_scroll_anchor(self) -> _ScrollAnchor | None:
@@ -538,6 +695,37 @@ class _ConversationDisplay(VerticalScroll):
             self.app.query_one("#new-content", Static).display = state[1]
         except (NoMatches, NoScreen, ScreenStackError):
             pass
+
+
+class _SizeInsufficientScreen(ModalScreen[None]):
+    """Block all interaction until the terminal can render the application."""
+
+    CSS = """
+    _SizeInsufficientScreen {
+        align: center middle;
+        background: $background;
+    }
+
+    #size-insufficient-modal {
+        width: 100%;
+        height: 100%;
+        padding: 1 2;
+        content-align: center middle;
+        text-align: center;
+        background: $background;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "Terminal window is too small. Resize to continue.",
+            id="size-insufficient-modal",
+            markup=False,
+        )
+
+    async def _on_key(self, event: Key) -> None:
+        event.stop()
+        event.prevent_default()
 
 
 class _ToolConfirmationScreen(ModalScreen[ConfirmationDecision]):
@@ -628,6 +816,13 @@ class _ToolConfirmationScreen(ModalScreen[ConfirmationDecision]):
 
     def on_mount(self) -> None:
         self.query_one("#confirmation-decline", Button).focus()
+
+    def restore_after_size(self) -> None:
+        """Reveal the confirmation heading after a constrained background layout."""
+        self.query_one("#confirmation-panel", Vertical).scroll_home(
+            animate=False,
+            immediate=True,
+        )
 
     @on(Button.Pressed)
     def _button_pressed(self, event: Button.Pressed) -> None:
@@ -747,6 +942,17 @@ class TerminalConversationApp(App[None]):
         width: 100%;
     }
 
+    #size-insufficient {
+        display: none;
+        width: 100%;
+        height: 1fr;
+        padding: 1 2;
+        align: center middle;
+        content-align: center middle;
+        text-align: center;
+        background: transparent;
+    }
+
     #new-content {
         display: none;
         height: 1;
@@ -776,6 +982,12 @@ class TerminalConversationApp(App[None]):
         self._runtime = runtime
         self._keyboard_adapter = EnhancedKeyboardAdapter()
         self._runtime_started = False
+        self._size_insufficient = False
+        self._driver_mode_started = False
+        self._driver_mode_stopped = True
+        self._viable_size = Event()
+        self._viable_size.set()
+        self._size_screen: _SizeInsufficientScreen | None = None
         self._turn_worker: Worker[None] | None = None
         self._resume_worker: Worker[None] | None = None
         self._cancel_requested_turn: object | None = None
@@ -785,6 +997,12 @@ class TerminalConversationApp(App[None]):
         self._completion_options: tuple[str, ...] = ()
         self._completion_dismissed_text: str | None = None
         self._closing = False
+        self._application_error: Exception | None = None
+
+    def _handle_exception(self, error: Exception) -> None:
+        if self._application_error is None:
+            self._application_error = error
+        super()._handle_exception(error)
 
     def _build_driver(
         self,
@@ -800,7 +1018,90 @@ class TerminalConversationApp(App[None]):
         # Textual has no public hook around its Kitty push/pop writes. Keep this
         # compatibility boundary narrow and exercise it through App.run_async tests.
         self._keyboard_adapter = EnhancedKeyboardAdapter.install_on_driver(driver)
+        self._install_driver_lifecycle(driver)
         return driver
+
+    def _install_driver_lifecycle(self, driver: Driver) -> None:
+        hooks = cast(_DriverLifecycleHooks, driver)
+        original_write = hooks.write
+        original_flush = hooks.flush
+        original_start = hooks.start_application_mode
+        original_stop = hooks.stop_application_mode
+        self._driver_mode_started = False
+        self._driver_mode_stopped = True
+        active_mode_resets: set[str] = set()
+
+        def write(value: str) -> None:
+            original_write(value)
+            transitions: list[tuple[int, str, bool]] = []
+            for enable, reset in _TERMINAL_MODE_RESETS:
+                enable_at = value.find(enable)
+                if enable_at >= 0:
+                    transitions.append((enable_at, reset, True))
+                reset_at = value.find(reset)
+                if reset_at >= 0:
+                    transitions.append((reset_at, reset, False))
+            for _, reset, enabled in sorted(transitions):
+                if enabled:
+                    active_mode_resets.add(reset)
+                else:
+                    active_mode_resets.discard(reset)
+
+        def restore_terminal_modes() -> None:
+            if active_mode_resets:
+                for _, reset in _TERMINAL_MODE_RESETS:
+                    if reset in active_mode_resets:
+                        write(reset)
+                original_flush()
+
+            restore_console = getattr(driver, "_restore_console", None)
+            if callable(restore_console):
+                restore_console()
+                cast(_ConsoleRestoreHooks, driver)._restore_console = None
+
+        def stop_application_mode() -> None:
+            if not self._driver_mode_started or self._driver_mode_stopped:
+                return
+            primary_error = sys.exception()
+            try:
+                original_stop()
+            except BaseException as stop_error:
+                try:
+                    restore_terminal_modes()
+                except BaseException as restore_error:
+                    stop_error.__cause__ = restore_error
+                else:
+                    self._driver_mode_stopped = True
+                if primary_error is not None:
+                    if stop_error is primary_error:
+                        raise
+                    raise primary_error from stop_error
+                raise stop_error
+            try:
+                restore_terminal_modes()
+            except BaseException as cleanup_error:
+                if primary_error is not None:
+                    raise primary_error from cleanup_error
+                raise
+            self._driver_mode_stopped = True
+
+        def start_application_mode() -> None:
+            self._driver_mode_started = True
+            self._driver_mode_stopped = False
+            try:
+                original_start()
+            except BaseException as primary_error:
+                try:
+                    stop_application_mode()
+                except BaseException as cleanup_error:
+                    if cleanup_error is primary_error:
+                        raise
+                    raise primary_error from cleanup_error
+                raise
+
+        hooks.write = write
+        hooks.start_application_mode = start_application_mode
+        hooks.stop_application_mode = stop_application_mode
 
     def compose(self) -> ComposeResult:
         yield _ConversationDisplay(id="conversation-display")
@@ -815,26 +1116,64 @@ class TerminalConversationApp(App[None]):
             _ConversationInput(id="conversation-input", placeholder="Message MyClaw"),
             id="conversation-input-region",
         )
+        yield Static(
+            "Terminal window is too small. Resize to continue.",
+            id="size-insufficient",
+            markup=False,
+        )
 
     async def on_mount(self) -> None:
         self._runtime_started = True
         await self._runtime.start()
-        self.query_one(_ConversationInput).focus()
+        if not self._size_insufficient:
+            self.query_one(_ConversationInput).focus()
 
     async def on_unmount(self, event: Unmount) -> None:
         del event
         self._closing = True
-        if self._turn_worker is not None:
-            self._turn_worker.cancel()
-            with suppress(WorkerError):
-                await self._turn_worker.wait()
-        if self._resume_worker is not None:
-            self._resume_worker.cancel()
-            with suppress(WorkerError):
-                await self._resume_worker.wait()
-        if self._runtime_started:
-            self._runtime_started = False
-            await self._runtime.close()
+        cleanup_errors: list[BaseException] = []
+        try:
+            if self._turn_worker is not None:
+                self._turn_worker.cancel()
+                with suppress(WorkerError):
+                    await self._turn_worker.wait()
+            if self._resume_worker is not None:
+                self._resume_worker.cancel()
+                with suppress(WorkerError):
+                    await self._resume_worker.wait()
+        except BaseException as worker_error:
+            cleanup_errors.append(worker_error)
+        finally:
+            if self._runtime_started:
+                self._runtime_started = False
+                try:
+                    await self._runtime.close()
+                except BaseException as runtime_error:
+                    cleanup_errors.append(runtime_error)
+
+        primary_error = self._application_error
+        if primary_error is not None and cleanup_errors:
+            causes: list[BaseException] = []
+            if primary_error.__cause__ is not None:
+                causes.append(primary_error.__cause__)
+            causes.extend(cleanup_errors)
+            unique_causes: list[BaseException] = []
+            for error in causes:
+                if not any(error is existing for existing in unique_causes):
+                    unique_causes.append(error)
+            cause: BaseException = (
+                unique_causes[0]
+                if len(unique_causes) == 1
+                else BaseExceptionGroup("Terminal Conversation cleanup failed", unique_causes)
+            )
+            raise primary_error from cause
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        if cleanup_errors:
+            raise cleanup_errors[0] from BaseExceptionGroup(
+                "Additional Terminal Conversation cleanup failures",
+                cleanup_errors[1:],
+            )
 
     @property
     def command_completion_visible(self) -> bool:
@@ -856,6 +1195,55 @@ class TerminalConversationApp(App[None]):
     def _completion_dismissed(self, message: _CommandCompletion.Dismissed) -> None:
         message.stop()
         self.dismiss_command_completion()
+
+    def on_resize(self, event: Resize) -> None:
+        too_small = (
+            event.size.width < _MIN_TERMINAL_WIDTH or event.size.height < _MIN_TERMINAL_HEIGHT
+        )
+        if too_small == self._size_insufficient:
+            return
+
+        display = self.query_one("#conversation-display", _ConversationDisplay)
+        if too_small:
+            display.suspend_for_size()
+        self._size_insufficient = too_small
+        if too_small:
+            self._viable_size.clear()
+        else:
+            self._viable_size.set()
+        input_region = self.query_one("#conversation-input-region", Vertical)
+        size_state = self.query_one("#size-insufficient", Static)
+        display.display = not too_small
+        input_region.display = not too_small
+        size_state.display = too_small
+        if too_small:
+            size_screen = _SizeInsufficientScreen()
+            self._size_screen = size_screen
+            self.push_screen(size_screen)
+            return
+
+        active_size_screen = self._size_screen
+        self._size_screen = None
+        if active_size_screen is not None and active_size_screen is self.screen:
+            active_size_screen.dismiss()
+        if not too_small and not self._closing:
+            self.refresh(layout=True)
+            display.resume_from_size()
+            display.restore_resize_anchor()
+            # Let the layout-driven scroll range settle before the final retry.
+            display.schedule_resize_anchor_retry()
+            self.call_after_refresh(self._restore_input_focus_after_size)
+
+    def _restore_input_focus_after_size(self) -> None:
+        if self._size_insufficient or self._closing:
+            return
+        self.screen.refresh(layout=True)
+        if isinstance(self.screen, _ToolConfirmationScreen):
+            self.screen.restore_after_size()
+        if len(self.screen_stack) != 1:
+            return
+        with suppress(Exception):
+            self.query_one(_ConversationInput).focus()
 
     def move_command_completion(self, direction: int) -> None:
         if not self._completion_options:
@@ -927,7 +1315,9 @@ class TerminalConversationApp(App[None]):
         compact = message.width <= _COMPACT_MESSAGE_MAX_WIDTH
         for content in message.display.query(".message"):
             content.set_class(compact, "message-compact")
-        message.display.restore_resize_anchor()
+        if not self._size_insufficient:
+            message.display.restore_resize_anchor(message.generation)
+            message.display.schedule_resize_anchor_retry(message.generation)
 
     @on(_ConversationInput.Submitted)
     async def _submit_input(self, message: _ConversationInput.Submitted) -> None:
@@ -935,6 +1325,7 @@ class TerminalConversationApp(App[None]):
         if (
             not text.strip()
             or message.text_area.read_only
+            or self._size_insufficient
             or (self._resume_worker is not None and not self._resume_worker.is_finished)
         ):
             return
@@ -1037,6 +1428,7 @@ class TerminalConversationApp(App[None]):
         terminal_content: str | None = None
         terminal_status: str | None = None
         cancelled = False
+        primary_error: BaseException | None = None
         try:
             async for event in events:
                 if event.type == "text_delta":
@@ -1096,44 +1488,77 @@ class TerminalConversationApp(App[None]):
                         "The Tool call ended with the turn failure.",
                     )
                     terminal_status = payload.error.message
-        except CancelledError:
-            cancelled = True
-            raise
-        finally:
+        except BaseException as error:
+            primary_error = error
+            cancelled = isinstance(error, CancelledError)
+
+        cleanup_errors: list[BaseException] = []
+        if not cancelled and not self._closing and primary_error is None:
             try:
+                for turn_id in observed_tool_turns - self._closed_tool_turns:
+                    await self._finish_tool_turn(
+                        turn_id,
+                        "Tool completion was not reported.",
+                    )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if stream is not None:
+            try:
+                await stream.stop()
+            except BaseException as cleanup_error:
                 if not cancelled:
-                    for turn_id in observed_tool_turns - self._closed_tool_turns:
-                        await self._finish_tool_turn(
-                            turn_id,
-                            "Tool completion was not reported.",
-                        )
-                if stream is not None:
-                    try:
-                        await stream.stop()
-                    except BaseException:
-                        if not cancelled:
-                            raise
-                final_content = (
-                    terminal_content
-                    if terminal_content is not None
-                    else "".join(streamed_fragments)
+                    cleanup_errors.append(cleanup_error)
+        final_content = (
+            terminal_content if terminal_content is not None else "".join(streamed_fragments)
+        )
+        if (
+            not cancelled
+            and not self._closing
+            and primary_error is None
+            and not cleanup_errors
+            and (final_content or (assistant is not None and terminal_content is not None))
+        ):
+            try:
+                if assistant is None:
+                    assistant = await self._mount_assistant()
+                await assistant.update(final_content)
+                self._scroll_to_latest()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if (
+            not cancelled
+            and not self._closing
+            and primary_error is None
+            and not cleanup_errors
+            and terminal_status is not None
+        ):
+            try:
+                await self._mount_status(terminal_status)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if isinstance(events, _ClosableEventStream):
+            try:
+                await events.aclose()
+            except BaseException as cleanup_error:
+                if not cancelled:
+                    cleanup_errors.append(cleanup_error)
+
+        if primary_error is not None:
+            if cleanup_errors:
+                cause: BaseException = (
+                    cleanup_errors[0]
+                    if len(cleanup_errors) == 1
+                    else BaseExceptionGroup("Turn cleanup failed", cleanup_errors)
                 )
-                if not cancelled and (
-                    final_content or (assistant is not None and terminal_content is not None)
-                ):
-                    if assistant is None:
-                        assistant = await self._mount_assistant()
-                    await assistant.update(final_content)
-                    self._scroll_to_latest()
-                if not cancelled and terminal_status is not None:
-                    await self._mount_status(terminal_status)
-            finally:
-                if isinstance(events, _ClosableEventStream):
-                    try:
-                        await events.aclose()
-                    except BaseException:
-                        if not cancelled:
-                            raise
+                raise primary_error from cause
+            raise primary_error
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        if cleanup_errors:
+            raise cleanup_errors[0] from BaseExceptionGroup(
+                "Additional turn cleanup failures",
+                cleanup_errors[1:],
+            )
 
     async def _request_confirmation(self, request: ConfirmationRequestedPayload) -> None:
         if self._active_confirmation_id is not None:
@@ -1141,6 +1566,7 @@ class TerminalConversationApp(App[None]):
             return
         self._active_confirmation_id = request.confirmation_id
         try:
+            await self._viable_size.wait()
             dismissed = self.push_screen(
                 _ToolConfirmationScreen(request),
                 wait_for_dismiss=True,
@@ -1351,6 +1777,7 @@ class TerminalConversationApp(App[None]):
         *,
         skipped_count: int,
     ) -> None:
+        await self._viable_size.wait()
         await self.push_screen(
             _SessionPickerScreen(sessions, skipped_count=skipped_count),
             callback=lambda session_id: self._resume_picker_dismissed(
@@ -1640,8 +2067,37 @@ def _safe_failure_reason(summary: str, tool_name: str) -> str:
     return f"{detail[: _FAILURE_REASON_MAX_CHARS - 3].rstrip()}..."
 
 
+def _stream_is_tty(stream: object) -> bool:
+    isatty = getattr(stream, "isatty", None)
+    if not callable(isatty):
+        return False
+    try:
+        return bool(isatty())
+    except Exception:
+        return False
+
+
+def is_interactive_terminal() -> bool:
+    """Return whether the standard streams can support a full-screen conversation."""
+
+    def stream_is_interactive(current: object, driver_stream: object | None) -> bool:
+        return _stream_is_tty(current) and _stream_is_tty(driver_stream)
+
+    return all(
+        (
+            stream_is_interactive(sys.stdin, sys.__stdin__),
+            stream_is_interactive(sys.stdout, sys.__stdout__),
+            stream_is_interactive(sys.stderr, sys.__stderr__),
+        )
+    )
+
+
 def run_terminal_conversation(runtime: PreparedReplRuntime) -> None:
     """Run a Terminal Conversation application around a prepared Runtime."""
+    if not is_interactive_terminal():
+        raise TerminalConversationError(
+            "Terminal Conversation requires interactive stdin, stdout, and stderr TTYs."
+        )
     TerminalConversationApp(runtime).run()
 
 

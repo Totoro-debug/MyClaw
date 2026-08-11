@@ -6,9 +6,10 @@ from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAda
 
 
 class RecordingTerminal:
-    def __init__(self, *, fail_start: bool = False) -> None:
+    def __init__(self, *, fail_start: bool = False, fail_stop: bool = False) -> None:
         self.operations: list[tuple[str, str]] = []
         self.fail_start = fail_start
+        self.fail_stop = fail_stop
 
     def write(self, value: str) -> None:
         self.operations.append(("write", value))
@@ -27,6 +28,8 @@ class RecordingTerminal:
         self.write("\x1b[<u")
         self.write("application:stop")
         self.flush()
+        if self.fail_stop:
+            raise RuntimeError("cleanup failed")
 
 
 def test_kitty_enter_sequences_preserve_modifier_meaning() -> None:
@@ -148,6 +151,28 @@ def test_driver_hooks_restore_keyboard_mode_when_startup_fails() -> None:
     with pytest.raises(RuntimeError, match="startup failed"):
         driver.start_application_mode()
 
+    keyboard_writes = [
+        value
+        for operation, value in driver.operations
+        if operation == "write" and value in {"\x1b[>1u", "\x1b[<u"}
+    ]
+    assert keyboard_writes == ["\x1b[>1u", "\x1b[<u"]
+    assert not adapter.enabled
+
+
+def test_driver_hooks_preserve_a_body_failure_when_terminal_stop_also_fails() -> None:
+    driver = RecordingTerminal(fail_stop=True)
+    adapter = EnhancedKeyboardAdapter.install_on_driver(driver, supports=lambda: True)
+
+    with pytest.raises(RuntimeError, match="body failed") as raised:
+        try:
+            driver.start_application_mode()
+            raise RuntimeError("body failed")
+        finally:
+            driver.stop_application_mode()
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "cleanup failed"
     keyboard_writes = [
         value
         for operation, value in driver.operations

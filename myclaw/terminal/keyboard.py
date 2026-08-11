@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from collections.abc import Callable, Mapping
-from contextlib import suppress
 from enum import StrEnum
 from typing import Final, Literal, Protocol, cast
 
@@ -54,6 +54,7 @@ class _DriverHooks(Protocol):
     write: Callable[[str], None]
     flush: Callable[[], None]
     start_application_mode: Callable[[], None]
+    stop_application_mode: Callable[[], None]
 
 
 class EnhancedKeyboardAdapter:
@@ -143,6 +144,7 @@ class EnhancedKeyboardAdapter:
         adapter = cls(write=hooks.write, flush=hooks.flush, supports=supports)
         original_write = hooks.write
         original_start = hooks.start_application_mode
+        original_stop = hooks.stop_application_mode
 
         def write(value: str) -> None:
             if adapter.is_enable_sequence(value):
@@ -155,13 +157,36 @@ class EnhancedKeyboardAdapter:
         def start_application_mode() -> None:
             try:
                 original_start()
-            except BaseException:
-                with suppress(BaseException):
+            except BaseException as primary_error:
+                try:
                     adapter.restore()
+                except BaseException as cleanup_error:
+                    raise primary_error from cleanup_error
                 raise
+
+        def stop_application_mode() -> None:
+            body_error = sys.exception()
+            try:
+                original_stop()
+            except BaseException as stop_error:
+                try:
+                    adapter.restore()
+                except BaseException as restore_error:
+                    stop_error.__cause__ = restore_error
+                if body_error is not None:
+                    raise body_error from stop_error
+                raise stop_error
+            else:
+                try:
+                    adapter.restore()
+                except BaseException as cleanup_error:
+                    if body_error is not None:
+                        raise body_error from cleanup_error
+                    raise
 
         hooks.write = write
         hooks.start_application_mode = start_application_mode
+        hooks.stop_application_mode = stop_application_mode
         return adapter
 
     def enable(self) -> bool:
