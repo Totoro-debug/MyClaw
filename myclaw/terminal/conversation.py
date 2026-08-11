@@ -26,7 +26,7 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.scrollbar import ScrollTo
 from textual.widget import Widget
-from textual.widgets import Button, Markdown, Static, TextArea
+from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 from textual.worker import Worker, WorkerError
 
 from myclaw.agent.events import (
@@ -41,6 +41,7 @@ from myclaw.agent.events import (
     TurnFailedPayload,
 )
 from myclaw.agent.runtime import PreparedReplRuntime
+from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
 
 __all__ = ["TerminalConversationApp", "run_terminal_conversation"]
@@ -134,6 +135,22 @@ class _ConversationInput(TextArea):
         self._history_draft = ""
 
     async def _on_key(self, event: Key) -> None:
+        completion = cast(_CommandCompletionHost, self.app)
+        if event.key in {"up", "down"} and completion.command_completion_visible:
+            event.stop()
+            event.prevent_default()
+            completion.move_command_completion(-1 if event.key == "up" else 1)
+            return
+        if event.key == "escape" and completion.command_completion_visible:
+            event.stop()
+            event.prevent_default()
+            completion.dismiss_command_completion()
+            return
+        if event.key == "enter" and completion.command_completion_visible:
+            event.stop()
+            event.prevent_default()
+            completion.accept_command_completion()
+            return
         if event.key in _CONVERSATION_NAVIGATION_KEYS:
             event.stop()
             event.prevent_default()
@@ -181,6 +198,30 @@ class _ConversationInput(TextArea):
             event.stop()
             event.prevent_default()
             self.post_message(self.Submitted(self, self.text))
+            return
+        await super()._on_key(event)
+
+
+class _CommandCompletionHost(Protocol):
+    @property
+    def command_completion_visible(self) -> bool: ...
+
+    def move_command_completion(self, direction: int) -> None: ...
+
+    def dismiss_command_completion(self) -> None: ...
+
+    def accept_command_completion(self) -> None: ...
+
+
+class _CommandCompletion(OptionList):
+    class Dismissed(Message):
+        pass
+
+    async def _on_key(self, event: Key) -> None:
+        if event.key == "escape":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Dismissed())
             return
         await super()._on_key(event)
 
@@ -554,6 +595,26 @@ class TerminalConversationApp(App[None]):
         background: transparent;
     }
 
+    #command-completion {
+        display: none;
+        overlay: screen;
+        offset: 0 -7;
+        width: 100%;
+        max-height: 7;
+        background: transparent;
+        border: round $panel;
+    }
+
+    .management-row {
+        width: 100%;
+        min-width: 0;
+        height: auto;
+        margin: 0 0 1 0;
+        padding: 0 1;
+        color: $text-muted;
+        background: transparent;
+    }
+
     .user-row {
         align: right top;
     }
@@ -564,7 +625,7 @@ class TerminalConversationApp(App[None]):
 
     #conversation-input-region {
         height: auto;
-        min-height: 5;
+        min-height: 3;
         max-height: 8;
         width: 100%;
     }
@@ -603,6 +664,8 @@ class TerminalConversationApp(App[None]):
         self._tool_rows: dict[_ToolRowKey, _ToolRowState] = {}
         self._closed_tool_turns: set[UUID] = set()
         self._active_confirmation_id: UUID | None = None
+        self._completion_options: tuple[str, ...] = ()
+        self._completion_dismissed_text: str | None = None
         self._closing = False
 
     def _build_driver(
@@ -624,6 +687,11 @@ class TerminalConversationApp(App[None]):
     def compose(self) -> ComposeResult:
         yield _ConversationDisplay(id="conversation-display")
         yield Vertical(
+            _CommandCompletion(
+                id="command-completion",
+                markup=False,
+                compact=True,
+            ),
             Static("New content below", id="new-content", markup=False),
             Static("Working", id="turn-status", markup=False),
             _ConversationInput(id="conversation-input", placeholder="Message MyClaw"),
@@ -646,6 +714,90 @@ class TerminalConversationApp(App[None]):
             self._runtime_started = False
             await self._runtime.close()
 
+    @property
+    def command_completion_visible(self) -> bool:
+        return bool(self._completion_options)
+
+    @on(TextArea.Changed, "#conversation-input")
+    def _input_changed(self, message: TextArea.Changed) -> None:
+        self._refresh_command_completion(message.text_area.text)
+
+    @on(_CommandCompletion.OptionSelected)
+    def _completion_selected(self, message: _CommandCompletion.OptionSelected) -> None:
+        if message.option_list.id != "command-completion":
+            return
+        self._select_command_completion(message.option_index)
+
+    @on(_CommandCompletion.Dismissed)
+    def _completion_dismissed(self, message: _CommandCompletion.Dismissed) -> None:
+        message.stop()
+        self.dismiss_command_completion()
+
+    def move_command_completion(self, direction: int) -> None:
+        if not self._completion_options:
+            return
+        completion = self.query_one("#command-completion", _CommandCompletion)
+        highlighted = completion.highlighted
+        current = 0 if highlighted is None else highlighted
+        completion.highlighted = max(
+            0,
+            min(len(self._completion_options) - 1, current + direction),
+        )
+
+    def dismiss_command_completion(self) -> None:
+        input_area = self.query_one("#conversation-input", _ConversationInput)
+        self._hide_command_completion(remember_text=input_area.text)
+        input_area.focus()
+
+    def accept_command_completion(self) -> None:
+        if not self._completion_options:
+            return
+        completion = self.query_one("#command-completion", _CommandCompletion)
+        highlighted = completion.highlighted
+        index = 0 if highlighted is None else highlighted
+        selected = self._completion_options[index]
+        input_area = self.query_one("#conversation-input", _ConversationInput)
+        should_submit = input_area.text == selected
+        self._select_command_completion(index)
+        if should_submit:
+            self.post_message(_ConversationInput.Submitted(input_area, selected))
+
+    def _select_command_completion(self, index: int) -> None:
+        if not self._completion_options:
+            return
+        selected = self._completion_options[index]
+        input_area = self.query_one("#conversation-input", _ConversationInput)
+        input_area.text = selected
+        input_area.move_cursor(
+            (len(input_area.document.lines) - 1, len(input_area.document.lines[-1]))
+        )
+        self._hide_command_completion(remember_text=selected)
+        input_area.focus()
+
+    def _refresh_command_completion(self, text: str) -> None:
+        if text == self._completion_dismissed_text:
+            self._hide_command_completion()
+            return
+        self._completion_dismissed_text = None
+        candidates = _management_command_candidates(text)
+        if not candidates:
+            self._hide_command_completion()
+            return
+        completion = self.query_one("#command-completion", _CommandCompletion)
+        completion.set_options(candidates)
+        completion.highlighted = 0
+        completion.display = True
+        self._completion_options = candidates
+
+    def _hide_command_completion(self, *, remember_text: str | None = None) -> None:
+        self._completion_options = ()
+        if remember_text is not None:
+            self._completion_dismissed_text = remember_text
+        with suppress(NoMatches, NoScreen, ScreenStackError):
+            completion = self.query_one("#command-completion", _CommandCompletion)
+            completion.set_options(())
+            completion.display = False
+
     @on(_ConversationDisplay.Resized)
     def _display_resized(self, message: _ConversationDisplay.Resized) -> None:
         compact = message.width <= _COMPACT_MESSAGE_MAX_WIDTH
@@ -662,6 +814,15 @@ class TerminalConversationApp(App[None]):
             message.text_area.text = ""
             self.exit()
             return
+
+        dispatcher = self._runtime.management_dispatcher
+        if dispatcher is not None:
+            result = await dispatcher.dispatch(text)
+            if result.handled:
+                message.text_area.remember_submission(text)
+                message.text_area.text = ""
+                await self._mount_management_rows(text, result.output)
+                return
 
         message.text_area.remember_submission(text)
         message.text_area.text = ""
@@ -961,6 +1122,19 @@ class TerminalConversationApp(App[None]):
         await display.mount(Static(content, markup=False, classes="turn-status"))
         self._scroll_to_latest()
 
+    async def _mount_management_rows(self, command: str, output: str | None) -> None:
+        display = self.query_one("#conversation-display", _ConversationDisplay)
+        await display.mount(
+            Static(
+                f"Command: {command}",
+                markup=False,
+                classes="management-row",
+            )
+        )
+        if output is not None:
+            await display.mount(Static(output, markup=False, classes="management-row"))
+        self._scroll_to_latest()
+
     def _set_working(self, working: bool) -> None:
         with suppress(NoMatches, NoScreen, ScreenStackError):
             self.query_one("#turn-status", Static).display = working
@@ -984,6 +1158,12 @@ def _friendly_name(name: str, *, fallback: str) -> str:
         )
         or fallback
     )
+
+
+def _management_command_candidates(text: str) -> tuple[str, ...]:
+    if not text.startswith("/") or "\n" in text or " " in text or "\t" in text:
+        return ()
+    return tuple(command for command in SUPPORTED_MANAGEMENT_COMMANDS if command.startswith(text))
 
 
 def _friendly_tool_name(tool_name: str) -> str:

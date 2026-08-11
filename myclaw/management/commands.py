@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 from loguru import logger
@@ -17,6 +18,17 @@ from myclaw.management.service import (
 )
 from myclaw.memory.memory_task import MemoryTaskResult
 from myclaw.utils.time import format_rfc3339_milliseconds
+
+
+class _ManagementCommand(StrEnum):
+    CONFIG = "/config"
+    STATUS = "/status"
+    RESUME = "/resume"
+    MEMORY = "/memory"
+    DREAM = "/dream"
+
+
+SUPPORTED_MANAGEMENT_COMMANDS = tuple(command.value for command in _ManagementCommand)
 
 
 class ManagementPort(Protocol):
@@ -51,10 +63,14 @@ class ManagementCommandDispatcher:
     async def dispatch(self, command: str) -> ManagementCommandResult:
         """Return rendered output for a recognized Management Command."""
         with without_session_log():
-            return await self._dispatch(command)
+            try:
+                parsed_command = _ManagementCommand(command)
+            except ValueError:
+                return ManagementCommandResult(handled=False, output=None)
+            return await self._dispatch(parsed_command)
 
-    async def _dispatch(self, command: str) -> ManagementCommandResult:
-        if command == "/resume":
+    async def _dispatch(self, command: _ManagementCommand) -> ManagementCommandResult:
+        if command is _ManagementCommand.RESUME:
             try:
                 listing = await self._management.resumable_listing()
             except ManagementError as management_error:
@@ -85,14 +101,14 @@ class ManagementCommandDispatcher:
                 output="\n".join(lines),
                 resume_sessions=sessions,
             )
-        if command == "/status":
+        if command is _ManagementCommand.STATUS:
             try:
                 status = await self._management.status()
                 output = json.dumps(status.to_dict(), ensure_ascii=False, indent=2)
             except ManagementError as management_error:
                 output = f"{management_error.error.code}: {management_error.error.message}"
             return ManagementCommandResult(handled=True, output=output)
-        if command == "/memory":
+        if command is _ManagementCommand.MEMORY:
             try:
                 output = await self._management.memory_view()
             except ManagementError as management_error:
@@ -101,7 +117,7 @@ class ManagementCommandDispatcher:
                 handled=True,
                 output=output,
             )
-        if command == "/dream":
+        if command is _ManagementCommand.DREAM:
             try:
                 result = await self._management.dream()
             except ManagementError as management_error:
@@ -122,8 +138,8 @@ class ManagementCommandDispatcher:
                         f"cursor: {result.cursor}"
                     )
             return ManagementCommandResult(handled=True, output=output)
-        if command != "/config":
-            return ManagementCommandResult(handled=False, output=None)
+        if command is not _ManagementCommand.CONFIG:
+            raise RuntimeError(f"Supported Management Command has no handler: {command}")
         try:
             view = await self._management.config_view()
         except ManagementError as management_error:

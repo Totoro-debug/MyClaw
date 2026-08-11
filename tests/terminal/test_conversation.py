@@ -557,6 +557,7 @@ class FailingMarkdownStream:
 class FakeRuntime:
     def __init__(self, conversation: object) -> None:
         self.conversation = cast(ConversationPort, conversation)
+        self.management_dispatcher: object | None = None
         self.start_calls = 0
         self.close_calls = 0
 
@@ -604,8 +605,13 @@ class CloseOrderingRuntime(FakeRuntime):
         await super().close()
 
 
-def _runtime(conversation: object) -> FakeRuntime:
-    return FakeRuntime(conversation)
+def _runtime(
+    conversation: object,
+    management_dispatcher: object | None = None,
+) -> FakeRuntime:
+    runtime = FakeRuntime(conversation)
+    runtime.management_dispatcher = management_dispatcher
+    return runtime
 
 
 def _turn_started_event(turn_id: UUID, event_id: int = 0) -> AgentEvent:
@@ -2399,3 +2405,216 @@ async def test_shutdown_settles_stream_worker_before_runtime_close() -> None:
 
     assert conversation.closed.is_set()
     assert runtime.close_saw_stream_closed
+
+
+@pytest.mark.asyncio
+async def test_management_completion_supports_keyboard_filtering_and_escape() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        input_area = app.query_one("#conversation-input", TextArea)
+
+        await pilot.press("/")
+
+        visible_commands = [
+            text
+            for text, _x, _y in _screenshot_text_nodes(app)
+            if text in {"/config", "/status", "/resume", "/memory", "/dream"}
+        ]
+        assert visible_commands == [
+            "/config",
+            "/status",
+            "/resume",
+            "/memory",
+            "/dream",
+        ]
+        assert any(text == "/" for text, _x, _y in _screenshot_text_nodes(app))
+        assert app.screen.focused is input_area
+
+        await pilot.press("down", "enter")
+
+        assert input_area.text == "/status"
+        assert app.screen.focused is input_area
+
+        await pilot.press("ctrl+c", "/", "down", "up", "enter")
+
+        assert input_area.text == "/config"
+
+        await pilot.press("ctrl+c", "/", "escape")
+
+        assert input_area.text == "/"
+        assert not any(
+            text in {"/config", "/status", "/resume", "/memory", "/dream"}
+            for text, _x, _y in _screenshot_text_nodes(app)
+        )
+        assert app.screen.focused is input_area
+
+        await pilot.press("m")
+
+        assert [
+            text
+            for text, _x, _y in _screenshot_text_nodes(app)
+            if text in {"/config", "/status", "/resume", "/memory", "/dream"}
+        ] == ["/memory"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", ((80, 24), (30, 12), (20, 10)))
+async def test_management_completion_keeps_the_composer_visible(
+    size: tuple[int, int],
+) -> None:
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(ScriptedConversation())))
+
+    async with app.run_test(size=size) as pilot:
+        await pilot.press("/")
+
+        visible_nodes = _screenshot_text_nodes(app)
+        assert [
+            text
+            for text, _x, _y in visible_nodes
+            if text in {"/config", "/status", "/resume", "/memory", "/dream"}
+        ] == ["/config", "/status", "/resume", "/memory", "/dream"]
+        assert any(text == "/" for text, _x, _y in visible_nodes)
+        assert isinstance(app.screen.focused, TextArea)
+
+
+@pytest.mark.asyncio
+async def test_management_completion_mouse_selection_updates_the_composer() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("/")
+
+        await pilot.click("#command-completion", offset=(2, 2))
+
+        assert app.query_one("#conversation-input", TextArea).text == "/status"
+        assert isinstance(app.screen.focused, TextArea)
+        assert not any(
+            text in {"/config", "/resume", "/memory", "/dream"}
+            for text, _x, _y in _screenshot_text_nodes(app)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "output_marker"),
+    (
+        ("/config", "Path:"),
+        ("/status", '"version": "0.1.0"'),
+        ("/resume", "No resumable Conversation Sessions."),
+        ("/memory", "# Long-term Memory"),
+        ("/dream", "No pending summaries"),
+    ),
+)
+async def test_supported_management_commands_use_the_prepared_runtime_without_session_messages(
+    agent_home: Path,
+    workspace: Path,
+    command: str,
+    output_marker: str,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    original_session = runtime.session
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list(command), "enter")
+        await pilot.pause()
+        await pilot.press("ctrl+home")
+
+        visible_text = _visible_screen_text(app)
+        assert f"Command: {command}" in visible_text
+        assert output_marker in visible_text
+        assert runtime.session is original_session
+        assert original_session.messages == []
+        assert provider.stream_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ("/ordinary", "/CONFIG", "/config extra", "/memory "))
+async def test_inexact_slash_input_reaches_the_prepared_conversation_port_unchanged(
+    agent_home: Path,
+    workspace: Path,
+    command: str,
+) -> None:
+    provider = _RuntimeProvider((_response(content="Ordinary slash response."),))
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    original_session = runtime.session
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list(command), "enter")
+        await _wait_for_turn(app)
+
+        assert runtime.session is original_session
+        assert original_session.messages[0]["role"] == "user"
+        assert original_session.messages[0]["content"] == command
+        assert provider.stream_requests
+
+
+@pytest.mark.asyncio
+async def test_management_rows_remain_visible_after_a_later_command(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/dream"), "enter")
+        await pilot.press(*list("/resume"), "enter")
+        await pilot.press("ctrl+home")
+
+        visible_text = _visible_screen_text(app)
+        assert "Command: /dream" in visible_text
+        assert "No pending summaries" in visible_text
+        assert "Command: /resume" in visible_text
+        assert "No resumable Conversation Sessions." in visible_text
+        assert runtime.session.messages == []
+        assert provider.stream_requests == []
+
+
+@pytest.mark.asyncio
+async def test_management_error_row_preserves_later_command_interaction(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime.session.workspace_state.long_term_memory_path.unlink()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/memory"), "enter")
+        await pilot.press(*list("/dream"), "enter")
+        await pilot.press("ctrl+home")
+
+        visible_text = _visible_screen_text(app)
+        assert "persistence_error: Long-term Memory could not be read." in visible_text
+        assert "No pending summaries" in visible_text
+        assert runtime.session.messages == []
+        assert provider.stream_requests == []
+
+
+@pytest.mark.asyncio
+async def test_completion_direction_keys_take_precedence_over_runtime_input_history() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("previous"), "enter")
+        await _wait_for_turn(app)
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        await pilot.press("/")
+        await pilot.press("up")
+        assert input_area.text == "/"
+
+        await pilot.press("escape", "ctrl+c", "up")
+        assert input_area.text == "previous"
