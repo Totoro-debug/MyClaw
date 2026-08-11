@@ -1,18 +1,11 @@
-import asyncio
 import os
 import shutil
 import subprocess
-from collections.abc import Awaitable, Callable, Coroutine
+import sys
 from pathlib import Path
-from types import SimpleNamespace
-from typing import cast
 
 import pytest
-import typer
 
-import myclaw.terminal.cli as cli
-from myclaw.config.agent_home import AgentHome
-from myclaw.logging.process import configure_process_logging
 from tests.configuration.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,
@@ -64,93 +57,6 @@ def legacy_runtime_log_snapshot(agent_home: Path) -> dict[str, bytes]:
     }
 
 
-def test_cli_drains_interrupts_before_restoring_handler_and_preserves_runtime_error(
-    monkeypatch: pytest.MonkeyPatch,
-    agent_home: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    events: list[str] = []
-
-    class FakeLoader:
-        def __init__(self, agent_home: object) -> None:
-            self.agent_home = agent_home
-            self.path = Path("config.toml")
-
-        def load_for_startup(self) -> object:
-            return object()
-
-    class FakeConversation:
-        async def cancel_active_turn(self) -> None:
-            return None
-
-    class FailingRuntime:
-        conversation = FakeConversation()
-
-        async def run(self, *, input_reader: object, writer: object) -> None:
-            del input_reader, writer
-            events.append("runtime")
-            raise LookupError("runtime failed")
-
-    class FailingInterruptController:
-        def __init__(
-            self,
-            *,
-            loop: asyncio.AbstractEventLoop,
-            cancel_foreground: Callable[[], Awaitable[None]],
-        ) -> None:
-            del loop, cancel_foreground
-            self.installed = False
-
-        def install(self) -> None:
-            self.installed = True
-            events.append("install")
-
-        async def close(self) -> None:
-            events.append("interrupt-close")
-            if not self.installed:
-                raise AssertionError("SIGINT handler restored before interrupt drain")
-            raise RuntimeError("PRIVATE_INTERRUPT_CLEANUP_BODY_52")
-
-        def restore(self) -> None:
-            self.installed = False
-            events.append("restore")
-
-    class RecordingRunner:
-        def __init__(self) -> None:
-            self._loop = asyncio.new_event_loop()
-
-        def __enter__(self) -> "RecordingRunner":
-            return self
-
-        def __exit__(self, *errors: object) -> None:
-            del errors
-            self._loop.close()
-
-        def get_loop(self) -> asyncio.AbstractEventLoop:
-            return self._loop
-
-        def run(self, awaitable: Coroutine[object, object, object]) -> object:
-            return self._loop.run_until_complete(awaitable)
-
-    runtime = FailingRuntime()
-    monkeypatch.setattr(cli, "ConfigLoader", FakeLoader)
-    monkeypatch.setattr(cli, "prepare_repl_runtime", lambda **_kwargs: runtime)
-    monkeypatch.setattr(cli, "ForegroundInterruptController", FailingInterruptController)
-    monkeypatch.setattr(asyncio, "Runner", RecordingRunner)
-    monkeypatch.setattr(AgentHome, "production", lambda: AgentHome(agent_home))
-    context = cast(typer.Context, SimpleNamespace(invoked_subcommand=None))
-
-    configure_process_logging()
-    with pytest.raises(LookupError, match="runtime failed") as raised:
-        cli.main(context)
-
-    assert isinstance(raised.value.__cause__, RuntimeError)
-    assert str(raised.value.__cause__) == "PRIVATE_INTERRUPT_CLEANUP_BODY_52"
-    assert events == ["install", "runtime", "interrupt-close", "restore"]
-    assert capsys.readouterr().err == "Interrupt controller cleanup failed type=RuntimeError\n"
-    assert not (agent_home / "logs").exists()
-
-
 def test_installed_myclaw_console_entry_starts() -> None:
     executable = shutil.which("myclaw")
 
@@ -164,6 +70,127 @@ def test_installed_myclaw_console_entry_starts() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "MyClaw Personal Agent" in result.stdout
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="The Windows Python runtime has no termios/pty harness; use the Windows Terminal matrix.",
+)
+def test_installed_wheel_terminal_conversation_pseudo_terminal_smoke(tmp_path: Path) -> None:
+    pty = pytest.importorskip("pty")
+    termios = pytest.importorskip("termios")
+    import select
+    import time
+
+    wheel_dir = tmp_path / "wheel"
+    wheel_dir.mkdir()
+    build_result = subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(wheel_dir)],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert build_result.returncode == 0, build_result.stderr
+    wheels = tuple(wheel_dir.glob("myclaw-*.whl"))
+    assert len(wheels) == 1
+
+    venv = tmp_path / "venv"
+    venv_result = subprocess.run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert venv_result.returncode == 0, venv_result.stderr
+    venv_bin = venv / "bin"
+    venv_python = venv_bin / "python"
+    install_result = subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--no-deps", str(wheels[0])],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert install_result.returncode == 0, install_result.stderr
+
+    agent_home = tmp_path / "home" / ".myclaw"
+    agent_home.mkdir(parents=True)
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment["HOME"] = str(agent_home.parent)
+
+    master_fd, slave_fd = pty.openpty()
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        original_terminal = termios.tcgetattr(slave_fd)
+        process = subprocess.Popen(
+            [str(venv_bin / "myclaw")],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            cwd=workspace,
+            env=environment,
+            close_fds=True,
+        )
+        output = bytearray()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and b"Message MyClaw" not in output:
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if ready:
+                output.extend(os.read(master_fd, 4096))
+        assert b"Message MyClaw" in output or b"\x1b[?1049h" in output
+        assert process.poll() is None
+
+        os.write(master_fd, b"\x03")
+        deadline = time.monotonic() + 5
+        while process.poll() is None and time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if ready:
+                try:
+                    output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+        assert process.poll() == 0
+
+        while True:
+            ready, _, _ = select.select([master_fd], [], [], 0)
+            if not ready:
+                break
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output.extend(chunk)
+
+        terminal_output = bytes(output)
+        restoration_pairs = (
+            (b"\x1b[?2004h", b"\x1b[?2004l"),
+            (b"\x1b[?1000h", b"\x1b[?1000l"),
+            (b"\x1b[?1003h", b"\x1b[?1003l"),
+            (b"\x1b[?1015h", b"\x1b[?1015l"),
+            (b"\x1b[?1006h", b"\x1b[?1006l"),
+            (b"\x1b[?1004h", b"\x1b[?1004l"),
+            (b"\x1b[?1049h", b"\x1b[?1049l"),
+            (b"\x1b[?25l", b"\x1b[?25h"),
+            (b"\x1b[>1u", b"\x1b[<u"),
+        )
+        assert b"\x1b[?1049h" in terminal_output
+        for enabled, restored in restoration_pairs:
+            if enabled in terminal_output:
+                assert restored in terminal_output
+                assert terminal_output.rfind(restored) > terminal_output.rfind(enabled)
+        assert termios.tcgetattr(slave_fd) == original_terminal
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)
+        os.close(slave_fd)
 
 
 def test_installed_myclaw_generates_missing_configuration_and_stops(
@@ -296,7 +323,7 @@ def test_installed_config_command_keeps_undefined_content_inspectable(
     assert not (workspace / ".myclaw").exists()
 
 
-def test_installed_myclaw_passes_valid_configuration_gate(
+def test_installed_myclaw_rejects_valid_configuration_without_a_tty(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -305,18 +332,12 @@ def test_installed_myclaw_passes_valid_configuration_gate(
 
     result = run_installed_myclaw(agent_home, workspace=workspace)
 
-    assert result.returncode == 0, result.stderr
-    assert "configuration gate passed" in result.stdout
+    assert result.returncode == 2, result.stderr
+    assert "interactive_terminal_required" in result.stdout
+    assert "configuration gate passed" not in result.stdout
     assert_plaintext_absent(result.stdout + result.stderr, "sk-ant-secret")
     assert not (agent_home / "logs").exists()
-    state = workspace / ".myclaw"
-    tree = tuple(
-        sorted(
-            "/".join(path.relative_to(state).parts) + ("/" if path.is_dir() else "")
-            for path in state.rglob("*")
-        )
-    )
-    assert tree == (".gitignore", "memory/", "memory/memory.md", "sessions/")
+    assert not (workspace / ".myclaw").exists()
 
 
 def test_installed_myclaw_stops_only_on_parse_failure(
@@ -341,15 +362,15 @@ def test_installed_myclaw_stops_only_on_parse_failure(
 
     assert (parse_result.returncode, schema_result.returncode, default_result.returncode) == (
         2,
-        0,
-        0,
+        2,
+        2,
     )
     assert "config_parse_error" in parse_result.stdout
     assert "config_invalid" not in schema_result.stdout
     assert "configuration gate passed" not in parse_result.stdout
-    assert "configuration gate passed" in schema_result.stdout
-    assert "configuration gate passed" in default_result.stdout
-    assert (workspace / ".myclaw").exists()
+    assert "interactive_terminal_required" in schema_result.stdout
+    assert "interactive_terminal_required" in default_result.stdout
+    assert not (workspace / ".myclaw").exists()
     combined_output = "".join(
         result.stdout + result.stderr for result in (parse_result, schema_result, default_result)
     )
@@ -363,7 +384,7 @@ def test_installed_myclaw_stops_only_on_parse_failure(
     assert not (agent_home / "logs").exists()
 
 
-def test_installed_myclaw_reports_unsafe_workspace_state_without_traceback(
+def test_installed_myclaw_rejects_non_tty_before_unsafe_workspace_state(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -374,17 +395,18 @@ def test_installed_myclaw_reports_unsafe_workspace_state_without_traceback(
 
     result = run_installed_myclaw(agent_home, workspace=workspace)
 
-    assert result.returncode == 1
-    assert result.stdout.count("persistence_error") == 1
-    assert "Workspace State" in result.stdout
-    assert str(state_path) in result.stdout
+    assert result.returncode == 2
+    assert result.stdout.count("interactive_terminal_required") == 1
+    assert "Workspace State" not in result.stdout
+    assert str(state_path) not in result.stdout
     assert "private collision content" not in result.stdout + result.stderr
     assert "Traceback" not in result.stdout + result.stderr
     assert result.stderr == ""
+    assert state_path.read_text(encoding="utf-8") == "private collision content"
     assert not (agent_home / "logs").exists()
 
 
-def test_installed_myclaw_reports_corrupt_schedule_state_without_traceback(
+def test_installed_myclaw_rejects_non_tty_before_corrupt_schedule_state(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -397,20 +419,18 @@ def test_installed_myclaw_reports_corrupt_schedule_state_without_traceback(
 
     result = run_installed_myclaw(agent_home, workspace=workspace)
 
-    assert result.returncode == 1
-    assert result.stdout.count("schedule_state_error") == 1
-    assert (
-        "Schedule state could not be loaded. Repair or move the file, then start MyClaw again."
-        in result.stdout
-    )
-    assert f"Path: {schedule_path}" in result.stdout
+    assert result.returncode == 2
+    assert result.stdout.count("interactive_terminal_required") == 1
+    assert "schedule_state_error" not in result.stdout
+    assert str(schedule_path) not in result.stdout
     assert "{corrupt" not in result.stdout + result.stderr
     assert "Traceback" not in result.stdout + result.stderr
     assert result.stderr == ""
+    assert schedule_path.read_text(encoding="utf-8") == "{corrupt"
     assert not (state_path / "logs").exists()
 
 
-def test_installed_myclaw_rejects_user_home_workspace_without_traceback(
+def test_installed_myclaw_rejects_non_tty_before_user_home_workspace_validation(
     agent_home: Path,
 ) -> None:
     agent_home.mkdir(parents=True)
@@ -418,10 +438,10 @@ def test_installed_myclaw_rejects_user_home_workspace_without_traceback(
 
     result = run_installed_myclaw(agent_home, workspace=agent_home.parent)
 
-    assert result.returncode == 1
-    assert result.stdout.count("persistence_error") == 1
-    assert "Workspace State" in result.stdout
-    assert str(agent_home) in result.stdout
+    assert result.returncode == 2
+    assert result.stdout.count("interactive_terminal_required") == 1
+    assert "Workspace State" not in result.stdout
+    assert str(agent_home) not in result.stdout
     assert "Traceback" not in result.stdout + result.stderr
     assert result.stderr == ""
     assert not (agent_home / "memory").exists()

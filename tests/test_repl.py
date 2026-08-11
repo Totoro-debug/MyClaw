@@ -1,15 +1,11 @@
 import asyncio
-import subprocess
-import sys
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import datetime, timedelta, timezone
-from io import StringIO
 from pathlib import Path
 from uuid import UUID
 
 import pytest
-from rich.console import Console
 
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -28,7 +24,7 @@ from myclaw.provider.models import (
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.session import Session
-from myclaw.terminal.repl import ConsoleProgressiveWriter, ConsoleReplInput, run_repl
+from myclaw.terminal.repl import run_repl
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -83,109 +79,6 @@ class CancelOnFirstDeltaWriter(RecordingProgressiveWriter):
         if not self._cancelled:
             self._cancelled = True
             raise asyncio.CancelledError
-
-
-@pytest.mark.asyncio
-async def test_console_progressive_writer_writes_chunks_then_one_complete_line() -> None:
-    output = StringIO()
-    writer = ConsoleProgressiveWriter(Console(file=output, force_terminal=False, color_system=None))
-
-    await writer.write_delta("Hello ")
-    await writer.write_delta("world")
-    await writer.finish_turn()
-    await writer.write_line("Management output\n")
-
-    assert output.getvalue() == "Hello world\nManagement output\n"
-
-
-@pytest.mark.asyncio
-async def test_console_repl_input_returns_eof_without_prompting_when_noninteractive() -> None:
-    output = StringIO()
-    input_reader = ConsoleReplInput(Console(file=output, force_terminal=False, color_system=None))
-
-    assert await input_reader.read() is None
-    assert output.getvalue() == ""
-
-
-@pytest.mark.asyncio
-async def test_console_repl_input_cancellation_stops_async_prompt_without_a_worker_thread(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class TerminalInput:
-        def isatty(self) -> bool:
-            return True
-
-    class BlockingPromptSession:
-        def __init__(self) -> None:
-            self.started = asyncio.Event()
-            self.handle_sigint: bool | None = None
-
-        async def prompt_async(self, message: str, *, handle_sigint: bool) -> str:
-            assert message == "You: "
-            self.handle_sigint = handle_sigint
-            self.started.set()
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
-
-    monkeypatch.setattr("myclaw.terminal.repl.sys.stdin", TerminalInput())
-    prompt = BlockingPromptSession()
-    input_reader = ConsoleReplInput(
-        Console(force_terminal=True),
-        prompt_session=prompt,
-    )
-    reading = asyncio.create_task(input_reader.read())
-    await prompt.started.wait()
-
-    reading.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await reading
-
-    assert prompt.handle_sigint is False
-
-
-def test_cancelled_console_prompt_does_not_delay_process_exit() -> None:
-    script = """
-import asyncio
-from prompt_toolkit import PromptSession
-from prompt_toolkit.input.defaults import create_pipe_input
-from prompt_toolkit.output import DummyOutput
-from rich.console import Console
-import myclaw.terminal.repl as repl_module
-from myclaw.terminal.repl import ConsoleReplInput
-
-class TerminalInput:
-    def isatty(self):
-        return True
-
-async def main():
-    repl_module.sys.stdin = TerminalInput()
-    with create_pipe_input() as pipe:
-        reader = ConsoleReplInput(
-            Console(force_terminal=True),
-            prompt_session=PromptSession(input=pipe, output=DummyOutput()),
-        )
-        reading = asyncio.create_task(reader.read())
-        await asyncio.sleep(0.05)
-        reading.cancel()
-        try:
-            await reading
-        except asyncio.CancelledError:
-            print("prompt-cancelled", flush=True)
-
-asyncio.run(main())
-"""
-
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=Path.cwd(),
-        capture_output=True,
-        text=True,
-        timeout=2,
-        check=False,
-    )
-
-    assert completed.returncode == 0
-    assert "prompt-cancelled" in completed.stdout
 
 
 @pytest.mark.asyncio

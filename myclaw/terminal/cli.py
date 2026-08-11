@@ -1,12 +1,10 @@
 """Command-line entry point for MyClaw."""
 
-import asyncio
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 import typer
-from loguru import logger
 from rich.console import Console
 
 from myclaw.agent.runtime import (
@@ -17,8 +15,7 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader
 from myclaw.errors import ErrorInfo
 from myclaw.provider.factory import create_provider
-from myclaw.terminal.interrupts import ForegroundInterruptController
-from myclaw.terminal.repl import ConsoleProgressiveWriter, ConsoleReplInput
+from myclaw.terminal.conversation import is_interactive_terminal, run_terminal_conversation
 
 app = typer.Typer(
     add_completion=False,
@@ -46,13 +43,6 @@ def _print_error(error: ErrorInfo, path: object) -> None:
     console.print(f"Path: {path}", markup=False, highlight=False, soft_wrap=True)
 
 
-def _log_interrupt_cleanup_failure(error: BaseException) -> None:
-    logger.opt(exception=error).error(
-        "Interrupt controller cleanup failed type={}",
-        type(error).__name__,
-    )
-
-
 @app.callback(invoke_without_command=True)
 def main(context: typer.Context) -> None:
     """Start the MyClaw Personal Agent."""
@@ -72,7 +62,14 @@ def main(context: typer.Context) -> None:
             loader.path,
         )
         raise typer.Exit(code=1) from None
-    console.print("MyClaw Personal Agent configuration gate passed.")
+    if not is_interactive_terminal():
+        _print_error_info(
+            ErrorInfo(
+                "interactive_terminal_required",
+                "Terminal Conversation requires interactive stdin, stdout, and stderr TTYs.",
+            )
+        )
+        raise typer.Exit(code=2)
     try:
         runtime = prepare_repl_runtime(
             agent_home=loader.agent_home,
@@ -85,35 +82,7 @@ def main(context: typer.Context) -> None:
     except WorkspaceStateError as workspace_state_error:
         _print_error(workspace_state_error.error, workspace_state_error.path)
         raise typer.Exit(code=1) from None
-    with asyncio.Runner() as runner:
-        interrupts = ForegroundInterruptController(
-            loop=runner.get_loop(),
-            cancel_foreground=runtime.conversation.cancel_active_turn,
-        )
-        interrupts.install()
-        try:
-            try:
-                runner.run(
-                    runtime.run(
-                        input_reader=ConsoleReplInput(console),
-                        writer=ConsoleProgressiveWriter(console),
-                    )
-                )
-            except BaseException as primary_error:
-                try:
-                    runner.run(interrupts.close())
-                except BaseException as cleanup_error:
-                    _log_interrupt_cleanup_failure(cleanup_error)
-                    raise primary_error from cleanup_error
-                raise
-            else:
-                try:
-                    runner.run(interrupts.close())
-                except BaseException as cleanup_error:
-                    _log_interrupt_cleanup_failure(cleanup_error)
-                    raise
-        finally:
-            interrupts.restore()
+    run_terminal_conversation(runtime)
 
 
 @app.command("config")

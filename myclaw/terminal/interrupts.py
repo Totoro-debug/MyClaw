@@ -1,4 +1,4 @@
-"""Repeatable foreground-only SIGINT coordination for one REPL Runtime."""
+"""Foreground-only SIGINT coordination retained for the headless Runtime seam."""
 
 import asyncio
 import signal

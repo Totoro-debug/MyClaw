@@ -25,6 +25,7 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
             "model_invalid_request",
             "model_context_overflow",
             "memory_context_too_large",
+            "interactive_terminal_required",
             "model_failed",
             "turn_cancelled",
             "tool_not_found",

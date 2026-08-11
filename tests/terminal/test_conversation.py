@@ -764,6 +764,9 @@ async def _wait_for_turn(app: TerminalConversationApp) -> None:
     async with asyncio.timeout(2):
         while text_area.read_only:
             await asyncio.sleep(0)
+        refreshed = asyncio.Event()
+        app.call_after_refresh(refreshed.set)
+        await refreshed.wait()
 
 
 def _constant_datetime(value: datetime) -> Callable[[], datetime]:
@@ -2115,6 +2118,9 @@ async def test_prepared_runtime_exec_confirmation_preserves_the_exact_long_comma
         await pilot.press("escape")
         await asyncio.wait_for(submission, timeout=2)
         await _wait_for_turn(app)
+        async with asyncio.timeout(2):
+            while "The command was declined." not in _visible_screen_text(app):
+                await pilot.pause()
         assert "The command was declined." in _visible_screen_text(app)
 
     assert provider.closed
@@ -2389,12 +2395,14 @@ async def test_historical_streaming_pauses_follow_and_exposes_new_content() -> N
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("seed"), "enter")
+        await _wait_for_turn(app)
 
         conversation.pause_after_next_first_delta()
         submission = asyncio.create_task(pilot.press(*list("stream"), "enter"))
         try:
             await asyncio.wait_for(conversation.first_delta_emitted.wait(), timeout=1)
             await asyncio.sleep(0.1)
+            await pilot.pause()
             display = app.query_one("#conversation-display")
             assert display.max_scroll_y > 0
             assert display.is_vertical_scroll_end

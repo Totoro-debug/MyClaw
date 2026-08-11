@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
-from asyncio import CancelledError, Event, current_task
+from asyncio import CancelledError, Event, Task, create_task, current_task, sleep
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -378,6 +378,65 @@ class _MarkdownStream(Protocol):
     async def stop(self) -> None: ...
 
 
+class _CoalescedMarkdownStream:
+    """Batch adjacent provider deltas into one Textual Markdown refresh."""
+
+    def __init__(
+        self,
+        stream: _MarkdownStream,
+        *,
+        content_changed: Callable[[], None],
+    ) -> None:
+        self._stream = stream
+        self._content_changed = content_changed
+        self._pending: list[str] = []
+        self._flush_task: Task[None] | None = None
+        self._flush_error: BaseException | None = None
+        self._stopped = False
+
+    def write(self, fragment: str) -> None:
+        if self._stopped:
+            raise RuntimeError("Markdown stream is already stopped")
+        self._pending.append(fragment)
+        if self._flush_task is None and self._flush_error is None:
+            self._flush_task = create_task(self._flush_after_event_loop_turn())
+
+    async def stop(self) -> None:
+        self._stopped = True
+        try:
+            if self._flush_task is not None:
+                await self._flush_task
+            if self._pending and self._flush_error is None:
+                await self._flush_pending()
+        except BaseException as error:
+            self._flush_error = error
+
+        try:
+            await self._stream.stop()
+        except BaseException as stop_error:
+            if self._flush_error is not None:
+                raise self._flush_error from stop_error
+            raise
+        if self._flush_error is not None:
+            raise self._flush_error
+
+    async def _flush_after_event_loop_turn(self) -> None:
+        try:
+            await sleep(0)
+            while self._pending:
+                await self._flush_pending()
+        except BaseException as error:
+            self._flush_error = error
+        finally:
+            self._flush_task = None
+
+    async def _flush_pending(self) -> None:
+        fragments = self._pending
+        self._pending = []
+        await self._stream.write("".join(fragments))
+        self._content_changed()
+
+
 def _make_links_visible(state: StateCore) -> None:
     """Render Markdown links as ordinary label-and-URL text."""
     for token in state.tokens:
@@ -592,6 +651,9 @@ class _ConversationDisplay(VerticalScroll):
             return
         if self.following:
             self.scroll_end(animate=False, immediate=True)
+            self._following = True
+            self._new_content = False
+            self._historical_anchor = None
             self.call_after_refresh(self._follow_latest)
         else:
             self._new_content = True
@@ -612,12 +674,20 @@ class _ConversationDisplay(VerticalScroll):
         self._resize_anchor = None
         self._resize_generation += 1
         self.scroll_end(animate=False, immediate=True)
+        self._following = True
         self.call_after_refresh(self._follow_latest)
         self._emit_scroll_state()
 
-    def _follow_latest(self) -> None:
-        if self.following:
-            self.scroll_end(animate=False, immediate=True)
+    def _follow_latest(self, attempt: int = 0) -> None:
+        if not self.following:
+            return
+        self.scroll_end(animate=False, immediate=True)
+        self._following = True
+        self._new_content = False
+        self._historical_anchor = None
+        self._emit_scroll_state()
+        if attempt < 2:
+            self.call_after_refresh(self._follow_latest, attempt + 1)
 
     def _sync_after_user_scroll(self) -> None:
         if self._size_suspended or self._restoring_resize:
@@ -1421,7 +1491,7 @@ class TerminalConversationApp(App[None]):
 
     async def _consume_turn(self, events: AsyncIterator[AgentEvent]) -> None:
         assistant: Markdown | None = None
-        stream: _MarkdownStream | None = None
+        stream: _CoalescedMarkdownStream | None = None
         streamed_fragments: list[str] = []
         observed_tool_turns: set[UUID] = set()
         resolved_confirmations: set[UUID] = set()
@@ -1438,10 +1508,12 @@ class TerminalConversationApp(App[None]):
                     streamed_fragments.append(payload.delta)
                     if assistant is None:
                         assistant = await self._mount_assistant()
-                        stream = Markdown.get_stream(assistant)
+                        stream = _CoalescedMarkdownStream(
+                            Markdown.get_stream(assistant),
+                            content_changed=self._scroll_to_latest,
+                        )
                     assert stream is not None
-                    await stream.write(payload.delta)
-                    self._scroll_to_latest()
+                    stream.write(payload.delta)
                 elif event.type == "tool_started":
                     payload = event.payload
                     if not isinstance(payload, ToolStartedPayload):

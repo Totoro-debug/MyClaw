@@ -1,12 +1,16 @@
 # MyClaw Schedule Release Readiness
 
-Status: **READY**
+Schedule release status: **READY**
+
+Terminal Conversation real-terminal validation: **PENDING**
 
 This is the current evidence index for GitHub issues
 [#69](https://github.com/Totoro-debug/myclaw/issues/69), the final Session
 architecture gate [#92](https://github.com/Totoro-debug/myclaw/issues/92), and the
 Schedule end-to-end gate [#117](https://github.com/Totoro-debug/myclaw/issues/117),
 which completes parent issue [#104](https://github.com/Totoro-debug/myclaw/issues/104).
+The READY status above applies to that recorded Schedule release candidate; it does not
+claim that the later Terminal Conversation real-terminal matrix has been completed.
 The active Tool boundary decision is [ADR-0010](adr/0010-fixed-tool-catalog-and-base-tool-boundaries.md),
 which supersedes the affected parts of ADR-0003, ADR-0005, and ADR-0007 without
 rewriting those historical decisions.
@@ -34,6 +38,34 @@ rewriting those historical decisions.
   confirmation, at/every/cron timing, Schedule Session ownership, Summary/Memory
   behavior, fault recovery, and shutdown are covered through the Runtime composition
   seam documented in [Windows x64 validation](release/windows-validation.md).
+
+## Terminal Conversation Acceptance Matrix
+
+The default `myclaw` command is the full-screen Terminal Conversation. A non-TTY
+launch is rejected before Textual or Runtime startup with the stable
+`interactive_terminal_required` outcome; it never falls back to the internal headless
+REPL seam and it does not create Conversation Session history.
+
+| Host input path | Validation status | Shift+Enter | Alt+Enter | Ctrl+J | Expected result |
+| --- | --- | --- | --- | --- | --- |
+| Windows Terminal target | **PENDING real-terminal run** | Newline only when the enhanced-keyboard report is delivered | Newline only when the host delivers it; Windows Terminal may reserve the chord | Always newline | Capability-aware multiline composition |
+| Other terminal with enhanced-keyboard reporting | Capability contract only | Newline when the supported report is negotiated and parsed | Newline only when delivered by the host | Always newline | Capability-gated behavior; no inferred modifier |
+| Basic or unsupported terminal | Capability contract only | Ordinary Enter keeps submit semantics | No assumption about delivery | Always newline | Safe ordinary submission plus portable multiline fallback |
+
+The current Windows Python environment cannot import the standard-library `pty` module
+because `termios` is unavailable, and it has no `winpty` or `pexpect` harness. A native
+pseudo-terminal process smoke therefore cannot run on this host. The nearest executable
+process seam is the installed console-entry-point test for non-TTY rejection, while
+Textual headless lifecycle tests cover application startup, exit, cancellation, and
+terminal restoration. No Windows Terminal version, settings snapshot, observation date,
+or physical Shift+Enter/Alt+Enter/Ctrl+J result has been recorded, so this document does
+not claim that path as validated. Run the installed-wheel PTY smoke on a POSIX host and
+record the Windows Terminal real-terminal matrix before release.
+
+The accepted Terminal Conversation architecture is recorded in
+[ADR-0011](adr/0011-use-terminal-conversation-as-the-interactive-cli.md), and the
+Textual/enhanced-keyboard choice is recorded in
+[ADR-0012](adr/0012-use-textual-and-capability-gated-enhanced-keyboard-input.md).
 
 ## Delivery Evidence
 

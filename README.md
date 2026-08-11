@@ -27,7 +27,7 @@ attempt the POSIX adapter, but this release makes no formal support claim for th
 
 The first start creates `~/.myclaw/config.toml` and the base
 Agent Home, prints `config_missing`, and exits with status 2. Edit that file before
-starting the REPL. `myclaw config` prints the current file with API keys redacted,
+starting Terminal Conversation. `myclaw config` prints the current file with API keys redacted,
 including when the configuration is invalid.
 
 ## Configure
@@ -70,8 +70,8 @@ Agent Home permissions, and use a dedicated key with the minimum required access
 ## Run
 
 Start `myclaw` from the Workspace the agent should operate in. The current directory
-defines the Workspace boundary and the Session group. The REPL supports normal chat
-plus these built-in management commands:
+defines the Workspace boundary and the Session group. The full-screen Terminal Conversation
+supports normal chat plus these built-in management commands:
 
 - `/config`: show redacted configuration.
 - `/status`: show runtime, model, token, and Session status.
@@ -80,7 +80,7 @@ plus these built-in management commands:
 - `/dream`: process pending Conversation Summaries now.
 
 Use `exit` or `quit` to shut down. Ctrl+C cancels the active foreground Agent Run
-while the REPL remains available. Schedule Tool add/list/remove operations do not
+while Terminal Conversation remains available. Schedule Tool add/list/remove operations do not
 request confirmation; Scheduled Agent Runs refuse add while permitting list/remove.
 Workspace file operations are allowed subject to operating-system permissions. Paths
 outside the Workspace, and Exec/Web targets that fail their concrete safety checks,
@@ -119,7 +119,7 @@ the reserved `.myclaw` directory beneath that Workspace:
     <session_id>.log
 ```
 
-Valid REPL startup creates only the Workspace State root, `.gitignore`, `memory/`,
+Valid interactive startup creates only the Workspace State root, `.gitignore`, `memory/`,
 `sessions/`, and `memory/memory.md`; `logs/` and `schedule-sessions/` are created lazily
 by their owning Session operations. Schedule state, Summary, Summary Cursor, Session,
 and Artifact files remain on demand. Old non-global Agent Home data is ignored and is
@@ -154,6 +154,9 @@ per Session only, so total Workspace log usage is unbounded across Sessions.
   `default` route, then run `myclaw` again.
 - `config_parse_error` or `config_invalid`: run `myclaw config` for a redacted view,
   then correct TOML syntax, unknown fields, Provider details, or route values.
+- `interactive_terminal_required`: run the default command from an interactive terminal;
+  the full-screen Terminal Conversation does not fall back to a plain prompt for pipes
+  or redirected streams.
 - `route_unavailable`: ensure `models.routes.default` references a configured
   Provider and a model listed by that Provider.
 - Provider authentication, timeout, or connection failures: verify the dedicated
@@ -168,7 +171,7 @@ per Session only, so total Workspace log usage is unbounded across Sessions.
 
 ## Known Limits
 
-- Multiple REPL processes do not coordinate Session writes, Session Logs, or background
+- Multiple Terminal Conversation processes do not coordinate Session writes, Session Logs, or background
   schedules. In particular, same-Session concurrency is unsupported.
 - A failed background Session snapshot can lose the latest in-memory turn after an
   abnormal process exit; Session persistence has no ordinary acknowledgement or failure

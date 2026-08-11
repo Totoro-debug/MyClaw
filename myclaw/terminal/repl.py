@@ -1,13 +1,9 @@
-"""Injectable asynchronous command-line conversation loop."""
+"""Injectable headless Conversation seam for Runtime regression coverage."""
 
 import asyncio
 import json
-import sys
 from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
-
-from prompt_toolkit import PromptSession
-from rich.console import Console
 
 from myclaw.agent.events import (
     AgentEvent,
@@ -25,35 +21,6 @@ class ReplInput(Protocol):
     async def read(self) -> str | None: ...
 
 
-class PromptSessionBoundary(Protocol):
-    async def prompt_async(self, message: str, *, handle_sigint: bool) -> str: ...
-
-
-class ConsoleReplInput:
-    """Read terminal input asynchronously and treat noninteractive streams as EOF."""
-
-    def __init__(
-        self,
-        console: Console,
-        *,
-        prompt_session: PromptSessionBoundary | None = None,
-    ) -> None:
-        self._console = console
-        self._prompt_session = prompt_session
-
-    async def read(self) -> str | None:
-        if not self._console.is_terminal or not sys.stdin.isatty():
-            return None
-        prompt_session = self._prompt_session
-        if prompt_session is None:
-            prompt_session = PromptSession()
-            self._prompt_session = prompt_session
-        try:
-            return await prompt_session.prompt_async("You: ", handle_sigint=False)
-        except EOFError:
-            return None
-
-
 class ProgressiveWriter(Protocol):
     async def write_delta(self, delta: str) -> None: ...
 
@@ -65,28 +32,6 @@ class ProgressiveWriter(Protocol):
 @runtime_checkable
 class _ClosableEventStream(Protocol):
     async def aclose(self) -> None: ...
-
-
-class ConsoleProgressiveWriter:
-    """Render streamed text and complete lines through a Rich Console."""
-
-    def __init__(self, console: Console) -> None:
-        self._console = console
-
-    async def write_delta(self, delta: str) -> None:
-        self._console.print(delta, end="", markup=False, highlight=False, soft_wrap=True)
-
-    async def finish_turn(self) -> None:
-        self._console.print()
-
-    async def write_line(self, content: str) -> None:
-        self._console.print(
-            content,
-            end="" if content.endswith("\n") else "\n",
-            markup=False,
-            highlight=False,
-            soft_wrap=True,
-        )
 
 
 class ManagementDispatchResult(Protocol):
