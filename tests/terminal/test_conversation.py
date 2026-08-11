@@ -26,6 +26,8 @@ from myclaw.agent.events import (
     AgentEvent,
     ConversationPort,
     TextDeltaPayload,
+    ToolCompletedPayload,
+    ToolStartedPayload,
     TurnCancelledPayload,
     TurnCompletedPayload,
     TurnFailedPayload,
@@ -52,6 +54,8 @@ from tests.agent.test_fixed_catalog_runtime import (
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 TURN_ID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
+OTHER_TURN_ID = UUID("b3fbe13b-3d1f-4ee6-98e5-dc40a2c4be1c")
+type ToolActivityStatus = Literal["success", "error", "refused"]
 
 
 class ScriptedConversation:
@@ -161,6 +165,90 @@ class ScriptedConversation:
                     error=ErrorInfo(code="model_failed", message=self._failure_message)
                 ),
             )
+
+
+class ToolActivityConversation:
+    def __init__(
+        self,
+        *,
+        status: ToolActivityStatus,
+        start_summary: str = "Running read_file",
+        final_summary: str,
+    ) -> None:
+        self.submissions: list[str] = []
+        self.tool_started = asyncio.Event()
+        self.complete_tool = asyncio.Event()
+        self._status = status
+        self._start_summary = start_summary
+        self._final_summary = final_summary
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        self.submissions.append(text)
+        yield AgentEvent(
+            type="turn_started",
+            event_id=0,
+            turn_id=TURN_ID,
+            created_at=NOW,
+            payload=TurnStartedPayload(),
+        )
+        yield AgentEvent(
+            type="tool_started",
+            event_id=1,
+            turn_id=TURN_ID,
+            created_at=NOW,
+            payload=ToolStartedPayload(
+                tool_call_id="call-read-file",
+                tool_name="read_file",
+                summary=self._start_summary,
+            ),
+        )
+        self.tool_started.set()
+        await self.complete_tool.wait()
+        yield AgentEvent(
+            type="tool_completed",
+            event_id=2,
+            turn_id=TURN_ID,
+            created_at=NOW,
+            payload=ToolCompletedPayload(
+                tool_call_id="call-read-file",
+                tool_name="read_file",
+                status=self._status,
+                summary=self._final_summary,
+            ),
+        )
+        yield AgentEvent(
+            type="turn_completed",
+            event_id=3,
+            turn_id=TURN_ID,
+            created_at=NOW,
+            payload=TurnCompletedPayload(
+                content="Tool completed.",
+                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            ),
+        )
+
+
+class ToolEventSequenceConversation:
+    def __init__(
+        self,
+        *sequences: tuple[AgentEvent, ...],
+        pause_after: tuple[int, int] | None = None,
+    ) -> None:
+        self.submissions: list[str] = []
+        self._sequences = sequences
+        self._pause_after = pause_after
+        self.paused = asyncio.Event()
+        self.continue_events = asyncio.Event()
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        self.submissions.append(text)
+        submission_index = len(self.submissions) - 1
+        sequence = self._sequences[submission_index]
+        for event_index, event in enumerate(sequence):
+            yield event
+            if self._pause_after == (submission_index, event_index):
+                self.paused.set()
+                await self.continue_events.wait()
 
 
 class CancellableConversation:
@@ -351,6 +439,68 @@ class CloseOrderingRuntime(FakeRuntime):
 
 def _runtime(conversation: object) -> FakeRuntime:
     return FakeRuntime(conversation)
+
+
+def _turn_started_event(turn_id: UUID, event_id: int = 0) -> AgentEvent:
+    return AgentEvent(
+        type="turn_started",
+        event_id=event_id,
+        turn_id=turn_id,
+        created_at=NOW,
+        payload=TurnStartedPayload(),
+    )
+
+
+def _tool_started_event(
+    turn_id: UUID,
+    event_id: int,
+    tool_call_id: str,
+    tool_name: str,
+    summary: str,
+) -> AgentEvent:
+    return AgentEvent(
+        type="tool_started",
+        event_id=event_id,
+        turn_id=turn_id,
+        created_at=NOW,
+        payload=ToolStartedPayload(tool_call_id, tool_name, summary),
+    )
+
+
+def _tool_completed_event(
+    turn_id: UUID,
+    event_id: int,
+    tool_call_id: str,
+    tool_name: str,
+    status: ToolActivityStatus,
+    summary: str,
+) -> AgentEvent:
+    return AgentEvent(
+        type="tool_completed",
+        event_id=event_id,
+        turn_id=turn_id,
+        created_at=NOW,
+        payload=ToolCompletedPayload(tool_call_id, tool_name, status, summary),
+    )
+
+
+def _turn_completed_event(turn_id: UUID, event_id: int) -> AgentEvent:
+    return AgentEvent(
+        type="turn_completed",
+        event_id=event_id,
+        turn_id=turn_id,
+        created_at=NOW,
+        payload=TurnCompletedPayload(
+            content="",
+            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+        ),
+    )
+
+
+def _tool_row_texts(app: TerminalConversationApp) -> list[str]:
+    rows = app.query(".tool-row")
+    assert all(isinstance(row, Static) for row in rows)
+    return [str(cast(Static, row).content) for row in rows]
 
 
 def _visible_screen_text(app: TerminalConversationApp) -> str:
@@ -839,6 +989,260 @@ async def test_text_deltas_update_one_assistant_markdown_and_completion_wins() -
         assert "First answer." not in completed_text
 
     assert runtime.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_activity_replaces_one_running_row_with_its_final_summary() -> None:
+    conversation = ToolActivityConversation(
+        status="success",
+        start_summary='Running read_file {"arguments":{"path":"C:/private.txt"}}',
+        final_summary='Finished read_file {"result":"complete file contents"}',
+    )
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.tool_started.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+
+        running_text = _visible_screen_text(app)
+        assert "Running: read_file" in running_text
+        assert "call-read-file" not in running_text
+        assert "private.txt" not in running_text
+        row = app.query_one(".tool-row", Static)
+        assert row.outer_size.width == app.query_one(".message-row").outer_size.width
+        assert row.parent is app.query_one("#conversation-display")
+        assert not row.has_class("message")
+        assert not row.can_focus
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+        running_row_content = str(row.content)
+        await pilot.click(".tool-row")
+        assert not row.has_focus
+        assert str(row.content) == running_row_content
+
+        conversation.complete_tool.set()
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+        await asyncio.sleep(0.05)
+
+        final_text = _visible_screen_text(app)
+        assert "Running: read_file" not in final_text
+        assert final_text.count("Completed: read_file") == 1
+        assert "complete file contents" not in final_text
+        assert "Tool completed." in final_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "summary", "expected"),
+    [
+        ("refused", "Finished read_file", "Rejected: read_file"),
+        (
+            "error",
+            "Finished read_file",
+            "Failed: read_file - The operation did not complete.",
+        ),
+        (
+            "error",
+            "Permission denied for the selected file.",
+            "Failed: read_file - Permission denied for the selected file.",
+        ),
+    ],
+)
+async def test_tool_activity_final_statuses_explain_refusal_and_failure(
+    status: ToolActivityStatus,
+    summary: str,
+    expected: str,
+) -> None:
+    conversation = ToolActivityConversation(status=status, final_summary=summary)
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.tool_started.wait(), timeout=1)
+        conversation.complete_tool.set()
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+        visible_text = _visible_screen_text(app)
+        assert visible_text.count(expected) == 1
+        assert "call-read-file" not in visible_text
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_hides_structured_or_sensitive_detail_and_limits_safe_reason() -> None:
+    unsafe = ToolActivityConversation(
+        status="error",
+        final_summary="Authorization Bearer sk-secret with complete output",
+    )
+    unsafe_app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(unsafe)))
+
+    async with unsafe_app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(unsafe.tool_started.wait(), timeout=1)
+        unsafe.complete_tool.set()
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(unsafe_app)
+
+        text = " ".join(_tool_row_texts(unsafe_app))
+        assert text == "Failed: read_file - The operation did not complete."
+        assert "sk-secret" not in text
+        assert "complete output" not in text
+
+    long_reason = "x" * 240
+    lengthy = ToolActivityConversation(status="error", final_summary=long_reason)
+    lengthy_app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(lengthy)))
+    async with lengthy_app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(lengthy.tool_started.wait(), timeout=1)
+        lengthy.complete_tool.set()
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(lengthy_app)
+
+        reason = _tool_row_texts(lengthy_app)[0].removeprefix("Failed: read_file - ")
+        assert len(reason) == 120
+        assert reason.endswith("...")
+
+
+@pytest.mark.asyncio
+async def test_tool_rows_isolate_calls_and_turns_with_monotonic_final_status() -> None:
+    first_turn = (
+        _turn_started_event(TURN_ID),
+        _tool_completed_event(TURN_ID, 1, "completion-first", "glob", "success", "Finished glob"),
+        _tool_started_event(TURN_ID, 2, "completion-first", "glob", "Running glob"),
+        _tool_started_event(TURN_ID, 3, "shared-call", "read_file", "Running read_file"),
+        _tool_started_event(TURN_ID, 4, "missing-completion", "write_file", "Running write_file"),
+        _tool_started_event(TURN_ID, 5, "shared-call", "read_file", "Running read_file"),
+        _tool_completed_event(
+            TURN_ID,
+            6,
+            "shared-call",
+            "read_file",
+            "success",
+            "Finished read_file",
+        ),
+        _tool_completed_event(
+            TURN_ID,
+            7,
+            "shared-call",
+            "read_file",
+            "error",
+            "Permission denied",
+        ),
+        _tool_started_event(TURN_ID, 8, "shared-call", "read_file", "Running read_file"),
+        _turn_completed_event(TURN_ID, 9),
+    )
+    second_turn = (
+        _turn_started_event(OTHER_TURN_ID),
+        _tool_started_event(OTHER_TURN_ID, 1, "shared-call", "read_file", "Running read_file"),
+        _tool_completed_event(
+            OTHER_TURN_ID,
+            2,
+            "shared-call",
+            "read_file",
+            "refused",
+            "Finished read_file",
+        ),
+        _turn_completed_event(OTHER_TURN_ID, 3),
+    )
+    conversation = ToolEventSequenceConversation(first_turn, second_turn)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("first"), "enter")
+        await _wait_for_turn(app)
+        assert _tool_row_texts(app) == [
+            "Completed: glob",
+            "Completed: read_file",
+            "Failed: write_file - Tool completion was not reported.",
+        ]
+
+        await pilot.press(*list("second"), "enter")
+        await _wait_for_turn(app)
+        assert _tool_row_texts(app) == [
+            "Completed: glob",
+            "Completed: read_file",
+            "Failed: write_file - Tool completion was not reported.",
+            "Rejected: read_file",
+        ]
+        assert "completion-first" not in _visible_screen_text(app)
+        assert "shared-call" not in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_tool_row_updates_preserve_historical_follow_and_resize_state() -> None:
+    first_events: list[AgentEvent] = [_turn_started_event(TURN_ID)]
+    event_id = 1
+    for index in range(24):
+        tool_name = f"tool_{index:02d}"
+        tool_call_id = f"call-{index:02d}"
+        first_events.append(
+            _tool_started_event(TURN_ID, event_id, tool_call_id, tool_name, f"Running {tool_name}")
+        )
+        event_id += 1
+        first_events.append(
+            _tool_completed_event(
+                TURN_ID,
+                event_id,
+                tool_call_id,
+                tool_name,
+                "success",
+                f"Finished {tool_name}",
+            )
+        )
+        event_id += 1
+    first_events.append(_turn_completed_event(TURN_ID, event_id))
+    second_events = (
+        _turn_started_event(OTHER_TURN_ID),
+        _tool_started_event(OTHER_TURN_ID, 1, "later-call", "web_search", "Running web_search"),
+        _tool_completed_event(
+            OTHER_TURN_ID,
+            2,
+            "later-call",
+            "web_search",
+            "success",
+            "Finished web_search",
+        ),
+        _turn_completed_event(OTHER_TURN_ID, 3),
+    )
+    conversation = ToolEventSequenceConversation(
+        tuple(first_events),
+        second_events,
+        pause_after=(1, 1),
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.press(*list("seed"), "enter")
+        await _wait_for_turn(app)
+        display = app.query_one("#conversation-display")
+        assert display.is_vertical_scroll_end
+
+        await pilot.press("pageup", "pageup")
+        assert not display.is_vertical_scroll_end
+        submission = asyncio.create_task(pilot.press(*list("later"), "enter"))
+        try:
+            await asyncio.wait_for(conversation.paused.wait(), timeout=1)
+            await pilot.pause()
+            historical_scroll_y = display.scroll_y
+            assert app.query_one("#new-content").display
+            conversation.continue_events.set()
+            await asyncio.wait_for(submission, timeout=1)
+            await _wait_for_turn(app)
+        finally:
+            conversation.continue_events.set()
+
+        assert not display.is_vertical_scroll_end
+        assert display.scroll_y == historical_scroll_y
+        assert app.query_one("#new-content").display
+
+        await pilot.resize_terminal(40, 20)
+        await pilot.pause()
+        assert not display.is_vertical_scroll_end
+        message_width = app.query_one(".message-row").outer_size.width
+        assert all(row.outer_size.width == message_width for row in app.query(".tool-row"))
 
 
 @pytest.mark.asyncio

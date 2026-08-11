@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from asyncio import CancelledError, current_task
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
+from uuid import UUID
 
 from markdown_it import MarkdownIt
 from markdown_it.rules_core.state_core import StateCore
@@ -27,6 +29,8 @@ from textual.worker import Worker, WorkerError
 from myclaw.agent.events import (
     AgentEvent,
     TextDeltaPayload,
+    ToolCompletedPayload,
+    ToolStartedPayload,
     TurnCancelledPayload,
     TurnCompletedPayload,
     TurnFailedPayload,
@@ -38,7 +42,31 @@ __all__ = ["TerminalConversationApp", "run_terminal_conversation"]
 
 _COMPACT_MESSAGE_MAX_WIDTH = 60
 _CONVERSATION_NAVIGATION_KEYS = frozenset({"pageup", "pagedown", "ctrl+home", "ctrl+end"})
+_FAILURE_REASON_MAX_CHARS = 120
+_TOOL_NAME_MAX_CHARS = 80
+_GENERIC_TOOL_FAILURE_REASON = "The operation did not complete."
+_UNSAFE_TOOL_DETAIL_PATTERN = re.compile(
+    r"(?:^\s*[\[{])|(?:[\"'][^\"']+[\"']\s*:)|"
+    r"(?:\b(?:api[_-]?key|authorization|bearer|password|secret|token)\b)|"
+    r"(?:\b(?:arguments?|parameters?|result|output|content)\b\s*[:=])|"
+    r"(?:\bcall[-_][A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
 type _ControlAction = Literal["cancel_active_turn", "clear_draft", "exit"]
+type _ToolRowStatus = Literal["running", "success", "error", "refused"]
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolRowKey:
+    turn_id: UUID
+    tool_call_id: str
+
+
+@dataclass(slots=True)
+class _ToolRowState:
+    widget: Static
+    tool_name: str
+    status: _ToolRowStatus
 
 
 class _ConversationInput(TextArea):
@@ -404,6 +432,16 @@ class TerminalConversationApp(App[None]):
         height: auto;
     }
 
+    .tool-row {
+        width: 100%;
+        min-width: 0;
+        height: auto;
+        margin: 0 0 1 0;
+        padding: 0 1;
+        color: $text-muted;
+        background: transparent;
+    }
+
     .user-row {
         align: right top;
     }
@@ -450,6 +488,8 @@ class TerminalConversationApp(App[None]):
         self._runtime_started = False
         self._turn_worker: Worker[None] | None = None
         self._cancel_requested_turn: object | None = None
+        self._tool_rows: dict[_ToolRowKey, _ToolRowState] = {}
+        self._closed_tool_turns: set[UUID] = set()
         self._closing = False
 
     def _build_driver(
@@ -591,6 +631,7 @@ class TerminalConversationApp(App[None]):
         assistant: Markdown | None = None
         stream: _MarkdownStream | None = None
         streamed_fragments: list[str] = []
+        observed_tool_turns: set[UUID] = set()
         terminal_content: str | None = None
         terminal_status: str | None = None
         cancelled = False
@@ -607,15 +648,32 @@ class TerminalConversationApp(App[None]):
                     assert stream is not None
                     await stream.write(payload.delta)
                     self._scroll_to_latest()
+                elif event.type == "tool_started":
+                    payload = event.payload
+                    if not isinstance(payload, ToolStartedPayload):
+                        raise TypeError("tool_started event has an invalid payload")
+                    observed_tool_turns.add(event.turn_id)
+                    await self._show_tool_started(event.turn_id, payload)
+                elif event.type == "tool_completed":
+                    payload = event.payload
+                    if not isinstance(payload, ToolCompletedPayload):
+                        raise TypeError("tool_completed event has an invalid payload")
+                    observed_tool_turns.add(event.turn_id)
+                    await self._show_tool_completed(event.turn_id, payload)
                 elif event.type == "turn_completed":
                     payload = event.payload
                     if not isinstance(payload, TurnCompletedPayload):
                         raise TypeError("turn_completed event has an invalid payload")
+                    await self._finish_tool_turn(
+                        event.turn_id,
+                        "Tool completion was not reported.",
+                    )
                     terminal_content = payload.content
                 elif event.type == "turn_cancelled":
                     payload = event.payload
                     if not isinstance(payload, TurnCancelledPayload):
                         raise TypeError("turn_cancelled event has an invalid payload")
+                    await self._finish_tool_turn(event.turn_id, "The Tool call was interrupted.")
                     if payload.partial_content:
                         terminal_content = payload.partial_content
                     terminal_status = "Turn cancelled."
@@ -623,12 +681,22 @@ class TerminalConversationApp(App[None]):
                     payload = event.payload
                     if not isinstance(payload, TurnFailedPayload):
                         raise TypeError("turn_failed event has an invalid payload")
+                    await self._finish_tool_turn(
+                        event.turn_id,
+                        "The Tool call ended with the turn failure.",
+                    )
                     terminal_status = payload.error.message
         except CancelledError:
             cancelled = True
             raise
         finally:
             try:
+                if not cancelled:
+                    for turn_id in observed_tool_turns - self._closed_tool_turns:
+                        await self._finish_tool_turn(
+                            turn_id,
+                            "Tool completion was not reported.",
+                        )
                 if stream is not None:
                     try:
                         await stream.stop()
@@ -669,6 +737,65 @@ class TerminalConversationApp(App[None]):
         await row.mount(assistant)
         return assistant
 
+    async def _show_tool_started(self, turn_id: UUID, payload: ToolStartedPayload) -> None:
+        key = _ToolRowKey(turn_id, payload.tool_call_id)
+        if turn_id in self._closed_tool_turns or key in self._tool_rows:
+            return
+        await self._mount_tool_row(
+            key,
+            tool_name=payload.tool_name,
+            status="running",
+            summary=payload.summary,
+        )
+
+    async def _show_tool_completed(self, turn_id: UUID, payload: ToolCompletedPayload) -> None:
+        if turn_id in self._closed_tool_turns:
+            return
+        key = _ToolRowKey(turn_id, payload.tool_call_id)
+        state = self._tool_rows.get(key)
+        if state is None:
+            await self._mount_tool_row(
+                key,
+                tool_name=payload.tool_name,
+                status=payload.status,
+                summary=payload.summary,
+            )
+            return
+        if state.status != "running":
+            return
+        state.status = payload.status
+        state.widget.update(_tool_row_content(payload.status, state.tool_name, payload.summary))
+        self._scroll_to_latest()
+
+    async def _mount_tool_row(
+        self,
+        key: _ToolRowKey,
+        *,
+        tool_name: str,
+        status: _ToolRowStatus,
+        summary: str,
+    ) -> None:
+        row = Static(
+            _tool_row_content(status, tool_name, summary),
+            markup=False,
+            classes="tool-row",
+        )
+        self._tool_rows[key] = _ToolRowState(row, tool_name, status)
+        await self.query_one("#conversation-display", _ConversationDisplay).mount(row)
+        self._scroll_to_latest()
+
+    async def _finish_tool_turn(self, turn_id: UUID, failure_reason: str) -> None:
+        self._closed_tool_turns.add(turn_id)
+        changed = False
+        for key, state in self._tool_rows.items():
+            if key.turn_id != turn_id or state.status != "running":
+                continue
+            state.status = "error"
+            state.widget.update(_tool_row_content("error", state.tool_name, failure_reason))
+            changed = True
+        if changed:
+            self._scroll_to_latest()
+
     def _scroll_to_latest(self) -> None:
         display = self.query_one("#conversation-display", _ConversationDisplay)
         display.content_changed()
@@ -687,6 +814,42 @@ class TerminalConversationApp(App[None]):
         compact = display.size.width <= _COMPACT_MESSAGE_MAX_WIDTH
         suffix = " message-compact" if compact else ""
         return f"message {role}{suffix}"
+
+
+def _tool_row_content(status: _ToolRowStatus, tool_name: str, summary: str) -> str:
+    display_name = _concise_tool_name(tool_name)
+    if status == "running":
+        return f"Running: {display_name}"
+    if status == "success":
+        return f"Completed: {display_name}"
+    if status == "refused":
+        return f"Rejected: {display_name}"
+    return f"Failed: {display_name} - {_safe_failure_reason(summary, display_name)}"
+
+
+def _concise_tool_name(tool_name: str) -> str:
+    display_name = " ".join(tool_name.split()) or "Tool"
+    if len(display_name) <= _TOOL_NAME_MAX_CHARS:
+        return display_name
+    return f"{display_name[: _TOOL_NAME_MAX_CHARS - 3].rstrip()}..."
+
+
+def _safe_failure_reason(summary: str, tool_name: str) -> str:
+    detail = " ".join(summary.split())
+    if not detail or _UNSAFE_TOOL_DETAIL_PATTERN.search(detail):
+        return _GENERIC_TOOL_FAILURE_REASON
+
+    for prefix in ("Failed", "Error", "Finished", "Completed"):
+        if detail.casefold().startswith(prefix.casefold()):
+            detail = detail[len(prefix) :].lstrip(" :-")
+            break
+    if detail.casefold().startswith(tool_name.casefold()):
+        detail = detail[len(tool_name) :].lstrip(" :-")
+    if not detail:
+        return _GENERIC_TOOL_FAILURE_REASON
+    if len(detail) <= _FAILURE_REASON_MAX_CHARS:
+        return detail
+    return f"{detail[: _FAILURE_REASON_MAX_CHARS - 3].rstrip()}..."
 
 
 def run_terminal_conversation(runtime: PreparedReplRuntime) -> None:
