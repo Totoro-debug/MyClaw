@@ -126,14 +126,7 @@ class PreparedReplRuntime:
 
     async def start(self) -> None:
         self._lifetime.begin()
-        try:
-            self._start_schedulers()
-        except BaseException as primary_error:
-            try:
-                await self.close()
-            except BaseException as cleanup_error:
-                raise primary_error from cleanup_error
-            raise
+        self._start_schedulers()
 
     def _start_schedulers(self) -> None:
         with without_session_log():

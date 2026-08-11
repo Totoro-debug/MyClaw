@@ -2759,7 +2759,7 @@ async def test_resize_back_from_undersized_terminal_restores_bottom_follow() -> 
 
 
 @pytest.mark.asyncio
-async def test_runtime_start_failure_restores_terminal_before_runtime_cleanup() -> None:
+async def test_runtime_start_failure_restores_terminal_before_owner_cleanup() -> None:
     terminal_state = {"restored": False}
 
     class RecordingDriver(KeyboardLifecycleDriver):
@@ -2789,6 +2789,7 @@ async def test_runtime_start_failure_restores_terminal_before_runtime_cleanup() 
             pass
 
     assert runtime.close_saw_terminal_restored
+    assert runtime.close_calls == 1
 
 
 @pytest.mark.asyncio

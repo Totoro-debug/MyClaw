@@ -7,7 +7,7 @@ import re
 import sys
 from collections.abc import Callable, Mapping
 from enum import StrEnum
-from typing import Final, Literal, Protocol, cast
+from typing import Final, Protocol, cast
 
 __all__ = ["EnhancedKeyboardAction", "EnhancedKeyboardAdapter"]
 
@@ -128,11 +128,6 @@ class EnhancedKeyboardAdapter:
         return cls._action_for_modifiers(modifiers)
 
     @classmethod
-    def action_for_key(cls, key: str) -> EnhancedKeyboardAction | None:
-        """Map an Enter-family key report to its composition action."""
-        return cls.parse(key)
-
-    @classmethod
     def install_on_driver(
         cls,
         driver: object,
@@ -224,12 +219,3 @@ class EnhancedKeyboardAdapter:
         finally:
             self._enabled = False
         return True
-
-    def __enter__(self) -> EnhancedKeyboardAdapter:
-        self.enable()
-        return self
-
-    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> Literal[False]:
-        del exc_type, exc_value, traceback
-        self.restore()
-        return False

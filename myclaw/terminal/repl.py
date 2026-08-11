@@ -3,7 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from myclaw.agent.events import (
     AgentEvent,
@@ -15,6 +15,10 @@ from myclaw.agent.events import (
     TurnFailedPayload,
 )
 from myclaw.management.service import SessionListingEntry
+from myclaw.terminal._turn_stream import (
+    clear_current_task_cancellation,
+    close_event_stream,
+)
 
 
 class ReplInput(Protocol):
@@ -27,11 +31,6 @@ class ProgressiveWriter(Protocol):
     async def finish_turn(self) -> None: ...
 
     async def write_line(self, content: str) -> None: ...
-
-
-@runtime_checkable
-class _ClosableEventStream(Protocol):
-    async def aclose(self) -> None: ...
 
 
 class ManagementDispatchResult(Protocol):
@@ -96,7 +95,7 @@ async def run_repl(
             except asyncio.CancelledError:
                 if shutdown_requested is not None and shutdown_requested.is_set():
                     raise
-                _clear_current_task_cancellation()
+                clear_current_task_cancellation()
                 await conversation.cancel_active_turn()
                 await _render_turn(
                     events,
@@ -106,27 +105,14 @@ async def run_repl(
                 )
         except BaseException as primary_error:
             try:
-                await _close_event_stream(events)
+                await close_event_stream(events)
             except BaseException as cleanup_error:
                 raise primary_error from cleanup_error
             raise
         else:
-            await _close_event_stream(events)
+            await close_event_stream(events)
             if shutdown_requested is None or not shutdown_requested.is_set():
-                _clear_current_task_cancellation()
-
-
-async def _close_event_stream(events: AsyncIterator[AgentEvent]) -> None:
-    if isinstance(events, _ClosableEventStream):
-        await events.aclose()
-
-
-def _clear_current_task_cancellation() -> None:
-    task = asyncio.current_task()
-    if task is None:
-        return
-    while task.cancelling():
-        task.uncancel()
+                clear_current_task_cancellation()
 
 
 async def _choose_resume_session(

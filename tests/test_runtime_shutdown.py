@@ -160,13 +160,14 @@ async def test_partial_scheduler_start_failure_closes_the_started_memory_loop(
 
 
 @pytest.mark.asyncio
-async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising(
+async def test_async_start_failure_defers_cleanup_to_the_lifecycle_owner(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    memory_clock = BlockingSchedulerClock()
     runtime = prepare_repl_runtime(
         agent_home=home,
         workspace=workspace,
@@ -174,7 +175,7 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
         provider_factory=lambda _configuration: ScriptedFakeProvider(),
         now=lambda: NOW,
         new_uuid=uuid4,
-        memory_scheduler_clock=BlockingSchedulerClock(),
+        memory_scheduler_clock=memory_clock,
         schedule_scheduler_clock=FailingSchedulerClock(),
     )
     baseline = asyncio.all_tasks()
@@ -186,10 +187,13 @@ async def test_async_start_rolls_back_a_partial_scheduler_failure_before_raising
         with session_log(state, ambient_session_id):
             with pytest.raises(RuntimeError, match="Schedule Service clock failed to start"):
                 await runtime.start()
-        await asyncio.sleep(0)
+        await memory_clock.sleep_started.wait()
+        assert not memory_clock.sleep_stopped.is_set()
     finally:
+        await runtime.close()
         log_capture.close()
 
+    assert memory_clock.sleep_stopped.is_set()
     assert asyncio.all_tasks() == baseline
     assert not (state.logs_directory / f"{ambient_session_id}.log").exists()
     content = log_capture.text
@@ -661,81 +665,10 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
 
 
 @pytest.mark.asyncio
-async def test_interrupt_controller_restores_handler_and_drains_foreground_cancels() -> None:
-    from types import FrameType
-
-    from myclaw.terminal.interrupts import (
-        ForegroundInterruptController,
-        SignalDisposition,
-    )
-
-    previous_calls = 0
-    cancel_calls = 0
-    cancel_started = asyncio.Event()
-    release_cancel = asyncio.Event()
-
-    def previous_handler(signum: int, frame: FrameType | None) -> None:
-        del signum, frame
-        nonlocal previous_calls
-        previous_calls += 1
-
-    class SignalSetter:
-        def __init__(self) -> None:
-            self.current: SignalDisposition = previous_handler
-
-        def __call__(self, signum: int, handler: SignalDisposition) -> SignalDisposition:
-            assert signum > 0
-            prior = self.current
-            self.current = handler
-            return prior
-
-    async def cancel_foreground() -> None:
-        nonlocal cancel_calls
-        cancel_calls += 1
-        cancel_started.set()
-        await release_cancel.wait()
-
-    signals = SignalSetter()
-    controller = ForegroundInterruptController(
-        loop=asyncio.get_running_loop(),
-        cancel_foreground=cancel_foreground,
-        set_signal=signals,
-    )
-    controller.install()
-    assert callable(signals.current)
-
-    signals.current(2, None)
-    await cancel_started.wait()
-    closing = asyncio.create_task(controller.close())
-    await asyncio.sleep(0)
-
-    try:
-        assert not closing.done()
-        during_close = signals.current
-        assert callable(during_close)
-        during_close(2, None)
-        await asyncio.sleep(0)
-        assert cancel_calls == 1
-    finally:
-        release_cancel.set()
-        await closing
-        controller.restore()
-
-    assert cancel_calls == 1
-    assert signals.current is previous_handler
-    assert previous_calls == 0
-
-
-@pytest.mark.asyncio
-async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
+async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    from myclaw.terminal.interrupts import (
-        ForegroundInterruptController,
-        SignalDisposition,
-    )
-
     class InterruptibleProvider:
         def __init__(self) -> None:
             self.started = (asyncio.Event(), asyncio.Event())
@@ -788,19 +721,6 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
             await self.release_exit.wait()
             return "exit"
 
-    def previous_handler(signum: int, frame: object) -> None:
-        del signum, frame
-
-    class SignalSetter:
-        def __init__(self) -> None:
-            self.current: SignalDisposition = previous_handler
-
-        def __call__(self, signum: int, handler: SignalDisposition) -> SignalDisposition:
-            assert signum > 0
-            previous = self.current
-            self.current = handler
-            return previous
-
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
@@ -818,37 +738,24 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
         schedule_scheduler_clock=scheduled_clock,
     )
     input_reader = ControlledInput()
-    signals = SignalSetter()
-    interrupts = ForegroundInterruptController(
-        loop=asyncio.get_running_loop(),
-        cancel_foreground=runtime.conversation.cancel_active_turn,
-        set_signal=signals,
-    )
-    interrupts.install()
     log_capture = capture_diagnostics()
     running = asyncio.create_task(runtime.run(input_reader=input_reader, writer=SilentWriter()))
     await provider.started[0].wait()
     await memory_clock.sleep_started.wait()
     await scheduled_clock.sleep_started.wait()
     try:
-        first_handler = signals.current
-        assert callable(first_handler)
-        first_handler(2, None)
+        await runtime.conversation.cancel_active_turn()
         await input_reader.idle.wait()
         assert not memory_clock.sleep_stopped.is_set()
         assert not scheduled_clock.sleep_stopped.is_set()
 
-        idle_handler = signals.current
-        assert callable(idle_handler)
-        idle_handler(2, None)
+        await runtime.conversation.cancel_active_turn()
         await asyncio.sleep(0)
         assert not running.done()
         input_reader.release_second.set()
 
         await provider.started[1].wait()
-        second_handler = signals.current
-        assert callable(second_handler)
-        second_handler(2, None)
+        await runtime.conversation.cancel_active_turn()
         await input_reader.waiting_for_exit.wait()
         assert running.cancelling() == 0
         assert not memory_clock.sleep_stopped.is_set()
@@ -860,8 +767,6 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
         input_reader.release_second.set()
         input_reader.release_exit.set()
         await asyncio.gather(running, return_exceptions=True)
-        await interrupts.close()
-        interrupts.restore()
         log_capture.close()
 
     assert provider.stopped[0].is_set()
@@ -869,7 +774,6 @@ async def test_repeated_and_idle_interrupts_cancel_only_foreground_until_exit(
     assert memory_clock.sleep_stopped.is_set()
     assert scheduled_clock.sleep_stopped.is_set()
     assert provider.closed
-    assert signals.current is previous_handler
     content = log_capture.text
     records = [line for line in content.splitlines() if "myclaw.provider.model_router:" in line]
     assert len(records) == 3

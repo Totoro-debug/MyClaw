@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import re
 import sys
-from asyncio import CancelledError, Event, Task, create_task, current_task, sleep
+from asyncio import CancelledError, Event, Task, create_task, sleep
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
-from typing import ClassVar, Final, Literal, Protocol, cast, runtime_checkable
+from typing import ClassVar, Final, Literal, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -46,6 +46,10 @@ from myclaw.agent.events import (
 from myclaw.agent.runtime import PreparedReplRuntime
 from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS, ManagementCommandResult
 from myclaw.management.service import SessionListingEntry
+from myclaw.terminal._turn_stream import (
+    clear_current_task_cancellation,
+    close_event_stream,
+)
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
 
 __all__ = [
@@ -231,7 +235,7 @@ class _ConversationInput(TextArea):
             event.stop()
             event.prevent_default()
             return
-        action = EnhancedKeyboardAdapter.action_for_key(event.key)
+        action = EnhancedKeyboardAdapter.parse(event.key)
         if self._history_index is not None and (
             event.is_printable
             or event.key in {"backspace", "delete", "ctrl+backspace", "ctrl+delete"}
@@ -365,11 +369,6 @@ class _SessionPickerScreen(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
-
-
-@runtime_checkable
-class _ClosableEventStream(Protocol):
-    async def aclose(self) -> None: ...
 
 
 class _MarkdownStream(Protocol):
@@ -1050,7 +1049,6 @@ class TerminalConversationApp(App[None]):
     def __init__(self, runtime: PreparedReplRuntime) -> None:
         super().__init__()
         self._runtime = runtime
-        self._keyboard_adapter = EnhancedKeyboardAdapter()
         self._runtime_started = False
         self._size_insufficient = False
         self._driver_mode_started = False
@@ -1087,7 +1085,7 @@ class TerminalConversationApp(App[None]):
 
         # Textual has no public hook around its Kitty push/pop writes. Keep this
         # compatibility boundary narrow and exercise it through App.run_async tests.
-        self._keyboard_adapter = EnhancedKeyboardAdapter.install_on_driver(driver)
+        EnhancedKeyboardAdapter.install_on_driver(driver)
         self._install_driver_lifecycle(driver)
         return driver
 
@@ -1474,7 +1472,7 @@ class TerminalConversationApp(App[None]):
         except CancelledError:
             if self._closing:
                 raise
-            _clear_current_task_cancellation()
+            clear_current_task_cancellation()
             await self._mount_status("Turn cancelled.")
         except Exception as error:
             self._handle_exception(error)
@@ -1608,12 +1606,11 @@ class TerminalConversationApp(App[None]):
                 await self._mount_status(terminal_status)
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
-        if isinstance(events, _ClosableEventStream):
-            try:
-                await events.aclose()
-            except BaseException as cleanup_error:
-                if not cancelled:
-                    cleanup_errors.append(cleanup_error)
+        try:
+            await close_event_stream(events)
+        except BaseException as cleanup_error:
+            if not cancelled:
+                cleanup_errors.append(cleanup_error)
 
         if primary_error is not None:
             if cleanup_errors:
@@ -2171,11 +2168,3 @@ def run_terminal_conversation(runtime: PreparedReplRuntime) -> None:
             "Terminal Conversation requires interactive stdin, stdout, and stderr TTYs."
         )
     TerminalConversationApp(runtime).run()
-
-
-def _clear_current_task_cancellation() -> None:
-    task = current_task()
-    if task is None:
-        return
-    while task.cancelling():
-        task.uncancel()

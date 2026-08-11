@@ -58,10 +58,10 @@ def test_ordinary_carriage_return_is_not_treated_as_shift_enter() -> None:
 def test_key_events_map_only_distinct_enter_chords_to_newline() -> None:
     adapter = EnhancedKeyboardAdapter()
 
-    assert adapter.action_for_key("shift+enter") is EnhancedKeyboardAction.NEWLINE
-    assert adapter.action_for_key("alt+enter") is EnhancedKeyboardAction.NEWLINE
-    assert adapter.action_for_key("enter") is EnhancedKeyboardAction.SUBMIT
-    assert adapter.action_for_key("ctrl+enter") is None
+    assert adapter.parse("shift+enter") is EnhancedKeyboardAction.NEWLINE
+    assert adapter.parse("alt+enter") is EnhancedKeyboardAction.NEWLINE
+    assert adapter.parse("enter") is EnhancedKeyboardAction.SUBMIT
+    assert adapter.parse("ctrl+enter") is None
 
 
 def test_capability_detection_is_conservative() -> None:
@@ -103,22 +103,6 @@ def test_unsupported_terminal_keeps_keyboard_mode_untouched() -> None:
     assert not adapter.enable()
     assert not adapter.restore()
     assert terminal.operations == []
-
-
-def test_keyboard_mode_is_restored_when_the_application_body_raises() -> None:
-    terminal = RecordingTerminal()
-    adapter = EnhancedKeyboardAdapter(
-        write=terminal.write,
-        flush=terminal.flush,
-        supports=lambda: True,
-    )
-
-    with pytest.raises(RuntimeError, match="boom"):
-        with adapter:
-            raise RuntimeError("boom")
-
-    assert not adapter.enabled
-    assert terminal.operations[-2:] == [("write", "\x1b[<u"), ("flush", "")]
 
 
 def test_driver_hooks_preserve_normal_lifecycle_order_and_ignore_duplicate_restore() -> None:
