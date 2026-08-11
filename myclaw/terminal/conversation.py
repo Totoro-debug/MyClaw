@@ -104,6 +104,7 @@ class _ConversationInput(TextArea):
         self._history_index: int | None = None
         self._history_draft = ""
         self.active_turn_token: object | None = None
+        self._ctrl_c_turn_token: object | None = None
 
     def remember_submission(self, text: str) -> None:
         """Keep accepted input only for this live application instance."""
@@ -138,10 +139,13 @@ class _ConversationInput(TextArea):
 
     async def _on_key(self, event: Key) -> None:
         completion = cast(_CommandCompletionHost, self.app)
-        if event.key in {"up", "down"} and completion.command_completion_visible:
+        if event.key != "ctrl+c":
+            self._ctrl_c_turn_token = None
+        if event.key in {"up", "down", "left", "right"} and completion.command_completion_visible:
             event.stop()
             event.prevent_default()
-            completion.move_command_completion(-1 if event.key == "up" else 1)
+            if event.key in {"up", "down"}:
+                completion.move_command_completion(-1 if event.key == "up" else 1)
             return
         if event.key == "escape" and completion.command_completion_visible:
             event.stop()
@@ -152,6 +156,11 @@ class _ConversationInput(TextArea):
             event.stop()
             event.prevent_default()
             completion.accept_command_completion()
+            return
+        if event.key == "ctrl+c" and completion.command_completion_visible:
+            event.stop()
+            event.prevent_default()
+            completion.dismiss_command_completion()
             return
         if event.key in _CONVERSATION_NAVIGATION_KEYS:
             event.stop()
@@ -164,6 +173,11 @@ class _ConversationInput(TextArea):
             if self.read_only:
                 control_action = "cancel_active_turn"
                 turn_token = self.active_turn_token
+                if turn_token is not None:
+                    self._ctrl_c_turn_token = turn_token
+            elif self._ctrl_c_turn_token is not None:
+                control_action = "cancel_active_turn"
+                turn_token = self._ctrl_c_turn_token
             elif self.text:
                 control_action = "clear_draft"
             else:
@@ -828,6 +842,8 @@ class TerminalConversationApp(App[None]):
 
     @on(TextArea.Changed, "#conversation-input")
     def _input_changed(self, message: TextArea.Changed) -> None:
+        if isinstance(message.text_area, _ConversationInput):
+            message.text_area._ctrl_c_turn_token = None
         self._refresh_command_completion(message.text_area.text)
 
     @on(_CommandCompletion.OptionSelected)

@@ -848,7 +848,7 @@ async def test_active_turn_is_read_only_working_and_cancellable_before_a_later_t
 
 
 @pytest.mark.asyncio
-async def test_repeated_active_ctrl_c_is_bound_to_one_turn_without_exiting() -> None:
+async def test_repeated_or_delayed_active_ctrl_c_stays_bound_to_the_cancelled_turn() -> None:
     conversation = CancellableConversation()
     runtime = _runtime(conversation)
     app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
@@ -858,14 +858,20 @@ async def test_repeated_active_ctrl_c_is_bound_to_one_turn_without_exiting() -> 
         await asyncio.wait_for(conversation.first_delta_emitted.wait(), timeout=1)
 
         input_area = app.query_one("#conversation-input", TextArea)
-        input_area.post_message(Key("ctrl+c", None))
-        input_area.post_message(Key("ctrl+c", None))
+        await pilot.press("ctrl+c")
         await asyncio.wait_for(submission, timeout=1)
         await _wait_for_turn(app)
+        await pilot.press("ctrl+c")
 
         assert conversation.cancel_calls == 1
         assert app.is_running
         assert input_area.text == ""
+        assert not input_area.read_only
+        assert app.screen.focused is input_area
+
+        await pilot.press("x", "backspace", "ctrl+c")
+        await pilot.pause()
+        assert not app.is_running
 
 
 @pytest.mark.asyncio
@@ -1322,6 +1328,14 @@ async def test_exec_confirmation_shows_exact_command_and_arrow_keys_select_appro
 
         await pilot.press("right")
         assert app.screen.focused is app.screen.query_one("#confirmation-approve", Button)
+        await pilot.press("left")
+        assert app.screen.focused is app.screen.query_one("#confirmation-decline", Button)
+        await pilot.press("down")
+        assert app.screen.focused is app.screen.query_one("#confirmation-approve", Button)
+        await pilot.press("up")
+        assert app.screen.focused is app.screen.query_one("#confirmation-decline", Button)
+        await pilot.press("right")
+        assert app.screen.focused is app.screen.query_one("#confirmation-approve", Button)
         await pilot.press("enter")
         await asyncio.wait_for(submission, timeout=1)
         await _wait_for_turn(app)
@@ -1374,10 +1388,15 @@ async def test_confirmation_escape_and_ctrl_c_decline_only_the_pending_tool(key:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
         await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
         await pilot.pause()
+        input_area = app.query_one("#conversation-input", TextArea)
 
         await pilot.press(key)
         await asyncio.wait_for(submission, timeout=1)
         await _wait_for_turn(app)
+
+        assert app.is_running
+        assert app.screen.focused is input_area
+        assert not input_area.read_only
 
     assert conversation.responses == [
         (UUID("16fd2706-8baf-4334-8c7f-ada847da0314"), "declined"),
@@ -2821,8 +2840,15 @@ async def test_resume_picker_cancellation_and_outside_click_preserve_current_dis
 
         await pilot.click(offset=(1, 1))
         assert app.screen.id == "session-picker"
+        await pilot.press("left", "right")
+        assert app.screen.id == "session-picker"
+        assert runtime.session.session_id == initial_session_id
+        assert app.screen.query_one("#session-picker-options", OptionList).has_focus
         await pilot.press(cancel_key)
         await pilot.pause()
+        assert app.is_running
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert not input_area.read_only
         await pilot.press("ctrl+home")
 
         visible_text = _visible_screen_text(app)
@@ -2832,7 +2858,7 @@ async def test_resume_picker_cancellation_and_outside_click_preserve_current_dis
         assert "Command: /status" in visible_text
         assert "Command: /resume" not in visible_text
         assert "Target content." not in visible_text
-        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+        assert app.screen.focused is input_area
 
 
 @pytest.mark.asyncio
@@ -3253,7 +3279,7 @@ async def test_management_error_row_preserves_later_command_interaction(
 
 
 @pytest.mark.asyncio
-async def test_completion_direction_keys_take_precedence_over_runtime_input_history() -> None:
+async def test_completion_direction_keys_take_precedence_over_composer_and_input_history() -> None:
     conversation = ScriptedConversation()
     runtime = _runtime(conversation)
     app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
@@ -3264,8 +3290,50 @@ async def test_completion_direction_keys_take_precedence_over_runtime_input_hist
 
         input_area = app.query_one("#conversation-input", TextArea)
         await pilot.press("/")
-        await pilot.press("up")
+        for direction in ("left", "right"):
+            cursor_before = input_area.cursor_location
+            await pilot.press(direction)
+            assert input_area.cursor_location == cursor_before
+            assert input_area.text == "/"
+            assert any(text == "/config" for text, _x, _y in _screenshot_text_nodes(app))
+
+        await pilot.press("up", "down")
         assert input_area.text == "/"
 
         await pilot.press("escape", "ctrl+c", "up")
         assert input_area.text == "previous"
+
+
+@pytest.mark.asyncio
+async def test_completion_ctrl_c_closes_completion_before_idle_draft_behavior() -> None:
+    conversation = ScriptedConversation()
+    runtime = _runtime(conversation)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("previous"), "enter")
+        await _wait_for_turn(app)
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        await pilot.press("/")
+        await pilot.pause()
+        assert any(text == "/config" for text, _x, _y in _screenshot_text_nodes(app))
+
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+
+        assert input_area.text == "/"
+        assert not any(
+            text in {"/config", "/status", "/resume", "/memory", "/dream"}
+            for text, _x, _y in _screenshot_text_nodes(app)
+        )
+        assert app.is_running
+        assert app.screen.focused is input_area
+
+        await pilot.press("ctrl+c")
+        assert input_area.text == ""
+        assert app.is_running
+
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert not app.is_running
