@@ -446,6 +446,42 @@ class ToolEventSequenceConversation:
                 await self.continue_events.wait()
 
 
+class StagedToolEventSequenceConversation:
+    def __init__(
+        self,
+        *sequences: tuple[AgentEvent, ...],
+        pause_after: tuple[tuple[int, int], ...],
+    ) -> None:
+        self.submissions: list[str] = []
+        self._sequences = sequences
+        self._checkpoints = {
+            checkpoint: (asyncio.Event(), asyncio.Event()) for checkpoint in pause_after
+        }
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        self.submissions.append(text)
+        submission_index = len(self.submissions) - 1
+        for event_index, event in enumerate(self._sequences[submission_index]):
+            yield event
+            checkpoint = self._checkpoints.get((submission_index, event_index))
+            if checkpoint is not None:
+                reached, continue_events = checkpoint
+                reached.set()
+                await continue_events.wait()
+
+    async def wait_after(self, submission_index: int, event_index: int) -> None:
+        reached, _ = self._checkpoints[(submission_index, event_index)]
+        await asyncio.wait_for(reached.wait(), timeout=1)
+
+    def continue_after(self, submission_index: int, event_index: int) -> None:
+        _, continue_events = self._checkpoints[(submission_index, event_index)]
+        continue_events.set()
+
+    def continue_all(self) -> None:
+        for _, continue_events in self._checkpoints.values():
+            continue_events.set()
+
+
 class CancellableConversation:
     def __init__(self) -> None:
         self.submissions: list[str] = []
@@ -1482,6 +1518,64 @@ async def test_activity_heading_starts_with_accumulated_time_and_freezes_on_succ
 
 
 @pytest.mark.asyncio
+async def test_manual_activity_disclosure_keeps_heading_position_while_content_grows_downward() -> (
+    None
+):
+    intermediate = "\n".join(f"activity {index:02d} " + "a" * 35 for index in range(45))
+    conversation = ToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            _model_call_completed_event(
+                TURN_ID,
+                1,
+                intermediate,
+                continues_with_tools=True,
+            ),
+            _tool_started_event(TURN_ID, 2, "call-read", "read_file", "Running read_file"),
+            _tool_completed_event(
+                TURN_ID,
+                3,
+                "call-read",
+                "read_file",
+                "success",
+                "Finished read_file",
+            ),
+            _turn_completed_event(TURN_ID, 4, "Final answer."),
+        )
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+        heading = app.query_one(".agent-run-activity-heading", Static)
+        content = app.query_one(".agent-run-activity-content")
+        assert not content.display
+
+        await pilot.click(".agent-run-activity-heading")
+        await pilot.pause()
+        expanded_heading_y = heading.region.y
+        assert content.display
+        display = app.query_one("#conversation-display")
+        assert not display.is_vertical_scroll_end
+        assert app.query_one("#new-content").display
+
+        # The heading remains in the viewport after the group shrinks, so the
+        # next click can still target the same visible control.
+        await pilot.click(".agent-run-activity-heading")
+        await pilot.pause()
+        assert not content.display
+        assert heading.region.y == expanded_heading_y
+        assert display.is_vertical_scroll_end
+
+        await pilot.click(".agent-run-activity-heading")
+        await pilot.pause()
+        assert content.display
+        assert heading.region.y == expanded_heading_y
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+
+@pytest.mark.asyncio
 async def test_failed_activity_group_is_mouse_toggleable_without_moving_composer_focus() -> None:
     conversation = ToolEventSequenceConversation(
         (
@@ -2085,6 +2179,261 @@ async def test_tool_row_updates_preserve_historical_follow_and_resize_state() ->
             for row in app.query(".tool-row")
             if row.display and row.parent.display
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reading_history", [False, True])
+async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_each_stage(
+    reading_history: bool,
+) -> None:
+    history = "\n".join(f"history {index:02d} " + "h" * 35 for index in range(70))
+    second_events = (
+        _turn_started_event(OTHER_TURN_ID),
+        AgentEvent(
+            type="text_delta",
+            event_id=1,
+            turn_id=OTHER_TURN_ID,
+            created_at=NOW,
+            payload=TextDeltaPayload(delta="candidate"),
+        ),
+        _model_call_completed_event(
+            OTHER_TURN_ID,
+            2,
+            "candidate",
+            continues_with_tools=True,
+        ),
+        _tool_started_event(
+            OTHER_TURN_ID,
+            3,
+            "activity-call",
+            "read_file",
+            "Running read_file",
+        ),
+        _tool_completed_event(
+            OTHER_TURN_ID,
+            4,
+            "activity-call",
+            "read_file",
+            "success",
+            "Finished read_file",
+        ),
+        _model_call_completed_event(
+            OTHER_TURN_ID,
+            5,
+            "latest answer",
+            continues_with_tools=False,
+        ),
+        _turn_completed_event(OTHER_TURN_ID, 6, content="latest answer"),
+    )
+    conversation = StagedToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta=history),
+            ),
+            _turn_completed_event(TURN_ID, 2, content=history),
+        ),
+        second_events,
+        pause_after=tuple((1, event_index) for event_index in range(1, 7)),
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.press(*list("history"), "enter")
+        await _wait_for_turn(app)
+        display = app.query_one("#conversation-display")
+        await pilot.press("ctrl+end")
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        try:
+            await conversation.wait_after(1, 1)
+            await asyncio.sleep(0.05)
+            await pilot.pause()
+            assert "candidate" in _visible_screen_text(app)
+            assert display.is_vertical_scroll_end
+            historical_position = display.scroll_y
+            if reading_history:
+                await pilot.press("pageup")
+                await pilot.pause()
+                historical_position = display.scroll_y
+                assert not display.is_vertical_scroll_end
+
+            expected_tool_rows: dict[int, list[str]] = {
+                2: [],
+                3: ["Running: read_file"],
+                4: ["Completed: read_file"],
+                5: ["Completed: read_file"],
+                6: ["Completed: read_file"],
+            }
+            for previous_event, next_event in zip(range(1, 6), range(2, 7), strict=True):
+                conversation.continue_after(1, previous_event)
+                await conversation.wait_after(1, next_event)
+                await asyncio.sleep(0.05)
+                await pilot.pause()
+                assert _tool_row_texts(app)[-1:] == expected_tool_rows[next_event][-1:]
+                if reading_history:
+                    assert not display.is_vertical_scroll_end
+                    assert display.scroll_y == historical_position
+                    assert app.query_one("#new-content").display
+                else:
+                    assert display.is_vertical_scroll_end, (
+                        f"lost bottom follow after event {next_event}"
+                    )
+                    assert not app.query_one("#new-content").display
+
+            conversation.continue_after(1, 6)
+            await asyncio.wait_for(submission, timeout=1)
+            await _wait_for_turn(app)
+
+            if reading_history:
+                assert not display.is_vertical_scroll_end
+                assert display.scroll_y == historical_position
+                assert app.query_one("#new-content").display
+            else:
+                assert display.is_vertical_scroll_end
+                assert "latest answer" in _visible_screen_text(app)
+                assert not app.query_one("#new-content").display
+            assert not app.query_one(".agent-run-activity-content").display
+        finally:
+            conversation.continue_all()
+            if not submission.done():
+                await asyncio.wait_for(submission, timeout=1)
+            await _wait_for_turn(app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expanded", "reading_history"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+async def test_activity_group_resize_preserves_scroll_mode_anchor_and_input_focus(
+    expanded: bool,
+    reading_history: bool,
+) -> None:
+    history = "\n".join(f"history {index:02d}" for index in range(80))
+    activity = "\n".join(f"activity {index:02d}" for index in range(50))
+    conversation = ToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            _model_call_completed_event(TURN_ID, 1, history, continues_with_tools=False),
+            _turn_completed_event(TURN_ID, 2, history),
+        ),
+        (
+            _turn_started_event(OTHER_TURN_ID),
+            _model_call_completed_event(
+                OTHER_TURN_ID,
+                1,
+                activity,
+                continues_with_tools=True,
+            ),
+            _tool_started_event(
+                OTHER_TURN_ID,
+                2,
+                "activity-call",
+                "read_file",
+                "Running read_file",
+            ),
+            _tool_completed_event(
+                OTHER_TURN_ID,
+                3,
+                "activity-call",
+                "read_file",
+                "success",
+                "Finished read_file",
+            ),
+            _turn_completed_event(OTHER_TURN_ID, 4, "final"),
+        ),
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(70, 22)) as pilot:
+        await pilot.press(*list("history"), "enter")
+        await _wait_for_turn(app)
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+        display = app.query_one("#conversation-display")
+        content = app.query_one(".agent-run-activity-content")
+        if expanded:
+            await pilot.click(".agent-run-activity-heading")
+            await pilot.pause()
+        assert content.display is expanded
+
+        await pilot.press("pageup" if reading_history else "ctrl+end")
+        await pilot.pause()
+        scroll_position = display.scroll_y
+        assert display.is_vertical_scroll_end is not reading_history
+
+        await pilot.resize_terminal(55, 22)
+        await pilot.pause()
+
+        assert content.display is expanded
+        assert display.is_vertical_scroll_end is not reading_history
+        if reading_history:
+            assert display.scroll_y == scroll_position
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+
+@pytest.mark.asyncio
+async def test_activity_content_uses_main_vertical_scroll_and_keeps_code_horizontal_scroll() -> (
+    None
+):
+    code_line = "very_long_variable_name = " + "0123456789" * 8 + "TAIL"
+    intermediate = f"```python\n{code_line}\n```\n\n" + "\n".join(
+        f"activity {index:02d}" for index in range(60)
+    )
+    conversation = ToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            _model_call_completed_event(
+                TURN_ID,
+                1,
+                intermediate,
+                continues_with_tools=True,
+            ),
+            _tool_started_event(TURN_ID, 2, "activity-call", "read_file", "Running read_file"),
+            _tool_completed_event(
+                TURN_ID,
+                3,
+                "activity-call",
+                "read_file",
+                "success",
+                "Finished read_file",
+            ),
+            _turn_completed_event(TURN_ID, 4, "final"),
+        )
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(48, 20)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+        await asyncio.sleep(0.05)
+        await pilot.press("ctrl+end")
+        await pilot.click(".agent-run-activity-heading")
+        await pilot.pause()
+        display = app.query_one("#conversation-display")
+        markdown = app.query_one(".agent-run-activity-content").query_one(Markdown)
+        horizontal_scroll_y = display.scroll_y
+
+        assert "TAIL" not in _visible_screen_text(app)
+        await pilot._post_mouse_events(
+            [MouseScrollRight],
+            offset=(10, markdown.region.y + 2),
+            times=30,
+        )
+        assert "TAIL" in _visible_screen_text(app)
+        assert display.scroll_y == horizontal_scroll_y
+
+        await pilot._post_mouse_events(
+            [MouseScrollDown],
+            offset=(10, min(markdown.region.bottom - 1, 15)),
+            times=3,
+        )
+        assert display.scroll_y > horizontal_scroll_y
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
 
 
 @pytest.mark.asyncio
