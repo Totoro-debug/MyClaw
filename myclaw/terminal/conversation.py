@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
+from time import monotonic as monotonic_now
 from typing import ClassVar, Final, Literal, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -23,10 +24,11 @@ from textual.containers import Center, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.dom import NoScreen
 from textual.driver import Driver
-from textual.events import Key, MouseScrollDown, MouseScrollUp, Resize, Unmount
+from textual.events import Click, Key, MouseScrollDown, MouseScrollUp, Resize, Unmount
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.scrollbar import ScrollTo
+from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
@@ -43,6 +45,7 @@ from myclaw.agent.events import (
     TurnCancelledPayload,
     TurnCompletedPayload,
     TurnFailedPayload,
+    TurnStartedPayload,
 )
 from myclaw.agent.runtime import PreparedReplRuntime
 from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS, ManagementCommandResult
@@ -74,6 +77,8 @@ _UNSAFE_TOOL_DETAIL_PATTERN = re.compile(
     r"(?:\bcall[-_][A-Za-z0-9_-]+)",
     re.IGNORECASE,
 )
+_ACTIVITY_EXPANDED_SYMBOL = "\u25bc"
+_ACTIVITY_COLLAPSED_SYMBOL = "\u25b6"
 _TERMINAL_MODE_RESETS: Final = (
     ("\x1b[?2004h", "\x1b[?2004l"),
     ("\x1b[?1000h", "\x1b[?1000l"),
@@ -86,6 +91,7 @@ _TERMINAL_MODE_RESETS: Final = (
 )
 type _ControlAction = Literal["cancel_active_turn", "clear_draft", "exit"]
 type _ToolRowStatus = Literal["running", "success", "error", "refused"]
+type _TerminalOutcome = Literal["completed", "cancelled", "failed"]
 
 
 class _DriverLifecycleHooks(Protocol):
@@ -116,9 +122,42 @@ class _ToolRowState:
     status: _ToolRowStatus
 
 
+class _ActivityGroupHeading(Static):
+    """Mouse-only disclosure title for one Agent Run Activity Group."""
+
+    FOCUS_ON_CLICK = False
+    activity_group: _ActivityGroupState | None = None
+
+    class Clicked(Message):
+        def __init__(self, heading: _ActivityGroupHeading) -> None:
+            super().__init__()
+            self.heading = heading
+
+    @on(Click)
+    async def _on_click(self, event: Click) -> None:
+        if event.widget is not self:
+            return
+        event.stop()
+        event.prevent_default()
+        self.post_message(self.Clicked(self))
+
+
 @dataclass(slots=True)
 class _ActivityGroupState:
+    heading: _ActivityGroupHeading
     content: Vertical
+    expanded: bool = True
+    toggleable: bool = False
+    elapsed: float = 0.0
+
+
+@dataclass(slots=True)
+class _AgentRunTiming:
+    started_at: float
+    elapsed: float = 0.0
+    outcome: _TerminalOutcome | None = None
+    timer: Timer | None = None
+    group: _ActivityGroupState | None = None
 
 
 class _ConversationInput(TextArea):
@@ -491,6 +530,8 @@ class _ScrollAnchor:
 
 class _ConversationDisplay(VerticalScroll):
     """Conversation viewport with bottom-following and historical navigation."""
+
+    FOCUS_ON_CLICK = False
 
     class Resized(Message):
         def __init__(self, display: _ConversationDisplay, width: int, generation: int) -> None:
@@ -1075,9 +1116,15 @@ class TerminalConversationApp(App[None]):
     }
     """
 
-    def __init__(self, runtime: PreparedReplRuntime) -> None:
+    def __init__(
+        self,
+        runtime: PreparedReplRuntime,
+        *,
+        monotonic: Callable[[], float] = monotonic_now,
+    ) -> None:
         super().__init__()
         self._runtime = runtime
+        self._monotonic = monotonic
         self._runtime_started = False
         self._size_insufficient = False
         self._driver_mode_started = False
@@ -1095,6 +1142,7 @@ class TerminalConversationApp(App[None]):
         self._completion_dismissed_text: str | None = None
         self._closing = False
         self._application_error: Exception | None = None
+        self._run_timing: _AgentRunTiming | None = None
 
     def _handle_exception(self, error: Exception) -> None:
         if self._application_error is None:
@@ -1292,6 +1340,18 @@ class TerminalConversationApp(App[None]):
     def _completion_dismissed(self, message: _CommandCompletion.Dismissed) -> None:
         message.stop()
         self.dismiss_command_completion()
+
+    @on(_ActivityGroupHeading.Clicked)
+    def _activity_group_clicked(self, message: _ActivityGroupHeading.Clicked) -> None:
+        message.stop()
+        state = message.heading.activity_group
+        if state is not None and state.toggleable:
+            self._set_activity_group_expanded(state, not state.expanded)
+        with suppress(NoMatches, NoScreen, ScreenStackError):
+            self.screen.set_focus(
+                self.query_one("#conversation-input", _ConversationInput),
+                scroll_visible=False,
+            )
 
     def on_resize(self, event: Resize) -> None:
         too_small = (
@@ -1545,7 +1605,12 @@ class TerminalConversationApp(App[None]):
 
         try:
             async for event in events:
-                if event.type == "text_delta":
+                if event.type == "turn_started":
+                    payload = event.payload
+                    if not isinstance(payload, TurnStartedPayload):
+                        raise TypeError("turn_started event has an invalid payload")
+                    self._start_run_timing()
+                elif event.type == "text_delta":
                     payload = event.payload
                     if not isinstance(payload, TextDeltaPayload):
                         raise TypeError("text_delta event has an invalid payload")
@@ -1605,6 +1670,7 @@ class TerminalConversationApp(App[None]):
                     payload = event.payload
                     if not isinstance(payload, TurnCompletedPayload):
                         raise TypeError("turn_completed event has an invalid payload")
+                    self._finish_run_timing("completed")
                     await self._finish_tool_turn(
                         event.turn_id,
                         "Tool completion was not reported.",
@@ -1615,6 +1681,7 @@ class TerminalConversationApp(App[None]):
                     payload = event.payload
                     if not isinstance(payload, TurnCancelledPayload):
                         raise TypeError("turn_cancelled event has an invalid payload")
+                    self._finish_run_timing("cancelled")
                     await self._finish_tool_turn(event.turn_id, "The Tool call was interrupted.")
                     if payload.partial_content:
                         terminal_content = payload.partial_content
@@ -1623,6 +1690,7 @@ class TerminalConversationApp(App[None]):
                     payload = event.payload
                     if not isinstance(payload, TurnFailedPayload):
                         raise TypeError("turn_failed event has an invalid payload")
+                    self._finish_run_timing("failed")
                     await self._finish_tool_turn(
                         event.turn_id,
                         "The Tool call ended with the turn failure.",
@@ -1698,7 +1766,7 @@ class TerminalConversationApp(App[None]):
             and primary_error is None
             and not cleanup_errors
         ):
-            activity_group.content.display = False
+            self._set_activity_group_expanded(activity_group, False)
             self._scroll_to_latest()
         try:
             await close_event_stream(events)
@@ -1801,19 +1869,104 @@ class TerminalConversationApp(App[None]):
         if activity_group is not None:
             return activity_group
         display = self.query_one("#conversation-display", _ConversationDisplay)
-        container = Vertical(
-            Static(
-                "Agent Run Activity",
-                markup=False,
-                classes="agent-run-activity-heading",
+        timing = self._run_timing
+        if timing is not None and timing.outcome is None:
+            timing.elapsed = max(0.0, self._monotonic() - timing.started_at)
+        expanded = timing is None or timing.outcome != "completed"
+        toggleable = timing is not None and timing.outcome is not None
+        heading = _ActivityGroupHeading(
+            _activity_group_heading_text(
+                expanded=expanded,
+                elapsed=0.0 if timing is None else timing.elapsed,
             ),
+            markup=False,
+            classes="agent-run-activity-heading",
+        )
+        container = Vertical(
+            heading,
             Vertical(classes="agent-run-activity-content"),
             classes="agent-run-activity-group",
         )
         await display.mount(container)
         content = container.query_one(".agent-run-activity-content", Vertical)
+        state = _ActivityGroupState(
+            heading=heading,
+            content=content,
+            expanded=expanded,
+            toggleable=toggleable,
+            elapsed=0.0 if timing is None else timing.elapsed,
+        )
+        heading.activity_group = state
+        if timing is not None:
+            timing.group = state
         self._scroll_to_latest()
-        return _ActivityGroupState(content)
+        return state
+
+    def _start_run_timing(self) -> None:
+        self._stop_run_timing()
+        timing = _AgentRunTiming(started_at=self._monotonic())
+        self._run_timing = timing
+        timing.timer = self.set_interval(1.0, self._refresh_run_timing, name="agent-run-duration")
+
+    def _refresh_run_timing(self) -> None:
+        timing = self._run_timing
+        if timing is None or timing.outcome is not None:
+            return
+        timing.elapsed = max(0.0, self._monotonic() - timing.started_at)
+        if timing.group is not None:
+            timing.group.elapsed = timing.elapsed
+            timing.group.heading.update(
+                _activity_group_heading_text(
+                    expanded=timing.group.expanded,
+                    elapsed=timing.elapsed,
+                )
+            )
+
+    def _finish_run_timing(self, outcome: _TerminalOutcome) -> None:
+        timing = self._run_timing
+        if timing is None or timing.outcome is not None:
+            return
+        timing.elapsed = max(0.0, self._monotonic() - timing.started_at)
+        timing.outcome = outcome
+        if timing.timer is not None:
+            timing.timer.stop()
+            timing.timer = None
+        group = timing.group
+        if group is not None:
+            group.elapsed = timing.elapsed
+            group.toggleable = True
+            if outcome != "completed":
+                group.expanded = True
+            group.heading.update(
+                _activity_group_heading_text(
+                    expanded=group.expanded,
+                    elapsed=group.elapsed,
+                )
+            )
+        self._run_timing = None
+
+    def _stop_run_timing(self) -> None:
+        timing = self._run_timing
+        self._run_timing = None
+        if timing is not None and timing.timer is not None:
+            timing.timer.stop()
+            timing.timer = None
+
+    def _set_activity_group_expanded(
+        self,
+        activity_group: _ActivityGroupState,
+        expanded: bool,
+    ) -> None:
+        if not activity_group.toggleable:
+            expanded = True
+        activity_group.expanded = expanded
+        activity_group.content.display = expanded
+        activity_group.heading.update(
+            _activity_group_heading_text(
+                expanded=expanded,
+                elapsed=activity_group.elapsed,
+            )
+        )
 
     async def _move_assistant_to_activity(
         self,
@@ -2273,6 +2426,23 @@ def _tool_row_content(status: _ToolRowStatus, tool_name: str, summary: str) -> s
     if status == "refused":
         return f"Rejected: {display_name}"
     return f"Failed: {display_name} - {_safe_failure_reason(summary, display_name)}"
+
+
+def _format_activity_duration(elapsed: float) -> str:
+    total_seconds = max(0, int(elapsed))
+    seconds = total_seconds % 60
+    if total_seconds < 60:
+        return f"{seconds}s"
+    minutes = (total_seconds // 60) % 60
+    if total_seconds < 3600:
+        return f"{total_seconds // 60}min {seconds}s"
+    hours = total_seconds // 3600
+    return f"{hours}h {minutes}min {seconds}s"
+
+
+def _activity_group_heading_text(*, expanded: bool, elapsed: float) -> str:
+    symbol = _ACTIVITY_EXPANDED_SYMBOL if expanded else _ACTIVITY_COLLAPSED_SYMBOL
+    return f"{symbol} {_format_activity_duration(elapsed)}"
 
 
 def _concise_tool_name(tool_name: str) -> str:

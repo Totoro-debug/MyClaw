@@ -55,6 +55,7 @@ from myclaw.session.session import Session
 from myclaw.terminal.conversation import (
     TerminalConversationApp,
     TerminalConversationError,
+    _format_activity_duration,
     run_terminal_conversation,
 )
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -1402,6 +1403,125 @@ async def test_intermediate_completion_replaces_stream_candidate_and_empty_outpu
         assert len(list(activity_content.query(".assistant-row"))) == 1
         assert len(list(app.query("#conversation-display > .assistant-row"))) == 0
         assert "Completed with no response." in _visible_screen_text(app)
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "expected"),
+    [
+        (0.99, "0s"),
+        (59.99, "59s"),
+        (60, "1min 0s"),
+        (65.9, "1min 5s"),
+        (3605, "1h 0min 5s"),
+        (24 * 3600 + 5, "24h 0min 5s"),
+    ],
+)
+def test_activity_duration_uses_floored_accumulated_seconds(elapsed: float, expected: str) -> None:
+    assert _format_activity_duration(elapsed) == expected
+
+
+@pytest.mark.asyncio
+async def test_activity_heading_starts_with_accumulated_time_and_freezes_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    events = (
+        _turn_started_event(TURN_ID),
+        _model_call_completed_event(
+            TURN_ID,
+            1,
+            "intermediate",
+            continues_with_tools=True,
+        ),
+        _tool_started_event(TURN_ID, 2, "call-read", "read_file", "Running read_file"),
+        _tool_completed_event(TURN_ID, 3, "call-read", "read_file", "success", "Finished"),
+        _turn_completed_event(TURN_ID, 4, "final"),
+    )
+    conversation = ToolEventSequenceConversation(events, pause_after=(0, 2))
+    app = TerminalConversationApp(
+        cast(PreparedReplRuntime, _runtime(conversation)),
+        monotonic=lambda: clock[0],
+    )
+    finish_tool_turn = app._finish_tool_turn
+
+    async def finish_tool_turn_after_delay(turn_id: UUID, failure_reason: str) -> None:
+        clock[0] = 10000
+        await finish_tool_turn(turn_id, failure_reason)
+
+    monkeypatch.setattr(app, "_finish_tool_turn", finish_tool_turn_after_delay)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
+        await asyncio.wait_for(conversation.paused.wait(), timeout=1)
+
+        clock[0] = 5.9
+        app._refresh_run_timing()
+        heading = app.query_one(".agent-run-activity-heading", Static)
+        content = app.query_one(".agent-run-activity-content")
+        assert not heading.can_focus
+        assert str(heading.content) == "\u25bc 5s"
+        assert content.display
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+        await pilot.click(".agent-run-activity-heading")
+        assert content.display
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+        clock[0] = 3605.9
+        app._refresh_run_timing()
+        assert str(heading.content) == "\u25bc 1h 0min 5s"
+
+        conversation.continue_events.set()
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+        assert str(heading.content) == "\u25b6 1h 0min 5s"
+        assert not content.display
+        app._refresh_run_timing()
+        assert str(heading.content) == "\u25b6 1h 0min 5s"
+
+
+@pytest.mark.asyncio
+async def test_failed_activity_group_is_mouse_toggleable_without_moving_composer_focus() -> None:
+    conversation = ToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            _model_call_completed_event(TURN_ID, 1, "intermediate", continues_with_tools=True),
+            _tool_started_event(TURN_ID, 2, "call-read", "read_file", "Running read_file"),
+            AgentEvent(
+                type="turn_failed",
+                event_id=3,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TurnFailedPayload(
+                    error=ErrorInfo(code="model_failed", message="The Agent Run failed.")
+                ),
+            ),
+        )
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        heading = app.query_one(".agent-run-activity-heading", Static)
+        content = app.query_one(".agent-run-activity-content")
+        assert not heading.can_focus
+        assert str(heading.content).startswith("\u25bc ")
+        assert content.display
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+        await pilot.press("enter")
+        assert content.display
+        await pilot.click(".agent-run-activity-heading")
+        assert not content.display
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+        await pilot.click(".agent-run-activity-heading")
+        assert content.display
+        await pilot.click(".tool-row")
+        assert content.display
 
 
 @pytest.mark.asyncio
