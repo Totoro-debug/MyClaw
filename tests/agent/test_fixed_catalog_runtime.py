@@ -148,14 +148,16 @@ async def test_runtime_uses_fixed_catalog_for_provider_confirmation_and_persiste
 
     assert [event.type for event in events] == [
         "turn_started",
+        "model_call_completed",
         "tool_started",
         "confirmation_requested",
         "tool_completed",
+        "model_call_completed",
         "turn_completed",
     ]
-    assert isinstance(events[2].payload, ConfirmationRequestedPayload)
-    assert events[2].payload.turn_id == events[0].turn_id
-    assert events[2].payload.details["path"] != str(outside) or len(str(outside)) <= 256
+    assert isinstance(events[3].payload, ConfirmationRequestedPayload)
+    assert events[3].payload.turn_id == events[0].turn_id
+    assert events[3].payload.details["path"] != str(outside) or len(str(outside)) <= 256
     assert provider.stream_requests
     assert [definition["function"]["name"] for definition in provider.stream_requests[0].tools] == [
         "read_file",
@@ -231,6 +233,7 @@ async def test_runtime_cancellation_reaches_an_active_fixed_catalog_tool(
     assert cancelled.is_set()
     assert [event.type for event in events] == [
         "turn_started",
+        "model_call_completed",
         "tool_started",
         "turn_cancelled",
     ]

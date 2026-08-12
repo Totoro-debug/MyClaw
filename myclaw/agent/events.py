@@ -18,6 +18,7 @@ type ConfirmationDecision = Literal["approved", "declined"]
 type AgentEventType = Literal[
     "turn_started",
     "text_delta",
+    "model_call_completed",
     "tool_started",
     "confirmation_requested",
     "tool_completed",
@@ -46,6 +47,14 @@ class TextDeltaPayload:
         if not self.delta:
             msg = "delta must not be empty"
             raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCallCompletedPayload:
+    """Complete text and continuation decision for one nonterminal model call."""
+
+    content: str
+    continues_with_tools: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +146,7 @@ class TurnCancelledPayload:
 type AgentEventPayload = (
     TurnStartedPayload
     | TextDeltaPayload
+    | ModelCallCompletedPayload
     | ToolStartedPayload
     | ConfirmationRequestedPayload
     | ToolCompletedPayload
@@ -148,6 +158,7 @@ type AgentEventPayload = (
 _EVENT_PAYLOAD_TYPES: dict[AgentEventType, type[object]] = {
     "turn_started": TurnStartedPayload,
     "text_delta": TextDeltaPayload,
+    "model_call_completed": ModelCallCompletedPayload,
     "tool_started": ToolStartedPayload,
     "confirmation_requested": ConfirmationRequestedPayload,
     "tool_completed": ToolCompletedPayload,

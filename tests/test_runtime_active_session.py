@@ -124,7 +124,11 @@ async def test_runtime_routes_turn_title_status_and_close_through_one_active_ses
     events = [event async for event in runtime.conversation.submit("First input.")]
     await provider.title_started.wait()
 
-    assert [event.type for event in events] == ["turn_started", "turn_completed"]
+    assert [event.type for event in events] == [
+        "turn_started",
+        "model_call_completed",
+        "turn_completed",
+    ]
     assert [message["role"] for message in session.messages] == ["user", "assistant"]
     assert session.metadata["title"] == "Untitled session"
 
@@ -454,8 +458,10 @@ async def test_runtime_active_session_keeps_artifact_and_log_correlation_when_pe
 
     assert [event.type for event in events] == [
         "turn_started",
+        "model_call_completed",
         "tool_started",
         "tool_completed",
+        "model_call_completed",
         "turn_completed",
     ]
     tool_message = session.messages[2]

@@ -14,6 +14,7 @@ from myclaw.agent.events import (
     AgentEventType,
     ConfirmationDecision,
     ConfirmationRequestedPayload,
+    ModelCallCompletedPayload,
     TextDeltaPayload,
     ToolCompletedPayload,
     ToolStartedPayload,
@@ -29,6 +30,7 @@ from myclaw.agent.run import (
     AgentRunConfirmationRequestedPayload,
     AgentRunFailedPayload,
     AgentRunInterface,
+    AgentRunModelCallCompletedPayload,
     AgentRunModelSettings,
     AgentRunPayload,
     AgentRunStartedPayload,
@@ -392,6 +394,11 @@ def _map_agent_run_payload(
         return "turn_started", TurnStartedPayload()
     if isinstance(payload, AgentRunTextDeltaPayload):
         return "text_delta", TextDeltaPayload(delta=payload.delta)
+    if isinstance(payload, AgentRunModelCallCompletedPayload):
+        return "model_call_completed", ModelCallCompletedPayload(
+            content=payload.content,
+            continues_with_tools=payload.continues_with_tools,
+        )
     if isinstance(payload, AgentRunToolStartedPayload):
         return "tool_started", ToolStartedPayload(
             tool_call_id=payload.tool_call_id,

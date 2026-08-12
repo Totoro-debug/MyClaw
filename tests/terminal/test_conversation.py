@@ -31,6 +31,7 @@ from myclaw.agent.events import (
     ConfirmationDecision,
     ConfirmationRequestedPayload,
     ConversationPort,
+    ModelCallCompletedPayload,
     TextDeltaPayload,
     ToolCompletedPayload,
     ToolStartedPayload,
@@ -152,8 +153,18 @@ class ScriptedConversation:
         event_id = len(deltas) + 1
         if outcome == "completed":
             yield AgentEvent(
-                type="turn_completed",
+                type="model_call_completed",
                 event_id=event_id,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=ModelCallCompletedPayload(
+                    content=completed_content,
+                    continues_with_tools=False,
+                ),
+            )
+            yield AgentEvent(
+                type="turn_completed",
+                event_id=event_id + 1,
                 turn_id=TURN_ID,
                 created_at=NOW,
                 payload=TurnCompletedPayload(
@@ -206,8 +217,15 @@ class ToolActivityConversation:
             payload=TurnStartedPayload(),
         )
         yield AgentEvent(
-            type="tool_started",
+            type="model_call_completed",
             event_id=1,
+            turn_id=TURN_ID,
+            created_at=NOW,
+            payload=ModelCallCompletedPayload(content="", continues_with_tools=True),
+        )
+        yield AgentEvent(
+            type="tool_started",
+            event_id=2,
             turn_id=TURN_ID,
             created_at=NOW,
             payload=ToolStartedPayload(
@@ -220,7 +238,7 @@ class ToolActivityConversation:
         await self.complete_tool.wait()
         yield AgentEvent(
             type="tool_completed",
-            event_id=2,
+            event_id=3,
             turn_id=TURN_ID,
             created_at=NOW,
             payload=ToolCompletedPayload(
@@ -232,7 +250,7 @@ class ToolActivityConversation:
         )
         yield AgentEvent(
             type="turn_completed",
-            event_id=3,
+            event_id=4,
             turn_id=TURN_ID,
             created_at=NOW,
             payload=TurnCompletedPayload(
@@ -681,6 +699,25 @@ def _tool_started_event(
     )
 
 
+def _model_call_completed_event(
+    turn_id: UUID,
+    event_id: int,
+    content: str,
+    *,
+    continues_with_tools: bool,
+) -> AgentEvent:
+    return AgentEvent(
+        type="model_call_completed",
+        event_id=event_id,
+        turn_id=turn_id,
+        created_at=NOW,
+        payload=ModelCallCompletedPayload(
+            content=content,
+            continues_with_tools=continues_with_tools,
+        ),
+    )
+
+
 def _tool_completed_event(
     turn_id: UUID,
     event_id: int,
@@ -698,14 +735,18 @@ def _tool_completed_event(
     )
 
 
-def _turn_completed_event(turn_id: UUID, event_id: int) -> AgentEvent:
+def _turn_completed_event(
+    turn_id: UUID,
+    event_id: int,
+    content: str = "",
+) -> AgentEvent:
     return AgentEvent(
         type="turn_completed",
         event_id=event_id,
         turn_id=turn_id,
         created_at=NOW,
         payload=TurnCompletedPayload(
-            content="",
+            content=content,
             usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
         ),
     )
@@ -1237,8 +1278,130 @@ async def test_text_deltas_update_one_assistant_markdown_and_completion_wins() -
         completed_text = _visible_screen_text(app)
         assert completed_text.count("Final answer.") == 1
         assert "First answer." not in completed_text
+        assert not list(app.query(".agent-run-activity-group"))
 
     assert runtime.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_intermediate_model_output_and_tools_share_one_activity_group() -> None:
+    conversation = ToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            _model_call_completed_event(
+                TURN_ID,
+                1,
+                "Planning **the tool call**.",
+                continues_with_tools=True,
+            ),
+            _tool_started_event(
+                TURN_ID,
+                2,
+                "call-read-file",
+                "read_file",
+                "Running read_file",
+            ),
+            _tool_completed_event(
+                TURN_ID,
+                3,
+                "call-read-file",
+                "read_file",
+                "success",
+                "Finished read_file",
+            ),
+            _model_call_completed_event(
+                TURN_ID,
+                4,
+                "Final **answer**.",
+                continues_with_tools=False,
+            ),
+            _turn_completed_event(TURN_ID, 5, content="Final **answer**."),
+        )
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        groups = list(app.query(".agent-run-activity-group"))
+        assert len(groups) == 1
+        group = groups[0]
+        activity_content = group.query_one(".agent-run-activity-content")
+        assert not activity_content.display
+        assert len(list(activity_content.query(".assistant-row"))) == 1
+        assert len(list(activity_content.query(".tool-row"))) == 1
+        activity_markdown = activity_content.query_one(".assistant-row").query_one(Markdown)
+        assert "Planning" in activity_markdown.source
+
+        display = app.query_one("#conversation-display")
+        direct_assistant_rows = [
+            row for row in display.query(".assistant-row") if row.parent is display
+        ]
+        assert len(direct_assistant_rows) == 1
+        final_markdown = direct_assistant_rows[0].query_one(Markdown)
+        assert "Final" in final_markdown.source
+        assert _visible_screen_text(app).count("Final") == 1
+
+
+@pytest.mark.asyncio
+async def test_intermediate_completion_replaces_stream_candidate_and_empty_output_is_not_mounted() -> (
+    None
+):
+    conversation = ToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta="candidate"),
+            ),
+            _model_call_completed_event(
+                TURN_ID,
+                2,
+                "authoritative candidate",
+                continues_with_tools=True,
+            ),
+            _tool_started_event(
+                TURN_ID,
+                3,
+                "call-empty",
+                "read_file",
+                "Running read_file",
+            ),
+            _tool_completed_event(
+                TURN_ID,
+                4,
+                "call-empty",
+                "read_file",
+                "success",
+                "Finished read_file",
+            ),
+            _model_call_completed_event(
+                TURN_ID,
+                5,
+                "",
+                continues_with_tools=False,
+            ),
+            _turn_completed_event(TURN_ID, 6),
+        )
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        group = app.query_one(".agent-run-activity-group")
+        activity_content = group.query_one(".agent-run-activity-content")
+        assert activity_content.query(".assistant-row").first().query_one(Markdown).source == (
+            "authoritative candidate"
+        )
+        assert len(list(activity_content.query(".assistant-row"))) == 1
+        assert len(list(app.query("#conversation-display > .assistant-row"))) == 0
+        assert "Completed with no response." in _visible_screen_text(app)
 
 
 @pytest.mark.asyncio
@@ -1553,7 +1716,7 @@ async def test_tool_activity_replaces_one_running_row_with_its_final_summary() -
         assert "private.txt" not in running_text
         row = app.query_one(".tool-row", Static)
         assert row.outer_size.width == app.query_one(".message-row").outer_size.width
-        assert row.parent is app.query_one("#conversation-display")
+        assert row.parent is app.query_one(".agent-run-activity-content")
         assert not row.has_class("message")
         assert not row.can_focus
         assert app.screen.focused is app.query_one("#conversation-input", TextArea)
@@ -1569,7 +1732,8 @@ async def test_tool_activity_replaces_one_running_row_with_its_final_summary() -
 
         final_text = _visible_screen_text(app)
         assert "Running: read_file" not in final_text
-        assert final_text.count("Completed: read_file") == 1
+        assert str(row.content) == "Completed: read_file"
+        assert not row.parent.display
         assert "complete file contents" not in final_text
         assert "Tool completed." in final_text
 
@@ -1608,7 +1772,10 @@ async def test_tool_activity_final_statuses_explain_refusal_and_failure(
         await _wait_for_turn(app)
 
         visible_text = _visible_screen_text(app)
-        assert visible_text.count(expected) == 1
+        assert _tool_row_texts(app).count(expected) == 1
+        assert expected not in visible_text
+        assert not app.query_one(".agent-run-activity-content").display
+        assert "Tool completed." in visible_text
         assert "call-read-file" not in visible_text
 
 
@@ -1734,7 +1901,17 @@ async def test_tool_row_updates_preserve_historical_follow_and_resize_state() ->
             )
         )
         event_id += 1
-    first_events.append(_turn_completed_event(TURN_ID, event_id))
+    first_events.append(
+        AgentEvent(
+            type="turn_failed",
+            event_id=event_id,
+            turn_id=TURN_ID,
+            created_at=NOW,
+            payload=TurnFailedPayload(
+                error=ErrorInfo(code="model_failed", message="The Agent Run failed.")
+            ),
+        )
+    )
     second_events = (
         _turn_started_event(OTHER_TURN_ID),
         _tool_started_event(OTHER_TURN_ID, 1, "later-call", "web_search", "Running web_search"),
@@ -1783,7 +1960,11 @@ async def test_tool_row_updates_preserve_historical_follow_and_resize_state() ->
         await pilot.pause()
         assert not display.is_vertical_scroll_end
         message_width = app.query_one(".message-row").outer_size.width
-        assert all(row.outer_size.width == message_width for row in app.query(".tool-row"))
+        assert all(
+            row.outer_size.width == message_width
+            for row in app.query(".tool-row")
+            if row.display and row.parent.display
+        )
 
 
 @pytest.mark.asyncio

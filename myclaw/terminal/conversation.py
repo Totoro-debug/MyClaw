@@ -36,6 +36,7 @@ from myclaw.agent.events import (
     AgentEvent,
     ConfirmationDecision,
     ConfirmationRequestedPayload,
+    ModelCallCompletedPayload,
     TextDeltaPayload,
     ToolCompletedPayload,
     ToolStartedPayload,
@@ -113,6 +114,11 @@ class _ToolRowState:
     widget: Static
     tool_name: str
     status: _ToolRowStatus
+
+
+@dataclass(slots=True)
+class _ActivityGroupState:
+    content: Vertical
 
 
 class _ConversationInput(TextArea):
@@ -976,6 +982,29 @@ class TerminalConversationApp(App[None]):
         background: transparent;
     }
 
+    .agent-run-activity-group {
+        width: 100%;
+        height: auto;
+        margin: 0 0 1 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    .agent-run-activity-heading {
+        width: 100%;
+        height: auto;
+        padding: 0 1;
+        color: $text-muted;
+        background: transparent;
+    }
+
+    .agent-run-activity-content {
+        width: 100%;
+        height: auto;
+        padding: 0;
+        background: transparent;
+    }
+
     #command-completion {
         display: none;
         overlay: screen;
@@ -1491,12 +1520,29 @@ class TerminalConversationApp(App[None]):
         assistant: Markdown | None = None
         stream: _CoalescedMarkdownStream | None = None
         streamed_fragments: list[str] = []
+        activity_group: _ActivityGroupState | None = None
         observed_tool_turns: set[UUID] = set()
         resolved_confirmations: set[UUID] = set()
         terminal_content: str | None = None
         terminal_status: str | None = None
+        terminal_completed = False
         cancelled = False
         primary_error: BaseException | None = None
+
+        async def move_candidate_to_activity(content: str) -> None:
+            nonlocal activity_group, assistant, stream
+            if stream is not None:
+                await stream.stop()
+                stream = None
+            activity_group = await self._ensure_activity_group(activity_group)
+            await self._move_assistant_to_activity(
+                assistant,
+                content,
+                activity_group,
+            )
+            assistant = None
+            streamed_fragments.clear()
+
         try:
             async for event in events:
                 if event.type == "text_delta":
@@ -1512,12 +1558,30 @@ class TerminalConversationApp(App[None]):
                         )
                     assert stream is not None
                     stream.write(payload.delta)
+                elif event.type == "model_call_completed":
+                    payload = event.payload
+                    if not isinstance(payload, ModelCallCompletedPayload):
+                        raise TypeError("model_call_completed event has an invalid payload")
+                    if payload.continues_with_tools:
+                        await move_candidate_to_activity(payload.content)
+                    elif assistant is None and payload.content:
+                        streamed_fragments.clear()
+                        streamed_fragments.append(payload.content)
+                        assistant = await self._mount_assistant(payload.content)
+                        self._scroll_to_latest()
                 elif event.type == "tool_started":
                     payload = event.payload
                     if not isinstance(payload, ToolStartedPayload):
                         raise TypeError("tool_started event has an invalid payload")
                     observed_tool_turns.add(event.turn_id)
-                    await self._show_tool_started(event.turn_id, payload)
+                    if assistant is not None:
+                        await move_candidate_to_activity("".join(streamed_fragments))
+                    activity_group = await self._ensure_activity_group(activity_group)
+                    await self._show_tool_started(
+                        event.turn_id,
+                        payload,
+                        parent=activity_group.content,
+                    )
                 elif event.type == "confirmation_requested":
                     payload = event.payload
                     if not isinstance(payload, ConfirmationRequestedPayload):
@@ -1531,7 +1595,12 @@ class TerminalConversationApp(App[None]):
                     if not isinstance(payload, ToolCompletedPayload):
                         raise TypeError("tool_completed event has an invalid payload")
                     observed_tool_turns.add(event.turn_id)
-                    await self._show_tool_completed(event.turn_id, payload)
+                    activity_group = await self._ensure_activity_group(activity_group)
+                    await self._show_tool_completed(
+                        event.turn_id,
+                        payload,
+                        parent=activity_group.content,
+                    )
                 elif event.type == "turn_completed":
                     payload = event.payload
                     if not isinstance(payload, TurnCompletedPayload):
@@ -1541,6 +1610,7 @@ class TerminalConversationApp(App[None]):
                         "Tool completion was not reported.",
                     )
                     terminal_content = payload.content
+                    terminal_completed = True
                 elif event.type == "turn_cancelled":
                     payload = event.payload
                     if not isinstance(payload, TurnCancelledPayload):
@@ -1581,18 +1651,32 @@ class TerminalConversationApp(App[None]):
         final_content = (
             terminal_content if terminal_content is not None else "".join(streamed_fragments)
         )
+        if terminal_content is not None and not final_content and terminal_status is None:
+            terminal_status = "Completed with no response."
         if (
             not cancelled
             and not self._closing
             and primary_error is None
             and not cleanup_errors
-            and (final_content or (assistant is not None and terminal_content is not None))
+            and final_content
         ):
             try:
                 if assistant is None:
                     assistant = await self._mount_assistant()
                 await assistant.update(final_content)
                 self._scroll_to_latest()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        elif (
+            not cancelled
+            and not self._closing
+            and primary_error is None
+            and not cleanup_errors
+            and assistant is not None
+        ):
+            try:
+                await self._remove_assistant_candidate(assistant)
+                assistant = None
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
         if (
@@ -1606,6 +1690,16 @@ class TerminalConversationApp(App[None]):
                 await self._mount_status(terminal_status)
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
+        if (
+            terminal_completed
+            and activity_group is not None
+            and not cancelled
+            and not self._closing
+            and primary_error is None
+            and not cleanup_errors
+        ):
+            activity_group.content.display = False
+            self._scroll_to_latest()
         try:
             await close_event_stream(events)
         except BaseException as cleanup_error:
@@ -1683,9 +1777,12 @@ class TerminalConversationApp(App[None]):
         self,
         content: str = "",
         display: _ConversationDisplay | None = None,
+        parent: Widget | None = None,
     ) -> Markdown:
         if display is None:
             display = self.query_one("#conversation-display", _ConversationDisplay)
+        if parent is None:
+            parent = display
         assistant = Markdown(
             content,
             classes=self._message_classes("assistant-message", display),
@@ -1693,11 +1790,60 @@ class TerminalConversationApp(App[None]):
             parser_factory=_markdown_parser,
         )
         row = Horizontal(classes="message-row assistant-row")
-        await display.mount(row)
+        await parent.mount(row)
         await row.mount(assistant)
         return assistant
 
-    async def _show_tool_started(self, turn_id: UUID, payload: ToolStartedPayload) -> None:
+    async def _ensure_activity_group(
+        self,
+        activity_group: _ActivityGroupState | None,
+    ) -> _ActivityGroupState:
+        if activity_group is not None:
+            return activity_group
+        display = self.query_one("#conversation-display", _ConversationDisplay)
+        container = Vertical(
+            Static(
+                "Agent Run Activity",
+                markup=False,
+                classes="agent-run-activity-heading",
+            ),
+            Vertical(classes="agent-run-activity-content"),
+            classes="agent-run-activity-group",
+        )
+        await display.mount(container)
+        content = container.query_one(".agent-run-activity-content", Vertical)
+        self._scroll_to_latest()
+        return _ActivityGroupState(content)
+
+    async def _move_assistant_to_activity(
+        self,
+        assistant: Markdown | None,
+        content: str,
+        activity_group: _ActivityGroupState,
+    ) -> None:
+        if assistant is not None:
+            await self._remove_assistant_candidate(assistant)
+        if not content:
+            return
+        await self._mount_assistant(
+            content,
+            parent=activity_group.content,
+        )
+        self._scroll_to_latest()
+
+    async def _remove_assistant_candidate(self, assistant: Markdown) -> None:
+        parent = assistant.parent
+        if isinstance(parent, Widget):
+            await parent.remove()
+        self._scroll_to_latest()
+
+    async def _show_tool_started(
+        self,
+        turn_id: UUID,
+        payload: ToolStartedPayload,
+        *,
+        parent: Widget | None = None,
+    ) -> None:
         key = _ToolRowKey(turn_id, payload.tool_call_id)
         if turn_id in self._closed_tool_turns or key in self._tool_rows:
             return
@@ -1706,9 +1852,16 @@ class TerminalConversationApp(App[None]):
             tool_name=payload.tool_name,
             status="running",
             summary=payload.summary,
+            parent=parent,
         )
 
-    async def _show_tool_completed(self, turn_id: UUID, payload: ToolCompletedPayload) -> None:
+    async def _show_tool_completed(
+        self,
+        turn_id: UUID,
+        payload: ToolCompletedPayload,
+        *,
+        parent: Widget | None = None,
+    ) -> None:
         if turn_id in self._closed_tool_turns:
             return
         key = _ToolRowKey(turn_id, payload.tool_call_id)
@@ -1719,6 +1872,7 @@ class TerminalConversationApp(App[None]):
                 tool_name=payload.tool_name,
                 status=payload.status,
                 summary=payload.summary,
+                parent=parent,
             )
             return
         if state.status != "running":
@@ -1734,9 +1888,16 @@ class TerminalConversationApp(App[None]):
         tool_name: str,
         status: _ToolRowStatus,
         summary: str,
+        parent: Widget | None = None,
     ) -> None:
         display = self.query_one("#conversation-display", _ConversationDisplay)
-        row = await self._mount_tool_message(tool_name, status, summary, display)
+        row = await self._mount_tool_message(
+            tool_name,
+            status,
+            summary,
+            display,
+            parent=parent,
+        )
         self._tool_rows[key] = _ToolRowState(row, tool_name, status)
         self._scroll_to_latest()
 
@@ -1746,13 +1907,16 @@ class TerminalConversationApp(App[None]):
         status: _ToolRowStatus,
         summary: str,
         display: _ConversationDisplay,
+        parent: Widget | None = None,
     ) -> Static:
         row = Static(
             _tool_row_content(status, tool_name, summary),
             markup=False,
             classes="tool-row",
         )
-        await display.mount(row)
+        if parent is None:
+            parent = display
+        await parent.mount(row)
         return row
 
     async def _finish_tool_turn(self, turn_id: UUID, failure_reason: str) -> None:

@@ -309,8 +309,8 @@ async def test_concurrent_foreground_sessions_write_only_to_their_own_session_lo
     first_events, second_events = await asyncio.gather(first_submit, second_submit)
     await asyncio.gather(first_runtime.close(), second_runtime.close())
 
-    assert first_events == ["turn_started", "turn_completed"]
-    assert second_events == ["turn_started", "turn_completed"]
+    assert first_events == ["turn_started", "model_call_completed", "turn_completed"]
+    assert second_events == ["turn_started", "model_call_completed", "turn_completed"]
     first_log = _session_log_text(workspace, first_runtime.session_id)
     second_log = _session_log_text(workspace, second_runtime.session_id)
     assert "marker=FIRST_SESSION" in first_log
@@ -397,12 +397,13 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
 
     assert [event.type for event in unavailable_events] == [
         "turn_started",
+        "model_call_completed",
         "tool_started",
         "tool_completed",
         "turn_failed",
     ]
-    assert isinstance(unavailable_events[2].payload, ToolCompletedPayload)
-    assert unavailable_events[2].payload.status == "error"
+    assert isinstance(unavailable_events[3].payload, ToolCompletedPayload)
+    assert unavailable_events[3].payload.status == "error"
     assert isinstance(unavailable_events[-1].payload, TurnFailedPayload)
     assert unavailable_events[-1].payload.error == ErrorInfo(
         code="model_failed",
@@ -507,12 +508,14 @@ async def test_foreground_tool_diagnostics_preserve_boundary_exception_details(
 
     assert [event.type for event in events] == [
         "turn_started",
+        "model_call_completed",
         "tool_started",
         "tool_completed",
+        "model_call_completed",
         "turn_completed",
     ]
-    assert isinstance(events[2].payload, ToolCompletedPayload)
-    assert events[2].payload.status == "error"
+    assert isinstance(events[3].payload, ToolCompletedPayload)
+    assert events[3].payload.status == "error"
     content = _session_log_text(workspace, runtime.session_id)
     assert content.count("Tool execution failed name=web_search") == 1
     assert "Traceback (most recent call last):" in content
@@ -1019,7 +1022,11 @@ async def test_prepared_repl_uses_the_effective_fallback_route_budget(
     events = [event async for event in runtime.conversation.submit("Use the fallback budget.")]
     await runtime.close()
 
-    assert [event.type for event in events] == ["turn_started", "turn_completed"]
+    assert [event.type for event in events] == [
+        "turn_started",
+        "model_call_completed",
+        "turn_completed",
+    ]
     assert provider.stream_requests
     for request in provider.stream_requests:
         assert isinstance(request, ModelRequest)

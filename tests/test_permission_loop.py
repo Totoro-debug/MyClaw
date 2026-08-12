@@ -106,10 +106,12 @@ async def test_foreground_mutations_execute_without_a_permission_pause(
 
     assert [event.type for event in events] == [
         "turn_started",
+        "model_call_completed",
         "tool_started",
         "tool_completed",
         "tool_started",
         "tool_completed",
+        "model_call_completed",
         "turn_completed",
     ]
     assert (workspace / "created.txt").read_text(encoding="utf-8") == "must not be written"

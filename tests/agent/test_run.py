@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -13,6 +14,7 @@ from myclaw.agent.run import (
     AgentRunCompletedPayload,
     AgentRunConfirmationRequestedPayload,
     AgentRunFailedPayload,
+    AgentRunModelCallCompletedPayload,
     AgentRunModelSettings,
 )
 from myclaw.agent.workspace import Workspace
@@ -194,7 +196,17 @@ async def test_agent_run_streams_chat_and_persists_one_terminal_turn(
         )
     ]
 
-    assert [payload.type for payload in payloads] == ["started", "text_delta", "completed"]
+    assert [payload.type for payload in payloads] == [
+        "started",
+        "text_delta",
+        "model_call_completed",
+        "completed",
+    ]
+    model_call = payloads[2]
+    assert isinstance(model_call, AgentRunModelCallCompletedPayload)
+    assert model_call.content == "Done."
+    assert model_call.continues_with_tools is False
+    assert {field.name for field in fields(model_call)} == {"content", "continues_with_tools"}
     assert isinstance(payloads[-1], AgentRunCompletedPayload)
     assert payloads[-1].content == "Done."
     assert sum(payload.type in {"completed", "failed", "cancelled"} for payload in payloads) == 1
@@ -241,7 +253,14 @@ async def test_agent_run_uses_non_streaming_completion_for_schedule(
         )
     ]
 
-    assert [payload.type for payload in payloads] == ["started", "completed"]
+    assert [payload.type for payload in payloads] == [
+        "started",
+        "model_call_completed",
+        "completed",
+    ]
+    assert isinstance(payloads[1], AgentRunModelCallCompletedPayload)
+    assert payloads[1].content == "Scheduled."
+    assert payloads[1].continues_with_tools is False
     assert isinstance(payloads[-1], AgentRunCompletedPayload)
     assert payloads[-1].content == "Scheduled."
     request = provider.complete_requests[0]
@@ -351,10 +370,18 @@ async def test_agent_run_keeps_tool_and_terminal_order_for_chat(
 
     assert [payload.type for payload in payloads] == [
         "started",
+        "model_call_completed",
         "tool_started",
         "tool_completed",
+        "model_call_completed",
         "completed",
     ]
+    assert isinstance(payloads[1], AgentRunModelCallCompletedPayload)
+    assert payloads[1].content == "Reading."
+    assert payloads[1].continues_with_tools is True
+    assert isinstance(payloads[4], AgentRunModelCallCompletedPayload)
+    assert payloads[4].content == "Finished."
+    assert payloads[4].continues_with_tools is False
     assert [message["role"] for message in session.messages] == [
         "user",
         "assistant",
@@ -428,6 +455,7 @@ async def test_agent_run_emits_confirmation_request_before_waiting_for_approval(
     )
 
     assert (await anext(events)).type == "started"
+    assert (await anext(events)).type == "model_call_completed"
     assert (await anext(events)).type == "tool_started"
     pending_confirmation = asyncio.create_task(anext(events))
     confirmation_payload = await pending_confirmation
@@ -440,7 +468,11 @@ async def test_agent_run_emits_confirmation_request_before_waiting_for_approval(
     channel.respond_to_confirmation(confirmation_payload.request.confirmation_id, "approved")
 
     remaining = [payload async for payload in events]
-    assert [payload.type for payload in remaining] == ["tool_completed", "completed"]
+    assert [payload.type for payload in remaining] == [
+        "tool_completed",
+        "model_call_completed",
+        "completed",
+    ]
     assert tool.calls == ["write"]
     assert [message["role"] for message in session.messages] == [
         "user",
@@ -510,6 +542,7 @@ async def test_agent_run_keeps_declined_confirmation_as_refused_tool_result(
     )
 
     assert (await anext(events)).type == "started"
+    assert (await anext(events)).type == "model_call_completed"
     assert (await anext(events)).type == "tool_started"
     pending_confirmation = asyncio.create_task(anext(events))
     confirmation_payload = await pending_confirmation
@@ -517,7 +550,11 @@ async def test_agent_run_keeps_declined_confirmation_as_refused_tool_result(
     channel.respond_to_confirmation(confirmation_payload.request.confirmation_id, "declined")
 
     remaining = [payload async for payload in events]
-    assert [payload.type for payload in remaining] == ["tool_completed", "completed"]
+    assert [payload.type for payload in remaining] == [
+        "tool_completed",
+        "model_call_completed",
+        "completed",
+    ]
     assert tool.calls == []
     assert session.messages[2]["status"] == "refused"
     assert session.messages[2]["content"] == "Tool confirmation was declined."
@@ -594,7 +631,11 @@ async def test_agent_run_freezes_memory_prompt_and_tools_and_prepares_summary_pe
         )
     ]
 
-    assert [payload.type for payload in payloads] == ["started", "completed"]
+    assert [payload.type for payload in payloads] == [
+        "started",
+        "model_call_completed",
+        "completed",
+    ]
     assert memory_reads == 1
     assert summary_routes == ["chat"]
     assert summary_budgets == [(4096, 1024, "system:memory-1", 0)]
@@ -824,6 +865,7 @@ async def test_agent_run_repairs_unfinished_tool_calls_on_cooperative_cancellati
 
     assert [payload.type for payload in payloads] == [
         "started",
+        "model_call_completed",
         "tool_started",
         "tool_completed",
         "cancelled",
@@ -888,8 +930,10 @@ async def test_agent_run_keeps_tool_order_for_schedule_completion(
 
     assert [payload.type for payload in payloads] == [
         "started",
+        "model_call_completed",
         "tool_started",
         "tool_completed",
+        "model_call_completed",
         "completed",
     ]
     complete_requests = [cast(ModelRequest, request) for request in provider.complete_requests]
@@ -1129,8 +1173,10 @@ async def test_noninteractive_schedule_refusal_does_not_emit_confirmation_reques
 
     assert [payload.type for payload in payloads] == [
         "started",
+        "model_call_completed",
         "tool_started",
         "tool_completed",
+        "model_call_completed",
         "completed",
     ]
     assert tool.calls == []
@@ -1179,6 +1225,7 @@ async def test_closing_after_terminal_does_not_repair_completed_state(
 
     assert (await anext(events)).type == "started"
     assert (await anext(events)).type == "text_delta"
+    assert (await anext(events)).type == "model_call_completed"
     assert (await anext(events)).type == "completed"
     messages_at_terminal = list(session.messages)
     await events.aclose()
@@ -1245,6 +1292,7 @@ async def test_consumer_close_cancels_confirmation_operation_before_returning(
     )
 
     assert (await anext(events)).type == "started"
+    assert (await anext(events)).type == "model_call_completed"
     assert (await anext(events)).type == "tool_started"
     assert (await anext(events)).type == "confirmation_requested"
     await channel.started.wait()
@@ -1314,6 +1362,7 @@ async def test_cancellation_after_approval_propagates_to_the_running_tool(
     )
 
     assert (await anext(events)).type == "started"
+    assert (await anext(events)).type == "model_call_completed"
     assert (await anext(events)).type == "tool_started"
     pending_confirmation = asyncio.create_task(anext(events))
     confirmation_payload = await pending_confirmation
@@ -1433,7 +1482,12 @@ async def test_tool_publication_failure_repairs_provider_order_with_failure_resu
         )
     ]
 
-    assert [payload.type for payload in payloads] == ["started", "tool_started", "failed"]
+    assert [payload.type for payload in payloads] == [
+        "started",
+        "model_call_completed",
+        "tool_started",
+        "failed",
+    ]
     assert [message["role"] for message in session.messages] == [
         "user",
         "assistant",

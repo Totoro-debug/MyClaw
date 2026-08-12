@@ -6,11 +6,16 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.events import ConfirmationRequestedPayload, ToolCompletedPayload
+from myclaw.agent.events import (
+    ConfirmationRequestedPayload,
+    ModelCallCompletedPayload,
+    ToolCompletedPayload,
+)
 from myclaw.agent.run import (
     AgentRunCompletedPayload,
     AgentRunConfirmationRequestedPayload,
     AgentRunInterface,
+    AgentRunModelCallCompletedPayload,
     AgentRunPayload,
     AgentRunRoute,
     AgentRunStartedPayload,
@@ -78,6 +83,10 @@ class _ScriptedAgentRun(AgentRunInterface):
             await asyncio.sleep(0)
             yield AgentRunStartedPayload()
             yield AgentRunTextDeltaPayload(delta="Working")
+            yield AgentRunModelCallCompletedPayload(
+                content="Working",
+                continues_with_tools=True,
+            )
             yield AgentRunToolStartedPayload(
                 tool_call_id="call_confirm",
                 tool_name="schedule",
@@ -141,7 +150,17 @@ async def test_conversation_port_maps_agent_run_and_accepts_separate_confirmatio
     events = conversation.submit("Add a schedule.")
     assert (await anext(events)).type == "turn_started"
     assert (await anext(events)).type == "text_delta"
-    assert (await anext(events)).type == "tool_started"
+    model_call_completed = await anext(events)
+    assert model_call_completed.type == "model_call_completed"
+    assert isinstance(model_call_completed.payload, ModelCallCompletedPayload)
+    assert model_call_completed.turn_id == TURN_UUID
+    assert model_call_completed.event_id == 2
+    assert model_call_completed.payload.content == "Working"
+    assert model_call_completed.payload.continues_with_tools is True
+    tool_started = await anext(events)
+    assert tool_started.type == "tool_started"
+    assert tool_started.turn_id == TURN_UUID
+    assert tool_started.event_id == 3
     confirmation = await anext(events)
     assert confirmation.type == "confirmation_requested"
     assert isinstance(confirmation.payload, ConfirmationRequestedPayload)
@@ -158,7 +177,10 @@ async def test_conversation_port_maps_agent_run_and_accepts_separate_confirmatio
     assert confirmation.payload.details == {"message": "Remember this"}
     conversation.respond_to_confirmation(confirmation.payload.confirmation_id, "approved")
 
-    assert [event.type async for event in events] == ["tool_completed", "turn_completed"]
+    assert [event.type async for event in events] == [
+        "tool_completed",
+        "turn_completed",
+    ]
     assert agent_run.calls == [(session, "Add a schedule.", "chat", True, agent_run.calls[0][4])]
     await events.aclose()
 
@@ -231,6 +253,7 @@ async def test_foreground_confirmation_reply_is_not_added_as_a_session_user_mess
 
     events = conversation.submit("Create a job.")
     assert (await anext(events)).type == "turn_started"
+    assert (await anext(events)).type == "model_call_completed"
     assert (await anext(events)).type == "tool_started"
     requested = await anext(events)
     assert requested.type == "confirmation_requested"
@@ -238,7 +261,11 @@ async def test_foreground_confirmation_reply_is_not_added_as_a_session_user_mess
     assert requested.payload.tool_name == "schedule"
     conversation.respond_to_confirmation(requested.payload.confirmation_id, "approved")
 
-    assert [event.type async for event in events] == ["tool_completed", "turn_completed"]
+    assert [event.type async for event in events] == [
+        "tool_completed",
+        "model_call_completed",
+        "turn_completed",
+    ]
     assert [message["role"] for message in session.messages] == [
         "user",
         "assistant",
@@ -301,6 +328,7 @@ async def test_cancelling_a_foreground_confirmation_emits_cancelled_and_repairs_
 
     events = conversation.submit("Create a job.")
     assert (await anext(events)).type == "turn_started"
+    assert (await anext(events)).type == "model_call_completed"
     assert (await anext(events)).type == "tool_started"
     assert (await anext(events)).type == "confirmation_requested"
 

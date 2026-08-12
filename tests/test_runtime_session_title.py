@@ -143,7 +143,8 @@ async def test_title_finishing_before_chat_does_not_publish_an_intermediate_snap
     assert replacements == []
 
     provider.release_chat.set()
-    assert (await terminal).type == "turn_completed"
+    assert (await terminal).type == "model_call_completed"
+    assert (await anext(events)).type == "turn_completed"
     with pytest.raises(StopAsyncIteration):
         await anext(events)
     await asyncio.sleep(0)
@@ -183,7 +184,11 @@ async def test_prepared_runtime_uses_an_isolated_chat_stream_for_session_title(
             break
         await asyncio.sleep(0)
 
-    assert event_types == ["turn_started", "turn_completed"]
+    assert event_types == [
+        "turn_started",
+        "model_call_completed",
+        "turn_completed",
+    ]
     assert len(provider.requests) == 2
     title_request = next(
         request

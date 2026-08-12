@@ -396,7 +396,11 @@ async def test_active_conversation_prepares_summary_before_chat_request(
 
     events = [event async for event in conversation.submit("Current question.")]
 
-    assert [event.type for event in events] == ["turn_started", "turn_completed"]
+    assert [event.type for event in events] == [
+        "turn_started",
+        "model_call_completed",
+        "turn_completed",
+    ]
     assert session.last_consolidated == 2
     request = provider.stream_requests[0]
     assert isinstance(request, ModelRequest)

@@ -14,6 +14,7 @@ from myclaw.agent.run import (
     AgentRunCompletedPayload,
     AgentRunFailedPayload,
     AgentRunInterface,
+    AgentRunModelCallCompletedPayload,
     AgentRunPayload,
     AgentRunStartedPayload,
 )
@@ -112,6 +113,10 @@ class RecordingAgentRun(AgentRunInterface):
                 },
             )
             yield AgentRunStartedPayload()
+            yield AgentRunModelCallCompletedPayload(
+                content="Done.",
+                continues_with_tools=False,
+            )
             yield AgentRunCompletedPayload(
                 content="Done.",
                 usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),

@@ -94,6 +94,15 @@ class AgentRunToolCompletedPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentRunModelCallCompletedPayload:
+    """Complete text and phase classification for one nonterminal model call."""
+
+    type: ClassVar[Literal["model_call_completed"]] = "model_call_completed"
+    content: str
+    continues_with_tools: bool
+
+
+@dataclass(frozen=True, slots=True)
 class AgentRunCompletedPayload:
     type: ClassVar[Literal["completed"]] = "completed"
     content: str
@@ -118,6 +127,7 @@ type AgentRunPayload = (
     | AgentRunToolStartedPayload
     | AgentRunConfirmationRequestedPayload
     | AgentRunToolCompletedPayload
+    | AgentRunModelCallCompletedPayload
     | AgentRunCompletedPayload
     | AgentRunFailedPayload
     | AgentRunCancelledPayload
@@ -362,10 +372,16 @@ class AgentRun:
                         error=None,
                         token_usage={"model_calls": 1, **response.usage.to_dict()},
                     )
+                    continues_with_tools = bool(response.message.tool_calls and gateway is not None)
+                    yield AgentRunModelCallCompletedPayload(
+                        content=response.message.content,
+                        continues_with_tools=continues_with_tools,
+                    )
                     partial_content.clear()
                     await _close_iterator(events)
                     events = None
-                    if response.message.tool_calls and gateway is not None:
+                    if continues_with_tools:
+                        assert gateway is not None
                         pending_tool_calls = list(response.message.tool_calls)
                         for tool_call in response.message.tool_calls:
                             yield AgentRunToolStartedPayload(
@@ -942,6 +958,7 @@ __all__ = [
     "AgentRunConfirmationRequestedPayload",
     "AgentRunFailedPayload",
     "AgentRunInterface",
+    "AgentRunModelCallCompletedPayload",
     "AgentRunModelSettings",
     "AgentRunPayload",
     "AgentRunRoute",

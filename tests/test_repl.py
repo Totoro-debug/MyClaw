@@ -7,6 +7,13 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.events import (
+    AgentEvent,
+    ModelCallCompletedPayload,
+    TextDeltaPayload,
+    TurnCompletedPayload,
+    TurnStartedPayload,
+)
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -79,6 +86,51 @@ class CancelOnFirstDeltaWriter(RecordingProgressiveWriter):
         if not self._cancelled:
             self._cancelled = True
             raise asyncio.CancelledError
+
+
+class ModelCompletionReplConversation:
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        del text
+        yield AgentEvent(
+            type="turn_started",
+            event_id=0,
+            turn_id=TURN_UUID,
+            created_at=NOW,
+            payload=TurnStartedPayload(),
+        )
+        yield AgentEvent(
+            type="text_delta",
+            event_id=1,
+            turn_id=TURN_UUID,
+            created_at=NOW,
+            payload=TextDeltaPayload(delta="Answer."),
+        )
+        yield AgentEvent(
+            type="model_call_completed",
+            event_id=2,
+            turn_id=TURN_UUID,
+            created_at=NOW,
+            payload=ModelCallCompletedPayload(
+                content="Answer.",
+                continues_with_tools=False,
+            ),
+        )
+        yield AgentEvent(
+            type="turn_completed",
+            event_id=3,
+            turn_id=TURN_UUID,
+            created_at=NOW,
+            payload=TurnCompletedPayload(
+                content="Answer.",
+                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            ),
+        )
+
+    async def cancel_active_turn(self) -> None:
+        pass
+
+    def respond_to_confirmation(self, confirmation_id: UUID, decision: str) -> None:
+        del confirmation_id, decision
 
 
 @pytest.mark.asyncio
@@ -213,6 +265,19 @@ async def test_repl_writes_each_text_delta_progressively_then_finishes_once(
         ("delta", "inspect the files."),
         ("finish", ""),
     ]
+
+
+@pytest.mark.asyncio
+async def test_repl_ignores_nonterminal_model_completion_without_duplicate_output() -> None:
+    writer = RecordingProgressiveWriter()
+
+    await run_repl(
+        conversation=ModelCompletionReplConversation(),
+        input_reader=ScriptedReplInput(("Answer this.", None)),
+        writer=writer,
+    )
+
+    assert writer.operations == [("delta", "Answer."), ("finish", "")]
 
 
 @pytest.mark.asyncio

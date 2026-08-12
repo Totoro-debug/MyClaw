@@ -563,6 +563,7 @@ adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不
 | --- | --- | --- |
 | `turn_started` | `{}` | 前台 turn 接受并开始 |
 | `text_delta` | `{delta}` | chat streaming 文本 |
+| `model_call_completed` | `{content, continues_with_tools}` | 一个已发布到 Session 的 model call 的完整文本和是否继续执行 Tool；非终态，不含 Tool、Provider、usage 或 route 元数据 |
 | `tool_started` | `{tool_call_id, tool_name, summary}` | 不含完整 arguments |
 | `confirmation_requested` | `{confirmation_id, tool_call_id, tool_name, reason, summary, details, warnings}` | 等待当前前台 Agent Run 的一次性确认 |
 | `tool_completed` | `{tool_call_id, tool_name, status, summary}` | 不含完整 raw result |
@@ -571,6 +572,8 @@ adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不
 | `turn_cancelled` | `{partial_content}` | Ctrl+C 终态 |
 
 事件状态 summary 最长 240 字符。tool argument 和 raw result 不进入普通 tool activity event。Tool Confirmation 的规范化 details 只出现在 `confirmation_requested`，确认回复不进入 Session message。
+
+每个完成的 model call 恰好发出一个 `model_call_completed`，它出现在对应 Session publication 之后；当 `continues_with_tools` 为 true 时，它位于对应的 `tool_started` 事件之前。一个 Agent Run 仍恰好只有一个 `turn_completed`、`turn_failed` 或 `turn_cancelled` 终态事件。
 
 ### 10.3 Conversation Port
 

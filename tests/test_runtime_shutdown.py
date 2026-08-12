@@ -567,7 +567,11 @@ async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_p
 
     assert isinstance(first_outcome, asyncio.CancelledError)
     assert provider.stream_requests == []
-    assert await submit("Continue after interrupt.") == ["turn_started", "turn_completed"]
+    assert await submit("Continue after interrupt.") == [
+        "turn_started",
+        "model_call_completed",
+        "turn_completed",
+    ]
     await conversation.close()
 
 
@@ -641,7 +645,11 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
         before_submit=before_submit,
         on_foreground_terminal=lambda: None,
     )
-    assert await submit("Create the delegate.") == ["turn_started", "turn_completed"]
+    assert await submit("Create the delegate.") == [
+        "turn_started",
+        "model_call_completed",
+        "turn_completed",
+    ]
     blocked_submit = asyncio.create_task(submit("Interrupt before the second delegate call."))
     await before_started.wait()
 
@@ -660,7 +668,11 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
 
     assert isinstance(blocked_outcome, asyncio.CancelledError)
     assert len(provider.stream_requests) == 1
-    assert await submit("Continue with the delegate.") == ["turn_started", "turn_completed"]
+    assert await submit("Continue with the delegate.") == [
+        "turn_started",
+        "model_call_completed",
+        "turn_completed",
+    ]
     await conversation.close()
 
 
