@@ -108,6 +108,35 @@ class _BlockingStreamProvider:
         return None
 
 
+class _CompletedToolCallStreamProvider:
+    def __init__(self, tool_call: ModelToolCall) -> None:
+        self._tool_call = tool_call
+        self.stream_closed = False
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        try:
+            yield TextDelta(delta="Need a Tool.")
+            yield ModelCompleted(
+                response=ModelResponse(
+                    message=AssistantModelMessage(
+                        content="Need a Tool.",
+                        tool_calls=(self._tool_call,),
+                    ),
+                    usage=ModelUsage(input_tokens=4, output_tokens=3, total_tokens=7),
+                    finish_reason="tool_calls",
+                )
+            )
+        finally:
+            self.stream_closed = True
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        raise AssertionError(f"Unexpected completion request: {request!r}")
+
+    async def close(self) -> None:
+        return None
+
+
 class _BlockingConfirmedTool(_ConfirmingTool):
     action: str
 
@@ -1049,6 +1078,63 @@ async def test_agent_run_closes_and_repairs_when_consumer_abandons_stream(
     assert provider.closed is True
     assert session.messages[-1]["status"] == "interrupted"
     assert session.messages[-1]["content"] == "Partial."
+    assert persist_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_model_call_completion_commits_internal_state_before_consumer_close(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    session = Session.create(state, now=lambda: NOW)
+    tool_call = ModelToolCall(
+        id="call_completed_before_close",
+        name="read_file",
+        arguments='{"path":"notes.md"}',
+    )
+    provider = _CompletedToolCallStreamProvider(tool_call)
+    gateway = SingleToolGateway(
+        (FakeTool(name="read_file", description="Read a file.", outcomes=("contents",)),)
+    )
+    persist_calls = 0
+
+    def persist() -> None:
+        nonlocal persist_calls
+        persist_calls += 1
+
+    monkeypatch.setattr(session, "persist", persist)
+    run = AgentRun(
+        provider=provider,
+        settings=_settings(),
+        now=lambda: NOW,
+        new_uuid=lambda: REQUEST_UUID,
+        tool_gateway=gateway,
+    )
+    events = run.run_agent(
+        session,
+        "Read the notes.",
+        route="chat",
+        stream=True,
+    )
+
+    assert (await anext(events)).type == "started"
+    assert (await anext(events)).type == "text_delta"
+    assert (await anext(events)).type == "model_call_completed"
+    await events.aclose()
+
+    assert provider.stream_closed is True
+    assert [message["role"] for message in session.messages] == ["user", "assistant", "tool"]
+    assert session.messages[1]["status"] == "completed"
+    assert session.messages[1]["content"] == "Need a Tool."
+    assert session.messages[1]["tool_calls"] == [tool_call.to_dict()]
+    assert session.messages[2]["tool_call_id"] == tool_call.id
+    assert session.messages[2]["status"] == "error"
+    assert session.messages[2]["content"] == (
+        "Tool call interrupted because the turn was cancelled."
+    )
     assert persist_calls == 1
 
 

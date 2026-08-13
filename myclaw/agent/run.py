@@ -373,16 +373,17 @@ class AgentRun:
                         token_usage={"model_calls": 1, **response.usage.to_dict()},
                     )
                     continues_with_tools = bool(response.message.tool_calls and gateway is not None)
+                    partial_content.clear()
+                    if continues_with_tools:
+                        pending_tool_calls = list(response.message.tool_calls)
+                    await _close_iterator(events)
+                    events = None
                     yield AgentRunModelCallCompletedPayload(
                         content=response.message.content,
                         continues_with_tools=continues_with_tools,
                     )
-                    partial_content.clear()
-                    await _close_iterator(events)
-                    events = None
                     if continues_with_tools:
                         assert gateway is not None
-                        pending_tool_calls = list(response.message.tool_calls)
                         for tool_call in response.message.tool_calls:
                             yield AgentRunToolStartedPayload(
                                 tool_call_id=tool_call.id,
