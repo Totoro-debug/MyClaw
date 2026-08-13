@@ -5,9 +5,10 @@ from __future__ import annotations
 import re
 import sys
 from asyncio import CancelledError, Event, Task, create_task, sleep
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from time import monotonic as monotonic_now
 from typing import ClassVar, Final, Literal, Protocol, cast
@@ -158,6 +159,22 @@ class _AgentRunTiming:
     outcome: _TerminalOutcome | None = None
     timer: Timer | None = None
     group: _ActivityGroupState | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PersistedMessageProjection:
+    message: Mapping[str, object]
+    role: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalRunProjection:
+    activity: tuple[_PersistedMessageProjection, ...]
+    final: _PersistedMessageProjection | None
+    terminal_statuses: tuple[str, ...]
+    outcome: _TerminalOutcome | None
+    elapsed: float
 
 
 class _ConversationInput(TextArea):
@@ -1383,6 +1400,7 @@ class TerminalConversationApp(App[None]):
         self._closing = False
         self._application_error: Exception | None = None
         self._run_timing: _AgentRunTiming | None = None
+        self._activity_groups: list[_ActivityGroupState] = []
 
     def _handle_exception(self, error: Exception) -> None:
         if self._application_error is None:
@@ -1517,6 +1535,7 @@ class TerminalConversationApp(App[None]):
         del event
         self._closing = True
         self._stop_run_timing()
+        self._clear_activity_group_references()
         cleanup_errors: list[BaseException] = []
         try:
             if self._turn_worker is not None:
@@ -2222,10 +2241,27 @@ class TerminalConversationApp(App[None]):
             timing.elapsed = max(0.0, self._monotonic() - timing.started_at)
         expanded = timing is None or timing.outcome != "completed"
         toggleable = timing is not None and timing.outcome is not None
+        return await self._mount_activity_group(
+            display,
+            expanded=expanded,
+            toggleable=toggleable,
+            elapsed=0.0 if timing is None else timing.elapsed,
+            timing=timing,
+        )
+
+    async def _mount_activity_group(
+        self,
+        display: _ConversationDisplay,
+        *,
+        expanded: bool,
+        toggleable: bool,
+        elapsed: float,
+        timing: _AgentRunTiming | None = None,
+    ) -> _ActivityGroupState:
         heading = _ActivityGroupHeading(
             _activity_group_heading_text(
                 expanded=expanded,
-                elapsed=0.0 if timing is None else timing.elapsed,
+                elapsed=elapsed,
             ),
             markup=False,
             classes="agent-run-activity-heading",
@@ -2242,11 +2278,14 @@ class TerminalConversationApp(App[None]):
             content=content,
             expanded=expanded,
             toggleable=toggleable,
-            elapsed=0.0 if timing is None else timing.elapsed,
+            elapsed=elapsed,
         )
         heading.activity_group = state
+        self._activity_groups.append(state)
         if timing is not None:
             timing.group = state
+        if timing is None and not expanded:
+            content.display = False
         self._scroll_to_latest()
         return state
 
@@ -2309,9 +2348,16 @@ class TerminalConversationApp(App[None]):
     def _stop_run_timing(self) -> None:
         timing = self._run_timing
         self._run_timing = None
-        if timing is not None and timing.timer is not None:
-            timing.timer.stop()
-            timing.timer = None
+        if timing is not None:
+            timing.group = None
+            if timing.timer is not None:
+                timing.timer.stop()
+                timing.timer = None
+
+    def _clear_activity_group_references(self) -> None:
+        for activity_group in self._activity_groups:
+            activity_group.heading.activity_group = None
+        self._activity_groups.clear()
 
     def _set_activity_group_expanded(
         self,
@@ -2479,19 +2525,46 @@ class TerminalConversationApp(App[None]):
         authority = self._runtime.session
         if authority.session_id != expected_session_id:
             return False
-        projected_messages = tuple(
-            (message, *_persisted_role_and_content(message)) for message in authority.messages
-        )
+        projected_messages = tuple(authority.messages)
         if self._runtime.session is not authority:
             return False
 
         self._stop_run_timing()
+        self._clear_activity_group_references()
         display = self.query_one("#conversation-display", _ConversationDisplay)
         await display.remove_children()
         self._tool_rows.clear()
         self._closed_tool_turns.clear()
-        for message, role, content in projected_messages:
-            await self._mount_persisted_message(message, role, content, display)
+        for partition in _persisted_message_partitions(projected_messages):
+            historical = _classify_historical_partition(partition)
+            if historical is None:
+                for message in partition:
+                    role, content = _persisted_role_and_content(message)
+                    await self._mount_persisted_message(message, role, content, display)
+                continue
+
+            user = partition[0]
+            role, content = _persisted_role_and_content(user)
+            await self._mount_persisted_message(user, role, content, display)
+            if historical.activity:
+                group = await self._mount_activity_group(
+                    display,
+                    expanded=historical.outcome != "completed",
+                    toggleable=True,
+                    elapsed=historical.elapsed,
+                )
+                for item in historical.activity:
+                    await self._mount_persisted_activity_message(item, display, group.content)
+            if historical.final is not None and historical.final.content.strip():
+                final = historical.final
+                await self._mount_persisted_message(
+                    final.message,
+                    final.role,
+                    final.content,
+                    display,
+                )
+            for status in historical.terminal_statuses:
+                await display.mount(Static(status, markup=False, classes="turn-status"))
         display.reset_to_latest()
         return self._runtime.session is authority
 
@@ -2501,24 +2574,50 @@ class TerminalConversationApp(App[None]):
         role: str,
         content: str,
         display: _ConversationDisplay,
+        *,
+        parent: Widget | None = None,
     ) -> None:
         if role == "user":
             await self._mount_user_message(content, display)
             return
         if role == "assistant":
             if content:
-                await self._mount_assistant(content, display)
+                await self._mount_assistant(content, display, parent=parent)
             status = _persisted_assistant_status(message)
             if status is not None:
                 await display.mount(Static(status, markup=False, classes="turn-status"))
             return
         if role == "tool":
-            await self._mount_tool_message(
-                cast(str, message["name"]),
-                cast(_ToolRowStatus, message["status"]),
-                content,
-                display,
-            )
+            await self._mount_persisted_tool_message(message, display, parent=parent)
+
+    async def _mount_persisted_activity_message(
+        self,
+        item: _PersistedMessageProjection,
+        display: _ConversationDisplay,
+        parent: Widget,
+    ) -> None:
+        if item.role == "assistant":
+            if item.content:
+                await self._mount_assistant(item.content, display, parent=parent)
+            return
+        if item.role == "tool":
+            await self._mount_persisted_tool_message(item.message, display, parent=parent)
+
+    async def _mount_persisted_tool_message(
+        self,
+        message: Mapping[str, object],
+        display: _ConversationDisplay,
+        *,
+        parent: Widget | None = None,
+    ) -> None:
+        # Persisted Tool content is a raw result, not a display-safe activity summary.
+        await self._mount_tool_message(
+            cast(str, message["name"]),
+            cast(_ToolRowStatus, message["status"]),
+            "",
+            display,
+            parent=parent,
+        )
 
     async def _open_resume_picker(
         self,
@@ -2662,6 +2761,161 @@ def _persisted_assistant_status(message: Mapping[str, object]) -> str | None:
         if isinstance(detail, str) and detail:
             return detail
     return "Turn failed."
+
+
+def _persisted_message_partitions(
+    messages: Sequence[Mapping[str, object]],
+) -> tuple[tuple[Mapping[str, object], ...], ...]:
+    """Split persisted messages into user-owned historical run candidates."""
+    partitions: list[tuple[Mapping[str, object], ...]] = []
+    current: list[Mapping[str, object]] = []
+    seen_user = False
+    for message in messages:
+        if message.get("role") == "user":
+            if current:
+                partitions.append(tuple(current))
+            current = [message]
+            seen_user = True
+        elif seen_user:
+            current.append(message)
+        else:
+            partitions.append((message,))
+    if current:
+        partitions.append(tuple(current))
+    return tuple(partitions)
+
+
+def _classify_historical_partition(
+    partition: Sequence[Mapping[str, object]],
+) -> _HistoricalRunProjection | None:
+    """Infer one tolerant historical Agent Run projection from persisted messages."""
+    if not partition or partition[0].get("role") != "user":
+        return None
+
+    projected: list[_PersistedMessageProjection] = []
+    timestamps: list[datetime | None] = []
+    for message in partition:
+        try:
+            role, content = _persisted_role_and_content(message)
+        except (TypeError, ValueError):
+            return None
+        if role == "assistant" and not isinstance(message.get("tool_calls"), list):
+            return None
+        projected.append(_PersistedMessageProjection(message, role, content))
+        timestamps.append(_persisted_message_timestamp(message))
+
+    declared_tool_call_ids: set[str] = set()
+    completed_tool_call_ids: set[str] = set()
+    for item in projected:
+        if item.role == "assistant":
+            for tool_call in cast(list[object], item.message["tool_calls"]):
+                if not isinstance(tool_call, dict) or not isinstance(tool_call.get("id"), str):
+                    return None
+                tool_call_id = cast(str, tool_call["id"])
+                if tool_call_id in declared_tool_call_ids:
+                    return None
+                declared_tool_call_ids.add(tool_call_id)
+            continue
+        if item.role != "tool":
+            continue
+        result_tool_call_id = item.message.get("tool_call_id")
+        if (
+            not isinstance(result_tool_call_id, str)
+            or result_tool_call_id not in declared_tool_call_ids
+            or result_tool_call_id in completed_tool_call_ids
+        ):
+            return None
+        completed_tool_call_ids.add(result_tool_call_id)
+
+    user_timestamp = timestamps[0]
+    if user_timestamp is None:
+        return None
+
+    terminal_index: int | None = None
+    terminal_kind: _TerminalOutcome | None = None
+    for index, item in enumerate(projected[1:], start=1):
+        if item.role != "assistant":
+            continue
+        status = item.message.get("status")
+        if status == "completed" and not cast(list[object], item.message["tool_calls"]):
+            terminal_index = index
+            terminal_kind = "completed"
+        elif status == "interrupted":
+            terminal_index = index
+            terminal_kind = "cancelled"
+        elif status == "error":
+            terminal_index = index
+            terminal_kind = "failed"
+
+    if terminal_kind == "completed" and terminal_index != len(projected) - 1:
+        return None
+
+    final = (
+        projected[terminal_index]
+        if terminal_kind == "completed" and terminal_index is not None
+        else None
+    )
+    activity_items = projected[1:]
+    if final is not None:
+        activity_items = projected[1:terminal_index]
+    activity = tuple(
+        item
+        for item in activity_items
+        if item.role == "tool" or (item.role == "assistant" and bool(item.content.strip()))
+    )
+
+    terminal_statuses: list[str] = []
+    endpoint: datetime | None
+    if terminal_kind == "completed" and final is not None:
+        endpoint = timestamps[terminal_index] if terminal_index is not None else None
+        if endpoint is None:
+            return None
+        if not final.content.strip():
+            terminal_statuses.append("Completed with no response.")
+        for item in projected[1:terminal_index]:
+            if item.role != "assistant":
+                continue
+            status = _persisted_assistant_status(item.message)
+            if status is not None:
+                terminal_statuses.append(status)
+    elif terminal_kind in {"cancelled", "failed"} and terminal_index is not None:
+        endpoint = timestamps[terminal_index]
+        if endpoint is None:
+            return None
+        for item in projected[1:]:
+            if item.role != "assistant":
+                continue
+            status = _persisted_assistant_status(item.message)
+            if status is not None:
+                terminal_statuses.append(status)
+    else:
+        endpoint = timestamps[-1]
+        if endpoint is None:
+            return None
+
+    if not activity and final is None and not terminal_statuses:
+        return None
+    elapsed = max(0.0, (endpoint - user_timestamp).total_seconds())
+    return _HistoricalRunProjection(
+        activity=activity,
+        final=final,
+        terminal_statuses=tuple(terminal_statuses),
+        outcome=terminal_kind,
+        elapsed=elapsed,
+    )
+
+
+def _persisted_message_timestamp(message: Mapping[str, object]) -> datetime | None:
+    timestamp = message.get("timestamp")
+    if not isinstance(timestamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
 
 
 def _friendly_tool_name(tool_name: str) -> str:

@@ -4,7 +4,7 @@ import asyncio
 import json
 import sys
 from collections.abc import AsyncIterator, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar, Literal, cast
 from uuid import UUID
@@ -1594,9 +1594,7 @@ async def test_first_terminal_event_finishes_without_waiting_for_more_events() -
         group = app.query_one(".agent-run-activity-group")
         assert not group.query_one(".agent-run-activity-content").display
         assert "final response" in _visible_screen_text(app)
-        assert _tool_row_texts(app) == [
-            "Failed: read_file - Tool completion was not reported."
-        ]
+        assert _tool_row_texts(app) == ["Failed: read_file - Tool completion was not reported."]
         assert conversation.closed.is_set()
 
 
@@ -4453,7 +4451,7 @@ async def test_resume_selection_rebuilds_the_display_from_the_selected_session(
     )
     target.add_message(
         "tool",
-        "api_key=private",
+        "STDERR permission denied; STDOUT secret bytes",
         tool_call_id="call-error",
         name="exec",
         status="error",
@@ -4530,6 +4528,9 @@ async def test_resume_selection_rebuilds_the_display_from_the_selected_session(
         assert "call-error" not in visible_text
         assert "call-refused" not in visible_text
         assert "api_key" not in visible_text
+        assert "STDERR" not in visible_text
+        assert "STDOUT" not in visible_text
+        assert "secret bytes" not in visible_text
         assert visible_text.index("Persisted answer.") < visible_text.index("Completed: read_file")
         assert visible_text.index("Completed: read_file") < visible_text.index("Failed: exec")
         assert visible_text.index("Failed: exec") < visible_text.index("Rejected: web_fetch")
@@ -4539,6 +4540,405 @@ async def test_resume_selection_rebuilds_the_display_from_the_selected_session(
         assert "Command: /status" not in visible_text
         assert "Command: /resume" not in visible_text
         assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+
+@pytest.mark.asyncio
+async def test_resume_rebuilds_a_successful_tool_run_activity_group(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(10))
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: next(timestamps),
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Restored tool run")
+    target.add_message("user", "Read the file.")
+    target.add_message(
+        "assistant",
+        "I will inspect it first.",
+        tool_calls=[{"id": "call-restored", "name": "read_file", "arguments": '{"path":"x"}'}],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.add_message(
+        "tool",
+        "private result",
+        tool_call_id="call-restored",
+        name="read_file",
+        status="success",
+        artifact=None,
+    )
+    target.add_message(
+        "assistant",
+        "The file is ready.",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while (
+                runtime.session.session_id != target.session_id
+                or "The file is ready." not in _visible_screen_text(app)
+            ):
+                await pilot.pause()
+
+        group = app.query_one(".agent-run-activity-group")
+        activity = group.query_one(".agent-run-activity-content")
+        visible_text = _visible_screen_text(app)
+
+        assert "The file is ready." in visible_text
+        assert activity.query_one(Markdown).source == "I will inspect it first."
+        assert not activity.display
+        assert "\u25b6 3s" in visible_text
+        await pilot.click(".agent-run-activity-heading")
+        visible_text = _visible_screen_text(app)
+        assert "private result" not in visible_text
+        assert "Completed: read_file" in visible_text
+        assert visible_text.index("I will inspect it first.") < visible_text.index(
+            "Completed: read_file"
+        )
+        assert visible_text.index("Completed: read_file") < visible_text.index("The file is ready.")
+
+
+@pytest.mark.asyncio
+async def test_resume_uses_the_last_completed_no_tool_assistant_as_final_response(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(12))
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: next(timestamps),
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Multiple final candidates")
+    target.add_message("user", "First question")
+    target.add_message(
+        "assistant",
+        "Earlier activity.",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.add_message(
+        "assistant",
+        "Final answer.",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.add_message("user", "Second question")
+    target.add_message(
+        "assistant",
+        "   ",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while "Final answer." not in _visible_screen_text(app):
+                await pilot.pause()
+
+        groups = list(app.query(".agent-run-activity-group"))
+        assert len(groups) == 1
+        group = groups[0]
+        activity = group.query_one(".agent-run-activity-content")
+        visible_text = _visible_screen_text(app)
+        assert "Final answer." in visible_text
+        assert "\u25b6 2s" in visible_text
+        assert not activity.display
+        assert "Earlier activity." not in visible_text
+        assert "Completed with no response." in visible_text
+
+        await pilot.click(".agent-run-activity-heading")
+        visible_text = _visible_screen_text(app)
+        assert "Earlier activity." in visible_text
+        assert visible_text.index("Earlier activity.") < visible_text.index("Final answer.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error", "expected_status"),
+    [
+        (
+            "interrupted",
+            {"code": "turn_cancelled", "message": "cancelled"},
+            "Turn cancelled.",
+        ),
+        (
+            "error",
+            {"code": "model_failed", "message": "Persisted model failure."},
+            "Persisted model failure.",
+        ),
+    ],
+)
+async def test_resume_expands_cancelled_and_failed_activity_groups(
+    agent_home: Path,
+    workspace: Path,
+    status: Literal["interrupted", "error"],
+    error: dict[str, str],
+    expected_status: str,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(8))
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: next(timestamps),
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title=f"Restored {status} run")
+    target.add_message("user", "Run the operation.")
+    target.add_message(
+        "assistant",
+        "Partial activity.",
+        tool_calls=[],
+        status=status,
+        error=error,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while "Partial activity." not in _visible_screen_text(app):
+                await pilot.pause()
+
+        group = app.query_one(".agent-run-activity-group")
+        content = group.query_one(".agent-run-activity-content")
+        visible_text = _visible_screen_text(app)
+        assert content.display
+        assert str(group.query_one(".agent-run-activity-heading", Static).content) == "\u25bc 1s"
+        assert expected_status in visible_text
+
+        await pilot.click(".agent-run-activity-heading")
+        assert not content.display
+
+
+@pytest.mark.asyncio
+async def test_resume_keeps_unknown_outcome_expanded_without_inventing_status(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(6))
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: next(timestamps),
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Unknown outcome")
+    target.add_message("user", "Wait for the operation.")
+    target.add_message(
+        "assistant",
+        "Still waiting for a result.",
+        tool_calls=[{"id": "call-pending", "name": "read_file", "arguments": "{}"}],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while "Still waiting for a result." not in _visible_screen_text(app):
+                await pilot.pause()
+
+        group = app.query_one(".agent-run-activity-group")
+        content = group.query_one(".agent-run-activity-content")
+        visible_text = _visible_screen_text(app)
+        assert content.display
+        assert str(group.query_one(".agent-run-activity-heading", Static).content) == "\u25bc 1s"
+        assert "Turn cancelled." not in visible_text
+        assert "Turn failed." not in visible_text
+        assert "Completed with no response." not in visible_text
+
+        await pilot.click(".agent-run-activity-heading")
+        assert not content.display
+
+
+@pytest.mark.asyncio
+async def test_resume_clamps_reversed_historical_duration_to_zero(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Reversed timestamps")
+    target.add_message("user", "Run with reversed timestamps.")
+    target.add_message(
+        "assistant",
+        "Historical activity.",
+        tool_calls=[{"id": "call-reversed", "name": "read_file", "arguments": "{}"}],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.messages[0]["timestamp"] = (NOW + timedelta(seconds=5)).isoformat(
+        timespec="milliseconds"
+    )
+    target.messages[1]["timestamp"] = NOW.isoformat(timespec="milliseconds")
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while "Historical activity." not in _visible_screen_text(app):
+                await pilot.pause()
+
+        heading = app.query_one(".agent-run-activity-heading", Static)
+        assert str(heading.content) == "\u25bc 0s"
+
+
+@pytest.mark.asyncio
+async def test_resume_keeps_pre_user_messages_and_unclassifiable_runs_flat(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Unclassifiable history")
+    target.add_message(
+        "assistant",
+        "Before the first user message.",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.add_message(
+        "tool",
+        "private pre-user result",
+        tool_call_id="orphan-pre-user",
+        name="read_file",
+        status="success",
+        artifact=None,
+    )
+    target.add_message("user", "Question with an orphan tool result.")
+    target.add_message(
+        "tool",
+        "private orphan result",
+        tool_call_id="orphan-in-run",
+        name="read_file",
+        status="success",
+        artifact=None,
+    )
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while "Question with an orphan tool result." not in _visible_screen_text(app):
+                await pilot.pause()
+
+        visible_text = _visible_screen_text(app)
+        assert not list(app.query(".agent-run-activity-group"))
+        assert "Before the first user message." in visible_text
+        assert "Question with an orphan tool result." in visible_text
+        assert visible_text.count("Completed: read_file") == 2
+        assert "private pre-user result" not in visible_text
+        assert "private orphan result" not in visible_text
 
 
 @pytest.mark.asyncio
