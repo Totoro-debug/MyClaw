@@ -167,7 +167,7 @@ class _PersistedMessageProjection:
 class _HistoricalRunProjection:
     activity: tuple[_PersistedMessageProjection, ...]
     final: _PersistedMessageProjection | None
-    terminal_statuses: tuple[str, ...]
+    terminal_status: str | None
     outcome: _TerminalOutcome | None
     elapsed: float
 
@@ -2568,8 +2568,10 @@ class TerminalConversationApp(App[None]):
                     final.content,
                     display,
                 )
-            for status in historical.terminal_statuses:
-                await display.mount(Static(status, markup=False, classes="turn-status"))
+            if historical.terminal_status is not None:
+                await display.mount(
+                    Static(historical.terminal_status, markup=False, classes="turn-status")
+                )
         display.reset_to_latest()
         return self._runtime.session is authority
 
@@ -2869,42 +2871,31 @@ def _classify_historical_partition(
         if item.role == "tool" or (item.role == "assistant" and bool(item.content.strip()))
     )
 
-    terminal_statuses: list[str] = []
+    terminal_status: str | None = None
     endpoint: datetime | None
     if terminal_kind == "completed" and final is not None:
         endpoint = timestamps[terminal_index] if terminal_index is not None else None
         if endpoint is None:
             return None
         if not final.content.strip():
-            terminal_statuses.append("Completed with no response.")
-        for item in projected[1:terminal_index]:
-            if item.role != "assistant":
-                continue
-            status = _persisted_assistant_status(item.message)
-            if status is not None:
-                terminal_statuses.append(status)
+            terminal_status = "Completed with no response."
     elif terminal_kind in {"cancelled", "failed"} and terminal_index is not None:
         endpoint = timestamps[terminal_index]
         if endpoint is None:
             return None
-        for item in projected[1:]:
-            if item.role != "assistant":
-                continue
-            status = _persisted_assistant_status(item.message)
-            if status is not None:
-                terminal_statuses.append(status)
+        terminal_status = _persisted_assistant_status(projected[terminal_index].message)
     else:
         endpoint = timestamps[-1]
         if endpoint is None:
             return None
 
-    if not activity and final is None and not terminal_statuses:
+    if not activity and final is None and terminal_status is None:
         return None
     elapsed = max(0.0, (endpoint - user_timestamp).total_seconds())
     return _HistoricalRunProjection(
         activity=activity,
         final=final,
-        terminal_statuses=tuple(terminal_statuses),
+        terminal_status=terminal_status,
         outcome=terminal_kind,
         elapsed=elapsed,
     )

@@ -4541,7 +4541,7 @@ async def test_resume_selection_rebuilds_the_display_from_the_selected_session(
         assert "Failed: exec - The operation did not complete." in visible_text
         assert "Rejected: web_fetch" in visible_text
         assert "Persisted partial answer." in visible_text
-        assert "Turn cancelled." in visible_text
+        assert "Turn cancelled." not in visible_text
         assert "Persisted model failure." in visible_text
         assert "private tool result" not in visible_text
         assert "private refusal detail" not in visible_text
@@ -4662,6 +4662,19 @@ async def test_resume_uses_the_last_completed_no_tool_assistant_as_final_respons
     target.add_message("user", "First question")
     target.add_message(
         "assistant",
+        "Earlier failed activity.",
+        tool_calls=[],
+        status="error",
+        error={"code": "model_failed", "message": "Stale model failure."},
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.add_message(
+        "assistant",
         "Earlier activity.",
         tool_calls=[],
         status="completed",
@@ -4718,13 +4731,15 @@ async def test_resume_uses_the_last_completed_no_tool_assistant_as_final_respons
         activity = group.query_one(".agent-run-activity-content")
         visible_text = _visible_screen_text(app)
         assert "Final answer." in visible_text
-        assert "\u25b6 2s" in visible_text
+        assert "\u25b6 3s" in visible_text
         assert not activity.display
         assert "Earlier activity." not in visible_text
         assert "Completed with no response." in visible_text
+        assert "Stale model failure." not in visible_text
 
         await pilot.click(".agent-run-activity-heading")
         visible_text = _visible_screen_text(app)
+        assert "Earlier failed activity." in visible_text
         assert "Earlier activity." in visible_text
         assert visible_text.index("Earlier activity.") < visible_text.index("Final answer.")
 
@@ -4762,6 +4777,27 @@ async def test_resume_expands_cancelled_and_failed_activity_groups(
     )
     target.update_metadata(title=f"Restored {status} run")
     target.add_message("user", "Run the operation.")
+    stale_status: Literal["interrupted", "error"] = (
+        "error" if status == "interrupted" else "interrupted"
+    )
+    stale_error = (
+        {"code": "model_failed", "message": "Stale model failure."}
+        if stale_status == "error"
+        else {"code": "turn_cancelled", "message": "cancelled"}
+    )
+    target.add_message(
+        "assistant",
+        "Earlier terminal activity.",
+        tool_calls=[],
+        status=stale_status,
+        error=stale_error,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
     target.add_message(
         "assistant",
         "Partial activity.",
@@ -4791,8 +4827,12 @@ async def test_resume_expands_cancelled_and_failed_activity_groups(
         content = group.query_one(".agent-run-activity-content")
         visible_text = _visible_screen_text(app)
         assert content.display
-        assert str(group.query_one(".agent-run-activity-heading", Static).content) == "\u25bc 1s"
+        assert str(group.query_one(".agent-run-activity-heading", Static).content) == "\u25bc 2s"
         assert expected_status in visible_text
+        stale_terminal_status = (
+            "Stale model failure." if status == "interrupted" else "Turn cancelled."
+        )
+        assert stale_terminal_status not in visible_text
 
         await pilot.click(".agent-run-activity-heading")
         assert not content.display
