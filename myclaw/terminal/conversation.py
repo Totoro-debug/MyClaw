@@ -142,6 +142,10 @@ class _ActivityGroupHeading(Static):
         event.prevent_default()
         self.post_message(self.Clicked(self))
 
+    def on_unmount(self, event: Unmount) -> None:
+        del event
+        self.activity_group = None
+
 
 @dataclass(slots=True)
 class _ActivityGroupState:
@@ -150,15 +154,6 @@ class _ActivityGroupState:
     expanded: bool = True
     toggleable: bool = False
     elapsed: float = 0.0
-
-
-@dataclass(slots=True)
-class _AgentRunTiming:
-    started_at: float
-    elapsed: float = 0.0
-    outcome: _TerminalOutcome | None = None
-    timer: Timer | None = None
-    group: _ActivityGroupState | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1215,6 +1210,498 @@ class _ToolConfirmationScreen(ModalScreen[ConfirmationDecision]):
         self.query_one("#confirmation-approve", Button).focus()
 
 
+class _AgentRunProjection:
+    """Own the complete live UI projection for one Agent Run."""
+
+    def __init__(self, app: TerminalConversationApp) -> None:
+        self._app = app
+        self._assistant: Markdown | None = None
+        self._stream: _CoalescedMarkdownStream | None = None
+        self._streamed_fragments: list[str] = []
+        self._classified_candidate: Markdown | None = None
+        self._activity_group: _ActivityGroupState | None = None
+        self._tool_rows: dict[_ToolRowKey, _ToolRowState] = {}
+        self._closed_tool_turns: set[UUID] = set()
+        self._observed_tool_turns: set[UUID] = set()
+        self._resolved_confirmations: set[UUID] = set()
+        self._highest_event_id = -1
+        self._awaiting_tool_for_candidate = False
+        self._terminal_content: str | None = None
+        self._terminal_status: str | None = None
+        self._outcome: _TerminalOutcome | None = None
+        self._started_at: float | None = None
+        self._elapsed = 0.0
+        self._timer: Timer | None = None
+
+    async def consume(self, events: AsyncIterator[AgentEvent]) -> None:
+        """Consume and project one Run, including terminal reconciliation."""
+        cancelled = False
+        primary_error: BaseException | None = None
+        event_stream_failed = False
+
+        while not cancelled and primary_error is None:
+            try:
+                event = await anext(events)
+            except StopAsyncIteration:
+                if self._outcome is None:
+                    event_stream_failed = True
+                break
+            except CancelledError as error:
+                primary_error = error
+                cancelled = True
+                break
+            except BaseException as error:
+                if self._app._closing:
+                    primary_error = error
+                elif self._outcome is None:
+                    event_stream_failed = True
+                break
+            try:
+                await self._process_event(event)
+            except CancelledError as error:
+                primary_error = error
+                cancelled = True
+            except BaseException as error:
+                primary_error = error
+            if self._outcome is not None:
+                break
+
+        if event_stream_failed and self._outcome is None and not self._app._closing:
+            self._finish("failed")
+            self._terminal_status = "Turn failed."
+        elif cancelled:
+            self._terminal_content = "".join(self._streamed_fragments)
+            self._finish("cancelled")
+        elif primary_error is not None and self._outcome is None:
+            self._finish("failed")
+
+        cleanup_errors = await self._reconcile(cancelled, primary_error)
+        if cancelled:
+            clear_current_task_cancellation()
+        try:
+            await close_event_stream(events)
+        except BaseException as cleanup_error:
+            if not cancelled:
+                cleanup_errors.append(cleanup_error)
+        self.stop()
+
+        if primary_error is not None:
+            if cleanup_errors:
+                cause: BaseException = (
+                    cleanup_errors[0]
+                    if len(cleanup_errors) == 1
+                    else BaseExceptionGroup("Turn cleanup failed", cleanup_errors)
+                )
+                raise primary_error from cause
+            raise primary_error
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        if cleanup_errors:
+            raise cleanup_errors[0] from BaseExceptionGroup(
+                "Additional turn cleanup failures",
+                cleanup_errors[1:],
+            )
+
+    def stop(self) -> None:
+        """Stop projection-owned background work without touching mounted output."""
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+
+    async def _process_event(self, event: AgentEvent) -> None:
+        if self._outcome is not None:
+            return
+        out_of_order = event.event_id <= self._highest_event_id
+        self._highest_event_id = max(self._highest_event_id, event.event_id)
+        if event.type == "turn_started":
+            payload = event.payload
+            if not isinstance(payload, TurnStartedPayload):
+                raise TypeError("turn_started event has an invalid payload")
+            self._start_timing()
+        elif event.type == "text_delta":
+            payload = event.payload
+            if not isinstance(payload, TextDeltaPayload):
+                raise TypeError("text_delta event has an invalid payload")
+            if out_of_order or (self._assistant is not None and self._stream is None):
+                return
+            self._classified_candidate = None
+            self._streamed_fragments.append(payload.delta)
+            if self._assistant is None:
+                self._assistant = await self._app._mount_assistant()
+                self._stream = _CoalescedMarkdownStream(
+                    Markdown.get_stream(self._assistant),
+                    content_changed=self._app._scroll_to_latest,
+                )
+            assert self._stream is not None
+            self._stream.write(payload.delta)
+        elif event.type == "model_call_completed":
+            payload = event.payload
+            if not isinstance(payload, ModelCallCompletedPayload):
+                raise TypeError("model_call_completed event has an invalid payload")
+            if payload.continues_with_tools:
+                if out_of_order and self._classified_candidate is None:
+                    return
+                self._streamed_fragments[:] = [payload.content]
+                await self._move_candidate_to_activity(
+                    payload.content,
+                    reconcile=out_of_order or self._awaiting_tool_for_candidate,
+                )
+                self._awaiting_tool_for_candidate = True
+            elif self._assistant is None:
+                if out_of_order:
+                    return
+                self._streamed_fragments[:] = [payload.content]
+                if payload.content:
+                    self._assistant = await self._app._mount_assistant(payload.content)
+                    self._app._scroll_to_latest()
+            else:
+                self._streamed_fragments[:] = [payload.content]
+                if self._stream is not None:
+                    await self._stream.stop()
+                    self._stream = None
+                await self._assistant.update(payload.content)
+                self._app._scroll_to_latest()
+        elif event.type == "tool_started":
+            payload = event.payload
+            if not isinstance(payload, ToolStartedPayload):
+                raise TypeError("tool_started event has an invalid payload")
+            self._observed_tool_turns.add(event.turn_id)
+            if self._assistant is not None or self._streamed_fragments:
+                await self._move_candidate_to_activity("".join(self._streamed_fragments))
+            self._awaiting_tool_for_candidate = False
+            group = await self._ensure_activity_group()
+            await self._show_tool_started(event.turn_id, payload, parent=group.content)
+        elif event.type == "confirmation_requested":
+            payload = event.payload
+            if not isinstance(payload, ConfirmationRequestedPayload):
+                raise TypeError("confirmation_requested event has an invalid payload")
+            if payload.confirmation_id in self._resolved_confirmations:
+                return
+            await self._app._request_confirmation(payload)
+            self._resolved_confirmations.add(payload.confirmation_id)
+        elif event.type == "tool_completed":
+            payload = event.payload
+            if not isinstance(payload, ToolCompletedPayload):
+                raise TypeError("tool_completed event has an invalid payload")
+            self._observed_tool_turns.add(event.turn_id)
+            group = await self._ensure_activity_group()
+            await self._show_tool_completed(event.turn_id, payload, parent=group.content)
+        elif event.type == "turn_completed":
+            payload = event.payload
+            if not isinstance(payload, TurnCompletedPayload):
+                raise TypeError("turn_completed event has an invalid payload")
+            self._terminal_content = payload.content
+            self._finish("completed")
+        elif event.type == "turn_cancelled":
+            payload = event.payload
+            if not isinstance(payload, TurnCancelledPayload):
+                raise TypeError("turn_cancelled event has an invalid payload")
+            self._terminal_content = payload.partial_content
+            self._terminal_status = "Turn cancelled."
+            self._finish("cancelled")
+        elif event.type == "turn_failed":
+            payload = event.payload
+            if not isinstance(payload, TurnFailedPayload):
+                raise TypeError("turn_failed event has an invalid payload")
+            self._terminal_status = payload.error.message
+            self._finish("failed")
+
+    async def _reconcile(
+        self,
+        cancelled: bool,
+        primary_error: BaseException | None,
+    ) -> list[BaseException]:
+        cleanup_errors: list[BaseException] = []
+        if not self._app._closing:
+            failure_reason = (
+                "Tool completion was not reported."
+                if self._outcome == "completed"
+                else "The Tool call was interrupted."
+                if self._outcome == "cancelled"
+                else "The Tool call ended with the turn failure."
+            )
+            try:
+                for turn_id in self._observed_tool_turns - self._closed_tool_turns:
+                    await self._finish_tool_turn(turn_id, failure_reason)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if self._stream is not None:
+            try:
+                await self._stream.stop()
+            except BaseException as cleanup_error:
+                if not cancelled:
+                    cleanup_errors.append(cleanup_error)
+            finally:
+                self._stream = None
+
+        if (
+            not self._app._closing
+            and self._outcome in {"cancelled", "failed"}
+            and primary_error is None
+            and not cleanup_errors
+        ):
+            candidate = (
+                self._terminal_content
+                if self._outcome == "cancelled" and self._terminal_content is not None
+                else "".join(self._streamed_fragments)
+            )
+            try:
+                await self._move_candidate_to_activity(candidate)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if (
+            not self._app._closing
+            and self._outcome == "completed"
+            and primary_error is None
+            and not cleanup_errors
+        ):
+            final_content = self._terminal_content or ""
+            try:
+                if final_content:
+                    if self._assistant is None:
+                        self._assistant = await self._app._mount_assistant()
+                    await self._assistant.update(final_content)
+                    self._app._scroll_to_latest()
+                elif self._assistant is not None:
+                    await self._remove_assistant_candidate(self._assistant)
+                    self._assistant = None
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if (
+            not self._app._closing
+            and self._outcome is not None
+            and self._outcome != "completed"
+            and primary_error is None
+            and not cleanup_errors
+        ):
+            try:
+                await self._app._mount_status(self._terminal_status or "Turn failed.")
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        elif (
+            not self._app._closing
+            and self._outcome == "completed"
+            and not self._terminal_content
+            and primary_error is None
+            and not cleanup_errors
+        ):
+            try:
+                await self._app._mount_status("Completed with no response.")
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if (
+            not self._app._closing
+            and self._outcome is not None
+            and self._activity_group is not None
+            and primary_error is None
+            and not cleanup_errors
+        ):
+            self._set_activity_group_terminal(self._outcome)
+            if self._outcome == "completed":
+                self._app._scroll_to_latest()
+        return cleanup_errors
+
+    async def _move_candidate_to_activity(
+        self,
+        content: str,
+        *,
+        reconcile: bool = False,
+    ) -> None:
+        if self._stream is not None:
+            await self._stream.stop()
+            self._stream = None
+        if not content:
+            if self._assistant is not None:
+                await self._remove_assistant_candidate(self._assistant)
+                self._assistant = None
+            if reconcile and self._classified_candidate is not None:
+                await self._remove_assistant_candidate(self._classified_candidate)
+                self._classified_candidate = None
+            self._streamed_fragments.clear()
+            return
+        group = await self._ensure_activity_group()
+        if reconcile and self._classified_candidate is not None:
+            await self._classified_candidate.update(content)
+            self._app._scroll_to_latest()
+        else:
+            self._classified_candidate = await self._move_assistant_to_activity(
+                self._assistant,
+                content,
+                group,
+            )
+        self._assistant = None
+        self._streamed_fragments.clear()
+
+    async def _ensure_activity_group(self) -> _ActivityGroupState:
+        if self._activity_group is not None:
+            return self._activity_group
+        self._refresh_elapsed()
+        display = self._app.query_one("#conversation-display", _ConversationDisplay)
+        self._activity_group = await self._app._mount_activity_group(
+            display,
+            expanded=self._started_at is None or self._outcome != "completed",
+            toggleable=self._started_at is not None and self._outcome is not None,
+            elapsed=self._elapsed,
+        )
+        return self._activity_group
+
+    def _start_timing(self) -> None:
+        if self._started_at is not None:
+            return
+        self._started_at = self._app._monotonic()
+        self._timer = self._app.set_interval(
+            1.0,
+            self._refresh_elapsed,
+            name="agent-run-duration",
+        )
+
+    def _refresh_elapsed(self) -> None:
+        if self._started_at is None or self._outcome is not None:
+            return
+        self._elapsed = max(0.0, self._app._monotonic() - self._started_at)
+        self._update_group_heading()
+
+    def _finish(self, outcome: _TerminalOutcome) -> None:
+        if self._outcome is not None:
+            return
+        if self._started_at is not None:
+            self._elapsed = max(0.0, self._app._monotonic() - self._started_at)
+        self._outcome = outcome
+        self.stop()
+        self._update_group_heading()
+
+    def _update_group_heading(self) -> None:
+        if self._activity_group is None:
+            return
+        self._activity_group.elapsed = self._elapsed
+        self._activity_group.heading.update(
+            _activity_group_heading_text(
+                expanded=self._activity_group.expanded,
+                elapsed=self._elapsed,
+            )
+        )
+
+    def _set_activity_group_terminal(self, outcome: _TerminalOutcome) -> None:
+        group = self._activity_group
+        if group is None:
+            return
+        group.toggleable = True
+        group.expanded = outcome != "completed"
+        group.content.display = group.expanded
+        group.heading.update(
+            _activity_group_heading_text(
+                expanded=group.expanded,
+                elapsed=group.elapsed,
+            )
+        )
+
+    async def _move_assistant_to_activity(
+        self,
+        assistant: Markdown | None,
+        content: str,
+        activity_group: _ActivityGroupState,
+    ) -> Markdown | None:
+        if not content:
+            if assistant is not None:
+                await self._remove_assistant_candidate(assistant)
+            return None
+        if assistant is None:
+            assistant = await self._app._mount_assistant(
+                content,
+                parent=activity_group.content,
+            )
+        else:
+            await assistant.update(content)
+            row = assistant.parent
+            if not isinstance(row, Widget):
+                raise RuntimeError("Assistant Markdown is not mounted in a row")
+            self._app._reparent_mounted_widget(row, activity_group.content)
+        self._app._scroll_to_latest()
+        return assistant
+
+    async def _remove_assistant_candidate(self, assistant: Markdown) -> None:
+        parent = assistant.parent
+        if isinstance(parent, Widget):
+            await parent.remove()
+        self._app._scroll_to_latest()
+
+    async def _show_tool_started(
+        self,
+        turn_id: UUID,
+        payload: ToolStartedPayload,
+        *,
+        parent: Widget,
+    ) -> None:
+        key = _ToolRowKey(turn_id, payload.tool_call_id)
+        if turn_id in self._closed_tool_turns or key in self._tool_rows:
+            return
+        await self._mount_tool_row(
+            key,
+            tool_name=payload.tool_name,
+            status="running",
+            summary=payload.summary,
+            parent=parent,
+        )
+
+    async def _show_tool_completed(
+        self,
+        turn_id: UUID,
+        payload: ToolCompletedPayload,
+        *,
+        parent: Widget,
+    ) -> None:
+        if turn_id in self._closed_tool_turns:
+            return
+        key = _ToolRowKey(turn_id, payload.tool_call_id)
+        state = self._tool_rows.get(key)
+        if state is None:
+            await self._mount_tool_row(
+                key,
+                tool_name=payload.tool_name,
+                status=payload.status,
+                summary=payload.summary,
+                parent=parent,
+            )
+            return
+        if state.status != "running":
+            return
+        state.status = payload.status
+        state.widget.update(_tool_row_content(payload.status, state.tool_name, payload.summary))
+        self._app._scroll_to_latest()
+
+    async def _mount_tool_row(
+        self,
+        key: _ToolRowKey,
+        *,
+        tool_name: str,
+        status: _ToolRowStatus,
+        summary: str,
+        parent: Widget,
+    ) -> None:
+        display = self._app.query_one("#conversation-display", _ConversationDisplay)
+        row = await self._app._mount_tool_message(
+            tool_name,
+            status,
+            summary,
+            display,
+            parent=parent,
+        )
+        self._tool_rows[key] = _ToolRowState(row, tool_name, status)
+        self._app._scroll_to_latest()
+
+    async def _finish_tool_turn(self, turn_id: UUID, failure_reason: str) -> None:
+        self._closed_tool_turns.add(turn_id)
+        changed = False
+        for key, state in self._tool_rows.items():
+            if key.turn_id != turn_id or state.status != "running":
+                continue
+            state.status = "error"
+            state.widget.update(_tool_row_content("error", state.tool_name, failure_reason))
+            changed = True
+        if changed:
+            self._app._scroll_to_latest()
+
+
 class TerminalConversationApp(App[None]):
     """The two-region Textual application for one prepared Runtime."""
 
@@ -1392,15 +1879,12 @@ class TerminalConversationApp(App[None]):
         self._turn_worker: Worker[None] | None = None
         self._resume_worker: Worker[None] | None = None
         self._cancel_requested_turn: object | None = None
-        self._tool_rows: dict[_ToolRowKey, _ToolRowState] = {}
-        self._closed_tool_turns: set[UUID] = set()
+        self._active_run_projection: _AgentRunProjection | None = None
         self._active_confirmation_id: UUID | None = None
         self._completion_options: tuple[str, ...] = ()
         self._completion_dismissed_text: str | None = None
         self._closing = False
         self._application_error: Exception | None = None
-        self._run_timing: _AgentRunTiming | None = None
-        self._activity_groups: list[_ActivityGroupState] = []
 
     def _handle_exception(self, error: Exception) -> None:
         if self._application_error is None:
@@ -1534,8 +2018,10 @@ class TerminalConversationApp(App[None]):
     async def on_unmount(self, event: Unmount) -> None:
         del event
         self._closing = True
-        self._stop_run_timing()
-        self._clear_activity_group_references()
+        projection = self._active_run_projection
+        self._active_run_projection = None
+        if projection is not None:
+            projection.stop()
         cleanup_errors: list[BaseException] = []
         try:
             if self._turn_worker is not None:
@@ -1839,324 +2325,16 @@ class TerminalConversationApp(App[None]):
                         text_area.focus()
 
     async def _consume_turn(self, events: AsyncIterator[AgentEvent]) -> None:
-        assistant: Markdown | None = None
-        stream: _CoalescedMarkdownStream | None = None
-        streamed_fragments: list[str] = []
-        classified_candidate: Markdown | None = None
-        activity_group: _ActivityGroupState | None = None
-        observed_tool_turns: set[UUID] = set()
-        resolved_confirmations: set[UUID] = set()
-        highest_event_id = -1
-        awaiting_tool_for_candidate = False
-        terminal_content: str | None = None
-        terminal_status: str | None = None
-        terminal_outcome: _TerminalOutcome | None = None
-        cancelled = False
-        primary_error: BaseException | None = None
-        event_stream_failed = False
-
-        async def move_candidate_to_activity(content: str, *, reconcile: bool = False) -> None:
-            nonlocal activity_group, assistant, classified_candidate, stream
-            if stream is not None:
-                await stream.stop()
-                stream = None
-            if not content:
-                if assistant is not None:
-                    await self._remove_assistant_candidate(assistant)
-                    assistant = None
-                if reconcile and classified_candidate is not None:
-                    await self._remove_assistant_candidate(classified_candidate)
-                    classified_candidate = None
-                streamed_fragments.clear()
-                return
-            activity_group = await self._ensure_activity_group(activity_group)
-            if reconcile and classified_candidate is not None:
-                await classified_candidate.update(content)
-                self._scroll_to_latest()
-            else:
-                classified_candidate = await self._move_assistant_to_activity(
-                    assistant,
-                    content,
-                    activity_group,
-                )
-            assistant = None
-            streamed_fragments.clear()
-
-        async def process_event(event: AgentEvent) -> None:
-            nonlocal activity_group, assistant, stream, terminal_content, terminal_status
-            nonlocal awaiting_tool_for_candidate, classified_candidate, highest_event_id
-            nonlocal terminal_outcome
-            if terminal_outcome is not None:
-                return
-            out_of_order = event.event_id <= highest_event_id
-            highest_event_id = max(highest_event_id, event.event_id)
-            if event.type == "turn_started":
-                payload = event.payload
-                if not isinstance(payload, TurnStartedPayload):
-                    raise TypeError("turn_started event has an invalid payload")
-                self._start_run_timing()
-            elif event.type == "text_delta":
-                payload = event.payload
-                if not isinstance(payload, TextDeltaPayload):
-                    raise TypeError("text_delta event has an invalid payload")
-                if out_of_order or (assistant is not None and stream is None):
-                    return
-                classified_candidate = None
-                streamed_fragments.append(payload.delta)
-                if assistant is None:
-                    assistant = await self._mount_assistant()
-                    stream = _CoalescedMarkdownStream(
-                        Markdown.get_stream(assistant),
-                        content_changed=self._scroll_to_latest,
-                    )
-                assert stream is not None
-                stream.write(payload.delta)
-            elif event.type == "model_call_completed":
-                payload = event.payload
-                if not isinstance(payload, ModelCallCompletedPayload):
-                    raise TypeError("model_call_completed event has an invalid payload")
-                if payload.continues_with_tools:
-                    if out_of_order and classified_candidate is None:
-                        return
-                    streamed_fragments[:] = [payload.content]
-                    await move_candidate_to_activity(
-                        payload.content,
-                        reconcile=out_of_order or awaiting_tool_for_candidate,
-                    )
-                    awaiting_tool_for_candidate = True
-                elif assistant is None:
-                    if out_of_order:
-                        return
-                    streamed_fragments[:] = [payload.content]
-                    if payload.content:
-                        assistant = await self._mount_assistant(payload.content)
-                        self._scroll_to_latest()
-                else:
-                    streamed_fragments[:] = [payload.content]
-                    if stream is not None:
-                        await stream.stop()
-                        stream = None
-                    await assistant.update(payload.content)
-                    self._scroll_to_latest()
-            elif event.type == "tool_started":
-                payload = event.payload
-                if not isinstance(payload, ToolStartedPayload):
-                    raise TypeError("tool_started event has an invalid payload")
-                observed_tool_turns.add(event.turn_id)
-                if assistant is not None or streamed_fragments:
-                    await move_candidate_to_activity("".join(streamed_fragments))
-                awaiting_tool_for_candidate = False
-                activity_group = await self._ensure_activity_group(activity_group)
-                await self._show_tool_started(
-                    event.turn_id,
-                    payload,
-                    parent=activity_group.content,
-                )
-            elif event.type == "confirmation_requested":
-                payload = event.payload
-                if not isinstance(payload, ConfirmationRequestedPayload):
-                    raise TypeError("confirmation_requested event has an invalid payload")
-                if payload.confirmation_id in resolved_confirmations:
-                    return
-                await self._request_confirmation(payload)
-                resolved_confirmations.add(payload.confirmation_id)
-            elif event.type == "tool_completed":
-                payload = event.payload
-                if not isinstance(payload, ToolCompletedPayload):
-                    raise TypeError("tool_completed event has an invalid payload")
-                observed_tool_turns.add(event.turn_id)
-                activity_group = await self._ensure_activity_group(activity_group)
-                await self._show_tool_completed(
-                    event.turn_id,
-                    payload,
-                    parent=activity_group.content,
-                )
-            elif event.type == "turn_completed":
-                payload = event.payload
-                if not isinstance(payload, TurnCompletedPayload):
-                    raise TypeError("turn_completed event has an invalid payload")
-                terminal_outcome = "completed"
-                terminal_content = payload.content
-                self._finish_run_timing("completed")
-                return
-            elif event.type == "turn_cancelled":
-                payload = event.payload
-                if not isinstance(payload, TurnCancelledPayload):
-                    raise TypeError("turn_cancelled event has an invalid payload")
-                terminal_outcome = "cancelled"
-                terminal_content = payload.partial_content
-                terminal_status = "Turn cancelled."
-                self._finish_run_timing("cancelled")
-                return
-            elif event.type == "turn_failed":
-                payload = event.payload
-                if not isinstance(payload, TurnFailedPayload):
-                    raise TypeError("turn_failed event has an invalid payload")
-                terminal_outcome = "failed"
-                terminal_status = payload.error.message
-                self._finish_run_timing("failed")
-                return
-
-        while not cancelled and primary_error is None:
-            try:
-                event = await anext(events)
-            except StopAsyncIteration:
-                if terminal_outcome is None:
-                    event_stream_failed = True
-                break
-            except CancelledError as error:
-                primary_error = error
-                cancelled = True
-                break
-            except BaseException as error:
-                if self._closing:
-                    primary_error = error
-                elif terminal_outcome is None:
-                    event_stream_failed = True
-                break
-            try:
-                await process_event(event)
-            except CancelledError as error:
-                primary_error = error
-                cancelled = True
-            except BaseException as error:
-                primary_error = error
-            if terminal_outcome is not None:
-                break
-
-        if event_stream_failed and terminal_outcome is None and not self._closing:
-            terminal_outcome = "failed"
-            terminal_status = "Turn failed."
-            self._finish_run_timing("failed")
-        elif cancelled:
-            terminal_outcome = "cancelled"
-            terminal_content = "".join(streamed_fragments)
-            self._finish_run_timing("cancelled")
-        elif primary_error is not None and terminal_outcome is None:
-            terminal_outcome = "failed"
-            self._finish_run_timing("failed")
-
-        cleanup_errors: list[BaseException] = []
-        if not self._closing:
-            failure_reason = (
-                "Tool completion was not reported."
-                if terminal_outcome == "completed"
-                else "The Tool call was interrupted."
-                if terminal_outcome == "cancelled"
-                else "The Tool call ended with the turn failure."
-            )
-            try:
-                for turn_id in observed_tool_turns - self._closed_tool_turns:
-                    await self._finish_tool_turn(turn_id, failure_reason)
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        if stream is not None:
-            try:
-                await stream.stop()
-            except BaseException as cleanup_error:
-                if not cancelled:
-                    cleanup_errors.append(cleanup_error)
-            finally:
-                stream = None
-
-        if (
-            not self._closing
-            and terminal_outcome in {"cancelled", "failed"}
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            candidate = (
-                terminal_content
-                if terminal_outcome == "cancelled" and terminal_content is not None
-                else "".join(streamed_fragments)
-            )
-            try:
-                await move_candidate_to_activity(candidate)
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        if (
-            not self._closing
-            and terminal_outcome == "completed"
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            final_content = terminal_content or ""
-            try:
-                if final_content:
-                    if assistant is None:
-                        assistant = await self._mount_assistant()
-                    await assistant.update(final_content)
-                    self._scroll_to_latest()
-                elif assistant is not None:
-                    await self._remove_assistant_candidate(assistant)
-                    assistant = None
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        if (
-            not self._closing
-            and terminal_outcome is not None
-            and terminal_outcome != "completed"
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            try:
-                await self._mount_status(terminal_status or "Turn failed.")
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        elif (
-            not self._closing
-            and terminal_outcome == "completed"
-            and not terminal_content
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            try:
-                await self._mount_status("Completed with no response.")
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        if (
-            not self._closing
-            and terminal_outcome == "completed"
-            and activity_group is not None
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            self._set_activity_group_terminal(activity_group, "completed")
-            self._scroll_to_latest()
-        elif (
-            not self._closing
-            and terminal_outcome in {"cancelled", "failed"}
-            and activity_group is not None
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            self._set_activity_group_terminal(activity_group, terminal_outcome)
-
-        if cancelled:
-            clear_current_task_cancellation()
+        if self._active_run_projection is not None:
+            raise RuntimeError("An Agent Run projection is already active")
+        projection = _AgentRunProjection(self)
+        self._active_run_projection = projection
         try:
-            await close_event_stream(events)
-        except BaseException as cleanup_error:
-            if not cancelled:
-                cleanup_errors.append(cleanup_error)
-        self._stop_run_timing()
-
-        if primary_error is not None:
-            if cleanup_errors:
-                cause: BaseException = (
-                    cleanup_errors[0]
-                    if len(cleanup_errors) == 1
-                    else BaseExceptionGroup("Turn cleanup failed", cleanup_errors)
-                )
-                raise primary_error from cause
-            raise primary_error
-        if len(cleanup_errors) == 1:
-            raise cleanup_errors[0]
-        if cleanup_errors:
-            raise cleanup_errors[0] from BaseExceptionGroup(
-                "Additional turn cleanup failures",
-                cleanup_errors[1:],
-            )
+            await projection.consume(events)
+        finally:
+            projection.stop()
+            if self._active_run_projection is projection:
+                self._active_run_projection = None
 
     async def _request_confirmation(self, request: ConfirmationRequestedPayload) -> None:
         if self._active_confirmation_id is not None:
@@ -2229,26 +2407,6 @@ class TerminalConversationApp(App[None]):
         await row.mount(assistant)
         return assistant
 
-    async def _ensure_activity_group(
-        self,
-        activity_group: _ActivityGroupState | None,
-    ) -> _ActivityGroupState:
-        if activity_group is not None:
-            return activity_group
-        display = self.query_one("#conversation-display", _ConversationDisplay)
-        timing = self._run_timing
-        if timing is not None and timing.outcome is None:
-            timing.elapsed = max(0.0, self._monotonic() - timing.started_at)
-        expanded = timing is None or timing.outcome != "completed"
-        toggleable = timing is not None and timing.outcome is not None
-        return await self._mount_activity_group(
-            display,
-            expanded=expanded,
-            toggleable=toggleable,
-            elapsed=0.0 if timing is None else timing.elapsed,
-            timing=timing,
-        )
-
     async def _mount_activity_group(
         self,
         display: _ConversationDisplay,
@@ -2256,7 +2414,6 @@ class TerminalConversationApp(App[None]):
         expanded: bool,
         toggleable: bool,
         elapsed: float,
-        timing: _AgentRunTiming | None = None,
     ) -> _ActivityGroupState:
         heading = _ActivityGroupHeading(
             _activity_group_heading_text(
@@ -2281,83 +2438,10 @@ class TerminalConversationApp(App[None]):
             elapsed=elapsed,
         )
         heading.activity_group = state
-        self._activity_groups.append(state)
-        if timing is not None:
-            timing.group = state
-        if timing is None and not expanded:
+        if not expanded:
             content.display = False
         self._scroll_to_latest()
         return state
-
-    def _start_run_timing(self) -> None:
-        if self._run_timing is not None and self._run_timing.outcome is None:
-            return
-        self._stop_run_timing()
-        timing = _AgentRunTiming(started_at=self._monotonic())
-        self._run_timing = timing
-        timing.timer = self.set_interval(1.0, self._refresh_run_timing, name="agent-run-duration")
-
-    def _refresh_run_timing(self) -> None:
-        timing = self._run_timing
-        if timing is None or timing.outcome is not None:
-            return
-        timing.elapsed = max(0.0, self._monotonic() - timing.started_at)
-        if timing.group is not None:
-            timing.group.elapsed = timing.elapsed
-            timing.group.heading.update(
-                _activity_group_heading_text(
-                    expanded=timing.group.expanded,
-                    elapsed=timing.elapsed,
-                )
-            )
-
-    def _finish_run_timing(self, outcome: _TerminalOutcome) -> None:
-        timing = self._run_timing
-        if timing is None or timing.outcome is not None:
-            return
-        timing.elapsed = max(0.0, self._monotonic() - timing.started_at)
-        timing.outcome = outcome
-        if timing.timer is not None:
-            timing.timer.stop()
-            timing.timer = None
-        group = timing.group
-        if group is not None:
-            group.elapsed = timing.elapsed
-            group.heading.update(
-                _activity_group_heading_text(
-                    expanded=group.expanded,
-                    elapsed=group.elapsed,
-                )
-            )
-
-    def _set_activity_group_terminal(
-        self,
-        activity_group: _ActivityGroupState,
-        outcome: _TerminalOutcome,
-    ) -> None:
-        activity_group.toggleable = True
-        activity_group.expanded = outcome != "completed"
-        activity_group.content.display = activity_group.expanded
-        activity_group.heading.update(
-            _activity_group_heading_text(
-                expanded=activity_group.expanded,
-                elapsed=activity_group.elapsed,
-            )
-        )
-
-    def _stop_run_timing(self) -> None:
-        timing = self._run_timing
-        self._run_timing = None
-        if timing is not None:
-            timing.group = None
-            if timing.timer is not None:
-                timing.timer.stop()
-                timing.timer = None
-
-    def _clear_activity_group_references(self) -> None:
-        for activity_group in self._activity_groups:
-            activity_group.heading.activity_group = None
-        self._activity_groups.clear()
 
     def _set_activity_group_expanded(
         self,
@@ -2375,30 +2459,6 @@ class TerminalConversationApp(App[None]):
             )
         )
         self._scroll_to_latest()
-
-    async def _move_assistant_to_activity(
-        self,
-        assistant: Markdown | None,
-        content: str,
-        activity_group: _ActivityGroupState,
-    ) -> Markdown | None:
-        if not content:
-            if assistant is not None:
-                await self._remove_assistant_candidate(assistant)
-            return None
-        if assistant is None:
-            assistant = await self._mount_assistant(
-                content,
-                parent=activity_group.content,
-            )
-        else:
-            await assistant.update(content)
-            row = assistant.parent
-            if not isinstance(row, Widget):
-                raise RuntimeError("Assistant Markdown is not mounted in a row")
-            self._reparent_mounted_widget(row, activity_group.content)
-        self._scroll_to_latest()
-        return assistant
 
     @staticmethod
     def _reparent_mounted_widget(widget: Widget, parent: Widget) -> None:
@@ -2420,76 +2480,6 @@ class TerminalConversationApp(App[None]):
         current_parent.refresh(layout=True)
         parent.refresh(layout=True)
 
-    async def _remove_assistant_candidate(self, assistant: Markdown) -> None:
-        parent = assistant.parent
-        if isinstance(parent, Widget):
-            await parent.remove()
-        self._scroll_to_latest()
-
-    async def _show_tool_started(
-        self,
-        turn_id: UUID,
-        payload: ToolStartedPayload,
-        *,
-        parent: Widget | None = None,
-    ) -> None:
-        key = _ToolRowKey(turn_id, payload.tool_call_id)
-        if turn_id in self._closed_tool_turns or key in self._tool_rows:
-            return
-        await self._mount_tool_row(
-            key,
-            tool_name=payload.tool_name,
-            status="running",
-            summary=payload.summary,
-            parent=parent,
-        )
-
-    async def _show_tool_completed(
-        self,
-        turn_id: UUID,
-        payload: ToolCompletedPayload,
-        *,
-        parent: Widget | None = None,
-    ) -> None:
-        if turn_id in self._closed_tool_turns:
-            return
-        key = _ToolRowKey(turn_id, payload.tool_call_id)
-        state = self._tool_rows.get(key)
-        if state is None:
-            await self._mount_tool_row(
-                key,
-                tool_name=payload.tool_name,
-                status=payload.status,
-                summary=payload.summary,
-                parent=parent,
-            )
-            return
-        if state.status != "running":
-            return
-        state.status = payload.status
-        state.widget.update(_tool_row_content(payload.status, state.tool_name, payload.summary))
-        self._scroll_to_latest()
-
-    async def _mount_tool_row(
-        self,
-        key: _ToolRowKey,
-        *,
-        tool_name: str,
-        status: _ToolRowStatus,
-        summary: str,
-        parent: Widget | None = None,
-    ) -> None:
-        display = self.query_one("#conversation-display", _ConversationDisplay)
-        row = await self._mount_tool_message(
-            tool_name,
-            status,
-            summary,
-            display,
-            parent=parent,
-        )
-        self._tool_rows[key] = _ToolRowState(row, tool_name, status)
-        self._scroll_to_latest()
-
     async def _mount_tool_message(
         self,
         tool_name: str,
@@ -2507,18 +2497,6 @@ class TerminalConversationApp(App[None]):
             parent = display
         await parent.mount(row)
         return row
-
-    async def _finish_tool_turn(self, turn_id: UUID, failure_reason: str) -> None:
-        self._closed_tool_turns.add(turn_id)
-        changed = False
-        for key, state in self._tool_rows.items():
-            if key.turn_id != turn_id or state.status != "running":
-                continue
-            state.status = "error"
-            state.widget.update(_tool_row_content("error", state.tool_name, failure_reason))
-            changed = True
-        if changed:
-            self._scroll_to_latest()
 
     def _scroll_to_latest(self) -> None:
         display = self.query_one("#conversation-display", _ConversationDisplay)
@@ -2556,12 +2534,12 @@ class TerminalConversationApp(App[None]):
         if self._runtime.session is not authority:
             return False
 
-        self._stop_run_timing()
-        self._clear_activity_group_references()
+        projection = self._active_run_projection
+        self._active_run_projection = None
+        if projection is not None:
+            projection.stop()
         display = self.query_one("#conversation-display", _ConversationDisplay)
         await display.remove_children()
-        self._tool_rows.clear()
-        self._closed_tool_turns.clear()
         for partition in _persisted_message_partitions(projected_messages):
             historical = _classify_historical_partition(partition)
             if historical is None:

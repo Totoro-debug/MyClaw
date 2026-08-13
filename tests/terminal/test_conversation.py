@@ -56,6 +56,7 @@ from myclaw.session.session import Session
 from myclaw.terminal.conversation import (
     TerminalConversationApp,
     TerminalConversationError,
+    _AgentRunProjection,
     _format_activity_duration,
     run_terminal_conversation,
 )
@@ -1889,16 +1890,15 @@ async def test_replacing_the_display_stops_a_frozen_run_timer(
     app = TerminalConversationApp(runtime)
 
     async with app.run_test(size=(80, 24)):
-        app._start_run_timing()
-        timing = app._run_timing
-        assert timing is not None
-        assert timing.timer is not None
+        projection = _AgentRunProjection(app)
+        app._active_run_projection = projection
+        projection._start_timing()
+        assert projection._timer is not None
 
         replaced = await app._replace_display_from_session(runtime.session.session_id)
 
         assert replaced
-        assert app._run_timing is None
-        assert timing.timer is None
+        assert projection._timer is None
 
 
 @pytest.mark.parametrize(
@@ -1938,20 +1938,26 @@ async def test_activity_heading_starts_with_accumulated_time_and_freezes_on_succ
         cast(PreparedReplRuntime, _runtime(conversation)),
         monotonic=lambda: clock[0],
     )
-    finish_tool_turn = app._finish_tool_turn
+    finish_tool_turn = _AgentRunProjection._finish_tool_turn
 
-    async def finish_tool_turn_after_delay(turn_id: UUID, failure_reason: str) -> None:
+    async def finish_tool_turn_after_delay(
+        projection: _AgentRunProjection,
+        turn_id: UUID,
+        failure_reason: str,
+    ) -> None:
         clock[0] = 10000
-        await finish_tool_turn(turn_id, failure_reason)
+        await finish_tool_turn(projection, turn_id, failure_reason)
 
-    monkeypatch.setattr(app, "_finish_tool_turn", finish_tool_turn_after_delay)
+    monkeypatch.setattr(_AgentRunProjection, "_finish_tool_turn", finish_tool_turn_after_delay)
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
         await asyncio.wait_for(conversation.paused.wait(), timeout=1)
+        projection = app._active_run_projection
+        assert projection is not None
 
         clock[0] = 5.9
-        app._refresh_run_timing()
+        projection._refresh_elapsed()
         heading = app.query_one(".agent-run-activity-heading", Static)
         content = app.query_one(".agent-run-activity-content")
         assert not heading.can_focus
@@ -1964,7 +1970,7 @@ async def test_activity_heading_starts_with_accumulated_time_and_freezes_on_succ
         assert app.screen.focused is app.query_one("#conversation-input", TextArea)
 
         clock[0] = 3605.9
-        app._refresh_run_timing()
+        projection._refresh_elapsed()
         assert str(heading.content) == "\u25bc 1h 0min 5s"
 
         conversation.continue_events.set()
@@ -1973,7 +1979,7 @@ async def test_activity_heading_starts_with_accumulated_time_and_freezes_on_succ
 
         assert str(heading.content) == "\u25b6 1h 0min 5s"
         assert not content.display
-        app._refresh_run_timing()
+        projection._refresh_elapsed()
         assert str(heading.content) == "\u25b6 1h 0min 5s"
 
 
