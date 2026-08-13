@@ -24,6 +24,7 @@ from textual.events import (
     Paste,
 )
 from textual.pilot import Pilot
+from textual.widget import Widget
 from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 
 from myclaw.agent.events import (
@@ -1454,9 +1455,9 @@ async def test_intermediate_model_output_and_tools_share_one_activity_group() ->
 
 
 @pytest.mark.asyncio
-async def test_intermediate_completion_replaces_stream_candidate_and_empty_output_is_not_mounted() -> (
-    None
-):
+async def test_intermediate_completion_reparents_stream_candidate_and_empty_output_is_not_mounted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     conversation = ToolEventSequenceConversation(
         (
             _turn_started_event(TURN_ID),
@@ -1498,6 +1499,15 @@ async def test_intermediate_completion_replaces_stream_candidate_and_empty_outpu
         )
     )
     app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+    mounted_assistants: list[tuple[Markdown, Widget | None]] = []
+    mount_assistant = app._mount_assistant
+
+    async def record_mounted_assistant(*args: object, **kwargs: object) -> Markdown:
+        assistant = await mount_assistant(*args, **kwargs)  # type: ignore[arg-type]
+        mounted_assistants.append((assistant, assistant.parent))
+        return assistant
+
+    monkeypatch.setattr(app, "_mount_assistant", record_mounted_assistant)
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -1505,9 +1515,14 @@ async def test_intermediate_completion_replaces_stream_candidate_and_empty_outpu
 
         group = app.query_one(".agent-run-activity-group")
         activity_content = group.query_one(".agent-run-activity-content")
-        assert activity_content.query(".assistant-row").first().query_one(Markdown).source == (
-            "authoritative candidate"
-        )
+        activity_markdown = activity_content.query(".assistant-row").first().query_one(Markdown)
+        assert activity_markdown.source == "authoritative candidate"
+        assert len(mounted_assistants) == 1
+        streamed_markdown, streamed_row = mounted_assistants[0]
+        assert activity_markdown is streamed_markdown
+        assert activity_markdown.parent is streamed_row
+        assert streamed_row is not None
+        assert streamed_row.parent is activity_content
         assert len(list(activity_content.query(".assistant-row"))) == 1
         assert len(list(app.query("#conversation-display > .assistant-row"))) == 0
         assert "Completed with no response." in _visible_screen_text(app)

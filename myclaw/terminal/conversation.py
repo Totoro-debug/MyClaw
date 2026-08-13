@@ -2382,16 +2382,43 @@ class TerminalConversationApp(App[None]):
         content: str,
         activity_group: _ActivityGroupState,
     ) -> Markdown | None:
-        if assistant is not None:
-            await self._remove_assistant_candidate(assistant)
         if not content:
+            if assistant is not None:
+                await self._remove_assistant_candidate(assistant)
             return None
-        activity = await self._mount_assistant(
-            content,
-            parent=activity_group.content,
-        )
+        if assistant is None:
+            assistant = await self._mount_assistant(
+                content,
+                parent=activity_group.content,
+            )
+        else:
+            await assistant.update(content)
+            row = assistant.parent
+            if not isinstance(row, Widget):
+                raise RuntimeError("Assistant Markdown is not mounted in a row")
+            self._reparent_mounted_widget(row, activity_group.content)
         self._scroll_to_latest()
-        return activity
+        return assistant
+
+    @staticmethod
+    def _reparent_mounted_widget(widget: Widget, parent: Widget) -> None:
+        current_parent = widget.parent
+        if current_parent is parent:
+            return
+        if not isinstance(current_parent, Widget):
+            raise RuntimeError("Widget is not mounted under another widget")
+
+        # Textual's public move_child only reorders siblings, while remove() prunes
+        # the mounted subtree. Update the DOM links directly to preserve its state.
+        current_parent._nodes._remove(widget)
+        widget._detach()
+        widget._attach(parent)
+        parent._nodes._append(widget)
+
+        current_parent.update_node_styles(animate=False)
+        parent.update_node_styles(animate=False)
+        current_parent.refresh(layout=True)
+        parent.refresh(layout=True)
 
     async def _remove_assistant_candidate(self, assistant: Markdown) -> None:
         parent = assistant.parent
