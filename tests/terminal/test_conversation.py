@@ -588,6 +588,64 @@ class FailingConversation:
             self.closed.set()
 
 
+class ExplodingConversation:
+    def __init__(self, *, include_tool: bool = True) -> None:
+        self.closed = asyncio.Event()
+        self.include_tool = include_tool
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        del text
+        try:
+            yield _turn_started_event(TURN_ID)
+            yield AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta="Unconfirmed candidate."),
+            )
+            if self.include_tool:
+                yield _tool_started_event(
+                    TURN_ID,
+                    2,
+                    "exploding-call",
+                    "read_file",
+                    "Running read_file",
+                )
+            raise RuntimeError("event stream failed")
+        finally:
+            self.closed.set()
+
+
+class TerminalThenBlockingConversation:
+    def __init__(self) -> None:
+        self.terminal_emitted = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        del text
+        try:
+            yield _turn_started_event(TURN_ID)
+            yield _model_call_completed_event(
+                TURN_ID,
+                1,
+                "process activity",
+                continues_with_tools=True,
+            )
+            yield _tool_started_event(
+                TURN_ID,
+                2,
+                "unfinished-call",
+                "read_file",
+                "Running read_file",
+            )
+            self.terminal_emitted.set()
+            yield _turn_completed_event(TURN_ID, 3, "final response")
+            await asyncio.Event().wait()
+        finally:
+            self.closed.set()
+
+
 class BlockingConversation:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -786,6 +844,20 @@ def _turn_completed_event(
             content=content,
             usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
         ),
+    )
+
+
+def _turn_cancelled_event(
+    turn_id: UUID,
+    event_id: int,
+    partial_content: str,
+) -> AgentEvent:
+    return AgentEvent(
+        type="turn_cancelled",
+        event_id=event_id,
+        turn_id=turn_id,
+        created_at=NOW,
+        payload=TurnCancelledPayload(partial_content=partial_content),
     )
 
 
@@ -1439,6 +1511,381 @@ async def test_intermediate_completion_replaces_stream_candidate_and_empty_outpu
         assert len(list(activity_content.query(".assistant-row"))) == 1
         assert len(list(app.query("#conversation-display > .assistant-row"))) == 0
         assert "Completed with no response." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_tool_start_reclassifies_a_streamed_candidate_without_model_completion() -> None:
+    conversation = ToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta="Unclassified candidate."),
+            ),
+            _tool_started_event(TURN_ID, 2, "call-read", "read_file", "Running read_file"),
+            _tool_completed_event(
+                TURN_ID,
+                3,
+                "call-read",
+                "read_file",
+                "success",
+                "Finished read_file",
+            ),
+            _turn_completed_event(TURN_ID, 4, "Final answer."),
+        )
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        group = app.query_one(".agent-run-activity-group")
+        activity_content = group.query_one(".agent-run-activity-content")
+        assert activity_content.query_one(Markdown).source == "Unclassified candidate."
+        assert _tool_row_texts(app) == ["Completed: read_file"]
+        assert app.query("#conversation-display > .assistant-row").first().query_one(
+            Markdown
+        ).source == ("Final answer.")
+        assert not activity_content.display
+
+
+@pytest.mark.asyncio
+async def test_direct_terminal_completion_updates_the_current_candidate() -> None:
+    conversation = ToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta="streamed candidate"),
+            ),
+            _turn_completed_event(TURN_ID, 2, "authoritative final"),
+        )
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        assert not list(app.query(".agent-run-activity-group"))
+        assert app.query("#conversation-display > .assistant-row").first().query_one(
+            Markdown
+        ).source == ("authoritative final")
+        assert "streamed candidate" not in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_first_terminal_event_finishes_without_waiting_for_more_events() -> None:
+    conversation = TerminalThenBlockingConversation()
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await asyncio.wait_for(conversation.terminal_emitted.wait(), timeout=1)
+        await _wait_for_turn(app)
+
+        group = app.query_one(".agent-run-activity-group")
+        assert not group.query_one(".agent-run-activity-content").display
+        assert "final response" in _visible_screen_text(app)
+        assert _tool_row_texts(app) == [
+            "Failed: read_file - Tool completion was not reported."
+        ]
+        assert conversation.closed.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "events",
+    [
+        (
+            _turn_started_event(TURN_ID),
+            _model_call_completed_event(
+                TURN_ID,
+                1,
+                "process activity",
+                continues_with_tools=True,
+            ),
+            _model_call_completed_event(
+                TURN_ID,
+                2,
+                "process activity",
+                continues_with_tools=True,
+            ),
+            _tool_started_event(
+                TURN_ID,
+                3,
+                "call-read",
+                "read_file",
+                "Running read_file",
+            ),
+            _tool_completed_event(
+                TURN_ID,
+                4,
+                "call-read",
+                "read_file",
+                "success",
+                "Finished read_file",
+            ),
+            _turn_completed_event(TURN_ID, 5, "final response"),
+        ),
+        (
+            _turn_started_event(TURN_ID),
+            AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta="process activity"),
+            ),
+            _tool_started_event(
+                TURN_ID,
+                3,
+                "call-read",
+                "read_file",
+                "Running read_file",
+            ),
+            _model_call_completed_event(
+                TURN_ID,
+                2,
+                "process activity",
+                continues_with_tools=True,
+            ),
+            _tool_completed_event(
+                TURN_ID,
+                4,
+                "call-read",
+                "read_file",
+                "success",
+                "Finished read_file",
+            ),
+            _turn_completed_event(TURN_ID, 5, "final response"),
+        ),
+    ],
+)
+async def test_duplicate_or_late_model_completion_reconciles_grouped_candidate(
+    events: tuple[AgentEvent, ...],
+) -> None:
+    conversation = ToolEventSequenceConversation(events)
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        content = app.query_one(".agent-run-activity-content")
+        assert [markdown.source for markdown in content.query(Markdown)] == ["process activity"]
+        assert _tool_row_texts(app) == ["Completed: read_file"]
+
+
+@pytest.mark.asyncio
+async def test_late_delta_after_completed_candidate_does_not_reopen_its_stream() -> None:
+    conversation = ToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            _model_call_completed_event(
+                TURN_ID,
+                2,
+                "authoritative complete content",
+                continues_with_tools=False,
+            ),
+            AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta="late fragment"),
+            ),
+            _turn_completed_event(TURN_ID, 3, "authoritative complete content"),
+        )
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        assistant = app.query_one("#conversation-display > .assistant-row").query_one(Markdown)
+        assert assistant.source == "authoritative complete content"
+        assert "late fragment" not in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_successful_empty_terminal_content_shows_status_without_activity() -> None:
+    conversation = ScriptedConversation(deltas=(), completed_content="")
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("empty"), "enter")
+        await _wait_for_turn(app)
+
+        assert not list(app.query(".agent-run-activity-group"))
+        assert "Completed with no response." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_first_terminal_event_remains_authoritative() -> None:
+    conversation = ToolEventSequenceConversation(
+        (
+            _turn_started_event(TURN_ID),
+            AgentEvent(
+                type="text_delta",
+                event_id=1,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TextDeltaPayload(delta="candidate"),
+            ),
+            _turn_cancelled_event(TURN_ID, 2, "authoritative partial"),
+            AgentEvent(
+                type="turn_failed",
+                event_id=3,
+                turn_id=TURN_ID,
+                created_at=NOW,
+                payload=TurnFailedPayload(
+                    error=ErrorInfo(code="model_failed", message="Late failure."),
+                ),
+            ),
+            _turn_completed_event(TURN_ID, 4, "late success"),
+        )
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        group = app.query_one(".agent-run-activity-group")
+        assert group.query_one(".agent-run-activity-content").query_one(Markdown).source == (
+            "authoritative partial"
+        )
+        visible_text = _visible_screen_text(app)
+        assert "Turn cancelled." in visible_text
+        assert "Late failure." not in visible_text
+        assert "late success" not in visible_text
+        assert group.query_one(".agent-run-activity-content").display
+
+
+@pytest.mark.asyncio
+async def test_event_stream_failure_groups_candidate_and_finishes_unfinished_tool() -> None:
+    conversation = ExplodingConversation()
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        group = app.query_one(".agent-run-activity-group")
+        activity_content = group.query_one(".agent-run-activity-content")
+        assert activity_content.display
+        assert activity_content.query_one(Markdown).source == "Unconfirmed candidate."
+        assert _tool_row_texts(app) == [
+            "Failed: read_file - The Tool call ended with the turn failure."
+        ]
+        assert "Turn failed." in _visible_screen_text(app)
+        assert "Unconfirmed candidate." in _visible_screen_text(app)
+        assert not list(app.query("#conversation-display > .assistant-row"))
+        assert conversation.closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_event_stream_failure_without_activity_does_not_create_empty_group() -> None:
+    conversation = ToolEventSequenceConversation((_turn_started_event(TURN_ID),))
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        assert not list(app.query(".agent-run-activity-group"))
+        assert "Turn failed." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_failed_no_tool_candidate_becomes_expanded_activity() -> None:
+    conversation = ScriptedConversation(
+        deltas=("draft content",),
+        outcomes=("failed",),
+        failure_message="Model unavailable.",
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        group = app.query_one(".agent-run-activity-group")
+        assert group.query_one(".agent-run-activity-content").query_one(Markdown).source == (
+            "draft content"
+        )
+        assert group.query_one(".agent-run-activity-content").display
+        assert not list(app.query("#conversation-display > .assistant-row"))
+        assert "Model unavailable." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_failure_before_visible_activity_does_not_create_empty_group() -> None:
+    conversation = ScriptedConversation(
+        deltas=(),
+        outcomes=("failed",),
+        failure_message="Model unavailable.",
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        assert not list(app.query(".agent-run-activity-group"))
+        assert "Model unavailable." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_empty_cancelled_content_removes_candidate_without_empty_group() -> None:
+    conversation = ScriptedConversation(
+        deltas=("streamed candidate",),
+        outcomes=("cancelled",),
+        cancelled_content="",
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("cancel"), "enter")
+        await _wait_for_turn(app)
+
+        assert not list(app.query(".agent-run-activity-group"))
+        assert not list(app.query("#conversation-display > .assistant-row"))
+        assert "Turn cancelled." in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_replacing_the_display_stops_a_frozen_run_timer(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    runtime = _prepared_runtime(
+        agent_home,
+        workspace,
+        _RuntimeProvider(()),
+    )
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(80, 24)):
+        app._start_run_timing()
+        timing = app._run_timing
+        assert timing is not None
+        assert timing.timer is not None
+
+        replaced = await app._replace_display_from_session(runtime.session.session_id)
+
+        assert replaced
+        assert app._run_timing is None
+        assert timing.timer is None
 
 
 @pytest.mark.parametrize(
@@ -2238,7 +2685,7 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
             _turn_completed_event(TURN_ID, 2, content=history),
         ),
         second_events,
-        pause_after=tuple((1, event_index) for event_index in range(1, 7)),
+        pause_after=tuple((1, event_index) for event_index in range(1, 6)),
     )
     app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
 
@@ -2266,9 +2713,8 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
                 3: ["Running: read_file"],
                 4: ["Completed: read_file"],
                 5: ["Completed: read_file"],
-                6: ["Completed: read_file"],
             }
-            for previous_event, next_event in zip(range(1, 6), range(2, 7), strict=True):
+            for previous_event, next_event in zip(range(1, 5), range(2, 6), strict=True):
                 conversation.continue_after(1, previous_event)
                 await conversation.wait_after(1, next_event)
                 await asyncio.sleep(0.05)
@@ -2284,7 +2730,7 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
                     )
                     assert not app.query_one("#new-content").display
 
-            conversation.continue_after(1, 6)
+            conversation.continue_after(1, 5)
             await asyncio.wait_for(submission, timeout=1)
             await _wait_for_turn(app)
 
@@ -2663,6 +3109,30 @@ async def test_cancelled_partial_content_precedes_the_final_cancelled_status() -
         assert visible_text.index("Retained partial response.") < visible_text.index(
             "Turn cancelled."
         )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_content_moves_the_candidate_into_an_expanded_group() -> None:
+    conversation = ScriptedConversation(
+        deltas=("streamed candidate",),
+        outcomes=("cancelled",),
+        cancelled_content="authoritative partial",
+    )
+    app = TerminalConversationApp(cast(PreparedReplRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("cancel"), "enter")
+        await _wait_for_turn(app)
+
+        group = app.query_one(".agent-run-activity-group")
+        content = group.query_one(".agent-run-activity-content")
+        assert content.display
+        assert content.query_one(Markdown).source == "authoritative partial"
+        assert not app.query("#conversation-display > .assistant-row")
+        visible_text = _visible_screen_text(app)
+        assert "authoritative partial" in visible_text
+        assert "streamed candidate" not in visible_text
+        assert visible_text.index("authoritative partial") < visible_text.index("Turn cancelled.")
 
 
 @pytest.mark.asyncio
@@ -3191,6 +3661,7 @@ async def test_shutdown_settles_stream_worker_before_runtime_close() -> None:
 
     assert conversation.closed.is_set()
     assert runtime.close_saw_stream_closed
+    assert not list(app.query(".turn-status"))
 
 
 @pytest.mark.asyncio
