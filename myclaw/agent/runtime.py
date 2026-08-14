@@ -22,13 +22,15 @@ from myclaw.agent.prompts import (
 from myclaw.agent.run import (
     AgentRun,
     AgentRunModelSettings,
+    AgentRunRoute,
+    SummaryPreparer,
     ToolResultExternalizer,
     model_message_from_session,
 )
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ProviderConfiguration, RouteConfiguration, UserConfiguration
+from myclaw.config.config import ProviderConfiguration, UserConfiguration
 from myclaw.logging.session import session_log, without_session_log
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import (
@@ -253,12 +255,9 @@ class _DeferredConversationPort:
         title_prompt: str,
         tool_gateway: ToolGateway,
         on_foreground_terminal: Callable[[], None],
-        history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
+        summary_preparer: SummaryPreparer | None = None,
         memory_snapshot: Callable[[], str] | None = None,
         system_prompt_for_memory: Callable[[str], str] | None = None,
-        history_preparer_for_memory: (
-            Callable[[str], Callable[[Session], Awaitable[Session]]] | None
-        ) = None,
         before_submit: Callable[[], Awaitable[None]] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
     ) -> None:
@@ -270,10 +269,9 @@ class _DeferredConversationPort:
         self._system_prompt = system_prompt
         self._title_prompt = title_prompt
         self._tool_gateway = tool_gateway
-        self._history_preparer = history_preparer
+        self._summary_preparer = summary_preparer
         self._memory_snapshot = memory_snapshot
         self._system_prompt_for_memory = system_prompt_for_memory
-        self._history_preparer_for_memory = history_preparer_for_memory
         self._before_submit = before_submit
         self._on_foreground_terminal = on_foreground_terminal
         self._externalize_result = externalize_result
@@ -314,10 +312,9 @@ class _DeferredConversationPort:
                         system_prompt=self._system_prompt,
                         title_prompt=self._title_prompt,
                         tool_gateway=self._tool_gateway,
-                        history_preparer=self._history_preparer,
+                        summary_preparer=self._summary_preparer,
                         memory_snapshot=self._memory_snapshot,
                         system_prompt_for_memory=self._system_prompt_for_memory,
-                        history_preparer_for_memory=self._history_preparer_for_memory,
                         externalize_result=self._externalize_result,
                         workspace_state=self._session.workspace_state,
                         title_log_ready=title_log_ready.wait,
@@ -458,7 +455,6 @@ def _prepare_repl_runtime(
         temperature=configured_chat.temperature,
         reasoning_effort=configured_chat.reasoning_effort,
         timeout_seconds=configured_chat.timeout,
-        context_window=configured_chat.context_window,
     )
     router = ModelRouter(
         configuration=configuration,
@@ -487,26 +483,13 @@ def _prepare_repl_runtime(
     system_prompt = system_prompt_for(runtime_memory.snapshot())
     configured_memory = configuration.configured_route("memory")
     summaries = WorkspaceJsonlSummaryStore(workspace_state)
-
-    def summary_manager_for(chat_route: RouteConfiguration) -> ConversationSummaryManager:
-        return ConversationSummaryManager(
-            provider=router,
-            summaries=summaries,
-            settings=SummaryModelSettings(
-                model=configured_memory.model,
-                max_output=configured_memory.max_output,
-                temperature=configured_memory.temperature,
-                reasoning_effort=configured_memory.reasoning_effort,
-                timeout_seconds=configured_memory.timeout,
-            ),
-            chat_context_window=chat_route.context_window,
-            chat_max_output=chat_route.max_output,
-            consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
-            chat_system_prompt=system_prompt,
-            tools=tuple(tool_gateway.schemas),
-            now=now,
-            new_uuid=new_uuid,
-        )
+    summary_settings = SummaryModelSettings(
+        model=configured_memory.model,
+        max_output=configured_memory.max_output,
+        temperature=configured_memory.temperature,
+        reasoning_effort=configured_memory.reasoning_effort,
+        timeout_seconds=configured_memory.timeout,
+    )
 
     memory_manager = MemoryManager(
         provider=router,
@@ -542,33 +525,26 @@ def _prepare_repl_runtime(
             max_tool_result_chars=configuration.runtime.max_tool_result_chars,
         )
 
-    def history_preparer_for(
-        memory_snapshot: str,
-    ) -> Callable[[Session], Awaitable[Session]]:
-        prompt = system_prompt_for(memory_snapshot)
-
-        async def prepare(active_session: Session) -> Session:
-            effective_chat = configuration.resolve_route("chat").route
-            return await summary_manager_for(effective_chat).prepare(
-                active_session,
-                system_prompt=prompt,
-            )
-
-        return prepare
-
-    def history_preparer_for_schedule(
-        memory_snapshot: str,
-    ) -> Callable[[Session], Awaitable[Session]]:
-        prompt = system_prompt_for(memory_snapshot)
-
-        async def prepare(active_session: Session) -> Session:
-            effective_schedule = configuration.resolve_route("schedule").route
-            return await summary_manager_for(effective_schedule).prepare(
-                active_session,
-                system_prompt=prompt,
-            )
-
-        return prepare
+    async def prepare_summary(
+        active_session: Session,
+        route: AgentRunRoute,
+        current_system_prompt: str,
+        tools: tuple[OpenAIToolSchema, ...],
+    ) -> Session:
+        effective_route = configuration.resolve_route(route).route
+        manager = ConversationSummaryManager(
+            provider=router,
+            summaries=summaries,
+            settings=summary_settings,
+            chat_context_window=effective_route.context_window,
+            chat_max_output=effective_route.max_output,
+            consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
+            chat_system_prompt=current_system_prompt,
+            tools=tools,
+            now=now,
+            new_uuid=new_uuid,
+        )
+        return await manager.prepare(active_session)
 
     configured_schedule = configuration.configured_route("schedule")
     schedule_agent_run = AgentRun(
@@ -579,7 +555,6 @@ def _prepare_repl_runtime(
             temperature=configured_schedule.temperature,
             reasoning_effort=configured_schedule.reasoning_effort,
             timeout_seconds=configured_schedule.timeout,
-            context_window=configured_schedule.context_window,
         ),
         now=now,
         new_uuid=new_uuid,
@@ -588,7 +563,7 @@ def _prepare_repl_runtime(
         externalize_result_for=externalize_result_for,
         memory_snapshot=runtime_memory.snapshot,
         system_prompt_for_memory=system_prompt_for,
-        history_preparer_for_memory=history_preparer_for_schedule,
+        summary_preparer=prepare_summary,
     )
     schedule_clock = (
         schedule_scheduler_clock
@@ -624,10 +599,9 @@ def _prepare_repl_runtime(
             system_prompt=system_prompt,
             title_prompt=session_title_prompt(),
             tool_gateway=tool_gateway,
-            history_preparer=history_preparer_for(runtime_memory.snapshot()),
+            summary_preparer=prepare_summary,
             memory_snapshot=runtime_memory.snapshot,
             system_prompt_for_memory=system_prompt_for,
-            history_preparer_for_memory=history_preparer_for,
             on_foreground_terminal=capture_foreground_chat_status,
             externalize_result=_build_tool_result_externalizer(
                 session=active_session,

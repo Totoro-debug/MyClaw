@@ -26,6 +26,7 @@ from myclaw.provider.models import (
 )
 from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
 from myclaw.session.session import Session
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures import ScriptedFakeProvider, StreamScript
 
@@ -129,6 +130,15 @@ def _conversation(
     session: Session,
     manager: ConversationSummaryManager,
 ) -> StreamingConversationPort:
+    async def prepare_summary(
+        active_session: Session,
+        route: str,
+        system_prompt: str,
+        tools: tuple[OpenAIToolSchema, ...],
+    ) -> Session:
+        del route, system_prompt, tools
+        return await manager.prepare(active_session)
+
     return StreamingConversationPort(
         provider=provider,
         session=session,
@@ -141,7 +151,7 @@ def _conversation(
         ),
         now=lambda: NOW,
         new_uuid=uuid4,
-        history_preparer=manager.prepare,
+        summary_preparer=prepare_summary,
     )
 
 

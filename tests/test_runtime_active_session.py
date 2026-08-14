@@ -479,7 +479,7 @@ async def test_runtime_active_session_keeps_artifact_and_log_correlation_when_pe
 
 
 @pytest.mark.asyncio
-async def test_runtime_summary_advances_the_same_active_session(
+async def test_runtime_summary_uses_the_effective_route_and_advances_the_active_session(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -502,8 +502,26 @@ async def test_runtime_summary_advances_the_same_active_session(
             ),
         )
     )
-    config = VALID_CONFIG.replace(
-        "consolidation_message_threshold = 50", "consolidation_message_threshold = 4"
+    config = (
+        VALID_CONFIG.replace(
+            "consolidation_message_threshold = 50", "consolidation_message_threshold = 4"
+        )
+        + """
+
+[models.providers.unusable-chat]
+protocol = "future-protocol"
+base_url = "https://chat.example/v1"
+api_key = "unused-chat-key"
+models = ["chat-model"]
+
+[models.routes.chat]
+provider_id = "unusable-chat"
+model = "chat-model"
+context_window = 1024
+max_output = 1023
+temperature = 0.1
+timeout = 30
+"""
     )
     runtime = _runtime(agent_home, workspace, provider, config=config)
     session = runtime.session
@@ -516,4 +534,7 @@ async def test_runtime_summary_advances_the_same_active_session(
     assert events[-1].type == "turn_completed"
     assert session.last_consolidated == 2
     assert (workspace / ".myclaw" / "memory" / "summary.jsonl").exists()
+    chat_requests = [request for request in provider.requests if request.route == "chat"]
+    assert chat_requests
+    assert all(request.model == "claude-model" for request in chat_requests)
     await runtime.close()

@@ -37,6 +37,7 @@ from myclaw.agent.run import (
     AgentRunTextDeltaPayload,
     AgentRunToolCompletedPayload,
     AgentRunToolStartedPayload,
+    SummaryPreparer,
     ToolResultExternalizer,
     _log_artifact_failure,
     model_message_from_session,
@@ -68,7 +69,6 @@ class ChatModelSettings:
     temperature: float
     reasoning_effort: ReasoningEffort | None
     timeout_seconds: int
-    context_window: int = 0
 
 
 class StreamingConversationPort:
@@ -87,12 +87,9 @@ class StreamingConversationPort:
         title_new_uuid: Callable[[], UUID] = uuid4,
         tool_gateway: ToolGateway | None = None,
         agent_run: AgentRunInterface | None = None,
-        history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
+        summary_preparer: SummaryPreparer | None = None,
         memory_snapshot: Callable[[], str] | None = None,
         system_prompt_for_memory: Callable[[str], str] | None = None,
-        history_preparer_for_memory: (
-            Callable[[str], Callable[[Session], Awaitable[Session]]] | None
-        ) = None,
         externalize_result: ToolResultExternalizer | None = None,
         workspace_state: WorkspaceState | None = None,
         title_log_ready: Callable[[], Awaitable[object]] | None = None,
@@ -110,7 +107,7 @@ class StreamingConversationPort:
         self._title_log_ready = title_log_ready
         self._memory_snapshot = memory_snapshot
         self._system_prompt_for_memory = system_prompt_for_memory
-        self._history_preparer_for_memory = history_preparer_for_memory
+        self._summary_preparer = summary_preparer
         self._agent_run = agent_run
         self._title_task: asyncio.Task[None] | None = None
         self._next_event_id = 0
@@ -120,7 +117,6 @@ class StreamingConversationPort:
         self._cancel_requested = False
         self._close_task: asyncio.Task[None] | None = None
         self._system_prompt = system_prompt
-        self._history_preparer = history_preparer
         self._confirmation: ConfirmationChannel | None = None
 
     async def submit(self, text: str) -> AsyncGenerator[AgentEvent, None]:
@@ -163,7 +159,6 @@ class StreamingConversationPort:
                     temperature=self._settings.temperature,
                     reasoning_effort=self._settings.reasoning_effort,
                     timeout_seconds=self._settings.timeout_seconds,
-                    context_window=self._settings.context_window,
                 ),
                 now=self._now,
                 new_uuid=self._new_uuid,
@@ -172,8 +167,7 @@ class StreamingConversationPort:
                 externalize_result=self._externalize_result,
                 memory_snapshot=self._memory_snapshot,
                 system_prompt_for_memory=self._system_prompt_for_memory,
-                history_preparer=self._history_preparer,
-                history_preparer_for_memory=self._history_preparer_for_memory,
+                summary_preparer=self._summary_preparer,
                 after_user_published=self._start_title_for_first_user,
                 on_terminal_failure=_log_terminal_failure,
                 on_artifact_failure=lambda error, tool_name: _log_artifact_failure(

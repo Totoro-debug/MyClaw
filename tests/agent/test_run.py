@@ -54,7 +54,6 @@ def _settings() -> AgentRunModelSettings:
         temperature=0.2,
         reasoning_effort=None,
         timeout_seconds=30,
-        context_window=4096,
     )
 
 
@@ -620,7 +619,7 @@ async def test_agent_run_freezes_memory_prompt_and_tools_and_prepares_summary_pe
     )
     memory_reads = 0
     summary_routes: list[str] = []
-    summary_budgets: list[tuple[int, int, str, int]] = []
+    summary_contexts: list[tuple[str, int]] = []
 
     def read_memory() -> str:
         nonlocal memory_reads
@@ -630,13 +629,11 @@ async def test_agent_run_freezes_memory_prompt_and_tools_and_prepares_summary_pe
     async def prepare_summary(
         active_session: Session,
         route: str,
-        context_window: int,
-        max_output: int,
         system_prompt: str,
         tools: tuple[OpenAIToolSchema, ...],
     ) -> Session:
         summary_routes.append(route)
-        summary_budgets.append((context_window, max_output, system_prompt, len(tools)))
+        summary_contexts.append((system_prompt, len(tools)))
         return active_session
 
     run = AgentRun(
@@ -647,7 +644,7 @@ async def test_agent_run_freezes_memory_prompt_and_tools_and_prepares_summary_pe
         system_prompt="unused",
         memory_snapshot=read_memory,
         system_prompt_for_memory=lambda value: f"system:{value}",
-        summary_preparer_for_route=prepare_summary,
+        summary_preparer=prepare_summary,
     )
 
     payloads = [
@@ -667,7 +664,7 @@ async def test_agent_run_freezes_memory_prompt_and_tools_and_prepares_summary_pe
     ]
     assert memory_reads == 1
     assert summary_routes == ["chat"]
-    assert summary_budgets == [(4096, 1024, "system:memory-1", 0)]
+    assert summary_contexts == [("system:memory-1", 0)]
     request = cast(ModelRequest, provider.stream_requests[0])
     assert request.system_prompt == "system:memory-1"
 
@@ -1646,12 +1643,10 @@ async def test_summary_cannot_replace_the_caller_owned_session(
     async def replace_session(
         active_session: Session,
         route: str,
-        context_window: int,
-        max_output: int,
         system_prompt: str,
         tools: tuple[OpenAIToolSchema, ...],
     ) -> Session:
-        del active_session, route, context_window, max_output, system_prompt, tools
+        del active_session, route, system_prompt, tools
         return replacement
 
     def persist() -> None:
@@ -1664,7 +1659,7 @@ async def test_summary_cannot_replace_the_caller_owned_session(
         settings=_settings(),
         now=lambda: NOW,
         new_uuid=lambda: REQUEST_UUID,
-        summary_preparer_for_route=replace_session,
+        summary_preparer=replace_session,
     )
 
     payloads = [

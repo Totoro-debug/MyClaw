@@ -43,6 +43,10 @@ from myclaw.tools.tool_gateway import (
 type AgentRunRoute = Literal["chat", "schedule"]
 type ConfirmationChannel = ToolConfirmationChannel
 type ToolResultExternalizer = Callable[[ToolResult], ToolResult]
+type SummaryPreparer = Callable[
+    [Session, AgentRunRoute, str, tuple[OpenAIToolSchema, ...]],
+    Awaitable[Session],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +147,6 @@ class AgentRunModelSettings:
     temperature: float
     reasoning_effort: ReasoningEffort | None
     timeout_seconds: int
-    context_window: int = 0
 
 
 @dataclass(slots=True)
@@ -181,46 +184,12 @@ class AgentRun:
         | None = None,
         memory_snapshot: Callable[[], str] | None = None,
         system_prompt_for_memory: Callable[[str], str] | None = None,
-        summary_preparer_for_route: (
-            Callable[
-                [
-                    Session,
-                    AgentRunRoute,
-                    int,
-                    int,
-                    str,
-                    tuple[OpenAIToolSchema, ...],
-                ],
-                Awaitable[Session],
-            ]
-            | None
-        ) = None,
-        summary_preparer: Callable[[Session, AgentRunRoute], Awaitable[Session]] | None = None,
-        history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
-        history_preparer_for_route: (
-            Callable[[AgentRunRoute], Callable[[Session], Awaitable[Session]] | None] | None
-        ) = None,
-        history_preparer_for_memory: (
-            Callable[[str], Callable[[Session], Awaitable[Session]] | None] | None
-        ) = None,
+        summary_preparer: SummaryPreparer | None = None,
         after_user_published: Callable[[Session], None] | None = None,
         on_terminal_failure: Callable[[BaseException], None] | None = None,
         on_artifact_failure: Callable[[Exception, str], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
-        if summary_preparer_for_route is not None and (
-            summary_preparer is not None
-            or history_preparer is not None
-            or history_preparer_for_route is not None
-            or history_preparer_for_memory is not None
-        ):
-            raise ValueError("Provide only one Summary preparer source")
-        if summary_preparer is not None and (
-            history_preparer is not None
-            or history_preparer_for_route is not None
-            or history_preparer_for_memory is not None
-        ):
-            raise ValueError("Provide only one Summary preparer source")
         self._provider = provider
         self._settings = settings
         self._now = now
@@ -231,11 +200,7 @@ class AgentRun:
         self._externalize_result_for = externalize_result_for
         self._memory_snapshot = memory_snapshot
         self._system_prompt_for_memory = system_prompt_for_memory
-        self._summary_preparer_for_route = summary_preparer_for_route
         self._summary_preparer = summary_preparer
-        self._history_preparer = history_preparer
-        self._history_preparer_for_route = history_preparer_for_route
-        self._history_preparer_for_memory = history_preparer_for_memory
         self._after_user_published = after_user_published
         self._on_terminal_failure = on_terminal_failure
         self._on_artifact_failure = on_artifact_failure
@@ -315,16 +280,11 @@ class AgentRun:
                 return
             while True:
                 partial_content.clear()
-                history_preparer = self._history_preparer
-                if memory is not None and self._history_preparer_for_memory is not None:
-                    history_preparer = self._history_preparer_for_memory(memory)
                 prepared_session = await self._prepare_summary(
                     session,
                     route,
-                    settings,
                     system_prompt,
                     frozen_tools,
-                    history_preparer=history_preparer,
                 )
                 if prepared_session is not session:
                     raise RuntimeError("Conversation Summary replaced the active Session")
@@ -631,28 +591,12 @@ class AgentRun:
         self,
         session: Session,
         route: AgentRunRoute,
-        settings: AgentRunModelSettings,
         system_prompt: str,
         tools: tuple[OpenAIToolSchema, ...],
-        history_preparer: Callable[[Session], Awaitable[Session]] | None = None,
     ) -> Session:
-        if self._summary_preparer_for_route is not None:
-            return await self._summary_preparer_for_route(
-                session,
-                route,
-                settings.context_window,
-                settings.max_output,
-                system_prompt,
-                tools,
-            )
-        if self._summary_preparer is not None:
-            return await self._summary_preparer(session, route)
-        preparer = history_preparer
-        if self._history_preparer_for_route is not None:
-            preparer = self._history_preparer_for_route(route)
-        if preparer is None:
+        if self._summary_preparer is None:
             return session
-        return await preparer(session)
+        return await self._summary_preparer(session, route, system_prompt, tools)
 
     @staticmethod
     async def _call_tool(

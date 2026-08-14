@@ -431,9 +431,6 @@ async def test_deferred_conversation_does_not_construct_after_close_during_pre_s
         before_started.set()
         await release_before.wait()
 
-    async def preserve_history(session: Session) -> Session:
-        return session
-
     async def submit() -> list[str]:
         return [event.type async for event in conversation.submit("Do not construct after close.")]
 
@@ -470,7 +467,6 @@ async def test_deferred_conversation_does_not_construct_after_close_during_pre_s
         system_prompt="system",
         title_prompt=session_title_prompt(),
         tool_gateway=_fixed_gateway(workspace, agent_home),
-        history_preparer=preserve_history,
         before_submit=before_submit,
         on_foreground_terminal=lambda: None,
     )
@@ -505,9 +501,6 @@ async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_p
         if before_calls == 1:
             before_started.set()
             await release_first_before.wait()
-
-    async def preserve_history(session: Session) -> Session:
-        return session
 
     async def submit(text: str) -> list[str]:
         return [event.type async for event in conversation.submit(text)]
@@ -545,7 +538,6 @@ async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_p
         system_prompt="system",
         title_prompt=session_title_prompt(),
         tool_gateway=_fixed_gateway(workspace, agent_home),
-        history_preparer=preserve_history,
         before_submit=before_submit,
         on_foreground_terminal=lambda: None,
     )
@@ -590,9 +582,6 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
         if before_calls == 2:
             before_started.set()
             await release_before.wait()
-
-    async def preserve_history(session: Session) -> Session:
-        return session
 
     async def submit(text: str) -> list[str]:
         return [event.type async for event in conversation.submit(text)]
@@ -641,7 +630,6 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
         system_prompt="system",
         title_prompt=session_title_prompt(),
         tool_gateway=_fixed_gateway(workspace, agent_home),
-        history_preparer=preserve_history,
         before_submit=before_submit,
         on_foreground_terminal=lambda: None,
     )
