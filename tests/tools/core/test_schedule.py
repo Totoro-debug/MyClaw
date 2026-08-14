@@ -190,6 +190,38 @@ async def test_cron_defaults_to_utc_and_invalid_at_time_is_rejected(
     assert naive.content == "Invalid arguments for schedule."
 
 
+@pytest.mark.parametrize(
+    "schedule_arguments",
+    [
+        {"cron_expr": "@daily"},
+        {"cron_expr": "0 9 * * *", "timezone": "Not/A_Timezone"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_add_rejects_invalid_cron_inputs_without_mutating_the_store(
+    workspace: Path,
+    agent_home: Path,
+    schedule_arguments: dict[str, object],
+) -> None:
+    store = _store(workspace, agent_home)
+    gateway = _gateway(ScheduleTool(store=store, now=lambda: NOW, new_uuid=lambda: JOB_UUID))
+
+    result = await gateway.call(
+        ModelToolCall(
+            id="call_invalid_cron",
+            name="schedule",
+            arguments=json.dumps(
+                {"action": "add", "message": "Invalid", **schedule_arguments},
+                separators=(",", ":"),
+            ),
+        )
+    )
+
+    assert result.status == "error"
+    assert result.content == "Invalid arguments for schedule."
+    assert await store.snapshot() == ()
+
+
 @pytest.mark.asyncio
 async def test_list_returns_only_public_jobs_in_creation_then_id_order(
     workspace: Path,

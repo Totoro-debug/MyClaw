@@ -7,16 +7,12 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import cast
 from uuid import UUID, uuid4
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-from croniter import croniter  # type: ignore[import-untyped]
 
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.store import ScheduleStaleRemovalError, WorkspaceScheduleStore
 from myclaw.tools.base import BaseTool, ToolError
 from myclaw.tools.schema import Schema
 from myclaw.utils.json_types import JsonObject
-from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_uuid4_string
 
 _INVALID_ARGUMENTS = "Invalid arguments for schedule."
@@ -24,7 +20,6 @@ _NOT_FOUND = "Schedule Job was not found."
 _STALE_REMOVAL = "Schedule Job changed before removal. Request removal again."
 _STATE_READ_FAILED = "Schedule state could not be read."
 _STATE_UPDATE_FAILED = "Schedule state could not be updated."
-_TIMEZONE_FAILED = "Schedule timezone could not be resolved."
 
 
 class _ScheduleArgumentsSchema(Schema):
@@ -248,47 +243,27 @@ class ScheduleTool(BaseTool):
             raise ToolError(_INVALID_ARGUMENTS)
 
         if every_seconds is not None:
-            if isinstance(every_seconds, bool) or not isinstance(every_seconds, int):
-                raise ToolError(_INVALID_ARGUMENTS)
             try:
                 schedule = JobSchedule.every(every_seconds)
-            except ValueError as error:
+            except (TypeError, ValueError) as error:
                 raise ToolError(_INVALID_ARGUMENTS) from error
             return normalized_message, schedule
 
         if cron_expr is not None:
-            if not isinstance(cron_expr, str):
-                raise ToolError(_INVALID_ARGUMENTS)
-            normalized_cron = " ".join(cron_expr.split())
-            if len(normalized_cron.split()) != 5 or not croniter.is_valid(normalized_cron):
-                raise ToolError(_INVALID_ARGUMENTS)
-            resolved_timezone = self._resolve_timezone(timezone)
             try:
-                schedule = JobSchedule.cron(normalized_cron, resolved_timezone)
-            except ValueError as error:
+                schedule = JobSchedule.from_cron_input(cron_expr, timezone)
+            except (TypeError, ValueError) as error:
                 raise ToolError(_INVALID_ARGUMENTS) from error
             return normalized_message, schedule
 
         if at_time is not None:
             try:
-                normalized_at = _normalize_at_time(at_time)
-                schedule = JobSchedule.at(normalized_at)
+                schedule = JobSchedule.from_at_input(at_time)
             except (TypeError, ValueError) as error:
                 raise ToolError(_INVALID_ARGUMENTS) from error
             return normalized_message, schedule
 
         raise ToolError(_INVALID_ARGUMENTS)
-
-    def _resolve_timezone(self, value: str | None) -> str:
-        if value is None:
-            return "UTC"
-        if not isinstance(value, str):
-            raise ToolError(_INVALID_ARGUMENTS)
-        try:
-            ZoneInfo(value)
-        except (ZoneInfoNotFoundError, ValueError) as error:
-            raise ToolError(_TIMEZONE_FAILED) from error
-        return value
 
     def _aware_now(self) -> datetime:
         current = self._now()
@@ -309,16 +284,6 @@ class ScheduleTool(BaseTool):
         except Exception as error:
             raise ToolError(_STATE_READ_FAILED) from error
         return next((job for job in jobs if job.job_id == job_id), None)
-
-
-def _normalize_at_time(value: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError("at_time must be a string")
-    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
-    parsed = datetime.fromisoformat(candidate)
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("at_time must include an offset")
-    return format_rfc3339_milliseconds(parsed)
 
 
 def _public_schedule(schedule: JobSchedule) -> JsonObject:

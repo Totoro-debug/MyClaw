@@ -82,12 +82,37 @@ class JobSchedule:
         return cls(kind="at", at_time=at_time)
 
     @classmethod
+    def from_at_input(cls, at_time: str) -> JobSchedule:
+        """Normalize one timezone-aware ISO input into a strict at Schedule."""
+        if not isinstance(at_time, str):
+            raise TypeError("at_time must be a string")
+        candidate = at_time[:-1] + "+00:00" if at_time.endswith("Z") else at_time
+        parsed = datetime.fromisoformat(candidate)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("at_time must include an offset")
+        return cls.at(format_rfc3339_milliseconds(parsed))
+
+    @classmethod
     def every(cls, every_seconds: int) -> JobSchedule:
         return cls(kind="every", every_seconds=every_seconds)
 
     @classmethod
     def cron(cls, cron_expr: str, timezone: str) -> JobSchedule:
         return cls(kind="cron", cron_expr=cron_expr, timezone=timezone)
+
+    @classmethod
+    def from_cron_input(
+        cls,
+        cron_expr: str,
+        timezone: str | None = None,
+    ) -> JobSchedule:
+        """Normalize one Tool-facing Cron input into a strict cron Schedule."""
+        if not isinstance(cron_expr, str):
+            raise TypeError("cron_expr must be a string")
+        if timezone is not None and not isinstance(timezone, str):
+            raise TypeError("timezone must be a string or null")
+        normalized_cron = " ".join(cron_expr.split())
+        return cls.cron(normalized_cron, "UTC" if timezone is None else timezone)
 
     def to_dict(self) -> dict[str, object]:
         return {

@@ -246,6 +246,52 @@ def test_cron_schedule_requires_canonical_cron_and_valid_iana_timezone(
         JobSchedule(kind="cron", cron_expr=cron_expr, timezone=timezone)
 
 
+def test_cron_input_normalizes_whitespace_and_defaults_to_utc() -> None:
+    assert JobSchedule.from_cron_input(" 0  9 * * 1 ") == JobSchedule.cron(
+        "0 9 * * 1",
+        "UTC",
+    )
+
+
+def test_cron_input_preserves_an_explicit_iana_timezone() -> None:
+    assert JobSchedule.from_cron_input("0 9 * * *", "US/Eastern") == JobSchedule.cron(
+        "0 9 * * *",
+        "US/Eastern",
+    )
+
+
+def test_at_input_normalizes_timezone_aware_iso_values() -> None:
+    assert JobSchedule.from_at_input("2020-01-02T03:04:05.123456Z") == JobSchedule.at(
+        "2020-01-02T03:04:05.123+00:00"
+    )
+
+
+@pytest.mark.parametrize("value", ["2026-08-07T13:00:00", 1])
+def test_at_input_rejects_naive_or_non_string_values(value: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        JobSchedule.from_at_input(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cron_expr", "0  9 * * 1"),
+        ("timezone", None),
+    ],
+)
+def test_schedule_job_from_dict_does_not_normalize_cron_input(
+    field: str,
+    value: object,
+) -> None:
+    document = _valid_job(schedule=JobSchedule.cron("0 9 * * 1", "Asia/Shanghai")).to_dict()
+    schedule = document["schedule"]
+    assert isinstance(schedule, dict)
+    schedule[field] = value
+
+    with pytest.raises(ValueError):
+        ScheduleJob.from_dict(document)
+
+
 @pytest.mark.parametrize(
     "state",
     [
