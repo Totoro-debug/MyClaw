@@ -37,7 +37,7 @@ from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider
+from tests.fixtures import ScriptedFakeProvider, write_schedule_state
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -1053,7 +1053,6 @@ async def test_system_at_job_is_deleted_after_terminal_completion(
     agent_home: Path,
 ) -> None:
     state = _state(workspace, agent_home)
-    store = WorkspaceScheduleStore(state)
     job = ScheduleJob(
         job_id=str(JOB_UUID),
         message="Run this.",
@@ -1062,7 +1061,8 @@ async def test_system_at_job_is_deleted_after_terminal_completion(
         updated_at_ms=1,
         source="system",
     )
-    await store.add_system_job(job)
+    write_schedule_state(state, job)
+    store = WorkspaceScheduleStore(state)
     agent_run = RecordingAgentRun()
     service = ScheduleService(
         store=store,

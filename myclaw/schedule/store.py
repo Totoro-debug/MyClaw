@@ -114,11 +114,6 @@ class WorkspaceScheduleStore:
             raise ValueError("public Schedule mutations can add only user Jobs")
         return await self._add_job(job)
 
-    async def add_system_job(self, job: ScheduleJob) -> ScheduleJob:
-        if job.source != "system":
-            raise ValueError("internal Schedule mutations can add only system Jobs")
-        return await self._add_job(job)
-
     async def _add_job(self, job: ScheduleJob) -> ScheduleJob:
         if not isinstance(job, ScheduleJob):
             raise TypeError("job must be a ScheduleJob")

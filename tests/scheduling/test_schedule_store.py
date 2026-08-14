@@ -12,6 +12,7 @@ from myclaw.schedule.store import (
     ScheduleStoreFaultedError,
     WorkspaceScheduleStore,
 )
+from tests.fixtures import write_schedule_state
 
 JOB_ID = "550e8400-e29b-41d4-a716-446655440000"
 SYSTEM_ID = "6fa459ea-ee8a-4ca4-894e-db77e160355e"
@@ -61,9 +62,13 @@ async def test_missing_schedule_state_is_empty_until_first_mutation(workspace: P
 async def test_snapshot_is_immutable_and_public_snapshot_hides_system_jobs(
     workspace: Path,
 ) -> None:
-    store = WorkspaceScheduleStore(_state(workspace))
-    await store.add_user_job(_job())
-    await store.add_system_job(_job(SYSTEM_ID, source="system", message="Internal run."))
+    state = _state(workspace)
+    write_schedule_state(
+        state,
+        _job(),
+        _job(SYSTEM_ID, source="system", message="Internal run."),
+    )
+    store = WorkspaceScheduleStore(state)
 
     snapshot = await store.snapshot()
     public = await store.public_snapshot()
@@ -149,7 +154,7 @@ async def test_write_failure_keeps_old_snapshot_and_latches_fault(
     assert store.revision == revision
     assert store.health == "faulted"
     with pytest.raises(ScheduleStoreFaultedError):
-        await store.add_system_job(_job(SYSTEM_ID, source="system"))
+        await store.add_user_job(_job(SYSTEM_ID))
 
 
 @pytest.mark.asyncio
@@ -182,9 +187,10 @@ async def test_write_failure_leaves_the_last_complete_document_for_restart(
 
 @pytest.mark.asyncio
 async def test_public_removal_treats_a_system_job_as_missing(workspace: Path) -> None:
-    store = WorkspaceScheduleStore(_state(workspace))
+    state = _state(workspace)
     system_job = _job(SYSTEM_ID, source="system", message="Internal run.")
-    await store.add_system_job(system_job)
+    write_schedule_state(state, system_job)
+    store = WorkspaceScheduleStore(state)
     revision = store.revision
 
     assert await store.remove_user_job(SYSTEM_ID) is False

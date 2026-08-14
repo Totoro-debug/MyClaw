@@ -13,15 +13,21 @@ from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import ModelToolCall
-from tests.fixtures import SingleToolGateway
+from tests.fixtures import SingleToolGateway, write_schedule_state
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
 
 
-def _store(workspace: Path, agent_home: Path) -> WorkspaceScheduleStore:
+def _store(
+    workspace: Path,
+    agent_home: Path,
+    *persisted_jobs: ScheduleJob,
+) -> WorkspaceScheduleStore:
     state = WorkspaceState(Workspace.from_path(workspace))
     state.initialize(agent_home_root=agent_home)
+    if persisted_jobs:
+        write_schedule_state(state, *persisted_jobs)
     return WorkspaceScheduleStore(state)
 
 
@@ -227,7 +233,6 @@ async def test_list_returns_only_public_jobs_in_creation_then_id_order(
     workspace: Path,
     agent_home: Path,
 ) -> None:
-    store = _store(workspace, agent_home)
     first_id = JOB_UUID
     second_id = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
     earlier_id = UUID("9ba7b810-9dad-41d1-80b4-00c04fd430c8")
@@ -260,10 +265,10 @@ async def test_list_returns_only_public_jobs_in_creation_then_id_order(
         created_at_ms=1,
         updated_at_ms=1,
     )
+    store = _store(workspace, agent_home, hidden)
     await store.add_user_job(second)
     await store.add_user_job(first)
     await store.add_user_job(earlier)
-    await store.add_system_job(hidden)
 
     result = await _gateway(
         ScheduleTool(store=store, now=lambda: NOW, new_uuid=lambda: JOB_UUID)
@@ -297,7 +302,6 @@ async def test_remove_requires_canonical_uuid_and_hides_unknown_or_system_jobs(
     workspace: Path,
     agent_home: Path,
 ) -> None:
-    store = _store(workspace, agent_home)
     public = ScheduleJob(
         job_id=str(JOB_UUID),
         message="Remove me",
@@ -313,8 +317,8 @@ async def test_remove_requires_canonical_uuid_and_hides_unknown_or_system_jobs(
         created_at_ms=2,
         updated_at_ms=2,
     )
+    store = _store(workspace, agent_home, hidden)
     await store.add_user_job(public)
-    await store.add_system_job(hidden)
     gateway = _gateway(ScheduleTool(store=store, now=lambda: NOW, new_uuid=lambda: JOB_UUID))
 
     invalid = await gateway.call(
