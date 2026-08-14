@@ -2854,17 +2854,16 @@ def _classify_historical_partition(
             terminal_index = index
             terminal_kind = "failed"
 
-    if terminal_kind == "completed" and terminal_index != len(projected) - 1:
-        return None
-
     final = (
         projected[terminal_index]
         if terminal_kind == "completed" and terminal_index is not None
         else None
     )
     activity_items = projected[1:]
-    if final is not None:
-        activity_items = projected[1:terminal_index]
+    if final is not None and terminal_index is not None:
+        activity_items = [
+            item for index, item in enumerate(projected[1:], start=1) if index != terminal_index
+        ]
     activity = tuple(
         item
         for item in activity_items

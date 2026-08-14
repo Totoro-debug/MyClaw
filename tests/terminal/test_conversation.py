@@ -4646,6 +4646,86 @@ async def test_resume_rebuilds_a_successful_tool_run_activity_group(
 
 
 @pytest.mark.asyncio
+async def test_resume_groups_a_recognizable_tool_result_after_the_final_response(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _prepared_runtime(agent_home, workspace, provider)
+    timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(10))
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: next(timestamps),
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Late recognizable Tool result")
+    target.add_message("user", "Read the file.")
+    target.add_message(
+        "assistant",
+        "I will inspect it first.",
+        tool_calls=[{"id": "call-late", "name": "read_file", "arguments": '{"path":"x"}'}],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.add_message(
+        "assistant",
+        "The file is ready.",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    target.add_message(
+        "tool",
+        "private result",
+        tool_call_id="call-late",
+        name="read_file",
+        status="success",
+        artifact=None,
+    )
+    target.close()
+    app = TerminalConversationApp(runtime)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while "The file is ready." not in _visible_screen_text(app):
+                await pilot.pause()
+
+        group = app.query_one(".agent-run-activity-group")
+        activity = group.query_one(".agent-run-activity-content")
+        visible_text = _visible_screen_text(app)
+
+        assert not activity.display
+        assert "\u25b6 2s" in visible_text
+        assert "The file is ready." in visible_text
+        assert "I will inspect it first." not in visible_text
+        assert "Completed: read_file" not in visible_text
+
+        await pilot.click(".agent-run-activity-heading")
+        visible_text = _visible_screen_text(app)
+        assert "private result" not in visible_text
+        assert visible_text.index("I will inspect it first.") < visible_text.index(
+            "Completed: read_file"
+        )
+        assert visible_text.index("Completed: read_file") < visible_text.index("The file is ready.")
+
+
+@pytest.mark.asyncio
 async def test_resume_uses_the_last_completed_no_tool_assistant_as_final_response(
     agent_home: Path,
     workspace: Path,
