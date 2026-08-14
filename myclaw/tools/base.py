@@ -99,14 +99,6 @@ def is_workspace_path(workspace: Workspace | Path, resolved: Path) -> bool:
     return resolved.is_relative_to(root)
 
 
-def resolve_workspace_path(workspace: Path, requested: str | Path) -> Path:
-    """Resolve a requested path and reject targets outside the Workspace."""
-    resolved = resolve_tool_path(workspace, requested)
-    if not is_workspace_path(workspace, resolved):
-        raise ValueError("Workspace path resolves outside the Workspace")
-    return resolved
-
-
 def normalize_public_ip(value: str) -> str:
     """Normalize one globally routable IPv4/IPv6 address or reject it."""
     if not isinstance(value, str) or "%" in value:
@@ -620,6 +612,5 @@ __all__ = [
     "normalize_public_ip",
     "parameter",
     "resolve_tool_path",
-    "resolve_workspace_path",
     "truncate_text",
 ]

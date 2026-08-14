@@ -499,13 +499,6 @@ class Schema:
             return NotImplemented
         return self.to_json_schema() == other.to_json_schema()
 
-    @property
-    def json_schema(self) -> JsonObject:
-        return self.to_json_schema()
-
-    def to_dict(self) -> JsonObject:
-        return self.to_json_schema()
-
     def cast(self, value: builtins.object) -> builtins.object:
         """Apply only the safe conversions and recursively copy JSON values."""
         if value is None:
@@ -553,9 +546,6 @@ class Schema:
         errors = self.validate(value, path=path)
         if errors:
             raise SchemaValidationError(errors)
-
-    def is_valid(self, value: builtins.object) -> bool:
-        return not self.validate(value)
 
     def _validate(self, value: builtins.object, path: str, errors: list[SchemaError]) -> None:
         if value is None:
@@ -691,9 +681,6 @@ def parameter[T](
         return _attach_schema(target, root)
 
     return decorate
-
-
-parameters = parameter
 
 
 def _parameter_schema(
@@ -888,5 +875,4 @@ __all__ = [
     "String",
     "ToolParam",
     "parameter",
-    "parameters",
 ]

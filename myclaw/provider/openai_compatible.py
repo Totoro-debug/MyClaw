@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from importlib import import_module
@@ -25,7 +24,6 @@ from myclaw.provider.models import (
     UserModelMessage,
 )
 from myclaw.tools.tool_gateway import ModelToolCall
-from myclaw.utils.json_types import JsonObject
 
 
 class _Completions(Protocol):
@@ -259,7 +257,7 @@ def _openai_message(
                     "type": "function",
                     "function": {
                         "name": tool_call.name,
-                        "arguments": _raw_argument_text(tool_call.arguments),
+                        "arguments": tool_call.arguments,
                     },
                 }
                 for tool_call in message.tool_calls
@@ -270,13 +268,6 @@ def _openai_message(
         "tool_call_id": message.tool_call_id,
         "content": message.content,
     }
-
-
-def _raw_argument_text(arguments: str | JsonObject) -> str:
-    if isinstance(arguments, str):
-        return arguments
-    # Temporary support for pre-migration test fixtures; removed by #48.
-    return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
 
 
 def _finish_reason(value: str) -> FinishReason:

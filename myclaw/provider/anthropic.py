@@ -273,10 +273,7 @@ class _StreamingToolUse:
         return ModelToolCall(id=self.id, name=self.name, arguments=arguments)
 
 
-def _argument_object(arguments: str | JsonObject) -> JsonObject:
-    if isinstance(arguments, dict):
-        # Temporary support for pre-migration test fixtures; removed by #48.
-        return arguments
+def _argument_object(arguments: str) -> JsonObject:
     try:
         value = cast(object, json.loads(arguments))
     except json.JSONDecodeError as error:
