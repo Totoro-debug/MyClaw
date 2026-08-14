@@ -404,6 +404,7 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
     ]
     assert isinstance(unavailable_events[3].payload, ToolCompletedPayload)
     assert unavailable_events[3].payload.status == "error"
+    assert unavailable_events[3].payload.summary == "The requested tool is not available."
     assert isinstance(unavailable_events[-1].payload, TurnFailedPayload)
     assert unavailable_events[-1].payload.error == ErrorInfo(
         code="model_failed",
@@ -516,6 +517,9 @@ async def test_foreground_tool_diagnostics_preserve_boundary_exception_details(
     ]
     assert isinstance(events[3].payload, ToolCompletedPayload)
     assert events[3].payload.status == "error"
+    assert events[3].payload.summary == "web_search could not complete the request."
+    assert private_query not in events[3].payload.summary
+    assert "PRIVATE_WEB_CREDENTIAL" not in events[3].payload.summary
     content = _session_log_text(workspace, runtime.session_id)
     assert content.count("Tool execution failed name=web_search") == 1
     assert "Traceback (most recent call last):" in content

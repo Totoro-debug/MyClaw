@@ -459,7 +459,7 @@ class AgentRun:
                                 tool_call_id=result.tool_call_id,
                                 tool_name=result.name,
                                 status=result.status,
-                                summary=_tool_summary("Finished", result.name),
+                                summary=_tool_completion_summary(result),
                             )
                             if self._cancel_requested():
                                 cancelled_content = "".join(partial_content)
@@ -884,6 +884,12 @@ def _require_summary(value: str) -> None:
 
 def _tool_summary(action: str, tool_name: str) -> str:
     return " ".join(f"{action} {tool_name}".split())[:240]
+
+
+def _tool_completion_summary(result: ToolResult) -> str:
+    if result.status == "error":
+        return " ".join(result.content.split())[:240]
+    return _tool_summary("Finished", result.name)
 
 
 async def _close_iterator(iterator: AsyncIterator[object] | None) -> None:
