@@ -3,6 +3,10 @@
 from myclaw.errors import ErrorInfo
 
 
+class EmptyModelResponseError(ValueError):
+    """A successful Model Response contained neither text nor Tool calls."""
+
+
 class ModelCallError(Exception):
     """A normalized Model Provider failure handled by the Model Router."""
 

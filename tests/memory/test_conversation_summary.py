@@ -334,29 +334,6 @@ async def test_context_overflow_without_old_complete_turn_keeps_current_message(
 
 
 @pytest.mark.asyncio
-async def test_empty_summary_response_is_model_failure_without_last_consolidated_progress(
-    workspace: Path,
-) -> None:
-    state = _state(workspace)
-    session = _session_with_history(state)
-    provider = ScriptedFakeProvider(completions=(_response(""),))
-    summaries = WorkspaceJsonlSummaryStore(state)
-
-    with pytest.raises(ModelCallError) as raised:
-        await _manager(provider, summaries).prepare(session)
-
-    assert raised.value.error.code == "model_failed"
-    assert session.last_consolidated == 0
-    assert session.metadata["token_usage"] == {
-        "model_calls": 3,
-        "input_tokens": 28,
-        "output_tokens": 9,
-        "total_tokens": 37,
-    }
-    assert not summaries.path.exists()
-
-
-@pytest.mark.asyncio
 async def test_summary_provider_failure_preserves_user_visible_model_error(
     workspace: Path,
 ) -> None:

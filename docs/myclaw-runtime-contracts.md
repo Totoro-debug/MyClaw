@@ -520,6 +520,8 @@ ModelUsage(
 )
 ```
 
+成功的 `ModelResponse` 必须包含非空白 `message.content` 或至少一个 Tool call；两者都没有时，provider adapter 将响应规范化为不可重试的 `model_failed`。
+
 streaming contract 只向 Runtime Core 暴露：
 
 - `text_delta(delta)`：非空 text chunk，按顺序到达。

@@ -18,7 +18,7 @@ from anthropic import (
 
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorInfo
-from myclaw.provider.errors import ModelCallError
+from myclaw.provider.errors import EmptyModelResponseError, ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
     FinishReason,
@@ -87,6 +87,8 @@ class AnthropicProvider:
         try:
             async for event in self._stream_once(request):
                 yield event
+        except EmptyModelResponseError as error:
+            raise _empty_response_error() from error
         except APIError as error:
             raise _normalized_error(error) from error
         except (TypeError, ValueError) as error:
@@ -156,6 +158,8 @@ class AnthropicProvider:
                 **_request_arguments(request, stream=False)
             )
             return _response_from_message(message)
+        except EmptyModelResponseError as error:
+            raise _empty_response_error() from error
         except APIError as error:
             raise _normalized_error(error) from error
         except (TypeError, ValueError) as error:
@@ -414,6 +418,15 @@ def _normalized_error(
 
 def _model_failed_error() -> ModelCallError:
     return ModelCallError(ErrorInfo(code="model_failed", message="Anthropic model call failed."))
+
+
+def _empty_response_error() -> ModelCallError:
+    return ModelCallError(
+        ErrorInfo(
+            code="model_failed",
+            message="Anthropic provider returned an empty response. Check its model configuration.",
+        )
+    )
 
 
 def _retry_after_seconds(error: APIStatusError) -> float | None:

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import ClassVar, Literal, Protocol
 from uuid import UUID
 
+from myclaw.provider.errors import EmptyModelResponseError
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.validation import require_nonnegative_int, require_uuid4
@@ -137,6 +138,10 @@ class ModelResponse:
     usage: ModelUsage
     finish_reason: FinishReason
 
+    def __post_init__(self) -> None:
+        if not self.message.content.strip() and not self.message.tool_calls:
+            raise EmptyModelResponseError("model response requires content or tool calls")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "message": self.message.to_dict(),
@@ -176,7 +181,7 @@ type ModelStreamEvent = TextDelta | ModelCompleted
 
 
 class ModelProvider(Protocol):
-    """Execute provider-neutral model requests."""
+    """Return responses containing nonblank text or at least one Tool call."""
 
     def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]: ...
 

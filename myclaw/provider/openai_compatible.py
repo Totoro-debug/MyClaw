@@ -11,7 +11,7 @@ from typing import Protocol, cast
 
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorCode, ErrorInfo
-from myclaw.provider.errors import ModelCallError
+from myclaw.provider.errors import EmptyModelResponseError, ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
     FinishReason,
@@ -145,8 +145,6 @@ class OpenAICompatibleProvider:
         tool_calls = tuple(
             _model_tool_call(tool_call_parts[index]) for index in sorted(tool_call_parts)
         )
-        if not content.strip() and not tool_calls:
-            raise _empty_response_error()
 
         yield ModelCompleted(
             response=ModelResponse(
@@ -309,6 +307,8 @@ _ROUTE_ERROR_CODES = frozenset(
 
 
 def _model_call_error(failure: Exception) -> ModelCallError:
+    if isinstance(failure, EmptyModelResponseError):
+        return _empty_response_error()
     status = _status_code(failure)
     provider_code = _provider_error_code(failure)
     class_name = type(failure).__name__.lower()

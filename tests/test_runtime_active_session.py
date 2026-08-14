@@ -271,7 +271,7 @@ async def test_runtime_rejects_tool_call_title_and_counts_its_usage(
 
 
 @pytest.mark.asyncio
-async def test_runtime_empty_generated_title_uses_the_first_user_fallback(
+async def test_runtime_empty_normalized_title_uses_the_first_user_fallback(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -284,7 +284,7 @@ async def test_runtime_empty_generated_title_uses_the_first_user_fallback(
             ),
         ),
         title_response=ModelResponse(
-            message=AssistantModelMessage(content="\n\t  "),
+            message=AssistantModelMessage(content='""'),
             usage=ModelUsage(input_tokens=3, output_tokens=1, total_tokens=4),
             finish_reason="stop",
         ),

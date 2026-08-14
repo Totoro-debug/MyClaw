@@ -233,13 +233,6 @@ class ConversationSummaryManager:
         )
         response = await self._provider.complete(request)
         session.update_metadata(usage_delta={"model_calls": 1, **response.usage.to_dict()})
-        if not response.message.content:
-            raise ModelCallError(
-                ErrorInfo(
-                    code="model_failed",
-                    message="The memory model returned an empty Conversation Summary.",
-                )
-            )
         try:
             new_last_consolidated = session.last_consolidated + cutoff
             await self._summaries.append(

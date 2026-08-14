@@ -345,8 +345,24 @@ async def test_complete_normalizes_memory_and_schedule_responses(route: ModelRou
 
 
 @pytest.mark.asyncio
-async def test_complete_rejects_an_empty_success_response() -> None:
-    client = FakeOpenAIClient(SimpleNamespace(choices=[], usage=None))
+@pytest.mark.parametrize(
+    "response",
+    [
+        SimpleNamespace(choices=[], usage=None),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=" \n", tool_calls=None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+        ),
+    ],
+    ids=("no-choices", "blank-message"),
+)
+async def test_complete_rejects_an_empty_success_response(response: object) -> None:
+    client = FakeOpenAIClient(response)
     provider = OpenAICompatibleProvider(
         configuration(),
         client_factory=FakeOpenAIClientFactory(client),

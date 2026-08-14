@@ -24,7 +24,7 @@ from httpx import Request, Response
 
 from myclaw.config.config import ProviderConfiguration
 from myclaw.provider.anthropic import AnthropicProvider
-from myclaw.provider.errors import ModelCallError
+from myclaw.provider.errors import EmptyModelResponseError, ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
@@ -197,6 +197,25 @@ async def test_stream_translates_text_and_usage_through_official_sdk_boundary() 
 
 
 @pytest.mark.asyncio
+async def test_stream_rejects_an_empty_success_response() -> None:
+    client = FakeAnthropicClient(FakeAnthropicStream())
+    provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
+
+    with pytest.raises(ModelCallError) as captured:
+        async for _event in provider.stream(request()):
+            pass
+
+    assert captured.value.error.to_dict() == {
+        "code": "model_failed",
+        "message": "Anthropic provider returned an empty response. Check its model configuration.",
+        "retryable": False,
+        "retry_after_seconds": None,
+    }
+    assert isinstance(captured.value.__cause__, EmptyModelResponseError)
+    assert len(client.messages.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_stream_aggregates_mixed_text_and_tool_use_content() -> None:
     stream = FakeAnthropicStream(
         SimpleNamespace(
@@ -362,6 +381,29 @@ async def test_complete_translates_mixed_history_and_full_message() -> None:
             ],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_complete_rejects_an_empty_success_response() -> None:
+    response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=" \n")],
+        usage=SimpleNamespace(input_tokens=3, output_tokens=1),
+        stop_reason="end_turn",
+    )
+    client = FakeAnthropicClient(response)
+    provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
+
+    with pytest.raises(ModelCallError) as captured:
+        await provider.complete(request(stream=False))
+
+    assert captured.value.error.to_dict() == {
+        "code": "model_failed",
+        "message": "Anthropic provider returned an empty response. Check its model configuration.",
+        "retryable": False,
+        "retry_after_seconds": None,
+    }
+    assert isinstance(captured.value.__cause__, EmptyModelResponseError)
+    assert len(client.messages.calls) == 1
 
 
 @pytest.mark.asyncio

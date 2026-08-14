@@ -2,6 +2,7 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.provider.errors import EmptyModelResponseError
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
@@ -168,6 +169,32 @@ def test_assistant_message_rejects_duplicate_tool_call_ids() -> None:
 
     with pytest.raises(ValueError, match="tool call IDs must be unique"):
         AssistantModelMessage(content="", tool_calls=(first, second))
+
+
+@pytest.mark.parametrize("content", ["", " \n\t"])
+def test_model_response_rejects_empty_success(content: str) -> None:
+    with pytest.raises(EmptyModelResponseError):
+        ModelResponse(
+            message=AssistantModelMessage(content=content),
+            usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+            finish_reason="stop",
+        )
+
+
+def test_model_response_accepts_tool_call_without_text() -> None:
+    tool_call = ModelToolCall(
+        id="call_123",
+        name="read_file",
+        arguments='{"path":"README.md"}',
+    )
+
+    response = ModelResponse(
+        message=AssistantModelMessage(content="", tool_calls=(tool_call,)),
+        usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
+        finish_reason="tool_calls",
+    )
+
+    assert response.message.tool_calls == (tool_call,)
 
 
 def test_model_boundary_rejects_non_uuid4_nonstreaming_chat_and_empty_deltas() -> None:
