@@ -64,8 +64,6 @@ class Session:
     _workspace_state: WorkspaceState
     _session_id: str
     _storage_partition: SessionStoragePartition
-    _storage_directory: Path
-    _artifact_directory: Path
     _created_at: datetime
     _updated_at: datetime
     _now: Callable[[], datetime] | None
@@ -100,8 +98,6 @@ class Session:
         session._workspace_state = workspace_state
         session._session_id = session_id
         session._storage_partition = resolved_partition
-        session._storage_directory = _storage_directory(workspace_state, resolved_partition)
-        session._artifact_directory = workspace_state.artifacts_directory / session_id
         session._created_at = created_at
         session._updated_at = updated_at
         session._now = now
@@ -243,14 +239,6 @@ class Session:
     @property
     def storage_partition(self) -> SessionStoragePartition:
         return self._storage_partition
-
-    @property
-    def storage_directory(self) -> Path:
-        return self._storage_directory
-
-    @property
-    def artifact_directory(self) -> Path:
-        return self._artifact_directory
 
     @property
     def created_at(self) -> datetime:

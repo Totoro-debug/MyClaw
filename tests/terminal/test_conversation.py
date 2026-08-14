@@ -5182,7 +5182,7 @@ async def test_resume_failure_after_a_stale_listing_preserves_the_current_displa
     target.update_metadata(title="Stale target")
     target.add_message("user", "Should not be restored.")
     target.close()
-    target_path = target.storage_directory / f"{target.session_id}.jsonl"
+    target_path = target.workspace_state.sessions_directory / f"{target.session_id}.jsonl"
     app = TerminalConversationApp(runtime)
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -5269,7 +5269,7 @@ async def test_resume_picker_reports_corrupt_entries_without_mutating_them(
     target.update_metadata(title="Valid target")
     target.add_message("user", "Valid restored content.")
     target.close()
-    corrupt_path = target.storage_directory / (
+    corrupt_path = target.workspace_state.sessions_directory / (
         "20260811-120000-000000_00000000-0000-0000-0000-000000000000.jsonl"
     )
     corrupt_content = b"{not-json\n"

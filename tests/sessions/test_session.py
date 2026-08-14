@@ -111,8 +111,6 @@ def test_create_schedule_session_uses_a_lazy_isolated_storage_partition(
 
     assert session.session_id == f"schedule_{SCHEDULE_JOB_ID}"
     assert session.storage_partition is SessionStoragePartition.SCHEDULE
-    assert session.storage_directory == state.schedule_sessions_directory
-    assert session.artifact_directory == state.artifacts_directory / session.session_id
     assert not state.schedule_sessions_directory.exists()
 
     session.add_message("user", "Run the scheduled task.")

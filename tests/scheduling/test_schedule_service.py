@@ -222,7 +222,6 @@ async def test_overdue_at_runs_once_through_shared_agent_run_and_deletes_definit
     assert route == "schedule"
     assert stream is False
     assert session.session_id == f"schedule_{JOB_UUID}"
-    assert session.storage_directory == state.schedule_sessions_directory
     assert (state.schedule_sessions_directory / f"schedule_{JOB_UUID}.jsonl").exists()
     assert not (state.sessions_directory / f"schedule_{JOB_UUID}.jsonl").exists()
     assert await store.snapshot() == ()
