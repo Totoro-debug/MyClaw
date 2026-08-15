@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from math import isfinite
 from typing import Protocol, cast
@@ -23,14 +23,16 @@ from myclaw.provider.models import (
     AssistantModelMessage,
     FinishReason,
     ModelCompleted,
+    ModelMessages,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
     TextDelta,
-    ToolModelMessage,
-    UserModelMessage,
+    resolve_provider_call_arguments,
 )
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.json_types import JsonObject, JsonValue
 
@@ -83,9 +85,62 @@ class AnthropicProvider:
             max_retries=0,
         )
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+    def stream(
+        self,
+        request: ModelRequest | None = None,
+        *,
+        messages: ModelMessages | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
+        model: str | None = None,
+        max_output: int | None = None,
+        temperature: float | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+        timeout: int | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        arguments = resolve_provider_call_arguments(
+            request,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_output=max_output,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
+        return self._stream_with_arguments(
+            messages=arguments.messages,
+            tools=arguments.tools,
+            model=arguments.model,
+            max_output=arguments.max_output,
+            temperature=arguments.temperature,
+            reasoning_effort=arguments.reasoning_effort,
+            timeout=arguments.timeout,
+            from_legacy_request=arguments.from_legacy_request,
+        )
+
+    async def _stream_with_arguments(
+        self,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+        from_legacy_request: bool,
+    ) -> AsyncIterator[ModelStreamEvent]:
         try:
-            async for event in self._stream_once(request):
+            async for event in self._stream_once(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+                from_legacy_request=from_legacy_request,
+            ):
                 yield event
         except EmptyModelResponseError as error:
             raise _empty_response_error() from error
@@ -94,8 +149,30 @@ class AnthropicProvider:
         except (TypeError, ValueError) as error:
             raise _model_failed_error() from error
 
-    async def _stream_once(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        sdk_stream = await self._client.messages.create(**_request_arguments(request, stream=True))
+    async def _stream_once(
+        self,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+        from_legacy_request: bool,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del reasoning_effort, from_legacy_request
+        sdk_stream = await self._client.messages.create(
+            **_request_arguments(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                timeout=timeout,
+                stream=True,
+            )
+        )
         if not hasattr(sdk_stream, "__aiter__"):
             msg = "Anthropic streaming response is not asynchronously iterable"
             raise TypeError(msg)
@@ -152,10 +229,39 @@ class AnthropicProvider:
         )
         yield ModelCompleted(response=response)
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
+    async def complete(
+        self,
+        request: ModelRequest | None = None,
+        *,
+        messages: ModelMessages | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
+        model: str | None = None,
+        max_output: int | None = None,
+        temperature: float | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+        timeout: int | None = None,
+    ) -> ModelResponse:
+        arguments = resolve_provider_call_arguments(
+            request,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_output=max_output,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
         try:
             message = await self._client.messages.create(
-                **_request_arguments(request, stream=False)
+                **_request_arguments(
+                    messages=arguments.messages,
+                    tools=arguments.tools,
+                    model=arguments.model,
+                    max_output=arguments.max_output,
+                    temperature=arguments.temperature,
+                    timeout=arguments.timeout,
+                    stream=False,
+                )
             )
             return _response_from_message(message)
         except EmptyModelResponseError as error:
@@ -169,58 +275,91 @@ class AnthropicProvider:
         await self._client.close()
 
 
-def _request_arguments(request: ModelRequest, *, stream: bool) -> dict[str, object]:
-    messages = [_message_argument(message) for message in request.messages]
-    tools: list[dict[str, object]] = []
-    for tool in request.tools:
+def _request_arguments(
+    *,
+    messages: ModelMessages,
+    tools: Sequence[OpenAIToolSchema],
+    model: str,
+    max_output: int,
+    temperature: float,
+    timeout: int,
+    stream: bool,
+) -> dict[str, object]:
+    system: object | None = None
+    if messages and messages[0].get("role") == "system":
+        system = messages[0].get("content", "")
+        messages = messages[1:]
+    translated_messages = [_message_argument(message) for message in messages]
+    translated_tools: list[dict[str, object]] = []
+    for tool in tools:
         function = tool["function"]
-        tools.append(
+        translated_tools.append(
             {
                 "name": function["name"],
                 "description": function["description"],
                 "input_schema": function["parameters"],
             }
         )
-    return {
-        "max_tokens": request.max_output,
-        "messages": messages,
-        "model": request.model,
+    arguments: dict[str, object] = {
+        "max_tokens": max_output,
+        "messages": translated_messages,
+        "model": model,
         "stream": stream,
-        "system": request.system_prompt,
-        "temperature": request.temperature,
-        "timeout": request.timeout_seconds,
-        "tools": tools,
+        "temperature": temperature,
+        "timeout": timeout,
+        "tools": translated_tools,
     }
+    if system is not None:
+        arguments["system"] = system
+    return arguments
 
 
-def _message_argument(
-    message: UserModelMessage | AssistantModelMessage | ToolModelMessage,
-) -> dict[str, object]:
-    if isinstance(message, UserModelMessage):
-        return {"role": "user", "content": message.content}
-    if isinstance(message, AssistantModelMessage):
+def _message_argument(message: Mapping[str, object]) -> dict[str, object]:
+    role = message.get("role")
+    if role == "user":
+        return {"role": "user", "content": message.get("content", "")}
+    if role == "assistant":
         content: list[dict[str, object]] = []
-        if message.content:
-            content.append({"type": "text", "text": message.content})
+        message_content = message.get("content", "")
+        if message_content:
+            content.append({"type": "text", "text": message_content})
+        tool_calls = message.get("tool_calls", ())
         content.extend(
-            {
-                "type": "tool_use",
-                "id": tool_call.id,
-                "name": tool_call.name,
-                "input": _argument_object(tool_call.arguments),
-            }
-            for tool_call in message.tool_calls
+            _anthropic_tool_use(tool_call) for tool_call in _tool_call_sequence(tool_calls)
         )
         return {"role": "assistant", "content": content}
+    if role == "tool":
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": message.get("tool_call_id", ""),
+                    "content": message.get("content", ""),
+                }
+            ],
+        }
+    raise TypeError("Model message role is unsupported")
+
+
+def _tool_call_sequence(value: object) -> Sequence[object]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("assistant tool_calls must be a sequence")
+    return value
+
+
+def _anthropic_tool_use(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError("assistant tool call must be a mapping")
+    name = value.get("name")
+    arguments = value.get("arguments", "")
+    if not isinstance(name, str) or not isinstance(arguments, str):
+        raise TypeError("assistant tool call name and arguments must be strings")
     return {
-        "role": "user",
-        "content": [
-            {
-                "type": "tool_result",
-                "tool_use_id": message.tool_call_id,
-                "content": message.content,
-            }
-        ],
+        "type": "tool_use",
+        "id": value.get("id", ""),
+        "name": name,
+        "input": _argument_object(arguments),
     }
 
 

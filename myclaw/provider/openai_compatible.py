@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import import_module
 from math import isfinite
@@ -15,14 +15,16 @@ from myclaw.provider.models import (
     AssistantModelMessage,
     FinishReason,
     ModelCompleted,
+    ModelMessages,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
     TextDelta,
-    ToolModelMessage,
-    UserModelMessage,
+    resolve_provider_call_arguments,
 )
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 
 
@@ -95,18 +97,92 @@ class OpenAICompatibleProvider:
             ),
         )
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+    def stream(
+        self,
+        request: ModelRequest | None = None,
+        *,
+        messages: ModelMessages | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
+        model: str | None = None,
+        max_output: int | None = None,
+        temperature: float | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+        timeout: int | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        arguments = resolve_provider_call_arguments(
+            request,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_output=max_output,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
+        return self._stream_with_arguments(
+            messages=arguments.messages,
+            tools=arguments.tools,
+            model=arguments.model,
+            max_output=arguments.max_output,
+            temperature=arguments.temperature,
+            reasoning_effort=arguments.reasoning_effort,
+            timeout=arguments.timeout,
+            from_legacy_request=arguments.from_legacy_request,
+        )
+
+    async def _stream_with_arguments(
+        self,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+        from_legacy_request: bool,
+    ) -> AsyncIterator[ModelStreamEvent]:
         try:
-            async for event in self._stream_once(request):
+            async for event in self._stream_once(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+                from_legacy_request=from_legacy_request,
+            ):
                 yield event
         except ModelCallError:
             raise
         except Exception as failure:
             raise _model_call_error(failure) from failure
 
-    async def _stream_once(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+    async def _stream_once(
+        self,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+        from_legacy_request: bool,
+    ) -> AsyncIterator[ModelStreamEvent]:
         result = await self._client.chat.completions.create(
-            **_request_arguments(request, stream=True)
+            **_request_arguments(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+                stream=True,
+                include_reasoning=not from_legacy_request,
+            )
         )
         chunks = cast(AsyncIterator[object], result)
         content_parts: list[str] = []
@@ -159,17 +235,68 @@ class OpenAICompatibleProvider:
             )
         )
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
+    async def complete(
+        self,
+        request: ModelRequest | None = None,
+        *,
+        messages: ModelMessages | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
+        model: str | None = None,
+        max_output: int | None = None,
+        temperature: float | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+        timeout: int | None = None,
+    ) -> ModelResponse:
+        arguments = resolve_provider_call_arguments(
+            request,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_output=max_output,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
         try:
-            return await self._complete_once(request)
+            return await self._complete_once(
+                messages=arguments.messages,
+                tools=arguments.tools,
+                model=arguments.model,
+                max_output=arguments.max_output,
+                temperature=arguments.temperature,
+                reasoning_effort=arguments.reasoning_effort,
+                timeout=arguments.timeout,
+                from_legacy_request=arguments.from_legacy_request,
+            )
         except ModelCallError:
             raise
         except Exception as failure:
             raise _model_call_error(failure) from failure
 
-    async def _complete_once(self, request: ModelRequest) -> ModelResponse:
+    async def _complete_once(
+        self,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+        from_legacy_request: bool,
+    ) -> ModelResponse:
         result = await self._client.chat.completions.create(
-            **_request_arguments(request, stream=False)
+            **_request_arguments(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+                stream=False,
+                include_reasoning=not from_legacy_request,
+            )
         )
         choices = cast(list[object], getattr(result, "choices", []))
         if not choices:
@@ -199,19 +326,29 @@ class OpenAICompatibleProvider:
         await self._client.close()
 
 
-def _request_arguments(request: ModelRequest, *, stream: bool) -> dict[str, object]:
+def _request_arguments(
+    *,
+    messages: ModelMessages,
+    tools: Sequence[OpenAIToolSchema],
+    model: str,
+    max_output: int,
+    temperature: float,
+    reasoning_effort: ReasoningEffort | None,
+    timeout: int,
+    stream: bool,
+    include_reasoning: bool,
+) -> dict[str, object]:
     arguments: dict[str, object] = {
-        "max_tokens": request.max_output,
-        "messages": [
-            {"role": "system", "content": request.system_prompt},
-            *[_openai_message(message) for message in request.messages],
-        ],
-        "model": request.model,
+        "max_tokens": max_output,
+        "messages": [_openai_message(message) for message in messages],
+        "model": model,
         "stream": stream,
-        "temperature": request.temperature,
-        "timeout": request.timeout_seconds,
-        "tools": list(request.tools),
+        "temperature": temperature,
+        "timeout": timeout,
+        "tools": list(tools),
     }
+    if include_reasoning and reasoning_effort is not None:
+        arguments["reasoning_effort"] = reasoning_effort
     if stream:
         arguments["stream_options"] = {"include_usage": True}
     return arguments
@@ -240,33 +377,50 @@ def _complete_tool_call(tool_call: object) -> ModelToolCall:
     )
 
 
-def _openai_message(
-    message: UserModelMessage | AssistantModelMessage | ToolModelMessage,
-) -> dict[str, object]:
-    if isinstance(message, UserModelMessage):
-        return {"role": "user", "content": message.content}
-    if isinstance(message, AssistantModelMessage):
+def _openai_message(message: Mapping[str, object]) -> dict[str, object]:
+    role = message.get("role")
+    content = message.get("content", "")
+    if role == "assistant":
         result: dict[str, object] = {
             "role": "assistant",
-            "content": message.content,
+            "content": content,
         }
-        if message.tool_calls:
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
             result["tool_calls"] = [
-                {
-                    "id": tool_call.id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_call.name,
-                        "arguments": tool_call.arguments,
-                    },
-                }
-                for tool_call in message.tool_calls
+                _openai_tool_call(tool_call) for tool_call in _tool_call_sequence(tool_calls)
             ]
         return result
+    if role == "tool":
+        return {
+            "role": "tool",
+            "tool_call_id": message.get("tool_call_id", ""),
+            "content": content,
+        }
+    if role in {"system", "user"}:
+        return {"role": role, "content": content}
+    raise TypeError("Model message role is unsupported")
+
+
+def _tool_call_sequence(value: object) -> Sequence[object]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("assistant tool_calls must be a sequence")
+    return value
+
+
+def _openai_tool_call(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError("assistant tool call must be a mapping")
+    function = value.get("function")
+    function_mapping = function if isinstance(function, Mapping) else value
+    name = function_mapping.get("name")
+    arguments = function_mapping.get("arguments", "")
+    if not isinstance(name, str) or not isinstance(arguments, str):
+        raise TypeError("assistant tool call name and arguments must be strings")
     return {
-        "role": "tool",
-        "tool_call_id": message.tool_call_id,
-        "content": message.content,
+        "id": value.get("id", ""),
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
     }
 
 

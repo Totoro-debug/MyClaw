@@ -1,7 +1,7 @@
 """Model Route resolution and one shared Provider attempt budget."""
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
@@ -10,12 +10,15 @@ from loguru import logger
 from myclaw.config.config import ProviderConfiguration, ResolvedModelRoute, UserConfiguration
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
+    DirectModelProvider,
+    ModelMessages,
     ModelProvider,
     ModelRequest,
     ModelResponse,
     ModelRoute,
     ModelStreamEvent,
 )
+from myclaw.tools.base import OpenAIToolSchema
 
 _MAX_ATTEMPTS = 5
 _RETRYABLE_CODES = frozenset({"provider_rate_limited", "provider_timeout", "provider_unavailable"})
@@ -26,7 +29,8 @@ class RetryClock(Protocol):
     async def sleep(self, seconds: float) -> None: ...
 
 
-type ProviderFactory = Callable[[ProviderConfiguration], ModelProvider]
+type ProviderImplementation = ModelProvider | DirectModelProvider
+type ProviderFactory = Callable[[ProviderConfiguration], ProviderImplementation]
 type Jitter = Callable[[float], float]
 
 
@@ -57,7 +61,7 @@ class ModelRouter:
         self._provider_factory = provider_factory
         self._clock = clock
         self._jitter = jitter
-        self._providers: dict[str, ModelProvider] = {}
+        self._providers: dict[str, ProviderImplementation] = {}
         self._route_statuses: dict[ModelRoute, ModelRouteStatus] = {}
         self._close_task: asyncio.Task[None] | None = None
 
@@ -72,11 +76,30 @@ class ModelRouter:
             self._route_statuses[requested_route] = status
         return status
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+    def stream(
+        self,
+        route: ModelRoute | ModelRequest,
+        *,
+        messages: ModelMessages | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        if isinstance(route, ModelRequest):
+            if messages is not None or tools is not None:
+                raise TypeError("legacy ModelRequest and direct Router arguments cannot be mixed")
+            return self._stream_request(route)
+        if messages is None:
+            raise TypeError("direct Router calls require messages")
+        return self._stream_direct(
+            route,
+            messages=messages,
+            tools=() if tools is None else tools,
+        )
+
+    async def _stream_request(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         resolved = self._begin_call(request.route)
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            provider = self._provider(resolved.provider)
+            provider = cast(ModelProvider, self._provider(resolved.provider))
             concrete_request = _concrete_request(request, resolved)
             emitted = False
             try:
@@ -89,14 +112,89 @@ class ModelRouter:
                     raise
                 resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
+    async def _stream_direct(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+    ) -> AsyncIterator[ModelStreamEvent]:
+        resolved = self._begin_call(route)
+
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            provider = cast(DirectModelProvider, self._provider(resolved.provider))
+            emitted = False
+            try:
+                async for event in provider.stream(
+                    messages=messages,
+                    tools=tools,
+                    model=resolved.route.model,
+                    max_output=resolved.route.max_output,
+                    temperature=resolved.route.temperature,
+                    reasoning_effort=resolved.route.reasoning_effort,
+                    timeout=resolved.route.timeout,
+                ):
+                    emitted = True
+                    yield event
+                return
+            except ModelCallError as failure:
+                if emitted:
+                    raise
+                resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
+
+    async def complete(
+        self,
+        route: ModelRoute | ModelRequest,
+        *,
+        messages: ModelMessages | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
+    ) -> ModelResponse:
+        if isinstance(route, ModelRequest):
+            if messages is not None or tools is not None:
+                raise TypeError("legacy ModelRequest and direct Router arguments cannot be mixed")
+            return await self._complete_request(route)
+        if messages is None:
+            raise TypeError("direct Router calls require messages")
+        return await self._complete_direct(
+            route,
+            messages=messages,
+            tools=() if tools is None else tools,
+        )
+
+    async def _complete_request(self, request: ModelRequest) -> ModelResponse:
         resolved = self._begin_call(request.route)
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            provider = self._provider(resolved.provider)
+            provider = cast(ModelProvider, self._provider(resolved.provider))
             concrete_request = _concrete_request(request, resolved)
             try:
                 return await provider.complete(concrete_request)
+            except ModelCallError as failure:
+                resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
+
+        raise AssertionError("Provider attempt budget exhausted without a terminal result")
+
+    async def _complete_direct(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+    ) -> ModelResponse:
+        resolved = self._begin_call(route)
+
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            provider = cast(DirectModelProvider, self._provider(resolved.provider))
+            try:
+                return await provider.complete(
+                    messages=messages,
+                    tools=tools,
+                    model=resolved.route.model,
+                    max_output=resolved.route.max_output,
+                    temperature=resolved.route.temperature,
+                    reasoning_effort=resolved.route.reasoning_effort,
+                    timeout=resolved.route.timeout,
+                )
             except ModelCallError as failure:
                 resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
 
@@ -113,7 +211,7 @@ class ModelRouter:
         providers = tuple(self._providers.values())
         self._providers.clear()
         closed: set[int] = set()
-        unique: list[ModelProvider] = []
+        unique: list[ProviderImplementation] = []
         for provider in providers:
             identity = id(provider)
             if identity in closed:
@@ -170,7 +268,7 @@ class ModelRouter:
         _log_fallback(current, fallback, failure, attempt=attempt)
         return fallback
 
-    def _provider(self, configuration: ProviderConfiguration) -> ModelProvider:
+    def _provider(self, configuration: ProviderConfiguration) -> ProviderImplementation:
         if self._close_task is not None:
             raise RuntimeError("Model Router is closed")
         provider = self._providers.get(configuration.provider_id)

@@ -1,8 +1,8 @@
 """Provider-neutral model request and response values."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from typing import ClassVar, Literal, Protocol
+from typing import Any, ClassVar, Literal, Protocol
 from uuid import UUID
 
 from myclaw.provider.errors import EmptyModelResponseError
@@ -13,6 +13,20 @@ from myclaw.utils.validation import require_nonnegative_int, require_uuid4
 type ModelRoute = Literal["default", "chat", "memory", "schedule"]
 type ReasoningEffort = Literal["low", "medium", "high"]
 type FinishReason = Literal["stop", "tool_calls", "length", "cancelled"]
+type ModelMessageDictionary = dict[str, Any]
+type ModelMessages = Sequence[ModelMessageDictionary]
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderCallArguments:
+    messages: ModelMessages
+    tools: Sequence[OpenAIToolSchema]
+    model: str
+    max_output: int
+    temperature: float
+    reasoning_effort: ReasoningEffort | None
+    timeout: int
+    from_legacy_request: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +144,69 @@ class ModelRequest:
         }
 
 
+def resolve_provider_call_arguments(
+    request: ModelRequest | None,
+    *,
+    messages: ModelMessages | None,
+    tools: Sequence[OpenAIToolSchema] | None,
+    model: str | None,
+    max_output: int | None,
+    temperature: float | None,
+    reasoning_effort: ReasoningEffort | None,
+    timeout: int | None,
+) -> _ProviderCallArguments:
+    """Normalize the temporary request-object and direct Provider call seams."""
+    if request is not None:
+        if any(
+            value is not None
+            for value in (
+                messages,
+                tools,
+                model,
+                max_output,
+                temperature,
+                reasoning_effort,
+                timeout,
+            )
+        ):
+            raise TypeError("legacy ModelRequest and direct Provider arguments cannot be mixed")
+        return _ProviderCallArguments(
+            messages=[
+                {"role": "system", "content": request.system_prompt},
+                *(message.to_dict() for message in request.messages),
+            ],
+            tools=request.tools,
+            model=request.model,
+            max_output=request.max_output,
+            temperature=request.temperature,
+            reasoning_effort=request.reasoning_effort,
+            timeout=request.timeout_seconds,
+            from_legacy_request=True,
+        )
+    if messages is None:
+        raise TypeError("direct Provider calls require messages")
+    if tools is None:
+        raise TypeError("direct Provider calls require tools")
+    if model is None:
+        raise TypeError("direct Provider calls require model")
+    if max_output is None:
+        raise TypeError("direct Provider calls require max_output")
+    if temperature is None:
+        raise TypeError("direct Provider calls require temperature")
+    if timeout is None:
+        raise TypeError("direct Provider calls require timeout")
+    return _ProviderCallArguments(
+        messages=messages,
+        tools=tools,
+        model=model,
+        max_output=max_output,
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        timeout=timeout,
+        from_legacy_request=False,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ModelResponse:
     """One complete provider-neutral model response."""
@@ -181,10 +258,40 @@ type ModelStreamEvent = TextDelta | ModelCompleted
 
 
 class ModelProvider(Protocol):
-    """Return responses containing nonblank text or at least one Tool call."""
+    """Legacy request-object Model Provider boundary during the migration stack."""
 
     def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]: ...
 
     async def complete(self, request: ModelRequest) -> ModelResponse: ...
+
+    async def close(self) -> None: ...
+
+
+class DirectModelProvider(Protocol):
+    """Temporary direct-call seam for provider-neutral message dictionaries."""
+
+    def stream(
+        self,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> AsyncIterator[ModelStreamEvent]: ...
+
+    async def complete(
+        self,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> ModelResponse: ...
 
     async def close(self) -> None: ...
