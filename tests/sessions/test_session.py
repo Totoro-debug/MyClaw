@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -440,6 +441,322 @@ def test_public_state_is_directly_mutable_and_message_inputs_are_deep_copied(
     }
     assert session.metadata["future_key"] == {"enabled": True}
     assert session.last_consolidated == -1
+
+
+def test_append_messages_commits_a_valid_increment_in_order_with_timestamps_and_usage(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    session = Session.create(_state(workspace, agent_home), now=lambda: CREATED_AT)
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "Inspect this project."},
+        {
+            "role": "assistant",
+            "content": "I will inspect it.",
+            "tool_calls": [],
+            "status": "completed",
+            "error": None,
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "total_tokens": 15,
+            },
+        },
+        {
+            "role": "tool",
+            "content": "README.md",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "status": "success",
+            "artifact": {
+                "path": ".myclaw/artifacts/session-1/call-1.txt",
+                "total_chars": 123,
+                "preview_chars": 80,
+            },
+            "confirmation": {"approved": True},
+            "provider_extension": {"trace": [1, 2]},
+        },
+    ]
+
+    session.append_messages(messages)
+
+    assert [message["role"] for message in session.messages] == ["user", "assistant", "tool"]
+    assert [message["content"] for message in session.messages] == [
+        "Inspect this project.",
+        "I will inspect it.",
+        "README.md",
+    ]
+    assert all("timestamp" in message for message in session.messages)
+    assert all(
+        message["timestamp"] == CREATED_AT.isoformat(timespec="milliseconds")
+        for message in session.messages
+    )
+    assert session.messages[2]["artifact"] == messages[2]["artifact"]
+    assert session.messages[2]["confirmation"] == {"approved": True}
+    assert session.metadata["token_usage"] == {
+        "model_calls": 1,
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "total_tokens": 15,
+    }
+
+
+def test_append_messages_leaves_state_unchanged_when_a_middle_message_is_invalid(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "Existing history")
+    before_messages = copy.deepcopy(session.messages)
+    before_usage = copy.deepcopy(session.metadata["token_usage"])
+
+    with pytest.raises(ValueError, match="assistant message is missing"):
+        session.append_messages(
+            [
+                {"role": "user", "content": "Before the invalid record."},
+                {"role": "assistant", "content": "Missing durable fields."},
+                {"role": "user", "content": "After the invalid record."},
+            ]
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata["token_usage"] == before_usage
+
+
+def test_append_messages_leaves_state_unchanged_when_the_final_message_is_invalid(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "Existing history")
+    before_messages = copy.deepcopy(session.messages)
+    before_usage = copy.deepcopy(session.metadata["token_usage"])
+
+    with pytest.raises(ValueError, match="tool_call_id"):
+        session.append_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": "A valid assistant record.",
+                    "tool_calls": [],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 2,
+                        "output_tokens": 1,
+                        "total_tokens": 3,
+                    },
+                },
+                {
+                    "role": "tool",
+                    "content": "Invalid result.",
+                    "name": "read_file",
+                    "status": "error",
+                },
+            ]
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata["token_usage"] == before_usage
+
+
+def test_append_messages_isolated_from_nested_caller_mutations(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "I will inspect it.",
+            "tool_calls": [{"id": "call-1", "name": "read_file", "arguments": "{}"}],
+            "status": "completed",
+            "error": None,
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "total_tokens": 15,
+            },
+            "provider_extension": {"trace": ["before"]},
+        },
+        {
+            "role": "tool",
+            "content": "README.md",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "status": "success",
+            "artifact": {
+                "path": ".myclaw/artifacts/session-1/call-1.txt",
+                "total_chars": 123,
+                "preview_chars": 80,
+            },
+            "confirmation": {"approved": True, "details": {"source": "user"}},
+        },
+    ]
+
+    session.append_messages(messages)
+
+    messages[0]["tool_calls"][0]["arguments"] = '{"path":"changed"}'
+    messages[0]["provider_extension"]["trace"].append("after")
+    messages[0]["token_usage"]["input_tokens"] = 99
+    messages[1]["artifact"]["total_chars"] = 999
+    messages[1]["confirmation"]["details"]["source"] = "changed"
+
+    assert session.messages[0]["tool_calls"] == [
+        {"id": "call-1", "name": "read_file", "arguments": "{}"}
+    ]
+    assert session.messages[0]["provider_extension"] == {"trace": ["before"]}
+    assert session.messages[0]["token_usage"]["input_tokens"] == 12
+    assert session.messages[1]["artifact"]["total_chars"] == 123
+    assert session.messages[1]["confirmation"] == {
+        "approved": True,
+        "details": {"source": "user"},
+    }
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {
+            "model_calls": 1,
+            "input_tokens": 2,
+            "output_tokens": 1,
+            "total_tokens": 99,
+        },
+        {
+            "model_calls": 1,
+            "input_tokens": 2,
+            "output_tokens": 1,
+        },
+        {
+            "model_calls": 1,
+            "input_tokens": 2,
+            "output_tokens": 1,
+            "total_tokens": 3,
+            "cached_tokens": 0,
+        },
+    ],
+)
+def test_append_messages_rejects_usage_shape_errors_without_state_changes(
+    agent_home: Path,
+    workspace: Path,
+    usage: dict[str, int],
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "Existing history")
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+
+    with pytest.raises(ValueError, match="token"):
+        session.append_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Invalid usage.",
+                    "tool_calls": [],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": usage,
+                }
+            ]
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+
+
+def test_append_messages_accumulates_multiple_assistants_once_beyond_64_bit_range(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    signed_64_max = 2**63 - 1
+    session.update_metadata(
+        token_usage_delta={
+            "model_calls": 7,
+            "input_tokens": signed_64_max - 2,
+            "output_tokens": 1,
+            "total_tokens": signed_64_max - 1,
+        }
+    )
+
+    session.append_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "First response.",
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "total_tokens": 3,
+                },
+            },
+            {
+                "role": "assistant",
+                "content": "Second response.",
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 4,
+                    "output_tokens": 2,
+                    "total_tokens": 6,
+                },
+            },
+        ]
+    )
+
+    assert session.metadata["token_usage"] == {
+        "model_calls": 9,
+        "input_tokens": signed_64_max + 4,
+        "output_tokens": 4,
+        "total_tokens": signed_64_max + 8,
+    }
+
+
+def test_append_messages_rejects_invalid_existing_usage_without_state_changes(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.metadata["token_usage"] = {
+        "model_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": "invalid",
+    }
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+
+    with pytest.raises(ValueError, match=r"metadata\.token_usage"):
+        session.append_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": "A valid message.",
+                    "tool_calls": [],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 2,
+                        "output_tokens": 1,
+                        "total_tokens": 3,
+                    },
+                }
+            ]
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
 
 
 def test_tool_message_preserves_provider_fields_and_unknown_extensions(

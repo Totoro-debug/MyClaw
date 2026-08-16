@@ -276,6 +276,38 @@ class Session:
         if updated_usage is not None:
             self.metadata["token_usage"] = updated_usage
 
+    def append_messages(self, messages: list[dict[str, Any]]) -> None:
+        """Atomically append a validated Agent Run increment."""
+        if not isinstance(messages, list):
+            raise TypeError("messages must be a list")
+
+        prepared: list[dict[str, Any]] = []
+        updated_usage: dict[str, int] | None = None
+        for index, record in enumerate(messages):
+            if not isinstance(record, dict):
+                raise TypeError(f"messages[{index}] must be a dictionary")
+            copied = _copy_json_object(record, field="message")
+            if "timestamp" in copied:
+                raise ValueError("timestamp is reserved for Session message timestamps")
+            copied["timestamp"] = format_rfc3339_milliseconds(self._clock_now())
+            try:
+                _validate_message(copied)
+            except KeyError as error:
+                raise ValueError(f"Session message is missing {error.args[0]}") from error
+            prepared.append(copied)
+
+            if copied["role"] == "assistant":
+                if updated_usage is None:
+                    updated_usage = copy.deepcopy(self.metadata.get("token_usage"))
+                updated_usage = _accumulate_token_usage(
+                    updated_usage,
+                    copied["token_usage"],
+                )
+
+        self.messages.extend(prepared)
+        if updated_usage is not None:
+            self.metadata["token_usage"] = updated_usage
+
     def update_metadata(self, metadata: dict[str, Any] | None = None, **updates: Any) -> None:
         """Apply a copied shallow metadata patch and accumulate token usage deltas."""
         patch: dict[str, Any] = {}
@@ -397,15 +429,7 @@ class Session:
     def _usage_after_delta(self, delta: Any) -> dict[str, int] | None:
         if delta is None:
             return None
-        current = self.metadata.get("token_usage")
-        _validate_token_usage(current, field="metadata.token_usage")
-        _validate_token_usage(delta, field="token_usage_delta")
-        assert isinstance(current, dict)
-        assert isinstance(delta, dict)
-        return {
-            key: current[key] + delta[key]
-            for key in ("model_calls", "input_tokens", "output_tokens", "total_tokens")
-        }
+        return _accumulate_token_usage(self.metadata.get("token_usage"), delta)
 
     def _clock_now(self) -> datetime:
         return _clock_now(self._now)
@@ -734,6 +758,20 @@ def _validate_token_usage(value: Any, *, field: str) -> None:
         require_nonnegative_int(value[key], field=f"{field}.{key}")
     if value["total_tokens"] != value["input_tokens"] + value["output_tokens"]:
         raise ValueError(f"{field}.total_tokens must equal input_tokens + output_tokens")
+
+
+def _accumulate_token_usage(
+    current: Any,
+    delta: Any,
+) -> dict[str, int]:
+    _validate_token_usage(current, field="metadata.token_usage")
+    _validate_token_usage(delta, field="token_usage_delta")
+    assert isinstance(current, dict)
+    assert isinstance(delta, dict)
+    return {
+        key: current[key] + delta[key]
+        for key in ("model_calls", "input_tokens", "output_tokens", "total_tokens")
+    }
 
 
 def _normalize_title(value: str, *, fallback: str = "Untitled session") -> str:

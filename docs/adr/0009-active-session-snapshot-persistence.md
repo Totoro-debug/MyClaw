@@ -23,12 +23,19 @@ does not own model calls, Tool execution, Agent Events, cancellation, or the
 Conversation Port.
 
 `Session` exposes synchronous `create`, `load`, `add_message`,
-`update_metadata`, `persist`, and `close` methods. Its public mutable state is
-JSON-native `list[dict[str, Any]]` messages, `dict[str, Any]` metadata, and the
-integer `last_consolidated`. `session_id`, `created_at`, and `updated_at` are
-read-only properties. Message and metadata values must remain a JSON-compatible
-tree; provider-specific values are converted at the provider seam before they
-enter Session.
+`append_messages`, `update_metadata`, `persist`, and `close` methods. Its public
+mutable state is JSON-native `list[dict[str, Any]]` messages, `dict[str, Any]`
+metadata, and the integer `last_consolidated`. `session_id`, `created_at`, and
+`updated_at` are read-only properties. Message and metadata values must remain a
+JSON-compatible tree; provider-specific values are converted at the provider seam
+before they enter Session.
+
+`append_messages` is the atomic in-memory boundary for an Agent Run increment. It
+deep-copies, timestamps, and validates every input message and calculates the complete
+assistant usage delta before changing Session state. A failure leaves messages and
+cumulative usage unchanged; success appends all prepared messages in input order and
+applies the usage delta once. `add_message` remains the compatible single-message
+operation.
 
 Creation and loading are synchronous. A new empty Session is memory-only and
 does not create a history file. Its first message makes it eligible for
