@@ -31,6 +31,7 @@ TEMPLATE_NAMES = {
     "long-term-memory.md",
     "memory-task-input.md",
     "memory-task-prompt.md",
+    "foreground-chat-system-prompt.md",
     "runtime-context.md",
     "session-title-prompt.md",
     "tool-guidance-entry.md",
