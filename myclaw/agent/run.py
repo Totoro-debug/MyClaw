@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, ClassVar, Literal, Protocol, cast
-from uuid import UUID
+from typing import Any, ClassVar, Literal, Protocol, cast, runtime_checkable
+from uuid import UUID, uuid4
 
 from loguru import logger
 
@@ -16,10 +17,12 @@ from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
+    DirectModelProvider,
     ModelCompleted,
     ModelMessage,
     ModelProvider,
     ModelRequest,
+    ModelResponse,
     ModelStreamEvent,
     ModelUsage,
     ReasoningEffort,
@@ -138,6 +141,39 @@ type AgentRunPayload = (
 )
 
 
+class AgentRunEmitter(Protocol):
+    """Awaitable sink for ordered Agent Run progress payloads."""
+
+    async def emit(self, payload: AgentRunPayload) -> None: ...
+
+
+@runtime_checkable
+class AgentRunRouter(Protocol):
+    """Direct-call Model Router boundary used by the awaitable Agent Run."""
+
+    def route_status(self, route: AgentRunRoute) -> object: ...
+
+    def stream(
+        self,
+        route: AgentRunRoute,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> AsyncIterator[ModelStreamEvent]: ...
+
+    async def complete(
+        self,
+        route: AgentRunRoute,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> ModelResponse: ...
+
+
+type AgentRunProvider = ModelProvider | DirectModelProvider
+type _AgentRunModelClient = AgentRunProvider | AgentRunRouter
+
+
 @dataclass(frozen=True, slots=True)
 class AgentRunModelSettings:
     """Provider-neutral budget and model settings for one Agent Run route."""
@@ -173,10 +209,12 @@ class AgentRun:
     def __init__(
         self,
         *,
-        provider: ModelProvider | Mapping[AgentRunRoute, ModelProvider],
-        settings: AgentRunModelSettings | Mapping[AgentRunRoute, AgentRunModelSettings],
-        now: Callable[[], datetime],
-        new_uuid: Callable[[], UUID],
+        provider: _AgentRunModelClient | Mapping[AgentRunRoute, AgentRunProvider],
+        settings: AgentRunModelSettings
+        | Mapping[AgentRunRoute, AgentRunModelSettings]
+        | None = None,
+        now: Callable[[], datetime] | None = None,
+        new_uuid: Callable[[], UUID] | None = None,
         system_prompt: str = "",
         tool_gateway: ToolGateway | None = None,
         externalize_result: Callable[[ToolResult], ToolResult] | None = None,
@@ -192,8 +230,8 @@ class AgentRun:
     ) -> None:
         self._provider = provider
         self._settings = settings
-        self._now = now
-        self._new_uuid = new_uuid
+        self._now = datetime.now().astimezone if now is None else now
+        self._new_uuid = uuid4 if new_uuid is None else new_uuid
         self._system_prompt = system_prompt
         self._tool_gateway = tool_gateway
         self._externalize_result = externalize_result
@@ -221,6 +259,488 @@ class AgentRun:
             stream=stream,
             confirmation=confirmation,
         )
+
+    async def run(
+        self,
+        messages: Sequence[dict[str, Any]],
+        current_user: dict[str, Any],
+        *,
+        route: AgentRunRoute,
+        emitter: AgentRunEmitter,
+        confirmation: ConfirmationChannel | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run the model and Tool loop without owning Conversation Session state.
+
+        ``messages`` is the complete model-visible context, including the current
+        user message with Runtime Context already applied. ``current_user`` is the
+        raw message that the caller will later append to its Session. The two
+        message lists maintained here deliberately cross an isolated copy boundary
+        so a provider or caller cannot mutate the returned Session increment.
+        """
+        if route not in {"chat", "schedule"}:
+            raise ValueError("Agent Run route must be chat or schedule")
+        if not isinstance(current_user, dict):
+            raise TypeError("current_user must be a dictionary")
+
+        runtime_messages = deepcopy(list(messages))
+        increment = [deepcopy(current_user)]
+        partial_content: list[str] = []
+        pending_tool_calls: list[ModelToolCall] = []
+        events: AsyncIterator[ModelStreamEvent] | None = None
+        started_emitted = False
+        terminal_emitted = False
+        stream = route == "chat"
+
+        try:
+            model_client = self._model_client(route)
+            gateway = self._tool_gateway
+            frozen_tools = () if gateway is None else tuple(gateway.schemas)
+            externalize_result = self._externalize_result or _identity_tool_result
+
+            await _emit_agent_run_payload(emitter, AgentRunStartedPayload())
+            started_emitted = True
+            if self._cancel_requested():
+                cancelled_content = "".join(partial_content)
+                self._repair_awaitable_cancelled(
+                    runtime_messages,
+                    increment,
+                    partial_content,
+                    pending_tool_calls,
+                )
+                await _emit_agent_run_payload(
+                    emitter,
+                    AgentRunCancelledPayload(partial_content=cancelled_content),
+                )
+                terminal_emitted = True
+                return increment
+
+            while True:
+                partial_content.clear()
+                events = (
+                    self._direct_stream(
+                        model_client,
+                        route,
+                        runtime_messages,
+                        frozen_tools,
+                    )
+                    if stream
+                    else self._direct_complete_events(
+                        model_client,
+                        route,
+                        runtime_messages,
+                        frozen_tools,
+                    )
+                )
+                model_completed = False
+                async for event in events:
+                    if isinstance(event, TextDelta):
+                        partial_content.append(event.delta)
+                        await _emit_agent_run_payload(
+                            emitter,
+                            AgentRunTextDeltaPayload(delta=event.delta),
+                        )
+                        if self._cancel_requested():
+                            cancelled_content = "".join(partial_content)
+                            await _close_iterator(events)
+                            events = None
+                            self._repair_awaitable_cancelled(
+                                runtime_messages,
+                                increment,
+                                partial_content,
+                                pending_tool_calls,
+                            )
+                            await _emit_agent_run_payload(
+                                emitter,
+                                AgentRunCancelledPayload(partial_content=cancelled_content),
+                            )
+                            terminal_emitted = True
+                            return increment
+                        continue
+
+                    if not isinstance(event, ModelCompleted):
+                        raise _model_failure()
+                    model_completed = True
+                    response = event.response
+                    assistant = _assistant_run_message(response)
+                    _append_run_message(runtime_messages, increment, assistant)
+                    continues_with_tools = bool(response.message.tool_calls and gateway is not None)
+                    partial_content.clear()
+                    if continues_with_tools:
+                        pending_tool_calls = list(response.message.tool_calls)
+                    await _close_iterator(events)
+                    events = None
+                    await _emit_agent_run_payload(
+                        emitter,
+                        AgentRunModelCallCompletedPayload(
+                            content=response.message.content,
+                            continues_with_tools=continues_with_tools,
+                        ),
+                    )
+                    if continues_with_tools:
+                        assert gateway is not None
+                        for tool_call in response.message.tool_calls:
+                            await _emit_agent_run_payload(
+                                emitter,
+                                AgentRunToolStartedPayload(
+                                    tool_call_id=tool_call.id,
+                                    tool_name=tool_call.name,
+                                    summary=_tool_summary("Running", tool_call.name),
+                                ),
+                            )
+                            if self._cancel_requested():
+                                cancelled_content = "".join(partial_content)
+                                self._repair_awaitable_cancelled(
+                                    runtime_messages,
+                                    increment,
+                                    partial_content,
+                                    pending_tool_calls,
+                                )
+                                await _emit_agent_run_payload(
+                                    emitter,
+                                    AgentRunCancelledPayload(partial_content=cancelled_content),
+                                )
+                                terminal_emitted = True
+                                return increment
+
+                            result: ToolResult | None = None
+                            tool_state = _ToolCallState()
+                            try:
+                                try:
+                                    tool_outcomes = self._call_tool(
+                                        gateway,
+                                        tool_call,
+                                        confirmation,
+                                        tool_state,
+                                    )
+                                    try:
+                                        async for tool_outcome in tool_outcomes:
+                                            if isinstance(tool_outcome, ConfirmationRequest):
+                                                await _emit_agent_run_payload(
+                                                    emitter,
+                                                    AgentRunConfirmationRequestedPayload(
+                                                        request=tool_outcome
+                                                    ),
+                                                )
+                                            else:
+                                                result = tool_outcome
+                                    finally:
+                                        await _close_iterator(tool_outcomes)
+                                except BaseException as failure:
+                                    if (
+                                        not isinstance(failure, Exception)
+                                        and tool_state.result is not None
+                                    ):
+                                        try:
+                                            result = self._externalize_awaitable_result(
+                                                tool_state.result,
+                                                externalize_result,
+                                            )
+                                            _append_run_message(
+                                                runtime_messages,
+                                                increment,
+                                                _tool_run_message(result),
+                                            )
+                                        except Exception:
+                                            pass
+                                        else:
+                                            pending_tool_calls.pop(0)
+                                    raise
+                                if result is None:
+                                    raise RuntimeError("Tool Gateway ended without a result")
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                result = ToolResult(
+                                    tool_call_id=tool_call.id,
+                                    name=tool_call.name,
+                                    status="error",
+                                    content=f"{tool_call.name} could not complete the request.",
+                                    artifact=None,
+                                )
+                            result = self._externalize_awaitable_result(result, externalize_result)
+                            _append_run_message(
+                                runtime_messages, increment, _tool_run_message(result)
+                            )
+                            pending_tool_calls.pop(0)
+                            await _emit_agent_run_payload(
+                                emitter,
+                                AgentRunToolCompletedPayload(
+                                    tool_call_id=result.tool_call_id,
+                                    tool_name=result.name,
+                                    status=result.status,
+                                    summary=_tool_completion_summary(result),
+                                ),
+                            )
+                            if self._cancel_requested():
+                                cancelled_content = "".join(partial_content)
+                                self._repair_awaitable_cancelled(
+                                    runtime_messages,
+                                    increment,
+                                    partial_content,
+                                    pending_tool_calls,
+                                )
+                                await _emit_agent_run_payload(
+                                    emitter,
+                                    AgentRunCancelledPayload(partial_content=cancelled_content),
+                                )
+                                terminal_emitted = True
+                                return increment
+                        continue
+
+                    await _emit_agent_run_payload(
+                        emitter,
+                        AgentRunCompletedPayload(
+                            content=response.message.content,
+                            usage=response.usage,
+                        ),
+                    )
+                    terminal_emitted = True
+                    return increment
+
+                if not model_completed:
+                    raise _model_failure()
+        except ModelCallError as failure:
+            await _close_iterator(events)
+            events = None
+            if failure.error.code == "turn_cancelled" or self._cancel_requested():
+                cancelled_content = "".join(partial_content)
+                self._repair_awaitable_cancelled(
+                    runtime_messages,
+                    increment,
+                    partial_content,
+                    pending_tool_calls,
+                )
+                if not started_emitted:
+                    await _emit_agent_run_payload(emitter, AgentRunStartedPayload())
+                    started_emitted = True
+                await _emit_agent_run_payload(
+                    emitter,
+                    AgentRunCancelledPayload(partial_content=cancelled_content),
+                )
+                terminal_emitted = True
+                return increment
+            self._capture_terminal_failure(failure)
+            self._repair_awaitable_failed(
+                runtime_messages,
+                increment,
+                partial_content,
+                pending_tool_calls,
+                stream=stream,
+                failure=failure,
+            )
+            if not started_emitted:
+                await _emit_agent_run_payload(emitter, AgentRunStartedPayload())
+                started_emitted = True
+            await _emit_agent_run_payload(emitter, AgentRunFailedPayload(error=failure.error))
+            terminal_emitted = True
+            return increment
+        except Exception:
+            await _close_iterator(events)
+            events = None
+            generic_failure = _model_failure()
+            self._capture_terminal_failure(generic_failure)
+            self._repair_awaitable_failed(
+                runtime_messages,
+                increment,
+                partial_content,
+                pending_tool_calls,
+                stream=stream,
+                failure=generic_failure,
+            )
+            if not started_emitted:
+                await _emit_agent_run_payload(emitter, AgentRunStartedPayload())
+                started_emitted = True
+            await _emit_agent_run_payload(
+                emitter,
+                AgentRunFailedPayload(error=generic_failure.error),
+            )
+            terminal_emitted = True
+            return increment
+        except asyncio.CancelledError:
+            await _close_iterator(events)
+            events = None
+            if self._cancel_requested():
+                cancelled_content = "".join(partial_content)
+                self._repair_awaitable_cancelled(
+                    runtime_messages,
+                    increment,
+                    partial_content,
+                    pending_tool_calls,
+                )
+                if not started_emitted:
+                    await _emit_agent_run_payload(emitter, AgentRunStartedPayload())
+                    started_emitted = True
+                await _emit_agent_run_payload(
+                    emitter,
+                    AgentRunCancelledPayload(partial_content=cancelled_content),
+                )
+                terminal_emitted = True
+                return increment
+            try:
+                self._repair_awaitable_cancelled(
+                    runtime_messages,
+                    increment,
+                    partial_content,
+                    pending_tool_calls,
+                )
+            except BaseException:
+                pass
+            raise
+        except BaseException:
+            await _close_iterator(events)
+            if not terminal_emitted:
+                try:
+                    self._repair_awaitable_cancelled(
+                        runtime_messages,
+                        increment,
+                        partial_content,
+                        pending_tool_calls,
+                    )
+                except BaseException:
+                    pass
+            raise
+
+    def _direct_stream(
+        self,
+        model_client: _AgentRunModelClient,
+        route: AgentRunRoute,
+        messages: list[dict[str, Any]],
+        tools: tuple[OpenAIToolSchema, ...],
+    ) -> AsyncIterator[ModelStreamEvent]:
+        if isinstance(model_client, AgentRunRouter):
+            return model_client.stream(
+                route,
+                messages=messages,
+                tools=tools,
+            )
+        settings = self._route_settings(route)
+        return cast(DirectModelProvider, model_client).stream(
+            messages=messages,
+            tools=tools,
+            model=settings.model,
+            max_output=settings.max_output,
+            temperature=settings.temperature,
+            reasoning_effort=settings.reasoning_effort,
+            timeout=settings.timeout_seconds,
+        )
+
+    async def _direct_complete_events(
+        self,
+        model_client: _AgentRunModelClient,
+        route: AgentRunRoute,
+        messages: list[dict[str, Any]],
+        tools: tuple[OpenAIToolSchema, ...],
+    ) -> AsyncGenerator[ModelStreamEvent, None]:
+        if isinstance(model_client, AgentRunRouter):
+            response = await model_client.complete(
+                route,
+                messages=messages,
+                tools=tools,
+            )
+        else:
+            settings = self._route_settings(route)
+            response = await cast(DirectModelProvider, model_client).complete(
+                messages=messages,
+                tools=tools,
+                model=settings.model,
+                max_output=settings.max_output,
+                temperature=settings.temperature,
+                reasoning_effort=settings.reasoning_effort,
+                timeout=settings.timeout_seconds,
+            )
+        yield ModelCompleted(response=response)
+
+    def _externalize_awaitable_result(
+        self,
+        result: ToolResult,
+        externalize_result: ToolResultExternalizer,
+    ) -> ToolResult:
+        try:
+            return externalize_result(result)
+        except Exception as failure:
+            if self._on_artifact_failure is not None:
+                self._on_artifact_failure(failure, result.name)
+            return ToolResult(
+                tool_call_id=result.tool_call_id,
+                name=result.name,
+                status="error",
+                content=f"{result.name} result could not be stored.",
+                artifact=None,
+                confirmation=result.confirmation,
+            )
+
+    def _repair_awaitable_cancelled(
+        self,
+        runtime_messages: list[dict[str, Any]],
+        increment: list[dict[str, Any]],
+        partial_content: list[str],
+        pending_tool_calls: list[ModelToolCall],
+    ) -> None:
+        if partial_content:
+            _append_run_message(
+                runtime_messages,
+                increment,
+                _assistant_repair_message(
+                    content="".join(partial_content),
+                    status="interrupted",
+                    error={
+                        "code": "turn_cancelled",
+                        "message": "Turn interrupted by user.",
+                    },
+                ),
+            )
+        for tool_call in pending_tool_calls:
+            _append_run_message(
+                runtime_messages,
+                increment,
+                _tool_run_message(
+                    ToolResult(
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                        status="error",
+                        content="Tool call interrupted because the turn was cancelled.",
+                        artifact=None,
+                    )
+                ),
+            )
+        pending_tool_calls.clear()
+        partial_content.clear()
+
+    def _repair_awaitable_failed(
+        self,
+        runtime_messages: list[dict[str, Any]],
+        increment: list[dict[str, Any]],
+        partial_content: list[str],
+        pending_tool_calls: list[ModelToolCall],
+        *,
+        stream: bool,
+        failure: ModelCallError,
+    ) -> None:
+        for tool_call in pending_tool_calls:
+            _append_run_message(
+                runtime_messages,
+                increment,
+                _tool_run_message(
+                    ToolResult(
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                        status="error",
+                        content="Tool call interrupted because the Agent Run failed.",
+                        artifact=None,
+                    )
+                ),
+            )
+        pending_tool_calls.clear()
+        _append_run_message(
+            runtime_messages,
+            increment,
+            _assistant_repair_message(
+                content="".join(partial_content) if stream else "",
+                status="error",
+                error={"code": failure.error.code, "message": failure.error.message},
+            ),
+        )
+        partial_content.clear()
 
     async def _run_agent(
         self,
@@ -533,6 +1053,9 @@ class AgentRun:
             self._on_terminal_failure(failure)
 
     def _route_provider(self, route: AgentRunRoute) -> ModelProvider:
+        return cast(ModelProvider, self._model_client(route))
+
+    def _model_client(self, route: AgentRunRoute) -> _AgentRunModelClient:
         if isinstance(self._provider, Mapping):
             return self._provider[route]
         return self._provider
@@ -540,6 +1063,8 @@ class AgentRun:
     def _route_settings(self, route: AgentRunRoute) -> AgentRunModelSettings:
         if isinstance(self._settings, Mapping):
             return self._settings[route]
+        if self._settings is None:
+            raise TypeError("Agent Run model settings are required for this Provider")
         return self._settings
 
     def _request(
@@ -817,6 +1342,58 @@ def _model_failure() -> ModelCallError:
     return ModelCallError(ErrorInfo("model_failed", "The model request failed."))
 
 
+async def _emit_agent_run_payload(
+    emitter: AgentRunEmitter,
+    payload: AgentRunPayload,
+) -> None:
+    await emitter.emit(payload)
+
+
+def _append_run_message(
+    runtime_messages: list[dict[str, Any]],
+    increment: list[dict[str, Any]],
+    message: dict[str, Any],
+) -> None:
+    runtime_messages.append(deepcopy(message))
+    increment.append(deepcopy(message))
+
+
+def _assistant_run_message(response: ModelResponse) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": response.message.content,
+        "tool_calls": [call.to_dict() for call in response.message.tool_calls],
+        "status": "completed",
+        "error": None,
+        "token_usage": {"model_calls": 1, **response.usage.to_dict()},
+    }
+
+
+def _assistant_repair_message(
+    *,
+    content: str,
+    status: Literal["interrupted", "error"],
+    error: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [],
+        "status": status,
+        "error": error,
+        "token_usage": {
+            "model_calls": 1,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+
+
+def _tool_run_message(result: ToolResult) -> dict[str, Any]:
+    return {"role": "tool", **result.to_dict()}
+
+
 def _identity_tool_result(result: ToolResult) -> ToolResult:
     return result
 
@@ -907,12 +1484,15 @@ __all__ = [
     "AgentRunCancelledPayload",
     "AgentRunCompletedPayload",
     "AgentRunConfirmationRequestedPayload",
+    "AgentRunEmitter",
     "AgentRunFailedPayload",
     "AgentRunInterface",
     "AgentRunModelCallCompletedPayload",
     "AgentRunModelSettings",
     "AgentRunPayload",
+    "AgentRunProvider",
     "AgentRunRoute",
+    "AgentRunRouter",
     "AgentRunStartedPayload",
     "AgentRunTextDeltaPayload",
     "AgentRunToolCompletedPayload",
