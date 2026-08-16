@@ -10,6 +10,7 @@ import pytest
 
 import myclaw.agent.context as context
 from myclaw.agent.context import ContextBuilder
+from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
 from myclaw.agent.workspace import Workspace
 
 FIXED_UTC = datetime(2026, 8, 16, 4, 5, 6, 789000, tzinfo=UTC)
@@ -198,3 +199,77 @@ def test_context_builder_projects_tool_and_interrupted_history_without_mutating_
 def test_context_builder_does_not_accept_tool_gateway_or_schemas(workspace: Path) -> None:
     with pytest.raises(TypeError):
         ContextBuilder(Workspace.from_path(workspace), "UTC", tool_gateway=object())  # type: ignore[call-arg]
+
+
+def test_runtime_lane_projections_keep_current_turn_continuation_separate(
+    workspace: Path,
+) -> None:
+    builder = ContextBuilder(Workspace.from_path(workspace), "UTC")
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": "Earlier question.",
+            "timestamp": "2026-08-15T12:00:00.000+08:00",
+        },
+        {
+            "role": "assistant",
+            "content": "Earlier answer.",
+            "timestamp": "2026-08-15T12:00:01.000+08:00",
+            "tool_calls": [],
+            "status": "completed",
+        },
+        {
+            "role": "user",
+            "content": "Current question.",
+            "timestamp": "2026-08-16T12:00:00.000+08:00",
+        },
+        {
+            "role": "assistant",
+            "content": "Calling a tool.",
+            "timestamp": "2026-08-16T12:00:01.000+08:00",
+            "tool_calls": [{"id": "call-1", "name": "read_file", "arguments": "{}"}],
+            "status": "completed",
+        },
+        {
+            "role": "tool",
+            "content": "Tool output.",
+            "timestamp": "2026-08-16T12:00:02.000+08:00",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "status": "success",
+            "artifact": None,
+        },
+    ]
+
+    foreground = _project_foreground_messages(
+        builder,
+        messages,
+        session_id="session-id",
+        long_term_memory="memory",
+    )
+    schedule = _project_schedule_messages(
+        messages,
+        system_prompt="schedule system",
+        session_id="session-id",
+    )
+
+    assert [message["role"] for message in foreground] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert "Workspace:" in foreground[0]["content"]
+    assert foreground[3]["content"].endswith("Current question.\n</user_input>")
+    assert [message["role"] for message in schedule] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert schedule[0] == {"role": "system", "content": "schedule system"}
+    assert "current_time: 2026-08-16T12:00:00.000+08:00" in schedule[3]["content"]

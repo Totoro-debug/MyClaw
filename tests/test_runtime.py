@@ -5,10 +5,13 @@ from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfoNotFoundError
 
 import pytest
 from loguru import logger
 
+import myclaw.agent.runtime as runtime_module
+from myclaw.agent.context import ContextBuilder
 from myclaw.agent.events import ConversationPort, ToolCompletedPayload, TurnFailedPayload
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
@@ -130,6 +133,70 @@ class BlockingSessionLogProvider:
 
     async def close(self) -> None:
         return None
+
+
+@pytest.mark.asyncio
+async def test_runtime_composition_passes_discovered_iana_name_to_context_builder(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    discovered_names: list[str] = []
+    context_builder = ContextBuilder
+
+    def recording_context_builder(
+        runtime_workspace: Workspace,
+        timezone_name: str,
+    ) -> ContextBuilder:
+        discovered_names.append(timezone_name)
+        return context_builder(runtime_workspace, timezone_name)
+
+    monkeypatch.setattr(runtime_module, "get_localzone_name", lambda: "Asia/Shanghai")
+    monkeypatch.setattr(runtime_module, "ContextBuilder", recording_context_builder)
+
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=unexpected_provider_factory,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    await runtime.close()
+
+    assert discovered_names == ["Asia/Shanghai"]
+
+
+def test_runtime_composition_rejects_invalid_discovered_iana_before_provider_call(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    provider_calls: list[ProviderConfiguration] = []
+
+    def provider_factory(configuration: ProviderConfiguration) -> ModelProvider:
+        provider_calls.append(configuration)
+        return ScriptedFakeProvider()
+
+    monkeypatch.setattr(runtime_module, "get_localzone_name", lambda: "Invalid/MyClaw-Zone")
+
+    with pytest.raises(ZoneInfoNotFoundError):
+        prepare_repl_runtime(
+            agent_home=home,
+            workspace=workspace,
+            configuration=ConfigLoader(home).load(),
+            provider_factory=provider_factory,
+            now=lambda: NOW,
+            new_uuid=uuid4,
+        )
+
+    assert provider_calls == []
 
 
 @pytest.mark.asyncio

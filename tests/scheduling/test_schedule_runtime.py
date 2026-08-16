@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -34,9 +34,11 @@ from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.service import ScheduleClock
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock
+from tests.fixtures.provider import _legacy_request_from_direct
 
 NOW = datetime(2026, 8, 7, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -96,7 +98,31 @@ class _RuntimeProvider:
             await self.release_chat.wait()
         yield ModelCompleted(response=self._take("chat"))
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
+    async def complete(
+        self,
+        request: ModelRequest | str | None = None,
+        *,
+        messages: Sequence[dict[str, object]] | None = None,
+        tools: Sequence[OpenAIToolSchema] = (),
+        model: str | None = None,
+        max_output: int | None = None,
+        temperature: float | None = None,
+        reasoning_effort: str | None = None,
+        timeout: int | None = None,
+    ) -> ModelResponse:
+        if request is None or isinstance(request, str):
+            if messages is None:
+                raise TypeError("direct Runtime Provider calls require messages")
+            request = _legacy_request_from_direct(
+                route="memory",
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
         self.complete_requests.append(request)
         return self._take(request.route)
 

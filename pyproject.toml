@@ -23,6 +23,7 @@ dependencies = [
     "rich>=14.2.0,<15",
     "tomlkit>=0.13,<0.14",
     "textual>=8.2.8,<9",
+    "tzlocal>=5,<6",
     "typer>=0.12,<1",
     "tzdata>=2026.2",
 ]

@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -34,6 +35,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ToolModelMessage,
 )
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
@@ -349,9 +351,29 @@ async def test_memory_task_advances_the_summary_cursor_before_model_work(
     memory = WorkspaceFileMemoryStore(_state(home))
 
     class CursorObservingProvider(ScriptedFakeProvider):
-        async def complete(self, request: object) -> ModelResponse:
+        async def complete(
+            self,
+            request: object | None = None,
+            *,
+            messages: Sequence[dict[str, object]] | None = None,
+            tools: Sequence[OpenAIToolSchema] | None = None,
+            model: str | None = None,
+            max_output: int | None = None,
+            temperature: float | None = None,
+            reasoning_effort: str | None = None,
+            timeout: int | None = None,
+        ) -> ModelResponse:
             assert await memory.read_summary_cursor() == 1
-            return await super().complete(request)
+            return await super().complete(
+                request,
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
 
     provider = CursorObservingProvider(completions=(_response("No update needed."),))
     manager = MemoryManager(
@@ -796,7 +818,18 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
     release_first = asyncio.Event()
 
     class BlockingFirstProvider(ScriptedFakeProvider):
-        async def complete(self, request: object) -> ModelResponse:
+        async def complete(
+            self,
+            request: object | None = None,
+            *,
+            messages: Sequence[dict[str, object]] | None = None,
+            tools: Sequence[OpenAIToolSchema] | None = None,
+            model: str | None = None,
+            max_output: int | None = None,
+            temperature: float | None = None,
+            reasoning_effort: str | None = None,
+            timeout: int | None = None,
+        ) -> ModelResponse:
             self.complete_requests.append(request)
             if len(self.complete_requests) == 1:
                 first_started.set()
@@ -854,7 +887,18 @@ async def test_overlapping_manual_memory_task_ignores_a_corrupt_cursor(
     release_first = asyncio.Event()
 
     class BlockingProvider(ScriptedFakeProvider):
-        async def complete(self, request: object) -> ModelResponse:
+        async def complete(
+            self,
+            request: object | None = None,
+            *,
+            messages: Sequence[dict[str, object]] | None = None,
+            tools: Sequence[OpenAIToolSchema] | None = None,
+            model: str | None = None,
+            max_output: int | None = None,
+            temperature: float | None = None,
+            reasoning_effort: str | None = None,
+            timeout: int | None = None,
+        ) -> ModelResponse:
             self.complete_requests.append(request)
             first_started.set()
             await release_first.wait()

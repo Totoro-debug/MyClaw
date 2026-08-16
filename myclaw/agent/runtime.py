@@ -2,19 +2,23 @@
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
+from typing import Any
 from uuid import UUID
 
 from loguru import logger
+from tzlocal import get_localzone_name
 
+from myclaw.agent.context import ContextBuilder
 from myclaw.agent.events import AgentEvent, ConfirmationDecision, ConversationPort
 from myclaw.agent.prompts import (
     chat_system_prompt,
+    current_user_input,
     render_tool_guidance,
     runtime_context,
     session_title_prompt,
@@ -41,8 +45,8 @@ from myclaw.management.service import (
 )
 from myclaw.memory.conversation_summary import (
     ConversationSummaryManager,
-    SummaryModelSettings,
     WorkspaceJsonlSummaryStore,
+    _last_user_index,
 )
 from myclaw.memory.memory_scheduler import MemoryTaskScheduler
 from myclaw.memory.memory_task import (
@@ -396,6 +400,7 @@ def prepare_repl_runtime(
     memory_scheduler_clock: SchedulerClock | None = None,
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
+    timezone_name: str | None = None,
 ) -> PreparedReplRuntime:
     """Prepare one Runtime and record terminal composition failures once."""
     try:
@@ -411,6 +416,7 @@ def prepare_repl_runtime(
             memory_scheduler_clock=memory_scheduler_clock,
             schedule_scheduler_clock=schedule_scheduler_clock,
             monotonic_now=monotonic_now,
+            timezone_name=timezone_name,
         )
     except WorkspaceStateError:
         raise
@@ -434,6 +440,7 @@ def _prepare_repl_runtime(
     memory_scheduler_clock: SchedulerClock | None = None,
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
+    timezone_name: str | None = None,
 ) -> PreparedReplRuntime:
     """Prepare a Session and defer provider construction until conversational input."""
     workspace_identity = Workspace.from_path(workspace)
@@ -442,6 +449,10 @@ def _prepare_repl_runtime(
     schedule_store = WorkspaceScheduleStore(workspace_state)
     long_term_memory = workspace_state.long_term_memory_path.read_text(encoding="utf-8")
     runtime_memory = RuntimeMemory(long_term_memory)
+    foreground_context = ContextBuilder(
+        workspace_identity,
+        get_localzone_name() if timezone_name is None else timezone_name,
+    )
     memory_store = WorkspaceFileMemoryStore(workspace_state)
     session = Session.create(
         workspace_state,
@@ -483,14 +494,6 @@ def _prepare_repl_runtime(
     system_prompt = system_prompt_for(runtime_memory.snapshot())
     configured_memory = configuration.configured_route("memory")
     summaries = WorkspaceJsonlSummaryStore(workspace_state)
-    summary_settings = SummaryModelSettings(
-        model=configured_memory.model,
-        max_output=configured_memory.max_output,
-        temperature=configured_memory.temperature,
-        reasoning_effort=configured_memory.reasoning_effort,
-        timeout_seconds=configured_memory.timeout,
-    )
-
     memory_manager = MemoryManager(
         provider=router,
         summaries=summaries,
@@ -532,17 +535,47 @@ def _prepare_repl_runtime(
         tools: tuple[OpenAIToolSchema, ...],
     ) -> Session:
         effective_route = configuration.resolve_route(route).route
+        if route == "chat":
+
+            def project_messages(
+                messages: Sequence[dict[str, Any]],
+            ) -> list[dict[str, Any]]:
+                if _last_user_index(messages) == len(messages):
+                    return _project_without_current_user(
+                        messages,
+                        system_prompt=current_system_prompt,
+                    )
+                return _project_foreground_messages(
+                    foreground_context,
+                    messages,
+                    session_id=active_session.session_id,
+                    long_term_memory=runtime_memory.snapshot(),
+                )
+        else:
+
+            def project_messages(
+                messages: Sequence[dict[str, Any]],
+            ) -> list[dict[str, Any]]:
+                if _last_user_index(messages) == len(messages):
+                    return _project_without_current_user(
+                        messages,
+                        system_prompt=current_system_prompt,
+                    )
+                return _project_schedule_messages(
+                    messages,
+                    system_prompt=current_system_prompt,
+                    session_id=active_session.session_id,
+                )
+
         manager = ConversationSummaryManager(
             provider=router,
             summaries=summaries,
-            settings=summary_settings,
-            chat_context_window=effective_route.context_window,
-            chat_max_output=effective_route.max_output,
+            route_context_window=effective_route.context_window,
+            route_max_output=effective_route.max_output,
             consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
-            chat_system_prompt=current_system_prompt,
             tools=tools,
             now=now,
-            new_uuid=new_uuid,
+            project_messages=project_messages,
         )
         return await manager.prepare(active_session)
 
@@ -650,6 +683,90 @@ def _prepare_repl_runtime(
         _router=router,
         _lifetime=_RuntimeLifetime(),
     )
+
+
+def _project_foreground_messages(
+    context: ContextBuilder,
+    messages: Sequence[dict[str, Any]],
+    *,
+    session_id: str,
+    long_term_memory: str,
+) -> list[dict[str, Any]]:
+    history, current_user, current_user_index = _current_turn(messages, lane="Foreground")
+    projected = context.build_messages(
+        history=history,
+        current_user=current_user,
+        session_id=session_id,
+        long_term_memory=long_term_memory,
+    )
+    projected.extend(_project_continuation(messages, current_user_index))
+    return projected
+
+
+def _project_schedule_messages(
+    messages: Sequence[dict[str, Any]],
+    *,
+    system_prompt: str,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """Project Schedule context without using the foreground ContextBuilder."""
+    history, current_user, current_user_index = _current_turn(messages, lane="Schedule")
+    projected = _project_without_current_user(history, system_prompt=system_prompt)
+    content = current_user.get("content")
+    timestamp = current_user.get("timestamp")
+    if not isinstance(content, str) or not isinstance(timestamp, str):
+        raise TypeError("Session user message is malformed")
+    projected.append(
+        {
+            "role": "user",
+            "content": current_user_input(
+                content=content,
+                current_time=datetime.fromisoformat(timestamp),
+                session_id=session_id,
+            ),
+        }
+    )
+    projected.extend(_project_continuation(messages, current_user_index))
+    return projected
+
+
+def _project_continuation(
+    messages: Sequence[dict[str, Any]],
+    current_user_index: int,
+) -> list[dict[str, Any]]:
+    return _project_history_messages(messages[current_user_index + 1 :])
+
+
+def _project_without_current_user(
+    messages: Sequence[dict[str, Any]],
+    *,
+    system_prompt: str,
+) -> list[dict[str, Any]]:
+    return [
+        {"role": "system", "content": system_prompt},
+        *_project_history_messages(messages),
+    ]
+
+
+def _project_history_messages(
+    messages: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        model_message.to_dict()
+        for message in messages
+        if (model_message := model_message_from_session(message)) is not None
+    ]
+
+
+def _current_turn(
+    messages: Sequence[dict[str, Any]],
+    *,
+    lane: str,
+) -> tuple[Sequence[dict[str, Any]], dict[str, Any], int]:
+    current_user_index = _last_user_index(messages)
+    if current_user_index == len(messages):
+        raise ValueError(f"{lane} context requires a current user message")
+    return messages[:current_user_index], messages[current_user_index], current_user_index
 
 
 def _build_tool_result_externalizer(

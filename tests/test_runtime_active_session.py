@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -21,6 +21,7 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from myclaw.session.session import Session
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock
@@ -63,9 +64,22 @@ class RuntimeProvider:
             logger.warning(self.log_marker)
         yield ModelCompleted(response=self._chat_responses.pop(0))
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
-        if request.route != "memory":
+    async def complete(
+        self,
+        request: ModelRequest | None = None,
+        *,
+        messages: Sequence[dict[str, object]] | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
+        model: str | None = None,
+        max_output: int | None = None,
+        temperature: float | None = None,
+        reasoning_effort: str | None = None,
+        timeout: int | None = None,
+    ) -> ModelResponse:
+        if request is not None and request.route != "memory":
             raise AssertionError(f"Unexpected completion request: {request!r}")
+        if request is None and messages is None:
+            raise AssertionError("Unexpected direct completion without messages")
         return ModelResponse(
             message=AssistantModelMessage(content="Summary of the earlier turn."),
             usage=ModelUsage(input_tokens=3, output_tokens=1, total_tokens=4),

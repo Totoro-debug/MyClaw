@@ -1,26 +1,32 @@
 import asyncio
 import json
+from collections.abc import Sequence
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
 
+from myclaw.agent.context import ContextBuilder
 from myclaw.agent.events import TurnFailedPayload
+from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.memory.conversation_summary import (
     ConversationSummaryManager,
-    SummaryModelSettings,
     WorkspaceJsonlSummaryStore,
 )
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelMessages,
     ModelRequest,
     ModelResponse,
+    ModelRoute,
     ModelUsage,
     UserModelMessage,
 )
@@ -32,6 +38,25 @@ from tests.fixtures import ScriptedFakeProvider, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 8, 4, 16, 0, 0, tzinfo=LOCAL_OFFSET)
+
+
+class _DirectSummaryProvider:
+    def __init__(self, response: ModelResponse) -> None:
+        self.response = response
+        self.calls: list[dict[str, object]] = []
+
+    async def complete(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+    ) -> ModelResponse:
+        self.calls.append({"route": route, "messages": messages, "tools": tools})
+        return self.response
+
+    async def close(self) -> None:
+        pass
 
 
 def _state(workspace: Path) -> WorkspaceState:
@@ -69,6 +94,38 @@ def _response(
     )
 
 
+def _project_messages(
+    messages: list[dict[str, object]],
+    *,
+    system_prompt: str,
+) -> list[dict[str, object]]:
+    projected: list[dict[str, object]] = [
+        {"role": "system", "content": system_prompt},
+    ]
+    for message in messages:
+        role = message["role"]
+        if role == "user":
+            projected.append({"role": "user", "content": message["content"]})
+        elif role == "assistant":
+            projected.append(
+                {
+                    "role": "assistant",
+                    "content": message["content"],
+                    "tool_calls": message.get("tool_calls", []),
+                }
+            )
+        else:
+            projected.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": message["tool_call_id"],
+                    "name": message["name"],
+                    "content": message["content"],
+                }
+            )
+    return projected
+
+
 def _manager(
     provider: ScriptedFakeProvider,
     summaries: WorkspaceJsonlSummaryStore,
@@ -81,20 +138,15 @@ def _manager(
     return ConversationSummaryManager(
         provider=provider,
         summaries=summaries,
-        settings=SummaryModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-        chat_context_window=context_window,
-        chat_max_output=max_output,
+        route_context_window=context_window,
+        route_max_output=max_output,
         consolidation_message_threshold=threshold,
-        chat_system_prompt=system_prompt,
         tools=(),
         now=lambda: NOW,
-        new_uuid=uuid4,
+        project_messages=lambda messages: _project_messages(
+            list(messages),
+            system_prompt=system_prompt,
+        ),
     )
 
 
@@ -317,6 +369,71 @@ async def test_oversized_system_prompt_fails_without_summary_or_last_consolidate
 
 
 @pytest.mark.asyncio
+async def test_system_prompt_budget_keeps_raw_prompt_boundary(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = _session_with_history(state)
+    provider = ScriptedFakeProvider(completions=(_response("Boundary summary."),))
+    summaries = WorkspaceJsonlSummaryStore(state)
+
+    await _manager(
+        provider,
+        summaries,
+        context_window=600,
+        max_output=500,
+        threshold=100,
+        system_prompt="S" * 400,
+    ).prepare(session)
+
+    assert session.last_consolidated == 4
+    assert len(await summaries.after(0, 10)) == 1
+
+
+@pytest.mark.asyncio
+async def test_oversized_system_prompt_without_user_keeps_failure(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    provider = ScriptedFakeProvider()
+    summaries = WorkspaceJsonlSummaryStore(state)
+
+    with pytest.raises(ModelCallError) as raised:
+        await _manager(
+            provider,
+            summaries,
+            context_window=1_024,
+            max_output=128,
+            system_prompt="M" * 4_000,
+        ).prepare(session)
+
+    assert raised.value.error.code == "memory_context_too_large"
+    assert provider.complete_requests == []
+
+
+@pytest.mark.asyncio
+async def test_assistant_only_over_threshold_keeps_no_safe_cutoff_failure(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    _add_assistant(session, "Assistant-only history.")
+    provider = ScriptedFakeProvider()
+    summaries = WorkspaceJsonlSummaryStore(state)
+
+    with pytest.raises(ModelCallError) as raised:
+        await _manager(
+            provider,
+            summaries,
+            threshold=1,
+        ).prepare(session)
+
+    assert raised.value.error.code == "model_context_overflow"
+    assert provider.complete_requests == []
+
+
+@pytest.mark.asyncio
 async def test_context_overflow_without_old_complete_turn_keeps_current_message(
     workspace: Path,
 ) -> None:
@@ -506,3 +623,150 @@ def test_session_messages_remain_json_native(workspace: Path) -> None:
     session = _session_with_history(_state(workspace))
 
     assert json.loads(json.dumps(session.messages)) == session.messages
+
+
+@pytest.mark.parametrize("lane", ("chat", "schedule"))
+@pytest.mark.asyncio
+async def test_actual_lane_projections_share_summary_cutoff_and_persistence_policy(
+    workspace: Path,
+    lane: str,
+) -> None:
+    state = _state(workspace)
+    session = _session_with_history(state)
+    original_messages = deepcopy(session.messages)
+    provider = _DirectSummaryProvider(_response("Lane summary."))
+    summaries = WorkspaceJsonlSummaryStore(state)
+    tool_schema: OpenAIToolSchema = {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "x" * 5_000,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    if lane == "chat":
+        context = ContextBuilder(Workspace.from_path(workspace), "UTC")
+
+        def project_messages(
+            messages: Sequence[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            return _project_foreground_messages(
+                context,
+                messages,
+                session_id=session.session_id,
+                long_term_memory="memory",
+            )
+
+    else:
+
+        def project_messages(
+            messages: Sequence[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            return _project_schedule_messages(
+                messages,
+                system_prompt="schedule system",
+                session_id=session.session_id,
+            )
+
+    manager = ConversationSummaryManager(
+        provider=provider,
+        summaries=summaries,
+        route_context_window=1_024,
+        route_max_output=128,
+        consolidation_message_threshold=100,
+        tools=(tool_schema,),
+        now=lambda: NOW,
+        project_messages=project_messages,
+    )
+
+    await manager.prepare(session)
+
+    assert session.last_consolidated == 4
+    assert session.messages == original_messages
+    assert [entry.content for entry in await summaries.after(0, 10)] == ["Lane summary."]
+
+
+@pytest.mark.asyncio
+async def test_summary_uses_lane_projection_and_direct_memory_route(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = _session_with_history(state)
+    session.add_message(
+        "assistant",
+        "Current tool call.",
+        tool_calls=[{"id": "call-1", "name": "read_file", "arguments": "{}"}],
+        status="completed",
+        error=None,
+        token_usage={"model_calls": 1, "input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+    )
+    session.add_message(
+        "tool",
+        "Current tool result.",
+        tool_call_id="call-1",
+        name="read_file",
+        status="success",
+        artifact=None,
+    )
+    provider = _DirectSummaryProvider(_response("Projected summary."))
+    summaries = WorkspaceJsonlSummaryStore(state)
+    projection_calls: list[tuple[Sequence[dict[str, Any]], dict[str, Any]]] = []
+    tool_schema: OpenAIToolSchema = {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "x" * 5_000,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    def project_messages(
+        messages: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        projection_calls.append((messages, messages[-1]))
+        return [
+            {"role": "system", "content": "lane system"},
+            *[{"role": message["role"], "content": message["content"]} for message in messages],
+        ]
+
+    manager = ConversationSummaryManager(
+        provider=provider,
+        summaries=summaries,
+        route_context_window=1_024,
+        route_max_output=128,
+        consolidation_message_threshold=100,
+        tools=(tool_schema,),
+        now=lambda: NOW,
+        project_messages=project_messages,
+    )
+
+    await manager.prepare(session)
+
+    assert projection_calls
+    assert [message["role"] for message in projection_calls[0][0]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert projection_calls[0][1]["role"] == "tool"
+    assert [message["content"] for message in projection_calls[0][0] if message["role"] == "user"][
+        -1
+    ] == "Current question."
+    assert session.last_consolidated == 4
+    assert provider.calls[0]["route"] == "memory"
+    messages = provider.calls[0]["messages"]
+    assert isinstance(messages, list)
+    assert messages[0] == {
+        "role": "system",
+        "content": (
+            "Summarize the provided earlier conversation messages.\n"
+            "Preserve decisions, user intent, important facts, and unresolved work concisely."
+        ),
+    }
+    assert messages[1]["role"] == "user"
+    assert "First question." in messages[1]["content"]
+    assert provider.calls[0]["tools"] == ()

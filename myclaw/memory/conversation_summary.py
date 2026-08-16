@@ -4,18 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
-from uuid import UUID
 
-from myclaw.agent.prompts import (
-    conversation_summary_input,
-    conversation_summary_prompt,
-    current_user_input,
-)
+from myclaw.agent.prompts import conversation_summary_input, conversation_summary_prompt
 from myclaw.agent.run import model_message_from_session
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
@@ -23,13 +17,29 @@ from myclaw.logging.session import without_session_log
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
-from myclaw.provider.models import ModelProvider, ModelRequest, ReasoningEffort, UserModelMessage
+from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
+type SummaryProjection = Callable[
+    [Sequence[dict[str, Any]]],
+    list[dict[str, Any]],
+]
+
+
+class SummaryModelRouter(Protocol):
+    """The direct Router seam used for the specialized memory model call."""
+
+    async def complete(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+    ) -> ModelResponse: ...
 
 
 class SummaryStore(Protocol):
@@ -38,17 +48,6 @@ class SummaryStore(Protocol):
     async def append(self, content: str, timestamp: datetime) -> SummaryEntry: ...
 
     async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]: ...
-
-
-@dataclass(frozen=True, slots=True)
-class SummaryModelSettings:
-    """Resolved provider-neutral fields for Conversation Summary generation."""
-
-    model: str
-    max_output: int
-    temperature: float
-    reasoning_effort: ReasoningEffort | None
-    timeout_seconds: int
 
 
 class WorkspaceJsonlSummaryStore:
@@ -137,56 +136,42 @@ class WorkspaceJsonlSummaryStore:
 
 
 class ConversationSummaryManager:
-    """Compress eligible early Session messages before a chat model call."""
+    """Compress eligible early Session messages before an Agent Run model call."""
 
     def __init__(
         self,
         *,
-        provider: ModelProvider,
+        provider: SummaryModelRouter,
         summaries: SummaryStore,
-        settings: SummaryModelSettings,
-        chat_context_window: int,
-        chat_max_output: int,
+        route_context_window: int,
+        route_max_output: int,
         consolidation_message_threshold: int,
-        chat_system_prompt: str,
         tools: tuple[OpenAIToolSchema, ...],
         now: Callable[[], datetime],
-        new_uuid: Callable[[], UUID],
+        project_messages: SummaryProjection,
     ) -> None:
         self._provider = provider
         self._summaries = summaries
-        self._settings = settings
-        self._chat_context_window = chat_context_window
-        self._chat_max_output = chat_max_output
+        self._route_context_window = route_context_window
+        self._route_max_output = route_max_output
         self._message_threshold = consolidation_message_threshold
-        self._chat_system_prompt = chat_system_prompt
         self._tools = tools
         self._now = now
-        self._new_uuid = new_uuid
+        self._project_messages = project_messages
 
     async def prepare(
         self,
         session: Session,
-        *,
-        system_prompt: str | None = None,
     ) -> Session:
         with without_session_log():
-            return await self._prepare(session, system_prompt=system_prompt)
+            return await self._prepare(session)
 
-    async def _prepare(self, session: Session, *, system_prompt: str | None) -> Session:
+    async def _prepare(self, session: Session) -> Session:
         short_term = _short_term_messages(session)
-        available_input = self._chat_context_window - self._chat_max_output
-        effective_system_prompt = (
-            self._chat_system_prompt if system_prompt is None else system_prompt
-        )
-        system_tokens = estimate_input_tokens(
-            RuntimeStatusInput(
-                system_prompt=effective_system_prompt,
-                retained_messages=(),
-                tool_definitions=(),
-                runtime_context="",
-            )
-        )
+        current_user_index = _last_user_index(short_term)
+        complete_messages = self._project_messages(short_term)
+        available_input = self._route_context_window - self._route_max_output
+        system_tokens = _estimate_messages(complete_messages[:1])
         if system_tokens > available_input:
             raise ModelCallError(
                 ErrorInfo(
@@ -195,15 +180,19 @@ class ConversationSummaryManager:
                 )
             )
         token_triggered = (
-            estimate_input_tokens(self._chat_input(session, system_prompt=effective_system_prompt))
-            >= available_input
+            _estimate_messages(complete_messages, tools=self._tools) >= available_input
         )
         message_triggered = len(short_term) >= self._message_threshold
         if not token_triggered and not message_triggered:
             return session
         initial_cutoff = 0
         if token_triggered:
-            initial_cutoff = _token_cutoff(short_term, available_input)
+            initial_cutoff = _token_cutoff(
+                short_term,
+                current_user_index,
+                available_input,
+                self._project_messages,
+            )
         if message_triggered:
             initial_cutoff = max(
                 initial_cutoff,
@@ -218,20 +207,14 @@ class ConversationSummaryManager:
                 )
             )
         selected = short_term[:cutoff]
-        request = ModelRequest(
-            request_id=self._new_uuid(),
-            route="memory",
-            system_prompt=conversation_summary_prompt(),
-            messages=(UserModelMessage(content=_summary_input(selected)),),
+        response = await self._provider.complete(
+            "memory",
+            messages=[
+                {"role": "system", "content": conversation_summary_prompt()},
+                {"role": "user", "content": _summary_input(selected)},
+            ],
             tools=(),
-            stream=False,
-            model=self._settings.model,
-            max_output=self._settings.max_output,
-            temperature=self._settings.temperature,
-            reasoning_effort=self._settings.reasoning_effort,
-            timeout_seconds=self._settings.timeout_seconds,
         )
-        response = await self._provider.complete(request)
         session.update_metadata(usage_delta={"model_calls": 1, **response.usage.to_dict()})
         try:
             new_last_consolidated = session.last_consolidated + cutoff
@@ -248,48 +231,6 @@ class ConversationSummaryManager:
                     message="Conversation Summary could not be persisted.",
                 )
             ) from error
-
-    def _chat_input(
-        self,
-        session: Session,
-        *,
-        system_prompt: str,
-    ) -> RuntimeStatusInput:
-        short_term = _short_term_messages(session)
-        current_user_index = _last_user_index(short_term)
-        retained: list[str] = []
-        for index, message in enumerate(short_term):
-            model_message = model_message_from_session(message)
-            if model_message is None:
-                continue
-            if index == current_user_index and message.get("role") == "user":
-                content = message.get("content")
-                timestamp = message.get("timestamp")
-                if not isinstance(content, str) or not isinstance(timestamp, str):
-                    raise TypeError("Session user message is malformed")
-                model_message = UserModelMessage(
-                    content=current_user_input(
-                        content=content,
-                        current_time=datetime.fromisoformat(timestamp),
-                        session_id=session.session_id,
-                    )
-                )
-            retained.append(
-                json.dumps(
-                    model_message.to_dict(),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            )
-        tool_definitions = tuple(
-            json.dumps(tool, ensure_ascii=False, separators=(",", ":")) for tool in self._tools
-        )
-        return RuntimeStatusInput(
-            system_prompt=system_prompt,
-            retained_messages=tuple(retained),
-            tool_definitions=tool_definitions,
-            runtime_context="",
-        )
 
     def _persisted_now(self) -> datetime:
         value = self._now()
@@ -310,26 +251,63 @@ def _aligned_cutoff(messages: list[dict[str, Any]], initial: int) -> int:
     return 0
 
 
-def _token_cutoff(messages: list[dict[str, Any]], input_budget: int) -> int:
-    current_turn_start = _last_user_index(messages)
+def _token_cutoff(
+    messages: Sequence[dict[str, Any]],
+    current_user_index: int,
+    input_budget: int,
+    project_messages: SummaryProjection,
+) -> int:
     target_bytes = input_budget // 2 * 4
-    selected_bytes = 0
-    for index, message in enumerate(messages[:current_turn_start]):
-        model_message = model_message_from_session(message)
-        if model_message is not None:
-            selected_bytes += len(
-                json.dumps(
-                    model_message.to_dict(),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            )
+    if current_user_index == len(messages):
+        return len(messages)
+    current_user = messages[current_user_index]
+    for index in range(current_user_index):
+        projected = project_messages([*messages[: index + 1], current_user])
+        selected_bytes = _projected_history_bytes(projected)
         if selected_bytes >= target_bytes:
             return index + 1
-    return current_turn_start
+    return current_user_index
 
 
-def _last_user_index(messages: list[dict[str, Any]]) -> int:
+def _estimate_messages(
+    messages: Sequence[dict[str, Any]],
+    *,
+    tools: Sequence[OpenAIToolSchema] = (),
+) -> int:
+    system_prompt = ""
+    retained = messages
+    if messages and messages[0].get("role") == "system":
+        content = messages[0].get("content")
+        if not isinstance(content, str):
+            raise TypeError("Projected system message content must be a string")
+        system_prompt = content
+        retained = messages[1:]
+    retained_messages = tuple(
+        json.dumps(message, ensure_ascii=False, separators=(",", ":")) for message in retained
+    )
+    tool_definitions = tuple(
+        json.dumps(tool, ensure_ascii=False, separators=(",", ":")) for tool in tools
+    )
+    return estimate_input_tokens(
+        RuntimeStatusInput(
+            system_prompt=system_prompt,
+            retained_messages=retained_messages,
+            tool_definitions=tool_definitions,
+            runtime_context="",
+        )
+    )
+
+
+def _projected_history_bytes(messages: Sequence[dict[str, Any]]) -> int:
+    if len(messages) <= 2:
+        return 0
+    return sum(
+        len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        for message in messages[1:-1]
+    )
+
+
+def _last_user_index(messages: Sequence[dict[str, Any]]) -> int:
     for index in range(len(messages) - 1, -1, -1):
         if messages[index].get("role") == "user":
             return index

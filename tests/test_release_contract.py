@@ -17,6 +17,12 @@ def test_distribution_directly_declares_iana_timezone_database() -> None:
     assert "tzdata>=2026.2" in project["dependencies"]
 
 
+def test_distribution_directly_declares_host_timezone_discovery() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+    assert "tzlocal>=5,<6" in project["dependencies"]
+
+
 def test_distribution_retires_prompt_toolkit_dependency() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert not any(

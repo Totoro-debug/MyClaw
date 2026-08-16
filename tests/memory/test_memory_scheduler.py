@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from uuid import uuid4
@@ -35,6 +35,7 @@ from myclaw.provider.models import (
     ModelStreamEvent,
     ModelUsage,
 )
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.scheduler import AsyncioSchedulerClock
 from tests.configuration.test_config import VALID_CONFIG
@@ -223,7 +224,18 @@ async def test_memory_scheduler_trigger_does_not_borrow_a_foreground_session_log
     attempted = asyncio.Event()
 
     class UnexpectedFailureProvider(ScriptedFakeProvider):
-        async def complete(self, request: object) -> ModelResponse:
+        async def complete(
+            self,
+            request: object | None = None,
+            *,
+            messages: Sequence[dict[str, object]] | None = None,
+            tools: Sequence[OpenAIToolSchema] | None = None,
+            model: str | None = None,
+            max_output: int | None = None,
+            temperature: float | None = None,
+            reasoning_effort: str | None = None,
+            timeout: int | None = None,
+        ) -> ModelResponse:
             self.complete_requests.append(request)
             attempted.set()
             try:
@@ -294,7 +306,18 @@ async def test_periodic_trigger_is_skipped_while_the_previous_run_is_still_activ
     release = asyncio.Event()
 
     class BlockingProvider(ScriptedFakeProvider):
-        async def complete(self, request: object) -> ModelResponse:
+        async def complete(
+            self,
+            request: object | None = None,
+            *,
+            messages: Sequence[dict[str, object]] | None = None,
+            tools: Sequence[OpenAIToolSchema] | None = None,
+            model: str | None = None,
+            max_output: int | None = None,
+            temperature: float | None = None,
+            reasoning_effort: str | None = None,
+            timeout: int | None = None,
+        ) -> ModelResponse:
             self.complete_requests.append(request)
             started.set()
             await release.wait()
@@ -334,7 +357,18 @@ async def test_manual_memory_task_reports_running_while_a_periodic_run_is_active
     release = asyncio.Event()
 
     class BlockingProvider(ScriptedFakeProvider):
-        async def complete(self, request: object) -> ModelResponse:
+        async def complete(
+            self,
+            request: object | None = None,
+            *,
+            messages: Sequence[dict[str, object]] | None = None,
+            tools: Sequence[OpenAIToolSchema] | None = None,
+            model: str | None = None,
+            max_output: int | None = None,
+            temperature: float | None = None,
+            reasoning_effort: str | None = None,
+            timeout: int | None = None,
+        ) -> ModelResponse:
             self.complete_requests.append(request)
             started.set()
             await release.wait()
@@ -805,7 +839,18 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
     cancelled = asyncio.Event()
 
     class CancellationAwareProvider(ScriptedFakeProvider):
-        async def complete(self, request: object) -> ModelResponse:
+        async def complete(
+            self,
+            request: object | None = None,
+            *,
+            messages: Sequence[dict[str, object]] | None = None,
+            tools: Sequence[OpenAIToolSchema] | None = None,
+            model: str | None = None,
+            max_output: int | None = None,
+            temperature: float | None = None,
+            reasoning_effort: str | None = None,
+            timeout: int | None = None,
+        ) -> ModelResponse:
             self.complete_requests.append(request)
             if len(self.complete_requests) == 1:
                 started.set()
@@ -864,7 +909,18 @@ async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
     started = asyncio.Event()
 
     class CleanupFailingProvider(ScriptedFakeProvider):
-        async def complete(self, request: object) -> ModelResponse:
+        async def complete(
+            self,
+            request: object | None = None,
+            *,
+            messages: Sequence[dict[str, object]] | None = None,
+            tools: Sequence[OpenAIToolSchema] | None = None,
+            model: str | None = None,
+            max_output: int | None = None,
+            temperature: float | None = None,
+            reasoning_effort: str | None = None,
+            timeout: int | None = None,
+        ) -> ModelResponse:
             self.complete_requests.append(request)
             started.set()
             try:
