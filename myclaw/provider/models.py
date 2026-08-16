@@ -2,8 +2,9 @@
 
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar, Literal, Protocol
-from uuid import UUID
+from inspect import signature
+from typing import Any, ClassVar, Literal, Protocol, cast
+from uuid import UUID, uuid4
 
 from myclaw.provider.errors import EmptyModelResponseError
 from myclaw.tools.base import OpenAIToolSchema
@@ -142,6 +143,88 @@ class ModelRequest:
             "reasoning_effort": self.reasoning_effort,
             "timeout_seconds": self.timeout_seconds,
         }
+
+
+def accepts_direct_provider_call(method: object) -> bool:
+    """Detect whether a Provider method exposes the direct message seam."""
+    if not callable(method):
+        return True
+    try:
+        method_signature = signature(method)
+    except (TypeError, ValueError):
+        return True
+    return "messages" in method_signature.parameters
+
+
+def legacy_request_from_direct(
+    *,
+    route: ModelRoute,
+    messages: ModelMessages,
+    tools: Sequence[OpenAIToolSchema],
+    model: str,
+    max_output: int,
+    temperature: float,
+    reasoning_effort: ReasoningEffort | None,
+    timeout: int,
+    stream: bool,
+) -> ModelRequest:
+    """Adapt direct dictionaries for Providers that remain on the old seam."""
+    if not messages or messages[0].get("role") != "system":
+        raise TypeError("direct model messages must start with a system message")
+    system_prompt = messages[0].get("content")
+    if not isinstance(system_prompt, str):
+        raise TypeError("direct system message content must be a string")
+    return ModelRequest(
+        request_id=uuid4(),
+        route=route,
+        system_prompt=system_prompt,
+        messages=tuple(_legacy_model_message(message) for message in messages[1:]),
+        tools=tuple(tools),
+        stream=stream,
+        model=model,
+        max_output=max_output,
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        timeout_seconds=timeout,
+    )
+
+
+def _legacy_model_message(message: ModelMessageDictionary) -> ModelMessage:
+    role = message.get("role")
+    if role == "user":
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise TypeError("direct user message content must be a string")
+        return UserModelMessage(content=content)
+    if role == "assistant":
+        content = message.get("content")
+        raw_tool_calls = message.get("tool_calls", [])
+        if not isinstance(content, str) or not isinstance(raw_tool_calls, list):
+            raise TypeError("direct assistant message is malformed")
+        return AssistantModelMessage(
+            content=content,
+            tool_calls=tuple(
+                ModelToolCall(
+                    id=tool_call["id"],
+                    name=tool_call["name"],
+                    arguments=tool_call["arguments"],
+                )
+                for tool_call in raw_tool_calls
+                if isinstance(tool_call, dict)
+            ),
+        )
+    if role == "tool":
+        tool_call_id = message.get("tool_call_id")
+        name = message.get("name")
+        content = message.get("content")
+        if not all(isinstance(value, str) for value in (tool_call_id, name, content)):
+            raise TypeError("direct Tool message is malformed")
+        return ToolModelMessage(
+            tool_call_id=cast(str, tool_call_id),
+            name=cast(str, name),
+            content=cast(str, content),
+        )
+    raise TypeError("direct model message role is unsupported")
 
 
 def resolve_provider_call_arguments(

@@ -94,6 +94,32 @@ class TitleFirstProvider:
         return None
 
 
+class ExistingSessionProvider:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        content = (
+            "Unexpected regenerated title"
+            if request.system_prompt == "Generate a title."
+            else "Continued answer."
+        )
+        yield ModelCompleted(
+            response=ModelResponse(
+                message=AssistantModelMessage(content=content),
+                usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
+                finish_reason="stop",
+            )
+        )
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        raise AssertionError(f"Unexpected complete request: {request!r}")
+
+    async def close(self) -> None:
+        return None
+
+
 @pytest.mark.asyncio
 async def test_title_finishing_before_chat_does_not_publish_an_intermediate_snapshot(
     agent_home: Path,
@@ -211,3 +237,63 @@ async def test_prepared_runtime_uses_an_isolated_chat_stream_for_session_title(
         "total_tokens": 14,
     }
     assert [message["role"] for message in runtime.session.messages] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_existing_session_turn_does_not_regenerate_its_title(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    session = Session.create(state, now=lambda: NOW, new_uuid=lambda: SESSION_UUID)
+    session.update_metadata(title="Existing title")
+    session.add_message("user", "Earlier input.")
+    session.add_message(
+        "assistant",
+        "Earlier answer.",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    provider = ExistingSessionProvider()
+    conversation = StreamingConversationPort(
+        provider=provider,
+        session=session,
+        settings=ChatModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        now=lambda: NOW,
+        new_uuid=lambda: TURN_UUID,
+        system_prompt="Chat system.",
+        title_prompt="Generate a title.",
+    )
+
+    observed = [event async for event in conversation.submit("Continue this Session.")]
+    await asyncio.sleep(0)
+
+    assert [event.type for event in observed] == [
+        "turn_started",
+        "model_call_completed",
+        "turn_completed",
+    ]
+    assert len(provider.requests) == 1
+    assert provider.requests[0].system_prompt == "Chat system."
+    assert session.metadata["title"] == "Existing title"
+    assert session.metadata["token_usage"] == {
+        "model_calls": 2,
+        "input_tokens": 3,
+        "output_tokens": 2,
+        "total_tokens": 5,
+    }
+    await conversation.close()

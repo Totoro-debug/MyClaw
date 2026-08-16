@@ -60,6 +60,7 @@ from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.conversation import (
     ChatModelSettings,
+    ForegroundSummaryPreparer,
     StreamingConversationPort,
 )
 from myclaw.session.session import Session
@@ -259,6 +260,8 @@ class _DeferredConversationPort:
         tool_gateway: ToolGateway,
         on_foreground_terminal: Callable[[], None],
         summary_preparer: SummaryPreparer | None = None,
+        foreground_summary_preparer: ForegroundSummaryPreparer | None = None,
+        context_builder: ContextBuilder | None = None,
         memory_snapshot: Callable[[], str] | None = None,
         system_prompt_for_memory: Callable[[str], str] | None = None,
         before_submit: Callable[[], Awaitable[None]] | None = None,
@@ -273,6 +276,8 @@ class _DeferredConversationPort:
         self._title_prompt = title_prompt
         self._tool_gateway = tool_gateway
         self._summary_preparer = summary_preparer
+        self._foreground_summary_preparer = foreground_summary_preparer
+        self._context_builder = context_builder
         self._memory_snapshot = memory_snapshot
         self._system_prompt_for_memory = system_prompt_for_memory
         self._before_submit = before_submit
@@ -316,6 +321,8 @@ class _DeferredConversationPort:
                         title_prompt=self._title_prompt,
                         tool_gateway=self._tool_gateway,
                         summary_preparer=self._summary_preparer,
+                        foreground_summary_preparer=self._foreground_summary_preparer,
+                        context_builder=self._context_builder,
                         memory_snapshot=self._memory_snapshot,
                         system_prompt_for_memory=self._system_prompt_for_memory,
                         externalize_result=self._externalize_result,
@@ -337,6 +344,7 @@ class _DeferredConversationPort:
 
     async def cancel_active_turn(self) -> None:
         delegate = self._delegate
+        delegate_active = self._delegate_has_active_turn(delegate)
         if delegate is not None:
             await delegate.cancel_active_turn()
         active = self._active_task
@@ -347,7 +355,8 @@ class _DeferredConversationPort:
             or active.cancelling()
         ):
             return
-        active.cancel()
+        if delegate is None or not delegate_active:
+            active.cancel()
 
     def respond_to_confirmation(
         self, confirmation_id: UUID, decision: ConfirmationDecision
@@ -369,12 +378,11 @@ class _DeferredConversationPort:
         active_done = self._active_done
         delegate = self._delegate
         if active is not None and active is not asyncio.current_task() and not active.done():
-            if delegate is None:
+            delegate_active = self._delegate_has_active_turn(delegate)
+            if delegate is None or not delegate_active:
                 active.cancel()
             else:
                 await delegate.cancel_active_turn()
-                if not active.done() and not active.cancelling():
-                    active.cancel()
         if active_done is not None:
             await active_done.wait()
         if delegate is None:
@@ -384,6 +392,13 @@ class _DeferredConversationPort:
             await delegate.cancel_active_turn()
         else:
             await close()
+
+    @staticmethod
+    def _delegate_has_active_turn(delegate: ConversationPort | None) -> bool:
+        if delegate is None:
+            return False
+        has_active_turn = getattr(delegate, "has_active_turn", None)
+        return bool(has_active_turn()) if callable(has_active_turn) else False
 
 
 def prepare_repl_runtime(
@@ -452,6 +467,9 @@ def _prepare_repl_runtime(
         workspace_identity,
         get_localzone_name() if timezone_name is None else timezone_name,
     )
+    set_context_clock = getattr(foreground_context, "set_clock", None)
+    if callable(set_context_clock):
+        set_context_clock(now)
     memory_store = WorkspaceFileMemoryStore(workspace_state)
     session = Session.create(
         workspace_state,
@@ -524,6 +542,7 @@ def _prepare_repl_runtime(
         route: AgentRunRoute,
         current_system_prompt: str,
         tools: tuple[OpenAIToolSchema, ...],
+        current_user: dict[str, Any] | None = None,
     ) -> Session:
         effective_route = configuration.resolve_route(route).route
         if route == "chat":
@@ -568,7 +587,7 @@ def _prepare_repl_runtime(
             now=now,
             project_messages=project_messages,
         )
-        return await manager.prepare(active_session)
+        return await manager.prepare(active_session, current_user=current_user)
 
     configured_schedule = configuration.configured_route("schedule")
     schedule_agent_run = AgentRun(
@@ -614,6 +633,18 @@ def _prepare_repl_runtime(
         )
 
     def conversation_for(active_session: Session) -> ConversationPort:
+        async def prepare_foreground_summary(
+            current_session: Session,
+            current_user: dict[str, Any],
+        ) -> Session:
+            return await prepare_summary(
+                current_session,
+                "chat",
+                system_prompt_for(runtime_memory.snapshot()),
+                tuple(tool_gateway.schemas),
+                current_user,
+            )
+
         return _DeferredConversationPort(
             provider=router,
             session=active_session,
@@ -624,6 +655,8 @@ def _prepare_repl_runtime(
             title_prompt=session_title_prompt(),
             tool_gateway=tool_gateway,
             summary_preparer=prepare_summary,
+            foreground_summary_preparer=prepare_foreground_summary,
+            context_builder=foreground_context,
             memory_snapshot=runtime_memory.snapshot,
             system_prompt_for_memory=system_prompt_for,
             on_foreground_terminal=capture_foreground_chat_status,
@@ -642,8 +675,8 @@ def _prepare_repl_runtime(
         resolved_chat=current_foreground_chat_status,
         next_input=lambda active_session: _runtime_status_input(
             active_session,
-            system_prompt=system_prompt_for(runtime_memory.snapshot()),
-            current_time=now(),
+            context_builder=foreground_context,
+            long_term_memory=runtime_memory.snapshot(),
             session_id=active_session.session_id,
             tool_schemas=tuple(tool_gateway.schemas),
         ),
@@ -792,19 +825,42 @@ def _resolved_chat_status(router: ModelRouter) -> ResolvedChatStatus:
 def _runtime_status_input(
     session: Session,
     *,
-    system_prompt: str,
-    current_time: datetime,
+    context_builder: ContextBuilder | None = None,
+    long_term_memory: str = "",
+    system_prompt: str = "",
+    current_time: datetime | None = None,
     session_id: str,
     tool_schemas: tuple[OpenAIToolSchema, ...],
 ) -> RuntimeStatusInput:
-    retained_messages = tuple(
-        json.dumps(
-            model_message.to_dict(),
-            ensure_ascii=False,
-            separators=(",", ":"),
+    if context_builder is not None:
+        projected = context_builder.build_messages(
+            history=session.messages[session.last_consolidated :],
+            current_user={"role": "user", "content": ""},
+            session_id=session_id,
+            long_term_memory=long_term_memory,
         )
-        for message in session.messages[session.last_consolidated :]
-        if (model_message := model_message_from_session(message)) is not None
+        projected_system = projected[0].get("content")
+        if not isinstance(projected_system, str):
+            raise TypeError("Context Builder status system message is malformed")
+        system_prompt = projected_system
+        retained = projected[1:]
+        runtime_context_value = ""
+    else:
+        retained = [
+            model_message.to_dict()
+            for message in session.messages[session.last_consolidated :]
+            if (model_message := model_message_from_session(message)) is not None
+        ]
+        runtime_context_value = (
+            ""
+            if current_time is None
+            else runtime_context(
+                current_time=current_time,
+                session_id=session_id,
+            )
+        )
+    retained_messages = tuple(
+        json.dumps(message, ensure_ascii=False, separators=(",", ":")) for message in retained
     )
     return RuntimeStatusInput(
         system_prompt=system_prompt,
@@ -817,10 +873,7 @@ def _runtime_status_input(
             )
             for definition in tool_schemas
         ),
-        runtime_context=runtime_context(
-            current_time=current_time,
-            session_id=session_id,
-        ),
+        runtime_context=runtime_context_value,
     )
 
 

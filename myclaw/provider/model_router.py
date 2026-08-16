@@ -17,6 +17,8 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelRoute,
     ModelStreamEvent,
+    accepts_direct_provider_call,
+    legacy_request_from_direct,
 )
 from myclaw.tools.base import OpenAIToolSchema
 
@@ -125,15 +127,31 @@ class ModelRouter:
             provider = cast(DirectModelProvider, self._provider(resolved.provider))
             emitted = False
             try:
-                async for event in provider.stream(
-                    messages=messages,
-                    tools=tools,
-                    model=resolved.route.model,
-                    max_output=resolved.route.max_output,
-                    temperature=resolved.route.temperature,
-                    reasoning_effort=resolved.route.reasoning_effort,
-                    timeout=resolved.route.timeout,
-                ):
+                if accepts_direct_provider_call(provider.stream):
+                    events = provider.stream(
+                        messages=messages,
+                        tools=tools,
+                        model=resolved.route.model,
+                        max_output=resolved.route.max_output,
+                        temperature=resolved.route.temperature,
+                        reasoning_effort=resolved.route.reasoning_effort,
+                        timeout=resolved.route.timeout,
+                    )
+                else:
+                    events = cast(ModelProvider, provider).stream(
+                        legacy_request_from_direct(
+                            route=route,
+                            messages=messages,
+                            tools=tools,
+                            model=resolved.route.model,
+                            max_output=resolved.route.max_output,
+                            temperature=resolved.route.temperature,
+                            reasoning_effort=resolved.route.reasoning_effort,
+                            timeout=resolved.route.timeout,
+                            stream=True,
+                        )
+                    )
+                async for event in events:
                     emitted = True
                     yield event
                 return
@@ -186,14 +204,28 @@ class ModelRouter:
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             provider = cast(DirectModelProvider, self._provider(resolved.provider))
             try:
-                return await provider.complete(
-                    messages=messages,
-                    tools=tools,
-                    model=resolved.route.model,
-                    max_output=resolved.route.max_output,
-                    temperature=resolved.route.temperature,
-                    reasoning_effort=resolved.route.reasoning_effort,
-                    timeout=resolved.route.timeout,
+                if accepts_direct_provider_call(provider.complete):
+                    return await provider.complete(
+                        messages=messages,
+                        tools=tools,
+                        model=resolved.route.model,
+                        max_output=resolved.route.max_output,
+                        temperature=resolved.route.temperature,
+                        reasoning_effort=resolved.route.reasoning_effort,
+                        timeout=resolved.route.timeout,
+                    )
+                return await cast(ModelProvider, provider).complete(
+                    legacy_request_from_direct(
+                        route=route,
+                        messages=messages,
+                        tools=tools,
+                        model=resolved.route.model,
+                        max_output=resolved.route.max_output,
+                        temperature=resolved.route.temperature,
+                        reasoning_effort=resolved.route.reasoning_effort,
+                        timeout=resolved.route.timeout,
+                        stream=False,
+                    )
                 )
             except ModelCallError as failure:
                 resolved = await self._recover_attempt(resolved, failure, attempt=attempt)

@@ -244,6 +244,46 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
 
 
 @pytest.mark.asyncio
+async def test_summary_candidate_includes_current_user_without_publishing_it(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    session.add_message("user", "First question.")
+    _add_assistant(session, "First answer.")
+    session.add_message("user", "Second question.")
+    _add_assistant(session, "Second answer.")
+    original_messages = deepcopy(session.messages)
+    projected_inputs: list[list[dict[str, Any]]] = []
+
+    def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        projected_inputs.append(deepcopy(list(messages)))
+        return _project_messages(list(messages), system_prompt="CHAT SYSTEM")
+
+    provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
+    summaries = WorkspaceJsonlSummaryStore(state)
+    manager = ConversationSummaryManager(
+        provider=provider,
+        summaries=summaries,
+        route_context_window=10_000,
+        route_max_output=1_000,
+        consolidation_message_threshold=4,
+        tools=(),
+        now=lambda: NOW,
+        project_messages=project_messages,
+    )
+
+    await manager.prepare(session, current_user={"role": "user", "content": "Current question."})
+
+    assert projected_inputs[0][-1] == {
+        "role": "user",
+        "content": "Current question.",
+    }
+    assert session.messages == original_messages
+    assert session.last_consolidated == 2
+
+
+@pytest.mark.asyncio
 async def test_token_budget_summarizes_roughly_half_the_available_input(
     workspace: Path,
 ) -> None:

@@ -162,12 +162,19 @@ class ConversationSummaryManager:
     async def prepare(
         self,
         session: Session,
+        *,
+        current_user: dict[str, Any] | None = None,
     ) -> Session:
         with without_session_log():
-            return await self._prepare(session)
+            return await self._prepare(session, current_user=current_user)
 
-    async def _prepare(self, session: Session) -> Session:
-        short_term = _short_term_messages(session)
+    async def _prepare(
+        self,
+        session: Session,
+        *,
+        current_user: dict[str, Any] | None,
+    ) -> Session:
+        short_term = _short_term_messages(session, current_user=current_user)
         current_user_index = _last_user_index(short_term)
         complete_messages = self._project_messages(short_term)
         available_input = self._route_context_window - self._route_max_output
@@ -237,8 +244,15 @@ class ConversationSummaryManager:
         return value.replace(microsecond=value.microsecond // 1000 * 1000)
 
 
-def _short_term_messages(session: Session) -> list[dict[str, Any]]:
-    return session.messages[session.last_consolidated :]
+def _short_term_messages(
+    session: Session,
+    *,
+    current_user: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    messages = list(session.messages[session.last_consolidated :])
+    if current_user is not None:
+        messages.append(current_user)
+    return messages
 
 
 def _aligned_cutoff(messages: list[dict[str, Any]], initial: int) -> int:

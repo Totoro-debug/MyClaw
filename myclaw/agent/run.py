@@ -29,6 +29,8 @@ from myclaw.provider.models import (
     TextDelta,
     ToolModelMessage,
     UserModelMessage,
+    accepts_direct_provider_call,
+    legacy_request_from_direct,
 )
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
@@ -537,6 +539,23 @@ class AgentRun:
         except Exception:
             await _close_iterator(events)
             events = None
+            if self._cancel_requested():
+                cancelled_content = "".join(partial_content)
+                self._repair_awaitable_cancelled(
+                    runtime_messages,
+                    increment,
+                    partial_content,
+                    pending_tool_calls,
+                )
+                if not started_emitted:
+                    await _emit_agent_run_payload(emitter, AgentRunStartedPayload())
+                    started_emitted = True
+                await _emit_agent_run_payload(
+                    emitter,
+                    AgentRunCancelledPayload(partial_content=cancelled_content),
+                )
+                terminal_emitted = True
+                return increment
             generic_failure = _model_failure()
             self._capture_terminal_failure(generic_failure)
             self._repair_awaitable_failed(
@@ -614,14 +633,29 @@ class AgentRun:
                 tools=tools,
             )
         settings = self._route_settings(route)
-        return cast(DirectModelProvider, model_client).stream(
-            messages=messages,
-            tools=tools,
-            model=settings.model,
-            max_output=settings.max_output,
-            temperature=settings.temperature,
-            reasoning_effort=settings.reasoning_effort,
-            timeout=settings.timeout_seconds,
+        method = cast(Any, model_client).stream
+        if accepts_direct_provider_call(method):
+            return cast(DirectModelProvider, model_client).stream(
+                messages=messages,
+                tools=tools,
+                model=settings.model,
+                max_output=settings.max_output,
+                temperature=settings.temperature,
+                reasoning_effort=settings.reasoning_effort,
+                timeout=settings.timeout_seconds,
+            )
+        return cast(ModelProvider, model_client).stream(
+            legacy_request_from_direct(
+                route=route,
+                messages=messages,
+                tools=tools,
+                model=settings.model,
+                max_output=settings.max_output,
+                temperature=settings.temperature,
+                reasoning_effort=settings.reasoning_effort,
+                timeout=settings.timeout_seconds,
+                stream=True,
+            )
         )
 
     async def _direct_complete_events(
@@ -639,15 +673,31 @@ class AgentRun:
             )
         else:
             settings = self._route_settings(route)
-            response = await cast(DirectModelProvider, model_client).complete(
-                messages=messages,
-                tools=tools,
-                model=settings.model,
-                max_output=settings.max_output,
-                temperature=settings.temperature,
-                reasoning_effort=settings.reasoning_effort,
-                timeout=settings.timeout_seconds,
-            )
+            method = cast(Any, model_client).complete
+            if accepts_direct_provider_call(method):
+                response = await cast(DirectModelProvider, model_client).complete(
+                    messages=messages,
+                    tools=tools,
+                    model=settings.model,
+                    max_output=settings.max_output,
+                    temperature=settings.temperature,
+                    reasoning_effort=settings.reasoning_effort,
+                    timeout=settings.timeout_seconds,
+                )
+            else:
+                response = await cast(ModelProvider, model_client).complete(
+                    legacy_request_from_direct(
+                        route=route,
+                        messages=messages,
+                        tools=tools,
+                        model=settings.model,
+                        max_output=settings.max_output,
+                        temperature=settings.temperature,
+                        reasoning_effort=settings.reasoning_effort,
+                        timeout=settings.timeout_seconds,
+                        stream=False,
+                    )
+                )
         yield ModelCompleted(response=response)
 
     def _externalize_awaitable_result(

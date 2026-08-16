@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from datetime import datetime
 from typing import Any
@@ -19,11 +19,22 @@ from myclaw.templates import render_template
 class ContextBuilder:
     """Build the complete model-visible message list for one foreground turn."""
 
-    def __init__(self, workspace: Workspace, timezone_name: str) -> None:
+    def __init__(
+        self,
+        workspace: Workspace,
+        timezone_name: str,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         if not isinstance(workspace, Workspace):
             raise TypeError("Context Builder requires a Workspace")
         self._workspace = workspace
         self._timezone = ZoneInfo(timezone_name)
+        self._clock = clock
+
+    def set_clock(self, clock: Callable[[], datetime] | None) -> None:
+        """Override the clock used while composing Runtime Context in tests."""
+        self._clock = clock
 
     def build_messages(
         self,
@@ -53,12 +64,20 @@ class ContextBuilder:
                 "role": "user",
                 "content": current_user_input(
                     content=deepcopy(current_user["content"]),
-                    current_time=datetime.now(self._timezone),
+                    current_time=self._current_time(),
                     session_id=session_id,
                 ),
             }
         )
         return messages
+
+    def _current_time(self) -> datetime:
+        if self._clock is None:
+            return datetime.now(self._timezone)
+        current_time = self._clock()
+        if current_time.tzinfo is None or current_time.utcoffset() is None:
+            raise ValueError("Context Builder clock must return an aware datetime")
+        return current_time.astimezone(self._timezone)
 
 
 def _project_history_message(message: dict[str, Any]) -> dict[str, Any] | None:
