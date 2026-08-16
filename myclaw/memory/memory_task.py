@@ -1,11 +1,10 @@
 """Manual Memory Task orchestration and persistent-state adapters."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Protocol
-from uuid import uuid4
+from typing import Annotated, Any, Protocol
 
 from loguru import logger
 
@@ -16,14 +15,11 @@ from myclaw.logging.session import without_session_log
 from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
-    ModelMessage,
-    ModelProvider,
-    ModelRequest,
-    ReasoningEffort,
-    ToolModelMessage,
-    UserModelMessage,
+    ModelMessages,
+    ModelResponse,
+    ModelRoute,
 )
-from myclaw.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.tools.base import BaseTool, OpenAIToolSchema, ToolError, ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.validation import require_nonnegative_int
@@ -58,6 +54,18 @@ class MemoryStore(Protocol):
 
 class _SummaryReader(Protocol):
     async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]: ...
+
+
+class MemoryTaskModelRouter(Protocol):
+    """The direct Router seam used for the specialized Memory Task call."""
+
+    async def complete(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+    ) -> ModelResponse: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,36 +255,23 @@ class WorkspaceFileMemoryStore:
             self._replace_text(self._cursor_path, f"{index}\n")
 
 
-@dataclass(frozen=True, slots=True)
-class MemoryTaskModelSettings:
-    """Resolved provider-neutral settings for a Memory Task model call."""
-
-    model: str
-    max_output: int
-    temperature: float
-    reasoning_effort: ReasoningEffort | None
-    timeout_seconds: int
-
-
 class MemoryManager:
     """Process pending Conversation Summaries into Long-term Memory."""
 
     def __init__(
         self,
         *,
-        provider: ModelProvider,
+        router: MemoryTaskModelRouter,
         summaries: _SummaryReader,
         memory: MemoryStore,
         long_term_path: Path,
-        settings: MemoryTaskModelSettings,
         batch_size: int,
         runtime_memory: RuntimeMemory | None = None,
     ) -> None:
-        self._provider = provider
+        self._router = router
         self._summaries = summaries
         self._memory = memory
         self._long_term_path = long_term_path
-        self._settings = settings
         self._batch_size = batch_size
         self._failure_diagnostic: Exception | None = None
         self._tools = ToolGateway._for_memory(
@@ -365,28 +360,24 @@ class MemoryManager:
                 ),
             )
         self._running_cursor = new_cursor
-        messages: list[ModelMessage] = [
-            UserModelMessage(
-                content=memory_task_input(cursor=cursor, summaries=pending),
-            )
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": memory_task_prompt(long_term_path=self._long_term_path),
+            },
+            {
+                "role": "user",
+                "content": memory_task_input(cursor=cursor, summaries=pending),
+            },
         ]
         memory_updated = False
         while True:
-            request = ModelRequest(
-                request_id=uuid4(),
-                route="memory",
-                system_prompt=memory_task_prompt(long_term_path=self._long_term_path),
-                messages=tuple(messages),
-                tools=tuple(self._tools.schemas),
-                stream=False,
-                model=self._settings.model,
-                max_output=self._settings.max_output,
-                temperature=self._settings.temperature,
-                reasoning_effort=self._settings.reasoning_effort,
-                timeout_seconds=self._settings.timeout_seconds,
-            )
             try:
-                response = await self._provider.complete(request)
+                response = await self._router.complete(
+                    "memory",
+                    messages=messages,
+                    tools=self._tools.schemas,
+                )
             except ModelCallError as failure:
                 self._capture_terminal_failure(failure)
                 return MemoryTaskResult(
@@ -396,17 +387,18 @@ class MemoryManager:
                     cursor=new_cursor,
                     error=failure.error,
                 )
-            messages.append(response.message)
+            messages.append(response.message.to_dict())
             if not response.message.tool_calls:
                 break
             for tool_call in response.message.tool_calls:
                 tool_result = await self._tools.call(tool_call)
                 messages.append(
-                    ToolModelMessage(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        content=tool_result.content,
-                    )
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_call.name,
+                        "content": tool_result.content,
+                    }
                 )
                 if tool_result.status != "success":
                     return MemoryTaskResult(

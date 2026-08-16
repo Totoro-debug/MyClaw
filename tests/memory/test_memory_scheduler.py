@@ -20,7 +20,7 @@ from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
 from myclaw.memory.memory_scheduler import MemoryTaskScheduler
 from myclaw.memory.memory_task import (
     MemoryManager,
-    MemoryTaskModelSettings,
+    MemoryTaskModelRouter,
     MemoryTaskResult,
     WorkspaceFileMemoryStore,
 )
@@ -29,7 +29,6 @@ from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelProvider,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
@@ -134,21 +133,14 @@ def _response(
 def _manager(
     *,
     home: AgentHome,
-    provider: ModelProvider,
+    router: MemoryTaskModelRouter,
     summaries: WorkspaceJsonlSummaryStore,
 ) -> MemoryManager:
     return MemoryManager(
-        provider=provider,
+        router=router,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=home.path / "memory" / "memory.md",
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
 
@@ -160,7 +152,7 @@ async def test_periodic_memory_task_runs_when_the_manager_is_idle(agent_home: Pa
     summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
-    manager = _manager(home=home, provider=provider, summaries=summaries)
+    manager = _manager(home=home, router=provider, summaries=summaries)
 
     result = await manager.run_periodic()
 
@@ -196,7 +188,7 @@ async def test_periodic_memory_task_does_not_borrow_a_foreground_session_log(
     with configured_process_logging(), session_log(state, SESSION_ID):
         result = await _manager(
             home=home,
-            provider=router,
+            router=router,
             summaries=summaries,
         ).run_periodic()
 
@@ -247,7 +239,7 @@ async def test_memory_scheduler_trigger_does_not_borrow_a_foreground_session_log
     scheduler = MemoryTaskScheduler(
         manager=_manager(
             home=home,
-            provider=UnexpectedFailureProvider(),
+            router=UnexpectedFailureProvider(),
             summaries=summaries,
         ),
         schedule="0 * * * *",
@@ -276,7 +268,7 @@ async def test_hourly_memory_schedule_triggers_only_at_next_local_cron_boundary(
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=_manager(home=home, provider=provider, summaries=summaries),
+        manager=_manager(home=home, router=provider, summaries=summaries),
         schedule="0 * * * *",
         clock=clock,
     )
@@ -326,7 +318,7 @@ async def test_periodic_trigger_is_skipped_while_the_previous_run_is_still_activ
     provider = BlockingProvider()
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=_manager(home=home, provider=provider, summaries=summaries),
+        manager=_manager(home=home, router=provider, summaries=summaries),
         schedule="0 * * * *",
         clock=clock,
     )
@@ -375,7 +367,7 @@ async def test_manual_memory_task_reports_running_while_a_periodic_run_is_active
             return _response("No update needed.")
 
     provider = BlockingProvider()
-    manager = _manager(home=home, provider=provider, summaries=summaries)
+    manager = _manager(home=home, router=provider, summaries=summaries)
     periodic = asyncio.create_task(manager.run_periodic())
     await started.wait()
     (_state(home).memory_directory / ".cursor").write_bytes(b"corrupt\n")
@@ -479,7 +471,7 @@ async def test_custom_schedule_keeps_the_runtime_startup_local_timezone(
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(datetime(2026, 7, 11, 8, 50, tzinfo=LOCAL))
     scheduler = MemoryTaskScheduler(
-        manager=_manager(home=home, provider=provider, summaries=summaries),
+        manager=_manager(home=home, router=provider, summaries=summaries),
         schedule="0 9 * * *",
         clock=clock,
     )
@@ -504,7 +496,7 @@ async def test_local_schedule_wait_uses_elapsed_time_across_daylight_saving_chan
     scheduler = MemoryTaskScheduler(
         manager=_manager(
             home=home,
-            provider=ScriptedFakeProvider(),
+            router=ScriptedFakeProvider(),
             summaries=WorkspaceJsonlSummaryStore(_state(home)),
         ),
         schedule="30 3 * * *",
@@ -862,7 +854,7 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
             return _response("No update needed.")
 
     provider = CancellationAwareProvider()
-    manager = _manager(home=home, provider=provider, summaries=summaries)
+    manager = _manager(home=home, router=provider, summaries=summaries)
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
         manager=manager,
@@ -932,7 +924,7 @@ async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
     provider = CleanupFailingProvider()
     manager = _manager(
         home=home,
-        provider=provider,
+        router=provider,
         summaries=summaries,
     )
     clock = ControlledClock(NOW)

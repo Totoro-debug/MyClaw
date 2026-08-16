@@ -3,6 +3,7 @@ import json
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -21,7 +22,6 @@ from myclaw.memory.memory_task import (
     MemoryEditFileTool,
     MemoryManager,
     MemoryReadFileTool,
-    MemoryTaskModelSettings,
     MemoryTaskResult,
     RuntimeMemory,
     WorkspaceFileMemoryStore,
@@ -32,6 +32,7 @@ from myclaw.provider.models import (
     AssistantModelMessage,
     ModelRequest,
     ModelResponse,
+    ModelRoute,
     ModelUsage,
     ToolModelMessage,
 )
@@ -64,6 +65,26 @@ def _response(
         usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
         finish_reason="tool_calls" if tool_calls else "stop",
     )
+
+
+class _RecordingMemoryTaskRouter:
+    def __init__(self, *responses: ModelResponse) -> None:
+        self._responses = list(responses)
+        self.calls: list[
+            tuple[ModelRoute, Sequence[dict[str, Any]], Sequence[OpenAIToolSchema]]
+        ] = []
+
+    async def complete(
+        self,
+        route: ModelRoute,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> ModelResponse:
+        self.calls.append((route, list(messages), tuple(tools)))
+        if not self._responses:
+            raise AssertionError("No scripted Memory Task response remains")
+        return self._responses.pop(0)
 
 
 @pytest.mark.asyncio
@@ -213,17 +234,10 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
     home.initialize()
     provider = ScriptedFakeProvider()
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=WorkspaceJsonlSummaryStore(_state(home)),
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
     capture = capture_diagnostics()
@@ -239,6 +253,96 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
     )
     assert provider.complete_requests == []
     assert not (agent_home / "logs").exists()
+
+
+@pytest.mark.asyncio
+async def test_memory_task_uses_the_direct_memory_route_and_dictionary_messages(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
+    await summaries.append("The user prefers concise status reports.", NOW)
+    router = _RecordingMemoryTaskRouter(_response("No stable update is needed."))
+    manager = MemoryManager(
+        router=router,
+        summaries=summaries,
+        memory=WorkspaceFileMemoryStore(state),
+        long_term_path=state.long_term_memory_path,
+        batch_size=10,
+    )
+
+    result = await manager.run_manual()
+
+    assert result.status == "Processed 1 summary; Long-term Memory unchanged."
+    assert len(router.calls) == 1
+    route, messages, tools = router.calls[0]
+    assert route == "memory"
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert "User Info" in messages[0]["content"]
+    assert "The user prefers concise status reports." in messages[1]["content"]
+    assert [schema["function"]["name"] for schema in tools] == [
+        "read_file",
+        "edit_file",
+    ]
+    assert "request_id" not in json.dumps(messages)
+
+
+@pytest.mark.asyncio
+async def test_memory_task_direct_router_receives_tool_results_as_follow_up_dictionaries(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = _state(home)
+    summaries = WorkspaceJsonlSummaryStore(state)
+    await summaries.append("Inspect Long-term Memory before deciding.", NOW)
+    first_response = _response(
+        "",
+        tool_calls=(
+            ModelToolCall(
+                id="read-memory",
+                name="read_file",
+                arguments=json.dumps({"path": str(state.long_term_memory_path)}),
+            ),
+        ),
+    )
+    router = _RecordingMemoryTaskRouter(
+        first_response,
+        _response("No stable update is needed."),
+    )
+    manager = MemoryManager(
+        router=router,
+        summaries=summaries,
+        memory=WorkspaceFileMemoryStore(state),
+        long_term_path=state.long_term_memory_path,
+        batch_size=10,
+    )
+
+    result = await manager.run_manual()
+
+    assert result.status == "Processed 1 summary; Long-term Memory unchanged."
+    assert len(router.calls) == 2
+    assert [route for route, _, _ in router.calls] == ["memory", "memory"]
+    _, follow_up_messages, follow_up_tools = router.calls[1]
+    assert [message["role"] for message in follow_up_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert follow_up_messages[2] == first_response.message.to_dict()
+    assert follow_up_messages[3] == {
+        "role": "tool",
+        "tool_call_id": "read-memory",
+        "name": "read_file",
+        "content": state.long_term_memory_path.read_text(encoding="utf-8").rstrip("\n"),
+    }
+    assert [schema["function"]["name"] for schema in follow_up_tools] == [
+        "read_file",
+        "edit_file",
+    ]
 
 
 @pytest.mark.asyncio
@@ -263,17 +367,10 @@ async def test_manual_memory_task_does_not_borrow_a_foreground_session_log(
         clock=FakeClock(NOW),
     )
     manager = MemoryManager(
-        provider=router,
+        router=router,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
         long_term_path=state.long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
     with configured_process_logging(), session_log(state, SESSION_ID):
@@ -303,17 +400,10 @@ async def test_memory_task_without_an_edit_advances_the_summary_cursor(
         completions=(_response("No stable Long-term Memory update is needed."),)
     )
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=memory,
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
 
@@ -377,17 +467,10 @@ async def test_memory_task_advances_the_summary_cursor_before_model_work(
 
     provider = CursorObservingProvider(completions=(_response("No update needed."),))
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=memory,
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
 
@@ -443,17 +526,10 @@ async def test_memory_task_preadvances_summary_cursor_before_exact_edit(
         )
     )
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
 
@@ -504,17 +580,10 @@ async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
         )
     )
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
         long_term_path=state.long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
 
@@ -579,17 +648,10 @@ async def test_required_memory_edit_failure_keeps_the_advanced_summary_cursor(
         )
     )
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=memory,
         long_term_path=memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
         runtime_memory=runtime_memory,
     )
@@ -672,17 +734,10 @@ async def test_unexpected_memory_tool_failure_is_logged_once_at_the_task_boundar
         )
     )
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=FailingMemoryStore(),
         long_term_path=memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
     capture = capture_diagnostics()
@@ -709,17 +764,10 @@ async def test_conversation_summary_read_failure_is_logged_only_at_memory_task_b
     summaries = WorkspaceJsonlSummaryStore(_state(home))
     summaries.path.write_text("PRIVATE INVALID SUMMARY STREAM", encoding="utf-8")
     manager = MemoryManager(
-        provider=ScriptedFakeProvider(),
+        router=ScriptedFakeProvider(),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
     capture = capture_diagnostics()
@@ -768,17 +816,10 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
         )
     )
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
         long_term_path=memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
 
@@ -838,17 +879,10 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
 
     provider = BlockingFirstProvider()
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
     capture = capture_diagnostics()
@@ -906,17 +940,10 @@ async def test_overlapping_manual_memory_task_ignores_a_corrupt_cursor(
 
     provider = BlockingProvider()
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
     first_task = asyncio.create_task(manager.run_manual())
@@ -946,17 +973,10 @@ async def test_dream_command_returns_exact_no_pending_output_without_a_model_cal
     home.initialize()
     provider = ScriptedFakeProvider()
     memory_manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=WorkspaceJsonlSummaryStore(_state(home)),
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
     dispatcher = ManagementCommandDispatcher(
@@ -1024,17 +1044,10 @@ async def test_dream_command_renders_model_failure_after_advancing_cursor(
         )
     )
     memory_manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=memory,
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
     dispatcher = ManagementCommandDispatcher(
@@ -1073,17 +1086,10 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
     memory = WorkspaceFileMemoryStore(_state(home), replace_text=fail_cursor)
     provider = ScriptedFakeProvider(completions=(_response("No durable update is needed."),))
     memory_manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=memory,
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
     dispatcher = ManagementCommandDispatcher(
@@ -1121,17 +1127,10 @@ async def test_dream_reports_corrupt_cursor_without_calling_the_model(
     (_state(home).memory_directory / ".cursor").write_bytes(cursor_bytes)
     provider = ScriptedFakeProvider()
     memory_manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=WorkspaceJsonlSummaryStore(_state(home)),
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
     dispatcher = ManagementCommandDispatcher(
@@ -1164,17 +1163,10 @@ async def test_memory_task_rejects_an_external_hard_linked_cursor(
     cursor_path.hardlink_to(outside_cursor)
     provider = ScriptedFakeProvider()
     manager = MemoryManager(
-        provider=provider,
+        router=provider,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model="memory-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         batch_size=10,
     )
 

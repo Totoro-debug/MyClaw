@@ -51,7 +51,6 @@ from myclaw.memory.conversation_summary import (
 from myclaw.memory.memory_scheduler import MemoryTaskScheduler
 from myclaw.memory.memory_task import (
     MemoryManager,
-    MemoryTaskModelSettings,
     RuntimeMemory,
     WorkspaceFileMemoryStore,
 )
@@ -492,20 +491,12 @@ def _prepare_repl_runtime(
         )
 
     system_prompt = system_prompt_for(runtime_memory.snapshot())
-    configured_memory = configuration.configured_route("memory")
     summaries = WorkspaceJsonlSummaryStore(workspace_state)
     memory_manager = MemoryManager(
-        provider=router,
+        router=router,
         summaries=summaries,
         memory=memory_store,
         long_term_path=workspace_state.long_term_memory_path,
-        settings=MemoryTaskModelSettings(
-            model=configured_memory.model,
-            max_output=configured_memory.max_output,
-            temperature=configured_memory.temperature,
-            reasoning_effort=configured_memory.reasoning_effort,
-            timeout_seconds=configured_memory.timeout,
-        ),
         batch_size=configuration.memory.batch_size,
         runtime_memory=runtime_memory,
     )
