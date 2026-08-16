@@ -48,6 +48,10 @@ from myclaw.tools.tool_gateway import (
 type AgentRunRoute = Literal["chat", "schedule"]
 type ConfirmationChannel = ToolConfirmationChannel
 type ToolResultExternalizer = Callable[[ToolResult], ToolResult]
+type AgentRunContinuationPreparer = Callable[
+    [Sequence[dict[str, Any]], Sequence[dict[str, Any]]],
+    Awaitable[list[dict[str, Any]]],
+]
 type SummaryPreparer = Callable[
     [Session, AgentRunRoute, str, tuple[OpenAIToolSchema, ...]],
     Awaitable[Session],
@@ -270,6 +274,9 @@ class AgentRun:
         route: AgentRunRoute,
         emitter: AgentRunEmitter,
         confirmation: ConfirmationChannel | None = None,
+        externalize_result: ToolResultExternalizer | None = None,
+        continuation_preparer: AgentRunContinuationPreparer | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
         """Run the model and Tool loop without owning Conversation Session state.
 
@@ -292,16 +299,20 @@ class AgentRun:
         started_emitted = False
         terminal_emitted = False
         stream = route == "chat"
+        preparing_continuation = False
+        is_cancel_requested = cancel_requested or self._cancel_requested
 
         try:
             model_client = self._model_client(route)
             gateway = self._tool_gateway
             frozen_tools = () if gateway is None else tuple(gateway.schemas)
-            externalize_result = self._externalize_result or _identity_tool_result
+            externalize_result_for_run = (
+                externalize_result or self._externalize_result or _identity_tool_result
+            )
 
             await _emit_agent_run_payload(emitter, AgentRunStartedPayload())
             started_emitted = True
-            if self._cancel_requested():
+            if is_cancel_requested():
                 cancelled_content = "".join(partial_content)
                 self._repair_awaitable_cancelled(
                     runtime_messages,
@@ -317,6 +328,14 @@ class AgentRun:
                 return increment
 
             while True:
+                if preparing_continuation and continuation_preparer is not None:
+                    prepared = await continuation_preparer(
+                        deepcopy(runtime_messages),
+                        deepcopy(increment),
+                    )
+                    if not isinstance(prepared, list):
+                        raise TypeError("Agent Run continuation preparer must return a list")
+                    runtime_messages = deepcopy(prepared)
                 partial_content.clear()
                 events = (
                     self._direct_stream(
@@ -341,7 +360,7 @@ class AgentRun:
                             emitter,
                             AgentRunTextDeltaPayload(delta=event.delta),
                         )
-                        if self._cancel_requested():
+                        if is_cancel_requested():
                             cancelled_content = "".join(partial_content)
                             await _close_iterator(events)
                             events = None
@@ -389,7 +408,7 @@ class AgentRun:
                                     summary=_tool_summary("Running", tool_call.name),
                                 ),
                             )
-                            if self._cancel_requested():
+                            if is_cancel_requested():
                                 cancelled_content = "".join(partial_content)
                                 self._repair_awaitable_cancelled(
                                     runtime_messages,
@@ -435,7 +454,7 @@ class AgentRun:
                                         try:
                                             result = self._externalize_awaitable_result(
                                                 tool_state.result,
-                                                externalize_result,
+                                                externalize_result_for_run,
                                             )
                                             _append_run_message(
                                                 runtime_messages,
@@ -459,7 +478,10 @@ class AgentRun:
                                     content=f"{tool_call.name} could not complete the request.",
                                     artifact=None,
                                 )
-                            result = self._externalize_awaitable_result(result, externalize_result)
+                            result = self._externalize_awaitable_result(
+                                result,
+                                externalize_result_for_run,
+                            )
                             _append_run_message(
                                 runtime_messages, increment, _tool_run_message(result)
                             )
@@ -473,7 +495,7 @@ class AgentRun:
                                     summary=_tool_completion_summary(result),
                                 ),
                             )
-                            if self._cancel_requested():
+                            if is_cancel_requested():
                                 cancelled_content = "".join(partial_content)
                                 self._repair_awaitable_cancelled(
                                     runtime_messages,
@@ -487,6 +509,7 @@ class AgentRun:
                                 )
                                 terminal_emitted = True
                                 return increment
+                        preparing_continuation = True
                         continue
 
                     await _emit_agent_run_payload(
@@ -504,7 +527,7 @@ class AgentRun:
         except ModelCallError as failure:
             await _close_iterator(events)
             events = None
-            if failure.error.code == "turn_cancelled" or self._cancel_requested():
+            if failure.error.code == "turn_cancelled" or is_cancel_requested():
                 cancelled_content = "".join(partial_content)
                 self._repair_awaitable_cancelled(
                     runtime_messages,
@@ -539,7 +562,7 @@ class AgentRun:
         except Exception:
             await _close_iterator(events)
             events = None
-            if self._cancel_requested():
+            if is_cancel_requested():
                 cancelled_content = "".join(partial_content)
                 self._repair_awaitable_cancelled(
                     runtime_messages,
@@ -578,7 +601,7 @@ class AgentRun:
         except asyncio.CancelledError:
             await _close_iterator(events)
             events = None
-            if self._cancel_requested():
+            if is_cancel_requested():
                 cancelled_content = "".join(partial_content)
                 self._repair_awaitable_cancelled(
                     runtime_messages,
@@ -1534,6 +1557,7 @@ __all__ = [
     "AgentRunCancelledPayload",
     "AgentRunCompletedPayload",
     "AgentRunConfirmationRequestedPayload",
+    "AgentRunContinuationPreparer",
     "AgentRunEmitter",
     "AgentRunFailedPayload",
     "AgentRunInterface",

@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Sequence
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -13,6 +14,7 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.context import ContextBuilder
 from myclaw.agent.events import AgentEvent
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
@@ -84,6 +86,9 @@ class _RuntimeProvider:
         self.release_chat = asyncio.Event()
         self.stream_requests: list[ModelRequest] = []
         self.complete_requests: list[ModelRequest] = []
+        self.direct_complete_messages: list[
+            tuple[list[dict[str, object]], list[OpenAIToolSchema]]
+        ] = []
         self.closed = False
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
@@ -113,8 +118,9 @@ class _RuntimeProvider:
         if request is None or isinstance(request, str):
             if messages is None:
                 raise TypeError("direct Runtime Provider calls require messages")
+            self.direct_complete_messages.append((deepcopy(list(messages)), list(tools)))
             request = _legacy_request_from_direct(
-                route="memory",
+                route="schedule" if len(tools) == 10 else "memory",
                 messages=messages,
                 tools=tools,
                 model=model,
@@ -283,6 +289,233 @@ async def test_runtime_conversation_manages_schedule_jobs_without_confirmation(
         assert _tool_json(runtime)[-1]["action"] == "remove"
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_schedule_uses_its_own_complete_context_projection(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    await WorkspaceScheduleStore(state).add_user_job(
+        ScheduleJob(
+            job_id=str(JOB_UUID),
+            message="Run this.",
+            schedule=JobSchedule.at("2026-08-07T03:59:00.000+00:00"),
+            created_at_ms=1,
+            updated_at_ms=1,
+        )
+    )
+    provider = _RuntimeProvider(schedule_responses=(_response("Background result."),))
+
+    def fail_foreground_context(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        del args, kwargs
+        raise AssertionError("Schedule must not use ContextBuilder")
+
+    monkeypatch.setattr(ContextBuilder, "build_messages", fail_foreground_context)
+    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    await runtime.start()
+    try:
+        await _wait_until(lambda: runtime.schedule_service.status_snapshot().active_job_count == 0)
+    finally:
+        await runtime.close()
+
+    assert len(provider.direct_complete_messages) == 1
+    messages, tools = provider.direct_complete_messages[0]
+    assert messages[0]["role"] == "system"
+    assert str(workspace) in cast(str, messages[0]["content"])
+    assert messages[-1]["role"] == "user"
+    assert "Run this." in cast(str, messages[-1]["content"])
+    assert NOW.isoformat(timespec="milliseconds") in cast(str, messages[-1]["content"])
+    assert f"schedule_{JOB_UUID}" in cast(str, messages[-1]["content"])
+    assert all("timestamp" not in message for message in messages)
+    assert [definition["function"]["name"] for definition in tools] == [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "glob",
+        "grep",
+        "exec",
+        "web_search",
+        "web_fetch",
+        "schedule",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_schedule_tool_loop_persists_each_message_from_awaitable_run(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    await WorkspaceScheduleStore(state).add_user_job(
+        ScheduleJob(
+            job_id=str(JOB_UUID),
+            message="Read the memory template.",
+            schedule=JobSchedule.at("2026-08-07T03:59:00.000+00:00"),
+            created_at_ms=1,
+            updated_at_ms=1,
+        )
+    )
+    provider = _RuntimeProvider(
+        schedule_responses=(
+            _response(
+                "",
+                tool_call=ModelToolCall(
+                    id="call_read",
+                    name="read_file",
+                    arguments=json.dumps(
+                        {"path": str(state.long_term_memory_path)},
+                        separators=(",", ":"),
+                    ),
+                ),
+            ),
+            _response("The memory template was read."),
+        )
+    )
+    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    await runtime.start()
+    try:
+        await _wait_until(
+            lambda: (
+                len(provider.direct_complete_messages) == 2
+                and runtime.schedule_service.status_snapshot().active_job_count == 0
+            )
+        )
+    finally:
+        await runtime.close()
+
+    second_messages, _ = provider.direct_complete_messages[1]
+    assert [message["role"] for message in second_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert second_messages[2]["tool_calls"] == [
+        {
+            "id": "call_read",
+            "name": "read_file",
+            "arguments": json.dumps(
+                {"path": str(state.long_term_memory_path)},
+                separators=(",", ":"),
+            ),
+        }
+    ]
+    assert second_messages[3]["tool_call_id"] == "call_read"
+    session = Session.load(
+        state,
+        f"schedule_{JOB_UUID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert [message["role"] for message in session.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert session.messages[-1]["content"] == "The memory template was read."
+
+
+@pytest.mark.asyncio
+async def test_runtime_schedule_reapplies_summary_policy_before_tool_loop_continuation(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    config_text = VALID_CONFIG.replace(
+        "consolidation_message_threshold = 50",
+        "consolidation_message_threshold = 5",
+    )
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    await WorkspaceScheduleStore(state).add_user_job(
+        ScheduleJob(
+            job_id=str(JOB_UUID),
+            message="Continue after reading memory.",
+            schedule=JobSchedule.at("2026-08-07T03:59:00.000+00:00"),
+            created_at_ms=1,
+            updated_at_ms=1,
+        )
+    )
+    schedule_session = Session.create_schedule(state, JOB_UUID, now=lambda: NOW)
+    schedule_session.add_message("user", "Old scheduled request.")
+    schedule_session.add_message(
+        "assistant",
+        "Old scheduled answer.",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    schedule_session.close()
+    provider = _RuntimeProvider(
+        schedule_responses=(
+            _response(
+                "",
+                tool_call=ModelToolCall(
+                    id="call_read",
+                    name="read_file",
+                    arguments=json.dumps({"path": str(state.long_term_memory_path)}),
+                ),
+            ),
+            _response("Continuation completed."),
+        ),
+        memory_responses=(_response("Old Schedule turn summary."),),
+    )
+    runtime = _runtime(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+        config_text=config_text,
+    )
+
+    await runtime.start()
+    try:
+        await _wait_until(
+            lambda: (
+                [request.route for request in provider.complete_requests]
+                == ["schedule", "memory", "schedule"]
+                and runtime.schedule_service.status_snapshot().active_job_count == 0
+            )
+        )
+    finally:
+        await runtime.close()
+
+    schedule_messages = [
+        messages
+        for request, (messages, _tools) in zip(
+            provider.complete_requests,
+            provider.direct_complete_messages,
+            strict=True,
+        )
+        if request.route == "schedule"
+    ]
+    assert [message["role"] for message in schedule_messages[1]] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert "Old scheduled request." not in json.dumps(schedule_messages[1])
+    assert [entry.content for entry in await WorkspaceJsonlSummaryStore(state).after(0, 10)] == [
+        "Old Schedule turn summary."
+    ]
+    persisted = Session.load(
+        state,
+        f"schedule_{JOB_UUID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert persisted.last_consolidated == 2
 
 
 @pytest.mark.asyncio

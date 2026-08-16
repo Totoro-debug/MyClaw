@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from croniter import croniter  # type: ignore[import-untyped]
@@ -16,11 +17,18 @@ from loguru import logger
 from myclaw.agent.run import (
     AgentRunCancelledPayload,
     AgentRunCompletedPayload,
+    AgentRunContinuationPreparer,
+    AgentRunEmitter,
     AgentRunFailedPayload,
     AgentRunInterface,
+    AgentRunPayload,
+    AgentRunRoute,
+    ToolResultExternalizer,
 )
 from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
+from myclaw.provider.errors import ModelCallError
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.store import ScheduleStoreFaultedError, WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
@@ -36,6 +44,46 @@ class ScheduleClock(Protocol):
     def monotonic(self) -> float: ...
 
     async def sleep(self, seconds: float) -> None: ...
+
+
+type ScheduleContextPreparer = Callable[
+    [Session, dict[str, Any]],
+    Awaitable[list[dict[str, Any]]],
+]
+type ScheduleContinuationPreparer = Callable[
+    [Session, Sequence[dict[str, Any]], Sequence[dict[str, Any]]],
+    Awaitable[list[dict[str, Any]]],
+]
+
+
+class _AwaitableAgentRun(Protocol):
+    async def run(
+        self,
+        messages: Sequence[dict[str, Any]],
+        current_user: dict[str, Any],
+        *,
+        route: AgentRunRoute,
+        emitter: AgentRunEmitter,
+        externalize_result: ToolResultExternalizer | None = None,
+        continuation_preparer: AgentRunContinuationPreparer | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+
+class _ScheduleRunEmitter:
+    """Consume background Agent Run progress while retaining its terminal outcome."""
+
+    def __init__(self) -> None:
+        self.terminal: (
+            AgentRunCompletedPayload | AgentRunFailedPayload | AgentRunCancelledPayload | None
+        ) = None
+
+    async def emit(self, payload: AgentRunPayload) -> None:
+        if isinstance(
+            payload,
+            (AgentRunCompletedPayload, AgentRunFailedPayload, AgentRunCancelledPayload),
+        ):
+            self.terminal = payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,14 +107,20 @@ class ScheduleService:
         self,
         *,
         store: WorkspaceScheduleStore,
-        agent_run: AgentRunInterface,
+        agent_run: AgentRunInterface | _AwaitableAgentRun,
         workspace_state: WorkspaceState,
         clock: ScheduleClock,
+        context_preparer: ScheduleContextPreparer | None = None,
+        continuation_preparer: ScheduleContinuationPreparer | None = None,
+        externalize_result_for: Callable[[Session], ToolResultExternalizer] | None = None,
     ) -> None:
         self._store = store
         self._agent_run = agent_run
         self._workspace_state = workspace_state
         self._clock = clock
+        self._context_preparer = context_preparer
+        self._continuation_preparer = continuation_preparer
+        self._externalize_result_for = externalize_result_for
         self._loop_task: asyncio.Task[None] | None = None
         self._run_tasks: set[asyncio.Task[None]] = set()
         self._active_job_ids: set[str] = set()
@@ -361,6 +415,8 @@ class ScheduleService:
         terminal_error: str | None = None
         terminal_code: str | None = None
         payloads: AsyncIterator[object] | None = None
+        awaitable_run = callable(getattr(self._agent_run, "run", None))
+        terminal_ready = False
         with session_log(self._workspace_state, job.session_id):
             try:
                 try:
@@ -376,37 +432,54 @@ class ScheduleService:
                         job.job_id,
                         now=self._clock.now,
                     )
-                payloads = self._agent_run.run_agent(
-                    session,
-                    job.message,
-                    route="schedule",
-                    stream=False,
-                )
-                async for payload in payloads:
-                    if isinstance(payload, AgentRunCompletedPayload):
-                        terminal = "ok"
-                        terminal_error = None
-                        terminal_code = None
-                    elif isinstance(payload, AgentRunFailedPayload):
-                        terminal = "error"
-                        terminal_error = payload.error.message
-                        terminal_code = payload.error.code
-                    elif isinstance(payload, AgentRunCancelledPayload):
-                        return
-                if terminal is None:
-                    terminal = "error"
-                    terminal_error = "Schedule Job execution failed."
-                    logger.error(
-                        "Schedule Job execution failed job_id={} kind={} type={}",
-                        job.job_id,
-                        job.schedule.kind,
-                        "MissingTerminalPayload",
+                if awaitable_run:
+                    run = cast(_AwaitableAgentRun, self._agent_run)
+                    (
+                        terminal,
+                        terminal_error,
+                        terminal_code,
+                        terminal_ready,
+                    ) = await self._run_awaitable_job(
+                        session,
+                        job,
+                        run,
                     )
+                else:
+                    legacy_agent_run = cast(AgentRunInterface, self._agent_run)
+                    payloads = legacy_agent_run.run_agent(
+                        session,
+                        job.message,
+                        route="schedule",
+                        stream=False,
+                    )
+                    async for payload in payloads:
+                        if isinstance(payload, AgentRunCompletedPayload):
+                            terminal = "ok"
+                            terminal_error = None
+                            terminal_code = None
+                        elif isinstance(payload, AgentRunFailedPayload):
+                            terminal = "error"
+                            terminal_error = payload.error.message
+                            terminal_code = payload.error.code
+                        elif isinstance(payload, AgentRunCancelledPayload):
+                            return
+                    if terminal is None:
+                        terminal = "error"
+                        terminal_error = "Schedule Job execution failed."
+                        logger.error(
+                            "Schedule Job execution failed job_id={} kind={} type={}",
+                            job.job_id,
+                            job.schedule.kind,
+                            "MissingTerminalPayload",
+                        )
+                    terminal_ready = True
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 terminal = "error"
                 terminal_error = "Schedule Job execution failed."
+                if not awaitable_run:
+                    terminal_ready = True
                 logger.error(
                     "Schedule Job execution failed job_id={} type={}",
                     job.job_id,
@@ -414,17 +487,8 @@ class ScheduleService:
                 )
             finally:
                 await _close_payloads(payloads)
-                if session is not None:
-                    try:
-                        session.close()
-                    except Exception as error:
-                        logger.error(
-                            "Schedule Session close failed job_id={} type={}",
-                            job.job_id,
-                            type(error).__name__,
-                        )
                 try:
-                    if terminal is not None:
+                    if terminal is not None and terminal_ready:
                         if terminal_code is not None:
                             logger.warning(
                                 "Schedule Job failed job_id={} kind={} code={}",
@@ -434,7 +498,97 @@ class ScheduleService:
                             )
                         await self._commit_terminal(job, terminal, terminal_error)
                 finally:
+                    if session is not None:
+                        try:
+                            session.close()
+                        except Exception as error:
+                            logger.error(
+                                "Schedule Session close failed job_id={} type={}",
+                                job.job_id,
+                                type(error).__name__,
+                            )
                     self._active_job_ids.discard(job.job_id)
+
+    async def _run_awaitable_job(
+        self,
+        session: Session,
+        job: ScheduleJob,
+        run: _AwaitableAgentRun,
+    ) -> tuple[Literal["ok", "error"] | None, str | None, str | None, bool]:
+        current_user = {"role": "user", "content": job.message}
+        context_preparer = self._context_preparer
+        try:
+            if context_preparer is None:
+                raise RuntimeError("Schedule Agent Run requires a context preparer")
+            messages = await context_preparer(session, deepcopy(current_user))
+        except asyncio.CancelledError:
+            try:
+                session.append_messages([current_user])
+                session.persist()
+            except Exception as error:
+                logger.error(
+                    "Schedule cancellation persistence failed job_id={} type={}",
+                    job.job_id,
+                    type(error).__name__,
+                )
+            raise
+        except ModelCallError as failure:
+            return _persist_schedule_failure(session, current_user, failure)
+        except Exception:
+            return _persist_schedule_failure(session, current_user, _schedule_model_failure())
+
+        emitter = _ScheduleRunEmitter()
+        continuation_preparer = self._continuation_preparer
+
+        async def prepare_continuation(
+            runtime_messages: Sequence[dict[str, Any]],
+            current_increment: Sequence[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            if continuation_preparer is None:
+                return list(runtime_messages)
+            return await continuation_preparer(
+                session,
+                runtime_messages,
+                current_increment,
+            )
+
+        try:
+            if self._externalize_result_for is None:
+                increment = await run.run(
+                    messages,
+                    current_user,
+                    route="schedule",
+                    emitter=emitter,
+                    continuation_preparer=prepare_continuation,
+                    cancel_requested=self._closing.is_set,
+                )
+            else:
+                increment = await run.run(
+                    messages,
+                    current_user,
+                    route="schedule",
+                    emitter=emitter,
+                    externalize_result=self._externalize_result_for(session),
+                    continuation_preparer=prepare_continuation,
+                    cancel_requested=self._closing.is_set,
+                )
+        except ModelCallError as failure:
+            return _persist_schedule_failure(session, current_user, failure)
+        except Exception:
+            return _persist_schedule_failure(session, current_user, _schedule_model_failure())
+        if not isinstance(increment, list):
+            return _persist_schedule_failure(session, current_user, _schedule_model_failure())
+        terminal = emitter.terminal
+        if terminal is None:
+            return _persist_schedule_failure(session, current_user, _schedule_model_failure())
+
+        session.append_messages(increment)
+        session.persist()
+        if isinstance(terminal, AgentRunCancelledPayload):
+            return None, None, None, False
+        if isinstance(terminal, AgentRunFailedPayload):
+            return "error", terminal.error.message, terminal.error.code, True
+        return "ok", None, None, True
 
     async def _commit_terminal(
         self,
@@ -653,6 +807,45 @@ def _local_time_exists(value: datetime, zone: ZoneInfo) -> bool:
         if round_trip == naive:
             return True
     return False
+
+
+def _schedule_failure_increment(
+    current_user: dict[str, Any],
+    failure: ModelCallError,
+) -> list[dict[str, Any]]:
+    return [
+        deepcopy(current_user),
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [],
+            "status": "error",
+            "error": {
+                "code": failure.error.code,
+                "message": failure.error.message,
+            },
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        },
+    ]
+
+
+def _schedule_model_failure() -> ModelCallError:
+    return ModelCallError(ErrorInfo(code="model_failed", message="The model request failed."))
+
+
+def _persist_schedule_failure(
+    session: Session,
+    current_user: dict[str, Any],
+    failure: ModelCallError,
+) -> tuple[Literal["error"], str, str, bool]:
+    session.append_messages(_schedule_failure_increment(current_user, failure))
+    session.persist()
+    return "error", failure.error.message, failure.error.code, True
 
 
 async def _close_payloads(payloads: object | None) -> None:

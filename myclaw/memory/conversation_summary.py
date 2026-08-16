@@ -164,17 +164,27 @@ class ConversationSummaryManager:
         session: Session,
         *,
         current_user: dict[str, Any] | None = None,
+        continuation: Sequence[dict[str, Any]] = (),
     ) -> Session:
         with without_session_log():
-            return await self._prepare(session, current_user=current_user)
+            return await self._prepare(
+                session,
+                current_user=current_user,
+                continuation=continuation,
+            )
 
     async def _prepare(
         self,
         session: Session,
         *,
         current_user: dict[str, Any] | None,
+        continuation: Sequence[dict[str, Any]],
     ) -> Session:
-        short_term = _short_term_messages(session, current_user=current_user)
+        short_term = _short_term_messages(
+            session,
+            current_user=current_user,
+            continuation=continuation,
+        )
         current_user_index = _last_user_index(short_term)
         complete_messages = self._project_messages(short_term)
         available_input = self._route_context_window - self._route_max_output
@@ -248,10 +258,12 @@ def _short_term_messages(
     session: Session,
     *,
     current_user: dict[str, Any] | None = None,
+    continuation: Sequence[dict[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     messages = list(session.messages[session.last_consolidated :])
     if current_user is not None:
         messages.append(current_user)
+    messages.extend(continuation)
     return messages
 
 
@@ -275,8 +287,9 @@ def _token_cutoff(
     if current_user_index == len(messages):
         return len(messages)
     current_user = messages[current_user_index]
+    continuation = messages[current_user_index + 1 :]
     for index in range(current_user_index):
-        projected = project_messages([*messages[: index + 1], current_user])
+        projected = project_messages([*messages[: index + 1], current_user, *continuation])
         selected_bytes = _projected_history_bytes(projected)
         if selected_bytes >= target_bytes:
             return index + 1

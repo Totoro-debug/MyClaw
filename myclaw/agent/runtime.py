@@ -543,6 +543,7 @@ def _prepare_repl_runtime(
         current_system_prompt: str,
         tools: tuple[OpenAIToolSchema, ...],
         current_user: dict[str, Any] | None = None,
+        continuation: Sequence[dict[str, Any]] = (),
     ) -> Session:
         effective_route = configuration.resolve_route(route).route
         if route == "chat":
@@ -575,6 +576,7 @@ def _prepare_repl_runtime(
                     messages,
                     system_prompt=current_system_prompt,
                     session_id=active_session.session_id,
+                    current_time=now(),
                 )
 
         manager = ConversationSummaryManager(
@@ -587,7 +589,62 @@ def _prepare_repl_runtime(
             now=now,
             project_messages=project_messages,
         )
-        return await manager.prepare(active_session, current_user=current_user)
+        return await manager.prepare(
+            active_session,
+            current_user=current_user,
+            continuation=continuation,
+        )
+
+    async def prepare_schedule_context(
+        active_session: Session,
+        current_user: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        memory_snapshot = runtime_memory.snapshot()
+        current_system_prompt = system_prompt_for(memory_snapshot)
+        await prepare_summary(
+            active_session,
+            "schedule",
+            current_system_prompt,
+            tuple(scheduled_tool_gateway.schemas),
+            current_user,
+        )
+        history = active_session.messages[active_session.last_consolidated :]
+        return _project_schedule_messages(
+            [*history, current_user],
+            system_prompt=current_system_prompt,
+            session_id=active_session.session_id,
+            current_time=now(),
+        )
+
+    async def prepare_schedule_continuation(
+        active_session: Session,
+        runtime_messages: Sequence[dict[str, Any]],
+        increment: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not runtime_messages or runtime_messages[0].get("role") != "system":
+            raise TypeError("Schedule continuation context requires a System Prompt")
+        current_system_prompt = runtime_messages[0].get("content")
+        if not isinstance(current_system_prompt, str):
+            raise TypeError("Schedule System Prompt content must be a string")
+        if not increment or increment[0].get("role") != "user":
+            raise TypeError("Schedule continuation requires the current user increment")
+        current_user = increment[0]
+        continuation = increment[1:]
+        await prepare_summary(
+            active_session,
+            "schedule",
+            current_system_prompt,
+            tuple(scheduled_tool_gateway.schemas),
+            current_user,
+            continuation,
+        )
+        history = active_session.messages[active_session.last_consolidated :]
+        return _project_schedule_messages(
+            [*history, *increment],
+            system_prompt=current_system_prompt,
+            session_id=active_session.session_id,
+            current_time=now(),
+        )
 
     configured_schedule = configuration.configured_route("schedule")
     schedule_agent_run = AgentRun(
@@ -603,10 +660,6 @@ def _prepare_repl_runtime(
         new_uuid=new_uuid,
         system_prompt=system_prompt,
         tool_gateway=scheduled_tool_gateway,
-        externalize_result_for=externalize_result_for,
-        memory_snapshot=runtime_memory.snapshot,
-        system_prompt_for_memory=system_prompt_for,
-        summary_preparer=prepare_summary,
     )
     schedule_clock = (
         schedule_scheduler_clock
@@ -618,6 +671,9 @@ def _prepare_repl_runtime(
         agent_run=schedule_agent_run,
         workspace_state=workspace_state,
         clock=schedule_clock,
+        context_preparer=prepare_schedule_context,
+        continuation_preparer=prepare_schedule_continuation,
+        externalize_result_for=externalize_result_for,
     )
     foreground_chat_status: ResolvedChatStatus | None = None
 
@@ -732,20 +788,27 @@ def _project_schedule_messages(
     *,
     system_prompt: str,
     session_id: str,
+    current_time: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Project Schedule context without using the foreground ContextBuilder."""
     history, current_user, current_user_index = _current_turn(messages, lane="Schedule")
     projected = _project_without_current_user(history, system_prompt=system_prompt)
     content = current_user.get("content")
     timestamp = current_user.get("timestamp")
-    if not isinstance(content, str) or not isinstance(timestamp, str):
+    if not isinstance(content, str):
         raise TypeError("Session user message is malformed")
+    if isinstance(timestamp, str):
+        effective_current_time = datetime.fromisoformat(timestamp)
+    elif current_time is not None:
+        effective_current_time = current_time
+    else:
+        raise TypeError("Schedule user message is missing a timestamp")
     projected.append(
         {
             "role": "user",
             "content": current_user_input(
                 content=content,
-                current_time=datetime.fromisoformat(timestamp),
+                current_time=effective_current_time,
                 session_id=session_id,
             ),
         }

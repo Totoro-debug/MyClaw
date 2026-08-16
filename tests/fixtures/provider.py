@@ -85,7 +85,7 @@ class ScriptedFakeProvider:
     ) -> ModelResponse:
         if messages is not None:
             request = _legacy_request_from_direct(
-                route="memory",
+                route="schedule" if len(tools or ()) == 10 else "memory",
                 messages=messages,
                 tools=() if tools is None else tools,
                 model=model,

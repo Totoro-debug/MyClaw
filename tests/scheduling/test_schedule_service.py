@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 import pytest
 
+from myclaw.agent.context import ContextBuilder
 from myclaw.agent.run import (
+    AgentRun,
     AgentRunCancelledPayload,
     AgentRunCompletedPayload,
+    AgentRunEmitter,
     AgentRunFailedPayload,
     AgentRunInterface,
     AgentRunModelCallCompletedPayload,
@@ -125,6 +128,135 @@ class RecordingAgentRun(AgentRunInterface):
         return run()
 
 
+class AwaitableRecordingAgentRun:
+    def __init__(self, timeline: list[str]) -> None:
+        self.calls: list[tuple[list[dict[str, object]], dict[str, object], str]] = []
+        self.started = asyncio.Event()
+        self._timeline = timeline
+
+    async def run(
+        self,
+        messages: list[dict[str, object]],
+        current_user: dict[str, object],
+        *,
+        route: str,
+        emitter: AgentRunEmitter,
+        continuation_preparer: object | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> list[dict[str, object]]:
+        del continuation_preparer, cancel_requested
+        self._timeline.append("run")
+        self.calls.append((messages, current_user, route))
+        self.started.set()
+        await emitter.emit(AgentRunStartedPayload())
+        await emitter.emit(
+            AgentRunCompletedPayload(
+                content="Done.",
+                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+        )
+        return [
+            {"role": "user", "content": "Run this."},
+            {
+                "role": "assistant",
+                "content": "Done.",
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        ]
+
+
+class OutcomeAwaitableAgentRun:
+    def __init__(
+        self,
+        terminal: AgentRunCompletedPayload | AgentRunFailedPayload | AgentRunCancelledPayload,
+        increment: list[dict[str, object]],
+    ) -> None:
+        self.terminal = terminal
+        self.increment = increment
+        self.started = asyncio.Event()
+
+    async def run(
+        self,
+        messages: list[dict[str, object]],
+        current_user: dict[str, object],
+        *,
+        route: str,
+        emitter: AgentRunEmitter,
+        continuation_preparer: object | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> list[dict[str, object]]:
+        del messages, current_user, route, continuation_preparer, cancel_requested
+        self.started.set()
+        await emitter.emit(AgentRunStartedPayload())
+        await emitter.emit(self.terminal)
+        return self.increment
+
+
+class RaisingAwaitableAgentRun:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def run(
+        self,
+        messages: list[dict[str, object]],
+        current_user: dict[str, object],
+        *,
+        route: str,
+        emitter: AgentRunEmitter,
+        continuation_preparer: object | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> list[dict[str, object]]:
+        del (
+            messages,
+            current_user,
+            route,
+            emitter,
+            continuation_preparer,
+            cancel_requested,
+        )
+        self.started.set()
+        raise RuntimeError("unexpected Agent Run failure")
+
+
+class _BlockingScheduleRouter:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self._never = asyncio.Event()
+
+    def route_status(self, route: str) -> None:
+        del route
+
+    def stream(
+        self,
+        route: str,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[object],
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del route, messages, tools
+        raise AssertionError("Schedule Agent Run must not stream")
+
+    async def complete(
+        self,
+        route: str,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[object],
+    ) -> ModelResponse:
+        del route, messages, tools
+        self.started.set()
+        await self._never.wait()
+        raise AssertionError("Blocking Schedule Router was unexpectedly released")
+
+
 class ConcurrentScheduleAndForegroundProvider:
     def __init__(self) -> None:
         self.schedule_started = asyncio.Event()
@@ -229,6 +361,366 @@ async def test_overdue_at_runs_once_through_shared_agent_run_and_deletes_definit
         "status": "available",
         "active_job_count": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_awaitable_schedule_run_prepares_context_and_persists_before_terminal_commit(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    await store.add_user_job(
+        _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
+    )
+    timeline: list[str] = []
+
+    async def prepare_context(
+        session: Session,
+        current_user: dict[str, object],
+    ) -> list[dict[str, object]]:
+        del session
+        timeline.append("context")
+        return [
+            {"role": "system", "content": "Schedule system"},
+            {"role": "user", "content": current_user["content"]},
+        ]
+
+    original_append = Session.append_messages
+    original_persist = Session.persist
+    original_commit = store.commit_terminal
+
+    def fail_context_builder(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("Schedule Service must not construct ContextBuilder")
+
+    monkeypatch.setattr(ContextBuilder, "__init__", fail_context_builder)
+
+    def append_messages(session: Session, messages: list[dict[str, object]]) -> None:
+        timeline.append("append")
+        original_append(session, messages)
+
+    def persist(session: Session) -> None:
+        timeline.append("persist")
+        original_persist(session)
+
+    async def commit_terminal(
+        job_id: str,
+        *,
+        expected: ScheduleJob | None = None,
+        finished_at_ms: int,
+        status: Literal["ok", "error"],
+        error: str | None = None,
+        now_ms: int | None = None,
+    ) -> ScheduleJob | None:
+        timeline.append("terminal")
+        return await original_commit(
+            job_id,
+            expected=expected,
+            finished_at_ms=finished_at_ms,
+            status=status,
+            error=error,
+            now_ms=now_ms,
+        )
+
+    monkeypatch.setattr(Session, "append_messages", append_messages)
+    monkeypatch.setattr(Session, "persist", persist)
+    monkeypatch.setattr(store, "commit_terminal", commit_terminal)
+    agent_run = AwaitableRecordingAgentRun(timeline)
+    service = ScheduleService(
+        store=store,
+        agent_run=agent_run,  # type: ignore[arg-type]
+        workspace_state=state,
+        clock=ControlledClock(START),
+        context_preparer=prepare_context,
+    )
+
+    service.start()
+    await agent_run.started.wait()
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+    await service.close()
+
+    assert timeline == ["context", "run", "append", "persist", "terminal"]
+    messages, current_user, route = agent_run.calls[0]
+    assert messages == [
+        {"role": "system", "content": "Schedule system"},
+        {"role": "user", "content": "Run this."},
+    ]
+    assert current_user == {"role": "user", "content": "Run this."}
+    assert route == "schedule"
+    session = Session.load(
+        state,
+        f"schedule_{JOB_UUID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_failed_awaitable_schedule_run_persists_repair_before_error_state(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
+    await store.add_user_job(job)
+    failure = AgentRunFailedPayload(
+        error=ErrorInfo(code="model_failed", message="The model request failed.")
+    )
+    run = OutcomeAwaitableAgentRun(
+        failure,
+        [
+            {"role": "user", "content": job.message},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [],
+                "status": "error",
+                "error": {"code": "model_failed", "message": "The model request failed."},
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            },
+        ],
+    )
+
+    async def prepare_context(
+        session: Session,
+        current_user: dict[str, object],
+    ) -> list[dict[str, object]]:
+        del session
+        return [
+            {"role": "system", "content": "Schedule system"},
+            {"role": "user", "content": current_user["content"]},
+        ]
+
+    service = ScheduleService(
+        store=store,
+        agent_run=run,  # type: ignore[arg-type]
+        workspace_state=state,
+        clock=ControlledClock(START),
+        context_preparer=prepare_context,
+    )
+    service.start()
+    await run.started.wait()
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+    await service.close()
+
+    saved = (await store.snapshot())[0]
+    assert saved.state.last_status == "error"
+    assert saved.state.last_error == "The model request failed."
+    session = Session.load(
+        state,
+        job.session_id,
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert session.messages[-1]["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_awaitable_failure_persists_repair_before_error_state(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
+    await store.add_user_job(job)
+    run = RaisingAwaitableAgentRun()
+
+    async def prepare_context(
+        session: Session,
+        current_user: dict[str, object],
+    ) -> list[dict[str, object]]:
+        del session
+        return [
+            {"role": "system", "content": "Schedule system"},
+            {"role": "user", "content": current_user["content"]},
+        ]
+
+    service = ScheduleService(
+        store=store,
+        agent_run=run,  # type: ignore[arg-type]
+        workspace_state=state,
+        clock=ControlledClock(START),
+        context_preparer=prepare_context,
+    )
+    service.start()
+    await run.started.wait()
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+    await service.close()
+
+    saved = (await store.snapshot())[0]
+    assert saved.state.last_status == "error"
+    assert saved.state.last_error == "The model request failed."
+    session = Session.load(
+        state,
+        job.session_id,
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert session.messages[-1]["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_awaitable_schedule_run_persists_increment_but_keeps_job_pending(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = _job()
+    await store.add_user_job(job)
+    run = OutcomeAwaitableAgentRun(
+        AgentRunCancelledPayload(partial_content="Partial."),
+        [
+            {"role": "user", "content": job.message},
+            {
+                "role": "assistant",
+                "content": "Partial.",
+                "tool_calls": [],
+                "status": "interrupted",
+                "error": {
+                    "code": "turn_cancelled",
+                    "message": "Turn interrupted by user.",
+                },
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            },
+        ],
+    )
+
+    async def prepare_context(
+        session: Session,
+        current_user: dict[str, object],
+    ) -> list[dict[str, object]]:
+        del session
+        return [
+            {"role": "system", "content": "Schedule system"},
+            {"role": "user", "content": current_user["content"]},
+        ]
+
+    service = ScheduleService(
+        store=store,
+        agent_run=run,  # type: ignore[arg-type]
+        workspace_state=state,
+        clock=ControlledClock(START),
+        context_preparer=prepare_context,
+    )
+    service.start()
+    await run.started.wait()
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+    await service.close()
+
+    assert await store.snapshot() == (job,)
+    session = Session.load(
+        state,
+        job.session_id,
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert session.messages[-1]["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_production_awaitable_shutdown_persists_user_before_leaving_job_pending(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = _job()
+    await store.add_user_job(job)
+    router = _BlockingScheduleRouter()
+
+    async def prepare_context(
+        session: Session,
+        current_user: dict[str, object],
+    ) -> list[dict[str, object]]:
+        del session
+        return [
+            {"role": "system", "content": "Schedule system"},
+            {"role": "user", "content": current_user["content"]},
+        ]
+
+    service = ScheduleService(
+        store=store,
+        agent_run=AgentRun(provider=router),
+        workspace_state=state,
+        clock=ControlledClock(START),
+        context_preparer=prepare_context,
+    )
+    service.start()
+    await router.started.wait()
+    await service.close()
+
+    assert await store.snapshot() == (job,)
+    session = Session.load(
+        state,
+        job.session_id,
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert [(message["role"], message["content"]) for message in session.messages] == [
+        ("user", job.message)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_awaitable_shutdown_during_context_preparation_persists_user(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = _job()
+    await store.add_user_job(job)
+    run = OutcomeAwaitableAgentRun(
+        AgentRunCompletedPayload(
+            content="Unused.",
+            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+        ),
+        [],
+    )
+    context_started = asyncio.Event()
+    context_never_completes = asyncio.Event()
+
+    async def prepare_context(
+        session: Session,
+        current_user: dict[str, object],
+    ) -> list[dict[str, object]]:
+        del session, current_user
+        context_started.set()
+        await context_never_completes.wait()
+        raise AssertionError("Schedule context preparation was unexpectedly released")
+
+    service = ScheduleService(
+        store=store,
+        agent_run=run,  # type: ignore[arg-type]
+        workspace_state=state,
+        clock=ControlledClock(START),
+        context_preparer=prepare_context,
+    )
+    service.start()
+    await context_started.wait()
+    await service.close()
+
+    assert not run.started.is_set()
+    assert await store.snapshot() == (job,)
+    session = Session.load(
+        state,
+        job.session_id,
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert [(message["role"], message["content"]) for message in session.messages] == [
+        ("user", job.message)
+    ]
 
 
 @pytest.mark.asyncio
