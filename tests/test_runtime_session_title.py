@@ -9,7 +9,6 @@ import pytest
 
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.run import AgentRunModelSettings, AgentRunModelTarget
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -28,7 +27,7 @@ from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock, ProviderCall
+from tests.fixtures import FakeClock, ProviderCall, ScriptedFakeRouter
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -237,16 +236,7 @@ async def test_title_finishes_before_chat_when_direct_provider_exposes_route_sta
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_replace)
     conversation = StreamingConversationPort(
-        model=AgentRunModelTarget.for_provider(
-            provider,
-            AgentRunModelSettings(
-                model="test-model",
-                max_output=1024,
-                temperature=0.2,
-                reasoning_effort=None,
-                timeout_seconds=30,
-            ),
-        ),
+        model=ScriptedFakeRouter(provider),
         session=session,
         now=lambda: NOW,
         new_uuid=iter((TURN_UUID,)).__next__,
@@ -368,16 +358,7 @@ async def test_existing_session_turn_does_not_regenerate_its_title(
     )
     provider = ExistingSessionProvider()
     conversation = StreamingConversationPort(
-        model=AgentRunModelTarget.for_provider(
-            provider,
-            AgentRunModelSettings(
-                model="test-model",
-                max_output=1024,
-                temperature=0.2,
-                reasoning_effort=None,
-                timeout_seconds=30,
-            ),
-        ),
+        model=ScriptedFakeRouter(provider),
         session=session,
         now=lambda: NOW,
         new_uuid=lambda: TURN_UUID,

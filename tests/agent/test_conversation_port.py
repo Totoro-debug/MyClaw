@@ -18,9 +18,8 @@ from myclaw.agent.run import (
     AgentRunCompletedPayload,
     AgentRunConfirmationRequestedPayload,
     AgentRunModelCallCompletedPayload,
-    AgentRunModelSettings,
-    AgentRunModelTarget,
     AgentRunRoute,
+    AgentRunRouter,
     AgentRunStartedPayload,
     AgentRunTextDeltaPayload,
     AgentRunToolCompletedPayload,
@@ -49,7 +48,12 @@ from myclaw.tools.tool_gateway import (
     ConfirmationRequest,
     ModelToolCall,
 )
-from tests.fixtures import ScriptedFakeProvider, SingleToolGateway, StreamScript
+from tests.fixtures import (
+    ScriptedFakeProvider,
+    ScriptedFakeRouter,
+    SingleToolGateway,
+    StreamScript,
+)
 
 NOW = datetime(2026, 8, 7, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -63,17 +67,8 @@ def _session(workspace: Path, agent_home: Path) -> Session:
     return Session.create(state, now=lambda: NOW, new_uuid=lambda: SESSION_UUID)
 
 
-def _direct_model(provider: ModelProvider) -> AgentRunModelTarget:
-    return AgentRunModelTarget.for_provider(
-        provider,
-        AgentRunModelSettings(
-            model="test-model",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-    )
+def _direct_model(provider: ModelProvider) -> AgentRunRouter:
+    return ScriptedFakeRouter(provider)
 
 
 class _RecordingDirectProvider:

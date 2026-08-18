@@ -15,7 +15,7 @@ from myclaw.agent.events import (
     TurnCompletedPayload,
     TurnStartedPayload,
 )
-from myclaw.agent.run import AgentRunModelSettings, AgentRunModelTarget
+from myclaw.agent.run import AgentRunRouter
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -34,7 +34,7 @@ from myclaw.provider.models import (
 from myclaw.session.conversation import StreamingConversationPort
 from myclaw.session.session import Session
 from myclaw.terminal.repl import run_repl
-from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures import FakeClock, ScriptedFakeProvider, ScriptedFakeRouter, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -56,17 +56,8 @@ def _session(
     )
 
 
-def _direct_model(provider: ModelProvider) -> AgentRunModelTarget:
-    return AgentRunModelTarget.for_provider(
-        provider,
-        AgentRunModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-    )
+def _direct_model(provider: ModelProvider) -> AgentRunRouter:
+    return ScriptedFakeRouter(provider)
 
 
 class ScriptedReplInput:

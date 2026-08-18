@@ -5,7 +5,6 @@ from uuid import uuid4
 import pytest
 
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.run import AgentRunModelSettings, AgentRunModelTarget
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -20,7 +19,12 @@ from myclaw.session.session import Session
 from myclaw.tools.core.edit_file import EditFileTool
 from myclaw.tools.core.write_file import WriteFileTool
 from myclaw.tools.tool_gateway import ModelToolCall
-from tests.fixtures import ScriptedFakeProvider, SingleToolGateway, StreamScript
+from tests.fixtures import (
+    ScriptedFakeProvider,
+    ScriptedFakeRouter,
+    SingleToolGateway,
+    StreamScript,
+)
 
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=timezone(timedelta(hours=8)))
 
@@ -88,16 +92,7 @@ async def test_foreground_mutations_execute_without_a_permission_pause(
         (WriteFileTool(workspace=identity), EditFileTool(workspace=identity))
     )
     conversation = StreamingConversationPort(
-        model=AgentRunModelTarget.for_provider(
-            provider,
-            AgentRunModelSettings(
-                model="test-model",
-                max_output=1024,
-                temperature=0.2,
-                reasoning_effort=None,
-                timeout_seconds=30,
-            ),
-        ),
+        model=ScriptedFakeRouter(provider),
         session=session,
         now=lambda: NOW,
         new_uuid=uuid4,

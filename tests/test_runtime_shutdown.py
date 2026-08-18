@@ -9,7 +9,6 @@ import pytest
 
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.run import AgentRunModelSettings, AgentRunModelTarget
 from myclaw.agent.runtime import _DeferredConversationPort, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -30,7 +29,7 @@ from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider, StreamScript
+from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 NOW = datetime(2026, 7, 13, 0, 30, tzinfo=timezone(timedelta(hours=8)))
@@ -455,16 +454,7 @@ async def test_deferred_conversation_does_not_construct_after_close_during_pre_s
         )
     )
     conversation = _DeferredConversationPort(
-        model=AgentRunModelTarget.for_provider(
-            provider,
-            AgentRunModelSettings(
-                model="test-model",
-                max_output=1024,
-                temperature=0.1,
-                reasoning_effort=None,
-                timeout_seconds=30,
-            ),
-        ),
+        model=ScriptedFakeRouter(provider),
         session=session,
         now=lambda: NOW,
         new_uuid=uuid4,
@@ -528,16 +518,7 @@ async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_p
         )
     )
     conversation = _DeferredConversationPort(
-        model=AgentRunModelTarget.for_provider(
-            provider,
-            AgentRunModelSettings(
-                model="test-model",
-                max_output=1024,
-                temperature=0.1,
-                reasoning_effort=None,
-                timeout_seconds=30,
-            ),
-        ),
+        model=ScriptedFakeRouter(provider),
         session=session,
         now=lambda: NOW,
         new_uuid=uuid4,
@@ -622,16 +603,7 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
         )
     )
     conversation = _DeferredConversationPort(
-        model=AgentRunModelTarget.for_provider(
-            provider,
-            AgentRunModelSettings(
-                model="test-model",
-                max_output=1024,
-                temperature=0.1,
-                reasoning_effort=None,
-                timeout_seconds=30,
-            ),
-        ),
+        model=ScriptedFakeRouter(provider),
         session=session,
         now=lambda: NOW,
         new_uuid=uuid4,

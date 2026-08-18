@@ -11,7 +11,6 @@ import pytest
 
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.events import TurnFailedPayload
-from myclaw.agent.run import AgentRunModelSettings, AgentRunModelTarget
 from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -188,16 +187,7 @@ def _conversation(
         return await manager.prepare(active_session, current_user=current_user)
 
     return StreamingConversationPort(
-        model=AgentRunModelTarget.for_provider(
-            provider,
-            AgentRunModelSettings(
-                model="chat-model",
-                max_output=512,
-                temperature=0.0,
-                reasoning_effort=None,
-                timeout_seconds=30,
-            ),
-        ),
+        model=ScriptedFakeRouter(provider),
         session=session,
         now=lambda: NOW,
         new_uuid=uuid4,

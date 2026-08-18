@@ -24,8 +24,8 @@ from myclaw.agent.prompts import (
 )
 from myclaw.agent.run import (
     AgentRun,
-    AgentRunModelTarget,
     AgentRunRoute,
+    AgentRunRouter,
     ToolResultExternalizer,
 )
 from myclaw.agent.workspace import Workspace
@@ -247,7 +247,7 @@ class _DeferredConversationPort:
     def __init__(
         self,
         *,
-        model: AgentRunModelTarget,
+        model: AgentRunRouter,
         session: Session,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
@@ -467,7 +467,7 @@ def _prepare_repl_runtime(
         clock=retry_clock,
         jitter=retry_jitter,
     )
-    model = AgentRunModelTarget.for_router(router)
+    model = router
     tool_gateway = ToolGateway(
         workspace=workspace_identity,
         schedule_store=schedule_store,

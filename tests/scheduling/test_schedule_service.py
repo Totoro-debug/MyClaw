@@ -17,7 +17,6 @@ from myclaw.agent.run import (
     AgentRunEmitter,
     AgentRunFailedPayload,
     AgentRunModelCallCompletedPayload,
-    AgentRunModelTarget,
     AgentRunStartedPayload,
 )
 from myclaw.agent.runtime import prepare_repl_runtime
@@ -711,7 +710,7 @@ async def test_production_awaitable_shutdown_persists_user_before_leaving_job_pe
 
     service = _service(
         store=store,
-        agent_run=AgentRun(model=AgentRunModelTarget.for_router(router)),
+        agent_run=AgentRun(model=router),
         workspace_state=state,
         clock=ControlledClock(START),
         context_preparer=prepare_context,

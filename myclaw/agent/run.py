@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -15,11 +14,9 @@ from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     ModelCompleted,
-    ModelProvider,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
-    ReasoningEffort,
     TextDelta,
 )
 from myclaw.tools.base import OpenAIToolSchema
@@ -159,122 +156,6 @@ class AgentRunRouter(Protocol):
     ) -> ModelResponse: ...
 
 
-@dataclass(frozen=True, slots=True)
-class AgentRunModelSettings:
-    """Provider-neutral budget and model settings for one Agent Run route."""
-
-    model: str
-    max_output: int
-    temperature: float
-    reasoning_effort: ReasoningEffort | None
-    timeout_seconds: int
-
-
-class AgentRunModelTarget(ABC):
-    """One explicit Model Provider or Router call boundary for Agent Run."""
-
-    @classmethod
-    def for_provider(
-        cls,
-        provider: ModelProvider,
-        settings: AgentRunModelSettings,
-    ) -> AgentRunModelTarget:
-        return _ProviderModelTarget(provider, settings)
-
-    @classmethod
-    def for_router(cls, router: AgentRunRouter) -> AgentRunModelTarget:
-        return _RouterModelTarget(router)
-
-    @abstractmethod
-    def stream(
-        self,
-        route: AgentRunRoute,
-        *,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
-    ) -> AsyncIterator[ModelStreamEvent]: ...
-
-    @abstractmethod
-    async def complete(
-        self,
-        route: AgentRunRoute,
-        *,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
-    ) -> ModelResponse: ...
-
-
-class _ProviderModelTarget(AgentRunModelTarget):
-    __slots__ = ("_provider", "_settings")
-
-    def __init__(self, provider: ModelProvider, settings: AgentRunModelSettings) -> None:
-        self._provider = provider
-        self._settings = settings
-
-    def stream(
-        self,
-        route: AgentRunRoute,
-        *,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
-    ) -> AsyncIterator[ModelStreamEvent]:
-        del route
-        settings = self._settings
-        return self._provider.stream(
-            messages=messages,
-            tools=tools,
-            model=settings.model,
-            max_output=settings.max_output,
-            temperature=settings.temperature,
-            reasoning_effort=settings.reasoning_effort,
-            timeout=settings.timeout_seconds,
-        )
-
-    async def complete(
-        self,
-        route: AgentRunRoute,
-        *,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
-    ) -> ModelResponse:
-        del route
-        settings = self._settings
-        return await self._provider.complete(
-            messages=messages,
-            tools=tools,
-            model=settings.model,
-            max_output=settings.max_output,
-            temperature=settings.temperature,
-            reasoning_effort=settings.reasoning_effort,
-            timeout=settings.timeout_seconds,
-        )
-
-
-class _RouterModelTarget(AgentRunModelTarget):
-    __slots__ = ("_router",)
-
-    def __init__(self, router: AgentRunRouter) -> None:
-        self._router = router
-
-    def stream(
-        self,
-        route: AgentRunRoute,
-        *,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
-    ) -> AsyncIterator[ModelStreamEvent]:
-        return self._router.stream(route, messages=messages, tools=tools)
-
-    async def complete(
-        self,
-        route: AgentRunRoute,
-        *,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
-    ) -> ModelResponse:
-        return await self._router.complete(route, messages=messages, tools=tools)
-
-
 @dataclass(slots=True)
 class _ToolCallState:
     result: ToolResult | None = None
@@ -286,7 +167,7 @@ class AgentRun:
     def __init__(
         self,
         *,
-        model: AgentRunModelTarget,
+        model: AgentRunRouter,
         tool_gateway: ToolGateway | None = None,
         externalize_result: Callable[[ToolResult], ToolResult] | None = None,
         on_artifact_failure: Callable[[Exception, str], None] | None = None,
@@ -926,8 +807,6 @@ __all__ = [
     "AgentRunEmitter",
     "AgentRunFailedPayload",
     "AgentRunModelCallCompletedPayload",
-    "AgentRunModelSettings",
-    "AgentRunModelTarget",
     "AgentRunPayload",
     "AgentRunRoute",
     "AgentRunRouter",

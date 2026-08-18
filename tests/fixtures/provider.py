@@ -133,10 +133,28 @@ class ScriptedFakeProvider:
 
 
 class ScriptedFakeRouter:
-    """Adapt a direct fake provider to a specialized route-only test seam."""
+    """Adapt a direct provider test double to the route-only test seam."""
 
-    def __init__(self, provider: ScriptedFakeProvider) -> None:
+    def __init__(self, provider: ModelProvider) -> None:
         self._provider = provider
+
+    def stream(
+        self,
+        route: str,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del route
+        return self._provider.stream(
+            messages=messages,
+            tools=tools,
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout=30,
+        )
 
     async def complete(
         self,
@@ -149,6 +167,11 @@ class ScriptedFakeRouter:
         return await self._provider.complete(
             messages=messages,
             tools=tools,
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout=30,
         )
 
     async def close(self) -> None:
