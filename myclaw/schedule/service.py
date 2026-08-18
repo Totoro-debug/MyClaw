@@ -22,6 +22,7 @@ from myclaw.agent.run import (
     AgentRunPayload,
     AgentRunRoute,
     ToolResultExternalizer,
+    build_assistant_repair_message,
 )
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
@@ -778,22 +779,11 @@ def _schedule_failure_increment(
 ) -> list[dict[str, Any]]:
     return [
         deepcopy(current_user),
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [],
-            "status": "error",
-            "error": {
-                "code": failure.error.code,
-                "message": failure.error.message,
-            },
-            "token_usage": {
-                "model_calls": 1,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-            },
-        },
+        build_assistant_repair_message(
+            content="",
+            status="error",
+            error=failure.error,
+        ),
     ]
 
 

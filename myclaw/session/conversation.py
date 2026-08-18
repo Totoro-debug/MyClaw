@@ -42,6 +42,7 @@ from myclaw.agent.run import (
     AgentRunToolStartedPayload,
     ToolResultExternalizer,
     _log_artifact_failure,
+    build_assistant_repair_message,
 )
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
@@ -460,22 +461,11 @@ class StreamingConversationPort:
         self._commit_increment(
             [
                 deepcopy(current_user),
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [],
-                    "status": "error",
-                    "error": {
-                        "code": failure.error.code,
-                        "message": failure.error.message,
-                    },
-                    "token_usage": {
-                        "model_calls": 1,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "total_tokens": 0,
-                    },
-                },
+                build_assistant_repair_message(
+                    content="",
+                    status="error",
+                    error=failure.error,
+                ),
             ]
         )
         bridge.set_terminal(AgentRunFailedPayload(error=failure.error))

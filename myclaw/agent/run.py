@@ -711,13 +711,13 @@ class AgentRun:
             _append_run_message(
                 runtime_messages,
                 increment,
-                _assistant_repair_message(
+                build_assistant_repair_message(
                     content="".join(partial_content),
                     status="interrupted",
-                    error={
-                        "code": "turn_cancelled",
-                        "message": "Turn interrupted by user.",
-                    },
+                    error=ErrorInfo(
+                        code="turn_cancelled",
+                        message="Turn interrupted by user.",
+                    ),
                 ),
             )
         for tool_call in pending_tool_calls:
@@ -765,10 +765,10 @@ class AgentRun:
         _append_run_message(
             runtime_messages,
             increment,
-            _assistant_repair_message(
+            build_assistant_repair_message(
                 content="".join(partial_content) if stream else "",
                 status="error",
-                error={"code": failure.error.code, "message": failure.error.message},
+                error=failure.error,
             ),
         )
         partial_content.clear()
@@ -853,18 +853,18 @@ def _assistant_run_message(response: ModelResponse) -> dict[str, Any]:
     }
 
 
-def _assistant_repair_message(
+def build_assistant_repair_message(
     *,
     content: str,
     status: Literal["interrupted", "error"],
-    error: dict[str, str],
+    error: ErrorInfo,
 ) -> dict[str, Any]:
     return {
         "role": "assistant",
         "content": content,
         "tool_calls": [],
         "status": status,
-        "error": error,
+        "error": {"code": error.code, "message": error.message},
         "token_usage": {
             "model_calls": 1,
             "input_tokens": 0,
@@ -935,4 +935,5 @@ __all__ = [
     "AgentRunTextDeltaPayload",
     "AgentRunToolCompletedPayload",
     "AgentRunToolStartedPayload",
+    "build_assistant_repair_message",
 ]
