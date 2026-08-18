@@ -411,7 +411,7 @@ async def test_system_prompt_budget_keeps_raw_prompt_boundary(
     await _manager(
         provider,
         summaries,
-        context_window=600,
+        context_window=613,
         max_output=500,
         threshold=100,
         system_prompt="S" * 400,
@@ -488,6 +488,38 @@ async def test_context_overflow_without_old_complete_turn_keeps_current_message(
     assert provider.complete_requests == []
     assert session.last_consolidated == 0
     assert [message["content"] for message in session.messages] == [current_input]
+    assert not summaries.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_oversized_current_input_does_not_summarize_earlier_history(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    session.add_message("user", "Earlier question.")
+    _add_assistant(session, "Earlier answer.")
+    current_input = "Current oversized input: " + "x" * 4_000
+    current_user = {"role": "user", "content": current_input}
+    provider = ScriptedFakeProvider(completions=(_response("Must not be used."),))
+    summaries = WorkspaceJsonlSummaryStore(state)
+
+    with pytest.raises(ModelCallError) as raised:
+        await _manager(
+            provider,
+            summaries,
+            context_window=1_024,
+            max_output=128,
+            threshold=100,
+        ).prepare(session, current_user=current_user)
+
+    assert raised.value.error.code == "model_context_overflow"
+    assert provider.complete_requests == []
+    assert session.last_consolidated == 0
+    assert [message["content"] for message in session.messages] == [
+        "Earlier question.",
+        "Earlier answer.",
+    ]
     assert not summaries.path.exists()
 
 
