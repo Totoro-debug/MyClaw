@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import pytest
@@ -16,9 +16,8 @@ from myclaw.agent.run import (
     AgentRunCompletedPayload,
     AgentRunEmitter,
     AgentRunFailedPayload,
-    AgentRunInterface,
     AgentRunModelCallCompletedPayload,
-    AgentRunPayload,
+    AgentRunModelTarget,
     AgentRunStartedPayload,
 )
 from myclaw.agent.runtime import prepare_repl_runtime
@@ -30,17 +29,17 @@ from myclaw.errors import ErrorInfo
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
 )
 from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider, write_schedule_state
+from tests.fixtures import ProviderCall, ScriptedFakeProvider, write_schedule_state
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -79,53 +78,58 @@ class ControlledClock:
         self._now += timedelta(seconds=seconds)
 
 
-class RecordingAgentRun(AgentRunInterface):
+class RecordingAgentRun:
     def __init__(self, *, block: bool = False) -> None:
-        self.calls: list[tuple[Session, str, str, bool]] = []
+        self.calls: list[tuple[list[dict[str, object]], dict[str, object], str]] = []
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.block = block
 
-    def run_agent(
+    async def run(
         self,
-        session: Session,
-        input: str,
+        messages: list[dict[str, object]],
+        current_user: dict[str, object],
+        *,
         route: str,
-        stream: bool,
-        confirmation: object | None = None,
-    ) -> AsyncIterator[AgentRunPayload]:
-        del confirmation
-
-        async def run() -> AsyncIterator[AgentRunPayload]:
-            self.calls.append((session, input, route, stream))
-            self.started.set()
-            session.add_message("user", input)
-            if self.block:
-                await self.release.wait()
-            session.add_message(
-                "assistant",
-                "Done.",
-                tool_calls=[],
-                status="completed",
-                error=None,
-                token_usage={
+        emitter: AgentRunEmitter,
+        externalize_result: object | None = None,
+        continuation_preparer: object | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> list[dict[str, object]]:
+        del externalize_result, continuation_preparer, cancel_requested
+        self.calls.append((messages, current_user, route))
+        self.started.set()
+        if self.block:
+            await self.release.wait()
+        await emitter.emit(AgentRunStartedPayload())
+        await emitter.emit(
+            AgentRunModelCallCompletedPayload(
+                content="Done.",
+                continues_with_tools=False,
+            )
+        )
+        await emitter.emit(
+            AgentRunCompletedPayload(
+                content="Done.",
+                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+        )
+        return [
+            {"role": "user", "content": current_user["content"]},
+            {
+                "role": "assistant",
+                "content": "Done.",
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
                     "model_calls": 1,
                     "input_tokens": 1,
                     "output_tokens": 1,
                     "total_tokens": 2,
                 },
-            )
-            yield AgentRunStartedPayload()
-            yield AgentRunModelCallCompletedPayload(
-                content="Done.",
-                continues_with_tools=False,
-            )
-            yield AgentRunCompletedPayload(
-                content="Done.",
-                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            )
-
-        return run()
+            },
+        ]
 
 
 class AwaitableRecordingAgentRun:
@@ -261,11 +265,31 @@ class ConcurrentScheduleAndForegroundProvider:
     def __init__(self) -> None:
         self.schedule_started = asyncio.Event()
         self.release_schedule = asyncio.Event()
-        self.complete_requests: list[ModelRequest] = []
-        self.stream_requests: list[ModelRequest] = []
+        self.complete_requests: list[ProviderCall] = []
+        self.stream_requests: list[ProviderCall] = []
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
-        self.complete_requests.append(request)
+    async def complete(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[object],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> ModelResponse:
+        self.complete_requests.append(
+            ProviderCall(
+                messages=list(messages),
+                tools=tuple(tools),  # type: ignore[arg-type]
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
+        )
         self.schedule_started.set()
         await self.release_schedule.wait()
         return ModelResponse(
@@ -274,8 +298,28 @@ class ConcurrentScheduleAndForegroundProvider:
             finish_reason="stop",
         )
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        self.stream_requests.append(request)
+    async def stream(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[object],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        self.stream_requests.append(
+            ProviderCall(
+                messages=list(messages),
+                tools=tuple(tools),  # type: ignore[arg-type]
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
+        )
         yield ModelCompleted(
             response=ModelResponse(
                 message=AssistantModelMessage(content="Foreground result."),
@@ -331,6 +375,22 @@ async def _wait_until(predicate: object) -> None:
     raise AssertionError("condition did not become true")
 
 
+async def _schedule_context(
+    session: Session,
+    current_user: dict[str, object],
+) -> list[dict[str, object]]:
+    del session
+    return [
+        {"role": "system", "content": "Schedule system"},
+        {"role": "user", "content": current_user["content"]},
+    ]
+
+
+def _service(**kwargs: Any) -> ScheduleService:
+    kwargs.setdefault("context_preparer", _schedule_context)
+    return ScheduleService(**kwargs)
+
+
 @pytest.mark.asyncio
 async def test_overdue_at_runs_once_through_shared_agent_run_and_deletes_definition(
     workspace: Path,
@@ -340,7 +400,7 @@ async def test_overdue_at_runs_once_through_shared_agent_run_and_deletes_definit
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(_job())
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store, agent_run=agent_run, workspace_state=state, clock=ControlledClock(START)
     )
 
@@ -349,11 +409,10 @@ async def test_overdue_at_runs_once_through_shared_agent_run_and_deletes_definit
     await service.close()
 
     assert len(agent_run.calls) == 1
-    session, message, route, stream = agent_run.calls[0]
-    assert message == "Run this."
+    messages, current_user, route = agent_run.calls[0]
+    assert current_user == {"role": "user", "content": "Run this."}
     assert route == "schedule"
-    assert stream is False
-    assert session.session_id == f"schedule_{JOB_UUID}"
+    assert messages[-1] == {"role": "user", "content": "Run this."}
     assert (state.schedule_sessions_directory / f"schedule_{JOB_UUID}.jsonl").exists()
     assert not (state.sessions_directory / f"schedule_{JOB_UUID}.jsonl").exists()
     assert await store.snapshot() == ()
@@ -428,9 +487,9 @@ async def test_awaitable_schedule_run_prepares_context_and_persists_before_termi
     monkeypatch.setattr(Session, "persist", persist)
     monkeypatch.setattr(store, "commit_terminal", commit_terminal)
     agent_run = AwaitableRecordingAgentRun(timeline)
-    service = ScheduleService(
+    service = _service(
         store=store,
-        agent_run=agent_run,  # type: ignore[arg-type]
+        agent_run=agent_run,
         workspace_state=state,
         clock=ControlledClock(START),
         context_preparer=prepare_context,
@@ -499,9 +558,9 @@ async def test_failed_awaitable_schedule_run_persists_repair_before_error_state(
             {"role": "user", "content": current_user["content"]},
         ]
 
-    service = ScheduleService(
+    service = _service(
         store=store,
-        agent_run=run,  # type: ignore[arg-type]
+        agent_run=run,
         workspace_state=state,
         clock=ControlledClock(START),
         context_preparer=prepare_context,
@@ -543,9 +602,9 @@ async def test_unexpected_awaitable_failure_persists_repair_before_error_state(
             {"role": "user", "content": current_user["content"]},
         ]
 
-    service = ScheduleService(
+    service = _service(
         store=store,
-        agent_run=run,  # type: ignore[arg-type]
+        agent_run=run,
         workspace_state=state,
         clock=ControlledClock(START),
         context_preparer=prepare_context,
@@ -608,9 +667,9 @@ async def test_cancelled_awaitable_schedule_run_persists_increment_but_keeps_job
             {"role": "user", "content": current_user["content"]},
         ]
 
-    service = ScheduleService(
+    service = _service(
         store=store,
-        agent_run=run,  # type: ignore[arg-type]
+        agent_run=run,
         workspace_state=state,
         clock=ControlledClock(START),
         context_preparer=prepare_context,
@@ -650,9 +709,9 @@ async def test_production_awaitable_shutdown_persists_user_before_leaving_job_pe
             {"role": "user", "content": current_user["content"]},
         ]
 
-    service = ScheduleService(
+    service = _service(
         store=store,
-        agent_run=AgentRun(provider=router),
+        agent_run=AgentRun(model=AgentRunModelTarget.for_router(router)),
         workspace_state=state,
         clock=ControlledClock(START),
         context_preparer=prepare_context,
@@ -700,9 +759,9 @@ async def test_awaitable_shutdown_during_context_preparation_persists_user(
         await context_never_completes.wait()
         raise AssertionError("Schedule context preparation was unexpectedly released")
 
-    service = ScheduleService(
+    service = _service(
         store=store,
-        agent_run=run,  # type: ignore[arg-type]
+        agent_run=run,
         workspace_state=state,
         clock=ControlledClock(START),
         context_preparer=prepare_context,
@@ -740,7 +799,7 @@ async def test_cron_startup_ignores_match_at_startup_boundary(
     await store.add_user_job(job)
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -780,7 +839,7 @@ async def test_cron_startup_skips_an_overdue_match_until_the_next_one(
     await store.add_user_job(job)
     clock = ControlledClock(START + timedelta(minutes=30))
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -813,7 +872,7 @@ async def test_cron_spring_gap_skips_the_nonexistent_local_time(
     start = datetime(2026, 3, 8, 6, 0, tzinfo=UTC)
     clock = ControlledClock(start)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -848,7 +907,7 @@ async def test_cron_fall_overlap_runs_both_absolute_instants(
     await store.add_user_job(job)
     clock = ControlledClock(datetime(2026, 11, 1, 4, 0, tzinfo=UTC))
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -883,7 +942,7 @@ async def test_cron_forward_wall_jump_skips_missed_occurrences(
     await store.add_user_job(job)
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -920,7 +979,7 @@ async def test_cron_backward_wall_jump_does_not_repeat_an_absolute_occurrence(
     await store.add_user_job(job)
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -961,7 +1020,7 @@ async def test_cron_active_overlap_consumes_the_skipped_occurrence(
     await store.add_user_job(job)
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun(block=True)
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1015,29 +1074,31 @@ async def test_cron_failure_waits_for_the_next_match_without_retry(
     await store.add_user_job(job)
 
     class FailedRun(RecordingAgentRun):
-        def run_agent(
+        async def run(
             self,
-            session: Session,
-            input: str,
+            messages: list[dict[str, object]],
+            current_user: dict[str, object],
+            *,
             route: str,
-            stream: bool,
-            confirmation: object | None = None,
-        ) -> AsyncIterator[AgentRunPayload]:
-            del confirmation
-
-            async def run() -> AsyncIterator[AgentRunPayload]:
-                self.calls.append((session, input, route, stream))
-                self.started.set()
-                yield AgentRunStartedPayload()
-                yield AgentRunFailedPayload(
+            emitter: AgentRunEmitter,
+            externalize_result: object | None = None,
+            continuation_preparer: object | None = None,
+            cancel_requested: Callable[[], bool] | None = None,
+        ) -> list[dict[str, object]]:
+            del continuation_preparer, cancel_requested
+            self.calls.append((messages, current_user, route))
+            self.started.set()
+            await emitter.emit(AgentRunStartedPayload())
+            await emitter.emit(
+                AgentRunFailedPayload(
                     error=ErrorInfo(code="model_failed", message="The model request failed.")
                 )
-
-            return run()
+            )
+            return []
 
     clock = ControlledClock(START)
     agent_run = FailedRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1072,7 +1133,7 @@ async def test_overdue_every_commits_completion_and_restarts_interval_from_finis
     await store.add_user_job(job)
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1109,7 +1170,7 @@ async def test_future_every_uses_created_at_for_its_first_deadline(
     await store.add_user_job(_every_job(created_at_ms=created_at_ms))
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1137,7 +1198,7 @@ async def test_every_live_deadline_uses_monotonic_time_across_wall_clock_jump(
     await store.add_user_job(_every_job())
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1170,7 +1231,7 @@ async def test_every_completion_starts_a_monotonic_interval_across_wall_clock_ju
     await store.add_user_job(job)
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1210,7 +1271,7 @@ async def test_every_execution_time_is_included_before_the_next_start(
     await store.add_user_job(job)
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun(block=True)
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1246,7 +1307,7 @@ async def test_every_active_job_skips_due_occurrence_without_store_mutation(
     await store.add_user_job(job)
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun(block=True)
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1287,7 +1348,7 @@ async def test_different_every_jobs_run_concurrently(
     )
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun(block=True)
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1315,29 +1376,31 @@ async def test_every_safe_failure_commits_terminal_error_without_early_retry(
     await store.add_user_job(job)
 
     class FailedRun(RecordingAgentRun):
-        def run_agent(
+        async def run(
             self,
-            session: Session,
-            input: str,
+            messages: list[dict[str, object]],
+            current_user: dict[str, object],
+            *,
             route: str,
-            stream: bool,
-            confirmation: object | None = None,
-        ) -> AsyncIterator[AgentRunPayload]:
-            del confirmation
-
-            async def run() -> AsyncIterator[AgentRunPayload]:
-                self.calls.append((session, input, route, stream))
-                self.started.set()
-                yield AgentRunStartedPayload()
-                yield AgentRunFailedPayload(
+            emitter: AgentRunEmitter,
+            externalize_result: object | None = None,
+            continuation_preparer: object | None = None,
+            cancel_requested: Callable[[], bool] | None = None,
+        ) -> list[dict[str, object]]:
+            del continuation_preparer, cancel_requested
+            self.calls.append((messages, current_user, route))
+            self.started.set()
+            await emitter.emit(AgentRunStartedPayload())
+            await emitter.emit(
+                AgentRunFailedPayload(
                     error=ErrorInfo(code="model_failed", message="The model request failed.")
                 )
-
-            return run()
+            )
+            return []
 
     clock = ControlledClock(START)
     agent_run = FailedRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1377,7 +1440,7 @@ async def test_overdue_every_restarts_once_from_persisted_last_completion(
 
     store = WorkspaceScheduleStore(state)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1400,7 +1463,7 @@ async def test_revision_wakeup_dispatches_newly_added_at_job(
     store = WorkspaceScheduleStore(state)
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(store=store, agent_run=agent_run, workspace_state=state, clock=clock)
+    service = _service(store=store, agent_run=agent_run, workspace_state=state, clock=clock)
     service.start()
     await asyncio.sleep(0)
 
@@ -1425,7 +1488,7 @@ async def test_remove_before_reservation_prevents_the_at_run(
     await store.add_user_job(job)
     clock = ControlledClock(START)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(store=store, agent_run=agent_run, workspace_state=state, clock=clock)
+    service = _service(store=store, agent_run=agent_run, workspace_state=state, clock=clock)
     service.start()
     await asyncio.sleep(0)
 
@@ -1459,7 +1522,7 @@ async def test_due_candidates_are_revalidated_before_reservation(
 
     monkeypatch.setattr(store, "reserve_due", remove_before_reservation)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1484,7 +1547,7 @@ async def test_remove_after_reservation_allows_the_current_run_without_resurrect
     job = _job()
     await store.add_user_job(job)
     agent_run = RecordingAgentRun(block=True)
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1513,7 +1576,7 @@ async def test_terminal_at_removal_does_not_delete_a_replacement_job(
     job = _job()
     await store.add_user_job(job)
     agent_run = RecordingAgentRun(block=True)
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1556,7 +1619,7 @@ async def test_system_at_job_is_deleted_after_terminal_completion(
     write_schedule_state(state, job)
     store = WorkspaceScheduleStore(state)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1585,7 +1648,7 @@ async def test_store_fault_stops_dispatch_and_is_visible_in_status(
 
     store = WorkspaceScheduleStore(state, replace_text=fail_replace)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1622,7 +1685,7 @@ async def test_every_terminal_store_fault_preserves_previous_state_and_faults_se
     store = WorkspaceScheduleStore(state, replace_text=fail_replace)
     agent_run = RecordingAgentRun()
     capture = capture_diagnostics()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1660,32 +1723,34 @@ async def test_safe_agent_failure_logs_one_warning_without_failure_message(
     await store.add_user_job(_job())
 
     class FailedRun(RecordingAgentRun):
-        def run_agent(
+        async def run(
             self,
-            session: Session,
-            input: str,
+            messages: list[dict[str, object]],
+            current_user: dict[str, object],
+            *,
             route: str,
-            stream: bool,
-            confirmation: object | None = None,
-        ) -> AsyncIterator[AgentRunPayload]:
-            del confirmation
-
-            async def run() -> AsyncIterator[AgentRunPayload]:
-                self.calls.append((session, input, route, stream))
-                self.started.set()
-                yield AgentRunStartedPayload()
-                yield AgentRunFailedPayload(
+            emitter: AgentRunEmitter,
+            externalize_result: object | None = None,
+            continuation_preparer: object | None = None,
+            cancel_requested: Callable[[], bool] | None = None,
+        ) -> list[dict[str, object]]:
+            del continuation_preparer, cancel_requested
+            self.calls.append((messages, current_user, route))
+            self.started.set()
+            await emitter.emit(AgentRunStartedPayload())
+            await emitter.emit(
+                AgentRunFailedPayload(
                     error=ErrorInfo(
                         code="model_failed",
                         message="PRIVATE_AGENT_FAILURE_MESSAGE",
                     )
                 )
-
-            return run()
+            )
+            return []
 
     agent_run = FailedRun()
     capture = capture_diagnostics()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1726,32 +1791,34 @@ async def test_one_job_exception_does_not_stop_other_due_jobs(
             super().__init__()
             self.second_started = asyncio.Event()
 
-        def run_agent(
+        async def run(
             self,
-            session: Session,
-            input: str,
+            messages: list[dict[str, object]],
+            current_user: dict[str, object],
+            *,
             route: str,
-            stream: bool,
-            confirmation: object | None = None,
-        ) -> AsyncIterator[AgentRunPayload]:
-            del confirmation
-
-            async def run() -> AsyncIterator[AgentRunPayload]:
-                self.calls.append((session, input, route, stream))
-                if len(self.calls) == 1:
-                    raise RuntimeError("PRIVATE_JOB_EXCEPTION_BODY")
-                self.second_started.set()
-                yield AgentRunStartedPayload()
-                yield AgentRunCompletedPayload(
+            emitter: AgentRunEmitter,
+            externalize_result: object | None = None,
+            continuation_preparer: object | None = None,
+            cancel_requested: Callable[[], bool] | None = None,
+        ) -> list[dict[str, object]]:
+            del continuation_preparer, cancel_requested
+            self.calls.append((messages, current_user, route))
+            if len(self.calls) == 1:
+                raise RuntimeError("PRIVATE_JOB_EXCEPTION_BODY")
+            self.second_started.set()
+            await emitter.emit(AgentRunStartedPayload())
+            await emitter.emit(
+                AgentRunCompletedPayload(
                     content="Done.",
                     usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
                 )
-
-            return run()
+            )
+            return []
 
     agent_run = FirstRunRaises()
     capture = capture_diagnostics()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1793,7 +1860,7 @@ async def test_terminal_commit_keeps_job_active_until_store_operation_finishes(
 
     monkeypatch.setattr(store, "commit_terminal", blocked_commit_terminal)
     agent_run = RecordingAgentRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1819,7 +1886,7 @@ async def test_shutdown_cancellation_keeps_at_job_pending(
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(_job())
     agent_run = RecordingAgentRun(block=True)
-    service = ScheduleService(
+    service = _service(
         store=store, agent_run=agent_run, workspace_state=state, clock=ControlledClock(START)
     )
 
@@ -1840,7 +1907,7 @@ async def test_shutdown_cancellation_keeps_every_job_without_terminal_state(
     job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
     await store.add_user_job(job)
     agent_run = RecordingAgentRun(block=True)
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=agent_run,
         workspace_state=state,
@@ -1868,25 +1935,25 @@ async def test_agent_run_cancelled_payload_keeps_at_job_pending(
     await store.add_user_job(_job())
 
     class CancelledRun(RecordingAgentRun):
-        def run_agent(
+        async def run(
             self,
-            session: Session,
-            input: str,
+            messages: list[dict[str, object]],
+            current_user: dict[str, object],
+            *,
             route: str,
-            stream: bool,
-            confirmation: object | None = None,
-        ) -> AsyncIterator[AgentRunPayload]:
-            del confirmation
-
-            async def run() -> AsyncIterator[AgentRunPayload]:
-                self.calls.append((session, input, route, stream))
-                yield AgentRunStartedPayload()
-                yield AgentRunCancelledPayload(partial_content="")
-
-            return run()
+            emitter: AgentRunEmitter,
+            externalize_result: object | None = None,
+            continuation_preparer: object | None = None,
+            cancel_requested: Callable[[], bool] | None = None,
+        ) -> list[dict[str, object]]:
+            del continuation_preparer, cancel_requested
+            self.calls.append((messages, current_user, route))
+            await emitter.emit(AgentRunStartedPayload())
+            await emitter.emit(AgentRunCancelledPayload(partial_content=""))
+            return []
 
     agent_run = CancelledRun()
-    service = ScheduleService(
+    service = _service(
         store=store, agent_run=agent_run, workspace_state=state, clock=ControlledClock(START)
     )
     service.start()
@@ -1929,9 +1996,8 @@ async def test_prepared_runtime_executes_at_job_with_schedule_route_and_partitio
     await _wait_until(lambda: len(provider.complete_requests) == 1)
     await runtime.close()
 
-    request = cast(ModelRequest, provider.complete_requests[0])
-    assert request.route == "schedule"
-    assert request.stream is False
+    request = provider.complete_requests[0]
+    assert len(request.tools) == 10
     assert await WorkspaceScheduleStore(state).snapshot() == ()
     session = Session.load(
         state,
@@ -1979,8 +2045,8 @@ async def test_prepared_runtime_runs_foreground_while_every_job_is_active(
 
         assert events[-1].type == "turn_completed"
         assert runtime.schedule_service.status_snapshot().active_job_count == 1
-        assert provider.complete_requests[0].route == "schedule"
-        assert any(request.route == "chat" for request in provider.stream_requests)
+        assert len(provider.complete_requests[0].tools) == 10
+        assert provider.stream_requests
     finally:
         provider.release_schedule.set()
         await runtime.close()
@@ -1996,27 +2062,29 @@ async def test_failed_at_is_deleted_and_a_new_service_does_not_replay_it(
     await store.add_user_job(_job())
 
     class FailedRun(RecordingAgentRun):
-        def run_agent(
+        async def run(
             self,
-            session: Session,
-            input: str,
+            messages: list[dict[str, object]],
+            current_user: dict[str, object],
+            *,
             route: str,
-            stream: bool,
-            confirmation: object | None = None,
-        ) -> AsyncIterator[AgentRunPayload]:
-            del confirmation
-
-            async def run() -> AsyncIterator[AgentRunPayload]:
-                self.calls.append((session, input, route, stream))
-                yield AgentRunStartedPayload()
-                yield AgentRunFailedPayload(
+            emitter: AgentRunEmitter,
+            externalize_result: object | None = None,
+            continuation_preparer: object | None = None,
+            cancel_requested: Callable[[], bool] | None = None,
+        ) -> list[dict[str, object]]:
+            del continuation_preparer, cancel_requested
+            self.calls.append((messages, current_user, route))
+            await emitter.emit(AgentRunStartedPayload())
+            await emitter.emit(
+                AgentRunFailedPayload(
                     error=ErrorInfo(code="model_failed", message="The model request failed.")
                 )
-
-            return run()
+            )
+            return []
 
     first = FailedRun()
-    service = ScheduleService(
+    service = _service(
         store=store,
         agent_run=first,
         workspace_state=state,
@@ -2030,7 +2098,7 @@ async def test_failed_at_is_deleted_and_a_new_service_does_not_replay_it(
 
     restarted_store = WorkspaceScheduleStore(state)
     second = RecordingAgentRun()
-    restarted = ScheduleService(
+    restarted = _service(
         store=restarted_store,
         agent_run=second,
         workspace_state=state,

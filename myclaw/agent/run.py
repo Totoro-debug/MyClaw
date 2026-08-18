@@ -3,36 +3,25 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, ClassVar, Literal, Protocol, cast, runtime_checkable
-from uuid import UUID, uuid4
+from typing import Any, ClassVar, Literal, Protocol
 
 from loguru import logger
 
-from myclaw.agent.prompts import current_user_input, interrupted_assistant_content
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
-    AssistantModelMessage,
-    DirectModelProvider,
     ModelCompleted,
-    ModelMessage,
     ModelProvider,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
     ReasoningEffort,
     TextDelta,
-    ToolModelMessage,
-    UserModelMessage,
-    accepts_direct_provider_call,
-    legacy_request_from_direct,
 )
-from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import (
     ConfirmationChannel as ToolConfirmationChannel,
@@ -51,10 +40,6 @@ type ToolResultExternalizer = Callable[[ToolResult], ToolResult]
 type AgentRunContinuationPreparer = Callable[
     [Sequence[dict[str, Any]], Sequence[dict[str, Any]]],
     Awaitable[list[dict[str, Any]]],
-]
-type SummaryPreparer = Callable[
-    [Session, AgentRunRoute, str, tuple[OpenAIToolSchema, ...]],
-    Awaitable[Session],
 ]
 
 
@@ -126,6 +111,7 @@ class AgentRunCompletedPayload:
 class AgentRunFailedPayload:
     type: ClassVar[Literal["failed"]] = "failed"
     error: ErrorInfo
+    cause: BaseException | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,11 +139,8 @@ class AgentRunEmitter(Protocol):
     async def emit(self, payload: AgentRunPayload) -> None: ...
 
 
-@runtime_checkable
 class AgentRunRouter(Protocol):
     """Direct-call Model Router boundary used by the awaitable Agent Run."""
-
-    def route_status(self, route: AgentRunRoute) -> object: ...
 
     def stream(
         self,
@@ -176,10 +159,6 @@ class AgentRunRouter(Protocol):
     ) -> ModelResponse: ...
 
 
-type AgentRunProvider = ModelProvider | DirectModelProvider
-type _AgentRunModelClient = AgentRunProvider | AgentRunRouter
-
-
 @dataclass(frozen=True, slots=True)
 class AgentRunModelSettings:
     """Provider-neutral budget and model settings for one Agent Run route."""
@@ -191,22 +170,114 @@ class AgentRunModelSettings:
     timeout_seconds: int
 
 
+class AgentRunModelTarget(ABC):
+    """One explicit Model Provider or Router call boundary for Agent Run."""
+
+    @classmethod
+    def for_provider(
+        cls,
+        provider: ModelProvider,
+        settings: AgentRunModelSettings,
+    ) -> AgentRunModelTarget:
+        return _ProviderModelTarget(provider, settings)
+
+    @classmethod
+    def for_router(cls, router: AgentRunRouter) -> AgentRunModelTarget:
+        return _RouterModelTarget(router)
+
+    @abstractmethod
+    def stream(
+        self,
+        route: AgentRunRoute,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> AsyncIterator[ModelStreamEvent]: ...
+
+    @abstractmethod
+    async def complete(
+        self,
+        route: AgentRunRoute,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> ModelResponse: ...
+
+
+class _ProviderModelTarget(AgentRunModelTarget):
+    __slots__ = ("_provider", "_settings")
+
+    def __init__(self, provider: ModelProvider, settings: AgentRunModelSettings) -> None:
+        self._provider = provider
+        self._settings = settings
+
+    def stream(
+        self,
+        route: AgentRunRoute,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del route
+        settings = self._settings
+        return self._provider.stream(
+            messages=messages,
+            tools=tools,
+            model=settings.model,
+            max_output=settings.max_output,
+            temperature=settings.temperature,
+            reasoning_effort=settings.reasoning_effort,
+            timeout=settings.timeout_seconds,
+        )
+
+    async def complete(
+        self,
+        route: AgentRunRoute,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> ModelResponse:
+        del route
+        settings = self._settings
+        return await self._provider.complete(
+            messages=messages,
+            tools=tools,
+            model=settings.model,
+            max_output=settings.max_output,
+            temperature=settings.temperature,
+            reasoning_effort=settings.reasoning_effort,
+            timeout=settings.timeout_seconds,
+        )
+
+
+class _RouterModelTarget(AgentRunModelTarget):
+    __slots__ = ("_router",)
+
+    def __init__(self, router: AgentRunRouter) -> None:
+        self._router = router
+
+    def stream(
+        self,
+        route: AgentRunRoute,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> AsyncIterator[ModelStreamEvent]:
+        return self._router.stream(route, messages=messages, tools=tools)
+
+    async def complete(
+        self,
+        route: AgentRunRoute,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> ModelResponse:
+        return await self._router.complete(route, messages=messages, tools=tools)
+
+
 @dataclass(slots=True)
 class _ToolCallState:
     result: ToolResult | None = None
-
-
-class AgentRunInterface(Protocol):
-    """Submit one complete Agent Run without exposing Session ownership."""
-
-    def run_agent(
-        self,
-        session: Session,
-        input: str,
-        route: AgentRunRoute,
-        stream: bool,
-        confirmation: ConfirmationChannel | None = None,
-    ) -> AsyncIterator[AgentRunPayload]: ...
 
 
 class AgentRun:
@@ -215,56 +286,17 @@ class AgentRun:
     def __init__(
         self,
         *,
-        provider: _AgentRunModelClient | Mapping[AgentRunRoute, AgentRunProvider],
-        settings: AgentRunModelSettings
-        | Mapping[AgentRunRoute, AgentRunModelSettings]
-        | None = None,
-        now: Callable[[], datetime] | None = None,
-        new_uuid: Callable[[], UUID] | None = None,
-        system_prompt: str = "",
+        model: AgentRunModelTarget,
         tool_gateway: ToolGateway | None = None,
         externalize_result: Callable[[ToolResult], ToolResult] | None = None,
-        externalize_result_for: Callable[[Session], Callable[[ToolResult], ToolResult]]
-        | None = None,
-        memory_snapshot: Callable[[], str] | None = None,
-        system_prompt_for_memory: Callable[[str], str] | None = None,
-        summary_preparer: SummaryPreparer | None = None,
-        after_user_published: Callable[[Session], None] | None = None,
-        on_terminal_failure: Callable[[BaseException], None] | None = None,
         on_artifact_failure: Callable[[Exception, str], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
-        self._provider = provider
-        self._settings = settings
-        self._now = datetime.now().astimezone if now is None else now
-        self._new_uuid = uuid4 if new_uuid is None else new_uuid
-        self._system_prompt = system_prompt
+        self._model = model
         self._tool_gateway = tool_gateway
         self._externalize_result = externalize_result
-        self._externalize_result_for = externalize_result_for
-        self._memory_snapshot = memory_snapshot
-        self._system_prompt_for_memory = system_prompt_for_memory
-        self._summary_preparer = summary_preparer
-        self._after_user_published = after_user_published
-        self._on_terminal_failure = on_terminal_failure
         self._on_artifact_failure = on_artifact_failure
         self._cancel_requested = cancel_requested or (lambda: False)
-
-    def run_agent(
-        self,
-        session: Session,
-        input: str,
-        route: AgentRunRoute,
-        stream: bool,
-        confirmation: ConfirmationChannel | None = None,
-    ) -> AsyncGenerator[AgentRunPayload, None]:
-        return self._run_agent(
-            session,
-            input,
-            route=route,
-            stream=stream,
-            confirmation=confirmation,
-        )
 
     async def run(
         self,
@@ -303,7 +335,6 @@ class AgentRun:
         is_cancel_requested = cancel_requested or self._cancel_requested
 
         try:
-            model_client = self._model_client(route)
             gateway = self._tool_gateway
             frozen_tools = () if gateway is None else tuple(gateway.schemas)
             externalize_result_for_run = (
@@ -338,15 +369,13 @@ class AgentRun:
                     runtime_messages = deepcopy(prepared)
                 partial_content.clear()
                 events = (
-                    self._direct_stream(
-                        model_client,
+                    self._model.stream(
                         route,
-                        runtime_messages,
-                        frozen_tools,
+                        messages=runtime_messages,
+                        tools=frozen_tools,
                     )
                     if stream
                     else self._direct_complete_events(
-                        model_client,
                         route,
                         runtime_messages,
                         frozen_tools,
@@ -544,7 +573,6 @@ class AgentRun:
                 )
                 terminal_emitted = True
                 return increment
-            self._capture_terminal_failure(failure)
             self._repair_awaitable_failed(
                 runtime_messages,
                 increment,
@@ -556,7 +584,10 @@ class AgentRun:
             if not started_emitted:
                 await _emit_agent_run_payload(emitter, AgentRunStartedPayload())
                 started_emitted = True
-            await _emit_agent_run_payload(emitter, AgentRunFailedPayload(error=failure.error))
+            await _emit_agent_run_payload(
+                emitter,
+                AgentRunFailedPayload(error=failure.error, cause=failure),
+            )
             terminal_emitted = True
             return increment
         except Exception:
@@ -580,7 +611,6 @@ class AgentRun:
                 terminal_emitted = True
                 return increment
             generic_failure = _model_failure()
-            self._capture_terminal_failure(generic_failure)
             self._repair_awaitable_failed(
                 runtime_messages,
                 increment,
@@ -594,7 +624,7 @@ class AgentRun:
                 started_emitted = True
             await _emit_agent_run_payload(
                 emitter,
-                AgentRunFailedPayload(error=generic_failure.error),
+                AgentRunFailedPayload(error=generic_failure.error, cause=generic_failure),
             )
             terminal_emitted = True
             return increment
@@ -642,85 +672,13 @@ class AgentRun:
                     pass
             raise
 
-    def _direct_stream(
-        self,
-        model_client: _AgentRunModelClient,
-        route: AgentRunRoute,
-        messages: list[dict[str, Any]],
-        tools: tuple[OpenAIToolSchema, ...],
-    ) -> AsyncIterator[ModelStreamEvent]:
-        if isinstance(model_client, AgentRunRouter):
-            return model_client.stream(
-                route,
-                messages=messages,
-                tools=tools,
-            )
-        settings = self._route_settings(route)
-        method = cast(Any, model_client).stream
-        if accepts_direct_provider_call(method):
-            return cast(DirectModelProvider, model_client).stream(
-                messages=messages,
-                tools=tools,
-                model=settings.model,
-                max_output=settings.max_output,
-                temperature=settings.temperature,
-                reasoning_effort=settings.reasoning_effort,
-                timeout=settings.timeout_seconds,
-            )
-        return cast(ModelProvider, model_client).stream(
-            legacy_request_from_direct(
-                route=route,
-                messages=messages,
-                tools=tools,
-                model=settings.model,
-                max_output=settings.max_output,
-                temperature=settings.temperature,
-                reasoning_effort=settings.reasoning_effort,
-                timeout=settings.timeout_seconds,
-                stream=True,
-            )
-        )
-
     async def _direct_complete_events(
         self,
-        model_client: _AgentRunModelClient,
         route: AgentRunRoute,
         messages: list[dict[str, Any]],
         tools: tuple[OpenAIToolSchema, ...],
     ) -> AsyncGenerator[ModelStreamEvent, None]:
-        if isinstance(model_client, AgentRunRouter):
-            response = await model_client.complete(
-                route,
-                messages=messages,
-                tools=tools,
-            )
-        else:
-            settings = self._route_settings(route)
-            method = cast(Any, model_client).complete
-            if accepts_direct_provider_call(method):
-                response = await cast(DirectModelProvider, model_client).complete(
-                    messages=messages,
-                    tools=tools,
-                    model=settings.model,
-                    max_output=settings.max_output,
-                    temperature=settings.temperature,
-                    reasoning_effort=settings.reasoning_effort,
-                    timeout=settings.timeout_seconds,
-                )
-            else:
-                response = await cast(ModelProvider, model_client).complete(
-                    legacy_request_from_direct(
-                        route=route,
-                        messages=messages,
-                        tools=tools,
-                        model=settings.model,
-                        max_output=settings.max_output,
-                        temperature=settings.temperature,
-                        reasoning_effort=settings.reasoning_effort,
-                        timeout=settings.timeout_seconds,
-                        stream=False,
-                    )
-                )
+        response = await self._model.complete(route, messages=messages, tools=tools)
         yield ModelCompleted(response=response)
 
     def _externalize_awaitable_result(
@@ -815,387 +773,6 @@ class AgentRun:
         )
         partial_content.clear()
 
-    async def _run_agent(
-        self,
-        session: Session,
-        input: str,
-        *,
-        route: AgentRunRoute,
-        stream: bool,
-        confirmation: ConfirmationChannel | None,
-    ) -> AsyncGenerator[AgentRunPayload, None]:
-        if route not in {"chat", "schedule"}:
-            raise ValueError("Agent Run route must be chat or schedule")
-        if stream != (route == "chat"):
-            raise ValueError("chat Agent Runs must stream and schedule Agent Runs must not stream")
-
-        partial_content: list[str] = []
-        pending_tool_calls: list[ModelToolCall] = []
-        persisted = False
-        events: AsyncIterator[ModelStreamEvent] | None = None
-        started_emitted = False
-        terminal_emitted = False
-        user_published = False
-
-        try:
-            settings = self._route_settings(route)
-            provider = self._route_provider(route)
-            system_prompt = self._system_prompt
-            memory: str | None = None
-            if self._memory_snapshot is not None:
-                memory = self._memory_snapshot()
-                if self._system_prompt_for_memory is None:
-                    raise RuntimeError("Memory snapshot requires a System Prompt factory")
-                system_prompt = self._system_prompt_for_memory(memory)
-            gateway = self._tool_gateway
-            frozen_tools = () if gateway is None else tuple(gateway.schemas)
-            externalize_result = (
-                self._externalize_result_for(session)
-                if self._externalize_result_for is not None
-                else self._externalize_result
-            )
-            if externalize_result is None:
-                externalize_result = _identity_tool_result
-            yield AgentRunStartedPayload()
-            started_emitted = True
-            session.add_message("user", input)
-            user_published = True
-            if self._after_user_published is not None:
-                self._after_user_published(session)
-            current_user = session.messages[-1]
-            if self._cancel_requested():
-                cancelled_content = "".join(partial_content)
-                persisted = self._repair_cancelled(
-                    session, partial_content, pending_tool_calls, persisted=persisted
-                )
-                terminal_emitted = True
-                yield AgentRunCancelledPayload(partial_content=cancelled_content)
-                return
-            while True:
-                partial_content.clear()
-                prepared_session = await self._prepare_summary(
-                    session,
-                    route,
-                    system_prompt,
-                    frozen_tools,
-                )
-                if prepared_session is not session:
-                    raise RuntimeError("Conversation Summary replaced the active Session")
-                request = self._request(
-                    session,
-                    current_user,
-                    route=route,
-                    stream=stream,
-                    settings=settings,
-                    tools=frozen_tools,
-                    system_prompt=system_prompt,
-                )
-                if stream:
-                    events = self._stream(provider, request)
-                else:
-                    events = self._complete(provider, request)
-                model_completed = False
-                async for event in events:
-                    if isinstance(event, TextDelta):
-                        partial_content.append(event.delta)
-                        yield AgentRunTextDeltaPayload(delta=event.delta)
-                        if self._cancel_requested():
-                            cancelled_content = "".join(partial_content)
-                            await _close_iterator(events)
-                            events = None
-                            persisted = self._repair_cancelled(
-                                session,
-                                partial_content,
-                                pending_tool_calls,
-                                persisted=persisted,
-                            )
-                            terminal_emitted = True
-                            yield AgentRunCancelledPayload(partial_content=cancelled_content)
-                            return
-                        continue
-                    if not isinstance(event, ModelCompleted):
-                        raise _model_failure()
-                    model_completed = True
-                    response = event.response
-                    session.add_message(
-                        "assistant",
-                        response.message.content,
-                        tool_calls=[call.to_dict() for call in response.message.tool_calls],
-                        status="completed",
-                        error=None,
-                        token_usage={"model_calls": 1, **response.usage.to_dict()},
-                    )
-                    continues_with_tools = bool(response.message.tool_calls and gateway is not None)
-                    partial_content.clear()
-                    if continues_with_tools:
-                        pending_tool_calls = list(response.message.tool_calls)
-                    await _close_iterator(events)
-                    events = None
-                    yield AgentRunModelCallCompletedPayload(
-                        content=response.message.content,
-                        continues_with_tools=continues_with_tools,
-                    )
-                    if continues_with_tools:
-                        assert gateway is not None
-                        for tool_call in response.message.tool_calls:
-                            yield AgentRunToolStartedPayload(
-                                tool_call_id=tool_call.id,
-                                tool_name=tool_call.name,
-                                summary=_tool_summary("Running", tool_call.name),
-                            )
-                            if self._cancel_requested():
-                                cancelled_content = "".join(partial_content)
-                                persisted = self._repair_cancelled(
-                                    session,
-                                    partial_content,
-                                    pending_tool_calls,
-                                    persisted=persisted,
-                                )
-                                terminal_emitted = True
-                                yield AgentRunCancelledPayload(partial_content=cancelled_content)
-                                return
-                            result: ToolResult | None = None
-                            tool_state = _ToolCallState()
-                            try:
-                                try:
-                                    tool_outcomes = self._call_tool(
-                                        gateway,
-                                        tool_call,
-                                        confirmation,
-                                        tool_state,
-                                    )
-                                    try:
-                                        async for tool_outcome in tool_outcomes:
-                                            if isinstance(tool_outcome, ConfirmationRequest):
-                                                yield AgentRunConfirmationRequestedPayload(
-                                                    request=tool_outcome
-                                                )
-                                            else:
-                                                result = tool_outcome
-                                    finally:
-                                        await _close_iterator(tool_outcomes)
-                                except BaseException as failure:
-                                    if (
-                                        not isinstance(failure, Exception)
-                                        and tool_state.result is not None
-                                    ):
-                                        try:
-                                            self._record_tool_result(
-                                                session,
-                                                tool_state.result,
-                                                externalize_result,
-                                            )
-                                        except Exception:
-                                            pass
-                                        else:
-                                            pending_tool_calls.pop(0)
-                                    raise
-                                if result is None:
-                                    raise RuntimeError("Tool Gateway ended without a result")
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception:
-                                result = ToolResult(
-                                    tool_call_id=tool_call.id,
-                                    name=tool_call.name,
-                                    status="error",
-                                    content=f"{tool_call.name} could not complete the request.",
-                                    artifact=None,
-                                )
-                            result = self._record_tool_result(
-                                session,
-                                result,
-                                externalize_result,
-                            )
-                            pending_tool_calls.pop(0)
-                            yield AgentRunToolCompletedPayload(
-                                tool_call_id=result.tool_call_id,
-                                tool_name=result.name,
-                                status=result.status,
-                                summary=_tool_completion_summary(result),
-                            )
-                            if self._cancel_requested():
-                                cancelled_content = "".join(partial_content)
-                                persisted = self._repair_cancelled(
-                                    session,
-                                    partial_content,
-                                    pending_tool_calls,
-                                    persisted=persisted,
-                                )
-                                terminal_emitted = True
-                                yield AgentRunCancelledPayload(partial_content=cancelled_content)
-                                return
-                        break
-                    persisted = self._request_persist(session, persisted=persisted)
-                    terminal_emitted = True
-                    yield AgentRunCompletedPayload(
-                        content=response.message.content,
-                        usage=response.usage,
-                    )
-                    return
-                if not model_completed:
-                    raise _model_failure()
-        except ModelCallError as failure:
-            await _close_iterator(events)
-            events = None
-            if failure.error.code == "turn_cancelled":
-                cancelled_content = "".join(partial_content)
-                persisted = self._repair_cancelled(
-                    session,
-                    partial_content,
-                    pending_tool_calls,
-                    persisted=persisted,
-                )
-                if not started_emitted:
-                    yield AgentRunStartedPayload()
-                    started_emitted = True
-                terminal_emitted = True
-                yield AgentRunCancelledPayload(partial_content=cancelled_content)
-                return
-            self._capture_terminal_failure(failure)
-            self._repair_failed(session, pending_tool_calls)
-            if user_published:
-                self._safe_add_failed_assistant(session, partial_content, stream, failure)
-            partial_content.clear()
-            persisted = self._request_persist(session, persisted=persisted)
-            if not started_emitted:
-                yield AgentRunStartedPayload()
-                started_emitted = True
-            terminal_emitted = True
-            yield AgentRunFailedPayload(error=failure.error)
-            return
-        except Exception:
-            await _close_iterator(events)
-            events = None
-            generic_failure = _model_failure()
-            self._capture_terminal_failure(generic_failure)
-            self._repair_failed(session, pending_tool_calls)
-            if user_published:
-                self._safe_add_failed_assistant(session, partial_content, stream, generic_failure)
-            partial_content.clear()
-            persisted = self._request_persist(session, persisted=persisted)
-            if not started_emitted:
-                yield AgentRunStartedPayload()
-                started_emitted = True
-            terminal_emitted = True
-            yield AgentRunFailedPayload(error=generic_failure.error)
-            return
-        except asyncio.CancelledError:
-            await _close_iterator(events)
-            events = None
-            if self._cancel_requested():
-                cancelled_content = "".join(partial_content)
-                persisted = self._repair_cancelled(
-                    session,
-                    partial_content,
-                    pending_tool_calls,
-                    persisted=persisted,
-                )
-                if not started_emitted:
-                    yield AgentRunStartedPayload()
-                    started_emitted = True
-                terminal_emitted = True
-                yield AgentRunCancelledPayload(partial_content=cancelled_content)
-                return
-            try:
-                self._repair_cancelled(
-                    session,
-                    partial_content,
-                    pending_tool_calls,
-                    persisted=persisted,
-                )
-            except BaseException:
-                pass
-            raise
-        except BaseException:
-            await _close_iterator(events)
-            if not terminal_emitted:
-                try:
-                    self._repair_cancelled(
-                        session,
-                        partial_content,
-                        pending_tool_calls,
-                        persisted=persisted,
-                    )
-                except BaseException:
-                    pass
-            raise
-
-    def _capture_terminal_failure(self, failure: BaseException) -> None:
-        if self._on_terminal_failure is not None:
-            self._on_terminal_failure(failure)
-
-    def _route_provider(self, route: AgentRunRoute) -> ModelProvider:
-        return cast(ModelProvider, self._model_client(route))
-
-    def _model_client(self, route: AgentRunRoute) -> _AgentRunModelClient:
-        if isinstance(self._provider, Mapping):
-            return self._provider[route]
-        return self._provider
-
-    def _route_settings(self, route: AgentRunRoute) -> AgentRunModelSettings:
-        if isinstance(self._settings, Mapping):
-            return self._settings[route]
-        if self._settings is None:
-            raise TypeError("Agent Run model settings are required for this Provider")
-        return self._settings
-
-    def _request(
-        self,
-        session: Session,
-        current_user: dict[str, Any],
-        *,
-        route: AgentRunRoute,
-        stream: bool,
-        settings: AgentRunModelSettings,
-        tools: tuple[OpenAIToolSchema, ...],
-        system_prompt: str,
-    ) -> ModelRequest:
-        messages: list[ModelMessage] = []
-        for message in session.messages[session.last_consolidated :]:
-            if message is current_user:
-                timestamp = message.get("timestamp")
-                content = message.get("content")
-                if not isinstance(timestamp, str) or not isinstance(content, str):
-                    raise TypeError("Session user message is malformed")
-                messages.append(
-                    UserModelMessage(
-                        content=current_user_input(
-                            content=content,
-                            current_time=datetime.fromisoformat(timestamp),
-                            session_id=session.session_id,
-                        )
-                    )
-                )
-                continue
-            model_message = model_message_from_session(message)
-            if model_message is not None:
-                messages.append(model_message)
-        return ModelRequest(
-            request_id=self._new_uuid(),
-            route=route,
-            system_prompt=system_prompt,
-            messages=tuple(messages),
-            tools=tools,
-            stream=stream,
-            model=settings.model,
-            max_output=settings.max_output,
-            temperature=settings.temperature,
-            reasoning_effort=settings.reasoning_effort,
-            timeout_seconds=settings.timeout_seconds,
-        )
-
-    async def _prepare_summary(
-        self,
-        session: Session,
-        route: AgentRunRoute,
-        system_prompt: str,
-        tools: tuple[OpenAIToolSchema, ...],
-    ) -> Session:
-        if self._summary_preparer is None:
-            return session
-        return await self._summary_preparer(session, route, system_prompt, tools)
-
     @staticmethod
     async def _call_tool(
         gateway: ToolGateway,
@@ -1243,172 +820,6 @@ class AgentRun:
                     state.result = operation.result()
                 except BaseException:
                     pass
-
-    async def _complete(
-        self,
-        provider: ModelProvider,
-        request: ModelRequest,
-    ) -> AsyncGenerator[ModelStreamEvent, None]:
-        yield ModelCompleted(response=await provider.complete(request))
-
-    async def _stream(
-        self,
-        provider: ModelProvider,
-        request: ModelRequest,
-    ) -> AsyncGenerator[ModelStreamEvent, None]:
-        stream: AsyncIterator[ModelStreamEvent] | None = None
-        try:
-            stream = provider.stream(request)
-            async for event in stream:
-                yield event
-        except ModelCallError:
-            raise
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            raise _model_failure() from None
-        finally:
-            if stream is not None:
-                close = getattr(stream, "aclose", None)
-                if close is not None:
-                    try:
-                        await close()
-                    except Exception:
-                        pass
-
-    def _request_persist(self, session: Session, *, persisted: bool) -> bool:
-        if persisted:
-            return True
-        try:
-            session.persist()
-        except Exception:
-            return True
-        return True
-
-    def _record_tool_result(
-        self,
-        session: Session,
-        result: ToolResult,
-        externalize_result: Callable[[ToolResult], ToolResult],
-    ) -> ToolResult:
-        try:
-            result = externalize_result(result)
-        except Exception as failure:
-            if self._on_artifact_failure is not None:
-                self._on_artifact_failure(failure, result.name)
-            result = ToolResult(
-                tool_call_id=result.tool_call_id,
-                name=result.name,
-                status="error",
-                content=f"{result.name} result could not be stored.",
-                artifact=None,
-                confirmation=result.confirmation,
-            )
-        self._add_tool_message(session, result)
-        return result
-
-    def _repair_cancelled(
-        self,
-        session: Session,
-        partial_content: list[str],
-        pending_tool_calls: list[ModelToolCall],
-        *,
-        persisted: bool,
-    ) -> bool:
-        if partial_content:
-            try:
-                session.add_message(
-                    "assistant",
-                    "".join(partial_content),
-                    tool_calls=[],
-                    status="interrupted",
-                    error={
-                        "code": "turn_cancelled",
-                        "message": "Turn interrupted by user.",
-                    },
-                    token_usage={
-                        "model_calls": 1,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "total_tokens": 0,
-                    },
-                )
-            except Exception:
-                pass
-        for tool_call in pending_tool_calls:
-            try:
-                self._add_tool_message(
-                    session,
-                    ToolResult(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        status="error",
-                        content="Tool call interrupted because the turn was cancelled.",
-                        artifact=None,
-                    ),
-                )
-            except Exception:
-                pass
-        pending_tool_calls.clear()
-        partial_content.clear()
-        return self._request_persist(session, persisted=persisted)
-
-    def _repair_failed(
-        self,
-        session: Session,
-        pending_tool_calls: list[ModelToolCall],
-    ) -> None:
-        for tool_call in pending_tool_calls:
-            try:
-                self._add_tool_message(
-                    session,
-                    ToolResult(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        status="error",
-                        content="Tool call interrupted because the Agent Run failed.",
-                        artifact=None,
-                    ),
-                )
-            except Exception:
-                pass
-        pending_tool_calls.clear()
-
-    @staticmethod
-    def _safe_add_failed_assistant(
-        session: Session,
-        partial_content: list[str],
-        stream: bool,
-        failure: ModelCallError,
-    ) -> None:
-        try:
-            session.add_message(
-                "assistant",
-                "".join(partial_content) if stream else "",
-                tool_calls=[],
-                status="error",
-                error={"code": failure.error.code, "message": failure.error.message},
-                token_usage={
-                    "model_calls": 1,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "total_tokens": 0,
-                },
-            )
-        except Exception:
-            pass
-
-    @staticmethod
-    def _add_tool_message(session: Session, result: ToolResult) -> None:
-        fields: dict[str, object] = {
-            "tool_call_id": result.tool_call_id,
-            "name": result.name,
-            "status": result.status,
-            "artifact": None if result.artifact is None else result.artifact.to_dict(),
-        }
-        if result.confirmation is not None:
-            fields["confirmation"] = result.confirmation.to_dict()
-        session.add_message("tool", result.content, **fields)
 
 
 def _model_failure() -> ModelCallError:
@@ -1506,52 +917,6 @@ def _log_artifact_failure(failure: Exception, *, tool_name: str) -> None:
     )
 
 
-def model_message_from_session(
-    message: dict[str, Any],
-) -> UserModelMessage | AssistantModelMessage | ToolModelMessage | None:
-    """Project persisted conversation history into the next provider request."""
-    role = message.get("role")
-    if role == "user":
-        content = message.get("content")
-        if not isinstance(content, str):
-            raise TypeError("Session user content must be a string")
-        return UserModelMessage(content=content)
-    if role == "assistant":
-        content = message.get("content")
-        tool_calls = message.get("tool_calls")
-        status = message.get("status")
-        if not isinstance(content, str) or not isinstance(tool_calls, list):
-            raise TypeError("Session assistant message is malformed")
-        projected_tool_calls = tuple(
-            ModelToolCall(
-                id=tool_call["id"],
-                name=tool_call["name"],
-                arguments=tool_call["arguments"],
-            )
-            for tool_call in tool_calls
-        )
-        if status == "error" and not content and not projected_tool_calls:
-            return None
-        if status == "interrupted":
-            return AssistantModelMessage(
-                content=interrupted_assistant_content(content),
-                tool_calls=projected_tool_calls,
-            )
-        return AssistantModelMessage(content=content, tool_calls=projected_tool_calls)
-    if role == "tool":
-        tool_call_id = message.get("tool_call_id")
-        name = message.get("name")
-        content = message.get("content")
-        if not all(isinstance(value, str) for value in (tool_call_id, name, content)):
-            raise TypeError("Session tool message is malformed")
-        return ToolModelMessage(
-            tool_call_id=cast(str, tool_call_id),
-            name=cast(str, name),
-            content=cast(str, content),
-        )
-    raise TypeError("Unsupported Session message role")
-
-
 __all__ = [
     "AgentRun",
     "AgentRunCancelledPayload",
@@ -1560,11 +925,10 @@ __all__ = [
     "AgentRunContinuationPreparer",
     "AgentRunEmitter",
     "AgentRunFailedPayload",
-    "AgentRunInterface",
     "AgentRunModelCallCompletedPayload",
     "AgentRunModelSettings",
+    "AgentRunModelTarget",
     "AgentRunPayload",
-    "AgentRunProvider",
     "AgentRunRoute",
     "AgentRunRouter",
     "AgentRunStartedPayload",

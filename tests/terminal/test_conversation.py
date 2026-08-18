@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar, Literal, cast
@@ -47,9 +47,9 @@ from myclaw.errors import ErrorInfo
 from myclaw.management.commands import ManagementCommandResult
 from myclaw.provider.models import (
     ModelCompleted,
-    ModelRequest,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
     TextDelta,
 )
 from myclaw.session.session import Session
@@ -60,6 +60,7 @@ from myclaw.terminal.conversation import (
     _format_activity_duration,
     run_terminal_conversation,
 )
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.json_types import JsonObject
 from tests.agent.test_fixed_catalog_runtime import (
@@ -69,6 +70,7 @@ from tests.agent.test_fixed_catalog_runtime import (
 from tests.agent.test_fixed_catalog_runtime import (
     _runtime as _prepared_runtime,
 )
+from tests.fixtures import ProviderCall
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 TURN_ID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
@@ -557,12 +559,43 @@ class CancellableRuntimeProvider(_RuntimeProvider):
         self.first_delta_emitted = asyncio.Event()
         self._chat_calls = 0
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        if request.system_prompt == session_title_prompt():
-            async for event in super().stream(request):
+    async def stream(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        if messages and messages[0] == {
+            "role": "system",
+            "content": session_title_prompt(),
+        }:
+            async for event in super().stream(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            ):
                 yield event
             return
-        self.stream_requests.append(request)
+        self.stream_requests.append(
+            ProviderCall(
+                messages=list(messages),
+                tools=tuple(tools),
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
+        )
         self._chat_calls += 1
         if self._chat_calls == 1:
             yield TextDelta(delta="partial runtime response")
@@ -1505,7 +1538,7 @@ async def test_intermediate_completion_reparents_stream_candidate_and_empty_outp
 
     async def record_mounted_assistant(*args: object, **kwargs: object) -> Markdown:
         assistant = await mount_assistant(*args, **kwargs)  # type: ignore[arg-type]
-        mounted_assistants.append((assistant, assistant.parent))
+        mounted_assistants.append((assistant, cast(Widget | None, assistant.parent)))
         return assistant
 
     monkeypatch.setattr(app, "_mount_assistant", record_mounted_assistant)

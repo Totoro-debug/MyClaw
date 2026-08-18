@@ -11,6 +11,7 @@ import pytest
 
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.events import TurnFailedPayload
+from myclaw.agent.run import AgentRunModelSettings, AgentRunModelTarget
 from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -24,17 +25,15 @@ from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelMessages,
-    ModelRequest,
     ModelResponse,
     ModelRoute,
     ModelUsage,
-    UserModelMessage,
 )
-from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.conversation import StreamingConversationPort
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
-from tests.fixtures import ScriptedFakeProvider, StreamScript
+from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 8, 4, 16, 0, 0, tzinfo=LOCAL_OFFSET)
@@ -136,7 +135,7 @@ def _manager(
     system_prompt: str = "CHAT SYSTEM",
 ) -> ConversationSummaryManager:
     return ConversationSummaryManager(
-        provider=provider,
+        provider=ScriptedFakeRouter(provider),
         summaries=summaries,
         route_context_window=context_window,
         route_max_output=max_output,
@@ -182,28 +181,32 @@ def _conversation(
     session: Session,
     manager: ConversationSummaryManager,
 ) -> StreamingConversationPort:
-    async def prepare_summary(
+    async def prepare_foreground_summary(
         active_session: Session,
-        route: str,
-        system_prompt: str,
-        tools: tuple[OpenAIToolSchema, ...],
+        current_user: dict[str, Any],
     ) -> Session:
-        del route, system_prompt, tools
-        return await manager.prepare(active_session)
+        return await manager.prepare(active_session, current_user=current_user)
 
     return StreamingConversationPort(
-        provider=provider,
-        session=session,
-        settings=ChatModelSettings(
-            model="chat-model",
-            max_output=512,
-            temperature=0.0,
-            reasoning_effort=None,
-            timeout_seconds=30,
+        model=AgentRunModelTarget.for_provider(
+            provider,
+            AgentRunModelSettings(
+                model="chat-model",
+                max_output=512,
+                temperature=0.0,
+                reasoning_effort=None,
+                timeout_seconds=30,
+            ),
         ),
+        session=session,
         now=lambda: NOW,
         new_uuid=uuid4,
-        summary_preparer=prepare_summary,
+        foreground_summary_preparer=prepare_foreground_summary,
+        context_builder=ContextBuilder(
+            Workspace.from_path(session.workspace_state.path),
+            "Asia/Shanghai",
+            clock=lambda: NOW,
+        ),
     )
 
 
@@ -232,14 +235,12 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
         "total_tokens": 37,
     }
     request = provider.complete_requests[0]
-    assert isinstance(request, ModelRequest)
-    assert isinstance(request.messages[0], UserModelMessage)
-    assert request.route == "memory"
-    assert request.stream is False
-    assert "First question." in request.messages[0].content
-    assert "First answer." in request.messages[0].content
-    assert "Second question." not in request.messages[0].content
-    assert "future_field" not in request.messages[0].content
+    summary_input = request.messages[1]["content"]
+    assert isinstance(summary_input, str)
+    assert "First question." in summary_input
+    assert "First answer." in summary_input
+    assert "Second question." not in summary_input
+    assert "future_field" not in summary_input
     assert (await summaries.after(0, 10))[0].content == "First turn summary."
 
 
@@ -263,7 +264,7 @@ async def test_summary_candidate_includes_current_user_without_publishing_it(
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
     summaries = WorkspaceJsonlSummaryStore(state)
     manager = ConversationSummaryManager(
-        provider=provider,
+        provider=ScriptedFakeRouter(provider),
         summaries=summaries,
         route_context_window=10_000,
         route_max_output=1_000,
@@ -310,11 +311,11 @@ async def test_token_budget_summarizes_roughly_half_the_available_input(
 
     assert session.last_consolidated == 2
     request = provider.complete_requests[0]
-    assert isinstance(request, ModelRequest)
-    assert isinstance(request.messages[0], UserModelMessage)
-    assert first_question in request.messages[0].content
-    assert first_answer in request.messages[0].content
-    assert second_question not in request.messages[0].content
+    summary_input = request.messages[1]["content"]
+    assert isinstance(summary_input, str)
+    assert first_question in summary_input
+    assert first_answer in summary_input
+    assert second_question not in summary_input
 
 
 @pytest.mark.asyncio
@@ -353,10 +354,10 @@ async def test_repeated_summary_preparation_advances_last_consolidated_once_per_
     assert second.last_consolidated == 4
     assert [entry.index for entry in await summaries.after(0, 10)] == [1, 2]
     second_request = provider.complete_requests[1]
-    assert isinstance(second_request, ModelRequest)
-    assert isinstance(second_request.messages[0], UserModelMessage)
-    assert "Question one." not in second_request.messages[0].content
-    assert "Question two." in second_request.messages[0].content
+    summary_input = second_request.messages[1]["content"]
+    assert isinstance(summary_input, str)
+    assert "Question one." not in summary_input
+    assert "Question two." in summary_input
 
 
 @pytest.mark.asyncio
@@ -547,8 +548,7 @@ async def test_active_conversation_prepares_summary_before_chat_request(
     ]
     assert session.last_consolidated == 2
     request = provider.stream_requests[0]
-    assert isinstance(request, ModelRequest)
-    request_content = json.dumps(request.to_dict(), ensure_ascii=False)
+    request_content = json.dumps(request.messages, ensure_ascii=False)
     assert "First question." not in request_content
     assert "Second question." in request_content
     assert "Current question." in request_content
@@ -653,10 +653,10 @@ async def test_cutoff_keeps_retained_suffix_at_user_boundary(
     assert session.last_consolidated == expected_position
     assert session.messages[session.last_consolidated]["content"] == first_retained
     request = provider.complete_requests[0]
-    assert isinstance(request, ModelRequest)
-    assert isinstance(request.messages[0], UserModelMessage)
-    assert last_summarized in request.messages[0].content
-    assert first_retained not in request.messages[0].content
+    summary_input = request.messages[1]["content"]
+    assert isinstance(summary_input, str)
+    assert last_summarized in summary_input
+    assert first_retained not in summary_input
 
 
 def test_session_messages_remain_json_native(workspace: Path) -> None:

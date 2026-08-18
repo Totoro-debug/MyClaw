@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from dataclasses import replace
 from types import SimpleNamespace
-from uuid import UUID
+from typing import Any
 
 import pytest
 from anthropic import (
@@ -26,17 +25,12 @@ from myclaw.config.config import ProviderConfiguration
 from myclaw.provider.anthropic import AnthropicProvider
 from myclaw.provider.errors import EmptyModelResponseError, ModelCallError
 from myclaw.provider.models import (
-    AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
     TextDelta,
-    ToolModelMessage,
-    UserModelMessage,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 
-REQUEST_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 READ_FILE_SCHEMA: OpenAIToolSchema = {
     "type": "function",
     "function": {
@@ -106,20 +100,20 @@ def configuration() -> ProviderConfiguration:
     )
 
 
-def request(*, stream: bool = True) -> ModelRequest:
-    return ModelRequest(
-        request_id=REQUEST_ID,
-        route="chat" if stream else "memory",
-        system_prompt="You are MyClaw.",
-        messages=(UserModelMessage(content="Hello"),),
-        tools=(READ_FILE_SCHEMA,),
-        stream=stream,
-        model="claude-test",
-        max_output=512,
-        temperature=0.25,
-        reasoning_effort="high",
-        timeout_seconds=17,
-    )
+def request(*, stream: bool = True) -> dict[str, Any]:
+    del stream
+    return {
+        "messages": [
+            {"role": "system", "content": "You are MyClaw."},
+            {"role": "user", "content": "Hello"},
+        ],
+        "tools": (READ_FILE_SCHEMA,),
+        "model": "claude-test",
+        "max_output": 512,
+        "temperature": 0.25,
+        "reasoning_effort": "high",
+        "timeout": 17,
+    }
 
 
 @pytest.mark.asyncio
@@ -155,7 +149,7 @@ async def test_stream_translates_text_and_usage_through_official_sdk_boundary() 
     factory = FakeAnthropicClientFactory(client)
     provider = AnthropicProvider(configuration(), client_factory=factory)
 
-    events = [event async for event in provider.stream(request())]
+    events = [event async for event in provider.stream(**request())]
 
     assert events[:2] == [TextDelta(delta="Hel"), TextDelta(delta="lo")]
     assert len(events) == 3
@@ -202,7 +196,7 @@ async def test_stream_rejects_an_empty_success_response() -> None:
     provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
 
     with pytest.raises(ModelCallError) as captured:
-        async for _event in provider.stream(request()):
+        async for _event in provider.stream(**request()):
             pass
 
     assert captured.value.error.to_dict() == {
@@ -263,7 +257,7 @@ async def test_stream_aggregates_mixed_text_and_tool_use_content() -> None:
         configuration(), client_factory=FakeAnthropicClientFactory(FakeAnthropicClient(stream))
     )
 
-    events = [event async for event in provider.stream(request())]
+    events = [event async for event in provider.stream(**request())]
 
     assert events[:-1] == [TextDelta(delta="Checking")]
     completed = events[-1]
@@ -297,29 +291,30 @@ async def test_complete_translates_mixed_history_and_full_message() -> None:
     )
     client = FakeAnthropicClient(sdk_message)
     provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
-    complete_request = replace(
-        request(stream=False),
-        messages=(
-            UserModelMessage(content="Read the file"),
-            AssistantModelMessage(
-                content="I will read it.",
-                tool_calls=(
-                    ModelToolCall(
-                        id="toolu_prior",
-                        name="read_file",
-                        arguments='{"path":"README.md"}',
-                    ),
-                ),
-            ),
-            ToolModelMessage(
-                tool_call_id="toolu_prior",
-                name="read_file",
-                content="Project documentation",
-            ),
-        ),
-    )
+    complete_request = request(stream=False)
+    complete_request["messages"] = [
+        {"role": "system", "content": "You are MyClaw."},
+        {"role": "user", "content": "Read the file"},
+        {
+            "role": "assistant",
+            "content": "I will read it.",
+            "tool_calls": [
+                {
+                    "id": "toolu_prior",
+                    "name": "read_file",
+                    "arguments": '{"path":"README.md"}',
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "toolu_prior",
+            "name": "read_file",
+            "content": "Project documentation",
+        },
+    ]
 
-    response = await provider.complete(complete_request)
+    response = await provider.complete(**complete_request)
 
     assert response.to_dict() == {
         "message": {
@@ -394,7 +389,7 @@ async def test_complete_rejects_an_empty_success_response() -> None:
     provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
 
     with pytest.raises(ModelCallError) as captured:
-        await provider.complete(request(stream=False))
+        await provider.complete(**request(stream=False))
 
     assert captured.value.error.to_dict() == {
         "code": "model_failed",
@@ -414,7 +409,7 @@ async def test_complete_normalizes_timeout_without_adapter_retry() -> None:
     provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
 
     with pytest.raises(ModelCallError) as captured:
-        await provider.complete(request(stream=False))
+        await provider.complete(**request(stream=False))
 
     assert captured.value.error.to_dict() == {
         "code": "provider_timeout",
@@ -442,7 +437,7 @@ async def test_complete_preserves_numeric_retry_after_for_rate_limit() -> None:
     provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
 
     with pytest.raises(ModelCallError) as captured:
-        await provider.complete(request(stream=False))
+        await provider.complete(**request(stream=False))
 
     assert captured.value.error.to_dict() == {
         "code": "provider_rate_limited",
@@ -469,7 +464,7 @@ async def test_complete_normalizes_authentication_as_permanent() -> None:
     provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
 
     with pytest.raises(ModelCallError) as captured:
-        await provider.complete(request(stream=False))
+        await provider.complete(**request(stream=False))
 
     assert captured.value.error.to_dict() == {
         "code": "provider_auth_error",
@@ -501,7 +496,7 @@ async def test_complete_normalizes_temporary_unavailability(sdk_error: Exception
     provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
 
     with pytest.raises(ModelCallError) as captured:
-        await provider.complete(request(stream=False))
+        await provider.complete(**request(stream=False))
 
     assert captured.value.error.to_dict() == {
         "code": "provider_unavailable",
@@ -527,7 +522,7 @@ async def test_complete_preserves_retry_after_for_temporary_unavailability() -> 
     provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
 
     with pytest.raises(ModelCallError) as captured:
-        await provider.complete(request(stream=False))
+        await provider.complete(**request(stream=False))
 
     assert captured.value.error.to_dict() == {
         "code": "provider_unavailable",
@@ -648,7 +643,7 @@ async def test_complete_normalizes_permanent_provider_errors(
     provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
 
     with pytest.raises(ModelCallError) as captured:
-        await provider.complete(request(stream=False))
+        await provider.complete(**request(stream=False))
 
     assert captured.value.error.to_dict() == expected
     assert len(client.messages.calls) == 1
@@ -701,7 +696,7 @@ async def test_stream_normalizes_sdk_errors_without_retry_or_completed(
     observed: list[TextDelta] = []
 
     with pytest.raises(ModelCallError) as captured:
-        async for event in provider.stream(request()):
+        async for event in provider.stream(**request()):
             assert isinstance(event, TextDelta)
             observed.append(event)
 
@@ -722,7 +717,7 @@ async def test_complete_normalizes_unclassified_sdk_failure() -> None:
     provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
 
     with pytest.raises(ModelCallError) as captured:
-        await provider.complete(request(stream=False))
+        await provider.complete(**request(stream=False))
 
     assert captured.value.error.to_dict() == {
         "code": "model_failed",
@@ -772,7 +767,7 @@ async def test_stream_normalizes_malformed_tool_arguments_as_model_failure() -> 
     )
 
     with pytest.raises(ModelCallError) as captured:
-        async for _event in provider.stream(request()):
+        async for _event in provider.stream(**request()):
             pass
 
     assert captured.value.error.to_dict() == {
@@ -803,7 +798,7 @@ async def test_complete_normalizes_malformed_tool_arguments_as_model_failure() -
     )
 
     with pytest.raises(ModelCallError) as captured:
-        await provider.complete(request(stream=False))
+        await provider.complete(**request(stream=False))
 
     assert captured.value.error.to_dict() == {
         "code": "model_failed",
@@ -829,7 +824,7 @@ async def test_stream_propagates_cancellation_without_completed_event() -> None:
     observed: list[TextDelta] = []
 
     with pytest.raises(asyncio.CancelledError):
-        async for event in provider.stream(request()):
+        async for event in provider.stream(**request()):
             assert isinstance(event, TextDelta)
             observed.append(event)
 

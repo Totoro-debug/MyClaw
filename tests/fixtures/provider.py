@@ -2,28 +2,20 @@
 
 from collections import deque
 from collections.abc import AsyncIterator, Iterable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import cast
-from uuid import uuid4
 
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
-    AssistantModelMessage,
-    ModelMessage,
     ModelProvider,
-    ModelRequest,
     ModelResponse,
-    ModelRoute,
     ModelStreamEvent,
     ReasoningEffort,
-    ToolModelMessage,
-    UserModelMessage,
 )
 from myclaw.tools.base import OpenAIToolSchema
-from myclaw.tools.tool_gateway import ModelToolCall
 
 
 def unexpected_provider_factory(configuration: ProviderConfiguration) -> ModelProvider:
@@ -39,6 +31,19 @@ class StreamScript:
     error: BaseException | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderCall:
+    """Arguments captured from one direct keyword-only provider call."""
+
+    messages: list[dict[str, object]]
+    tools: tuple[OpenAIToolSchema, ...]
+    model: str
+    max_output: int
+    temperature: float
+    reasoning_effort: ReasoningEffort | None
+    timeout: int
+
+
 class ScriptedFakeProvider:
     """Replay provider behavior without loading an SDK or using the network."""
 
@@ -50,18 +55,40 @@ class ScriptedFakeProvider:
     ) -> None:
         self._streams = deque(streams)
         self._completions = deque(completions)
-        self.stream_requests: list[object] = []
-        self.unscripted_title_requests: list[ModelRequest] = []
-        self.complete_requests: list[object] = []
+        self.stream_requests: list[ProviderCall] = []
+        self.unscripted_title_requests: list[ProviderCall] = []
+        self.complete_requests: list[ProviderCall] = []
         self.closed = False
 
-    async def stream(self, request: object) -> AsyncIterator[ModelStreamEvent]:
-        if isinstance(request, ModelRequest) and request.system_prompt == session_title_prompt():
-            self.unscripted_title_requests.append(request)
+    async def stream(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str = "test-model",
+        max_output: int = 1024,
+        temperature: float = 0.2,
+        reasoning_effort: ReasoningEffort | None = None,
+        timeout: int = 30,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        call = _provider_call(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_output=max_output,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
+        if call.messages and call.messages[0] == {
+            "role": "system",
+            "content": session_title_prompt(),
+        }:
+            self.unscripted_title_requests.append(call)
             raise ModelCallError(
                 ErrorInfo(code="model_failed", message="No title response was scripted.")
             )
-        self.stream_requests.append(request)
+        self.stream_requests.append(call)
         if not self._streams:
             msg = "No scripted stream remains"
             raise AssertionError(msg)
@@ -73,30 +100,26 @@ class ScriptedFakeProvider:
 
     async def complete(
         self,
-        request: object | None = None,
         *,
-        messages: Sequence[dict[str, object]] | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
-        model: str | None = None,
-        max_output: int | None = None,
-        temperature: float | None = None,
-        reasoning_effort: str | None = None,
-        timeout: int | None = None,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str = "test-model",
+        max_output: int = 1024,
+        temperature: float = 0.2,
+        reasoning_effort: ReasoningEffort | None = None,
+        timeout: int = 30,
     ) -> ModelResponse:
-        if messages is not None:
-            request = _legacy_request_from_direct(
-                route="schedule" if len(tools or ()) == 10 else "memory",
+        self.complete_requests.append(
+            _provider_call(
                 messages=messages,
-                tools=() if tools is None else tools,
+                tools=tools,
                 model=model,
                 max_output=max_output,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
             )
-        elif request is None:
-            raise TypeError("Provider calls require a request or direct messages")
-        self.complete_requests.append(request)
+        )
         if not self._completions:
             msg = "No scripted completion remains"
             raise AssertionError(msg)
@@ -109,69 +132,45 @@ class ScriptedFakeProvider:
         self.closed = True
 
 
-def _legacy_request_from_direct(
+class ScriptedFakeRouter:
+    """Adapt a direct fake provider to a specialized route-only test seam."""
+
+    def __init__(self, provider: ScriptedFakeProvider) -> None:
+        self._provider = provider
+
+    async def complete(
+        self,
+        route: str,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+    ) -> ModelResponse:
+        del route
+        return await self._provider.complete(
+            messages=messages,
+            tools=tools,
+        )
+
+    async def close(self) -> None:
+        await self._provider.close()
+
+
+def _provider_call(
     *,
-    route: ModelRoute,
     messages: Sequence[dict[str, object]],
     tools: Sequence[OpenAIToolSchema],
-    model: str | None,
-    max_output: int | None,
-    temperature: float | None,
-    reasoning_effort: str | None,
-    timeout: int | None,
-) -> ModelRequest:
-    if not messages or messages[0].get("role") != "system":
-        raise ValueError("direct fake Provider request must start with a system message")
-    system_prompt = messages[0].get("content")
-    if not isinstance(system_prompt, str):
-        raise TypeError("fake Provider system content must be a string")
-    projected: tuple[ModelMessage, ...] = tuple(_model_message(message) for message in messages[1:])
-    return ModelRequest(
-        request_id=uuid4(),
-        route=route,
-        system_prompt=system_prompt,
-        messages=projected,
+    model: str,
+    max_output: int,
+    temperature: float,
+    reasoning_effort: ReasoningEffort | None,
+    timeout: int,
+) -> ProviderCall:
+    return ProviderCall(
+        messages=deepcopy(list(messages)),
         tools=tuple(tools),
-        stream=False,
-        model="" if model is None else model,
-        max_output=0 if max_output is None else max_output,
-        temperature=0.0 if temperature is None else temperature,
-        reasoning_effort=cast(ReasoningEffort | None, reasoning_effort),
-        timeout_seconds=0 if timeout is None else timeout,
+        model=model,
+        max_output=max_output,
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        timeout=timeout,
     )
-
-
-def _model_message(message: dict[str, object]) -> ModelMessage:
-    role = message.get("role")
-    if role == "user":
-        return UserModelMessage(content=_require_string(message, "content"))
-    if role == "assistant":
-        raw_tool_calls = message.get("tool_calls", [])
-        if not isinstance(raw_tool_calls, list):
-            raise TypeError("fake Provider assistant tool calls must be a list")
-        return AssistantModelMessage(
-            content=_require_string(message, "content"),
-            tool_calls=tuple(
-                ModelToolCall(
-                    id=_require_string(tool_call, "id"),
-                    name=_require_string(tool_call, "name"),
-                    arguments=_require_string(tool_call, "arguments"),
-                )
-                for tool_call in raw_tool_calls
-                if isinstance(tool_call, dict)
-            ),
-        )
-    if role == "tool":
-        return ToolModelMessage(
-            tool_call_id=_require_string(message, "tool_call_id"),
-            name=_require_string(message, "name"),
-            content=_require_string(message, "content"),
-        )
-    raise ValueError("fake Provider message role is unsupported")
-
-
-def _require_string(message: dict[str, object], field: str) -> str:
-    value = message.get(field)
-    if not isinstance(value, str):
-        raise TypeError(f"fake Provider {field} must be a string")
-    return value

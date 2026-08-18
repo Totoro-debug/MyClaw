@@ -12,17 +12,14 @@ from myclaw.agent.prompts import (
     interrupted_assistant_content,
     memory_task_input,
     memory_task_prompt,
-    render_tool_guidance,
     runtime_context,
     session_title_prompt,
 )
 from myclaw.memory.records import SummaryEntry
 from myclaw.templates import load_template, render_template
-from myclaw.tools.base import OpenAIToolSchema
 
 TEMPLATE_NAMES = {
     "builtin-identity.md",
-    "chat-system-prompt.md",
     "conversation-summary-input.md",
     "conversation-summary-system-prompt.md",
     "current-user-input.md",
@@ -34,7 +31,6 @@ TEMPLATE_NAMES = {
     "foreground-chat-system-prompt.md",
     "runtime-context.md",
     "session-title-prompt.md",
-    "tool-guidance-entry.md",
     "user-input.md",
 }
 NOW = datetime(2026, 7, 19, 12, 34, 56, 789000, tzinfo=UTC)
@@ -88,28 +84,10 @@ def test_runtime_and_user_input_templates_render_exact_context() -> None:
     ) == (f"{context}\n\n<user_input>\nKeep {{braces}} unchanged.\n</user_input>")
 
 
-def test_chat_and_tool_templates_render_exact_system_prompt() -> None:
-    schemas: tuple[OpenAIToolSchema, ...] = (
-        {
-            "type": "function",
-            "function": {"name": "read_file", "description": "Read a file.", "parameters": {}},
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "description": "Write a file.",
-                "parameters": {},
-            },
-        },
-    )
-    guidance = render_tool_guidance(schemas)
-
-    assert guidance == "- read_file: Read a file.\n- write_file: Write a file."
+def test_chat_system_prompt_uses_the_fixed_catalog_guidance() -> None:
     assert chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),
         long_term_memory="# Memory\n",
-        tool_guidance=guidance,
     ) == (
         "You are the MyClaw Personal Agent.\n"
         "Act within the user's current Workspace.\n"
@@ -118,8 +96,16 @@ def test_chat_and_tool_templates_render_exact_system_prompt() -> None:
         "# Memory\n"
         "</long_term_memory>\n\n"
         "<tool_guidance>\n"
-        "- read_file: Read a file.\n"
-        "- write_file: Write a file.</tool_guidance>"
+        "- read_file: Read UTF-8 text lines from a file within the current Workspace.\n"
+        "- write_file: Write UTF-8 text to a file within the current Workspace.\n"
+        "- edit_file: Replace exact UTF-8 text in a file within the current Workspace.\n"
+        "- list_dir: List files and directories within a directory root.\n"
+        "- glob: Match files and directories beneath a directory root.\n"
+        "- grep: Search UTF-8 text in a file or directory.\n"
+        "- exec: Run one Bash login-shell command with captured output in the current Workspace.\n"
+        "- web_search: Search the public web and return normalized result summaries.\n"
+        "- web_fetch: Fetch readable content from an HTTP or HTTPS URL.\n"
+        "- schedule: Manage one-time and recurring Schedule Jobs.</tool_guidance>"
     )
 
 

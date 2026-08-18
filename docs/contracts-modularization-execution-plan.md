@@ -164,8 +164,8 @@ python -m mypy
 2. 迁移 ArtifactReference 和 artifact tool_call_id 编码规则。
 3. 将 PermissionDecision 移入 Permission Policy 模块。
 4. 将 Tool Protocol 移入 Tools ports。
-5. 迁移 ModelRoute、ReasoningEffort、FinishReason、ModelUsage 和 ModelMessage 类型。
-6. 迁移 ModelRequest、ModelResponse、ModelStreamEvent 和 stream 序列校验。
+5. 迁移 ModelRoute、ReasoningEffort、FinishReason、ModelUsage 和响应消息类型。
+6. 迁移 Provider 直接调用字段、ModelResponse、ModelStreamEvent 和 stream 序列校验。
 7. 将 ModelProvider 和 ModelCallError 分别移入 Provider ports 与 errors。
 8. 将原 models、tools 和 ports 中相应名称改为兼容性再导出。
 9. 更新 Model Router、Provider adapters、Tool Gateway、内置 Tools 和测试 fixtures

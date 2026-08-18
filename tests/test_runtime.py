@@ -1,9 +1,10 @@
 import asyncio
 import json
 from collections import deque
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfoNotFoundError
 
@@ -26,13 +27,14 @@ from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelProvider,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
     TextDelta,
 )
 from myclaw.session.session import Session
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
@@ -46,10 +48,7 @@ LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
 SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
-REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
-FINAL_REQUEST_UUID = UUID("a8098c1a-f86e-4f33-8a28-25f602f8e603")
 TURN_TWO_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
-REQUEST_TWO_UUID = UUID("886313e1-3b8a-4a2d-9f7f-77611a4b6f4e")
 
 
 def _session_log_text(workspace: Path, session_id: str) -> str:
@@ -107,8 +106,22 @@ class BlockingSessionLogProvider:
         self._release = release
         self.started = asyncio.Event()
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        if request.system_prompt == session_title_prompt():
+    async def stream(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del tools, model, max_output, temperature, reasoning_effort, timeout
+        if messages and messages[0] == {
+            "role": "system",
+            "content": session_title_prompt(),
+        }:
             yield ModelCompleted(
                 response=ModelResponse(
                     message=AssistantModelMessage(content=f"{self._marker} title"),
@@ -128,8 +141,18 @@ class BlockingSessionLogProvider:
             )
         )
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
-        raise AssertionError(f"Unexpected complete request: {request!r}")
+    async def complete(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> ModelResponse:
+        raise AssertionError(f"Unexpected complete request: {messages!r}")
 
     async def close(self) -> None:
         return None
@@ -318,7 +341,7 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
         configuration=ConfigLoader(home).load(),
         provider_factory=lambda _: provider,
         now=clock.now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID)).__next__,
         retry_clock=clock,
     )
 
@@ -444,14 +467,7 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
         configuration=configuration,
         provider_factory=lambda _: provider(),
         now=FakeClock(NOW).now,
-        new_uuid=iter(
-            (
-                SESSION_UUID,
-                TURN_UUID,
-                REQUEST_UUID,
-                FINAL_REQUEST_UUID,
-            )
-        ).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID)).__next__,
     )
     unavailable_logs = unavailable_workspace / ".myclaw" / "logs"
     unavailable_logs.write_text("Session Log unavailable", encoding="utf-8")
@@ -682,7 +698,7 @@ async def test_prepared_repl_defers_injected_provider_factory_until_first_nonbla
         configuration=configuration,
         provider_factory=provider_factory,
         now=clock.now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID)).__next__,
     )
 
     assert factory_calls == []
@@ -743,7 +759,7 @@ async def test_prepared_repl_uses_the_chat_model_route(
         configuration=configuration,
         provider_factory=provider_factory,
         now=FakeClock(NOW).now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID)).__next__,
     )
 
     await runtime.run(
@@ -753,15 +769,13 @@ async def test_prepared_repl_uses_the_chat_model_route(
 
     assert [call.provider_id for call in factory_calls] == ["chat-provider"]
     request = provider.stream_requests[0]
-    assert isinstance(request, ModelRequest)
     assert (
-        request.route,
         request.model,
         request.max_output,
         request.temperature,
         request.reasoning_effort,
-        request.timeout_seconds,
-    ) == ("chat", "chat-model", 4096, 0.1, "high", 90)
+        request.timeout,
+    ) == ("chat-model", 4096, 0.1, "high", 90)
 
 
 @pytest.mark.asyncio
@@ -810,7 +824,7 @@ async def test_prepared_repl_routes_transient_provider_failures_through_one_retr
         configuration=configuration,
         provider_factory=lambda _: provider,
         now=clock.now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID)).__next__,
         retry_clock=clock,
     )
     writer = RecordingWriter()
@@ -884,7 +898,7 @@ async def test_prepared_repl_status_reports_the_actual_fallback_route_and_sessio
         configuration=configuration,
         provider_factory=provider_factory,
         now=clock.now,
-        new_uuid=iter((SESSION_UUID, TURN_UUID, REQUEST_UUID)).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID)).__next__,
         retry_clock=clock,
     )
     writer = RecordingWriter()
@@ -1100,7 +1114,6 @@ async def test_prepared_repl_uses_the_effective_fallback_route_budget(
     ]
     assert provider.stream_requests
     for request in provider.stream_requests:
-        assert isinstance(request, ModelRequest)
         assert request.model == "claude-model"
 
 
@@ -1155,15 +1168,7 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
         configuration=configuration,
         provider_factory=lambda _: provider,
         now=clock.now,
-        new_uuid=iter(
-            (
-                SESSION_UUID,
-                TURN_UUID,
-                REQUEST_UUID,
-                TURN_TWO_UUID,
-                REQUEST_TWO_UUID,
-            )
-        ).__next__,
+        new_uuid=iter((SESSION_UUID, TURN_UUID, TURN_TWO_UUID)).__next__,
     )
     state.long_term_memory_path.write_text(
         "# Changed after startup\n",
@@ -1175,11 +1180,9 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
         writer=RecordingWriter(),
     )
 
-    requests = [
-        request for request in provider.stream_requests if isinstance(request, ModelRequest)
-    ]
+    requests = provider.stream_requests
     assert len(requests) == 2
-    assert [message.to_dict() for message in requests[1].messages] == [
+    assert requests[1].messages[1:] == [
         {"role": "user", "content": "First raw input."},
         {"role": "assistant", "content": "First answer.", "tool_calls": []},
         {
@@ -1195,8 +1198,8 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
             ),
         },
     ]
-    system_prompt = requests[0].system_prompt
-    assert requests[1].system_prompt == system_prompt
+    system_prompt = cast(str, requests[0].messages[0]["content"])
+    assert requests[1].messages[0]["content"] == system_prompt
     workspace_identity = f"Workspace: {workspace.absolute()}"
     memory_block = f"<long_term_memory>\n{startup_memory}</long_term_memory>"
     assert "MyClaw Personal Agent" in system_prompt

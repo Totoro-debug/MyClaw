@@ -19,17 +19,14 @@ from myclaw.agent.events import AgentEvent, ConfirmationDecision, ConversationPo
 from myclaw.agent.prompts import (
     chat_system_prompt,
     current_user_input,
-    render_tool_guidance,
     runtime_context,
     session_title_prompt,
 )
 from myclaw.agent.run import (
     AgentRun,
-    AgentRunModelSettings,
+    AgentRunModelTarget,
     AgentRunRoute,
-    SummaryPreparer,
     ToolResultExternalizer,
-    model_message_from_session,
 )
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
@@ -59,10 +56,10 @@ from myclaw.provider.models import ModelProvider
 from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.conversation import (
-    ChatModelSettings,
     ForegroundSummaryPreparer,
     StreamingConversationPort,
 )
+from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
@@ -250,36 +247,28 @@ class _DeferredConversationPort:
     def __init__(
         self,
         *,
-        provider: ModelProvider,
+        model: AgentRunModelTarget,
         session: Session,
-        settings: ChatModelSettings,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
-        system_prompt: str,
         title_prompt: str,
         tool_gateway: ToolGateway,
         on_foreground_terminal: Callable[[], None],
-        summary_preparer: SummaryPreparer | None = None,
         foreground_summary_preparer: ForegroundSummaryPreparer | None = None,
         context_builder: ContextBuilder | None = None,
         memory_snapshot: Callable[[], str] | None = None,
-        system_prompt_for_memory: Callable[[str], str] | None = None,
         before_submit: Callable[[], Awaitable[None]] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
     ) -> None:
-        self._provider = provider
+        self._model = model
         self._session = session
-        self._settings = settings
         self._now = now
         self._new_uuid = new_uuid
-        self._system_prompt = system_prompt
         self._title_prompt = title_prompt
         self._tool_gateway = tool_gateway
-        self._summary_preparer = summary_preparer
         self._foreground_summary_preparer = foreground_summary_preparer
         self._context_builder = context_builder
         self._memory_snapshot = memory_snapshot
-        self._system_prompt_for_memory = system_prompt_for_memory
         self._before_submit = before_submit
         self._on_foreground_terminal = on_foreground_terminal
         self._externalize_result = externalize_result
@@ -312,19 +301,15 @@ class _DeferredConversationPort:
                 delegate = self._delegate
                 if delegate is None:
                     delegate = StreamingConversationPort(
-                        provider=self._provider,
+                        model=self._model,
                         session=self._session,
-                        settings=self._settings,
                         now=self._now,
                         new_uuid=self._new_uuid,
-                        system_prompt=self._system_prompt,
                         title_prompt=self._title_prompt,
                         tool_gateway=self._tool_gateway,
-                        summary_preparer=self._summary_preparer,
                         foreground_summary_preparer=self._foreground_summary_preparer,
                         context_builder=self._context_builder,
                         memory_snapshot=self._memory_snapshot,
-                        system_prompt_for_memory=self._system_prompt_for_memory,
                         externalize_result=self._externalize_result,
                         workspace_state=self._session.workspace_state,
                         title_log_ready=title_log_ready.wait,
@@ -476,20 +461,13 @@ def _prepare_repl_runtime(
         now=now,
         new_uuid=new_uuid,
     )
-    configured_chat = configuration.configured_route("chat")
-    settings = ChatModelSettings(
-        model=configured_chat.model,
-        max_output=configured_chat.max_output,
-        temperature=configured_chat.temperature,
-        reasoning_effort=configured_chat.reasoning_effort,
-        timeout_seconds=configured_chat.timeout,
-    )
     router = ModelRouter(
         configuration=configuration,
         provider_factory=provider_factory,
         clock=retry_clock,
         jitter=retry_jitter,
     )
+    model = AgentRunModelTarget.for_router(router)
     tool_gateway = ToolGateway(
         workspace=workspace_identity,
         schedule_store=schedule_store,
@@ -499,16 +477,13 @@ def _prepare_repl_runtime(
         schedule_store=schedule_store,
         scheduled_agent=True,
     )
-    tool_guidance = render_tool_guidance(tool_gateway.schemas)
 
     def system_prompt_for(memory_snapshot: str) -> str:
         return chat_system_prompt(
             workspace=workspace_identity.path,
             long_term_memory=memory_snapshot,
-            tool_guidance=tool_guidance,
         )
 
-    system_prompt = system_prompt_for(runtime_memory.snapshot())
     summaries = WorkspaceJsonlSummaryStore(workspace_state)
     memory_manager = MemoryManager(
         router=router,
@@ -646,21 +621,7 @@ def _prepare_repl_runtime(
             current_time=now(),
         )
 
-    configured_schedule = configuration.configured_route("schedule")
-    schedule_agent_run = AgentRun(
-        provider=router,
-        settings=AgentRunModelSettings(
-            model=configured_schedule.model,
-            max_output=configured_schedule.max_output,
-            temperature=configured_schedule.temperature,
-            reasoning_effort=configured_schedule.reasoning_effort,
-            timeout_seconds=configured_schedule.timeout,
-        ),
-        now=now,
-        new_uuid=new_uuid,
-        system_prompt=system_prompt,
-        tool_gateway=scheduled_tool_gateway,
-    )
+    schedule_agent_run = AgentRun(model=model, tool_gateway=scheduled_tool_gateway)
     schedule_clock = (
         schedule_scheduler_clock
         if schedule_scheduler_clock is not None
@@ -702,19 +663,15 @@ def _prepare_repl_runtime(
             )
 
         return _DeferredConversationPort(
-            provider=router,
+            model=model,
             session=active_session,
-            settings=settings,
             now=now,
             new_uuid=new_uuid,
-            system_prompt=system_prompt,
             title_prompt=session_title_prompt(),
             tool_gateway=tool_gateway,
-            summary_preparer=prepare_summary,
             foreground_summary_preparer=prepare_foreground_summary,
             context_builder=foreground_context,
             memory_snapshot=runtime_memory.snapshot,
-            system_prompt_for_memory=system_prompt_for,
             on_foreground_terminal=capture_foreground_chat_status,
             externalize_result=_build_tool_result_externalizer(
                 session=active_session,
@@ -839,9 +796,9 @@ def _project_history_messages(
     messages: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     return [
-        model_message.to_dict()
+        projected
         for message in messages
-        if (model_message := model_message_from_session(message)) is not None
+        if (projected := project_session_message(message)) is not None
     ]
 
 
@@ -910,9 +867,9 @@ def _runtime_status_input(
         runtime_context_value = ""
     else:
         retained = [
-            model_message.to_dict()
+            projected_message
             for message in session.messages[session.last_consolidated :]
-            if (model_message := model_message_from_session(message)) is not None
+            if (projected_message := project_session_message(message)) is not None
         ]
         runtime_context_value = (
             ""

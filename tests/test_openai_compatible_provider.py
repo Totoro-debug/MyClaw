@@ -4,28 +4,22 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from types import SimpleNamespace
-from uuid import UUID
+from typing import Any
 
 import pytest
 
 from myclaw.config.config import ProviderConfiguration
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
-    AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
-    ModelRoute,
     TextDelta,
-    ToolModelMessage,
-    UserModelMessage,
 )
 from myclaw.provider.openai_compatible import OpenAICompatibleProvider
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 
-REQUEST_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 READ_FILE_SCHEMA: OpenAIToolSchema = {
     "type": "function",
     "function": {
@@ -106,36 +100,36 @@ def configuration() -> ProviderConfiguration:
     )
 
 
-def request(*, stream: bool = True) -> ModelRequest:
-    return ModelRequest(
-        request_id=REQUEST_ID,
-        route="chat" if stream else "memory",
-        system_prompt="You are MyClaw.",
-        messages=(UserModelMessage(content="Hello"),),
-        tools=(READ_FILE_SCHEMA,),
-        stream=stream,
-        model="model-test",
-        max_output=512,
-        temperature=0.25,
-        reasoning_effort="high",
-        timeout_seconds=17,
-    )
+def request(*, stream: bool = True) -> dict[str, Any]:
+    del stream
+    return {
+        "messages": [
+            {"role": "system", "content": "You are MyClaw."},
+            {"role": "user", "content": "Hello"},
+        ],
+        "tools": (READ_FILE_SCHEMA,),
+        "model": "model-test",
+        "max_output": 512,
+        "temperature": 0.25,
+        "reasoning_effort": "high",
+        "timeout": 17,
+    }
 
 
-def completion_request(route: ModelRoute) -> ModelRequest:
-    return ModelRequest(
-        request_id=REQUEST_ID,
-        route=route,
-        system_prompt="Summarize accurately.",
-        messages=(UserModelMessage(content="Conversation transcript"),),
-        tools=(),
-        stream=False,
-        model="model-test",
-        max_output=256,
-        temperature=0.1,
-        reasoning_effort=None,
-        timeout_seconds=23,
-    )
+def completion_request(route: str) -> dict[str, Any]:
+    del route
+    return {
+        "messages": [
+            {"role": "system", "content": "Summarize accurately."},
+            {"role": "user", "content": "Conversation transcript"},
+        ],
+        "tools": (),
+        "model": "model-test",
+        "max_output": 256,
+        "temperature": 0.1,
+        "reasoning_effort": None,
+        "timeout": 23,
+    }
 
 
 @pytest.mark.asyncio
@@ -177,7 +171,7 @@ async def test_stream_translates_text_and_usage_through_official_sdk_boundary() 
     factory = FakeOpenAIClientFactory(client)
     provider = OpenAICompatibleProvider(configuration(), client_factory=factory)
 
-    events = [event async for event in provider.stream(request())]
+    events = [event async for event in provider.stream(**request())]
 
     assert events[:2] == [TextDelta(delta="Hel"), TextDelta(delta="lo")]
     completed = events[-1]
@@ -203,6 +197,7 @@ async def test_stream_translates_text_and_usage_through_official_sdk_boundary() 
             ],
             "model": "model-test",
             "stream": True,
+            "reasoning_effort": "high",
             "stream_options": {"include_usage": True},
             "temperature": 0.25,
             "timeout": 17,
@@ -281,7 +276,7 @@ async def test_stream_aggregates_fragmented_tool_calls_with_mixed_content() -> N
         client_factory=FakeOpenAIClientFactory(FakeOpenAIClient(stream)),
     )
 
-    events = [event async for event in provider.stream(request())]
+    events = [event async for event in provider.stream(**request())]
 
     assert events[:2] == [TextDelta(delta="I can "), TextDelta(delta="inspect.")]
     completed = events[-1]
@@ -305,7 +300,7 @@ async def test_stream_aggregates_fragmented_tool_calls_with_mixed_content() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["memory", "schedule"])
-async def test_complete_normalizes_memory_and_schedule_responses(route: ModelRoute) -> None:
+async def test_complete_normalizes_memory_and_schedule_responses(route: str) -> None:
     response = SimpleNamespace(
         choices=[
             SimpleNamespace(
@@ -321,7 +316,7 @@ async def test_complete_normalizes_memory_and_schedule_responses(route: ModelRou
         client_factory=FakeOpenAIClientFactory(client),
     )
 
-    observed = await provider.complete(completion_request(route))
+    observed = await provider.complete(**completion_request(route))
 
     assert observed.to_dict() == {
         "message": {"role": "assistant", "content": "Concise summary", "tool_calls": []},
@@ -369,7 +364,7 @@ async def test_complete_rejects_an_empty_success_response(response: object) -> N
     )
 
     with pytest.raises(ModelCallError) as raised:
-        await provider.complete(completion_request("memory"))
+        await provider.complete(**completion_request("memory"))
 
     assert raised.value.error.to_dict() == {
         "code": "model_failed",
@@ -410,29 +405,30 @@ async def test_complete_translates_tool_history_and_mixed_tool_response() -> Non
         configuration(),
         client_factory=FakeOpenAIClientFactory(client),
     )
-    model_request = replace(
-        completion_request("memory"),
-        messages=(
-            UserModelMessage(content="Read memory."),
-            AssistantModelMessage(
-                content="Reading.",
-                tool_calls=(
-                    ModelToolCall(
-                        id="call_read",
-                        name="read_file",
-                        arguments='{"path":"memory.md"}',
-                    ),
-                ),
-            ),
-            ToolModelMessage(
-                tool_call_id="call_read",
-                name="read_file",
-                content="Existing memory",
-            ),
-        ),
-    )
+    model_request = completion_request("memory")
+    model_request["messages"] = [
+        {"role": "system", "content": "Summarize accurately."},
+        {"role": "user", "content": "Read memory."},
+        {
+            "role": "assistant",
+            "content": "Reading.",
+            "tool_calls": [
+                {
+                    "id": "call_read",
+                    "name": "read_file",
+                    "arguments": '{"path":"memory.md"}',
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_read",
+            "name": "read_file",
+            "content": "Existing memory",
+        },
+    ]
 
-    observed = await provider.complete(model_request)
+    observed = await provider.complete(**model_request)
 
     assert observed.to_dict() == {
         "message": {
@@ -569,7 +565,7 @@ async def test_complete_maps_sdk_failures_once(
     )
 
     with pytest.raises(ModelCallError) as raised:
-        await provider.complete(completion_request("memory"))
+        await provider.complete(**completion_request("memory"))
 
     assert raised.value.error.to_dict() == expected
     assert raised.value.__cause__ is failure
@@ -586,7 +582,7 @@ async def test_stream_maps_iteration_timeout_without_retrying() -> None:
     )
 
     with pytest.raises(ModelCallError) as raised:
-        async for _event in provider.stream(request()):
+        async for _event in provider.stream(**request()):
             pass
 
     assert raised.value.error.to_dict() == {
@@ -609,7 +605,7 @@ async def test_stream_maps_creation_error_without_retrying() -> None:
     )
 
     with pytest.raises(ModelCallError) as raised:
-        async for _event in provider.stream(request()):
+        async for _event in provider.stream(**request()):
             pass
 
     assert raised.value.error.to_dict() == {
@@ -631,7 +627,7 @@ async def test_stream_rejects_an_empty_success_response() -> None:
     )
 
     with pytest.raises(ModelCallError) as raised:
-        async for _event in provider.stream(request()):
+        async for _event in provider.stream(**request()):
             pass
 
     assert raised.value.error.to_dict() == {
@@ -677,7 +673,7 @@ async def test_stream_preserves_malformed_tool_argument_text_for_the_gateway() -
         client_factory=FakeOpenAIClientFactory(client),
     )
 
-    events = [event async for event in provider.stream(request())]
+    events = [event async for event in provider.stream(**request())]
 
     completed = events[-1]
     assert isinstance(completed, ModelCompleted)
@@ -712,7 +708,7 @@ async def test_complete_preserves_non_object_tool_argument_text_for_the_gateway(
         client_factory=FakeOpenAIClientFactory(client),
     )
 
-    observed = await provider.complete(completion_request("memory"))
+    observed = await provider.complete(**completion_request("memory"))
 
     assert observed.message.tool_calls == (
         ModelToolCall(id="call_invalid", name="read_file", arguments="[]"),
@@ -730,7 +726,7 @@ async def test_stream_propagates_cancellation_without_retrying() -> None:
     )
 
     with pytest.raises(asyncio.CancelledError) as raised:
-        async for _event in provider.stream(request()):
+        async for _event in provider.stream(**request()):
             pass
 
     assert raised.value is cancellation

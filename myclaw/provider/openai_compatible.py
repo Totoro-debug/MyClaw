@@ -16,13 +16,11 @@ from myclaw.provider.models import (
     FinishReason,
     ModelCompleted,
     ModelMessages,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
     ReasoningEffort,
     TextDelta,
-    resolve_provider_call_arguments,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -99,18 +97,16 @@ class OpenAICompatibleProvider:
 
     def stream(
         self,
-        request: ModelRequest | None = None,
         *,
-        messages: ModelMessages | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
-        model: str | None = None,
-        max_output: int | None = None,
-        temperature: float | None = None,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
         reasoning_effort: ReasoningEffort | None = None,
-        timeout: int | None = None,
+        timeout: int,
     ) -> AsyncIterator[ModelStreamEvent]:
-        arguments = resolve_provider_call_arguments(
-            request,
+        return self._stream_with_arguments(
             messages=messages,
             tools=tools,
             model=model,
@@ -118,16 +114,6 @@ class OpenAICompatibleProvider:
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             timeout=timeout,
-        )
-        return self._stream_with_arguments(
-            messages=arguments.messages,
-            tools=arguments.tools,
-            model=arguments.model,
-            max_output=arguments.max_output,
-            temperature=arguments.temperature,
-            reasoning_effort=arguments.reasoning_effort,
-            timeout=arguments.timeout,
-            from_legacy_request=arguments.from_legacy_request,
         )
 
     async def _stream_with_arguments(
@@ -140,7 +126,6 @@ class OpenAICompatibleProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
-        from_legacy_request: bool,
     ) -> AsyncIterator[ModelStreamEvent]:
         try:
             async for event in self._stream_once(
@@ -151,7 +136,6 @@ class OpenAICompatibleProvider:
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
-                from_legacy_request=from_legacy_request,
             ):
                 yield event
         except ModelCallError:
@@ -169,7 +153,6 @@ class OpenAICompatibleProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
-        from_legacy_request: bool,
     ) -> AsyncIterator[ModelStreamEvent]:
         result = await self._client.chat.completions.create(
             **_request_arguments(
@@ -181,7 +164,6 @@ class OpenAICompatibleProvider:
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
                 stream=True,
-                include_reasoning=not from_legacy_request,
             )
         )
         chunks = cast(AsyncIterator[object], result)
@@ -237,36 +219,24 @@ class OpenAICompatibleProvider:
 
     async def complete(
         self,
-        request: ModelRequest | None = None,
         *,
-        messages: ModelMessages | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
-        model: str | None = None,
-        max_output: int | None = None,
-        temperature: float | None = None,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
         reasoning_effort: ReasoningEffort | None = None,
-        timeout: int | None = None,
+        timeout: int,
     ) -> ModelResponse:
-        arguments = resolve_provider_call_arguments(
-            request,
-            messages=messages,
-            tools=tools,
-            model=model,
-            max_output=max_output,
-            temperature=temperature,
-            reasoning_effort=reasoning_effort,
-            timeout=timeout,
-        )
         try:
             return await self._complete_once(
-                messages=arguments.messages,
-                tools=arguments.tools,
-                model=arguments.model,
-                max_output=arguments.max_output,
-                temperature=arguments.temperature,
-                reasoning_effort=arguments.reasoning_effort,
-                timeout=arguments.timeout,
-                from_legacy_request=arguments.from_legacy_request,
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
             )
         except ModelCallError:
             raise
@@ -283,7 +253,6 @@ class OpenAICompatibleProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
-        from_legacy_request: bool,
     ) -> ModelResponse:
         result = await self._client.chat.completions.create(
             **_request_arguments(
@@ -295,7 +264,6 @@ class OpenAICompatibleProvider:
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
                 stream=False,
-                include_reasoning=not from_legacy_request,
             )
         )
         choices = cast(list[object], getattr(result, "choices", []))
@@ -336,7 +304,6 @@ def _request_arguments(
     reasoning_effort: ReasoningEffort | None,
     timeout: int,
     stream: bool,
-    include_reasoning: bool,
 ) -> dict[str, object]:
     arguments: dict[str, object] = {
         "max_tokens": max_output,
@@ -347,7 +314,7 @@ def _request_arguments(
         "timeout": timeout,
         "tools": list(tools),
     }
-    if include_reasoning and reasoning_effort is not None:
+    if reasoning_effort is not None:
         arguments["reasoning_effort"] = reasoning_effort
     if stream:
         arguments["stream_options"] = {"include_usage": True}

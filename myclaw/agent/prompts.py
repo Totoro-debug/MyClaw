@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from datetime import datetime
 from pathlib import PurePath
-from typing import TYPE_CHECKING
 
 from myclaw.memory.records import SummaryEntry
 from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
-
-if TYPE_CHECKING:
-    from myclaw.tools.base import OpenAIToolSchema
 
 
 def current_user_input(*, content: str, current_time: datetime, session_id: str) -> str:
@@ -33,27 +28,12 @@ def runtime_context(*, current_time: datetime, session_id: str) -> str:
     )
 
 
-def chat_system_prompt(
-    *, workspace: PurePath, long_term_memory: str, tool_guidance: str = ""
-) -> str:
-    """Compose chat system context in the accepted fixed order."""
+def chat_system_prompt(*, workspace: PurePath, long_term_memory: str) -> str:
+    """Compose the fixed Tool-guidance System Prompt."""
     return render_template(
-        "chat-system-prompt.md",
+        "foreground-chat-system-prompt.md",
         identity=render_template("builtin-identity.md", workspace=workspace),
         long_term_memory=long_term_memory,
-        tool_guidance=tool_guidance,
-    )
-
-
-def render_tool_guidance(schemas: Iterable[OpenAIToolSchema]) -> str:
-    """Render the model-visible tool catalog in stable definition order."""
-    return "\n".join(
-        render_template(
-            "tool-guidance-entry.md",
-            name=schema["function"]["name"],
-            description=schema["function"]["description"],
-        )
-        for schema in schemas
     )
 
 

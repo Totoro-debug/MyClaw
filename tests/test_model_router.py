@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import UUID
+from typing import Any
 
 import pytest
 
@@ -23,9 +23,7 @@ from myclaw.provider.model_router import ModelRouter, ModelRouteStatus
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
     ModelResponse,
-    ModelRoute,
     ModelUsage,
     TextDelta,
 )
@@ -34,7 +32,6 @@ from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
-REQUEST_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 SESSION_ID = "20260711-153012-123000_550e8400-e29b-41d4-a716-446655440000"
 
 
@@ -129,20 +126,12 @@ def memory_configuration() -> UserConfiguration:
     )
 
 
-def request(*, route: ModelRoute = "default", stream: bool = True) -> ModelRequest:
-    return ModelRequest(
-        request_id=REQUEST_UUID,
-        route=route,
-        system_prompt="You are MyClaw.",
-        messages=(),
-        tools=(),
-        stream=stream,
-        model="caller-placeholder",
-        max_output=1,
-        temperature=0,
-        reasoning_effort=None,
-        timeout_seconds=1,
-    )
+def request(*, route: str = "default", stream: bool = True) -> dict[str, Any]:
+    del route, stream
+    return {
+        "messages": [{"role": "system", "content": "You are MyClaw."}],
+        "tools": (),
+    }
 
 
 def completed(content: str = "Done") -> ModelCompleted:
@@ -203,8 +192,8 @@ async def test_router_close_settles_every_cached_provider_when_one_close_fails()
         provider_factory=lambda provider: providers[provider.provider_id],
         clock=FakeClock(NOW),
     )
-    await router.complete(request(route="default", stream=False))
-    await router.complete(request(route="memory", stream=False))
+    await router.complete("default", **request())
+    await router.complete("memory", **request())
 
     with pytest.raises(RuntimeError, match="default close failed"):
         await router.close()
@@ -236,8 +225,8 @@ async def test_router_close_settles_every_provider_when_one_close_is_cancelled()
         provider_factory=lambda provider: providers[provider.provider_id],
         clock=FakeClock(NOW),
     )
-    await router.complete(request(route="default", stream=False))
-    await router.complete(request(route="memory", stream=False))
+    await router.complete("default", **request())
+    await router.complete("memory", **request())
 
     with pytest.raises(asyncio.CancelledError):
         await router.close()
@@ -269,8 +258,8 @@ async def test_router_starts_every_provider_close_before_waiting_for_one_to_fini
         provider_factory=lambda provider: providers[provider.provider_id],
         clock=FakeClock(NOW),
     )
-    await router.complete(request(route="default", stream=False))
-    await router.complete(request(route="memory", stream=False))
+    await router.complete("default", **request())
+    await router.complete("memory", **request())
     closing = asyncio.create_task(router.close())
     await first_started.wait()
     try:
@@ -300,7 +289,7 @@ async def test_concurrent_router_close_waits_for_the_same_provider_shutdown() ->
         provider_factory=lambda _configuration: provider,
         clock=FakeClock(NOW),
     )
-    await router.complete(request(stream=False))
+    await router.complete("default", **request())
 
     first = asyncio.create_task(router.close())
     await started.wait()
@@ -333,7 +322,7 @@ async def test_cancelling_one_router_close_caller_does_not_cancel_provider_shutd
         provider_factory=lambda _configuration: provider,
         clock=FakeClock(NOW),
     )
-    await router.complete(request(stream=False))
+    await router.complete("default", **request())
 
     caller = asyncio.create_task(router.close())
     await started.wait()
@@ -363,11 +352,11 @@ async def test_router_cannot_create_a_new_provider_after_close() -> None:
         provider_factory=provider_factory,
         clock=FakeClock(NOW),
     )
-    await router.complete(request(stream=False))
+    await router.complete("default", **request())
     await router.close()
 
     with pytest.raises(RuntimeError, match="Model Router is closed"):
-        await router.complete(request(stream=False))
+        await router.complete("default", **request())
 
     assert factory_calls == 1
 
@@ -386,7 +375,7 @@ async def test_model_router_caps_one_logical_stream_at_five_provider_attempts() 
     )
 
     with pytest.raises(ModelCallError) as raised:
-        await collect(router.stream(request()))
+        await collect(router.stream("default", **request()))
 
     assert raised.value.error is failure.error
     assert len(provider.stream_requests) == 5
@@ -416,7 +405,7 @@ async def test_model_router_records_only_consumed_retry_attempts(
     capture = capture_diagnostics()
 
     with capture.session(SESSION_ID), pytest.raises(ModelCallError):
-        await collect(router.stream(request(route="chat")))
+        await collect(router.stream("chat", **request()))
     capture.close()
 
     records = [
@@ -463,7 +452,7 @@ async def test_model_router_uses_injected_clock_for_exponential_backoff_and_retr
         jitter=None,
     )
 
-    observed = await collect(router.stream(request()))
+    observed = await collect(router.stream("default", **request()))
 
     assert observed == [completed()]
     assert clock.sleeps == [0.5, 1.0, 7, 60]
@@ -490,7 +479,7 @@ async def test_model_router_uses_asyncio_sleep_when_clock_is_not_injected(
         provider_factory=lambda _: provider,
     )
 
-    observed = await collect(router.stream(request()))
+    observed = await collect(router.stream("default", **request()))
 
     assert observed == [completed()]
     assert sleeps == [0.5]
@@ -529,22 +518,20 @@ async def test_model_router_falls_back_after_a_permanent_requested_route_failure
         jitter=None,
     )
 
-    observed = await collect(router.stream(request(route="chat")))
+    observed = await collect(router.stream("chat", **request()))
 
     assert observed == [completed()]
     assert factory_calls == ["chat-provider", "default-provider"]
     assert len(chat_provider.stream_requests) == 2
     assert len(default_provider.stream_requests) == 1
     fallback_request = default_provider.stream_requests[0]
-    assert isinstance(fallback_request, ModelRequest)
     assert (
-        fallback_request.route,
         fallback_request.model,
         fallback_request.max_output,
         fallback_request.temperature,
         fallback_request.reasoning_effort,
-        fallback_request.timeout_seconds,
-    ) == ("chat", "default-model", 4096, 0.2, None, 120)
+        fallback_request.timeout,
+    ) == ("default-model", 4096, 0.2, None, 120)
     assert clock.sleeps == [0.5]
 
 
@@ -571,7 +558,7 @@ async def test_model_router_records_failed_attempt_and_default_fallback_separate
     capture = capture_diagnostics()
 
     with capture.session(SESSION_ID):
-        observed = await collect(router.stream(request(route="chat")))
+        observed = await collect(router.stream("chat", **request()))
     capture.close()
 
     assert observed == [completed("Recovered")]
@@ -628,7 +615,7 @@ async def test_model_router_route_status_updates_when_dynamic_fallback_is_select
     )
     assert "chat-secret" not in repr(initial)
 
-    await collect(router.stream(request(route="chat")))
+    await collect(router.stream("chat", **request()))
 
     fallback = router.route_status("chat")
     assert fallback == ModelRouteStatus(
@@ -677,7 +664,7 @@ async def test_model_router_records_static_default_fallback_without_provider_att
     capture = capture_diagnostics()
 
     with capture.session(SESSION_ID):
-        observed = await collect(router.stream(request(route="chat")))
+        observed = await collect(router.stream("chat", **request()))
     capture.close()
 
     assert observed == [completed("Static fallback")]
@@ -716,11 +703,11 @@ async def test_model_router_route_status_recovers_on_the_next_logical_stream() -
         jitter=None,
     )
 
-    first = await collect(router.stream(request(route="chat")))
+    first = await collect(router.stream("chat", **request()))
     assert first == [completed("Fallback response.")]
     assert router.route_status("chat").selected_route == "default"
 
-    second = await collect(router.stream(request(route="chat")))
+    second = await collect(router.stream("chat", **request()))
 
     assert second == [completed("Chat recovered.")]
     assert len(chat_provider.stream_requests) == 2
@@ -758,18 +745,13 @@ async def test_model_router_complete_shares_one_budget_across_requested_and_defa
         jitter=None,
     )
 
-    observed = await router.complete(request(route="memory", stream=False))
+    observed = await router.complete("memory", **request())
 
     assert observed is expected
     assert len(memory_provider.complete_requests) == 3
     assert len(default_provider.complete_requests) == 2
     fallback_request = default_provider.complete_requests[0]
-    assert isinstance(fallback_request, ModelRequest)
-    assert (fallback_request.route, fallback_request.model, fallback_request.stream) == (
-        "memory",
-        "default-model",
-        False,
-    )
+    assert fallback_request.model == "default-model"
     assert clock.sleeps == [0.5, 1.0, 4.0]
 
 
@@ -790,11 +772,11 @@ async def test_model_router_route_status_recovers_on_the_next_logical_completion
         jitter=None,
     )
 
-    first = await router.complete(request(route="memory", stream=False))
+    first = await router.complete("memory", **request())
     assert first == response("Fallback summary.")
     assert router.route_status("memory").selected_route == "default"
 
-    second = await router.complete(request(route="memory", stream=False))
+    second = await router.complete("memory", **request())
 
     assert second == response("Memory recovered.")
     assert len(memory_provider.complete_requests) == 2
@@ -846,7 +828,7 @@ async def test_model_router_does_not_retry_or_fallback_terminal_model_errors(
     )
 
     with pytest.raises(ModelCallError) as raised:
-        await collect(router.stream(request(route="chat")))
+        await collect(router.stream("chat", **request()))
 
     assert raised.value is failure
     assert len(chat_provider.stream_requests) == 1
@@ -880,7 +862,7 @@ async def test_model_router_never_retries_after_streaming_becomes_observable() -
     observed: list[object] = []
 
     with pytest.raises(ModelCallError):
-        async for event in router.stream(request(route="chat")):
+        async for event in router.stream("chat", **request()):
             observed.append(event)
 
     assert observed == [partial]
@@ -910,7 +892,7 @@ async def test_model_router_propagates_task_cancellation_without_another_attempt
     )
 
     with pytest.raises(asyncio.CancelledError):
-        await collect(router.stream(request(route="chat")))
+        await collect(router.stream("chat", **request()))
 
     assert len(chat_provider.stream_requests) == 1
     assert default_provider.stream_requests == []
@@ -933,7 +915,7 @@ async def test_model_router_closes_each_provider_adapter_it_constructed() -> Non
         clock=FakeClock(NOW),
         jitter=None,
     )
-    await collect(router.stream(request(route="chat")))
+    await collect(router.stream("chat", **request()))
 
     await router.close()
 

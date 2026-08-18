@@ -27,10 +27,10 @@ from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
 )
 from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.service import ScheduleClock
@@ -39,8 +39,7 @@ from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock
-from tests.fixtures.provider import _legacy_request_from_direct
+from tests.fixtures import FakeClock, ProviderCall
 
 NOW = datetime(2026, 8, 7, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -84,19 +83,42 @@ class _RuntimeProvider:
         self._chat_call_count = 0
         self.chat_block_started = asyncio.Event()
         self.release_chat = asyncio.Event()
-        self.stream_requests: list[ModelRequest] = []
-        self.complete_requests: list[ModelRequest] = []
+        self.stream_requests: list[ProviderCall] = []
+        self.complete_requests: list[ProviderCall] = []
         self.direct_complete_messages: list[
             tuple[list[dict[str, object]], list[OpenAIToolSchema]]
         ] = []
         self.closed = False
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        if request.system_prompt == session_title_prompt():
+    async def stream(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        if messages and messages[0] == {
+            "role": "system",
+            "content": session_title_prompt(),
+        }:
             yield ModelCompleted(response=_response("Schedule acceptance"))
             return
 
-        self.stream_requests.append(request)
+        self.stream_requests.append(
+            ProviderCall(
+                messages=deepcopy(list(messages)),
+                tools=tuple(tools),
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
+        )
         self._chat_call_count += 1
         if self._block_chat_call == self._chat_call_count:
             self.chat_block_started.set()
@@ -105,32 +127,27 @@ class _RuntimeProvider:
 
     async def complete(
         self,
-        request: ModelRequest | str | None = None,
         *,
-        messages: Sequence[dict[str, object]] | None = None,
-        tools: Sequence[OpenAIToolSchema] = (),
-        model: str | None = None,
-        max_output: int | None = None,
-        temperature: float | None = None,
-        reasoning_effort: str | None = None,
-        timeout: int | None = None,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
     ) -> ModelResponse:
-        if request is None or isinstance(request, str):
-            if messages is None:
-                raise TypeError("direct Runtime Provider calls require messages")
-            self.direct_complete_messages.append((deepcopy(list(messages)), list(tools)))
-            request = _legacy_request_from_direct(
-                route="schedule" if len(tools) == 10 else "memory",
-                messages=messages,
-                tools=tools,
-                model=model,
-                max_output=max_output,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
-                timeout=timeout,
-            )
-        self.complete_requests.append(request)
-        return self._take(request.route)
+        self.direct_complete_messages.append((deepcopy(list(messages)), list(tools)))
+        call = ProviderCall(
+            messages=deepcopy(list(messages)),
+            tools=tuple(tools),
+            model=model,
+            max_output=max_output,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
+        self.complete_requests.append(call)
+        return self._take("schedule" if len(tools) == 10 else "memory")
 
     async def close(self) -> None:
         self.closed = True
@@ -140,6 +157,10 @@ class _RuntimeProvider:
         if responses is None or not responses:
             raise AssertionError(f"No scripted response remains for {route}.")
         return responses.popleft()
+
+
+def _is_schedule_call(call: ProviderCall) -> bool:
+    return len(call.tools) == 10
 
 
 def _response(content: str, *, tool_call: ModelToolCall | None = None) -> ModelResponse:
@@ -483,8 +504,8 @@ async def test_runtime_schedule_reapplies_summary_policy_before_tool_loop_contin
     try:
         await _wait_until(
             lambda: (
-                [request.route for request in provider.complete_requests]
-                == ["schedule", "memory", "schedule"]
+                [_is_schedule_call(request) for request in provider.complete_requests]
+                == [True, False, True]
                 and runtime.schedule_service.status_snapshot().active_job_count == 0
             )
         )
@@ -498,7 +519,7 @@ async def test_runtime_schedule_reapplies_summary_policy_before_tool_loop_contin
             provider.direct_complete_messages,
             strict=True,
         )
-        if request.route == "schedule"
+        if _is_schedule_call(request)
     ]
     assert [message["role"] for message in schedule_messages[1]] == [
         "system",
@@ -639,7 +660,7 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
                     [
                         request
                         for request in provider.complete_requests
-                        if request.route == "schedule"
+                        if _is_schedule_call(request)
                     ]
                 )
                 == 1
@@ -663,7 +684,7 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
                     [
                         request
                         for request in provider.complete_requests
-                        if request.route == "schedule"
+                        if _is_schedule_call(request)
                     ]
                 )
                 == 2
@@ -671,10 +692,14 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
             )
         )
         schedule_requests = [
-            request for request in provider.complete_requests if request.route == "schedule"
+            request for request in provider.complete_requests if _is_schedule_call(request)
         ]
-        assert "Fresh schedule preference." not in schedule_requests[0].system_prompt
-        assert "Fresh schedule preference." in schedule_requests[1].system_prompt
+        assert "Fresh schedule preference." not in cast(
+            str, schedule_requests[0].messages[0]["content"]
+        )
+        assert "Fresh schedule preference." in cast(
+            str, schedule_requests[1].messages[0]["content"]
+        )
         assert [entry.content for entry in await summaries.after(0, 10)] == [
             "Schedule history summary.",
             "Second schedule history summary.",
@@ -715,8 +740,7 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
             )
         )
 
-        assert provider.complete_requests[0].route == "schedule"
-        assert provider.complete_requests[0].stream is False
+        assert _is_schedule_call(provider.complete_requests[0])
         assert [
             definition["function"]["name"] for definition in provider.complete_requests[0].tools
         ] == [

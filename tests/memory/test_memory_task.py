@@ -3,7 +3,7 @@ import json
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -30,17 +30,16 @@ from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
-    ModelRequest,
     ModelResponse,
     ModelRoute,
     ModelUsage,
-    ToolModelMessage,
+    ReasoningEffort,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock, ScriptedFakeProvider
+from tests.fixtures import FakeClock, ProviderCall, ScriptedFakeProvider, ScriptedFakeRouter
 from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
 
 NOW = datetime(2026, 7, 11, 16, 0, 0, tzinfo=timezone(timedelta(hours=8)))
@@ -65,6 +64,31 @@ def _response(
         usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
         finish_reason="tool_calls" if tool_calls else "stop",
     )
+
+
+def _provider_call(
+    *,
+    messages: Sequence[dict[str, object]],
+    tools: Sequence[OpenAIToolSchema],
+    model: str,
+    max_output: int,
+    temperature: float,
+    reasoning_effort: ReasoningEffort | None,
+    timeout: int,
+) -> ProviderCall:
+    return ProviderCall(
+        messages=list(messages),
+        tools=tuple(tools),
+        model=model,
+        max_output=max_output,
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        timeout=timeout,
+    )
+
+
+def _router(provider: ScriptedFakeProvider) -> ScriptedFakeRouter:
+    return ScriptedFakeRouter(provider)
 
 
 class _RecordingMemoryTaskRouter:
@@ -234,7 +258,7 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
     home.initialize()
     provider = ScriptedFakeProvider()
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=WorkspaceJsonlSummaryStore(_state(home)),
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
@@ -286,7 +310,7 @@ async def test_memory_task_uses_the_direct_memory_route_and_dictionary_messages(
         "read_file",
         "edit_file",
     ]
-    assert "request_id" not in json.dumps(messages)
+    assert all("id" not in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -400,7 +424,7 @@ async def test_memory_task_without_an_edit_advances_the_summary_cursor(
         completions=(_response("No stable Long-term Memory update is needed."),)
     )
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=memory,
         long_term_path=_state(home).long_term_memory_path,
@@ -418,16 +442,13 @@ async def test_memory_task_without_an_edit_advances_the_summary_cursor(
     assert await memory.read_summary_cursor() == 1
     assert await memory.read_long_term() == original_memory
     request = provider.complete_requests[0]
-    assert isinstance(request, ModelRequest)
-    assert request.route == "memory"
-    assert request.stream is False
     assert [schema["function"]["name"] for schema in request.tools] == [
         "read_file",
         "edit_file",
     ]
-    assert "The user prefers concise status reports." in request.messages[0].content
+    assert "The user prefers concise status reports." in cast(str, request.messages[1]["content"])
     for section in ("User Info", "User Preference", "Project Fact", "Lesson"):
-        assert section in request.system_prompt
+        assert section in cast(str, request.messages[0]["content"])
 
 
 @pytest.mark.asyncio
@@ -443,19 +464,17 @@ async def test_memory_task_advances_the_summary_cursor_before_model_work(
     class CursorObservingProvider(ScriptedFakeProvider):
         async def complete(
             self,
-            request: object | None = None,
             *,
-            messages: Sequence[dict[str, object]] | None = None,
-            tools: Sequence[OpenAIToolSchema] | None = None,
-            model: str | None = None,
-            max_output: int | None = None,
-            temperature: float | None = None,
-            reasoning_effort: str | None = None,
-            timeout: int | None = None,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str = "test-model",
+            max_output: int = 1024,
+            temperature: float = 0.2,
+            reasoning_effort: ReasoningEffort | None = None,
+            timeout: int = 30,
         ) -> ModelResponse:
             assert await memory.read_summary_cursor() == 1
             return await super().complete(
-                request,
                 messages=messages,
                 tools=tools,
                 model=model,
@@ -467,7 +486,7 @@ async def test_memory_task_advances_the_summary_cursor_before_model_work(
 
     provider = CursorObservingProvider(completions=(_response("No update needed."),))
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=memory,
         long_term_path=_state(home).long_term_memory_path,
@@ -526,7 +545,7 @@ async def test_memory_task_preadvances_summary_cursor_before_exact_edit(
         )
     )
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=memory_path,
@@ -544,11 +563,10 @@ async def test_memory_task_preadvances_summary_cursor_before_exact_edit(
     assert new_text in await WorkspaceFileMemoryStore(_state(home)).read_long_term()
     assert await WorkspaceFileMemoryStore(_state(home)).read_summary_cursor() == 1
     second_request = provider.complete_requests[1]
-    assert isinstance(second_request, ModelRequest)
     read_result = second_request.messages[-1]
-    assert isinstance(read_result, ToolModelMessage)
-    assert read_result.name == "read_file"
-    assert "# Long-term Memory" in read_result.content
+    assert read_result["role"] == "tool"
+    assert read_result["name"] == "read_file"
+    assert "# Long-term Memory" in cast(str, read_result["content"])
     assert list((agent_home / "sessions").rglob("*.jsonl")) == []
     assert list((agent_home / "sessions").rglob("artifacts")) == []
 
@@ -580,7 +598,7 @@ async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
         )
     )
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
         long_term_path=state.long_term_memory_path,
@@ -601,8 +619,7 @@ async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
     )
     assert len(provider.complete_requests) == 1
     request = provider.complete_requests[0]
-    assert isinstance(request, ModelRequest)
-    assert secret not in json.dumps(request.to_dict())
+    assert secret not in json.dumps(request.messages)
     assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
 
 
@@ -648,7 +665,7 @@ async def test_required_memory_edit_failure_keeps_the_advanced_summary_cursor(
         )
     )
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=memory,
         long_term_path=memory_path,
@@ -734,7 +751,7 @@ async def test_unexpected_memory_tool_failure_is_logged_once_at_the_task_boundar
         )
     )
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=FailingMemoryStore(),
         long_term_path=memory_path,
@@ -764,7 +781,7 @@ async def test_conversation_summary_read_failure_is_logged_only_at_memory_task_b
     summaries = WorkspaceJsonlSummaryStore(_state(home))
     summaries.path.write_text("PRIVATE INVALID SUMMARY STREAM", encoding="utf-8")
     manager = MemoryManager(
-        router=ScriptedFakeProvider(),
+        router=_router(ScriptedFakeProvider()),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
@@ -816,7 +833,7 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
         )
     )
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
         long_term_path=memory_path,
@@ -835,13 +852,11 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
             message="Long-term Memory must be a regular Workspace State file.",
         ),
     )
-    model_requests = [
-        request for request in provider.complete_requests if isinstance(request, ModelRequest)
-    ]
-    assert len(model_requests) == len(provider.complete_requests)
+    assert provider.complete_requests
     model_payload = json.dumps(
-        [request.to_dict() for request in model_requests], ensure_ascii=False
+        [request.messages for request in provider.complete_requests], ensure_ascii=False
     )
+
     assert secret not in model_payload
     assert outside.read_text(encoding="utf-8") == secret
     assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
@@ -861,17 +876,26 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
     class BlockingFirstProvider(ScriptedFakeProvider):
         async def complete(
             self,
-            request: object | None = None,
             *,
-            messages: Sequence[dict[str, object]] | None = None,
-            tools: Sequence[OpenAIToolSchema] | None = None,
-            model: str | None = None,
-            max_output: int | None = None,
-            temperature: float | None = None,
-            reasoning_effort: str | None = None,
-            timeout: int | None = None,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str = "test-model",
+            max_output: int = 1024,
+            temperature: float = 0.2,
+            reasoning_effort: ReasoningEffort | None = None,
+            timeout: int = 30,
         ) -> ModelResponse:
-            self.complete_requests.append(request)
+            self.complete_requests.append(
+                _provider_call(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    max_output=max_output,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    timeout=timeout,
+                )
+            )
             if len(self.complete_requests) == 1:
                 first_started.set()
                 await release_first.wait()
@@ -879,7 +903,7 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
 
     provider = BlockingFirstProvider()
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
@@ -923,24 +947,33 @@ async def test_overlapping_manual_memory_task_ignores_a_corrupt_cursor(
     class BlockingProvider(ScriptedFakeProvider):
         async def complete(
             self,
-            request: object | None = None,
             *,
-            messages: Sequence[dict[str, object]] | None = None,
-            tools: Sequence[OpenAIToolSchema] | None = None,
-            model: str | None = None,
-            max_output: int | None = None,
-            temperature: float | None = None,
-            reasoning_effort: str | None = None,
-            timeout: int | None = None,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str = "test-model",
+            max_output: int = 1024,
+            temperature: float = 0.2,
+            reasoning_effort: ReasoningEffort | None = None,
+            timeout: int = 30,
         ) -> ModelResponse:
-            self.complete_requests.append(request)
+            self.complete_requests.append(
+                _provider_call(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    max_output=max_output,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    timeout=timeout,
+                )
+            )
             first_started.set()
             await release_first.wait()
             return _response("No update needed.")
 
     provider = BlockingProvider()
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
@@ -973,7 +1006,7 @@ async def test_dream_command_returns_exact_no_pending_output_without_a_model_cal
     home.initialize()
     provider = ScriptedFakeProvider()
     memory_manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=WorkspaceJsonlSummaryStore(_state(home)),
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
@@ -1024,8 +1057,6 @@ async def test_runtime_dream_uses_memory_route_with_static_default_fallback(
     )
     assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
     request = provider.complete_requests[0]
-    assert isinstance(request, ModelRequest)
-    assert request.route == "memory"
     assert request.model == "claude-model"
 
 
@@ -1044,7 +1075,7 @@ async def test_dream_command_renders_model_failure_after_advancing_cursor(
         )
     )
     memory_manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=memory,
         long_term_path=_state(home).long_term_memory_path,
@@ -1086,7 +1117,7 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
     memory = WorkspaceFileMemoryStore(_state(home), replace_text=fail_cursor)
     provider = ScriptedFakeProvider(completions=(_response("No durable update is needed."),))
     memory_manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=memory,
         long_term_path=_state(home).long_term_memory_path,
@@ -1127,7 +1158,7 @@ async def test_dream_reports_corrupt_cursor_without_calling_the_model(
     (_state(home).memory_directory / ".cursor").write_bytes(cursor_bytes)
     provider = ScriptedFakeProvider()
     memory_manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=WorkspaceJsonlSummaryStore(_state(home)),
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
@@ -1163,7 +1194,7 @@ async def test_memory_task_rejects_an_external_hard_linked_cursor(
     cursor_path.hardlink_to(outside_cursor)
     provider = ScriptedFakeProvider()
     manager = MemoryManager(
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,

@@ -1,12 +1,13 @@
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
+from myclaw.agent.context import ContextBuilder
 from myclaw.agent.events import (
     AgentEvent,
     ModelCallCompletedPayload,
@@ -14,6 +15,7 @@ from myclaw.agent.events import (
     TurnCompletedPayload,
     TurnStartedPayload,
 )
+from myclaw.agent.run import AgentRunModelSettings, AgentRunModelTarget
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -23,13 +25,13 @@ from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
+    ModelProvider,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
     TextDelta,
 )
-from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.conversation import StreamingConversationPort
 from myclaw.session.session import Session
 from myclaw.terminal.repl import run_repl
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
@@ -38,7 +40,7 @@ LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
 SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
-REQUEST_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
+SECOND_TURN_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
 SECOND_SESSION_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
 
 
@@ -51,6 +53,19 @@ def _session(
         WorkspaceState(Workspace.from_path(workspace)),
         now=now,
         new_uuid=new_uuid,
+    )
+
+
+def _direct_model(provider: ModelProvider) -> AgentRunModelTarget:
+    return AgentRunModelTarget.for_provider(
+        provider,
+        AgentRunModelSettings(
+            model="test-model",
+            max_output=1024,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
     )
 
 
@@ -146,17 +161,15 @@ async def test_repl_without_nonblank_user_input_leaves_prepared_session_in_memor
     session = _session(workspace, clock.now, iter((SESSION_UUID,)).__next__)
     provider = ScriptedFakeProvider()
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=clock.now,
         new_uuid=iter(()).__next__,
+        context_builder=ContextBuilder(
+            Workspace.from_path(workspace),
+            "Asia/Shanghai",
+            clock=clock.now,
+        ),
     )
     writer = RecordingProgressiveWriter()
 
@@ -188,17 +201,11 @@ async def test_repl_exit_and_quit_ignore_case_and_whitespace_without_materializi
         session = _session(workspace, clock.now, iter((session_uuid,)).__next__)
         provider = ScriptedFakeProvider()
         conversation = StreamingConversationPort(
-            provider=provider,
+            model=_direct_model(provider),
             session=session,
-            settings=ChatModelSettings(
-                model="test-model",
-                max_output=1024,
-                temperature=0.2,
-                reasoning_effort=None,
-                timeout_seconds=30,
-            ),
             now=clock.now,
             new_uuid=iter(()).__next__,
+            context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
         )
         writer = RecordingProgressiveWriter()
 
@@ -240,17 +247,11 @@ async def test_repl_writes_each_text_delta_progressively_then_finishes_once(
         ]
     )
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=clock.now,
-        new_uuid=iter((TURN_UUID, REQUEST_UUID)).__next__,
+        new_uuid=iter((TURN_UUID,)).__next__,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
     writer = RecordingProgressiveWriter()
 
@@ -306,24 +307,11 @@ async def test_ctrl_c_during_stream_persists_partial_and_repl_runs_the_next_turn
         )
     )
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=clock.now,
-        new_uuid=iter(
-            (
-                TURN_UUID,
-                REQUEST_UUID,
-                UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-                UUID("16fd2706-8baf-433b-82eb-8c7fada847da"),
-            )
-        ).__next__,
+        new_uuid=iter((TURN_UUID, SECOND_TURN_UUID)).__next__,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
     writer = CancelOnFirstDeltaWriter()
 
@@ -359,14 +347,34 @@ async def test_task_cancellation_during_foreground_is_cleared_before_next_input(
         def __init__(self) -> None:
             self.waiting = asyncio.Event()
 
-        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-            del request
+        async def stream(
+            self,
+            *,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[object],
+            model: str,
+            max_output: int,
+            temperature: float,
+            reasoning_effort: str | None,
+            timeout: int,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            del messages, tools, model, max_output, temperature, reasoning_effort, timeout
             yield TextDelta(delta="Partial foreground")
             self.waiting.set()
             await asyncio.Event().wait()
 
-        async def complete(self, request: ModelRequest) -> ModelResponse:
-            raise AssertionError(f"Unexpected completion: {request!r}")
+        async def complete(
+            self,
+            *,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[object],
+            model: str,
+            max_output: int,
+            temperature: float,
+            reasoning_effort: str | None,
+            timeout: int,
+        ) -> ModelResponse:
+            raise AssertionError(f"Unexpected completion: {messages!r}")
 
         async def close(self) -> None:
             return None
@@ -390,17 +398,11 @@ async def test_task_cancellation_during_foreground_is_cleared_before_next_input(
     session = _session(workspace, lambda: NOW, iter((SESSION_UUID,)).__next__)
     provider = BlockingProvider()
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=lambda: NOW,
-        new_uuid=iter((TURN_UUID, REQUEST_UUID)).__next__,
+        new_uuid=iter((TURN_UUID,)).__next__,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
     input_reader = FirstThenExitInput()
     running = asyncio.create_task(
@@ -450,17 +452,15 @@ async def test_repl_dispatches_handled_management_output_and_converses_on_unknow
         ]
     )
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=clock.now,
-        new_uuid=iter((TURN_UUID, REQUEST_UUID)).__next__,
+        new_uuid=iter((TURN_UUID,)).__next__,
+        context_builder=ContextBuilder(
+            Workspace.from_path(workspace),
+            "Asia/Shanghai",
+            clock=clock.now,
+        ),
     )
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
@@ -485,8 +485,7 @@ async def test_repl_dispatches_handled_management_output_and_converses_on_unknow
     ]
     assert len(provider.stream_requests) == 1
     request = provider.stream_requests[0]
-    assert isinstance(request, ModelRequest)
-    assert [message.to_dict() for message in request.messages] == [
+    assert [message for message in request.messages if message["role"] != "system"] == [
         {
             "role": "user",
             "content": (

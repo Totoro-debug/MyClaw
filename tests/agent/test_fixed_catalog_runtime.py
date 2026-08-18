@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import deque
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -18,14 +18,16 @@ from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
 )
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.core.web_fetch import JinaReaderClient
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
+from tests.fixtures.provider import ProviderCall
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 
@@ -33,11 +35,33 @@ NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 class _RuntimeProvider:
     def __init__(self, responses: Iterable[ModelResponse]) -> None:
         self._responses = deque(responses)
-        self.stream_requests: list[ModelRequest] = []
+        self.stream_requests: list[ProviderCall] = []
         self.closed = False
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        if request.system_prompt == session_title_prompt():
+    async def stream(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        request = ProviderCall(
+            messages=list(messages),
+            tools=tuple(tools),
+            model=model,
+            max_output=max_output,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
+        if request.messages and request.messages[0] == {
+            "role": "system",
+            "content": session_title_prompt(),
+        }:
             yield ModelCompleted(
                 response=ModelResponse(
                     message=AssistantModelMessage(content="Read external file"),
@@ -51,8 +75,22 @@ class _RuntimeProvider:
             raise AssertionError("No scripted Runtime response remains")
         yield ModelCompleted(response=self._responses.popleft())
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
-        raise AssertionError(f"Unexpected non-chat request: {request!r}")
+    async def complete(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> ModelResponse:
+        raise AssertionError(
+            "Unexpected non-chat request: "
+            f"{messages=}, {tools=}, {model=}, {max_output=}, {temperature=}, "
+            f"{reasoning_effort=}, {timeout=}"
+        )
 
     async def close(self) -> None:
         self.closed = True

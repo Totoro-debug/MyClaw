@@ -3,9 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Sequence
 from copy import deepcopy
-from datetime import UTC, datetime
 from typing import Any
-from uuid import uuid4
 
 import pytest
 
@@ -15,6 +13,7 @@ from myclaw.agent.run import (
     AgentRunConfirmationRequestedPayload,
     AgentRunModelCallCompletedPayload,
     AgentRunModelSettings,
+    AgentRunModelTarget,
     AgentRunPayload,
     AgentRunStartedPayload,
     AgentRunTextDeltaPayload,
@@ -172,6 +171,10 @@ class _DirectProvider:
         self.stream_calls: list[dict[str, object]] = []
         self.complete_calls: list[dict[str, object]] = []
 
+    def route_status(self, route: str) -> None:
+        """Expose the former structural marker without becoming a Router."""
+        raise AssertionError(f"Direct Provider received Model Route {route!r}")
+
     def stream(
         self,
         *,
@@ -310,18 +313,7 @@ async def test_awaitable_run_returns_isolated_increment_and_emits_ordered_progre
     current_user = {"role": "user", "content": "Hello"}
     original_messages = deepcopy(messages)
     original_current_user = deepcopy(current_user)
-    run = AgentRun(
-        provider=provider,
-        settings=AgentRunModelSettings(
-            model="unused",
-            max_output=100,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-        now=lambda: datetime.now(UTC),
-        new_uuid=uuid4,
-    )
+    run = AgentRun(model=AgentRunModelTarget.for_router(provider))
 
     increment = await run.run(
         messages,
@@ -390,16 +382,7 @@ async def test_awaitable_run_carries_tool_messages_into_the_next_direct_call() -
     )
     emitter = _RecordingEmitter()
     run = AgentRun(
-        provider=provider,
-        settings=AgentRunModelSettings(
-            model="unused",
-            max_output=100,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-        now=lambda: datetime.now(UTC),
-        new_uuid=uuid4,
+        model=AgentRunModelTarget.for_router(provider),
         tool_gateway=gateway,
     )
 
@@ -442,18 +425,7 @@ async def test_awaitable_run_returns_failed_increment_without_raising_handled_mo
 ):
     provider = _FailingDirectRouter()
     emitter = _RecordingEmitter()
-    run = AgentRun(
-        provider=provider,
-        settings=AgentRunModelSettings(
-            model="unused",
-            max_output=100,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-        now=lambda: datetime.now(UTC),
-        new_uuid=uuid4,
-    )
+    run = AgentRun(model=AgentRunModelTarget.for_router(provider))
 
     increment = await run.run(
         [{"role": "system", "content": "System"}, {"role": "user", "content": "Hello"}],
@@ -474,16 +446,7 @@ async def test_awaitable_run_repairs_partial_assistant_on_cooperative_cancellati
     emitter = _RecordingEmitter()
     cancel_requested = iter((False, True)).__next__
     run = AgentRun(
-        provider=provider,
-        settings=AgentRunModelSettings(
-            model="unused",
-            max_output=100,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-        now=lambda: datetime.now(UTC),
-        new_uuid=uuid4,
+        model=AgentRunModelTarget.for_router(provider),
         cancel_requested=cancel_requested,
     )
 
@@ -527,16 +490,7 @@ async def test_awaitable_run_repairs_unfinished_tool_on_cooperative_cancellation
     emitter = _RecordingEmitter()
     cancel_requested = iter((False, True)).__next__
     run = AgentRun(
-        provider=provider,
-        settings=AgentRunModelSettings(
-            model="unused",
-            max_output=100,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
-        now=lambda: datetime.now(UTC),
-        new_uuid=uuid4,
+        model=AgentRunModelTarget.for_router(provider),
         tool_gateway=gateway,
         cancel_requested=cancel_requested,
     )
@@ -581,7 +535,7 @@ async def test_awaitable_schedule_run_uses_direct_complete_provider_call() -> No
         )
     )
     emitter = _RecordingEmitter()
-    run = AgentRun(provider=provider)
+    run = AgentRun(model=AgentRunModelTarget.for_router(provider))
 
     increment = await run.run(
         [{"role": "system", "content": "System"}, {"role": "user", "content": "runtime"}],
@@ -632,7 +586,10 @@ async def test_awaitable_run_emits_confirmation_before_publishing_confirmed_tool
     confirmation = ConfirmationChannel()
     emitter = _SignallingEmitter("confirmation_requested")
 
-    run = AgentRun(provider=provider, tool_gateway=gateway)
+    run = AgentRun(
+        model=AgentRunModelTarget.for_router(provider),
+        tool_gateway=gateway,
+    )
     task = asyncio.create_task(
         run.run(
             [{"role": "system", "content": "System"}, {"role": "user", "content": "runtime"}],
@@ -686,7 +643,7 @@ async def test_awaitable_chat_run_calls_direct_provider_with_explicit_settings()
         {"role": "user", "content": "runtime\n\nHello"},
     ]
 
-    increment = await AgentRun(provider=provider, settings=settings).run(
+    increment = await AgentRun(model=AgentRunModelTarget.for_provider(provider, settings)).run(
         messages,
         {"role": "user", "content": "Hello"},
         route="chat",
@@ -729,7 +686,7 @@ async def test_awaitable_schedule_run_calls_direct_provider_with_explicit_settin
         {"role": "user", "content": "runtime"},
     ]
 
-    increment = await AgentRun(provider=provider, settings=settings).run(
+    increment = await AgentRun(model=AgentRunModelTarget.for_provider(provider, settings)).run(
         messages,
         {"role": "user", "content": "Run schedule"},
         route="schedule",
@@ -798,7 +755,7 @@ async def test_awaitable_run_externalizes_tool_result_before_follow_up_model_cal
 
     emitter = _RecordingEmitter()
     increment = await AgentRun(
-        provider=provider,
+        model=AgentRunModelTarget.for_router(provider),
         tool_gateway=gateway,
         externalize_result=externalize,
     ).run(
@@ -869,7 +826,7 @@ async def test_awaitable_run_normalizes_tool_and_externalization_failures() -> N
 
     emitter = _RecordingEmitter()
     increment = await AgentRun(
-        provider=provider,
+        model=AgentRunModelTarget.for_router(provider),
         tool_gateway=gateway,
         externalize_result=externalize,
         on_artifact_failure=lambda failure, name: artifact_failures.append((str(failure), name)),
@@ -902,7 +859,7 @@ async def test_awaitable_run_repairs_partial_output_on_model_failure() -> None:
     provider = _FailingDirectRouter(deltas=("Partial.",))
     emitter = _RecordingEmitter()
 
-    increment = await AgentRun(provider=provider).run(
+    increment = await AgentRun(model=AgentRunModelTarget.for_router(provider)).run(
         [{"role": "system", "content": "System"}, {"role": "user", "content": "runtime"}],
         {"role": "user", "content": "Fail partially"},
         route="chat",
@@ -923,7 +880,7 @@ async def test_awaitable_run_returns_cancelled_increment_for_provider_cancellati
     )
     emitter = _RecordingEmitter()
 
-    increment = await AgentRun(provider=provider).run(
+    increment = await AgentRun(model=AgentRunModelTarget.for_router(provider)).run(
         [{"role": "system", "content": "System"}, {"role": "user", "content": "runtime"}],
         {"role": "user", "content": "Cancel"},
         route="chat",
@@ -963,7 +920,7 @@ async def test_awaitable_run_cancels_active_tool_and_returns_repaired_increment(
     emitter = _RecordingEmitter()
     task = asyncio.create_task(
         AgentRun(
-            provider=provider,
+            model=AgentRunModelTarget.for_router(provider),
             tool_gateway=SingleToolGateway((tool,)),
             cancel_requested=is_cancel_requested,
         ).run(

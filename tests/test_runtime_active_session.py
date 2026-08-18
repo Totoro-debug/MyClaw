@@ -15,16 +15,16 @@ from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
 )
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock
+from tests.fixtures import FakeClock, ProviderCall
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 8, 4, 10, 20, 30, 123000, tzinfo=LOCAL_OFFSET)
@@ -43,16 +43,39 @@ class RuntimeProvider:
             usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
             finish_reason="stop",
         )
-        self.requests: list[ModelRequest] = []
+        self.requests: list[ProviderCall] = []
         self.title_started = asyncio.Event()
         self.release_title = asyncio.Event()
         self.delay_title = False
         self.log_marker: str | None = None
         self.closed = False
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        self.requests.append(request)
-        if request.system_prompt == session_title_prompt():
+    async def stream(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(
+            ProviderCall(
+                messages=list(messages),
+                tools=tuple(tools),
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
+        )
+        if messages and messages[0] == {
+            "role": "system",
+            "content": session_title_prompt(),
+        }:
             self.title_started.set()
             if self.delay_title:
                 await self.release_title.wait()
@@ -66,20 +89,16 @@ class RuntimeProvider:
 
     async def complete(
         self,
-        request: ModelRequest | None = None,
         *,
-        messages: Sequence[dict[str, object]] | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
-        model: str | None = None,
-        max_output: int | None = None,
-        temperature: float | None = None,
-        reasoning_effort: str | None = None,
-        timeout: int | None = None,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
     ) -> ModelResponse:
-        if request is not None and request.route != "memory":
-            raise AssertionError(f"Unexpected completion request: {request!r}")
-        if request is None and messages is None:
-            raise AssertionError("Unexpected direct completion without messages")
+        del messages, tools, model, max_output, temperature, reasoning_effort, timeout
         return ModelResponse(
             message=AssistantModelMessage(content="Summary of the earlier turn."),
             usage=ModelUsage(input_tokens=3, output_tokens=1, total_tokens=4),
@@ -548,7 +567,7 @@ timeout = 30
     assert events[-1].type == "turn_completed"
     assert session.last_consolidated == 2
     assert (workspace / ".myclaw" / "memory" / "summary.jsonl").exists()
-    chat_requests = [request for request in provider.requests if request.route == "chat"]
+    chat_requests = provider.requests
     assert chat_requests
     assert all(request.model == "claude-model" for request in chat_requests)
     await runtime.close()

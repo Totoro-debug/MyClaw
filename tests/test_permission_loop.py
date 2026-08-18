@@ -4,18 +4,18 @@ from uuid import uuid4
 
 import pytest
 
+from myclaw.agent.context import ContextBuilder
+from myclaw.agent.run import AgentRunModelSettings, AgentRunModelTarget
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
     ModelResponse,
     ModelUsage,
-    ToolModelMessage,
 )
-from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.conversation import StreamingConversationPort
 from myclaw.session.session import Session
 from myclaw.tools.core.edit_file import EditFileTool
 from myclaw.tools.core.write_file import WriteFileTool
@@ -88,18 +88,25 @@ async def test_foreground_mutations_execute_without_a_permission_pause(
         (WriteFileTool(workspace=identity), EditFileTool(workspace=identity))
     )
     conversation = StreamingConversationPort(
-        provider=provider,
-        session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
+        model=AgentRunModelTarget.for_provider(
+            provider,
+            AgentRunModelSettings(
+                model="test-model",
+                max_output=1024,
+                temperature=0.2,
+                reasoning_effort=None,
+                timeout_seconds=30,
+            ),
         ),
+        session=session,
         now=lambda: NOW,
         new_uuid=uuid4,
         tool_gateway=gateway,
+        context_builder=ContextBuilder(
+            identity,
+            "Asia/Shanghai",
+            clock=lambda: NOW,
+        ),
     )
 
     events = [event async for event in conversation.submit("Change the files.")]
@@ -119,11 +126,8 @@ async def test_foreground_mutations_execute_without_a_permission_pause(
     tool_messages = [message for message in session.messages if message["role"] == "tool"]
     assert [message["status"] for message in tool_messages] == ["success", "success"]
     follow_up = provider.stream_requests[1]
-    assert isinstance(follow_up, ModelRequest)
-    model_results = [
-        message for message in follow_up.messages if isinstance(message, ToolModelMessage)
-    ]
-    assert [(message.name, message.content) for message in model_results] == [
+    model_results = [message for message in follow_up.messages if message["role"] == "tool"]
+    assert [(message["name"], message["content"]) for message in model_results] == [
         ("write_file", "File written successfully."),
         ("edit_file", "File edited successfully."),
     ]

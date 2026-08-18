@@ -24,13 +24,11 @@ from myclaw.provider.models import (
     FinishReason,
     ModelCompleted,
     ModelMessages,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
     ReasoningEffort,
     TextDelta,
-    resolve_provider_call_arguments,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -87,18 +85,16 @@ class AnthropicProvider:
 
     def stream(
         self,
-        request: ModelRequest | None = None,
         *,
-        messages: ModelMessages | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
-        model: str | None = None,
-        max_output: int | None = None,
-        temperature: float | None = None,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
         reasoning_effort: ReasoningEffort | None = None,
-        timeout: int | None = None,
+        timeout: int,
     ) -> AsyncIterator[ModelStreamEvent]:
-        arguments = resolve_provider_call_arguments(
-            request,
+        return self._stream_with_arguments(
             messages=messages,
             tools=tools,
             model=model,
@@ -106,16 +102,6 @@ class AnthropicProvider:
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             timeout=timeout,
-        )
-        return self._stream_with_arguments(
-            messages=arguments.messages,
-            tools=arguments.tools,
-            model=arguments.model,
-            max_output=arguments.max_output,
-            temperature=arguments.temperature,
-            reasoning_effort=arguments.reasoning_effort,
-            timeout=arguments.timeout,
-            from_legacy_request=arguments.from_legacy_request,
         )
 
     async def _stream_with_arguments(
@@ -128,7 +114,6 @@ class AnthropicProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
-        from_legacy_request: bool,
     ) -> AsyncIterator[ModelStreamEvent]:
         try:
             async for event in self._stream_once(
@@ -139,7 +124,6 @@ class AnthropicProvider:
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
-                from_legacy_request=from_legacy_request,
             ):
                 yield event
         except EmptyModelResponseError as error:
@@ -159,9 +143,8 @@ class AnthropicProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
-        from_legacy_request: bool,
     ) -> AsyncIterator[ModelStreamEvent]:
-        del reasoning_effort, from_legacy_request
+        del reasoning_effort
         sdk_stream = await self._client.messages.create(
             **_request_arguments(
                 messages=messages,
@@ -231,35 +214,24 @@ class AnthropicProvider:
 
     async def complete(
         self,
-        request: ModelRequest | None = None,
         *,
-        messages: ModelMessages | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
-        model: str | None = None,
-        max_output: int | None = None,
-        temperature: float | None = None,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
         reasoning_effort: ReasoningEffort | None = None,
-        timeout: int | None = None,
+        timeout: int,
     ) -> ModelResponse:
-        arguments = resolve_provider_call_arguments(
-            request,
-            messages=messages,
-            tools=tools,
-            model=model,
-            max_output=max_output,
-            temperature=temperature,
-            reasoning_effort=reasoning_effort,
-            timeout=timeout,
-        )
         try:
             message = await self._client.messages.create(
                 **_request_arguments(
-                    messages=arguments.messages,
-                    tools=arguments.tools,
-                    model=arguments.model,
-                    max_output=arguments.max_output,
-                    temperature=arguments.temperature,
-                    timeout=arguments.timeout,
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    max_output=max_output,
+                    temperature=temperature,
+                    timeout=timeout,
                     stream=False,
                 )
             )

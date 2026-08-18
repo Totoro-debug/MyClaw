@@ -17,9 +17,9 @@ from myclaw.agent.events import (
 from myclaw.agent.run import (
     AgentRunCompletedPayload,
     AgentRunConfirmationRequestedPayload,
-    AgentRunInterface,
     AgentRunModelCallCompletedPayload,
-    AgentRunPayload,
+    AgentRunModelSettings,
+    AgentRunModelTarget,
     AgentRunRoute,
     AgentRunStartedPayload,
     AgentRunTextDeltaPayload,
@@ -42,7 +42,7 @@ from myclaw.provider.models import (
     ReasoningEffort,
     TextDelta,
 )
-from myclaw.session.conversation import ChatModelSettings, StreamingConversationPort
+from myclaw.session.conversation import StreamingConversationPort
 from myclaw.session.session import Session
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.tool_gateway import (
@@ -61,6 +61,19 @@ def _session(workspace: Path, agent_home: Path) -> Session:
     state = WorkspaceState(Workspace.from_path(workspace))
     state.initialize(agent_home_root=agent_home)
     return Session.create(state, now=lambda: NOW, new_uuid=lambda: SESSION_UUID)
+
+
+def _direct_model(provider: ModelProvider) -> AgentRunModelTarget:
+    return AgentRunModelTarget.for_provider(
+        provider,
+        AgentRunModelSettings(
+            model="test-model",
+            max_output=10,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+    )
 
 
 class _RecordingDirectProvider:
@@ -160,15 +173,8 @@ async def test_awaitable_conversation_builds_context_and_commits_before_terminal
     monkeypatch.setattr(session, "append_messages", append_messages)
     monkeypatch.setattr(session, "persist", persist)
     conversation = StreamingConversationPort(
-        provider=cast(ModelProvider, provider),
+        model=_direct_model(cast(ModelProvider, provider)),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=lambda: NOW,
         new_uuid=lambda: TURN_UUID,
         foreground_summary_preparer=prepare_summary,
@@ -211,19 +217,22 @@ async def test_awaitable_conversation_builds_context_and_commits_before_terminal
     ]
 
 
-class _ScriptedAgentRun(AgentRunInterface):
-    def __init__(self) -> None:
-        self.calls: list[tuple[Session, str, AgentRunRoute, bool, object | None]] = []
+class _ScriptedAgentRun:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self.calls: list[tuple[Session, str, AgentRunRoute, object | None]] = []
 
-    def run_agent(
+    async def run(
         self,
-        session: Session,
-        input: str,
+        messages: Sequence[dict[str, Any]],
+        current_user: dict[str, Any],
+        *,
         route: AgentRunRoute,
-        stream: bool,
+        emitter: Any,
         confirmation: AgentRunConfirmationChannel | None = None,
-    ) -> AsyncIterator[AgentRunPayload]:
-        self.calls.append((session, input, route, stream, confirmation))
+    ) -> list[dict[str, Any]]:
+        del messages
+        self.calls.append((self._session, current_user["content"], route, confirmation))
         request = ConfirmationRequest(
             confirmation_id=CONFIRMATION_UUID,
             tool_call_id="call_confirm",
@@ -233,35 +242,56 @@ class _ScriptedAgentRun(AgentRunInterface):
             reason="Confirm Schedule Job: Remember this",
         )
 
-        async def payloads() -> AsyncIterator[AgentRunPayload]:
-            assert confirmation is not None
-            pending = asyncio.ensure_future(confirmation(request))
-            await asyncio.sleep(0)
-            yield AgentRunStartedPayload()
-            yield AgentRunTextDeltaPayload(delta="Working")
-            yield AgentRunModelCallCompletedPayload(
+        assert confirmation is not None
+        pending = asyncio.ensure_future(confirmation(request))
+        await asyncio.sleep(0)
+        await emitter.emit(AgentRunStartedPayload())
+        await emitter.emit(AgentRunTextDeltaPayload(delta="Working"))
+        await emitter.emit(
+            AgentRunModelCallCompletedPayload(
                 content="Working",
                 continues_with_tools=True,
             )
-            yield AgentRunToolStartedPayload(
+        )
+        await emitter.emit(
+            AgentRunToolStartedPayload(
                 tool_call_id="call_confirm",
                 tool_name="schedule",
                 summary="Running schedule",
             )
-            yield AgentRunConfirmationRequestedPayload(request=request)
-            await pending
-            yield AgentRunToolCompletedPayload(
+        )
+        await emitter.emit(AgentRunConfirmationRequestedPayload(request=request))
+        await pending
+        await emitter.emit(
+            AgentRunToolCompletedPayload(
                 tool_call_id="call_confirm",
                 tool_name="schedule",
                 status="success",
                 summary="Finished schedule",
             )
-            yield AgentRunCompletedPayload(
+        )
+        await emitter.emit(
+            AgentRunCompletedPayload(
                 content="Done",
                 usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
             )
-
-        return payloads()
+        )
+        return [
+            deepcopy(current_user),
+            {
+                "role": "assistant",
+                "content": "Done",
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        ]
 
 
 class _ConfirmedTool(BaseTool):
@@ -294,8 +324,18 @@ class _BlockingPartialProvider:
         self.partial_emitted = asyncio.Event()
         self.cancelled = asyncio.Event()
 
-    async def stream(self, request: object) -> AsyncIterator[ModelStreamEvent]:
-        del request
+    async def stream(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del messages, tools, model, max_output, temperature, reasoning_effort, timeout
         yield TextDelta(delta="Retained partial.")
         self.partial_emitted.set()
         try:
@@ -304,8 +344,22 @@ class _BlockingPartialProvider:
             self.cancelled.set()
             raise
 
-    async def complete(self, request: object) -> ModelResponse:
-        raise AssertionError(f"Unexpected complete request: {request!r}")
+    async def complete(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+    ) -> ModelResponse:
+        raise AssertionError(
+            "Unexpected complete request: "
+            f"{messages=}, {tools=}, {model=}, {max_output=}, {temperature=}, "
+            f"{reasoning_effort=}, {timeout=}"
+        )
 
     async def close(self) -> None:
         return None
@@ -316,21 +370,15 @@ async def test_conversation_port_maps_agent_run_and_accepts_separate_confirmatio
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    agent_run = _ScriptedAgentRun()
     session = _session(workspace, agent_home)
+    agent_run = _ScriptedAgentRun(session)
     conversation = StreamingConversationPort(
         agent_run=agent_run,
         session=session,
-        provider=ScriptedFakeProvider(),
-        settings=ChatModelSettings(
-            model="unused",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
+        model=_direct_model(ScriptedFakeProvider()),
         now=lambda: NOW,
         new_uuid=lambda: TURN_UUID,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
 
     events = conversation.submit("Add a schedule.")
@@ -367,7 +415,7 @@ async def test_conversation_port_maps_agent_run_and_accepts_separate_confirmatio
         "tool_completed",
         "turn_completed",
     ]
-    assert agent_run.calls == [(session, "Add a schedule.", "chat", True, agent_run.calls[0][4])]
+    assert agent_run.calls == [(session, "Add a schedule.", "chat", agent_run.calls[0][3])]
     await events.aclose()
 
 
@@ -423,18 +471,12 @@ async def test_foreground_confirmation_reply_is_not_added_as_a_session_user_mess
         )
     )
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=lambda: NOW,
         new_uuid=ids.__next__,
         tool_gateway=gateway,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
 
     events = conversation.submit("Create a job.")
@@ -498,18 +540,12 @@ async def test_cancelling_a_foreground_confirmation_emits_cancelled_and_repairs_
     gateway = SingleToolGateway((tool,))
     ids = iter((TURN_UUID, UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")))
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=lambda: NOW,
         new_uuid=ids.__next__,
         tool_gateway=gateway,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
 
     events = conversation.submit("Create a job.")
@@ -551,17 +587,11 @@ async def test_terminal_already_queued_is_not_lost_to_a_late_cross_task_cancel(
         )
     )
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=lambda: NOW,
         new_uuid=lambda: TURN_UUID,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
     model_call_observed = asyncio.Event()
     release_consumer = asyncio.Event()
@@ -623,17 +653,11 @@ async def test_batch_append_failure_raises_safe_error_without_publishing_termina
     monkeypatch.setattr(session, "append_messages", fail_append)
     monkeypatch.setattr(session, "persist", persist)
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=lambda: NOW,
         new_uuid=lambda: TURN_UUID,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
 
     observed = []
@@ -677,17 +701,11 @@ async def test_persist_request_failure_remains_silent_and_terminal_stays_ordered
 
     monkeypatch.setattr(session, "persist", fail_persist)
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=lambda: NOW,
         new_uuid=lambda: TURN_UUID,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
 
     observed = [event async for event in conversation.submit("Keep memory authoritative.")]
@@ -715,17 +733,11 @@ async def test_streamed_model_failure_commits_partial_error_before_terminal(
         )
     )
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=lambda: NOW,
         new_uuid=lambda: TURN_UUID,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
 
     observed = [event async for event in conversation.submit("Fail after streaming.")]
@@ -744,17 +756,11 @@ async def test_explicit_cancellation_commits_streamed_partial_before_terminal(
     session = _session(workspace, agent_home)
     provider = _BlockingPartialProvider()
     conversation = StreamingConversationPort(
-        provider=cast(ModelProvider, provider),
+        model=_direct_model(cast(ModelProvider, provider)),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=lambda: NOW,
         new_uuid=lambda: TURN_UUID,
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
     events = conversation.submit("Cancel after a partial response.")
 
@@ -818,15 +824,8 @@ async def test_multi_tool_refusal_and_error_are_committed_before_success_termina
         )
     )
     conversation = StreamingConversationPort(
-        provider=provider,
+        model=_direct_model(provider),
         session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=10,
-            temperature=0.2,
-            reasoning_effort=None,
-            timeout_seconds=30,
-        ),
         now=lambda: NOW,
         new_uuid=iter(
             (
@@ -836,6 +835,7 @@ async def test_multi_tool_refusal_and_error_are_committed_before_success_termina
             )
         ).__next__,
         tool_gateway=SingleToolGateway((_ConfirmedTool(), _FailingTool())),
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
     )
     events = conversation.submit("Exercise both Tool outcomes.")
 

@@ -3,6 +3,7 @@ import json
 from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -29,16 +30,22 @@ from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.scheduler import AsyncioSchedulerClock
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures import (
+    FakeClock,
+    ProviderCall,
+    ScriptedFakeProvider,
+    ScriptedFakeRouter,
+    StreamScript,
+)
 from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
 
 LOCAL = timezone(timedelta(hours=8))
@@ -145,6 +152,34 @@ def _manager(
     )
 
 
+def _record_complete(
+    provider: ScriptedFakeProvider,
+    *,
+    messages: Sequence[dict[str, object]],
+    tools: Sequence[OpenAIToolSchema],
+    model: str,
+    max_output: int,
+    temperature: float,
+    reasoning_effort: ReasoningEffort | None,
+    timeout: int,
+) -> None:
+    provider.complete_requests.append(
+        ProviderCall(
+            messages=list(messages),
+            tools=tuple(tools),
+            model=model,
+            max_output=max_output,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
+    )
+
+
+def _router(provider: ScriptedFakeProvider) -> ScriptedFakeRouter:
+    return ScriptedFakeRouter(provider)
+
+
 @pytest.mark.asyncio
 async def test_periodic_memory_task_runs_when_the_manager_is_idle(agent_home: Path) -> None:
     home = AgentHome(agent_home)
@@ -152,7 +187,7 @@ async def test_periodic_memory_task_runs_when_the_manager_is_idle(agent_home: Pa
     summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
-    manager = _manager(home=home, router=provider, summaries=summaries)
+    manager = _manager(home=home, router=_router(provider), summaries=summaries)
 
     result = await manager.run_periodic()
 
@@ -218,17 +253,25 @@ async def test_memory_scheduler_trigger_does_not_borrow_a_foreground_session_log
     class UnexpectedFailureProvider(ScriptedFakeProvider):
         async def complete(
             self,
-            request: object | None = None,
             *,
-            messages: Sequence[dict[str, object]] | None = None,
-            tools: Sequence[OpenAIToolSchema] | None = None,
-            model: str | None = None,
-            max_output: int | None = None,
-            temperature: float | None = None,
-            reasoning_effort: str | None = None,
-            timeout: int | None = None,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str = "test-model",
+            max_output: int = 1024,
+            temperature: float = 0.2,
+            reasoning_effort: ReasoningEffort | None = None,
+            timeout: int = 30,
         ) -> ModelResponse:
-            self.complete_requests.append(request)
+            _record_complete(
+                self,
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
             attempted.set()
             try:
                 raise OSError("technical storage cause")
@@ -239,7 +282,7 @@ async def test_memory_scheduler_trigger_does_not_borrow_a_foreground_session_log
     scheduler = MemoryTaskScheduler(
         manager=_manager(
             home=home,
-            router=UnexpectedFailureProvider(),
+            router=_router(UnexpectedFailureProvider()),
             summaries=summaries,
         ),
         schedule="0 * * * *",
@@ -268,7 +311,7 @@ async def test_hourly_memory_schedule_triggers_only_at_next_local_cron_boundary(
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=_manager(home=home, router=provider, summaries=summaries),
+        manager=_manager(home=home, router=_router(provider), summaries=summaries),
         schedule="0 * * * *",
         clock=clock,
     )
@@ -300,17 +343,25 @@ async def test_periodic_trigger_is_skipped_while_the_previous_run_is_still_activ
     class BlockingProvider(ScriptedFakeProvider):
         async def complete(
             self,
-            request: object | None = None,
             *,
-            messages: Sequence[dict[str, object]] | None = None,
-            tools: Sequence[OpenAIToolSchema] | None = None,
-            model: str | None = None,
-            max_output: int | None = None,
-            temperature: float | None = None,
-            reasoning_effort: str | None = None,
-            timeout: int | None = None,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str = "test-model",
+            max_output: int = 1024,
+            temperature: float = 0.2,
+            reasoning_effort: ReasoningEffort | None = None,
+            timeout: int = 30,
         ) -> ModelResponse:
-            self.complete_requests.append(request)
+            _record_complete(
+                self,
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
             started.set()
             await release.wait()
             return _response("No update needed.")
@@ -318,7 +369,7 @@ async def test_periodic_trigger_is_skipped_while_the_previous_run_is_still_activ
     provider = BlockingProvider()
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=_manager(home=home, router=provider, summaries=summaries),
+        manager=_manager(home=home, router=_router(provider), summaries=summaries),
         schedule="0 * * * *",
         clock=clock,
     )
@@ -351,23 +402,31 @@ async def test_manual_memory_task_reports_running_while_a_periodic_run_is_active
     class BlockingProvider(ScriptedFakeProvider):
         async def complete(
             self,
-            request: object | None = None,
             *,
-            messages: Sequence[dict[str, object]] | None = None,
-            tools: Sequence[OpenAIToolSchema] | None = None,
-            model: str | None = None,
-            max_output: int | None = None,
-            temperature: float | None = None,
-            reasoning_effort: str | None = None,
-            timeout: int | None = None,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str = "test-model",
+            max_output: int = 1024,
+            temperature: float = 0.2,
+            reasoning_effort: ReasoningEffort | None = None,
+            timeout: int = 30,
         ) -> ModelResponse:
-            self.complete_requests.append(request)
+            _record_complete(
+                self,
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
             started.set()
             await release.wait()
             return _response("No update needed.")
 
     provider = BlockingProvider()
-    manager = _manager(home=home, router=provider, summaries=summaries)
+    manager = _manager(home=home, router=_router(provider), summaries=summaries)
     periodic = asyncio.create_task(manager.run_periodic())
     await started.wait()
     (_state(home).memory_directory / ".cursor").write_bytes(b"corrupt\n")
@@ -471,7 +530,7 @@ async def test_custom_schedule_keeps_the_runtime_startup_local_timezone(
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(datetime(2026, 7, 11, 8, 50, tzinfo=LOCAL))
     scheduler = MemoryTaskScheduler(
-        manager=_manager(home=home, router=provider, summaries=summaries),
+        manager=_manager(home=home, router=_router(provider), summaries=summaries),
         schedule="0 9 * * *",
         clock=clock,
     )
@@ -496,7 +555,7 @@ async def test_local_schedule_wait_uses_elapsed_time_across_daylight_saving_chan
     scheduler = MemoryTaskScheduler(
         manager=_manager(
             home=home,
-            router=ScriptedFakeProvider(),
+            router=_router(ScriptedFakeProvider()),
             summaries=WorkspaceJsonlSummaryStore(_state(home)),
         ),
         schedule="30 3 * * *",
@@ -640,10 +699,9 @@ async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
     await runtime.close()
 
     first_chat = provider.stream_requests[0]
-    assert isinstance(first_chat, ModelRequest)
     assert memory_view.output == updated_memory
-    assert startup_memory not in first_chat.system_prompt
-    assert updated_memory in first_chat.system_prompt
+    assert startup_memory not in cast(str, first_chat.messages[0]["content"])
+    assert updated_memory in cast(str, first_chat.messages[0]["content"])
     assert legacy_path.read_bytes() == legacy_memory
 
     restarted_provider = ScriptedFakeProvider(
@@ -662,8 +720,7 @@ async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
     await restarted.close()
 
     restarted_chat = restarted_provider.stream_requests[0]
-    assert isinstance(restarted_chat, ModelRequest)
-    assert updated_memory in restarted_chat.system_prompt
+    assert updated_memory in cast(str, restarted_chat.messages[0]["content"])
 
 
 @pytest.mark.asyncio
@@ -687,15 +744,35 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
     release_first = asyncio.Event()
 
     class SnapshotProvider(ScriptedFakeProvider):
-        async def stream(self, request: object) -> AsyncIterator[ModelStreamEvent]:
-            if (
-                isinstance(request, ModelRequest)
-                and request.system_prompt == session_title_prompt()
-            ):
+        async def stream(
+            self,
+            *,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str = "test-model",
+            max_output: int = 1024,
+            temperature: float = 0.2,
+            reasoning_effort: ReasoningEffort | None = None,
+            timeout: int = 30,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            if messages and messages[0] == {
+                "role": "system",
+                "content": session_title_prompt(),
+            }:
                 raise ModelCallError(
                     ErrorInfo(code="model_failed", message="No title response was scripted.")
                 )
-            self.stream_requests.append(request)
+            self.stream_requests.append(
+                ProviderCall(
+                    messages=list(messages),
+                    tools=tuple(tools),
+                    model=model,
+                    max_output=max_output,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    timeout=timeout,
+                )
+            )
             request_count = len(self.stream_requests)
             if request_count == 1:
                 first_started.set()
@@ -747,10 +824,8 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
 
     first_chat = provider.stream_requests[0]
     second_chat = provider.stream_requests[1]
-    assert isinstance(first_chat, ModelRequest)
-    assert isinstance(second_chat, ModelRequest)
-    assert "Prefers concise status reports." not in first_chat.system_prompt
-    assert "Prefers concise status reports." in second_chat.system_prompt
+    assert "Prefers concise status reports." not in cast(str, first_chat.messages[0]["content"])
+    assert "Prefers concise status reports." in cast(str, second_chat.messages[0]["content"])
 
 
 @pytest.mark.asyncio
@@ -833,17 +908,25 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
     class CancellationAwareProvider(ScriptedFakeProvider):
         async def complete(
             self,
-            request: object | None = None,
             *,
-            messages: Sequence[dict[str, object]] | None = None,
-            tools: Sequence[OpenAIToolSchema] | None = None,
-            model: str | None = None,
-            max_output: int | None = None,
-            temperature: float | None = None,
-            reasoning_effort: str | None = None,
-            timeout: int | None = None,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str = "test-model",
+            max_output: int = 1024,
+            temperature: float = 0.2,
+            reasoning_effort: ReasoningEffort | None = None,
+            timeout: int = 30,
         ) -> ModelResponse:
-            self.complete_requests.append(request)
+            _record_complete(
+                self,
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
             if len(self.complete_requests) == 1:
                 started.set()
                 try:
@@ -854,7 +937,7 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
             return _response("No update needed.")
 
     provider = CancellationAwareProvider()
-    manager = _manager(home=home, router=provider, summaries=summaries)
+    manager = _manager(home=home, router=_router(provider), summaries=summaries)
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
         manager=manager,
@@ -903,17 +986,25 @@ async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
     class CleanupFailingProvider(ScriptedFakeProvider):
         async def complete(
             self,
-            request: object | None = None,
             *,
-            messages: Sequence[dict[str, object]] | None = None,
-            tools: Sequence[OpenAIToolSchema] | None = None,
-            model: str | None = None,
-            max_output: int | None = None,
-            temperature: float | None = None,
-            reasoning_effort: str | None = None,
-            timeout: int | None = None,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str = "test-model",
+            max_output: int = 1024,
+            temperature: float = 0.2,
+            reasoning_effort: ReasoningEffort | None = None,
+            timeout: int = 30,
         ) -> ModelResponse:
-            self.complete_requests.append(request)
+            _record_complete(
+                self,
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+            )
             started.set()
             try:
                 await asyncio.Event().wait()
@@ -924,7 +1015,7 @@ async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
     provider = CleanupFailingProvider()
     manager = _manager(
         home=home,
-        router=provider,
+        router=_router(provider),
         summaries=summaries,
     )
     clock = ControlledClock(NOW)

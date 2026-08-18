@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
-from typing import cast
-from uuid import UUID
+from typing import Any, cast
 
 import pytest
 from anthropic import APIConnectionError
@@ -27,7 +26,6 @@ from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelProvider,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
@@ -204,7 +202,7 @@ async def test_router_direct_call_keeps_retry_budget_and_reuses_message_dictiona
         {"role": "user", "content": "Hi"},
     ]
 
-    await router.complete("default", messages=messages)
+    await router.complete("default", messages=messages, tools=())
 
     assert clock.sleeps == [0.5]
     assert [call["messages"] for call in provider.calls] == [messages, messages]
@@ -226,6 +224,7 @@ async def test_router_direct_stream_returns_provider_usage() -> None:
         async for event in router.stream(
             "default",
             messages=[{"role": "system", "content": "System"}],
+            tools=(),
         )
     ]
 
@@ -290,6 +289,7 @@ async def test_router_direct_call_falls_back_to_default_route() -> None:
     response = await router.complete(
         "chat",
         messages=[{"role": "system", "content": "System"}],
+        tools=(),
     )
 
     assert response.message.content == "done"
@@ -462,31 +462,15 @@ async def test_openai_provider_direct_call_normalizes_sdk_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_provider_rejects_reasoning_effort_mixed_with_legacy_request() -> None:
+async def test_provider_requires_keyword_only_direct_arguments() -> None:
     client = _FakeOpenAIClient(object())
     provider = OpenAICompatibleProvider(
         _provider_configuration("openai-compatible"),
         client_factory=lambda **_kwargs: client,
     )
-    request = ModelRequest(
-        request_id=UUID("550e8400-e29b-41d4-a716-446655440000"),
-        route="memory",
-        system_prompt="System",
-        messages=(),
-        tools=(),
-        stream=False,
-        model="model",
-        max_output=512,
-        temperature=0.25,
-        reasoning_effort="low",
-        timeout_seconds=17,
-    )
-
-    with pytest.raises(
-        TypeError,
-        match="legacy ModelRequest and direct Provider arguments cannot be mixed",
-    ):
-        await provider.complete(request, reasoning_effort="high")
+    with pytest.raises(TypeError):
+        complete = cast(Any, provider.complete)
+        await complete({"role": "system", "content": "System"})
 
     assert client.chat.completions.calls == []
 

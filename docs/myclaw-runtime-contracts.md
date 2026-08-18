@@ -416,7 +416,7 @@ chat 和 schedule 的 system-level context 按以下固定顺序组装：
 
 1. 内置 identity prompt，其中包含 normalized absolute Workspace。
 2. 完整的 runtime-startup Long-term Memory snapshot，以明确的 `<long_term_memory>` delimiter 包裹。
-3. 当前 Tool Catalog 的 guidance，以明确的 `<tool_guidance>` delimiter 包裹。
+3. 固定 Tool Catalog 的 guidance，以明确的 `<tool_guidance>` delimiter 包裹。
 
 User Configuration 不得插入或替换 identity/system prompt。缓存的 OpenAI-format Tool schema snapshots 通过 provider 的结构化 tools 字段发送，不把 JSON schema 重复拼入自然语言 guidance。
 
@@ -484,25 +484,36 @@ logical purpose -> requested route -> usable route config -> provider adapter
 
 一个逻辑 model call 在 requested route 和 default 之间共享 5-attempt budget，最坏不超过 5 次 provider 调用。若第 5 次才暴露永久错误，则没有剩余预算调用 default，当前逻辑调用失败。
 
-### 9.2 统一请求
+### 9.2 Provider 直接调用
 
 ```python
-ModelRequest(
-    request_id: UUID,
-    route: Literal["default", "chat", "memory", "schedule"],
-    system_prompt: str,
-    messages: tuple[ModelMessage, ...],
-    tools: tuple[OpenAIToolSchema, ...],
-    stream: bool,
-    model: str,
-    max_output: int,
-    temperature: float,
-    reasoning_effort: Literal["low", "medium", "high"] | None,
-    timeout_seconds: int,
-)
+class ModelProvider(Protocol):
+    def stream(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: Literal["low", "medium", "high"] | None,
+        timeout: int,
+    ) -> AsyncIterator[ModelStreamEvent]: ...
+
+    async def complete(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: Literal["low", "medium", "high"] | None,
+        timeout: int,
+    ) -> ModelResponse: ...
 ```
 
-`OpenAIToolSchema` 是由 Tool Catalog 缓存的 OpenAI Function Calling 格式快照。OpenAI-compatible adapter 直接传递该格式；Anthropic adapter 在内部转换字段。provider adapter 接收已解析的 concrete route config，不自行 fallback、不读取 User Configuration、不处理 session。
+Router 只在调用边界接收逻辑 route、message dictionaries 和 Tool schemas，并负责 route resolution；具体 Provider 只接收上面列出的已解析字段。调用方通过 `stream` 或 `complete` 方法选择同步/流式语义，不携带请求 ID，也不把 route 传给 concrete Provider。`OpenAIToolSchema` 是由 Tool Catalog 缓存的 OpenAI Function Calling 格式快照。OpenAI-compatible adapter 直接传递该格式；Anthropic adapter 在内部转换字段。Provider adapter 不自行 fallback、不读取 User Configuration、不处理 Session。
 
 ### 9.3 统一响应与 streaming
 
@@ -876,8 +887,8 @@ class MemoryStore(Protocol):
     async def write_summary_cursor(self, index: int) -> None: ...
 
 class ModelProvider(Protocol):
-    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]: ...
-    async def complete(self, request: ModelRequest) -> ModelResponse: ...
+    def stream(self, *, messages, tools, model, max_output, temperature, reasoning_effort, timeout) -> AsyncIterator[ModelStreamEvent]: ...
+    async def complete(self, *, messages, tools, model, max_output, temperature, reasoning_effort, timeout) -> ModelResponse: ...
     async def close(self) -> None: ...
 
 class ConcreteTool(BaseTool):

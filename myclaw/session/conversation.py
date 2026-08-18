@@ -3,9 +3,8 @@
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from copy import deepcopy
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from loguru import logger
@@ -26,63 +25,56 @@ from myclaw.agent.events import (
     TurnFailedPayload,
     TurnStartedPayload,
 )
-from myclaw.agent.prompts import current_user_input
 from myclaw.agent.run import (
     AgentRun,
     AgentRunCancelledPayload,
     AgentRunCompletedPayload,
     AgentRunConfirmationRequestedPayload,
+    AgentRunEmitter,
     AgentRunFailedPayload,
-    AgentRunInterface,
     AgentRunModelCallCompletedPayload,
-    AgentRunModelSettings,
+    AgentRunModelTarget,
     AgentRunPayload,
+    AgentRunRoute,
     AgentRunStartedPayload,
     AgentRunTextDeltaPayload,
     AgentRunToolCompletedPayload,
     AgentRunToolStartedPayload,
-    SummaryPreparer,
     ToolResultExternalizer,
     _log_artifact_failure,
-    model_message_from_session,
 )
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
-    DirectModelProvider,
     ModelCompleted,
     ModelMessages,
-    ModelProvider,
     ModelStreamEvent,
     ModelUsage,
-    ReasoningEffort,
-    accepts_direct_provider_call,
-    legacy_request_from_direct,
 )
 from myclaw.session.session import Session
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ConfirmationChannel, ToolGateway, ToolResultStatus
 
-__all__ = ["ChatModelSettings", "StreamingConversationPort", "model_message_from_session"]
-
-
-@dataclass(frozen=True, slots=True)
-class ChatModelSettings:
-    """Resolved provider-neutral fields needed for one chat request."""
-
-    model: str
-    max_output: int
-    temperature: float
-    reasoning_effort: ReasoningEffort | None
-    timeout_seconds: int
+__all__ = ["ForegroundSummaryPreparer", "StreamingConversationPort"]
 
 
 type ForegroundSummaryPreparer = Callable[
     [Session, dict[str, Any]],
     Awaitable[Session],
 ]
+
+
+class _AwaitableAgentRun(Protocol):
+    async def run(
+        self,
+        messages: list[dict[str, Any]],
+        current_user: dict[str, Any],
+        *,
+        route: AgentRunRoute,
+        emitter: AgentRunEmitter,
+        confirmation: ConfirmationChannel | None = None,
+    ) -> list[dict[str, Any]]: ...
 
 
 _CONVERSATION_STREAM_DONE = object()
@@ -199,27 +191,22 @@ class StreamingConversationPort:
     def __init__(
         self,
         *,
-        provider: ModelProvider,
+        model: AgentRunModelTarget,
         session: Session,
-        settings: ChatModelSettings,
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
-        system_prompt: str = "",
         title_prompt: str | None = None,
         tool_gateway: ToolGateway | None = None,
-        agent_run: AgentRunInterface | None = None,
-        summary_preparer: SummaryPreparer | None = None,
+        agent_run: _AwaitableAgentRun | None = None,
         foreground_summary_preparer: ForegroundSummaryPreparer | None = None,
         context_builder: ContextBuilder | None = None,
         memory_snapshot: Callable[[], str] | None = None,
-        system_prompt_for_memory: Callable[[str], str] | None = None,
         externalize_result: ToolResultExternalizer | None = None,
         workspace_state: WorkspaceState | None = None,
         title_log_ready: Callable[[], Awaitable[object]] | None = None,
     ) -> None:
-        self._provider = provider
+        self._model = model
         self._session = session
-        self._settings = settings
         self._now = now
         self._new_uuid = new_uuid
         self._title_prompt = title_prompt
@@ -228,8 +215,6 @@ class StreamingConversationPort:
         self._workspace_state = workspace_state
         self._title_log_ready = title_log_ready
         self._memory_snapshot = memory_snapshot
-        self._system_prompt_for_memory = system_prompt_for_memory
-        self._summary_preparer = summary_preparer
         self._foreground_summary_preparer = foreground_summary_preparer
         self._context_builder = context_builder
         self._agent_run = agent_run
@@ -240,7 +225,6 @@ class StreamingConversationPort:
         self._active_turn_done: asyncio.Event | None = None
         self._cancel_requested = False
         self._close_task: asyncio.Task[None] | None = None
-        self._system_prompt = system_prompt
         self._confirmation: ConfirmationChannel | None = None
         self._execution_task: asyncio.Task[None] | None = None
 
@@ -328,56 +312,37 @@ class StreamingConversationPort:
             self._start_title_for_first_user_content(text)
             messages = await self._prepare_foreground_messages(current_user)
             agent_run = self._get_agent_run()
-            run = getattr(agent_run, "run", None)
-            if callable(run):
-                increment = await run(
-                    messages,
-                    current_user,
-                    route="chat",
-                    emitter=bridge,
-                    confirmation=confirmation,
+            increment = await agent_run.run(
+                messages,
+                current_user,
+                route="chat",
+                emitter=bridge,
+                confirmation=confirmation,
+            )
+            if bridge.terminal is None:
+                raise RuntimeError("Agent Run completed without a terminal payload")
+            if isinstance(bridge.terminal, AgentRunFailedPayload):
+                _log_terminal_failure(
+                    bridge.terminal.cause or ModelCallError(bridge.terminal.error)
                 )
-                if not isinstance(increment, list):
-                    raise TypeError("Agent Run increment must be a list")
-                if bridge.terminal is None:
-                    raise RuntimeError("Agent Run completed without a terminal payload")
-                try:
-                    self._commit_increment(increment)
-                except Exception as failure:
-                    logger.opt(exception=failure).error(
-                        "Agent Run Session increment failed code=persistence_error type={}",
-                        type(failure).__name__,
-                    )
-                    await queue.put(
-                        ModelCallError(
-                            ErrorInfo(
-                                code="persistence_error",
-                                message="The Conversation Session could not be updated.",
-                            )
+            try:
+                self._commit_increment(increment)
+            except Exception as failure:
+                logger.opt(exception=failure).error(
+                    "Agent Run Session increment failed code=persistence_error type={}",
+                    type(failure).__name__,
+                )
+                await queue.put(
+                    ModelCallError(
+                        ErrorInfo(
+                            code="persistence_error",
+                            message="The Conversation Session could not be updated.",
                         )
                     )
-                    return
-                await bridge.publish_repaired_tools(increment)
-                await bridge.publish_terminal()
-            else:
-                run_agent = getattr(agent_run, "run_agent", None)
-                if not callable(run_agent):
-                    raise TypeError("Agent Run does not expose a supported execution method")
-                payloads = run_agent(
-                    self._session,
-                    text,
-                    route="chat",
-                    stream=True,
-                    confirmation=confirmation,
                 )
-                try:
-                    async for payload in payloads:
-                        await bridge.emit(payload)
-                finally:
-                    close = getattr(payloads, "aclose", None)
-                    if close is not None:
-                        await close()
-                await bridge.publish_terminal()
+                return
+            await bridge.publish_repaired_tools(increment)
+            await bridge.publish_terminal()
         except ModelCallError as failure:
             if bridge.terminal is not None:
                 await queue.put(failure)
@@ -425,13 +390,6 @@ class StreamingConversationPort:
                 self._session,
                 deepcopy(current_user),
             )
-        elif self._summary_preparer is not None:
-            prepared = await self._summary_preparer(
-                self._session,
-                "chat",
-                self._system_prompt,
-                self._tool_schemas(),
-            )
         else:
             prepared = self._session
         if prepared is not self._session:
@@ -439,49 +397,24 @@ class StreamingConversationPort:
 
         history = self._session.messages[self._session.last_consolidated :]
         context_builder = self._context_builder
-        if context_builder is not None:
-            memory = "" if self._memory_snapshot is None else self._memory_snapshot()
-            return context_builder.build_messages(
-                history=history,
-                current_user=current_user,
-                session_id=self._session.session_id,
-                long_term_memory=memory,
-            )
-        return [
-            {"role": "system", "content": self._system_prompt},
-            *[
-                model_message.to_dict()
-                for message in history
-                if (model_message := model_message_from_session(message)) is not None
-            ],
-            {
-                "role": "user",
-                "content": current_user_input(
-                    content=cast(str, current_user["content"]),
-                    current_time=self._now(),
-                    session_id=self._session.session_id,
-                ),
-            },
-        ]
+        if context_builder is None:
+            raise RuntimeError("Foreground Conversation requires a ContextBuilder")
+        memory = "" if self._memory_snapshot is None else self._memory_snapshot()
+        return context_builder.build_messages(
+            history=history,
+            current_user=current_user,
+            session_id=self._session.session_id,
+            long_term_memory=memory,
+        )
 
-    def _get_agent_run(self) -> AgentRunInterface | object:
+    def _get_agent_run(self) -> _AwaitableAgentRun:
         agent_run = self._agent_run
         if agent_run is not None:
             return agent_run
         agent_run = AgentRun(
-            provider=self._provider,
-            settings=AgentRunModelSettings(
-                model=self._settings.model,
-                max_output=self._settings.max_output,
-                temperature=self._settings.temperature,
-                reasoning_effort=self._settings.reasoning_effort,
-                timeout_seconds=self._settings.timeout_seconds,
-            ),
-            now=self._now,
-            new_uuid=self._new_uuid,
+            model=self._model,
             tool_gateway=self._tool_gateway,
             externalize_result=self._externalize_result,
-            on_terminal_failure=_log_terminal_failure,
             on_artifact_failure=lambda error, tool_name: _log_artifact_failure(
                 error,
                 tool_name=tool_name,
@@ -498,11 +431,6 @@ class StreamingConversationPort:
             self._session.persist()
         except Exception:
             pass
-
-    def _tool_schemas(self) -> tuple[OpenAIToolSchema, ...]:
-        if self._tool_gateway is None:
-            return ()
-        return tuple(self._tool_gateway.schemas)
 
     def _event_from_payload(
         self,
@@ -675,36 +603,7 @@ class StreamingConversationPort:
             {"role": "system", "content": self._title_prompt or ""},
             {"role": "user", "content": normalized_user_content},
         ]
-        route_status = getattr(self._provider, "route_status", None)
-        if callable(route_status):
-            return cast(
-                AsyncIterator[ModelStreamEvent],
-                cast(Any, self._provider).stream("chat", messages=messages, tools=()),
-            )
-        method = cast(Any, self._provider).stream
-        if accepts_direct_provider_call(method):
-            return cast(DirectModelProvider, self._provider).stream(
-                messages=messages,
-                tools=(),
-                model=self._settings.model,
-                max_output=self._settings.max_output,
-                temperature=self._settings.temperature,
-                reasoning_effort=self._settings.reasoning_effort,
-                timeout=self._settings.timeout_seconds,
-            )
-        return self._provider.stream(
-            legacy_request_from_direct(
-                route="chat",
-                messages=messages,
-                tools=(),
-                model=self._settings.model,
-                max_output=self._settings.max_output,
-                temperature=self._settings.temperature,
-                reasoning_effort=self._settings.reasoning_effort,
-                timeout=self._settings.timeout_seconds,
-                stream=True,
-            )
-        )
+        return self._model.stream("chat", messages=messages, tools=())
 
     async def cancel_active_turn(self) -> None:
         if self._cancel_requested:

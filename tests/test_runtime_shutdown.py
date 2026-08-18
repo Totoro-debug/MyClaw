@@ -1,13 +1,15 @@
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from myclaw.agent.context import ContextBuilder
 from myclaw.agent.prompts import session_title_prompt
+from myclaw.agent.run import AgentRunModelSettings, AgentRunModelTarget
 from myclaw.agent.runtime import _DeferredConversationPort, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -17,15 +19,15 @@ from myclaw.logging.session import session_log
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
-    ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
     TextDelta,
 )
 from myclaw.schedule.store import WorkspaceScheduleStore
-from myclaw.session.conversation import ChatModelSettings
 from myclaw.session.session import Session
+from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
@@ -453,20 +455,22 @@ async def test_deferred_conversation_does_not_construct_after_close_during_pre_s
         )
     )
     conversation = _DeferredConversationPort(
-        provider=provider,
-        session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=30,
+        model=AgentRunModelTarget.for_provider(
+            provider,
+            AgentRunModelSettings(
+                model="test-model",
+                max_output=1024,
+                temperature=0.1,
+                reasoning_effort=None,
+                timeout_seconds=30,
+            ),
         ),
+        session=session,
         now=lambda: NOW,
         new_uuid=uuid4,
-        system_prompt="system",
         title_prompt=session_title_prompt(),
         tool_gateway=_fixed_gateway(workspace, agent_home),
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
         before_submit=before_submit,
         on_foreground_terminal=lambda: None,
     )
@@ -524,20 +528,22 @@ async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_p
         )
     )
     conversation = _DeferredConversationPort(
-        provider=provider,
-        session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=30,
+        model=AgentRunModelTarget.for_provider(
+            provider,
+            AgentRunModelSettings(
+                model="test-model",
+                max_output=1024,
+                temperature=0.1,
+                reasoning_effort=None,
+                timeout_seconds=30,
+            ),
         ),
+        session=session,
         now=lambda: NOW,
         new_uuid=uuid4,
-        system_prompt="system",
         title_prompt=session_title_prompt(),
         tool_gateway=_fixed_gateway(workspace, agent_home),
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
         before_submit=before_submit,
         on_foreground_terminal=lambda: None,
     )
@@ -616,20 +622,22 @@ async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existin
         )
     )
     conversation = _DeferredConversationPort(
-        provider=provider,
-        session=session,
-        settings=ChatModelSettings(
-            model="test-model",
-            max_output=1024,
-            temperature=0.1,
-            reasoning_effort=None,
-            timeout_seconds=30,
+        model=AgentRunModelTarget.for_provider(
+            provider,
+            AgentRunModelSettings(
+                model="test-model",
+                max_output=1024,
+                temperature=0.1,
+                reasoning_effort=None,
+                timeout_seconds=30,
+            ),
         ),
+        session=session,
         now=lambda: NOW,
         new_uuid=uuid4,
-        system_prompt="system",
         title_prompt=session_title_prompt(),
         tool_gateway=_fixed_gateway(workspace, agent_home),
+        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
         before_submit=before_submit,
         on_foreground_terminal=lambda: None,
     )
@@ -676,8 +684,21 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
             self.chat_calls = 0
             self.closed = False
 
-        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-            if request.system_prompt == session_title_prompt():
+        async def stream(
+            self,
+            *,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str,
+            max_output: int,
+            temperature: float,
+            reasoning_effort: ReasoningEffort | None,
+            timeout: int,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            if messages and messages[0] == {
+                "role": "system",
+                "content": session_title_prompt(),
+            }:
                 yield ModelCompleted(
                     response=ModelResponse(
                         message=AssistantModelMessage(content="Interrupt test"),
@@ -695,8 +716,18 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
             finally:
                 self.stopped[index].set()
 
-        async def complete(self, request: ModelRequest) -> ModelResponse:
-            raise AssertionError(f"Unexpected completion: {request!r}")
+        async def complete(
+            self,
+            *,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str,
+            max_output: int,
+            temperature: float,
+            reasoning_effort: ReasoningEffort | None,
+            timeout: int,
+        ) -> ModelResponse:
+            raise AssertionError(f"Unexpected completion: {messages!r}")
 
         async def close(self) -> None:
             self.closed = True

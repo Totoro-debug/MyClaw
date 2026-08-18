@@ -4,7 +4,9 @@ from tests.fixtures.clock import FakeClock
 from tests.fixtures.events import validate_agent_event_sequence
 from tests.fixtures.gateway import SingleToolGateway
 from tests.fixtures.provider import (
+    ProviderCall,
     ScriptedFakeProvider,
+    ScriptedFakeRouter,
     StreamScript,
     unexpected_provider_factory,
 )
@@ -15,7 +17,9 @@ __all__ = [
     "FakeClock",
     "FakeTool",
     "FakeToolCall",
+    "ProviderCall",
     "ScriptedFakeProvider",
+    "ScriptedFakeRouter",
     "SingleToolGateway",
     "StreamScript",
     "unexpected_provider_factory",

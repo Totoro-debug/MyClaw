@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from myclaw.agent.prompts import conversation_summary_input, conversation_summary_prompt
-from myclaw.agent.run import model_message_from_session
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
@@ -18,6 +17,7 @@ from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
+from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
@@ -343,9 +343,9 @@ def _last_user_index(messages: Sequence[dict[str, Any]]) -> int:
 
 def _summary_input(messages: list[dict[str, Any]]) -> str:
     records = [
-        model_message.to_dict()
+        projected
         for message in messages
-        if (model_message := model_message_from_session(message)) is not None
+        if (projected := project_session_message(message)) is not None
     ]
     return conversation_summary_input(
         messages=json.dumps(

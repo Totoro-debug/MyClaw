@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 from croniter import croniter  # type: ignore[import-untyped]
@@ -20,7 +19,6 @@ from myclaw.agent.run import (
     AgentRunContinuationPreparer,
     AgentRunEmitter,
     AgentRunFailedPayload,
-    AgentRunInterface,
     AgentRunPayload,
     AgentRunRoute,
     ToolResultExternalizer,
@@ -107,7 +105,7 @@ class ScheduleService:
         self,
         *,
         store: WorkspaceScheduleStore,
-        agent_run: AgentRunInterface | _AwaitableAgentRun,
+        agent_run: _AwaitableAgentRun,
         workspace_state: WorkspaceState,
         clock: ScheduleClock,
         context_preparer: ScheduleContextPreparer | None = None,
@@ -414,8 +412,6 @@ class ScheduleService:
         terminal: Literal["ok", "error"] | None = None
         terminal_error: str | None = None
         terminal_code: str | None = None
-        payloads: AsyncIterator[object] | None = None
-        awaitable_run = callable(getattr(self._agent_run, "run", None))
         terminal_ready = False
         with session_log(self._workspace_state, job.session_id):
             try:
@@ -432,61 +428,28 @@ class ScheduleService:
                         job.job_id,
                         now=self._clock.now,
                     )
-                if awaitable_run:
-                    run = cast(_AwaitableAgentRun, self._agent_run)
-                    (
-                        terminal,
-                        terminal_error,
-                        terminal_code,
-                        terminal_ready,
-                    ) = await self._run_awaitable_job(
-                        session,
-                        job,
-                        run,
-                    )
-                else:
-                    legacy_agent_run = cast(AgentRunInterface, self._agent_run)
-                    payloads = legacy_agent_run.run_agent(
-                        session,
-                        job.message,
-                        route="schedule",
-                        stream=False,
-                    )
-                    async for payload in payloads:
-                        if isinstance(payload, AgentRunCompletedPayload):
-                            terminal = "ok"
-                            terminal_error = None
-                            terminal_code = None
-                        elif isinstance(payload, AgentRunFailedPayload):
-                            terminal = "error"
-                            terminal_error = payload.error.message
-                            terminal_code = payload.error.code
-                        elif isinstance(payload, AgentRunCancelledPayload):
-                            return
-                    if terminal is None:
-                        terminal = "error"
-                        terminal_error = "Schedule Job execution failed."
-                        logger.error(
-                            "Schedule Job execution failed job_id={} kind={} type={}",
-                            job.job_id,
-                            job.schedule.kind,
-                            "MissingTerminalPayload",
-                        )
-                    terminal_ready = True
+                run = self._agent_run
+                (
+                    terminal,
+                    terminal_error,
+                    terminal_code,
+                    terminal_ready,
+                ) = await self._run_awaitable_job(
+                    session,
+                    job,
+                    run,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 terminal = "error"
                 terminal_error = "Schedule Job execution failed."
-                if not awaitable_run:
-                    terminal_ready = True
                 logger.error(
                     "Schedule Job execution failed job_id={} type={}",
                     job.job_id,
                     type(error).__name__,
                 )
             finally:
-                await _close_payloads(payloads)
                 try:
                     if terminal is not None and terminal_ready:
                         if terminal_code is not None:
@@ -846,20 +809,6 @@ def _persist_schedule_failure(
     session.append_messages(_schedule_failure_increment(current_user, failure))
     session.persist()
     return "error", failure.error.message, failure.error.code, True
-
-
-async def _close_payloads(payloads: object | None) -> None:
-    if payloads is None:
-        return
-    close = getattr(payloads, "aclose", None)
-    if close is None:
-        return
-    try:
-        result = close()
-        if inspect.isawaitable(result):
-            await result
-    except BaseException:
-        pass
 
 
 async def _await_shared(task: asyncio.Task[None]) -> None:

@@ -10,15 +10,11 @@ from loguru import logger
 from myclaw.config.config import ProviderConfiguration, ResolvedModelRoute, UserConfiguration
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
-    DirectModelProvider,
     ModelMessages,
     ModelProvider,
-    ModelRequest,
     ModelResponse,
     ModelRoute,
     ModelStreamEvent,
-    accepts_direct_provider_call,
-    legacy_request_from_direct,
 )
 from myclaw.tools.base import OpenAIToolSchema
 
@@ -31,7 +27,7 @@ class RetryClock(Protocol):
     async def sleep(self, seconds: float) -> None: ...
 
 
-type ProviderImplementation = ModelProvider | DirectModelProvider
+type ProviderImplementation = ModelProvider
 type ProviderFactory = Callable[[ProviderConfiguration], ProviderImplementation]
 type Jitter = Callable[[float], float]
 
@@ -80,39 +76,16 @@ class ModelRouter:
 
     def stream(
         self,
-        route: ModelRoute | ModelRequest,
+        route: ModelRoute,
         *,
-        messages: ModelMessages | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
     ) -> AsyncIterator[ModelStreamEvent]:
-        if isinstance(route, ModelRequest):
-            if messages is not None or tools is not None:
-                raise TypeError("legacy ModelRequest and direct Router arguments cannot be mixed")
-            return self._stream_request(route)
-        if messages is None:
-            raise TypeError("direct Router calls require messages")
         return self._stream_direct(
             route,
             messages=messages,
-            tools=() if tools is None else tools,
+            tools=tools,
         )
-
-    async def _stream_request(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        resolved = self._begin_call(request.route)
-
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
-            provider = cast(ModelProvider, self._provider(resolved.provider))
-            concrete_request = _concrete_request(request, resolved)
-            emitted = False
-            try:
-                async for event in provider.stream(concrete_request):
-                    emitted = True
-                    yield event
-                return
-            except ModelCallError as failure:
-                if emitted:
-                    raise
-                resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
 
     async def _stream_direct(
         self,
@@ -124,33 +97,18 @@ class ModelRouter:
         resolved = self._begin_call(route)
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            provider = cast(DirectModelProvider, self._provider(resolved.provider))
+            provider = self._provider(resolved.provider)
             emitted = False
             try:
-                if accepts_direct_provider_call(provider.stream):
-                    events = provider.stream(
-                        messages=messages,
-                        tools=tools,
-                        model=resolved.route.model,
-                        max_output=resolved.route.max_output,
-                        temperature=resolved.route.temperature,
-                        reasoning_effort=resolved.route.reasoning_effort,
-                        timeout=resolved.route.timeout,
-                    )
-                else:
-                    events = cast(ModelProvider, provider).stream(
-                        legacy_request_from_direct(
-                            route=route,
-                            messages=messages,
-                            tools=tools,
-                            model=resolved.route.model,
-                            max_output=resolved.route.max_output,
-                            temperature=resolved.route.temperature,
-                            reasoning_effort=resolved.route.reasoning_effort,
-                            timeout=resolved.route.timeout,
-                            stream=True,
-                        )
-                    )
+                events = provider.stream(
+                    messages=messages,
+                    tools=tools,
+                    model=resolved.route.model,
+                    max_output=resolved.route.max_output,
+                    temperature=resolved.route.temperature,
+                    reasoning_effort=resolved.route.reasoning_effort,
+                    timeout=resolved.route.timeout,
+                )
                 async for event in events:
                     emitted = True
                     yield event
@@ -162,35 +120,16 @@ class ModelRouter:
 
     async def complete(
         self,
-        route: ModelRoute | ModelRequest,
+        route: ModelRoute,
         *,
-        messages: ModelMessages | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
     ) -> ModelResponse:
-        if isinstance(route, ModelRequest):
-            if messages is not None or tools is not None:
-                raise TypeError("legacy ModelRequest and direct Router arguments cannot be mixed")
-            return await self._complete_request(route)
-        if messages is None:
-            raise TypeError("direct Router calls require messages")
         return await self._complete_direct(
             route,
             messages=messages,
-            tools=() if tools is None else tools,
+            tools=tools,
         )
-
-    async def _complete_request(self, request: ModelRequest) -> ModelResponse:
-        resolved = self._begin_call(request.route)
-
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
-            provider = cast(ModelProvider, self._provider(resolved.provider))
-            concrete_request = _concrete_request(request, resolved)
-            try:
-                return await provider.complete(concrete_request)
-            except ModelCallError as failure:
-                resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
-
-        raise AssertionError("Provider attempt budget exhausted without a terminal result")
 
     async def _complete_direct(
         self,
@@ -202,30 +141,16 @@ class ModelRouter:
         resolved = self._begin_call(route)
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            provider = cast(DirectModelProvider, self._provider(resolved.provider))
+            provider = self._provider(resolved.provider)
             try:
-                if accepts_direct_provider_call(provider.complete):
-                    return await provider.complete(
-                        messages=messages,
-                        tools=tools,
-                        model=resolved.route.model,
-                        max_output=resolved.route.max_output,
-                        temperature=resolved.route.temperature,
-                        reasoning_effort=resolved.route.reasoning_effort,
-                        timeout=resolved.route.timeout,
-                    )
-                return await cast(ModelProvider, provider).complete(
-                    legacy_request_from_direct(
-                        route=route,
-                        messages=messages,
-                        tools=tools,
-                        model=resolved.route.model,
-                        max_output=resolved.route.max_output,
-                        temperature=resolved.route.temperature,
-                        reasoning_effort=resolved.route.reasoning_effort,
-                        timeout=resolved.route.timeout,
-                        stream=False,
-                    )
+                return await provider.complete(
+                    messages=messages,
+                    tools=tools,
+                    model=resolved.route.model,
+                    max_output=resolved.route.max_output,
+                    temperature=resolved.route.temperature,
+                    reasoning_effort=resolved.route.reasoning_effort,
+                    timeout=resolved.route.timeout,
                 )
             except ModelCallError as failure:
                 resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
@@ -371,18 +296,6 @@ def _log_fallback(
         fallback.provider.provider_id,
         fallback.selected_route,
         fallback.route.model,
-    )
-
-
-def _concrete_request(request: ModelRequest, resolved: ResolvedModelRoute) -> ModelRequest:
-    route = resolved.route
-    return replace(
-        request,
-        model=route.model,
-        max_output=route.max_output,
-        temperature=route.temperature,
-        reasoning_effort=route.reasoning_effort,
-        timeout_seconds=route.timeout,
     )
 
 

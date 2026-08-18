@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -11,7 +12,7 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.tools.tool_gateway import ModelToolCall
-from tests.fixtures.provider import ScriptedFakeProvider, StreamScript
+from tests.fixtures.provider import ProviderCall, ScriptedFakeProvider, StreamScript
 
 
 async def collect(stream: AsyncIterator[object]) -> list[object]:
@@ -39,12 +40,20 @@ async def test_scripted_fake_provider_replays_stream_events_in_order() -> None:
         ModelCompleted(response=response),
     )
     provider = ScriptedFakeProvider(streams=[StreamScript(events=events)])
-    request = {"route": "chat"}
+    call: dict[str, Any] = {
+        "messages": [{"role": "system", "content": "System"}],
+        "tools": (),
+        "model": "model",
+        "max_output": 10,
+        "temperature": 0.2,
+        "reasoning_effort": None,
+        "timeout": 30,
+    }
 
-    observed = await collect(provider.stream(request))
+    observed = await collect(provider.stream(**call))
 
     assert observed == list(events)
-    assert provider.stream_requests == [request]
+    assert provider.stream_requests == [ProviderCall(**call)]
 
 
 @pytest.mark.asyncio
@@ -55,12 +64,20 @@ async def test_scripted_fake_provider_returns_complete_responses_in_order() -> N
         finish_reason="stop",
     )
     provider = ScriptedFakeProvider(completions=[response])
-    request = {"route": "memory"}
+    call: dict[str, Any] = {
+        "messages": [{"role": "system", "content": "System"}],
+        "tools": (),
+        "model": "model",
+        "max_output": 10,
+        "temperature": 0.2,
+        "reasoning_effort": None,
+        "timeout": 30,
+    }
 
-    observed = await provider.complete(request)
+    observed = await provider.complete(**call)
 
     assert observed is response
-    assert provider.complete_requests == [request]
+    assert provider.complete_requests == [ProviderCall(**call)]
 
 
 @pytest.mark.asyncio
@@ -76,11 +93,39 @@ async def test_scripted_fake_provider_raises_scripted_failures_and_cancellation(
     )
 
     with pytest.raises(TimeoutError, match="retry this provider call"):
-        await collect(provider.stream("retry request"))
+        await collect(
+            provider.stream(
+                messages=[],
+                tools=(),
+                model="model",
+                max_output=10,
+                temperature=0.2,
+                reasoning_effort=None,
+                timeout=30,
+            )
+        )
     with pytest.raises(asyncio.CancelledError):
-        await collect(provider.stream("cancel request"))
+        await collect(
+            provider.stream(
+                messages=[],
+                tools=(),
+                model="model",
+                max_output=10,
+                temperature=0.2,
+                reasoning_effort=None,
+                timeout=30,
+            )
+        )
     with pytest.raises(RuntimeError, match="provider failed"):
-        await provider.complete("final request")
+        await provider.complete(
+            messages=[],
+            tools=(),
+            model="model",
+            max_output=10,
+            temperature=0.2,
+            reasoning_effort=None,
+            timeout=30,
+        )
 
 
 @pytest.mark.asyncio
