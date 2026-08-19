@@ -518,7 +518,6 @@ def _prepare_repl_runtime(
         current_system_prompt: str,
         tools: tuple[OpenAIToolSchema, ...],
         current_user: dict[str, Any] | None = None,
-        continuation: Sequence[dict[str, Any]] = (),
     ) -> Session:
         effective_route = configuration.resolve_route(route).route
         if route == "chat":
@@ -567,7 +566,6 @@ def _prepare_repl_runtime(
         return await manager.prepare(
             active_session,
             current_user=current_user,
-            continuation=continuation,
         )
 
     async def prepare_schedule_context(
@@ -591,36 +589,6 @@ def _prepare_repl_runtime(
             current_time=now(),
         )
 
-    async def prepare_schedule_continuation(
-        active_session: Session,
-        runtime_messages: Sequence[dict[str, Any]],
-        increment: Sequence[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        if not runtime_messages or runtime_messages[0].get("role") != "system":
-            raise TypeError("Schedule continuation context requires a System Prompt")
-        current_system_prompt = runtime_messages[0].get("content")
-        if not isinstance(current_system_prompt, str):
-            raise TypeError("Schedule System Prompt content must be a string")
-        if not increment or increment[0].get("role") != "user":
-            raise TypeError("Schedule continuation requires the current user increment")
-        current_user = increment[0]
-        continuation = increment[1:]
-        await prepare_summary(
-            active_session,
-            "schedule",
-            current_system_prompt,
-            tuple(scheduled_tool_gateway.schemas),
-            current_user,
-            continuation,
-        )
-        history = active_session.messages[active_session.last_consolidated :]
-        return _project_schedule_messages(
-            [*history, *increment],
-            system_prompt=current_system_prompt,
-            session_id=active_session.session_id,
-            current_time=now(),
-        )
-
     schedule_agent_run = AgentRun(model=model, tool_gateway=scheduled_tool_gateway)
     schedule_clock = (
         schedule_scheduler_clock
@@ -633,7 +601,6 @@ def _prepare_repl_runtime(
         workspace_state=workspace_state,
         clock=schedule_clock,
         context_preparer=prepare_schedule_context,
-        continuation_preparer=prepare_schedule_continuation,
         externalize_result_for=externalize_result_for,
     )
     foreground_chat_status: ResolvedChatStatus | None = None

@@ -92,10 +92,9 @@ class RecordingAgentRun:
         route: str,
         emitter: AgentRunEmitter,
         externalize_result: object | None = None,
-        continuation_preparer: object | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> list[dict[str, object]]:
-        del externalize_result, continuation_preparer, cancel_requested
+        del externalize_result, cancel_requested
         self.calls.append((messages, current_user, route))
         self.started.set()
         if self.block:
@@ -144,10 +143,9 @@ class AwaitableRecordingAgentRun:
         *,
         route: str,
         emitter: AgentRunEmitter,
-        continuation_preparer: object | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> list[dict[str, object]]:
-        del continuation_preparer, cancel_requested
+        del cancel_requested
         self._timeline.append("run")
         self.calls.append((messages, current_user, route))
         self.started.set()
@@ -193,10 +191,9 @@ class OutcomeAwaitableAgentRun:
         *,
         route: str,
         emitter: AgentRunEmitter,
-        continuation_preparer: object | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> list[dict[str, object]]:
-        del messages, current_user, route, continuation_preparer, cancel_requested
+        del messages, current_user, route, cancel_requested
         self.started.set()
         await emitter.emit(AgentRunStartedPayload())
         await emitter.emit(self.terminal)
@@ -214,7 +211,6 @@ class RaisingAwaitableAgentRun:
         *,
         route: str,
         emitter: AgentRunEmitter,
-        continuation_preparer: object | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> list[dict[str, object]]:
         del (
@@ -222,7 +218,6 @@ class RaisingAwaitableAgentRun:
             current_user,
             route,
             emitter,
-            continuation_preparer,
             cancel_requested,
         )
         self.started.set()
@@ -1081,10 +1076,9 @@ async def test_cron_failure_waits_for_the_next_match_without_retry(
             route: str,
             emitter: AgentRunEmitter,
             externalize_result: object | None = None,
-            continuation_preparer: object | None = None,
             cancel_requested: Callable[[], bool] | None = None,
         ) -> list[dict[str, object]]:
-            del continuation_preparer, cancel_requested
+            del cancel_requested
             self.calls.append((messages, current_user, route))
             self.started.set()
             await emitter.emit(AgentRunStartedPayload())
@@ -1383,10 +1377,9 @@ async def test_every_safe_failure_commits_terminal_error_without_early_retry(
             route: str,
             emitter: AgentRunEmitter,
             externalize_result: object | None = None,
-            continuation_preparer: object | None = None,
             cancel_requested: Callable[[], bool] | None = None,
         ) -> list[dict[str, object]]:
-            del continuation_preparer, cancel_requested
+            del cancel_requested
             self.calls.append((messages, current_user, route))
             self.started.set()
             await emitter.emit(AgentRunStartedPayload())
@@ -1730,10 +1723,9 @@ async def test_safe_agent_failure_logs_one_warning_without_failure_message(
             route: str,
             emitter: AgentRunEmitter,
             externalize_result: object | None = None,
-            continuation_preparer: object | None = None,
             cancel_requested: Callable[[], bool] | None = None,
         ) -> list[dict[str, object]]:
-            del continuation_preparer, cancel_requested
+            del cancel_requested
             self.calls.append((messages, current_user, route))
             self.started.set()
             await emitter.emit(AgentRunStartedPayload())
@@ -1798,10 +1790,9 @@ async def test_one_job_exception_does_not_stop_other_due_jobs(
             route: str,
             emitter: AgentRunEmitter,
             externalize_result: object | None = None,
-            continuation_preparer: object | None = None,
             cancel_requested: Callable[[], bool] | None = None,
         ) -> list[dict[str, object]]:
-            del continuation_preparer, cancel_requested
+            del cancel_requested
             self.calls.append((messages, current_user, route))
             if len(self.calls) == 1:
                 raise RuntimeError("PRIVATE_JOB_EXCEPTION_BODY")
@@ -1942,10 +1933,9 @@ async def test_agent_run_cancelled_payload_keeps_at_job_pending(
             route: str,
             emitter: AgentRunEmitter,
             externalize_result: object | None = None,
-            continuation_preparer: object | None = None,
             cancel_requested: Callable[[], bool] | None = None,
         ) -> list[dict[str, object]]:
-            del continuation_preparer, cancel_requested
+            del cancel_requested
             self.calls.append((messages, current_user, route))
             await emitter.emit(AgentRunStartedPayload())
             await emitter.emit(AgentRunCancelledPayload(partial_content=""))
@@ -2069,10 +2059,9 @@ async def test_failed_at_is_deleted_and_a_new_service_does_not_replay_it(
             route: str,
             emitter: AgentRunEmitter,
             externalize_result: object | None = None,
-            continuation_preparer: object | None = None,
             cancel_requested: Callable[[], bool] | None = None,
         ) -> list[dict[str, object]]:
-            del continuation_preparer, cancel_requested
+            del cancel_requested
             self.calls.append((messages, current_user, route))
             await emitter.emit(AgentRunStartedPayload())
             await emitter.emit(

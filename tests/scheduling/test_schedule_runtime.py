@@ -443,7 +443,7 @@ async def test_runtime_schedule_tool_loop_persists_each_message_from_awaitable_r
 
 
 @pytest.mark.asyncio
-async def test_runtime_schedule_reapplies_summary_policy_before_tool_loop_continuation(
+async def test_runtime_schedule_tool_loop_does_not_prepare_summary_inside_agent_run(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -490,7 +490,6 @@ async def test_runtime_schedule_reapplies_summary_policy_before_tool_loop_contin
             ),
             _response("Continuation completed."),
         ),
-        memory_responses=(_response("Old Schedule turn summary."),),
     )
     runtime = _runtime(
         agent_home,
@@ -505,38 +504,30 @@ async def test_runtime_schedule_reapplies_summary_policy_before_tool_loop_contin
         await _wait_until(
             lambda: (
                 [_is_schedule_call(request) for request in provider.complete_requests]
-                == [True, False, True]
+                == [True, True]
                 and runtime.schedule_service.status_snapshot().active_job_count == 0
             )
         )
     finally:
         await runtime.close()
 
-    schedule_messages = [
-        messages
-        for request, (messages, _tools) in zip(
-            provider.complete_requests,
-            provider.direct_complete_messages,
-            strict=True,
-        )
-        if _is_schedule_call(request)
-    ]
+    schedule_messages = [messages for messages, _tools in provider.direct_complete_messages]
     assert [message["role"] for message in schedule_messages[1]] == [
         "system",
         "user",
         "assistant",
+        "user",
+        "assistant",
         "tool",
     ]
-    assert "Old scheduled request." not in json.dumps(schedule_messages[1])
-    assert [entry.content for entry in await WorkspaceJsonlSummaryStore(state).after(0, 10)] == [
-        "Old Schedule turn summary."
-    ]
+    assert "Old scheduled request." in json.dumps(schedule_messages[1])
+    assert await WorkspaceJsonlSummaryStore(state).after(0, 10) == ()
     persisted = Session.load(
         state,
         f"schedule_{JOB_UUID}",
         partition=SessionStoragePartition.SCHEDULE,
     )
-    assert persisted.last_consolidated == 2
+    assert persisted.last_consolidated == 0
 
 
 @pytest.mark.asyncio

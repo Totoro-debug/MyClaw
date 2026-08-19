@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, ClassVar, Literal, Protocol
@@ -34,10 +34,6 @@ from myclaw.tools.tool_gateway import (
 type AgentRunRoute = Literal["chat", "schedule"]
 type ConfirmationChannel = ToolConfirmationChannel
 type ToolResultExternalizer = Callable[[ToolResult], ToolResult]
-type AgentRunContinuationPreparer = Callable[
-    [Sequence[dict[str, Any]], Sequence[dict[str, Any]]],
-    Awaitable[list[dict[str, Any]]],
-]
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +184,6 @@ class AgentRun:
         emitter: AgentRunEmitter,
         confirmation: ConfirmationChannel | None = None,
         externalize_result: ToolResultExternalizer | None = None,
-        continuation_preparer: AgentRunContinuationPreparer | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
         """Run the model and Tool loop without owning Conversation Session state.
@@ -212,7 +207,6 @@ class AgentRun:
         started_emitted = False
         terminal_emitted = False
         stream = route == "chat"
-        preparing_continuation = False
         is_cancel_requested = cancel_requested or self._cancel_requested
 
         try:
@@ -240,14 +234,6 @@ class AgentRun:
                 return increment
 
             while True:
-                if preparing_continuation and continuation_preparer is not None:
-                    prepared = await continuation_preparer(
-                        deepcopy(runtime_messages),
-                        deepcopy(increment),
-                    )
-                    if not isinstance(prepared, list):
-                        raise TypeError("Agent Run continuation preparer must return a list")
-                    runtime_messages = deepcopy(prepared)
                 partial_content.clear()
                 events = (
                     self._model.stream(
@@ -419,7 +405,6 @@ class AgentRun:
                                 )
                                 terminal_emitted = True
                                 return increment
-                        preparing_continuation = True
                         continue
 
                     await _emit_agent_run_payload(
@@ -803,7 +788,6 @@ __all__ = [
     "AgentRunCancelledPayload",
     "AgentRunCompletedPayload",
     "AgentRunConfirmationRequestedPayload",
-    "AgentRunContinuationPreparer",
     "AgentRunEmitter",
     "AgentRunFailedPayload",
     "AgentRunModelCallCompletedPayload",

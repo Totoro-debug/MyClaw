@@ -16,7 +16,6 @@ from loguru import logger
 from myclaw.agent.run import (
     AgentRunCancelledPayload,
     AgentRunCompletedPayload,
-    AgentRunContinuationPreparer,
     AgentRunEmitter,
     AgentRunFailedPayload,
     AgentRunPayload,
@@ -49,10 +48,6 @@ type ScheduleContextPreparer = Callable[
     [Session, dict[str, Any]],
     Awaitable[list[dict[str, Any]]],
 ]
-type ScheduleContinuationPreparer = Callable[
-    [Session, Sequence[dict[str, Any]], Sequence[dict[str, Any]]],
-    Awaitable[list[dict[str, Any]]],
-]
 
 
 class _AwaitableAgentRun(Protocol):
@@ -64,7 +59,6 @@ class _AwaitableAgentRun(Protocol):
         route: AgentRunRoute,
         emitter: AgentRunEmitter,
         externalize_result: ToolResultExternalizer | None = None,
-        continuation_preparer: AgentRunContinuationPreparer | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]: ...
 
@@ -110,7 +104,6 @@ class ScheduleService:
         workspace_state: WorkspaceState,
         clock: ScheduleClock,
         context_preparer: ScheduleContextPreparer | None = None,
-        continuation_preparer: ScheduleContinuationPreparer | None = None,
         externalize_result_for: Callable[[Session], ToolResultExternalizer] | None = None,
     ) -> None:
         self._store = store
@@ -118,7 +111,6 @@ class ScheduleService:
         self._workspace_state = workspace_state
         self._clock = clock
         self._context_preparer = context_preparer
-        self._continuation_preparer = continuation_preparer
         self._externalize_result_for = externalize_result_for
         self._loop_task: asyncio.Task[None] | None = None
         self._run_tasks: set[asyncio.Task[None]] = set()
@@ -502,19 +494,6 @@ class ScheduleService:
             return _persist_schedule_failure(session, current_user, _schedule_model_failure())
 
         emitter = _ScheduleRunEmitter()
-        continuation_preparer = self._continuation_preparer
-
-        async def prepare_continuation(
-            runtime_messages: Sequence[dict[str, Any]],
-            current_increment: Sequence[dict[str, Any]],
-        ) -> list[dict[str, Any]]:
-            if continuation_preparer is None:
-                return list(runtime_messages)
-            return await continuation_preparer(
-                session,
-                runtime_messages,
-                current_increment,
-            )
 
         try:
             if self._externalize_result_for is None:
@@ -523,7 +502,6 @@ class ScheduleService:
                     current_user,
                     route="schedule",
                     emitter=emitter,
-                    continuation_preparer=prepare_continuation,
                     cancel_requested=self._closing.is_set,
                 )
             else:
@@ -533,7 +511,6 @@ class ScheduleService:
                     route="schedule",
                     emitter=emitter,
                     externalize_result=self._externalize_result_for(session),
-                    continuation_preparer=prepare_continuation,
                     cancel_requested=self._closing.is_set,
                 )
         except ModelCallError as failure:

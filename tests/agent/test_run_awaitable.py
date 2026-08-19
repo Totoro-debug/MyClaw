@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import AsyncIterator, Sequence
 from copy import deepcopy
 from typing import Any
@@ -29,6 +30,19 @@ from myclaw.provider.models import (
 from myclaw.tools.base import ArtifactReference, BaseTool
 from myclaw.tools.tool_gateway import ConfirmationChannel, ModelToolCall, ToolResult
 from tests.fixtures import FakeTool, SingleToolGateway
+
+
+def test_run_interface_accepts_only_execution_inputs() -> None:
+    assert tuple(inspect.signature(AgentRun.run).parameters) == (
+        "self",
+        "messages",
+        "current_user",
+        "route",
+        "emitter",
+        "confirmation",
+        "externalize_result",
+        "cancel_requested",
+    )
 
 
 class _RecordingEmitter:
