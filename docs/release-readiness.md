@@ -37,7 +37,7 @@ rewriting those historical decisions.
 - Schedule Jobs use the shared Agent Run through one dispatcher. Add/list/remove,
   confirmation, at/every/cron timing, Schedule Session ownership, Summary/Memory
   behavior, fault recovery, and shutdown are covered through the Runtime composition
-  seam documented in [Windows x64 validation](release/windows-validation.md).
+  seam.
 
 ## Terminal Conversation Acceptance Matrix
 
@@ -80,9 +80,6 @@ Textual/enhanced-keyboard choice is recorded in
 | CLI and package | Direct Typer entry, clean universal tag, clean installation, dependency check, and Unicode smoke | PASS |
 | Complete Windows gate | Full warning-strict pytest, repository Ruff lint, strict Mypy, clean artifact rebuild, and final clean install | PASS |
 
-Artifact identity, host details, exact commands, and final counts are recorded in
-[Windows x64 validation](release/windows-validation.md).
-
 ## Evidence Boundaries
 
 - POSIX adapter tests run on Windows with synthetic capabilities and fault injection.
@@ -112,5 +109,4 @@ Artifact identity, host details, exact commands, and final counts are recorded i
 
 Every required Windows gate passed for the issue-117 universal-wheel candidate.
 Native macOS validation remains outstanding and is not implied by this release
-evidence. The exact Schedule acceptance matrix and artifact identity are recorded
-in [Windows x64 validation](release/windows-validation.md).
+evidence.
