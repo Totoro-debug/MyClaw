@@ -20,6 +20,19 @@ For a release wheel, replace `.` in the install line with the wheel path, for ex
 The remaining examples use `myclaw` for readability; activate the virtual environment
 first or use the full console path shown above.
 
+## Git Worktree CodeGraph
+
+CodeGraph indexes are local to each Git worktree and are intentionally excluded from
+version control. Install the repository hook once so future `git worktree add` commands
+initialize a worktree-local index automatically:
+
+```text
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/install-codegraph-hook.ps1
+```
+
+The hook keeps worktree creation successful when CodeGraph is not installed; in that
+case run `scripts/ensure-codegraph.ps1` after installing CodeGraph.
+
 The same `py3-none-any` wheel contains the Windows and POSIX host adapters. macOS
 Intel and Apple Silicon are intended compatibility targets but remain unverified;
 fake-adapter coverage is not native macOS validation. Linux and other POSIX hosts may

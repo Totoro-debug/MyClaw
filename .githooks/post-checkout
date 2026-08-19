@@ -1,0 +1,32 @@
+#!/bin/sh
+
+# CodeGraph is local, generated state. Keep worktree creation successful even
+# when the optional indexer is unavailable or a rebuild fails.
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+hook_dir="$(CDPATH= cd -- "$(dirname "$0")" 2>/dev/null && pwd)"
+script="$hook_dir/../scripts/ensure-codegraph.ps1"
+[ -f "$script" ] || script="$root/scripts/ensure-codegraph.ps1"
+[ -f "$script" ] || exit 0
+
+status=1
+if command -v pwsh >/dev/null 2>&1; then
+    pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$script" -WorktreePath "$root"
+    status=$?
+elif command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$script" -WorktreePath "$root"
+    status=$?
+elif command -v codegraph >/dev/null 2>&1; then
+    if [ -f "$root/.codegraph/codegraph.db" ]; then
+        exit 0
+    fi
+    codegraph init "$root"
+    status=$?
+else
+    echo "warning: CodeGraph bootstrap skipped because no PowerShell or codegraph command was found" >&2
+    exit 0
+fi
+
+if [ "$status" -ne 0 ]; then
+    echo "warning: CodeGraph bootstrap failed for $root; run scripts/ensure-codegraph.ps1 manually" >&2
+fi
+exit 0
