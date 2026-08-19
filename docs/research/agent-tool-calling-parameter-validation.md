@@ -332,11 +332,11 @@ MCP 还明确说明，`structuredContent` 是 Server 产生的结果，与 LLM S
 
 MyClaw 已经接近推荐分层：
 
-- [`ToolDefinition`](../../myclaw/tools/models.py) 只有 `name`、`description`、`input_schema`，尚无 `strict` 或 `output_schema`；`input_schema` 是 Provider-neutral JSON object。
+- `ToolDefinition` 只有 `name`、`description`、`input_schema`，尚无 `strict` 或 `output_schema`；`input_schema` 是 Provider-neutral JSON object。
 - [`ToolGateway`](../../myclaw/tools/tool_gateway.py) 和 [Memory Task](../../myclaw/memory/memory_task.py) 使用 `Draft202012Validator(..., format_checker=FormatChecker())` 在 permission/执行前校验，但目前每次调用都会新建 Validator 和 FormatChecker。
 - 具体 Tool 继续检查路径边界、资源类型、权限、cron 等语义条件。
 - [`openai_compatible`](../../myclaw/provider/openai_compatible.py) 和 [`anthropic`](../../myclaw/provider/anthropic.py) adapter 当前都直传 canonical schema，且都没有设置 Provider 原生 `strict`。
-- [`read_file` 等 Tool](../../myclaw/tools/files/file_tools.py) 的可选字段带 `default` 且未全部列入 `required`，不能原样满足 OpenAI strict 的 schema 要求。
+- [`read_file`](../../myclaw/tools/core/read_file.py)、[`write_file`](../../myclaw/tools/core/write_file.py) 和 [`edit_file`](../../myclaw/tools/core/edit_file.py) 等 Tool 的可选字段带 `default` 且未全部列入 `required`，不能原样满足 OpenAI strict 的 schema 要求。
 - [`pyproject.toml`](../../pyproject.toml) 已经依赖 `jsonschema>=4.23,<5`，没有 Pydantic/PydanticAI/Zod 依赖。
 
 这说明当前主要缺口不是换 schema library，而是完善 schema 生命周期和 Provider capability 层。
