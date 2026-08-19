@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -93,11 +93,11 @@ def _response(
 
 
 def _project_messages(
-    messages: list[dict[str, object]],
+    messages: Sequence[dict[str, Any]],
     *,
     system_prompt: str,
-) -> list[dict[str, object]]:
-    projected: list[dict[str, object]] = [
+) -> list[dict[str, Any]]:
+    projected: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
     ]
     for message in messages:
@@ -132,7 +132,14 @@ def _manager(
     max_output: int = 1_000,
     threshold: int = 4,
     system_prompt: str = "CHAT SYSTEM",
+    project_messages: Callable[
+        [Sequence[dict[str, Any]]],
+        list[dict[str, Any]],
+    ] | None = None,
 ) -> ConversationSummaryManager:
+    projection = project_messages or (
+        lambda messages: _project_messages(messages, system_prompt=system_prompt)
+    )
     return ConversationSummaryManager(
         provider=ScriptedFakeRouter(provider),
         summaries=summaries,
@@ -141,10 +148,7 @@ def _manager(
         consolidation_message_threshold=threshold,
         tools=(),
         now=lambda: NOW,
-        project_messages=lambda messages: _project_messages(
-            list(messages),
-            system_prompt=system_prompt,
-        ),
+        project_messages=projection,
     )
 
 
@@ -611,6 +615,65 @@ async def test_summary_failure_is_not_rewritten_by_silent_session_persistence_fa
     assert persistence_attempts == [state.sessions_directory / f"{session.session_id}.jsonl"]
     assert provider.stream_requests == []
     assert not summaries.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_token_cutoff_excludes_schedule_continuation_from_history_budget(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    session.add_message("user", "First question: " + "u" * 900)
+    _add_assistant(session, "First answer: " + "a" * 900)
+    session.add_message("user", "Second question: " + "u" * 900)
+    _add_assistant(session, "Second answer: " + "a" * 900)
+    current_user = {"role": "user", "content": "Current scheduled question."}
+    continuation: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "Current tool call: " + "c" * 4_100,
+            "tool_calls": [],
+            "status": "completed",
+            "error": None,
+            "token_usage": _usage(),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "content": "Current tool result.",
+        },
+    ]
+    provider = ScriptedFakeProvider(completions=(_response("Scheduled summary."),))
+    summaries = WorkspaceJsonlSummaryStore(state)
+
+    def project_schedule(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _project_schedule_messages(
+            messages,
+            system_prompt="SCHEDULE SYSTEM",
+            session_id=session.session_id,
+            current_time=NOW,
+        )
+
+    await _manager(
+        provider,
+        summaries,
+        context_window=2_500,
+        max_output=500,
+        threshold=100,
+        project_messages=project_schedule,
+    ).prepare(
+        session,
+        current_user=current_user,
+        continuation=continuation,
+    )
+
+    assert session.last_consolidated == 4
+    summary_input = provider.complete_requests[0].messages[1]["content"]
+    assert isinstance(summary_input, str)
+    assert "First question:" in summary_input
+    assert "Second question:" in summary_input
+    assert "Current tool call:" not in summary_input
 
 
 @pytest.mark.parametrize(

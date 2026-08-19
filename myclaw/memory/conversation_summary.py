@@ -337,11 +337,11 @@ def _estimate_messages(
 
 
 def _projected_history_bytes(messages: Sequence[dict[str, Any]]) -> int:
-    if len(messages) <= 2:
-        return 0
+    current_user_index = _last_user_index(messages)
+    history_end = len(messages) if current_user_index == len(messages) else current_user_index
     return sum(
         len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        for message in messages[1:-1]
+        for message in messages[1:history_end]
     )
 
 
