@@ -30,6 +30,7 @@ from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
@@ -162,6 +163,7 @@ def _record_complete(
     temperature: float,
     reasoning_effort: ReasoningEffort | None,
     timeout: int,
+    continuation: ModelContinuation | None = None,
 ) -> None:
     provider.complete_requests.append(
         ProviderCall(
@@ -172,6 +174,7 @@ def _record_complete(
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             timeout=timeout,
+            continuation=continuation,
         )
     )
 
@@ -261,6 +264,7 @@ async def test_memory_scheduler_trigger_does_not_borrow_a_foreground_session_log
             temperature: float = 0.2,
             reasoning_effort: ReasoningEffort | None = None,
             timeout: int = 30,
+            continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             _record_complete(
                 self,
@@ -271,6 +275,7 @@ async def test_memory_scheduler_trigger_does_not_borrow_a_foreground_session_log
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             )
             attempted.set()
             try:
@@ -351,6 +356,7 @@ async def test_periodic_trigger_is_skipped_while_the_previous_run_is_still_activ
             temperature: float = 0.2,
             reasoning_effort: ReasoningEffort | None = None,
             timeout: int = 30,
+            continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             _record_complete(
                 self,
@@ -361,6 +367,7 @@ async def test_periodic_trigger_is_skipped_while_the_previous_run_is_still_activ
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             )
             started.set()
             await release.wait()
@@ -410,6 +417,7 @@ async def test_manual_memory_task_reports_running_while_a_periodic_run_is_active
             temperature: float = 0.2,
             reasoning_effort: ReasoningEffort | None = None,
             timeout: int = 30,
+            continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             _record_complete(
                 self,
@@ -420,6 +428,7 @@ async def test_manual_memory_task_reports_running_while_a_periodic_run_is_active
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             )
             started.set()
             await release.wait()
@@ -754,6 +763,7 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
             temperature: float = 0.2,
             reasoning_effort: ReasoningEffort | None = None,
             timeout: int = 30,
+            continuation: ModelContinuation | None = None,
         ) -> AsyncIterator[ModelStreamEvent]:
             if messages and messages[0] == {
                 "role": "system",
@@ -771,6 +781,7 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
                     temperature=temperature,
                     reasoning_effort=reasoning_effort,
                     timeout=timeout,
+                    continuation=continuation,
                 )
             )
             request_count = len(self.stream_requests)
@@ -916,6 +927,7 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
             temperature: float = 0.2,
             reasoning_effort: ReasoningEffort | None = None,
             timeout: int = 30,
+            continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             _record_complete(
                 self,
@@ -926,6 +938,7 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             )
             if len(self.complete_requests) == 1:
                 started.set()
@@ -994,6 +1007,7 @@ async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
             temperature: float = 0.2,
             reasoning_effort: ReasoningEffort | None = None,
             timeout: int = 30,
+            continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             _record_complete(
                 self,
@@ -1004,6 +1018,7 @@ async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             )
             started.set()
             try:

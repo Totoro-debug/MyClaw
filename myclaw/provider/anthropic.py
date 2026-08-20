@@ -23,10 +23,12 @@ from myclaw.provider.models import (
     AssistantModelMessage,
     FinishReason,
     ModelCompleted,
+    ModelContinuation,
     ModelMessages,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningDelta,
     ReasoningEffort,
     TextDelta,
 )
@@ -77,6 +79,7 @@ class AnthropicProvider:
         *,
         client_factory: AnthropicClientFactory = _official_client_factory,
     ) -> None:
+        self._provider_id = configuration.provider_id
         self._client = client_factory(
             api_key=configuration.api_key,
             base_url=configuration.base_url,
@@ -93,6 +96,7 @@ class AnthropicProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None = None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         return self._stream_with_arguments(
             messages=messages,
@@ -102,6 +106,7 @@ class AnthropicProvider:
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             timeout=timeout,
+            continuation=continuation,
         )
 
     async def _stream_with_arguments(
@@ -114,6 +119,7 @@ class AnthropicProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None,
     ) -> AsyncIterator[ModelStreamEvent]:
         try:
             async for event in self._stream_once(
@@ -124,6 +130,7 @@ class AnthropicProvider:
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             ):
                 yield event
         except EmptyModelResponseError as error:
@@ -143,6 +150,7 @@ class AnthropicProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del reasoning_effort
         sdk_stream = await self._client.messages.create(
@@ -154,6 +162,8 @@ class AnthropicProvider:
                 temperature=temperature,
                 timeout=timeout,
                 stream=True,
+                provider_id=self._provider_id,
+                continuation=continuation,
             )
         )
         if not hasattr(sdk_stream, "__aiter__"):
@@ -165,6 +175,7 @@ class AnthropicProvider:
         output_tokens = 0
         stop_reason: str | None = None
         tool_uses: dict[int, _StreamingToolUse] = {}
+        content_blocks: dict[int, dict[str, object]] = {}
         async for event in cast(AsyncIterator[object], sdk_stream):
             event_type = _string_field(event, "type")
             if event_type == "message_start":
@@ -177,7 +188,31 @@ class AnthropicProvider:
                     text = _string_field(delta, "text")
                     if text:
                         text_parts.append(text)
+                        block = content_blocks.setdefault(
+                            _integer_field(event, "index"),
+                            {"type": "text", "text": ""},
+                        )
+                        block["text"] = f"{_string_field(block, 'text') or ''}{text}"
                         yield TextDelta(delta=text)
+                elif delta_type == "thinking_delta":
+                    thinking = _string_field(delta, "thinking")
+                    if thinking:
+                        index = _integer_field(event, "index")
+                        block = content_blocks.setdefault(
+                            index,
+                            {"type": "thinking", "thinking": "", "signature": ""},
+                        )
+                        block["thinking"] = f"{_string_field(block, 'thinking') or ''}{thinking}"
+                        yield ReasoningDelta(delta=thinking)
+                elif delta_type == "signature_delta":
+                    signature = _string_field(delta, "signature")
+                    if signature:
+                        index = _integer_field(event, "index")
+                        block = content_blocks.setdefault(
+                            index,
+                            {"type": "thinking", "thinking": "", "signature": ""},
+                        )
+                        block["signature"] = f"{_string_field(block, 'signature') or ''}{signature}"
                 elif delta_type == "input_json_delta":
                     index = _integer_field(event, "index")
                     partial_json = _string_field(delta, "partial_json")
@@ -185,17 +220,49 @@ class AnthropicProvider:
                         tool_uses[index].json_parts.append(partial_json)
             elif event_type == "content_block_start":
                 content_block = _field(event, "content_block")
-                if _string_field(content_block, "type") == "tool_use":
-                    index = _integer_field(event, "index")
+                index = _integer_field(event, "index")
+                block_type = _string_field(content_block, "type")
+                if block_type == "text":
+                    text = _string_field(content_block, "text") or ""
+                    content_blocks[index] = {"type": "text", "text": text}
+                    if text:
+                        text_parts.append(text)
+                        yield TextDelta(delta=text)
+                elif block_type == "thinking":
+                    thinking = _string_field(content_block, "thinking") or ""
+                    content_blocks[index] = {
+                        "type": "thinking",
+                        "thinking": thinking,
+                        "signature": _string_field(content_block, "signature") or "",
+                    }
+                    if thinking:
+                        yield ReasoningDelta(delta=thinking)
+                elif block_type == "redacted_thinking":
+                    content_blocks[index] = {
+                        "type": "redacted_thinking",
+                        "data": _string_field(content_block, "data") or "",
+                    }
+                elif block_type == "tool_use":
                     tool_uses[index] = _StreamingToolUse(
                         id=_string_field(content_block, "id") or "",
                         name=_string_field(content_block, "name") or "",
                         initial_input=_field(content_block, "input"),
                     )
+                    content_blocks[index] = {
+                        "type": "tool_use",
+                        "id": _string_field(content_block, "id") or "",
+                        "name": _string_field(content_block, "name") or "",
+                        "input": _field(content_block, "input"),
+                    }
             elif event_type == "message_delta":
                 stop_reason = _string_field(_field(event, "delta"), "stop_reason")
                 output_tokens = _integer_field(_field(event, "usage"), "output_tokens")
 
+        continuation = _stream_continuation(
+            content_blocks,
+            tool_uses,
+            provider_id=self._provider_id,
+        )
         response = ModelResponse(
             message=AssistantModelMessage(
                 content="".join(text_parts),
@@ -209,6 +276,7 @@ class AnthropicProvider:
                 total_tokens=input_tokens + output_tokens,
             ),
             finish_reason=_finish_reason(stop_reason),
+            continuation=continuation,
         )
         yield ModelCompleted(response=response)
 
@@ -222,6 +290,7 @@ class AnthropicProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None = None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         try:
             message = await self._client.messages.create(
@@ -233,9 +302,11 @@ class AnthropicProvider:
                     temperature=temperature,
                     timeout=timeout,
                     stream=False,
+                    provider_id=self._provider_id,
+                    continuation=continuation,
                 )
             )
-            return _response_from_message(message)
+            return _response_from_message(message, provider_id=self._provider_id)
         except EmptyModelResponseError as error:
             raise _empty_response_error() from error
         except APIError as error:
@@ -256,12 +327,22 @@ def _request_arguments(
     temperature: float,
     timeout: int,
     stream: bool,
+    provider_id: str,
+    continuation: ModelContinuation | None,
 ) -> dict[str, object]:
     system: object | None = None
     if messages and messages[0].get("role") == "system":
         system = messages[0].get("content", "")
         messages = messages[1:]
-    translated_messages = [_message_argument(message) for message in messages]
+    continuation_index = _last_assistant_index(messages) if continuation is not None else None
+    translated_messages = [
+        _message_argument(
+            message,
+            continuation=continuation if index == continuation_index else None,
+            provider_id=provider_id,
+        )
+        for index, message in enumerate(messages)
+    ]
     translated_tools: list[dict[str, object]] = []
     for tool in tools:
         function = tool["function"]
@@ -286,11 +367,21 @@ def _request_arguments(
     return arguments
 
 
-def _message_argument(message: Mapping[str, object]) -> dict[str, object]:
+def _message_argument(
+    message: Mapping[str, object],
+    *,
+    continuation: ModelContinuation | None = None,
+    provider_id: str,
+) -> dict[str, object]:
     role = message.get("role")
     if role == "user":
         return {"role": "user", "content": message.get("content", "")}
     if role == "assistant":
+        if continuation is not None:
+            return {
+                "role": "assistant",
+                "content": _anthropic_continuation_content(continuation, provider_id),
+            }
         content: list[dict[str, object]] = []
         message_content = message.get("content", "")
         if message_content:
@@ -314,6 +405,35 @@ def _message_argument(message: Mapping[str, object]) -> dict[str, object]:
     raise TypeError("Model message role is unsupported")
 
 
+def _last_assistant_index(messages: ModelMessages) -> int:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "assistant":
+            return index
+    raise ValueError("continuation requires an assistant message")
+
+
+def _anthropic_continuation_content(
+    continuation: ModelContinuation,
+    provider_id: str,
+) -> list[dict[str, object]]:
+    if continuation.provider_id != provider_id:
+        raise ValueError("model continuation belongs to a different provider")
+    payload = continuation.payload
+    if isinstance(payload, (str, bytes)) or not isinstance(payload, Sequence):
+        raise TypeError("Anthropic continuation payload must be a sequence")
+    blocks: list[dict[str, object]] = []
+    for block in payload:
+        if not isinstance(block, Mapping):
+            raise TypeError("Anthropic continuation blocks must be mappings")
+        block_type = block.get("type")
+        if block_type not in {"thinking", "redacted_thinking", "text", "tool_use"}:
+            raise ValueError("Anthropic continuation block type is unsupported")
+        blocks.append(dict(block))
+    if not blocks:
+        raise ValueError("Anthropic continuation payload must not be empty")
+    return blocks
+
+
 def _tool_call_sequence(value: object) -> Sequence[object]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise TypeError("assistant tool_calls must be a sequence")
@@ -335,13 +455,20 @@ def _anthropic_tool_use(value: object) -> dict[str, object]:
     }
 
 
-def _response_from_message(message: object) -> ModelResponse:
+def _response_from_message(message: object, *, provider_id: str) -> ModelResponse:
     text_parts: list[str] = []
     tool_calls: list[ModelToolCall] = []
+    continuation_blocks: list[dict[str, object]] = []
+    has_continuation = False
     content = _field(message, "content")
     if isinstance(content, (list, tuple)):
         for block in content:
             block_type = _string_field(block, "type")
+            continuation_block = _continuation_block(block)
+            if continuation_block is not None:
+                continuation_blocks.append(continuation_block)
+            if block_type in {"thinking", "redacted_thinking"}:
+                has_continuation = True
             if block_type == "text":
                 text = _string_field(block, "text")
                 if text:
@@ -365,7 +492,60 @@ def _response_from_message(message: object) -> ModelResponse:
             total_tokens=input_tokens + output_tokens,
         ),
         finish_reason=_finish_reason(_string_field(message, "stop_reason")),
+        continuation=(
+            None
+            if not has_continuation
+            else ModelContinuation(provider_id=provider_id, payload=tuple(continuation_blocks))
+        ),
     )
+
+
+def _stream_continuation(
+    content_blocks: Mapping[int, Mapping[str, object]],
+    tool_uses: Mapping[int, _StreamingToolUse],
+    *,
+    provider_id: str,
+) -> ModelContinuation | None:
+    if not any(
+        _string_field(block, "type") in {"thinking", "redacted_thinking"}
+        for block in content_blocks.values()
+    ):
+        return None
+    blocks: list[dict[str, object]] = []
+    for index in sorted(content_blocks):
+        block = dict(content_blocks[index])
+        if _string_field(block, "type") == "tool_use" and index in tool_uses:
+            block["input"] = tool_uses[index].to_input_object()
+        blocks.append(block)
+    return ModelContinuation(provider_id=provider_id, payload=tuple(blocks))
+
+
+def _continuation_block(block: object) -> dict[str, object] | None:
+    block_type = _string_field(block, "type")
+    if block_type == "thinking":
+        continuation_block: dict[str, object] = {
+            "type": block_type,
+            "thinking": _string_field(block, "thinking") or "",
+        }
+        signature = _string_field(block, "signature")
+        if signature is not None:
+            continuation_block["signature"] = signature
+        return continuation_block
+    if block_type == "redacted_thinking":
+        return {
+            "type": block_type,
+            "data": _string_field(block, "data") or "",
+        }
+    if block_type == "text":
+        return {"type": block_type, "text": _string_field(block, "text") or ""}
+    if block_type == "tool_use":
+        return {
+            "type": block_type,
+            "id": _string_field(block, "id") or "",
+            "name": _string_field(block, "name") or "",
+            "input": _json_object(_field(block, "input")),
+        }
+    return None
 
 
 @dataclass(slots=True)
@@ -374,6 +554,11 @@ class _StreamingToolUse:
     name: str
     initial_input: object
     json_parts: list[str] = field(default_factory=list)
+
+    def to_input_object(self) -> JsonObject:
+        if self.json_parts:
+            return _argument_object("".join(self.json_parts))
+        return _json_object(self.initial_input)
 
     def to_model_tool_call(self) -> ModelToolCall:
         if self.json_parts:

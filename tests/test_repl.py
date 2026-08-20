@@ -25,6 +25,7 @@ from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelProvider,
     ModelResponse,
     ModelStreamEvent,
@@ -348,8 +349,18 @@ async def test_task_cancellation_during_foreground_is_cleared_before_next_input(
             temperature: float,
             reasoning_effort: str | None,
             timeout: int,
+            continuation: ModelContinuation | None = None,
         ) -> AsyncIterator[ModelStreamEvent]:
-            del messages, tools, model, max_output, temperature, reasoning_effort, timeout
+            del (
+                messages,
+                tools,
+                model,
+                max_output,
+                temperature,
+                reasoning_effort,
+                timeout,
+                continuation,
+            )
             yield TextDelta(delta="Partial foreground")
             self.waiting.set()
             await asyncio.Event().wait()
@@ -364,6 +375,7 @@ async def test_task_cancellation_during_foreground_is_cleared_before_next_input(
             temperature: float,
             reasoning_effort: str | None,
             timeout: int,
+            continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             raise AssertionError(f"Unexpected completion: {messages!r}")
 

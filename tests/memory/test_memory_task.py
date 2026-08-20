@@ -30,6 +30,7 @@ from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
+    ModelContinuation,
     ModelResponse,
     ModelRoute,
     ModelUsage,
@@ -75,6 +76,7 @@ def _provider_call(
     temperature: float,
     reasoning_effort: ReasoningEffort | None,
     timeout: int,
+    continuation: ModelContinuation | None = None,
 ) -> ProviderCall:
     return ProviderCall(
         messages=list(messages),
@@ -84,6 +86,7 @@ def _provider_call(
         temperature=temperature,
         reasoning_effort=reasoning_effort,
         timeout=timeout,
+        continuation=continuation,
     )
 
 
@@ -472,6 +475,7 @@ async def test_memory_task_advances_the_summary_cursor_before_model_work(
             temperature: float = 0.2,
             reasoning_effort: ReasoningEffort | None = None,
             timeout: int = 30,
+            continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             assert await memory.read_summary_cursor() == 1
             return await super().complete(
@@ -482,6 +486,7 @@ async def test_memory_task_advances_the_summary_cursor_before_model_work(
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             )
 
     provider = CursorObservingProvider(completions=(_response("No update needed."),))
@@ -884,6 +889,7 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
             temperature: float = 0.2,
             reasoning_effort: ReasoningEffort | None = None,
             timeout: int = 30,
+            continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             self.complete_requests.append(
                 _provider_call(
@@ -894,6 +900,7 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
                     temperature=temperature,
                     reasoning_effort=reasoning_effort,
                     timeout=timeout,
+                    continuation=continuation,
                 )
             )
             if len(self.complete_requests) == 1:
@@ -955,6 +962,7 @@ async def test_overlapping_manual_memory_task_ignores_a_corrupt_cursor(
             temperature: float = 0.2,
             reasoning_effort: ReasoningEffort | None = None,
             timeout: int = 30,
+            continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             self.complete_requests.append(
                 _provider_call(
@@ -965,6 +973,7 @@ async def test_overlapping_manual_memory_task_ignores_a_corrupt_cursor(
                     temperature=temperature,
                     reasoning_effort=reasoning_effort,
                     timeout=timeout,
+                    continuation=continuation,
                 )
             )
             first_started.set()

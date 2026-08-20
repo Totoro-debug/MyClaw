@@ -17,6 +17,7 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningDelta,
     TextDelta,
 )
 from myclaw.tools.base import OpenAIToolSchema
@@ -250,6 +251,8 @@ class AgentRun:
                 )
                 model_completed = False
                 async for event in events:
+                    if isinstance(event, ReasoningDelta):
+                        continue
                     if isinstance(event, TextDelta):
                         partial_content.append(event.delta)
                         await _emit_agent_run_payload(

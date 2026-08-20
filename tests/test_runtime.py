@@ -26,6 +26,7 @@ from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelProvider,
     ModelResponse,
     ModelStreamEvent,
@@ -116,6 +117,7 @@ class BlockingSessionLogProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del tools, model, max_output, temperature, reasoning_effort, timeout
         if messages and messages[0] == {
@@ -151,6 +153,7 @@ class BlockingSessionLogProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         raise AssertionError(f"Unexpected complete request: {messages!r}")
 

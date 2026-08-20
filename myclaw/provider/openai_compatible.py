@@ -15,10 +15,12 @@ from myclaw.provider.models import (
     AssistantModelMessage,
     FinishReason,
     ModelCompleted,
+    ModelContinuation,
     ModelMessages,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningDelta,
     ReasoningEffort,
     TextDelta,
 )
@@ -86,6 +88,7 @@ class OpenAICompatibleProvider:
         client_factory: OpenAIClientFactory | None = None,
     ) -> None:
         factory = _official_client_factory if client_factory is None else client_factory
+        self._provider_id = configuration.provider_id
         self._client = cast(
             _OpenAIClient,
             factory(
@@ -105,6 +108,7 @@ class OpenAICompatibleProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None = None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         return self._stream_with_arguments(
             messages=messages,
@@ -114,6 +118,7 @@ class OpenAICompatibleProvider:
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             timeout=timeout,
+            continuation=continuation,
         )
 
     async def _stream_with_arguments(
@@ -126,6 +131,7 @@ class OpenAICompatibleProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None,
     ) -> AsyncIterator[ModelStreamEvent]:
         try:
             async for event in self._stream_once(
@@ -136,6 +142,7 @@ class OpenAICompatibleProvider:
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             ):
                 yield event
         except ModelCallError:
@@ -153,6 +160,7 @@ class OpenAICompatibleProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None,
     ) -> AsyncIterator[ModelStreamEvent]:
         result = await self._client.chat.completions.create(
             **_request_arguments(
@@ -164,10 +172,13 @@ class OpenAICompatibleProvider:
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
                 stream=True,
+                provider_id=self._provider_id,
+                continuation=continuation,
             )
         )
         chunks = cast(AsyncIterator[object], result)
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         finish_reason: FinishReason = "stop"
         input_tokens = 0
         output_tokens = 0
@@ -177,6 +188,10 @@ class OpenAICompatibleProvider:
             choices = cast(list[object], getattr(chunk, "choices", []))
             for choice in choices:
                 delta = getattr(choice, "delta", None)
+                reasoning_content = getattr(delta, "reasoning_content", None)
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    reasoning_parts.append(reasoning_content)
+                    yield ReasoningDelta(delta=reasoning_content)
                 content = getattr(delta, "content", None)
                 if isinstance(content, str) and content:
                     content_parts.append(content)
@@ -214,6 +229,10 @@ class OpenAICompatibleProvider:
                     total_tokens=input_tokens + output_tokens,
                 ),
                 finish_reason=finish_reason,
+                continuation=_continuation_from_reasoning(
+                    provider_id=self._provider_id,
+                    reasoning="".join(reasoning_parts),
+                ),
             )
         )
 
@@ -227,6 +246,7 @@ class OpenAICompatibleProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None = None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         try:
             return await self._complete_once(
@@ -237,6 +257,7 @@ class OpenAICompatibleProvider:
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             )
         except ModelCallError:
             raise
@@ -253,6 +274,7 @@ class OpenAICompatibleProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None,
     ) -> ModelResponse:
         result = await self._client.chat.completions.create(
             **_request_arguments(
@@ -264,6 +286,8 @@ class OpenAICompatibleProvider:
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
                 stream=False,
+                provider_id=self._provider_id,
+                continuation=continuation,
             )
         )
         choices = cast(list[object], getattr(result, "choices", []))
@@ -288,6 +312,10 @@ class OpenAICompatibleProvider:
                 total_tokens=input_tokens + output_tokens,
             ),
             finish_reason=_finish_reason(str(choice.finish_reason or "stop")),
+            continuation=_continuation_from_reasoning(
+                provider_id=self._provider_id,
+                reasoning=getattr(message, "reasoning_content", ""),
+            ),
         )
 
     async def close(self) -> None:
@@ -304,10 +332,20 @@ def _request_arguments(
     reasoning_effort: ReasoningEffort | None,
     timeout: int,
     stream: bool,
+    provider_id: str,
+    continuation: ModelContinuation | None,
 ) -> dict[str, object]:
+    continuation_index = _last_assistant_index(messages) if continuation is not None else None
     arguments: dict[str, object] = {
         "max_tokens": max_output,
-        "messages": [_openai_message(message) for message in messages],
+        "messages": [
+            _openai_message(
+                message,
+                continuation=continuation if index == continuation_index else None,
+                provider_id=provider_id,
+            )
+            for index, message in enumerate(messages)
+        ],
         "model": model,
         "stream": stream,
         "temperature": temperature,
@@ -334,6 +372,34 @@ def _model_tool_call(parts: _ToolCallParts) -> ModelToolCall:
     )
 
 
+def _continuation_from_reasoning(
+    *,
+    provider_id: str,
+    reasoning: object,
+) -> ModelContinuation | None:
+    if not isinstance(reasoning, str) or not reasoning:
+        return None
+    return ModelContinuation(provider_id=provider_id, payload=reasoning)
+
+
+def _last_assistant_index(messages: ModelMessages) -> int:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "assistant":
+            return index
+    raise ValueError("continuation requires an assistant message")
+
+
+def _openai_continuation_content(
+    continuation: ModelContinuation,
+    provider_id: str,
+) -> str:
+    if continuation.provider_id != provider_id:
+        raise ValueError("model continuation belongs to a different provider")
+    if not isinstance(continuation.payload, str) or not continuation.payload:
+        raise TypeError("OpenAI-compatible continuation payload must be nonempty text")
+    return continuation.payload
+
+
 def _complete_tool_call(tool_call: object) -> ModelToolCall:
     complete_tool_call = cast(_CompleteToolCall, tool_call)
     function = complete_tool_call.function
@@ -344,7 +410,12 @@ def _complete_tool_call(tool_call: object) -> ModelToolCall:
     )
 
 
-def _openai_message(message: Mapping[str, object]) -> dict[str, object]:
+def _openai_message(
+    message: Mapping[str, object],
+    *,
+    continuation: ModelContinuation | None = None,
+    provider_id: str,
+) -> dict[str, object]:
     role = message.get("role")
     content = message.get("content", "")
     if role == "assistant":
@@ -357,6 +428,11 @@ def _openai_message(message: Mapping[str, object]) -> dict[str, object]:
             result["tool_calls"] = [
                 _openai_tool_call(tool_call) for tool_call in _tool_call_sequence(tool_calls)
             ]
+        if continuation is not None:
+            result["reasoning_content"] = _openai_continuation_content(
+                continuation,
+                provider_id,
+            )
         return result
     if role == "tool":
         return {

@@ -27,6 +27,7 @@ from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
@@ -100,6 +101,7 @@ class _RuntimeProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         if messages and messages[0] == {
             "role": "system",
@@ -135,6 +137,7 @@ class _RuntimeProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         self.direct_complete_messages.append((deepcopy(list(messages)), list(tools)))
         call = ProviderCall(

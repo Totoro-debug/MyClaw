@@ -10,6 +10,7 @@ from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
+    ModelContinuation,
     ModelProvider,
     ModelResponse,
     ModelStreamEvent,
@@ -42,6 +43,7 @@ class ProviderCall:
     temperature: float
     reasoning_effort: ReasoningEffort | None
     timeout: int
+    continuation: ModelContinuation | None = None
 
 
 class ScriptedFakeProvider:
@@ -70,6 +72,7 @@ class ScriptedFakeProvider:
         temperature: float = 0.2,
         reasoning_effort: ReasoningEffort | None = None,
         timeout: int = 30,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         call = _provider_call(
             messages=messages,
@@ -79,6 +82,7 @@ class ScriptedFakeProvider:
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             timeout=timeout,
+            continuation=continuation,
         )
         if call.messages and call.messages[0] == {
             "role": "system",
@@ -108,6 +112,7 @@ class ScriptedFakeProvider:
         temperature: float = 0.2,
         reasoning_effort: ReasoningEffort | None = None,
         timeout: int = 30,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         self.complete_requests.append(
             _provider_call(
@@ -118,6 +123,7 @@ class ScriptedFakeProvider:
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             )
         )
         if not self._completions:
@@ -144,6 +150,7 @@ class ScriptedFakeRouter:
         *,
         messages: Sequence[dict[str, object]],
         tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route
         return self._provider.stream(
@@ -154,6 +161,7 @@ class ScriptedFakeRouter:
             temperature=0.2,
             reasoning_effort=None,
             timeout=30,
+            continuation=continuation,
         )
 
     async def complete(
@@ -162,6 +170,7 @@ class ScriptedFakeRouter:
         *,
         messages: Sequence[dict[str, object]],
         tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del route
         return await self._provider.complete(
@@ -172,6 +181,7 @@ class ScriptedFakeRouter:
             temperature=0.2,
             reasoning_effort=None,
             timeout=30,
+            continuation=continuation,
         )
 
     async def close(self) -> None:
@@ -187,6 +197,7 @@ def _provider_call(
     temperature: float,
     reasoning_effort: ReasoningEffort | None,
     timeout: int,
+    continuation: ModelContinuation | None = None,
 ) -> ProviderCall:
     return ProviderCall(
         messages=deepcopy(list(messages)),
@@ -196,4 +207,5 @@ def _provider_call(
         temperature=temperature,
         reasoning_effort=reasoning_effort,
         timeout=timeout,
+        continuation=continuation,
     )

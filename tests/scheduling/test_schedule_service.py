@@ -28,6 +28,7 @@ from myclaw.errors import ErrorInfo
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
@@ -272,6 +273,7 @@ class ConcurrentScheduleAndForegroundProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         self.complete_requests.append(
             ProviderCall(
@@ -302,6 +304,7 @@ class ConcurrentScheduleAndForegroundProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         self.stream_requests.append(
             ProviderCall(

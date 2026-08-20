@@ -17,6 +17,7 @@ from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
@@ -49,6 +50,7 @@ class RuntimeTitleProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         self.requests.append(
             ProviderCall(
@@ -88,6 +90,7 @@ class RuntimeTitleProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         raise AssertionError(
             "Unexpected complete request: "
@@ -118,6 +121,7 @@ class TitleFirstProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del tools, model, max_output, temperature, reasoning_effort, timeout
         if messages and messages[0] == {"role": "system", "content": "Generate a title."}:
@@ -149,6 +153,7 @@ class TitleFirstProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         raise AssertionError(f"Unexpected complete request: {messages!r}")
 
@@ -170,6 +175,7 @@ class ExistingSessionProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         self.requests.append(
             ProviderCall(
@@ -210,6 +216,7 @@ class ExistingSessionProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         raise AssertionError(f"Unexpected complete request: {messages!r}")
 

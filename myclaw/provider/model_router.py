@@ -10,6 +10,7 @@ from loguru import logger
 from myclaw.config.config import ProviderConfiguration, ResolvedModelRoute, UserConfiguration
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
+    ModelContinuation,
     ModelMessages,
     ModelProvider,
     ModelResponse,
@@ -80,11 +81,13 @@ class ModelRouter:
         *,
         messages: ModelMessages,
         tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         return self._stream_direct(
             route,
             messages=messages,
             tools=tools,
+            continuation=continuation,
         )
 
     async def _stream_direct(
@@ -93,8 +96,11 @@ class ModelRouter:
         *,
         messages: ModelMessages,
         tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None,
     ) -> AsyncIterator[ModelStreamEvent]:
         resolved = self._begin_call(route)
+        if continuation is not None and continuation.provider_id != resolved.provider.provider_id:
+            continuation = None
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             provider = self._provider(resolved.provider)
@@ -108,6 +114,12 @@ class ModelRouter:
                     temperature=resolved.route.temperature,
                     reasoning_effort=resolved.route.reasoning_effort,
                     timeout=resolved.route.timeout,
+                    **(
+                        {"continuation": continuation}
+                        if continuation is not None
+                        and continuation.provider_id == resolved.provider.provider_id
+                        else {}
+                    ),
                 )
                 async for event in events:
                     emitted = True
@@ -124,11 +136,13 @@ class ModelRouter:
         *,
         messages: ModelMessages,
         tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         return await self._complete_direct(
             route,
             messages=messages,
             tools=tools,
+            continuation=continuation,
         )
 
     async def _complete_direct(
@@ -137,8 +151,11 @@ class ModelRouter:
         *,
         messages: ModelMessages,
         tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None,
     ) -> ModelResponse:
         resolved = self._begin_call(route)
+        if continuation is not None and continuation.provider_id != resolved.provider.provider_id:
+            continuation = None
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             provider = self._provider(resolved.provider)
@@ -151,6 +168,12 @@ class ModelRouter:
                     temperature=resolved.route.temperature,
                     reasoning_effort=resolved.route.reasoning_effort,
                     timeout=resolved.route.timeout,
+                    **(
+                        {"continuation": continuation}
+                        if continuation is not None
+                        and continuation.provider_id == resolved.provider.provider_id
+                        else {}
+                    ),
                 )
             except ModelCallError as failure:
                 resolved = await self._recover_attempt(resolved, failure, attempt=attempt)

@@ -26,6 +26,8 @@ from myclaw.provider.anthropic import AnthropicProvider
 from myclaw.provider.errors import EmptyModelResponseError, ModelCallError
 from myclaw.provider.models import (
     ModelCompleted,
+    ModelContinuation,
+    ReasoningDelta,
     TextDelta,
 )
 from myclaw.tools.base import OpenAIToolSchema
@@ -272,6 +274,234 @@ async def test_stream_aggregates_mixed_text_and_tool_use_content() -> None:
         "total_tokens": 17,
     }
     assert completed.response.finish_reason == "tool_calls"
+    assert completed.response.continuation is None
+
+
+@pytest.mark.asyncio
+async def test_stream_preserves_interleaved_thinking_blocks_and_replays_continuation() -> None:
+    first_stream = FakeAnthropicStream(
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(usage=SimpleNamespace(input_tokens=11, output_tokens=0)),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(type="thinking", thinking="", signature=""),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="thinking_delta", thinking="Plan"),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=1,
+            content_block=SimpleNamespace(type="text", text=""),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=1,
+            delta=SimpleNamespace(type="text_delta", text="Answer"),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=2,
+            content_block=SimpleNamespace(
+                type="redacted_thinking",
+                data="opaque-interleaved",
+            ),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=3,
+            content_block=SimpleNamespace(
+                type="tool_use",
+                id="toolu_interleaved",
+                name="read_file",
+                input={},
+            ),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=3,
+            delta=SimpleNamespace(type="input_json_delta", partial_json='{"path":"README.md"}'),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="thinking_delta", thinking=" more"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="signature_delta", signature="sig-interleaved"),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="tool_use"),
+            usage=SimpleNamespace(output_tokens=7),
+        ),
+    )
+    second_stream = FakeAnthropicStream(
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(usage=SimpleNamespace(input_tokens=19, output_tokens=0)),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(type="text", text=""),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="text_delta", text="Finished"),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=SimpleNamespace(output_tokens=2),
+        ),
+    )
+    client = FakeAnthropicClient(first_stream, second_stream)
+    provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
+
+    first_events = [event async for event in provider.stream(**request())]
+
+    assert first_events[:-1] == [
+        ReasoningDelta(delta="Plan"),
+        TextDelta(delta="Answer"),
+        ReasoningDelta(delta=" more"),
+    ]
+    first_completed = first_events[-1]
+    assert isinstance(first_completed, ModelCompleted)
+    continuation = first_completed.response.continuation
+    assert continuation == ModelContinuation(
+        provider_id="anthropic-default",
+        payload=(
+            {"type": "thinking", "thinking": "Plan more", "signature": "sig-interleaved"},
+            {"type": "text", "text": "Answer"},
+            {"type": "redacted_thinking", "data": "opaque-interleaved"},
+            {
+                "type": "tool_use",
+                "id": "toolu_interleaved",
+                "name": "read_file",
+                "input": {"path": "README.md"},
+            },
+        ),
+    )
+    assert "continuation" not in first_completed.response.to_dict()
+
+    second_request = request()
+    second_request["messages"] = [
+        {"role": "system", "content": "You are MyClaw."},
+        {"role": "user", "content": "Earlier question"},
+        {"role": "assistant", "content": "Earlier answer"},
+        {"role": "user", "content": "Read README.md"},
+        {
+            "role": "assistant",
+            "content": "Answer",
+            "tool_calls": [
+                {
+                    "id": "toolu_interleaved",
+                    "name": "read_file",
+                    "arguments": '{"path":"README.md"}',
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "toolu_interleaved",
+            "name": "read_file",
+            "content": "Project documentation",
+        },
+    ]
+    second_events = [
+        event
+        async for event in provider.stream(
+            **second_request,
+            continuation=continuation,
+        )
+    ]
+    assert isinstance(second_events[-1], ModelCompleted)
+    assert client.messages.calls[1]["messages"] == [
+        {"role": "user", "content": "Earlier question"},
+        {"role": "assistant", "content": [{"type": "text", "text": "Earlier answer"}]},
+        {"role": "user", "content": "Read README.md"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "Plan more", "signature": "sig-interleaved"},
+                {"type": "text", "text": "Answer"},
+                {"type": "redacted_thinking", "data": "opaque-interleaved"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_interleaved",
+                    "name": "read_file",
+                    "input": {"path": "README.md"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_interleaved",
+                    "content": "Project documentation",
+                }
+            ],
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_complete_retains_redacted_and_signature_only_continuation_without_reasoning_event() -> (
+    None
+):
+    sdk_message = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="redacted_thinking", data="opaque-redacted"),
+            SimpleNamespace(type="thinking", thinking="", signature="sig-only"),
+            SimpleNamespace(type="text", text="Done"),
+        ],
+        usage=SimpleNamespace(input_tokens=13, output_tokens=4),
+        stop_reason="end_turn",
+    )
+    client = FakeAnthropicClient(sdk_message)
+    provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
+
+    response = await provider.complete(**request(stream=False))
+
+    assert response.message.content == "Done"
+    assert response.continuation == ModelContinuation(
+        provider_id="anthropic-default",
+        payload=(
+            {"type": "redacted_thinking", "data": "opaque-redacted"},
+            {"type": "thinking", "thinking": "", "signature": "sig-only"},
+            {"type": "text", "text": "Done"},
+        ),
+    )
+    assert "continuation" not in response.to_dict()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_continuation_owned_by_another_provider_before_sdk_call() -> None:
+    client = FakeAnthropicClient(FakeAnthropicStream())
+    provider = AnthropicProvider(configuration(), client_factory=FakeAnthropicClientFactory(client))
+
+    with pytest.raises(ModelCallError):
+        async for _event in provider.stream(
+            **request(),
+            continuation=ModelContinuation(
+                provider_id="openai-local",
+                payload="opaque-openai-state",
+            ),
+        ):
+            pass
+
+    assert client.messages.calls == []
 
 
 @pytest.mark.asyncio

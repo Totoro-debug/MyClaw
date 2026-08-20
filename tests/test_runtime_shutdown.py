@@ -18,6 +18,7 @@ from myclaw.logging.session import session_log
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
@@ -666,6 +667,7 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
             temperature: float,
             reasoning_effort: ReasoningEffort | None,
             timeout: int,
+            continuation: ModelContinuation | None = None,
         ) -> AsyncIterator[ModelStreamEvent]:
             if messages and messages[0] == {
                 "role": "system",
@@ -698,6 +700,7 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
             temperature: float,
             reasoning_effort: ReasoningEffort | None,
             timeout: int,
+            continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             raise AssertionError(f"Unexpected completion: {messages!r}")
 

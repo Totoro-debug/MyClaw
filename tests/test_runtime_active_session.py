@@ -15,6 +15,7 @@ from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
@@ -60,6 +61,7 @@ class RuntimeProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         self.requests.append(
             ProviderCall(
@@ -97,6 +99,7 @@ class RuntimeProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del messages, tools, model, max_output, temperature, reasoning_effort, timeout
         return ModelResponse(

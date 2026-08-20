@@ -41,6 +41,18 @@ class ModelUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelContinuation:
+    """Opaque Provider-owned state for the next call in the same Tool loop."""
+
+    provider_id: str
+    payload: object
+
+    def __post_init__(self) -> None:
+        if not self.provider_id:
+            raise ValueError("provider_id must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class AssistantModelMessage:
     """Aggregated assistant content and provider tool calls."""
 
@@ -68,6 +80,7 @@ class ModelResponse:
     message: AssistantModelMessage
     usage: ModelUsage
     finish_reason: FinishReason
+    continuation: ModelContinuation | None = None
 
     def __post_init__(self) -> None:
         if not self.message.content.strip() and not self.message.tool_calls:
@@ -98,6 +111,22 @@ class TextDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class ReasoningDelta:
+    """One ordered, Provider-returned visible reasoning chunk."""
+
+    type: ClassVar[Literal["reasoning_delta"]] = "reasoning_delta"
+    delta: str
+
+    def __post_init__(self) -> None:
+        if not self.delta:
+            msg = "delta must not be empty"
+            raise ValueError(msg)
+
+    def to_dict(self) -> dict[str, object]:
+        return {"type": self.type, "delta": self.delta}
+
+
+@dataclass(frozen=True, slots=True)
 class ModelCompleted:
     """The sole successful terminal event in a provider stream."""
 
@@ -108,7 +137,7 @@ class ModelCompleted:
         return {"type": self.type, "response": self.response.to_dict()}
 
 
-type ModelStreamEvent = TextDelta | ModelCompleted
+type ModelStreamEvent = ReasoningDelta | TextDelta | ModelCompleted
 
 
 class ModelProvider(Protocol):
@@ -124,6 +153,7 @@ class ModelProvider(Protocol):
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]: ...
 
     async def complete(
@@ -136,6 +166,7 @@ class ModelProvider(Protocol):
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse: ...
 
     async def close(self) -> None: ...

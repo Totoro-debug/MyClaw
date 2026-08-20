@@ -14,6 +14,8 @@ from myclaw.config.config import ProviderConfiguration
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     ModelCompleted,
+    ModelContinuation,
+    ReasoningDelta,
     TextDelta,
 )
 from myclaw.provider.openai_compatible import OpenAICompatibleProvider
@@ -176,6 +178,7 @@ async def test_stream_translates_text_and_usage_through_official_sdk_boundary() 
     assert events[:2] == [TextDelta(delta="Hel"), TextDelta(delta="lo")]
     completed = events[-1]
     assert isinstance(completed, ModelCompleted)
+    assert completed.response.continuation is None
     assert completed.response.to_dict() == {
         "message": {"role": "assistant", "content": "Hello", "tool_calls": []},
         "usage": {"input_tokens": 7, "output_tokens": 2, "total_tokens": 9},
@@ -296,6 +299,228 @@ async def test_stream_aggregates_fragmented_tool_calls_with_mixed_content() -> N
         "usage": {"input_tokens": 11, "output_tokens": 4, "total_tokens": 15},
         "finish_reason": "tool_calls",
     }
+    assert completed.response.continuation is None
+
+
+@pytest.mark.asyncio
+async def test_stream_preserves_interleaved_reasoning_and_replays_latest_assistant_turn() -> None:
+    first_stream = FakeOpenAIStream(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning_content="Plan",
+                        tool_calls=None,
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content="Answer",
+                        reasoning_content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call_read",
+                                function=SimpleNamespace(name="read_file", arguments='{"path":"'),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning_content=" more",
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                function=SimpleNamespace(name=None, arguments='README.md"}'),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[],
+            usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+        ),
+    )
+    second_stream = FakeOpenAIStream(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content="Finished",
+                        reasoning_content=None,
+                        tool_calls=None,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=19, completion_tokens=2, total_tokens=21),
+        )
+    )
+    client = FakeOpenAIClient(first_stream, second_stream)
+    provider = OpenAICompatibleProvider(
+        configuration(),
+        client_factory=FakeOpenAIClientFactory(client),
+    )
+
+    first_events = [event async for event in provider.stream(**request())]
+
+    assert first_events[:-1] == [
+        ReasoningDelta(delta="Plan"),
+        TextDelta(delta="Answer"),
+        ReasoningDelta(delta=" more"),
+    ]
+    first_completed = first_events[-1]
+    assert isinstance(first_completed, ModelCompleted)
+    continuation = first_completed.response.continuation
+    assert continuation == ModelContinuation(
+        provider_id="openai-local",
+        payload="Plan more",
+    )
+    assert "continuation" not in first_completed.response.to_dict()
+
+    second_request = request()
+    second_request["messages"] = [
+        {"role": "system", "content": "You are MyClaw."},
+        {"role": "user", "content": "Earlier question"},
+        {"role": "assistant", "content": "Earlier answer"},
+        {"role": "user", "content": "Read README.md"},
+        {
+            "role": "assistant",
+            "content": "Answer",
+            "tool_calls": [
+                {
+                    "id": "call_read",
+                    "name": "read_file",
+                    "arguments": '{"path":"README.md"}',
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_read",
+            "name": "read_file",
+            "content": "Project documentation",
+        },
+    ]
+    assert continuation is not None
+    second_events = [
+        event
+        async for event in provider.stream(
+            **second_request,
+            continuation=continuation,
+        )
+    ]
+
+    assert isinstance(second_events[-1], ModelCompleted)
+    assert client.chat.completions.calls[1]["messages"] == [
+        {"role": "system", "content": "You are MyClaw."},
+        {"role": "user", "content": "Earlier question"},
+        {"role": "assistant", "content": "Earlier answer"},
+        {"role": "user", "content": "Read README.md"},
+        {
+            "role": "assistant",
+            "content": "Answer",
+            "tool_calls": [
+                {
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                }
+            ],
+            "reasoning_content": "Plan more",
+        },
+        {"role": "tool", "tool_call_id": "call_read", "content": "Project documentation"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_complete_retains_reasoning_continuation_without_stream_event() -> None:
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="Answer",
+                    reasoning_content="Plan",
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call_read",
+                            function=SimpleNamespace(
+                                name="read_file",
+                                arguments='{"path":"README.md"}',
+                            ),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+    )
+    client = FakeOpenAIClient(response)
+    provider = OpenAICompatibleProvider(
+        configuration(),
+        client_factory=FakeOpenAIClientFactory(client),
+    )
+
+    observed = await provider.complete(**request(stream=False))
+
+    assert observed.message.content == "Answer"
+    assert observed.message.tool_calls == (
+        ModelToolCall(
+            id="call_read",
+            name="read_file",
+            arguments='{"path":"README.md"}',
+        ),
+    )
+    assert observed.continuation == ModelContinuation(
+        provider_id="openai-local",
+        payload="Plan",
+    )
+    assert "continuation" not in observed.to_dict()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_continuation_owned_by_another_provider_before_sdk_call() -> None:
+    client = FakeOpenAIClient(FakeOpenAIStream())
+    provider = OpenAICompatibleProvider(
+        configuration(),
+        client_factory=FakeOpenAIClientFactory(client),
+    )
+
+    with pytest.raises(ModelCallError):
+        async for _event in provider.stream(
+            **request(),
+            continuation=ModelContinuation(
+                provider_id="anthropic-default",
+                payload=({"type": "thinking", "thinking": "opaque"},),
+            ),
+        ):
+            pass
+
+    assert client.chat.completions.calls == []
 
 
 @pytest.mark.asyncio

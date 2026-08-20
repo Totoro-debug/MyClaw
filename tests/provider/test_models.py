@@ -4,8 +4,10 @@ from myclaw.provider.errors import EmptyModelResponseError
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelResponse,
     ModelUsage,
+    ReasoningDelta,
     TextDelta,
 )
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -118,6 +120,36 @@ def test_stream_events_preserve_the_normalized_response_contract() -> None:
     assert ModelCompleted(response=response).to_dict() == {
         "type": "completed",
         "response": response.to_dict(),
+    }
+
+
+def test_reasoning_delta_is_distinct_from_text_and_rejects_empty_content() -> None:
+    assert ReasoningDelta(delta="Thinking...").to_dict() == {
+        "type": "reasoning_delta",
+        "delta": "Thinking...",
+    }
+
+    with pytest.raises(ValueError, match="delta must not be empty"):
+        ReasoningDelta(delta="")
+
+
+def test_model_response_retains_opaque_continuation_without_serializing_it() -> None:
+    continuation = ModelContinuation(
+        provider_id="anthropic-default",
+        payload=({"type": "thinking", "thinking": "private", "signature": "sig"},),
+    )
+    response = ModelResponse(
+        message=AssistantModelMessage(content="Answer"),
+        usage=ModelUsage(input_tokens=1, output_tokens=2, total_tokens=3),
+        finish_reason="stop",
+        continuation=continuation,
+    )
+
+    assert response.continuation is continuation
+    assert response.to_dict() == {
+        "message": {"role": "assistant", "content": "Answer", "tool_calls": []},
+        "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+        "finish_reason": "stop",
     }
 
 

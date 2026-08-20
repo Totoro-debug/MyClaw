@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -25,10 +25,12 @@ from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelProvider,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningEffort,
 )
 from myclaw.provider.openai_compatible import OpenAICompatibleProvider
 from myclaw.tools.base import OpenAIToolSchema
@@ -82,13 +84,14 @@ class _DirectProvider:
     def stream(
         self,
         *,
-        messages: list[dict[str, object]],
-        tools: tuple[OpenAIToolSchema, ...],
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
         model: str,
         max_output: int,
         temperature: float,
-        reasoning_effort: str | None,
+        reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         self.calls.append(
             {
@@ -110,13 +113,14 @@ class _DirectProvider:
     async def complete(
         self,
         *,
-        messages: list[dict[str, object]],
-        tools: tuple[OpenAIToolSchema, ...],
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
         model: str,
         max_output: int,
         temperature: float,
-        reasoning_effort: str | None,
+        reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         self.calls.append(
             {

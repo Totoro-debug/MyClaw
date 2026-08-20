@@ -34,6 +34,7 @@ from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelProvider,
     ModelResponse,
     ModelStreamEvent,
@@ -85,8 +86,9 @@ class _RecordingDirectProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
-        del tools, model, max_output, temperature, reasoning_effort, timeout
+        del tools, model, max_output, temperature, reasoning_effort, timeout, continuation
         self.messages.append(deepcopy(list(messages)))
 
         async def replay() -> AsyncIterator[ModelStreamEvent]:
@@ -110,6 +112,7 @@ class _RecordingDirectProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del messages, tools, model, max_output, temperature, reasoning_effort, timeout
         raise AssertionError("Unexpected complete call")
@@ -329,8 +332,9 @@ class _BlockingPartialProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
-        del messages, tools, model, max_output, temperature, reasoning_effort, timeout
+        del messages, tools, model, max_output, temperature, reasoning_effort, timeout, continuation
         yield TextDelta(delta="Retained partial.")
         self.partial_emitted.set()
         try:
@@ -349,6 +353,7 @@ class _BlockingPartialProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         raise AssertionError(
             "Unexpected complete request: "

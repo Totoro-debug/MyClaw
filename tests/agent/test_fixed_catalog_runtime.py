@@ -18,6 +18,7 @@ from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
@@ -48,6 +49,7 @@ class _RuntimeProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         request = ProviderCall(
             messages=list(messages),
@@ -85,6 +87,7 @@ class _RuntimeProvider:
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         raise AssertionError(
             "Unexpected non-chat request: "

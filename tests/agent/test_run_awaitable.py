@@ -25,6 +25,7 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    ReasoningDelta,
     TextDelta,
 )
 from myclaw.tools.base import ArtifactReference, BaseTool
@@ -267,6 +268,40 @@ async def test_awaitable_run_returns_isolated_increment_and_emits_ordered_progre
     assert isinstance(emitter.payloads[3], AgentRunCompletedPayload)
     assert provider.calls[0][0] == "chat"
     assert provider.calls[0][1] == messages
+
+
+@pytest.mark.asyncio
+async def test_awaitable_run_ignores_provider_reasoning_for_legacy_payloads() -> None:
+    provider = _DirectRouter(
+        (
+            ReasoningDelta(delta="Visible reasoning"),
+            TextDelta(delta="Answer"),
+            ModelCompleted(
+                response=ModelResponse(
+                    message=AssistantModelMessage(content="Answer"),
+                    usage=ModelUsage(input_tokens=3, output_tokens=2, total_tokens=5),
+                    finish_reason="stop",
+                )
+            ),
+        )
+    )
+    emitter = _RecordingEmitter()
+    run = AgentRun(model=provider)
+
+    increment = await run.run(
+        [{"role": "system", "content": "System"}, {"role": "user", "content": "Hello"}],
+        {"role": "user", "content": "Hello"},
+        route="chat",
+        emitter=emitter,
+    )
+
+    assert [payload.type for payload in emitter.payloads] == [
+        "started",
+        "text_delta",
+        "model_call_completed",
+        "completed",
+    ]
+    assert increment[1]["content"] == "Answer"
 
 
 @pytest.mark.asyncio

@@ -47,6 +47,7 @@ from myclaw.errors import ErrorInfo
 from myclaw.management.commands import ManagementCommandResult
 from myclaw.provider.models import (
     ModelCompleted,
+    ModelContinuation,
     ModelStreamEvent,
     ModelUsage,
     ReasoningEffort,
@@ -569,6 +570,7 @@ class CancellableRuntimeProvider(_RuntimeProvider):
         temperature: float,
         reasoning_effort: ReasoningEffort | None,
         timeout: int,
+        continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         if messages and messages[0] == {
             "role": "system",
@@ -582,6 +584,7 @@ class CancellableRuntimeProvider(_RuntimeProvider):
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             ):
                 yield event
             return
@@ -594,6 +597,7 @@ class CancellableRuntimeProvider(_RuntimeProvider):
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 timeout=timeout,
+                continuation=continuation,
             )
         )
         self._chat_calls += 1

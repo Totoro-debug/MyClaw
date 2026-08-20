@@ -23,6 +23,7 @@ from myclaw.provider.model_router import ModelRouter, ModelRouteStatus
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
+    ModelContinuation,
     ModelResponse,
     ModelUsage,
     TextDelta,
@@ -533,6 +534,127 @@ async def test_model_router_falls_back_after_a_permanent_requested_route_failure
         fallback_request.timeout,
     ) == ("default-model", 4096, 0.2, None, 120)
     assert clock.sleeps == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_model_router_does_not_replay_continuation_to_a_fallback_provider() -> None:
+    continuation = ModelContinuation(provider_id="chat-provider", payload="chat-state")
+    chat_provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(), error=permanent_failure()),)
+    )
+    default_provider = ScriptedFakeProvider(streams=(StreamScript(events=(completed(),)),))
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+
+    observed = await collect(router.stream("chat", **request(), continuation=continuation))
+
+    assert observed == [completed()]
+    assert chat_provider.stream_requests[0].continuation == continuation
+    assert default_provider.stream_requests[0].continuation is None
+
+
+@pytest.mark.asyncio
+async def test_model_router_does_not_activate_continuation_after_stream_fallback() -> None:
+    continuation = ModelContinuation(provider_id="default-provider", payload="default-state")
+    chat_provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(), error=permanent_failure()),)
+    )
+    default_provider = ScriptedFakeProvider(streams=(StreamScript(events=(completed(),)),))
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+
+    observed = await collect(router.stream("chat", **request(), continuation=continuation))
+
+    assert observed == [completed()]
+    assert chat_provider.stream_requests[0].continuation is None
+    assert default_provider.stream_requests[0].continuation is None
+
+
+@pytest.mark.asyncio
+async def test_model_router_replays_continuation_across_same_provider_retries() -> None:
+    continuation = ModelContinuation(provider_id="chat-provider", payload="chat-state")
+    chat_provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(events=(), error=retryable_timeout()),
+            StreamScript(events=(completed("Recovered"),)),
+        )
+    )
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda _: chat_provider,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+
+    observed = await collect(router.stream("chat", **request(), continuation=continuation))
+
+    assert observed == [completed("Recovered")]
+    assert [call.continuation for call in chat_provider.stream_requests] == [
+        continuation,
+        continuation,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_router_does_not_replay_continuation_to_a_fallback_completion() -> None:
+    continuation = ModelContinuation(provider_id="chat-provider", payload="chat-state")
+    chat_provider = ScriptedFakeProvider(completions=(permanent_failure(),))
+    default_provider = ScriptedFakeProvider(completions=(response("Fallback"),))
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+
+    observed = await router.complete("chat", **request(), continuation=continuation)
+
+    assert observed == response("Fallback")
+    assert chat_provider.complete_requests[0].continuation == continuation
+    assert default_provider.complete_requests[0].continuation is None
+
+
+@pytest.mark.asyncio
+async def test_model_router_does_not_activate_continuation_after_completion_fallback() -> None:
+    continuation = ModelContinuation(provider_id="default-provider", payload="default-state")
+    chat_provider = ScriptedFakeProvider(completions=(permanent_failure(),))
+    default_provider = ScriptedFakeProvider(completions=(response("Fallback"),))
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+
+    observed = await router.complete("chat", **request(), continuation=continuation)
+
+    assert observed == response("Fallback")
+    assert chat_provider.complete_requests[0].continuation is None
+    assert default_provider.complete_requests[0].continuation is None
 
 
 @pytest.mark.asyncio
