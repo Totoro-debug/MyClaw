@@ -229,6 +229,235 @@ async def test_persist_freezes_each_call_and_finishes_snapshots_in_call_order(
 
 
 @pytest.mark.asyncio
+async def test_persist_retries_a_transient_write_with_async_backoff(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "Retry this snapshot")
+    attempts: list[bytes] = []
+    delays: list[float] = []
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+    yield_once = asyncio.sleep
+
+    def fail_twice_then_replace(target: Path, content: bytes) -> None:
+        attempts.append(content)
+        if len(attempts) < 3:
+            raise OSError("transient snapshot failure")
+        replace(target, content)
+
+    async def immediate_backoff(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_twice_then_replace)
+    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", immediate_backoff)
+
+    session.persist()
+    await yield_once(0)
+
+    assert len(attempts) == 3
+    assert delays == [0.1, 0.2]
+    assert Session.load(state, session.session_id).messages == session.messages
+
+
+@pytest.mark.asyncio
+async def test_persist_retries_each_snapshot_before_starting_the_next_snapshot(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "First snapshot")
+    snapshots: list[tuple[str, ...]] = []
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+    yield_once = asyncio.sleep
+
+    def fail_first_snapshot_twice(target: Path, content: bytes) -> None:
+        records = [json.loads(line) for line in content.splitlines()]
+        snapshots.append(tuple(record["content"] for record in records[1:]))
+        if len(snapshots) <= 2:
+            raise OSError("transient snapshot failure")
+        replace(target, content)
+
+    async def immediate_backoff(_delay: float) -> None:
+        return
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_first_snapshot_twice)
+    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", immediate_backoff)
+
+    session.persist()
+    session.add_message("user", "Second snapshot")
+    session.persist()
+    await yield_once(0)
+
+    assert snapshots == [
+        ("First snapshot",),
+        ("First snapshot",),
+        ("First snapshot",),
+        ("First snapshot", "Second snapshot"),
+    ]
+    assert Session.load(state, session.session_id).messages == session.messages
+
+
+@pytest.mark.asyncio
+async def test_abandon_cancels_every_pending_snapshot_when_latest_has_not_started(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "First snapshot")
+    writes: list[bytes] = []
+    backoff_started = asyncio.Event()
+    backoff_cancelled = asyncio.Event()
+    release_backoff = asyncio.Event()
+    yield_once = asyncio.sleep
+
+    def fail_first_write(_target: Path, content: bytes) -> None:
+        writes.append(content)
+        raise OSError("transient snapshot failure")
+
+    async def blocked_backoff(_delay: float) -> None:
+        backoff_started.set()
+        try:
+            await release_backoff.wait()
+        except asyncio.CancelledError:
+            backoff_cancelled.set()
+            raise
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_first_write)
+    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", blocked_backoff)
+
+    session.persist()
+    await yield_once(0)
+    assert backoff_started.is_set()
+
+    session.add_message("user", "Second snapshot")
+    session.persist()
+    session.abandon()
+    await yield_once(0)
+
+    try:
+        assert not release_backoff.is_set()
+        assert backoff_cancelled.is_set()
+        assert len(writes) == 1
+        assert not (state.sessions_directory / f"{session.session_id}.jsonl").exists()
+    finally:
+        release_backoff.set()
+        await yield_once(0)
+
+    assert len(writes) == 1
+    session.abandon()
+
+
+@pytest.mark.asyncio
+async def test_close_wins_against_an_old_async_snapshot_in_backoff(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "Old snapshot")
+    snapshots: list[tuple[str, ...]] = []
+    backoff_started = asyncio.Event()
+    release_backoff = asyncio.Event()
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+    yield_once = asyncio.sleep
+
+    def fail_async_then_save_sync(target: Path, content: bytes) -> None:
+        records = [json.loads(line) for line in content.splitlines()]
+        snapshots.append(tuple(record["content"] for record in records[1:]))
+        if len(snapshots) == 1:
+            raise OSError("transient snapshot failure")
+        replace(target, content)
+
+    async def blocked_backoff(_delay: float) -> None:
+        backoff_started.set()
+        await release_backoff.wait()
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_async_then_save_sync)
+    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", blocked_backoff)
+
+    session.persist()
+    await yield_once(0)
+    assert backoff_started.is_set()
+
+    session.add_message("user", "Final state")
+    session.close()
+    assert snapshots == [("Old snapshot",), ("Old snapshot", "Final state")]
+
+    release_backoff.set()
+    await yield_once(0)
+
+    assert snapshots == [("Old snapshot",), ("Old snapshot", "Final state")]
+    assert Session.load(state, session.session_id).messages == session.messages
+
+
+@pytest.mark.asyncio
+async def test_abandon_rejects_mutators_and_close_does_not_save(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "Before abandonment")
+    original_messages = copy.deepcopy(session.messages)
+    original_metadata = copy.deepcopy(session.metadata)
+
+    session.abandon()
+
+    with pytest.raises(RuntimeError, match="Session has been abandoned"):
+        session.add_message("user", "Rejected")
+    with pytest.raises(RuntimeError, match="Session has been abandoned"):
+        session.append_messages([{"role": "user", "content": "Rejected"}])
+    with pytest.raises(RuntimeError, match="Session has been abandoned"):
+        session.update_metadata(title="Rejected")
+    with pytest.raises(RuntimeError, match="Session has been abandoned"):
+        session.add_message(123, None)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="Session has been abandoned"):
+        session.append_messages(None)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="Session has been abandoned"):
+        session.update_metadata("Rejected")  # type: ignore[arg-type]
+
+    session.persist()
+    session.close()
+
+    assert session.messages == original_messages
+    assert session.metadata == original_metadata
+    assert not (state.sessions_directory / f"{session.session_id}.jsonl").exists()
+
+
+def test_close_then_abandon_rejects_later_mutation_without_another_save(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "Saved before abandonment")
+    session.close()
+    path = state.sessions_directory / f"{session.session_id}.jsonl"
+    saved = path.read_bytes()
+
+    session.abandon()
+
+    with pytest.raises(RuntimeError, match="Session has been abandoned"):
+        session.add_message("user", "Rejected")
+    with pytest.raises(RuntimeError, match="Session has been abandoned"):
+        session.append_messages([{"role": "user", "content": "Rejected"}])
+    with pytest.raises(RuntimeError, match="Session has been abandoned"):
+        session.update_metadata(title="Rejected")
+    session.persist()
+    session.close()
+
+    assert path.read_bytes() == saved
+
+
+@pytest.mark.asyncio
 async def test_ordinary_persist_failure_is_silent_and_a_later_persist_is_independent(
     agent_home: Path,
     workspace: Path,
@@ -237,14 +466,22 @@ async def test_ordinary_persist_failure_is_silent_and_a_later_persist_is_indepen
     state = _state(workspace, agent_home)
     session = Session.create(state)
     session.add_message("user", "First attempt")
+    attempts: list[bytes] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
+    yield_once = asyncio.sleep
 
-    def fail_replace(_target: Path, _content: bytes) -> None:
+    def fail_replace(_target: Path, content: bytes) -> None:
+        attempts.append(content)
         raise OSError("simulated snapshot failure")
 
+    async def immediate_backoff(_delay: float) -> None:
+        return
+
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_replace)
+    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", immediate_backoff)
     session.persist()
-    await asyncio.sleep(0)
+    await yield_once(0)
+    assert len(attempts) == 3
 
     replacements: list[bytes] = []
 
@@ -255,8 +492,9 @@ async def test_ordinary_persist_failure_is_silent_and_a_later_persist_is_indepen
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_later_replace)
     session.add_message("user", "Second attempt")
     session.persist()
-    await asyncio.sleep(0)
+    await yield_once(0)
 
+    assert len(attempts) == 3
     assert len(replacements) == 1
     assert [message["content"] for message in Session.load(state, session.session_id).messages] == [
         "First attempt",

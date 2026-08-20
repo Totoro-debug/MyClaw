@@ -600,6 +600,11 @@ async def test_summary_failure_is_not_rewritten_by_silent_session_persistence_fa
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_session_persistence)
 
+    async def immediate_backoff(_delay: float) -> None:
+        return
+
+    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", immediate_backoff)
+
     events = [event async for event in conversation.submit("Current question.")]
     await asyncio.sleep(0)
 
@@ -612,7 +617,7 @@ async def test_summary_failure_is_not_rewritten_by_silent_session_persistence_fa
         "code": "model_failed",
         "message": "Safe summary failure.",
     }
-    assert persistence_attempts == [state.sessions_directory / f"{session.session_id}.jsonl"]
+    assert persistence_attempts == [state.sessions_directory / f"{session.session_id}.jsonl"] * 3
     assert provider.stream_requests == []
     assert not summaries.path.exists()
 

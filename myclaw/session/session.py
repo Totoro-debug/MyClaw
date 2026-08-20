@@ -71,7 +71,9 @@ class Session:
     metadata: dict[str, Any]
     last_consolidated: int
     _pending_persist: asyncio.Task[None] | None
+    _persist_tasks: set[asyncio.Task[None]]
     _closed: bool
+    _abandoned: bool
 
     def __init__(self) -> None:
         raise TypeError("Use Session.create() or Session.load()")
@@ -105,7 +107,9 @@ class Session:
         session.metadata = metadata
         session.last_consolidated = last_consolidated
         session._pending_persist = None
+        session._persist_tasks = set()
         session._closed = False
+        session._abandoned = False
         return session
 
     @classmethod
@@ -254,6 +258,7 @@ class Session:
 
     def add_message(self, role: str, content: str, **fields: Any) -> None:
         """Append one validated JSON-native user, assistant, or tool message."""
+        self._ensure_not_abandoned()
         if role not in {"user", "assistant", "tool"}:
             raise ValueError("role must be user, assistant, or tool")
         if not isinstance(content, str):
@@ -278,6 +283,7 @@ class Session:
 
     def append_messages(self, messages: list[dict[str, Any]]) -> None:
         """Atomically append a validated Agent Run increment."""
+        self._ensure_not_abandoned()
         if not isinstance(messages, list):
             raise TypeError("messages must be a list")
 
@@ -310,6 +316,7 @@ class Session:
 
     def update_metadata(self, metadata: dict[str, Any] | None = None, **updates: Any) -> None:
         """Apply a copied shallow metadata patch and accumulate token usage deltas."""
+        self._ensure_not_abandoned()
         patch: dict[str, Any] = {}
         if metadata is not None:
             if not isinstance(metadata, dict):
@@ -350,7 +357,10 @@ class Session:
             content = self._serialized_state()
             loop = asyncio.get_running_loop()
             previous = self._pending_persist
-            self._pending_persist = loop.create_task(self._persist_after(previous, content))
+            pending = loop.create_task(self._persist_after(previous, content))
+            self._pending_persist = pending
+            self._persist_tasks.add(pending)
+            pending.add_done_callback(self._persist_tasks.discard)
         except Exception:
             return
 
@@ -370,6 +380,19 @@ class Session:
             except Exception:
                 if attempt < 2:
                     time.sleep((0.1, 0.2)[attempt])
+
+    def abandon(self) -> None:
+        """Synchronously abandon the Session without a final persistence attempt."""
+        if self._abandoned:
+            return
+        self._abandoned = True
+        self._closed = True
+        self._pending_persist = None
+        pending_tasks = tuple(self._persist_tasks)
+        for pending in pending_tasks:
+            if not pending.done():
+                pending.cancel()
+        self._persist_tasks.clear()
 
     def _serialized_state(self) -> bytes:
         header = {
@@ -395,12 +418,20 @@ class Session:
                 await previous
             except Exception:
                 pass
-        if self._closed:
-            return
-        try:
-            self._write_content(content)
-        except Exception:
-            pass
+        for attempt in range(3):
+            if self._closed:
+                return
+            try:
+                self._write_content(content)
+                return
+            except Exception:
+                if attempt == 2 or self._closed:
+                    return
+                await asyncio.sleep((0.1, 0.2)[attempt])
+
+    def _ensure_not_abandoned(self) -> None:
+        if self._abandoned:
+            raise RuntimeError("Session has been abandoned")
 
     def _write_content(self, content: bytes) -> None:
         if self._storage_partition is SessionStoragePartition.FOREGROUND:
