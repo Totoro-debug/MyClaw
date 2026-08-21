@@ -8,7 +8,7 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import prepare_repl_runtime
+from myclaw.agent.runtime import prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -236,7 +236,7 @@ async def test_title_finishes_before_chat_when_direct_provider_exposes_route_sta
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -290,7 +290,7 @@ async def test_prepared_runtime_uses_an_isolated_chat_stream_for_session_title(
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     clock = FakeClock(NOW)
     provider = RuntimeTitleProvider()
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -360,7 +360,7 @@ async def test_existing_session_turn_does_not_regenerate_its_title(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),

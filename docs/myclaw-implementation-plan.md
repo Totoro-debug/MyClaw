@@ -1,5 +1,9 @@
 # MyClaw 首版分阶段实现计划
 
+> 历史状态：本文保留首版与 pre-#171 的阶段实施记录，不再定义当前 Runtime
+> transport、projection、module layout 或测试 seam。相关旧名称只描述当时的实施顺序；
+> 当前边界以 `CONTEXT.md`、`docs/myclaw-runtime-contracts.md` 和 ADR-0014 为准。
+
 ## 1. 计划目标与需求基线
 
 本计划用于把 MyClaw 首版从已确认的设计文档推进到可安装、可运行、可验收的 Python 产品。实现边界以以下文档为准：

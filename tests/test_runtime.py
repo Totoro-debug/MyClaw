@@ -14,7 +14,7 @@ from loguru import logger
 import myclaw.agent.runtime as runtime_module
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
+from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -183,7 +183,7 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
     monkeypatch.setattr(runtime_module, "get_localzone_name", lambda: "Asia/Shanghai")
     monkeypatch.setattr(runtime_module, "ContextBuilder", recording_context_builder)
 
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -213,7 +213,7 @@ def test_runtime_composition_rejects_invalid_discovered_iana_before_provider_cal
     monkeypatch.setattr(runtime_module, "get_localzone_name", lambda: "Invalid/MyClaw-Zone")
 
     with pytest.raises(ZoneInfoNotFoundError):
-        prepare_repl_runtime(
+        prepare_runtime(
             agent_home=home,
             workspace=workspace,
             configuration=ConfigLoader(home).load(),
@@ -251,7 +251,7 @@ async def test_runtime_leaves_legacy_schedule_state_untouched(
         return original_read_text(path, encoding=encoding, errors=errors)
 
     monkeypatch.setattr(Path, "read_text", observe_legacy_reads)
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -296,7 +296,7 @@ async def test_runtime_ignores_legacy_schedule_state_path_types(
         return original_lstat(path)
 
     monkeypatch.setattr(Path, "lstat", observe_legacy_lstat)
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -338,7 +338,7 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
     clock = FakeClock(NOW)
     failure = ModelCallError(ErrorInfo(code="model_failed", message="The model request failed."))
     provider = ScriptedFakeProvider(streams=(StreamScript(events=(), error=failure),))
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -357,7 +357,11 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
         ("system_control", "failed"),
     ]
     content = _session_log_text(workspace, runtime.session_id)
-    records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
+    records = [
+        line
+        for line in content.splitlines()
+        if "myclaw.agent.loop:" in line or "myclaw.agent.runner:" in line
+    ]
     assert len(records) == 2
     assert "ModelCallError: The model request failed." in content
     assert "ModelCallError: No title response was scripted." in content
@@ -378,8 +382,8 @@ async def test_concurrent_foreground_sessions_write_only_to_their_own_session_lo
     first_provider = BlockingSessionLogProvider(marker="FIRST_SESSION", release=release)
     second_provider = BlockingSessionLogProvider(marker="SECOND_SESSION", release=release)
 
-    def runtime_for(provider: BlockingSessionLogProvider) -> PreparedReplRuntime:
-        return prepare_repl_runtime(
+    def runtime_for(provider: BlockingSessionLogProvider) -> PreparedRuntime:
+        return prepare_runtime(
             agent_home=home,
             workspace=workspace,
             configuration=configuration,
@@ -468,7 +472,7 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
             )
         )
 
-    unavailable_runtime = prepare_repl_runtime(
+    unavailable_runtime = prepare_runtime(
         agent_home=home,
         workspace=unavailable_workspace,
         configuration=configuration,
@@ -576,7 +580,7 @@ async def test_foreground_tool_diagnostics_preserve_boundary_exception_details(
             )
 
     monkeypatch.setattr("myclaw.tools.core.web_search.DDGS", FailingDDGS)
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -618,7 +622,7 @@ async def test_foreground_model_failure_keeps_event_safe_without_log_redaction(
     )
     provider_failure.__cause__ = RuntimeError("RAW_PROVIDER_BODY auth=PRIVATE_MODEL_CREDENTIAL")
     provider = ScriptedFakeProvider(streams=(StreamScript(events=(), error=provider_failure),))
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -681,7 +685,7 @@ async def test_prepared_repl_defers_injected_provider_factory_until_first_nonbla
         factory_calls.append(configuration)
         return provider
 
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -742,7 +746,7 @@ async def test_prepared_repl_uses_the_chat_model_route(
         factory_calls.append(configuration)
         return provider
 
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -807,7 +811,7 @@ async def test_prepared_repl_routes_transient_provider_failures_through_one_retr
             ),
         )
     )
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -881,7 +885,7 @@ async def test_prepared_repl_status_reports_the_actual_fallback_route_and_sessio
             return chat_provider
         return default_provider
 
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -927,7 +931,7 @@ async def test_runtime_status_estimate_omits_a_pure_error_assistant(
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     configuration = ConfigLoader(home).load()
-    first = prepare_repl_runtime(
+    first = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -935,7 +939,7 @@ async def test_runtime_status_estimate_omits_a_pure_error_assistant(
         now=FakeClock(NOW).now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
-    second = prepare_repl_runtime(
+    second = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -975,7 +979,7 @@ async def test_runtime_status_estimate_includes_the_interrupted_history_marker(
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     configuration = ConfigLoader(home).load()
-    interrupted = prepare_repl_runtime(
+    interrupted = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -983,7 +987,7 @@ async def test_runtime_status_estimate_includes_the_interrupted_history_marker(
         now=FakeClock(NOW).now,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
-    projected = prepare_repl_runtime(
+    projected = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -1045,7 +1049,7 @@ async def test_prepared_repl_defers_an_unusable_default_until_route_use(
     (agent_home / "config.toml").write_text(content, encoding="utf-8")
     configuration = ConfigLoader(home).load()
 
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -1084,7 +1088,7 @@ async def test_prepared_repl_uses_the_effective_fallback_route_budget(
             StreamScript(events=(ModelCompleted(response=response),)),
         )
     )
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -1149,7 +1153,7 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
             ),
         )
     )
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,

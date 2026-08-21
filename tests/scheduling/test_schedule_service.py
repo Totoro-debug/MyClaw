@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from myclaw.agent.runtime import prepare_repl_runtime
+from myclaw.agent.runtime import prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -1246,7 +1246,7 @@ async def test_prepared_runtime_executes_at_job_with_schedule_route_and_partitio
             ),
         )
     )
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -1287,7 +1287,7 @@ async def test_prepared_runtime_runs_foreground_while_every_job_is_active(
         _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
     )
     provider = ConcurrentScheduleAndForegroundProvider()
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),

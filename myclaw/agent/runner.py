@@ -10,19 +10,6 @@ from typing import Any, ClassVar, Literal, Protocol
 
 from loguru import logger
 
-from myclaw.agent.run import (
-    _append_run_message,
-    _assistant_run_message,
-    _close_iterator,
-    _externalize_tool_result,
-    _identity_tool_result,
-    _model_failure,
-    _repair_cancelled_messages,
-    _repair_failed_messages,
-    _tool_run_message,
-    _ToolCallState,
-    build_assistant_repair_message,
-)
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -356,7 +343,7 @@ class AgentRunner:
                     _append_run_message(
                         runtime_messages,
                         increment,
-                        build_assistant_repair_message(
+                        _build_assistant_repair_message(
                             content=_MAX_ITERATIONS_MESSAGE,
                             status="error",
                             error=limit_error,
@@ -379,7 +366,7 @@ class AgentRunner:
             if failure.error.code == "turn_cancelled" or is_cancel_requested():
                 cancelled_content = "".join(partial_content)
                 return finish_cancelled(final_content=cancelled_content)
-            _log_legacy_agent_failure(failure)
+            _log_agent_failure(failure)
             failed_content = "".join(partial_content) if model == "chat" else ""
             _repair_failed_messages(
                 runtime_messages,
@@ -489,6 +476,171 @@ def _cancelled_result(
     )
 
 
+@dataclass(slots=True)
+class _ToolCallState:
+    result: ToolResult | None = None
+
+
+def _model_failure() -> ModelCallError:
+    return ModelCallError(ErrorInfo("model_failed", "The model request failed."))
+
+
+def _append_run_message(
+    runtime_messages: list[dict[str, Any]],
+    increment: list[dict[str, Any]],
+    message: dict[str, Any],
+) -> None:
+    runtime_messages.append(deepcopy(message))
+    increment.append(deepcopy(message))
+
+
+def _assistant_run_message(response: ModelResponse) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": response.message.content,
+        "tool_calls": [call.to_dict() for call in response.message.tool_calls],
+        "status": "completed",
+        "error": None,
+        "token_usage": {"model_calls": 1, **response.usage.to_dict()},
+    }
+
+
+def _build_assistant_repair_message(
+    *,
+    content: str,
+    status: Literal["interrupted", "error"],
+    error: ErrorInfo,
+    model_calls: int = 1,
+) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [],
+        "status": status,
+        "error": {"code": error.code, "message": error.message},
+        "token_usage": {
+            "model_calls": model_calls,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+
+
+def _tool_run_message(result: ToolResult) -> dict[str, Any]:
+    return {"role": "tool", **result.to_dict()}
+
+
+def _identity_tool_result(result: ToolResult) -> ToolResult:
+    return result
+
+
+def _externalize_tool_result(
+    result: ToolResult,
+    externalize_result: Callable[[ToolResult], ToolResult],
+    *,
+    on_artifact_failure: Callable[[Exception, str], None] | None = None,
+) -> ToolResult:
+    try:
+        return externalize_result(result)
+    except Exception as failure:
+        if on_artifact_failure is not None:
+            on_artifact_failure(failure, result.name)
+        return ToolResult(
+            tool_call_id=result.tool_call_id,
+            name=result.name,
+            status="error",
+            content=f"{result.name} result could not be stored.",
+            artifact=None,
+            confirmation=result.confirmation,
+        )
+
+
+def _repair_cancelled_messages(
+    runtime_messages: list[dict[str, Any]],
+    increment: list[dict[str, Any]],
+    partial_content: list[str],
+    pending_tool_calls: list[ModelToolCall],
+) -> None:
+    if partial_content:
+        _append_run_message(
+            runtime_messages,
+            increment,
+            _build_assistant_repair_message(
+                content="".join(partial_content),
+                status="interrupted",
+                error=ErrorInfo(
+                    code="turn_cancelled",
+                    message="Turn interrupted by user.",
+                ),
+            ),
+        )
+    for tool_call in pending_tool_calls:
+        _append_run_message(
+            runtime_messages,
+            increment,
+            _tool_run_message(
+                ToolResult(
+                    tool_call_id=tool_call.id,
+                    name=tool_call.name,
+                    status="error",
+                    content="Tool call interrupted because the turn was cancelled.",
+                    artifact=None,
+                )
+            ),
+        )
+    pending_tool_calls.clear()
+    partial_content.clear()
+
+
+def _repair_failed_messages(
+    runtime_messages: list[dict[str, Any]],
+    increment: list[dict[str, Any]],
+    partial_content: list[str],
+    pending_tool_calls: list[ModelToolCall],
+    *,
+    stream: bool,
+    failure: ModelCallError,
+) -> None:
+    for tool_call in pending_tool_calls:
+        _append_run_message(
+            runtime_messages,
+            increment,
+            _tool_run_message(
+                ToolResult(
+                    tool_call_id=tool_call.id,
+                    name=tool_call.name,
+                    status="error",
+                    content="Tool call interrupted because the Agent Run failed.",
+                    artifact=None,
+                )
+            ),
+        )
+    pending_tool_calls.clear()
+    _append_run_message(
+        runtime_messages,
+        increment,
+        _build_assistant_repair_message(
+            content="".join(partial_content) if stream else "",
+            status="error",
+            error=failure.error,
+        ),
+    )
+    partial_content.clear()
+
+
+async def _close_iterator(iterator: AsyncIterator[object] | None) -> None:
+    if iterator is None:
+        return
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    try:
+        await close()
+    except BaseException:
+        pass
+
+
 __all__ = [
     "AgentRunner",
     "AgentRunnerFinishReason",
@@ -503,11 +655,11 @@ __all__ = [
 ]
 
 
-def _log_legacy_agent_failure(failure: ModelCallError) -> None:
-    def set_legacy_name(record: Any) -> None:
-        record["name"] = "myclaw.session.conversation"
+def _log_agent_failure(failure: ModelCallError) -> None:
+    def set_runtime_name(record: Any) -> None:
+        record["name"] = "myclaw.agent.runner"
 
-    logger.patch(set_legacy_name).opt(exception=failure).error(
+    logger.patch(set_runtime_name).opt(exception=failure).error(
         "Agent Run failed code={} type={}",
         failure.error.code,
         type(failure).__name__,

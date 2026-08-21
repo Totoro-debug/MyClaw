@@ -1,14 +1,11 @@
-import asyncio
 import json
-from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
-from myclaw.agent.events import AgentEvent, TurnCompletedPayload, TurnStartedPayload
-from myclaw.agent.runtime import prepare_repl_runtime
+from myclaw.agent.runtime import prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -21,7 +18,6 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.terminal.repl import run_repl
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, StreamScript
@@ -175,73 +171,6 @@ async def test_resume_selects_the_loaded_session_for_the_runtime_owner(
     assert selected[0].messages == target.messages
 
 
-class _RecordingConversation:
-    def __init__(self) -> None:
-        self.submitted: list[str] = []
-        self.cancelled = False
-        self.closed = False
-
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
-        self.submitted.append(text)
-        yield AgentEvent(
-            type="turn_started",
-            event_id=0,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=TurnStartedPayload(),
-        )
-        yield AgentEvent(
-            type="turn_completed",
-            event_id=1,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=TurnCompletedPayload(
-                content="done",
-                usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
-            ),
-        )
-
-    async def cancel_active_turn(self) -> None:
-        self.cancelled = True
-
-    def respond_to_confirmation(self, confirmation_id: UUID, decision: str) -> None:
-        del confirmation_id, decision
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-class _BlockingConversation(_RecordingConversation):
-    def __init__(self) -> None:
-        super().__init__()
-        self.release = asyncio.Event()
-
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
-        self.submitted.append(text)
-        yield AgentEvent(
-            type="turn_started",
-            event_id=0,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=TurnStartedPayload(),
-        )
-        await self.release.wait()
-        yield AgentEvent(
-            type="turn_completed",
-            event_id=1,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=TurnCompletedPayload(
-                content="done",
-                usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
-            ),
-        )
-
-    async def cancel_active_turn(self) -> None:
-        self.cancelled = True
-        self.release.set()
-
-
 class _ScriptedInput:
     def __init__(self, values: tuple[str | None, ...]) -> None:
         self._values = iter(values)
@@ -262,72 +191,6 @@ class _RecordingWriter:
 
     async def write_line(self, content: str) -> None:
         self.operations.append(("line", content))
-
-
-@pytest.mark.asyncio
-async def test_switchable_port_closes_every_delegate_and_preserves_previous_history(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    first = _session(state, FIRST_UUID, "First session")
-    second = _session(state, SECOND_UUID, "Second session")
-    delegates = {
-        first.session_id: _RecordingConversation(),
-        second.session_id: _RecordingConversation(),
-    }
-    built_for: list[Session] = []
-
-    def build(session: Session) -> _RecordingConversation:
-        built_for.append(session)
-        return delegates[session.session_id]
-
-    conversation = SwitchableConversationPort(session=first, build_conversation=build)
-
-    first_events = [event async for event in conversation.submit("First turn")]
-    conversation.switch_session(second)
-    second_events = [event async for event in conversation.submit("Second turn")]
-    await conversation.close()
-
-    assert built_for == [first, second]
-    assert delegates[first.session_id].closed
-    assert delegates[second.session_id].closed
-    assert Session.load(state, first.session_id).messages == first.messages
-    assert [event.event_id for event in first_events + second_events] == [0, 1, 2, 3]
-
-
-@pytest.mark.asyncio
-async def test_active_turn_rejects_switch_and_keeps_cancellation_on_original_session(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    first = _session(state, FIRST_UUID, "First session")
-    second = _session(state, SECOND_UUID, "Second session")
-    first_delegate = _BlockingConversation()
-    second_delegate = _RecordingConversation()
-    delegates = {
-        first.session_id: first_delegate,
-        second.session_id: second_delegate,
-    }
-    conversation = SwitchableConversationPort(
-        session=first,
-        build_conversation=lambda session: delegates[session.session_id],
-    )
-    events = conversation.submit("Blocking turn")
-
-    assert (await anext(events)).type == "turn_started"
-    with pytest.raises(RuntimeError, match="active foreground turn"):
-        conversation.switch_session(second)
-    await conversation.cancel_active_turn()
-    assert [event.type async for event in events] == ["turn_completed"]
-
-    conversation.switch_session(second)
-
-    assert first_delegate.cancelled
-    assert conversation.session is second
-    assert second_delegate.cancelled is False
-    await conversation.close()
 
 
 @pytest.mark.asyncio
@@ -356,7 +219,7 @@ async def test_repl_resume_routes_the_next_input_through_the_selected_session(
             ),
         )
     )
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),

@@ -1,16 +1,13 @@
-import asyncio
 import json
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import pytest
 
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.events import TurnFailedPayload
 from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -22,17 +19,14 @@ from myclaw.memory.conversation_summary import (
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
-    ModelCompleted,
     ModelMessages,
     ModelResponse,
     ModelRoute,
     ModelUsage,
 )
-from myclaw.session.conversation import StreamingConversationPort
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
-from myclaw.utils.host_filesystem import HOST_FILESYSTEM
-from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter, StreamScript
+from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 8, 4, 16, 0, 0, tzinfo=LOCAL_OFFSET)
@@ -135,7 +129,8 @@ def _manager(
     project_messages: Callable[
         [Sequence[dict[str, Any]]],
         list[dict[str, Any]],
-    ] | None = None,
+    ]
+    | None = None,
 ) -> ConversationSummaryManager:
     projection = project_messages or (
         lambda messages: _project_messages(messages, system_prompt=system_prompt)
@@ -177,31 +172,6 @@ def _session_with_history(state: WorkspaceState) -> Session:
     _add_assistant(session, "Second answer.")
     session.add_message("user", "Current question.")
     return session
-
-
-def _conversation(
-    provider: ScriptedFakeProvider,
-    session: Session,
-    manager: ConversationSummaryManager,
-) -> StreamingConversationPort:
-    async def prepare_foreground_summary(
-        active_session: Session,
-        current_user: dict[str, Any],
-    ) -> Session:
-        return await manager.prepare(active_session, current_user=current_user)
-
-    return StreamingConversationPort(
-        model=ScriptedFakeRouter(provider),
-        session=session,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-        foreground_summary_preparer=prepare_foreground_summary,
-        context_builder=ContextBuilder(
-            Workspace.from_path(session.workspace_state.path),
-            "Asia/Shanghai",
-            clock=lambda: NOW,
-        ),
-    )
 
 
 @pytest.mark.asyncio
@@ -543,82 +513,6 @@ async def test_summary_provider_failure_preserves_user_visible_model_error(
     assert raised.value.error.code == "model_failed"
     assert raised.value.error.message == "PRIVATE FAILURE"
     assert session.last_consolidated == 0
-    assert not summaries.path.exists()
-
-
-@pytest.mark.asyncio
-async def test_active_conversation_prepares_summary_before_chat_request(
-    workspace: Path,
-) -> None:
-    state = _state(workspace)
-    session = Session.create(state)
-    for user, assistant in (
-        ("First question.", "First answer."),
-        ("Second question.", "Second answer."),
-    ):
-        session.add_message("user", user)
-        _add_assistant(session, assistant)
-    provider = ScriptedFakeProvider(
-        completions=(_response("First turn summary."),),
-        streams=(StreamScript(events=(ModelCompleted(response=_response("Chat answer.")),)),),
-    )
-    summaries = WorkspaceJsonlSummaryStore(state)
-    conversation = _conversation(provider, session, _manager(provider, summaries))
-
-    events = [event async for event in conversation.submit("Current question.")]
-
-    assert [event.type for event in events] == [
-        "turn_started",
-        "model_call_completed",
-        "turn_completed",
-    ]
-    assert session.last_consolidated == 2
-    request = provider.stream_requests[0]
-    request_content = json.dumps(request.messages, ensure_ascii=False)
-    assert "First question." not in request_content
-    assert "Second question." in request_content
-    assert "Current question." in request_content
-
-
-@pytest.mark.asyncio
-async def test_summary_failure_is_not_rewritten_by_silent_session_persistence_failure(
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = _state(workspace)
-    session = _session_with_history(state)
-    session.messages.pop()
-    failure = ModelCallError(ErrorInfo(code="model_failed", message="Safe summary failure."))
-    provider = ScriptedFakeProvider(completions=(failure,))
-    summaries = WorkspaceJsonlSummaryStore(state)
-    conversation = _conversation(provider, session, _manager(provider, summaries))
-    persistence_attempts: list[Path] = []
-
-    def fail_session_persistence(path: Path, _content: bytes) -> None:
-        persistence_attempts.append(path)
-        raise OSError("injected ordinary Session persistence failure")
-
-    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_session_persistence)
-
-    async def immediate_backoff(_delay: float) -> None:
-        return
-
-    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", immediate_backoff)
-
-    events = [event async for event in conversation.submit("Current question.")]
-    await asyncio.sleep(0)
-
-    assert [event.type for event in events] == ["turn_started", "turn_failed"]
-    failed = events[-1].payload
-    assert isinstance(failed, TurnFailedPayload)
-    assert failed.error == failure.error
-    assert session.last_consolidated == 0
-    assert session.messages[-1]["error"] == {
-        "code": "model_failed",
-        "message": "Safe summary failure.",
-    }
-    assert persistence_attempts == [state.sessions_directory / f"{session.session_id}.jsonl"] * 3
-    assert provider.stream_requests == []
     assert not summaries.path.exists()
 
 

@@ -12,7 +12,7 @@ import pytest
 
 from myclaw.agent.loop import ConfirmationRequestView
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
+from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
@@ -130,11 +130,11 @@ def _runtime(
     agent_home: Path,
     workspace: Path,
     provider: _RuntimeProvider,
-) -> PreparedReplRuntime:
+) -> PreparedRuntime:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    return prepare_repl_runtime(
+    return prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),

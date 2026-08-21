@@ -18,13 +18,13 @@ from myclaw.agent.message_bus import (
     OutboundMessage,
     OutboundMessageType,
 )
-from myclaw.agent.run import build_assistant_repair_message
 from myclaw.agent.runner import (
     AgentRunner,
     AgentRunnerResponseSegmentEnd,
     AgentRunnerResult,
     AgentRunnerRouter,
     AgentRunnerToolCallStarted,
+    _build_assistant_repair_message,
 )
 from myclaw.agent.workspace import Workspace
 from myclaw.errors import ErrorInfo
@@ -431,7 +431,7 @@ class AgentLoop:
         session.append_messages(
             [
                 deepcopy(current_user),
-                build_assistant_repair_message(
+                _build_assistant_repair_message(
                     content="",
                     status="error",
                     error=error,
@@ -602,7 +602,7 @@ class AgentLoop:
         try:
             active_session.append_messages([deepcopy(current_user), *deepcopy(result.messages)])
         except Exception as failure:
-            _legacy_logger().opt(exception=failure).error(
+            _runtime_logger().opt(exception=failure).error(
                 "Agent Run Session increment failed code=persistence_error type={}",
                 type(failure).__name__,
             )
@@ -710,7 +710,7 @@ class AgentLoop:
 
     async def _publish_preparation_failure(self, error: ErrorInfo) -> None:
         if error.code != "turn_cancelled":
-            _log_legacy_agent_failure(error)
+            _log_agent_failure(error)
         finish_reason = "cancelled" if error.code == "turn_cancelled" else "failed"
         await self._bus.put_outbound(
             OutboundMessage(
@@ -859,7 +859,7 @@ class AgentLoop:
                     title = candidate
                 break
         except Exception as error:
-            _legacy_logger().opt(exception=error).warning(
+            _runtime_logger().opt(exception=error).warning(
                 "Session title fallback selected type={}", type(error).__name__
             )
         finally:
@@ -894,16 +894,16 @@ __all__ = [
 ]
 
 
-def _legacy_logger() -> Any:
-    def set_legacy_name(record: Any) -> None:
-        record["name"] = "myclaw.session.conversation"
+def _runtime_logger() -> Any:
+    def set_runtime_name(record: Any) -> None:
+        record["name"] = "myclaw.agent.loop"
 
-    return logger.patch(set_legacy_name)
+    return logger.patch(set_runtime_name)
 
 
-def _log_legacy_agent_failure(error: ErrorInfo) -> None:
+def _log_agent_failure(error: ErrorInfo) -> None:
     failure = ModelCallError(error)
-    _legacy_logger().opt(exception=failure).error(
+    _runtime_logger().opt(exception=failure).error(
         "Agent Run failed code={} type={}",
         error.code,
         type(failure).__name__,

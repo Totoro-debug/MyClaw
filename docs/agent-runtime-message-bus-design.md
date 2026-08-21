@@ -1,6 +1,11 @@
 # Agent Message Bus and Runtime Refactoring Plan
 
-Status: design confirmed; implementation has not started.
+Status: design confirmed; legacy transport/runtime projection removal is implemented through Issue #171; Runtime Generation replacement remains Issue #172.
+
+This document retains the migration baseline and target-architecture record. References
+to legacy transport names below describe the pre-#171 comparison or deletion plan;
+the normative current contracts are in `docs/myclaw-runtime-contracts.md` and
+`CONTEXT.md`.
 
 ## 1. Objective
 

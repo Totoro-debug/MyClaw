@@ -5,6 +5,7 @@ import json
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar, Literal, cast
@@ -28,31 +29,15 @@ from textual.pilot import Pilot
 from textual.widget import Widget
 from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 
-from myclaw.agent.events import (
-    AgentEvent,
-    ConfirmationDecision,
-    ConfirmationRequestedPayload,
-    ConversationPort,
-    ModelCallCompletedPayload,
-    TextDeltaPayload,
-    ToolCompletedPayload,
-    ToolStartedPayload,
-    TurnCancelledPayload,
-    TurnCompletedPayload,
-    TurnFailedPayload,
-    TurnStartedPayload,
-)
 from myclaw.agent.loop import ConfirmationRequestView, ForegroundConversationProjection
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import PreparedReplRuntime
-from myclaw.errors import ErrorInfo
+from myclaw.agent.runtime import PreparedRuntime
 from myclaw.management.commands import ManagementCommandResult
 from myclaw.provider.models import (
     ModelCompleted,
     ModelContinuation,
     ModelStreamEvent,
-    ModelUsage,
     ReasoningDelta,
     ReasoningEffort,
     TextDelta,
@@ -68,7 +53,11 @@ from myclaw.terminal.conversation import (
     _MessageBusRunProjection as _AgentRunProjection,
 )
 from myclaw.tools.base import OpenAIToolSchema
-from myclaw.tools.tool_gateway import ModelToolCall
+from myclaw.tools.tool_gateway import (
+    ConfirmationDecision,
+    ConfirmationRequest,
+    ModelToolCall,
+)
 from myclaw.utils.json_types import JsonObject
 from tests.agent.test_fixed_catalog_runtime import (
     _response,
@@ -82,14 +71,29 @@ from tests.fixtures import ProviderCall
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 TURN_ID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
 OTHER_TURN_ID = UUID("b3fbe13b-3d1f-4ee6-98e5-dc40a2c4be1c")
-type ToolActivityStatus = Literal["success", "error", "refused"]
 
 
-class ScriptedConversation:
+@dataclass(frozen=True, slots=True)
+class _ResponseSegmentScript:
+    content: str
+
+
+type _ScriptItem = OutboundMessage | ConfirmationRequest | _ResponseSegmentScript
+
+
+class _ScriptedSource:
+    def run(self, text: str) -> AsyncIterator[_ScriptItem]:
+        raise NotImplementedError
+
+    async def cancel_active_turn(self) -> bool:
+        return False
+
+
+class ScriptedRunSource(_ScriptedSource):
     def __init__(
         self,
         *,
-        pause_before_events: bool = False,
+        pause_before_output: bool = False,
         pause_after_first_delta: bool = False,
         deltas: tuple[str, ...] = ("First ", "answer."),
         completed_content: str = "First answer.",
@@ -107,17 +111,17 @@ class ScriptedConversation:
         self._outcomes = outcomes
         self._cancelled_content = cancelled_content
         self._failure_message = failure_message
-        self.before_events = asyncio.Event()
+        self.before_output = asyncio.Event()
         self.first_delta_emitted = asyncio.Event()
-        self._continue_to_events = asyncio.Event()
+        self._continue_to_output = asyncio.Event()
         self._continue_after_first_delta = asyncio.Event()
-        if not pause_before_events:
-            self._continue_to_events.set()
+        if not pause_before_output:
+            self._continue_to_output.set()
         if not pause_after_first_delta:
             self._continue_after_first_delta.set()
 
-    def continue_to_events(self) -> None:
-        self._continue_to_events.set()
+    def continue_to_output(self) -> None:
+        self._continue_to_output.set()
 
     def continue_turn(self) -> None:
         self._continue_after_first_delta.set()
@@ -126,7 +130,7 @@ class ScriptedConversation:
         self.first_delta_emitted.clear()
         self._continue_after_first_delta.clear()
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage]:
         self.submissions.append(text)
         submission_index = len(self.submissions) - 1
         outcome = self._outcomes[min(submission_index, len(self._outcomes) - 1)]
@@ -142,137 +146,44 @@ class ScriptedConversation:
             if self._completed_contents is None
             else self._completed_contents[min(submission_index, len(self._completed_contents) - 1)]
         )
-        self.before_events.set()
-        await self._continue_to_events.wait()
-        yield AgentEvent(
-            type="turn_started",
-            event_id=0,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=TurnStartedPayload(),
-        )
-        for event_id, delta in enumerate(deltas, start=1):
-            yield AgentEvent(
-                type="text_delta",
-                event_id=event_id,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta=delta),
-            )
-            if event_id == 1:
+        self.before_output.set()
+        await self._continue_to_output.wait()
+        for output_index, delta in enumerate(deltas, start=1):
+            yield _response_delta(delta)
+            if output_index == 1:
                 self.first_delta_emitted.set()
                 await self._continue_after_first_delta.wait()
-        event_id = len(deltas) + 1
         if outcome == "completed":
-            yield AgentEvent(
-                type="model_call_completed",
-                event_id=event_id,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=ModelCallCompletedPayload(
-                    content=completed_content,
-                    continues_with_tools=False,
-                ),
-            )
-            yield AgentEvent(
-                type="turn_completed",
-                event_id=event_id + 1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TurnCompletedPayload(
-                    content=completed_content,
-                    usage=ModelUsage(input_tokens=1, output_tokens=2, total_tokens=3),
-                ),
-            )
+            if not deltas and completed_content:
+                yield _response_delta(completed_content)
+            yield OutboundMessage("model_response", "", {"_stream_end": True})
+            yield _completed_response()
         elif outcome == "cancelled":
-            yield AgentEvent(
-                type="turn_cancelled",
-                event_id=event_id,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TurnCancelledPayload(partial_content=self._cancelled_content),
-            )
+            yield _cancelled_response(self._cancelled_content)
         else:
-            yield AgentEvent(
-                type="turn_failed",
-                event_id=event_id,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TurnFailedPayload(
-                    error=ErrorInfo(code="model_failed", message=self._failure_message)
-                ),
-            )
+            yield _failed_response(self._failure_message)
 
 
-class ToolActivityConversation:
+class ToolActivityRunSource(_ScriptedSource):
     def __init__(
         self,
         *,
-        status: ToolActivityStatus,
         start_summary: str = "Running read_file",
-        final_summary: str,
     ) -> None:
         self.submissions: list[str] = []
         self.tool_started = asyncio.Event()
         self.complete_tool = asyncio.Event()
-        self._status = status
         self._start_summary = start_summary
-        self._final_summary = final_summary
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage]:
         self.submissions.append(text)
-        yield AgentEvent(
-            type="turn_started",
-            event_id=0,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=TurnStartedPayload(),
-        )
-        yield AgentEvent(
-            type="model_call_completed",
-            event_id=1,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=ModelCallCompletedPayload(content="", continues_with_tools=True),
-        )
-        yield AgentEvent(
-            type="tool_started",
-            event_id=2,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=ToolStartedPayload(
-                tool_call_id="call-read-file",
-                tool_name="read_file",
-                summary=self._start_summary,
-            ),
-        )
+        yield _tool_call("call-read-file", "read_file", self._start_summary)
         self.tool_started.set()
         await self.complete_tool.wait()
-        yield AgentEvent(
-            type="tool_completed",
-            event_id=3,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=ToolCompletedPayload(
-                tool_call_id="call-read-file",
-                tool_name="read_file",
-                status=self._status,
-                summary=self._final_summary,
-            ),
-        )
-        yield AgentEvent(
-            type="turn_completed",
-            event_id=4,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=TurnCompletedPayload(
-                content="Tool completed.",
-                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            ),
-        )
+        yield _completed_response()
 
 
-class ConfirmationConversation:
+class ConfirmationRunSource(_ScriptedSource):
     def __init__(
         self,
         *,
@@ -286,47 +197,25 @@ class ConfirmationConversation:
         self.cancel_calls = 0
         self.confirmation_requested = asyncio.Event()
         self._decision_received = asyncio.Event()
-        self._request = ConfirmationRequestedPayload(
+        self._request = ConfirmationRequest(
             confirmation_id=UUID("16fd2706-8baf-4334-8c7f-ada847da0314"),
-            turn_id=TURN_ID,
             tool_call_id="call-confirm",
             tool_name=tool_name,
-            reason=reason,
             summary=f"Confirm {tool_name}",
             details=({"path": "outside.txt"} if details is None else cast(JsonObject, details)),
             warnings=warnings,
+            reason=reason,
         )
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage | ConfirmationRequest]:
         self.submissions.append(text)
-        yield _turn_started_event(TURN_ID)
-        yield _tool_started_event(
-            TURN_ID,
-            1,
-            "call-confirm",
-            self._request.tool_name,
-            "Running",
-        )
+        yield _tool_call("call-confirm", self._request.tool_name, "Running")
         self.confirmation_requested.set()
-        yield AgentEvent(
-            type="confirmation_requested",
-            event_id=2,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=self._request,
-        )
+        yield self._request
         await self._decision_received.wait()
         decision = self.responses[-1][1]
-        status: ToolActivityStatus = "success" if decision == "approved" else "refused"
-        yield _tool_completed_event(
-            TURN_ID,
-            3,
-            "call-confirm",
-            self._request.tool_name,
-            status,
-            "Finished",
-        )
-        yield _turn_completed_event(TURN_ID, 4)
+        del decision
+        yield _completed_response()
 
     def respond_to_confirmation(
         self,
@@ -337,37 +226,30 @@ class ConfirmationConversation:
         self.responses.append((confirmation_id, decision))
         self._decision_received.set()
 
-    async def cancel_active_turn(self) -> None:
+    async def cancel_active_turn(self) -> bool:
         self.cancel_calls += 1
+        return False
 
 
-class DuplicateLateConfirmationConversation:
+class DuplicateLateConfirmationRunSource(_ScriptedSource):
     def __init__(self) -> None:
         self.responses: list[tuple[UUID, ConfirmationDecision]] = []
         self.confirmation_requested = asyncio.Event()
-        self.request = ConfirmationRequestedPayload(
+        self.request = ConfirmationRequest(
             confirmation_id=UUID("4c9b7d40-8b5d-4a17-8140-0ce4f3511ab1"),
-            turn_id=TURN_ID,
             tool_call_id="call-stale",
             tool_name="read_file",
-            reason="The path resolves outside the current Workspace.",
             summary="Confirm read_file",
             details={"path": "outside.txt"},
+            reason="The path resolves outside the current Workspace.",
         )
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage | ConfirmationRequest]:
         del text
-        yield _turn_started_event(TURN_ID)
         self.confirmation_requested.set()
-        for event_id in (1, 2):
-            yield AgentEvent(
-                type="confirmation_requested",
-                event_id=event_id,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=self.request,
-            )
-        yield _turn_completed_event(TURN_ID, 3)
+        yield self.request
+        yield self.request
+        yield _completed_response()
 
     def respond_to_confirmation(
         self,
@@ -377,51 +259,39 @@ class DuplicateLateConfirmationConversation:
         self.responses.append((confirmation_id, decision))
         raise ValueError("Confirmation response is late or unknown")
 
-    async def cancel_active_turn(self) -> None:
-        pass
+    async def cancel_active_turn(self) -> bool:
+        return False
 
 
-class MultipleConfirmationConversation:
+class MultipleConfirmationRunSource(_ScriptedSource):
     def __init__(self) -> None:
         self.responses: list[tuple[UUID, ConfirmationDecision]] = []
         self.confirmation_requested = (asyncio.Event(), asyncio.Event())
         self.requests = (
-            ConfirmationRequestedPayload(
+            ConfirmationRequest(
                 confirmation_id=UUID("b378d47d-2d73-4670-badc-844245c63c3d"),
-                turn_id=TURN_ID,
                 tool_call_id="call-first",
                 tool_name="read_file",
-                reason="First confirmation.",
                 summary="Confirm read_file",
                 details={"path": "first.txt"},
+                reason="First confirmation.",
             ),
-            ConfirmationRequestedPayload(
+            ConfirmationRequest(
                 confirmation_id=UUID("3f1bb452-a8cf-4760-9cde-77b6a4b80ae9"),
-                turn_id=TURN_ID,
                 tool_call_id="call-second",
                 tool_name="write_file",
-                reason="Second confirmation.",
                 summary="Confirm write_file",
                 details={"path": "second.txt", "content": "private"},
+                reason="Second confirmation.",
             ),
         )
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage | ConfirmationRequest]:
         del text
-        yield _turn_started_event(TURN_ID)
-        for event_id, (requested, request) in enumerate(
-            zip(self.confirmation_requested, self.requests, strict=True),
-            start=1,
-        ):
+        for requested, request in zip(self.confirmation_requested, self.requests, strict=True):
             requested.set()
-            yield AgentEvent(
-                type="confirmation_requested",
-                event_id=event_id,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=request,
-            )
-        yield _turn_completed_event(TURN_ID, 3)
+            yield request
+        yield _completed_response()
 
     def respond_to_confirmation(
         self,
@@ -430,37 +300,45 @@ class MultipleConfirmationConversation:
     ) -> None:
         self.responses.append((confirmation_id, decision))
 
-    async def cancel_active_turn(self) -> None:
-        pass
+    async def cancel_active_turn(self) -> bool:
+        return False
 
 
-class ToolEventSequenceConversation:
+class ToolMessageSequenceRunSource(_ScriptedSource):
     def __init__(
         self,
-        *sequences: tuple[AgentEvent, ...],
+        *sequences: tuple[_ScriptItem, ...],
+        pause_before: bool = False,
         pause_after: tuple[int, int] | None = None,
     ) -> None:
         self.submissions: list[str] = []
         self._sequences = sequences
+        self._pause_before = pause_before
         self._pause_after = pause_after
         self.paused = asyncio.Event()
         self.continue_events = asyncio.Event()
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage]:
         self.submissions.append(text)
         submission_index = len(self.submissions) - 1
         sequence = self._sequences[submission_index]
-        for event_index, event in enumerate(sequence):
-            yield event
-            if self._pause_after == (submission_index, event_index):
+        response_delta_seen = False
+        if self._pause_before:
+            self.paused.set()
+            await self.continue_events.wait()
+        for message_index, script_item in enumerate(sequence):
+            messages, response_delta_seen = _expand_script_item(script_item, response_delta_seen)
+            for message in messages:
+                yield message
+            if self._pause_after == (submission_index, message_index):
                 self.paused.set()
                 await self.continue_events.wait()
 
 
-class StagedToolEventSequenceConversation:
+class StagedToolMessageSequenceRunSource(_ScriptedSource):
     def __init__(
         self,
-        *sequences: tuple[AgentEvent, ...],
+        *sequences: tuple[_ScriptItem, ...],
         pause_after: tuple[tuple[int, int], ...],
     ) -> None:
         self.submissions: list[str] = []
@@ -469,23 +347,26 @@ class StagedToolEventSequenceConversation:
             checkpoint: (asyncio.Event(), asyncio.Event()) for checkpoint in pause_after
         }
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage]:
         self.submissions.append(text)
         submission_index = len(self.submissions) - 1
-        for event_index, event in enumerate(self._sequences[submission_index]):
-            yield event
-            checkpoint = self._checkpoints.get((submission_index, event_index))
+        response_delta_seen = False
+        for message_index, script_item in enumerate(self._sequences[submission_index]):
+            messages, response_delta_seen = _expand_script_item(script_item, response_delta_seen)
+            for message in messages:
+                yield message
+            checkpoint = self._checkpoints.get((submission_index, message_index))
             if checkpoint is not None:
                 reached, continue_events = checkpoint
                 reached.set()
                 await continue_events.wait()
 
-    async def wait_after(self, submission_index: int, event_index: int) -> None:
-        reached, _ = self._checkpoints[(submission_index, event_index)]
+    async def wait_after(self, submission_index: int, message_index: int) -> None:
+        reached, _ = self._checkpoints[(submission_index, message_index)]
         await asyncio.wait_for(reached.wait(), timeout=1)
 
-    def continue_after(self, submission_index: int, event_index: int) -> None:
-        _, continue_events = self._checkpoints[(submission_index, event_index)]
+    def continue_after(self, submission_index: int, message_index: int) -> None:
+        _, continue_events = self._checkpoints[(submission_index, message_index)]
         continue_events.set()
 
     def continue_all(self) -> None:
@@ -493,71 +374,38 @@ class StagedToolEventSequenceConversation:
             continue_events.set()
 
 
-class CancellableConversation:
+class CancellableRunSource(_ScriptedSource):
     def __init__(self) -> None:
         self.submissions: list[str] = []
         self.cancel_calls = 0
         self.first_delta_emitted = asyncio.Event()
         self._active_task: asyncio.Task[object] | None = None
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage]:
         self.submissions.append(text)
         active_task = asyncio.current_task()
         assert active_task is not None
         self._active_task = active_task
         try:
-            yield AgentEvent(
-                type="turn_started",
-                event_id=0,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TurnStartedPayload(),
-            )
             if len(self.submissions) == 1:
-                yield AgentEvent(
-                    type="text_delta",
-                    event_id=1,
-                    turn_id=TURN_ID,
-                    created_at=NOW,
-                    payload=TextDeltaPayload(delta="partial response"),
-                )
+                yield _response_delta("partial response")
                 self.first_delta_emitted.set()
                 try:
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
-                    yield AgentEvent(
-                        type="turn_cancelled",
-                        event_id=2,
-                        turn_id=TURN_ID,
-                        created_at=NOW,
-                        payload=TurnCancelledPayload(partial_content="partial response"),
-                    )
+                    yield _cancelled_response("partial response")
                     return
             else:
-                yield AgentEvent(
-                    type="text_delta",
-                    event_id=1,
-                    turn_id=TURN_ID,
-                    created_at=NOW,
-                    payload=TextDeltaPayload(delta="Recovered response."),
-                )
-                yield AgentEvent(
-                    type="turn_completed",
-                    event_id=2,
-                    turn_id=TURN_ID,
-                    created_at=NOW,
-                    payload=TurnCompletedPayload(
-                        content="Recovered response.",
-                        usage=ModelUsage(input_tokens=1, output_tokens=2, total_tokens=3),
-                    ),
-                )
+                yield _response_delta("Recovered response.")
+                yield _completed_response()
         finally:
             self._active_task = None
 
-    async def cancel_active_turn(self) -> None:
+    async def cancel_active_turn(self) -> bool:
         self.cancel_calls += 1
         if self._active_task is not None:
             self._active_task.cancel()
+        return True
 
 
 class CancellableRuntimeProvider(_RuntimeProvider):
@@ -615,119 +463,76 @@ class CancellableRuntimeProvider(_RuntimeProvider):
         yield ModelCompleted(response=_response(content="Recovered runtime response."))
 
 
-class FailingConversation:
+class FailingRunSource(_ScriptedSource):
     def __init__(self) -> None:
         self.closed = asyncio.Event()
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage]:
         del text
         try:
-            yield AgentEvent(
-                type="text_delta",
-                event_id=1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta="partial"),
-            )
+            yield _response_delta("partial")
         finally:
             self.closed.set()
 
 
-class ExplodingConversation:
+class ExplodingRunSource(_ScriptedSource):
     def __init__(self, *, include_tool: bool = True) -> None:
         self.closed = asyncio.Event()
         self.include_tool = include_tool
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage]:
         del text
         try:
-            yield _turn_started_event(TURN_ID)
-            yield AgentEvent(
-                type="text_delta",
-                event_id=1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta="Unconfirmed candidate."),
-            )
+            yield _response_delta("Unconfirmed candidate.")
             if self.include_tool:
-                yield _tool_started_event(
-                    TURN_ID,
-                    2,
-                    "exploding-call",
-                    "read_file",
-                    "Running read_file",
-                )
+                yield _tool_call("exploding-call", "read_file", "Running read_file")
             raise RuntimeError("event stream failed")
         finally:
             self.closed.set()
 
 
-class TerminalThenBlockingConversation:
+class TerminalThenBlockingRunSource(_ScriptedSource):
     def __init__(self) -> None:
         self.terminal_emitted = asyncio.Event()
         self.closed = asyncio.Event()
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage]:
         del text
         try:
-            yield _turn_started_event(TURN_ID)
-            yield _model_call_completed_event(
-                TURN_ID,
-                1,
-                "process activity",
-                continues_with_tools=True,
-            )
-            yield _tool_started_event(
-                TURN_ID,
-                2,
-                "unfinished-call",
-                "read_file",
-                "Running read_file",
-            )
+            yield _response_delta("process activity")
+            yield _tool_call("unfinished-call", "read_file", "Running read_file")
             self.terminal_emitted.set()
-            yield _text_delta_event(TURN_ID, 3, "final response")
-            yield _turn_completed_event(TURN_ID, 3, "final response")
+            yield _response_delta("final response")
+            yield _completed_response()
             await asyncio.Event().wait()
         finally:
             self.closed.set()
 
 
-class BlockingConversation:
+class BlockingRunSource(_ScriptedSource):
     def __init__(self) -> None:
         self.started = asyncio.Event()
         self.closed = asyncio.Event()
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage]:
         del text
         try:
             self.started.set()
-            yield AgentEvent(
-                type="text_delta",
-                event_id=1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta="partial"),
-            )
+            yield _response_delta("partial")
             await asyncio.Event().wait()
         finally:
             self.closed.set()
 
 
-class FailingCancellationCleanupConversation:
+class FailingCancellationCleanupRunSource(_ScriptedSource):
     def __init__(self) -> None:
         self.started = asyncio.Event()
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+    async def run(self, text: str) -> AsyncIterator[OutboundMessage]:
         del text
         try:
             self.started.set()
-            yield AgentEvent(
-                type="text_delta",
-                event_id=1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta="partial"),
-            )
+            yield _response_delta("partial")
             await asyncio.Event().wait()
         finally:
             raise RuntimeError("worker cleanup failed")
@@ -742,22 +547,17 @@ class FailingMarkdownStream:
         raise RuntimeError("markdown stop failed")
 
 
-class _LegacyConversationControl:
-    """Test-only control seam for legacy scripted fixtures.
+class _ScriptedControl:
+    """Final AgentLoop control surface for a scripted MessageBus runtime."""
 
-    The application under test talks only to MessageBus and this control
-    surface. The old event fixtures are translated at this test boundary so
-    the production Terminal has no ConversationPort execution path.
-    """
-
-    def __init__(self, conversation: object) -> None:
-        self._conversation = cast(ConversationPort, conversation)
+    def __init__(self, source: _ScriptedSource) -> None:
+        self._source = source
         self._active = False
         self._pending_confirmation: UUID | None = None
         self._callback: Callable[[ConfirmationRequestView], None] | None = None
         self._seen_confirmation_ids: set[UUID] = set()
         self._confirmation_released: asyncio.Event | None = None
-        self._response_delta_seen = False
+        self._bridge: asyncio.Task[None] | None = None
 
     @property
     def has_active_run(self) -> bool:
@@ -773,7 +573,13 @@ class _LegacyConversationControl:
         self._callback = callback
 
     async def cancel_active_run(self) -> None:
-        await self._conversation.cancel_active_turn()
+        handled = await self._source.cancel_active_turn()
+        if handled:
+            return
+        bridge = self._bridge
+        if bridge is not None and not bridge.done():
+            bridge.cancel()
+            await asyncio.gather(bridge, return_exceptions=True)
 
     def project_foreground_conversation(self) -> ForegroundConversationProjection:
         return ForegroundConversationProjection(session_id="test-session", messages=())
@@ -782,7 +588,11 @@ class _LegacyConversationControl:
         self, confirmation_id: UUID, decision: ConfirmationDecision
     ) -> None:
         try:
-            self._conversation.respond_to_confirmation(confirmation_id, decision)
+            respond = getattr(self._source, "respond_to_confirmation", None)
+            if callable(respond):
+                cast(Callable[[UUID, ConfirmationDecision], None], respond)(
+                    confirmation_id, decision
+                )
         finally:
             if self._pending_confirmation == confirmation_id:
                 self._pending_confirmation = None
@@ -791,106 +601,37 @@ class _LegacyConversationControl:
                 if released is not None:
                     released.set()
 
-    async def publish_event(self, event: AgentEvent, bus: MessageBus) -> bool:
-        """Translate one isolated fixture event into the public bus protocol."""
-
-        payload = event.payload
-        if event.type == "text_delta":
-            assert isinstance(payload, TextDeltaPayload)
-            self._response_delta_seen = True
-            await bus.put_outbound(
-                OutboundMessage(
-                    type="model_response",
-                    content=payload.delta,
-                    metadata={"_stream_delta": True},
-                )
-            )
-            return False
-        if event.type == "model_call_completed":
-            assert isinstance(payload, ModelCallCompletedPayload)
-            if payload.content and not self._response_delta_seen:
-                await bus.put_outbound(
-                    OutboundMessage(
-                        type="model_response",
-                        content=payload.content,
-                        metadata={"_stream_delta": True},
-                    )
-                )
-            self._response_delta_seen = False
-            await bus.put_outbound(
-                OutboundMessage(
-                    type="model_response",
-                    content="",
-                    metadata={"_stream_end": True},
-                )
-            )
-            return False
-        if event.type == "tool_started":
-            assert isinstance(payload, ToolStartedPayload)
-            await bus.put_outbound(
-                OutboundMessage(
-                    type="tool_call",
-                    content=payload.tool_name,
-                    metadata={
-                        "tool_call_id": payload.tool_call_id,
-                        "arguments": payload.summary,
-                    },
-                )
-            )
-            return False
-        if event.type == "confirmation_requested":
-            assert isinstance(payload, ConfirmationRequestedPayload)
-            if payload.confirmation_id in self._seen_confirmation_ids:
+    async def publish(
+        self,
+        item: _ScriptItem,
+        bus: MessageBus,
+    ) -> bool:
+        if isinstance(item, ConfirmationRequest):
+            if item.confirmation_id in self._seen_confirmation_ids:
                 return False
-            self._seen_confirmation_ids.add(payload.confirmation_id)
-            self._pending_confirmation = payload.confirmation_id
+            self._seen_confirmation_ids.add(item.confirmation_id)
+            self._pending_confirmation = item.confirmation_id
             released = asyncio.Event()
             self._confirmation_released = released
             callback = self._callback
             if callback is None:
                 raise AssertionError("confirmation callback was not bound")
-            callback(payload)
+            callback(item)
             await released.wait()
             return False
-        if event.type == "tool_completed":
-            # Tool results are intentionally not part of the foreground bus.
-            return False
-        if event.type == "turn_completed":
-            assert isinstance(payload, TurnCompletedPayload)
-            await bus.put_outbound(
-                OutboundMessage(
-                    type="model_response",
-                    content=payload.content,
-                    metadata={"_streamed": True},
-                )
-            )
-            return True
-        if event.type == "turn_cancelled":
-            assert isinstance(payload, TurnCancelledPayload)
-            await bus.put_outbound(
-                OutboundMessage(
-                    type="system_control",
-                    content=payload.partial_content,
-                    metadata={"_streamed": True, "finish_reason": "cancelled"},
-                )
-            )
-            return True
-        if event.type == "turn_failed":
-            assert isinstance(payload, TurnFailedPayload)
-            await bus.put_outbound(
-                OutboundMessage(
-                    type="system_control",
-                    content=payload.error.message,
-                    metadata={"_streamed": True, "finish_reason": "failed"},
-                )
-            )
-            return True
+        if isinstance(item, _ResponseSegmentScript):
+            raise TypeError("response segment scripts must be expanded by a run source")
+        await bus.put_outbound(item)
+        if item.type == "model_response":
+            return item.metadata.get("_streamed") is True
+        if item.type == "system_control":
+            return item.metadata.get("_streamed") is True
         return False
 
 
-class FakeRuntime:
-    def __init__(self, conversation: object) -> None:
-        self.conversation = cast(ConversationPort, conversation)
+class FakePreparedRuntime:
+    def __init__(self, source: _ScriptedSource) -> None:
+        self.source = source
         self.bus = MessageBus()
         self.inbound_history: list[InboundMessage] = []
         self.outbound_history: list[OutboundMessage] = []
@@ -901,7 +642,7 @@ class FakeRuntime:
             await put_outbound(message)
 
         self.bus.put_outbound = record_outbound  # type: ignore[method-assign]
-        self.control = _LegacyConversationControl(conversation)
+        self.control = _ScriptedControl(source)
         self.management_dispatcher: object | None = None
         self.session_id = "test-session"
         self.start_calls = 0
@@ -909,15 +650,16 @@ class FakeRuntime:
         self._closing = False
         self._bridge: asyncio.Task[None] | None = None
 
-    async def _bridge_bus(self) -> None:
+    async def _consume_inbound(self) -> None:
         while not self._closing:
             message = await self.bus.get_inbound()
             self.inbound_history.append(message)
             self.control._active = True
+            self.control._bridge = asyncio.current_task()
             terminal = False
             try:
-                async for event in self.conversation.submit(message.content):
-                    terminal = await self.control.publish_event(event, self.bus) or terminal
+                async for item in self.source.run(message.content):
+                    terminal = await self.control.publish(item, self.bus) or terminal
             except asyncio.CancelledError:
                 if self._closing:
                     raise
@@ -942,6 +684,7 @@ class FakeRuntime:
                 terminal = True
             finally:
                 self.control._active = False
+                self.control._bridge = None
             if not terminal:
                 await self.bus.put_outbound(
                     OutboundMessage(
@@ -953,7 +696,7 @@ class FakeRuntime:
 
     async def start(self) -> None:
         self.start_calls += 1
-        self._bridge = asyncio.create_task(self._bridge_bus())
+        self._bridge = asyncio.create_task(self._consume_inbound())
 
     def bind_confirmation_callback(
         self, callback: Callable[[ConfirmationRequestView], None]
@@ -1033,40 +776,40 @@ class KeyboardLifecycleDriver(Driver):
         self.operations.append(("close", ""))
 
 
-class CloseOrderingRuntime(FakeRuntime):
-    def __init__(self, conversation: BlockingConversation) -> None:
-        super().__init__(conversation)
-        self._blocking_conversation = conversation
+class CloseOrderingRuntime(FakePreparedRuntime):
+    def __init__(self, source: BlockingRunSource) -> None:
+        super().__init__(source)
+        self._blocking_source = source
         self.close_saw_stream_closed = False
 
     async def close(self) -> None:
         await super().close()
-        self.close_saw_stream_closed = self._blocking_conversation.closed.is_set()
+        self.close_saw_stream_closed = self._blocking_source.closed.is_set()
 
 
-class FailingStartRuntime(FakeRuntime):
+class FailingStartRuntime(FakePreparedRuntime):
     async def start(self) -> None:
         self.start_calls += 1
         raise RuntimeError("runtime startup failed")
 
 
-class FailingCloseRuntime(FakeRuntime):
+class FailingCloseRuntime(FakePreparedRuntime):
     async def close(self) -> None:
         self.close_calls += 1
         raise RuntimeError("runtime cleanup failed")
 
 
 def _runtime(
-    conversation: object,
+    source: _ScriptedSource,
     management_dispatcher: object | None = None,
-) -> FakeRuntime:
-    runtime = FakeRuntime(conversation)
+) -> FakePreparedRuntime:
+    runtime = FakePreparedRuntime(source)
     runtime.management_dispatcher = management_dispatcher
     return runtime
 
 
 def _terminal_app(
-    runtime: PreparedReplRuntime,
+    runtime: PreparedRuntime,
     *,
     app_type: type[TerminalConversationApp] = TerminalConversationApp,
     monotonic: Callable[[], float] | None = None,
@@ -1089,107 +832,72 @@ def _terminal_app(
     )
 
 
-def _turn_started_event(turn_id: UUID, event_id: int = 0) -> AgentEvent:
-    return AgentEvent(
-        type="turn_started",
-        event_id=event_id,
-        turn_id=turn_id,
-        created_at=NOW,
-        payload=TurnStartedPayload(),
-    )
-
-
-def _tool_started_event(
-    turn_id: UUID,
-    event_id: int,
+def _tool_call(
     tool_call_id: str,
     tool_name: str,
-    summary: str,
-) -> AgentEvent:
-    return AgentEvent(
-        type="tool_started",
-        event_id=event_id,
-        turn_id=turn_id,
-        created_at=NOW,
-        payload=ToolStartedPayload(tool_call_id, tool_name, summary),
+    arguments: str,
+) -> OutboundMessage:
+    return OutboundMessage(
+        type="tool_call",
+        content=tool_name,
+        metadata={"tool_call_id": tool_call_id, "arguments": arguments},
     )
 
 
-def _text_delta_event(turn_id: UUID, event_id: int, delta: str) -> AgentEvent:
-    return AgentEvent(
-        type="text_delta",
-        event_id=event_id,
-        turn_id=turn_id,
-        created_at=NOW,
-        payload=TextDeltaPayload(delta=delta),
+def _response_delta(delta: str) -> OutboundMessage:
+    return OutboundMessage(
+        type="model_response",
+        content=delta,
+        metadata={"_stream_delta": True},
     )
 
 
-def _model_call_completed_event(
-    turn_id: UUID,
-    event_id: int,
-    content: str,
-    *,
-    continues_with_tools: bool,
-) -> AgentEvent:
-    return AgentEvent(
-        type="model_call_completed",
-        event_id=event_id,
-        turn_id=turn_id,
-        created_at=NOW,
-        payload=ModelCallCompletedPayload(
-            content=content,
-            continues_with_tools=continues_with_tools,
-        ),
+def _response_segment(content: str) -> _ResponseSegmentScript:
+    return _ResponseSegmentScript(content=content)
+
+
+def _completed_response() -> OutboundMessage:
+    return OutboundMessage(
+        type="model_response",
+        content="",
+        metadata={"_streamed": True},
     )
 
 
-def _tool_completed_event(
-    turn_id: UUID,
-    event_id: int,
-    tool_call_id: str,
-    tool_name: str,
-    status: ToolActivityStatus,
-    summary: str,
-) -> AgentEvent:
-    return AgentEvent(
-        type="tool_completed",
-        event_id=event_id,
-        turn_id=turn_id,
-        created_at=NOW,
-        payload=ToolCompletedPayload(tool_call_id, tool_name, status, summary),
+def _cancelled_response(partial_content: str) -> OutboundMessage:
+    return OutboundMessage(
+        type="system_control",
+        content=partial_content,
+        metadata={"_streamed": True, "finish_reason": "cancelled"},
     )
 
 
-def _turn_completed_event(
-    turn_id: UUID,
-    event_id: int,
-    content: str = "",
-) -> AgentEvent:
-    return AgentEvent(
-        type="turn_completed",
-        event_id=event_id,
-        turn_id=turn_id,
-        created_at=NOW,
-        payload=TurnCompletedPayload(
-            content=content,
-            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-        ),
+def _failed_response(error_message: str) -> OutboundMessage:
+    return OutboundMessage(
+        type="system_control",
+        content=error_message,
+        metadata={"_streamed": True, "finish_reason": "failed"},
     )
 
 
-def _turn_cancelled_event(
-    turn_id: UUID,
-    event_id: int,
-    partial_content: str,
-) -> AgentEvent:
-    return AgentEvent(
-        type="turn_cancelled",
-        event_id=event_id,
-        turn_id=turn_id,
-        created_at=NOW,
-        payload=TurnCancelledPayload(partial_content=partial_content),
+def _expand_script_item(
+    script_item: _ScriptItem,
+    response_delta_seen: bool,
+) -> tuple[tuple[OutboundMessage, ...], bool]:
+    if isinstance(script_item, _ResponseSegmentScript):
+        messages: list[OutboundMessage] = []
+        if script_item.content and not response_delta_seen:
+            messages.append(
+                OutboundMessage("model_response", script_item.content, {"_stream_delta": True})
+            )
+        messages.append(OutboundMessage("model_response", "", {"_stream_end": True}))
+        return tuple(messages), False
+    if isinstance(script_item, ConfirmationRequest):
+        raise TypeError("confirmation scripts must be consumed by the run source")
+    is_delta = (
+        script_item.type == "model_response" and script_item.metadata.get("_stream_delta") is True
     )
+    return (script_item,), is_delta
 
 
 def _tool_row_texts(app: TerminalConversationApp) -> list[str]:
@@ -1286,9 +994,9 @@ async def _wait_for_confirmation(app: TerminalConversationApp, pilot: Pilot[None
 
 @pytest.mark.asyncio
 async def test_terminal_conversation_starts_blank_and_focuses_input() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)):
         visible_text = _visible_screen_text(app)
@@ -1421,9 +1129,9 @@ async def test_sparse_protocol_errors_and_duplicate_terminal_do_not_poison_next_
 
 @pytest.mark.asyncio
 async def test_terminal_conversation_inherits_the_terminal_background() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)):
         input_area = app.screen.focused
@@ -1436,14 +1144,14 @@ async def test_terminal_conversation_inherits_the_terminal_background() -> None:
 @pytest.mark.asyncio
 async def test_nonblank_enter_echoes_user_before_consuming_agent_events() -> None:
     app: TerminalConversationApp
-    conversation = ScriptedConversation(pause_before_events=True)
+    conversation = ScriptedRunSource(pause_before_output=True)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press("h", "i", "enter"))
         try:
-            await asyncio.wait_for(conversation.before_events.wait(), timeout=1)
+            await asyncio.wait_for(conversation.before_output.wait(), timeout=1)
             async with asyncio.timeout(1):
                 while "hi" not in _visible_screen_text(app):
                     await pilot.pause()
@@ -1452,16 +1160,16 @@ async def test_nonblank_enter_echoes_user_before_consuming_agent_events() -> Non
             assert "hi" in _visible_screen_text(app)
             assert runtime.inbound_history == [InboundMessage(content="hi")]
         finally:
-            conversation.continue_to_events()
+            conversation.continue_to_output()
             await asyncio.wait_for(submission, timeout=1)
             await _wait_for_turn(app)
 
 
 @pytest.mark.asyncio
 async def test_active_turn_keeps_input_editable_and_cancellable_before_a_later_turn() -> None:
-    conversation = CancellableConversation()
+    conversation = CancellableRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("first"), "enter"))
@@ -1516,9 +1224,9 @@ async def test_active_turn_keeps_input_editable_and_cancellable_before_a_later_t
 
 @pytest.mark.asyncio
 async def test_up_drains_pending_fifo_and_reenter_submits_one_multiline_inbound() -> None:
-    conversation = CancellableConversation()
+    conversation = CancellableRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("first"), "enter"))
@@ -1549,9 +1257,9 @@ async def test_up_drains_pending_fifo_and_reenter_submits_one_multiline_inbound(
 
 @pytest.mark.asyncio
 async def test_repeated_or_delayed_active_ctrl_c_stays_bound_to_the_cancelled_turn() -> None:
-    conversation = CancellableConversation()
+    conversation = CancellableRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("first"), "enter"))
@@ -1576,9 +1284,9 @@ async def test_repeated_or_delayed_active_ctrl_c_stays_bound_to_the_cancelled_tu
 
 @pytest.mark.asyncio
 async def test_ctrl_c_clears_an_idle_draft_without_exiting() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1591,9 +1299,9 @@ async def test_ctrl_c_clears_an_idle_draft_without_exiting() -> None:
 
 @pytest.mark.asyncio
 async def test_ctrl_c_on_empty_idle_input_exits() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("ctrl+c")
@@ -1604,9 +1312,9 @@ async def test_ctrl_c_on_empty_idle_input_exits() -> None:
 
 @pytest.mark.asyncio
 async def test_ctrl_d_deletes_forward_when_draft_is_nonempty() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1620,9 +1328,9 @@ async def test_ctrl_d_deletes_forward_when_draft_is_nonempty() -> None:
 
 @pytest.mark.asyncio
 async def test_ctrl_d_on_empty_input_exits() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("ctrl+d")
@@ -1633,9 +1341,9 @@ async def test_ctrl_d_on_empty_input_exits() -> None:
 
 @pytest.mark.asyncio
 async def test_ctrl_d_during_an_active_turn_settles_stream_before_runtime_close() -> None:
-    conversation = BlockingConversation()
+    conversation = BlockingRunSource()
     runtime = CloseOrderingRuntime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("active"), "enter"))
@@ -1653,9 +1361,9 @@ async def test_ctrl_d_during_an_active_turn_settles_stream_before_runtime_close(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command", [" EXIT ", " qUiT "])
 async def test_exit_and_quit_commands_exit_without_submitting(command: str) -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list(command), "enter")
@@ -1668,9 +1376,9 @@ async def test_exit_and_quit_commands_exit_without_submitting(command: str) -> N
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command", ["exit now", "quitter"])
 async def test_exit_like_text_is_submitted_as_an_ordinary_turn(command: str) -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list(command), "enter")
@@ -1682,9 +1390,9 @@ async def test_exit_like_text_is_submitted_as_an_ordinary_turn(command: str) -> 
 
 @pytest.mark.asyncio
 async def test_multiline_submission_preserves_text_and_ctrl_j_inserts_a_newline() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("first line"), "ctrl+j", *list("second line"), "enter")
@@ -1696,9 +1404,9 @@ async def test_multiline_submission_preserves_text_and_ctrl_j_inserts_a_newline(
 
 @pytest.mark.asyncio
 async def test_supported_modifier_enter_sequences_insert_newlines_without_submitting() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1720,9 +1428,9 @@ async def test_textual_driver_lifecycle_balances_enhanced_keyboard_mode(
 ) -> None:
     monkeypatch.setenv("KITTY_WINDOW_ID", "1")
     KeyboardLifecycleDriver.operations = []
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     app.driver_class = KeyboardLifecycleDriver
 
     async def exit_when_ready(_: object) -> None:
@@ -1743,9 +1451,9 @@ async def test_textual_driver_lifecycle_balances_enhanced_keyboard_mode(
 
 @pytest.mark.asyncio
 async def test_malformed_enhanced_keyboard_report_does_not_break_ordinary_submission() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1759,9 +1467,9 @@ async def test_malformed_enhanced_keyboard_report_does_not_break_ordinary_submis
 
 @pytest.mark.asyncio
 async def test_whitespace_only_submission_is_ignored() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1776,9 +1484,9 @@ async def test_whitespace_only_submission_is_ignored() -> None:
 
 @pytest.mark.asyncio
 async def test_multiline_paste_is_inserted_without_implicit_submission() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1796,9 +1504,9 @@ async def test_multiline_paste_is_inserted_without_implicit_submission() -> None
 
 @pytest.mark.asyncio
 async def test_multiline_input_grows_to_six_rows_then_scrolls_internally() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1821,12 +1529,12 @@ async def test_multiline_input_grows_to_six_rows_then_scrolls_internally() -> No
 
 @pytest.mark.asyncio
 async def test_accepted_submissions_are_recalled_only_within_the_runtime_lifetime() -> None:
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas_by_submission=((), (), ()),
         completed_contents=("", "", ""),
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("first"), "enter")
@@ -1844,8 +1552,8 @@ async def test_accepted_submissions_are_recalled_only_within_the_runtime_lifetim
         await pilot.press("down")
         assert input_area.text == ""
 
-    next_runtime = _runtime(ScriptedConversation())
-    next_app = _terminal_app(cast(PreparedReplRuntime, next_runtime))
+    next_runtime = _runtime(ScriptedRunSource())
+    next_app = _terminal_app(cast(PreparedRuntime, next_runtime))
     async with next_app.run_test(size=(80, 24)) as pilot:
         next_input = next_app.query_one("#conversation-input", TextArea)
         await pilot.press("up")
@@ -1855,9 +1563,9 @@ async def test_accepted_submissions_are_recalled_only_within_the_runtime_lifetim
 @pytest.mark.asyncio
 async def test_scrolling_conversation_keeps_composer_focus_and_draft() -> None:
     content = "\n".join(f"line {index:02d}" for index in range(80))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("seed"), "enter")
@@ -1872,12 +1580,12 @@ async def test_scrolling_conversation_keeps_composer_focus_and_draft() -> None:
 
 @pytest.mark.asyncio
 async def test_text_deltas_update_one_assistant_markdown_and_terminal_marker_closes() -> None:
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         pause_after_first_delta=True,
         completed_content="First answer.",
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press("h", "i", "enter"))
@@ -1904,42 +1612,21 @@ async def test_text_deltas_update_one_assistant_markdown_and_terminal_marker_clo
 
 @pytest.mark.asyncio
 async def test_intermediate_model_output_and_tools_share_one_activity_group() -> None:
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            _model_call_completed_event(
-                TURN_ID,
-                1,
-                "Planning **the tool call**.",
-                continues_with_tools=True,
-            ),
-            _tool_started_event(
-                TURN_ID,
-                2,
+            _response_segment("Planning **the tool call**."),
+            _tool_call(
                 "call-read-file",
                 "read_file",
                 "Running read_file",
             ),
-            _tool_completed_event(
-                TURN_ID,
-                3,
-                "call-read-file",
-                "read_file",
-                "success",
-                "Finished read_file",
-            ),
-            _text_delta_event(TURN_ID, 4, "Final **answer**."),
-            _model_call_completed_event(
-                TURN_ID,
-                5,
-                "Final **answer**.",
-                continues_with_tools=False,
-            ),
-            _turn_completed_event(TURN_ID, 6, content="Final **answer**."),
+            _response_delta("Final **answer**."),
+            _response_segment("Final **answer**."),
+            _completed_response(),
         )
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -1974,47 +1661,20 @@ async def test_intermediate_model_output_and_tools_share_one_activity_group() ->
 async def test_intermediate_completion_reparents_stream_candidate_and_empty_output_is_not_mounted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            AgentEvent(
-                type="text_delta",
-                event_id=1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta="candidate"),
-            ),
-            _model_call_completed_event(
-                TURN_ID,
-                2,
-                "",
-                continues_with_tools=True,
-            ),
-            _tool_started_event(
-                TURN_ID,
-                3,
+            _response_delta("candidate"),
+            _response_segment(""),
+            _tool_call(
                 "call-empty",
                 "read_file",
                 "Running read_file",
             ),
-            _tool_completed_event(
-                TURN_ID,
-                4,
-                "call-empty",
-                "read_file",
-                "success",
-                "Finished read_file",
-            ),
-            _model_call_completed_event(
-                TURN_ID,
-                5,
-                "",
-                continues_with_tools=False,
-            ),
-            _turn_completed_event(TURN_ID, 6),
+            _response_segment(""),
+            _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
     mounted_assistants: list[tuple[Markdown, Widget | None]] = []
     mount_assistant = app._mount_assistant
 
@@ -2045,30 +1705,15 @@ async def test_intermediate_completion_reparents_stream_candidate_and_empty_outp
 
 @pytest.mark.asyncio
 async def test_tool_start_reclassifies_a_streamed_candidate_without_model_completion() -> None:
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            AgentEvent(
-                type="text_delta",
-                event_id=1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta="Unclassified candidate."),
-            ),
-            _tool_started_event(TURN_ID, 2, "call-read", "read_file", "Running read_file"),
-            _tool_completed_event(
-                TURN_ID,
-                3,
-                "call-read",
-                "read_file",
-                "success",
-                "Finished read_file",
-            ),
-            _text_delta_event(TURN_ID, 4, "Final answer."),
-            _turn_completed_event(TURN_ID, 4, "Final answer."),
+            _response_delta("Unclassified candidate."),
+            _tool_call("call-read", "read_file", "Running read_file"),
+            _response_delta("Final answer."),
+            _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2086,20 +1731,13 @@ async def test_tool_start_reclassifies_a_streamed_candidate_without_model_comple
 
 @pytest.mark.asyncio
 async def test_direct_terminal_marker_preserves_the_current_candidate() -> None:
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            AgentEvent(
-                type="text_delta",
-                event_id=1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta="streamed candidate"),
-            ),
-            _turn_completed_event(TURN_ID, 2, "authoritative final"),
+            _response_delta("streamed candidate"),
+            _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2114,8 +1752,8 @@ async def test_direct_terminal_marker_preserves_the_current_candidate() -> None:
 
 @pytest.mark.asyncio
 async def test_first_terminal_event_finishes_without_waiting_for_more_events() -> None:
-    conversation = TerminalThenBlockingConversation()
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    conversation = TerminalThenBlockingRunSource()
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2133,75 +1771,32 @@ async def test_first_terminal_event_finishes_without_waiting_for_more_events() -
     "events",
     [
         (
-            _turn_started_event(TURN_ID),
-            _model_call_completed_event(
-                TURN_ID,
-                1,
-                "process activity",
-                continues_with_tools=True,
-            ),
-            _model_call_completed_event(
-                TURN_ID,
-                2,
-                "process activity",
-                continues_with_tools=True,
-            ),
-            _tool_started_event(
-                TURN_ID,
-                3,
+            _response_segment("process activity"),
+            _response_segment("process activity"),
+            _tool_call(
                 "call-read",
                 "read_file",
                 "Running read_file",
             ),
-            _tool_completed_event(
-                TURN_ID,
-                4,
-                "call-read",
-                "read_file",
-                "success",
-                "Finished read_file",
-            ),
-            _turn_completed_event(TURN_ID, 5, "final response"),
+            _completed_response(),
         ),
         (
-            _turn_started_event(TURN_ID),
-            AgentEvent(
-                type="text_delta",
-                event_id=1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta="process activity"),
-            ),
-            _tool_started_event(
-                TURN_ID,
-                3,
+            _response_delta("process activity"),
+            _tool_call(
                 "call-read",
                 "read_file",
                 "Running read_file",
             ),
-            _model_call_completed_event(
-                TURN_ID,
-                2,
-                "process activity",
-                continues_with_tools=True,
-            ),
-            _tool_completed_event(
-                TURN_ID,
-                4,
-                "call-read",
-                "read_file",
-                "success",
-                "Finished read_file",
-            ),
-            _turn_completed_event(TURN_ID, 5, "final response"),
+            _response_segment("process activity"),
+            _completed_response(),
         ),
     ],
 )
 async def test_duplicate_or_late_model_completion_reconciles_grouped_candidate(
-    events: tuple[AgentEvent, ...],
+    events: tuple[_ScriptItem, ...],
 ) -> None:
-    conversation = ToolEventSequenceConversation(events)
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    conversation = ToolMessageSequenceRunSource(events)
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2214,27 +1809,15 @@ async def test_duplicate_or_late_model_completion_reconciles_grouped_candidate(
 
 @pytest.mark.asyncio
 async def test_late_delta_after_completed_candidate_does_not_reopen_its_stream() -> None:
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            _text_delta_event(TURN_ID, 1, "authoritative complete content"),
-            _model_call_completed_event(
-                TURN_ID,
-                2,
-                "",
-                continues_with_tools=False,
-            ),
-            AgentEvent(
-                type="text_delta",
-                event_id=3,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta="late fragment"),
-            ),
-            _turn_completed_event(TURN_ID, 4, "authoritative complete content"),
+            _response_delta("authoritative complete content"),
+            _response_segment(""),
+            _response_delta("late fragment"),
+            _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2247,8 +1830,8 @@ async def test_late_delta_after_completed_candidate_does_not_reopen_its_stream()
 
 @pytest.mark.asyncio
 async def test_successful_empty_terminal_content_shows_status_without_activity() -> None:
-    conversation = ScriptedConversation(deltas=(), completed_content="")
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    conversation = ScriptedRunSource(deltas=(), completed_content="")
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("empty"), "enter")
@@ -2260,30 +1843,15 @@ async def test_successful_empty_terminal_content_shows_status_without_activity()
 
 @pytest.mark.asyncio
 async def test_first_terminal_event_remains_authoritative() -> None:
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            AgentEvent(
-                type="text_delta",
-                event_id=1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta="candidate"),
-            ),
-            _turn_cancelled_event(TURN_ID, 2, "authoritative partial"),
-            AgentEvent(
-                type="turn_failed",
-                event_id=3,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TurnFailedPayload(
-                    error=ErrorInfo(code="model_failed", message="Late failure."),
-                ),
-            ),
-            _turn_completed_event(TURN_ID, 4, "late success"),
+            _response_delta("candidate"),
+            _cancelled_response("authoritative partial"),
+            _failed_response("Late failure."),
+            _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2302,8 +1870,8 @@ async def test_first_terminal_event_remains_authoritative() -> None:
 
 @pytest.mark.asyncio
 async def test_event_stream_failure_groups_candidate_and_finishes_unfinished_tool() -> None:
-    conversation = ExplodingConversation()
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    conversation = ExplodingRunSource()
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2322,8 +1890,8 @@ async def test_event_stream_failure_groups_candidate_and_finishes_unfinished_too
 
 @pytest.mark.asyncio
 async def test_event_stream_failure_without_activity_does_not_create_empty_group() -> None:
-    conversation = ToolEventSequenceConversation((_turn_started_event(TURN_ID),))
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    conversation = ToolMessageSequenceRunSource(())
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2335,12 +1903,12 @@ async def test_event_stream_failure_without_activity_does_not_create_empty_group
 
 @pytest.mark.asyncio
 async def test_failed_no_tool_candidate_becomes_expanded_activity() -> None:
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas=("draft content",),
         outcomes=("failed",),
         failure_message="Model unavailable.",
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2357,12 +1925,12 @@ async def test_failed_no_tool_candidate_becomes_expanded_activity() -> None:
 
 @pytest.mark.asyncio
 async def test_failure_before_visible_activity_does_not_create_empty_group() -> None:
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas=(),
         outcomes=("failed",),
         failure_message="Model unavailable.",
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2374,12 +1942,12 @@ async def test_failure_before_visible_activity_does_not_create_empty_group() -> 
 
 @pytest.mark.asyncio
 async def test_empty_cancelled_content_removes_candidate_without_empty_group() -> None:
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas=("streamed candidate",),
         outcomes=("cancelled",),
         cancelled_content="",
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("cancel"), "enter")
@@ -2433,16 +2001,15 @@ def test_activity_duration_uses_floored_accumulated_seconds(elapsed: float, expe
 @pytest.mark.asyncio
 async def test_activity_timing_includes_wait_before_first_outbound() -> None:
     clock = [0.0]
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            _tool_started_event(TURN_ID, 1, "call-read", "read_file", "{}"),
-            _turn_completed_event(TURN_ID, 2, "done"),
+            _tool_call("call-read", "read_file", "{}"),
+            _completed_response(),
         ),
-        pause_after=(0, 0),
+        pause_before=True,
     )
     app = _terminal_app(
-        cast(PreparedReplRuntime, _runtime(conversation)),
+        cast(PreparedRuntime, _runtime(conversation)),
         monotonic=lambda: clock[0],
     )
 
@@ -2462,20 +2029,13 @@ async def test_activity_timing_includes_wait_before_first_outbound() -> None:
 async def test_activity_heading_starts_with_accumulated_time_and_freezes_on_success() -> None:
     clock = [0.0]
     events = (
-        _turn_started_event(TURN_ID),
-        _model_call_completed_event(
-            TURN_ID,
-            1,
-            "intermediate",
-            continues_with_tools=True,
-        ),
-        _tool_started_event(TURN_ID, 2, "call-read", "read_file", "Running read_file"),
-        _tool_completed_event(TURN_ID, 3, "call-read", "read_file", "success", "Finished"),
-        _turn_completed_event(TURN_ID, 4, "final"),
+        _response_segment("intermediate"),
+        _tool_call("call-read", "read_file", "Running read_file"),
+        _completed_response(),
     )
-    conversation = ToolEventSequenceConversation(events, pause_after=(0, 2))
+    conversation = ToolMessageSequenceRunSource(events, pause_after=(0, 1))
     app = _terminal_app(
-        cast(PreparedReplRuntime, _runtime(conversation)),
+        cast(PreparedRuntime, _runtime(conversation)),
         monotonic=lambda: clock[0],
     )
     async with app.run_test(size=(80, 24)) as pilot:
@@ -2528,28 +2088,14 @@ async def test_manual_activity_disclosure_keeps_heading_position_while_content_g
     None
 ):
     intermediate = "\n".join(f"activity {index:02d} " + "a" * 35 for index in range(45))
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            _model_call_completed_event(
-                TURN_ID,
-                1,
-                intermediate,
-                continues_with_tools=True,
-            ),
-            _tool_started_event(TURN_ID, 2, "call-read", "read_file", "Running read_file"),
-            _tool_completed_event(
-                TURN_ID,
-                3,
-                "call-read",
-                "read_file",
-                "success",
-                "Finished read_file",
-            ),
-            _turn_completed_event(TURN_ID, 4, "Final answer."),
+            _response_segment(intermediate),
+            _tool_call("call-read", "read_file", "Running read_file"),
+            _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2585,23 +2131,14 @@ async def test_manual_activity_disclosure_keeps_heading_position_while_content_g
 
 @pytest.mark.asyncio
 async def test_failed_activity_group_is_mouse_toggleable_without_moving_composer_focus() -> None:
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            _model_call_completed_event(TURN_ID, 1, "intermediate", continues_with_tools=True),
-            _tool_started_event(TURN_ID, 2, "call-read", "read_file", "Running read_file"),
-            AgentEvent(
-                type="turn_failed",
-                event_id=3,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TurnFailedPayload(
-                    error=ErrorInfo(code="model_failed", message="The Agent Run failed.")
-                ),
-            ),
+            _response_segment("intermediate"),
+            _tool_call("call-read", "read_file", "Running read_file"),
+            _failed_response("The Agent Run failed."),
         )
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2628,13 +2165,13 @@ async def test_failed_activity_group_is_mouse_toggleable_without_moving_composer
 
 @pytest.mark.asyncio
 async def test_tool_confirmation_defaults_to_decline_and_shows_effective_operation() -> None:
-    conversation = ConfirmationConversation(
+    conversation = ConfirmationRunSource(
         details={"path": "outside.txt", "limit": 20},
         reason="The path resolves outside the current Workspace.",
         warnings=("Review the target before allowing access.",),
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2642,7 +2179,9 @@ async def test_tool_confirmation_defaults_to_decline_and_shows_effective_operati
         await _wait_for_confirmation(app, pilot)
 
         visible_text = _visible_screen_text(app)
-        assert "Tool Confirmation" in visible_text
+        assert str(app.screen.query_one("#confirmation-heading", Static).content) == (
+            "Tool Confirmation"
+        )
         assert "Tool: Read File" in visible_text
         assert "Reason: The path resolves outside the current" in visible_text
         assert "Workspace." in visible_text
@@ -2670,12 +2209,12 @@ async def test_tool_confirmation_defaults_to_decline_and_shows_effective_operati
 @pytest.mark.asyncio
 async def test_write_confirmation_hides_content_and_unknown_details() -> None:
     secret = "Authorization: Bearer sk-sensitive-value"
-    conversation = ConfirmationConversation(
+    conversation = ConfirmationRunSource(
         tool_name="write_file",
         details={"path": "outside.txt", "content": secret, "internal": "raw-result"},
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(42, 16)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("write"), "enter"))
@@ -2701,7 +2240,7 @@ async def test_write_confirmation_hides_content_and_unknown_details() -> None:
 
 @pytest.mark.asyncio
 async def test_web_fetch_confirmation_redacts_url_credentials_and_query_values() -> None:
-    conversation = ConfirmationConversation(
+    conversation = ConfirmationRunSource(
         tool_name="web_fetch",
         details={
             "url": "http://user:password@127.0.0.1/private?token=secret-value",
@@ -2709,7 +2248,7 @@ async def test_web_fetch_confirmation_redacts_url_credentials_and_query_values()
         },
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("fetch"), "enter"))
@@ -2732,13 +2271,13 @@ async def test_web_fetch_confirmation_redacts_url_credentials_and_query_values()
 @pytest.mark.asyncio
 async def test_exec_confirmation_shows_exact_command_and_arrow_keys_select_approval() -> None:
     command = 'rm -rf "build output" && printf done'
-    conversation = ConfirmationConversation(
+    conversation = ConfirmationRunSource(
         tool_name="exec",
         details={"command": command, "cwd": ".", "timeout": 45},
         reason="The Exec command matches a known destructive operation.",
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(100, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("run"), "enter"))
@@ -2784,9 +2323,9 @@ async def test_confirmation_buttons_resolve_the_pending_tool_with_mouse(
     button_id: str,
     decision: ConfirmationDecision,
 ) -> None:
-    conversation = ConfirmationConversation()
+    conversation = ConfirmationRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2806,9 +2345,9 @@ async def test_confirmation_buttons_resolve_the_pending_tool_with_mouse(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("key", ("escape", "ctrl+c"))
 async def test_confirmation_escape_and_ctrl_c_decline_only_the_pending_tool(key: str) -> None:
-    conversation = ConfirmationConversation()
+    conversation = ConfirmationRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2832,9 +2371,9 @@ async def test_confirmation_escape_and_ctrl_c_decline_only_the_pending_tool(key:
 
 @pytest.mark.asyncio
 async def test_clicking_outside_confirmation_keeps_it_open_without_a_decision() -> None:
-    conversation = ConfirmationConversation()
+    conversation = ConfirmationRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2855,9 +2394,9 @@ async def test_clicking_outside_confirmation_keeps_it_open_without_a_decision() 
 
 @pytest.mark.asyncio
 async def test_duplicate_late_confirmation_is_shown_once_and_does_not_fail_the_turn() -> None:
-    conversation = DuplicateLateConfirmationConversation()
+    conversation = DuplicateLateConfirmationRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2874,9 +2413,9 @@ async def test_duplicate_late_confirmation_is_shown_once_and_does_not_fail_the_t
 
 @pytest.mark.asyncio
 async def test_multiple_confirmations_are_resolved_in_order_with_a_fresh_safe_default() -> None:
-    conversation = MultipleConfirmationConversation()
+    conversation = MultipleConfirmationRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2900,9 +2439,9 @@ async def test_multiple_confirmations_are_resolved_in_order_with_a_fresh_safe_de
 
 @pytest.mark.asyncio
 async def test_application_teardown_cancels_an_open_confirmation_without_a_decision() -> None:
-    conversation = ConfirmationConversation()
+    conversation = ConfirmationRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     submission: asyncio.Task[None]
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -2916,14 +2455,12 @@ async def test_application_teardown_cancels_an_open_confirmation_without_a_decis
 
 
 @pytest.mark.asyncio
-async def test_tool_activity_renders_raw_arguments_and_omits_tool_result() -> None:
-    conversation = ToolActivityConversation(
-        status="success",
+async def test_tool_activity_renders_raw_arguments_until_terminal_marker() -> None:
+    conversation = ToolActivityRunSource(
         start_summary='Running read_file {"arguments":{"path":"C:/private.txt"}}',
-        final_summary='Finished read_file {"result":"complete file contents"}',
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2960,119 +2497,25 @@ async def test_tool_activity_renders_raw_arguments_and_omits_tool_result() -> No
             'Running: read_file\nArguments: Running read_file {"arguments":{"path":"C:/private.txt"}}'
         )
         assert not row.parent.display
-        assert "complete file contents" not in final_text
         assert "Completed with no response." in final_text
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("status", "summary"),
-    [
-        ("refused", "Finished read_file"),
-        ("error", "Finished read_file"),
-        ("error", "Permission denied for the selected file."),
-    ],
-)
-async def test_tool_result_statuses_are_not_projected_to_the_foreground(
-    status: ToolActivityStatus,
-    summary: str,
-) -> None:
-    conversation = ToolActivityConversation(status=status, final_summary=summary)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
-        await asyncio.wait_for(conversation.tool_started.wait(), timeout=1)
-        conversation.complete_tool.set()
-        await asyncio.wait_for(submission, timeout=1)
-        await _wait_for_turn(app)
-
-        visible_text = _visible_screen_text(app)
-        assert _tool_row_texts(app).count("Running: read_file\nArguments: Running read_file") == 1
-        assert summary not in visible_text
-        assert not app.query_one(".agent-run-activity-content").display
-        assert "Completed with no response." in visible_text
-        assert "call-read-file" not in visible_text
-
-
-@pytest.mark.asyncio
-async def test_tool_failure_hides_structured_or_sensitive_detail_and_limits_safe_reason() -> None:
-    unsafe = ToolActivityConversation(
-        status="error",
-        final_summary="Authorization Bearer sk-secret with complete output",
-    )
-    unsafe_app = _terminal_app(cast(PreparedReplRuntime, _runtime(unsafe)))
-
-    async with unsafe_app.run_test(size=(80, 24)) as pilot:
-        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
-        await asyncio.wait_for(unsafe.tool_started.wait(), timeout=1)
-        unsafe.complete_tool.set()
-        await asyncio.wait_for(submission, timeout=1)
-        await _wait_for_turn(unsafe_app)
-
-        text = "\n".join(_tool_row_texts(unsafe_app))
-        assert text == "Running: read_file\nArguments: Running read_file"
-        assert "sk-secret" not in text
-        assert "complete output" not in text
-
-    long_reason = "x" * 240
-    lengthy = ToolActivityConversation(status="error", final_summary=long_reason)
-    lengthy_app = _terminal_app(cast(PreparedReplRuntime, _runtime(lengthy)))
-    async with lengthy_app.run_test(size=(80, 24)) as pilot:
-        submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
-        await asyncio.wait_for(lengthy.tool_started.wait(), timeout=1)
-        lengthy.complete_tool.set()
-        await asyncio.wait_for(submission, timeout=1)
-        await _wait_for_turn(lengthy_app)
-
-        text = "\n".join(_tool_row_texts(lengthy_app))
-        assert text == "Running: read_file\nArguments: Running read_file"
 
 
 @pytest.mark.asyncio
 async def test_tool_rows_isolate_calls_and_turns_without_tool_result_projection() -> None:
     first_turn = (
-        _turn_started_event(TURN_ID),
-        _tool_completed_event(TURN_ID, 1, "completion-first", "glob", "success", "Finished glob"),
-        _tool_started_event(TURN_ID, 2, "completion-first", "glob", "Running glob"),
-        _tool_started_event(TURN_ID, 3, "shared-call", "read_file", "Running read_file"),
-        _tool_started_event(TURN_ID, 4, "missing-completion", "write_file", "Running write_file"),
-        _tool_started_event(TURN_ID, 5, "shared-call", "read_file", "Running read_file"),
-        _tool_completed_event(
-            TURN_ID,
-            6,
-            "shared-call",
-            "read_file",
-            "success",
-            "Finished read_file",
-        ),
-        _tool_completed_event(
-            TURN_ID,
-            7,
-            "shared-call",
-            "read_file",
-            "error",
-            "Permission denied",
-        ),
-        _tool_started_event(TURN_ID, 8, "shared-call", "read_file", "Running read_file"),
-        _turn_completed_event(TURN_ID, 9),
+        _tool_call("completion-first", "glob", "Running glob"),
+        _tool_call("shared-call", "read_file", "Running read_file"),
+        _tool_call("missing-completion", "write_file", "Running write_file"),
+        _tool_call("shared-call", "read_file", "Running read_file"),
+        _tool_call("shared-call", "read_file", "Running read_file"),
+        _completed_response(),
     )
     second_turn = (
-        _turn_started_event(OTHER_TURN_ID),
-        _tool_started_event(OTHER_TURN_ID, 1, "shared-call", "read_file", "Running read_file"),
-        _tool_completed_event(
-            OTHER_TURN_ID,
-            2,
-            "shared-call",
-            "read_file",
-            "refused",
-            "Finished read_file",
-        ),
-        _turn_completed_event(OTHER_TURN_ID, 3),
+        _tool_call("shared-call", "read_file", "Running read_file"),
+        _completed_response(),
     )
-    conversation = ToolEventSequenceConversation(first_turn, second_turn)
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    conversation = ToolMessageSequenceRunSource(first_turn, second_turn)
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("first"), "enter")
@@ -3097,61 +2540,30 @@ async def test_tool_rows_isolate_calls_and_turns_without_tool_result_projection(
 
 @pytest.mark.asyncio
 async def test_tool_row_updates_preserve_historical_follow_and_resize_state() -> None:
-    first_events: list[AgentEvent] = [_turn_started_event(TURN_ID)]
-    event_id = 1
+    first_events: list[_ScriptItem] = []
     for index in range(24):
         tool_name = f"tool_{index:02d}"
         tool_call_id = f"call-{index:02d}"
-        first_events.append(
-            _tool_started_event(TURN_ID, event_id, tool_call_id, tool_name, f"Running {tool_name}")
-        )
-        event_id += 1
-        first_events.append(
-            _tool_completed_event(
-                TURN_ID,
-                event_id,
-                tool_call_id,
-                tool_name,
-                "success",
-                f"Finished {tool_name}",
-            )
-        )
-        event_id += 1
-    first_events.append(
-        AgentEvent(
-            type="turn_failed",
-            event_id=event_id,
-            turn_id=TURN_ID,
-            created_at=NOW,
-            payload=TurnFailedPayload(
-                error=ErrorInfo(code="model_failed", message="The Agent Run failed.")
-            ),
-        )
-    )
+        first_events.append(_tool_call(tool_call_id, tool_name, f"Running {tool_name}"))
+    first_events.append(_failed_response("The Agent Run failed."))
     second_events = (
-        _turn_started_event(OTHER_TURN_ID),
-        _tool_started_event(OTHER_TURN_ID, 1, "later-call", "web_search", "Running web_search"),
-        _tool_completed_event(
-            OTHER_TURN_ID,
-            2,
-            "later-call",
-            "web_search",
-            "success",
-            "Finished web_search",
-        ),
-        _turn_completed_event(OTHER_TURN_ID, 3),
+        _tool_call("later-call", "web_search", "Running web_search"),
+        _completed_response(),
     )
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         tuple(first_events),
         second_events,
-        pause_after=(1, 1),
+        pause_after=(1, 0),
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 20)) as pilot:
         await pilot.press(*list("seed"), "enter")
         await _wait_for_turn(app)
         display = app.query_one("#conversation-display")
+        async with asyncio.timeout(1):
+            while not display.is_vertical_scroll_end:
+                await pilot.pause()
         assert display.is_vertical_scroll_end
 
         await pilot.press("pageup", "pageup")
@@ -3161,6 +2573,9 @@ async def test_tool_row_updates_preserve_historical_follow_and_resize_state() ->
             await asyncio.wait_for(conversation.paused.wait(), timeout=1)
             await pilot.pause()
             historical_scroll_y = display.scroll_y
+            async with asyncio.timeout(1):
+                while not app.query_one("#new-content").display:
+                    await pilot.pause()
             assert app.query_one("#new-content").display
             conversation.continue_events.set()
             await asyncio.wait_for(submission, timeout=1)
@@ -3190,59 +2605,25 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
 ) -> None:
     history = "\n".join(f"history {index:02d} " + "h" * 35 for index in range(70))
     second_events = (
-        _turn_started_event(OTHER_TURN_ID),
-        AgentEvent(
-            type="text_delta",
-            event_id=1,
-            turn_id=OTHER_TURN_ID,
-            created_at=NOW,
-            payload=TextDeltaPayload(delta="candidate"),
-        ),
-        _model_call_completed_event(
-            OTHER_TURN_ID,
-            2,
-            "candidate",
-            continues_with_tools=True,
-        ),
-        _tool_started_event(
-            OTHER_TURN_ID,
-            3,
+        _response_delta("candidate"),
+        _response_segment("candidate"),
+        _tool_call(
             "activity-call",
             "read_file",
             "Running read_file",
         ),
-        _tool_completed_event(
-            OTHER_TURN_ID,
-            4,
-            "activity-call",
-            "read_file",
-            "success",
-            "Finished read_file",
-        ),
-        _model_call_completed_event(
-            OTHER_TURN_ID,
-            5,
-            "latest answer",
-            continues_with_tools=False,
-        ),
-        _turn_completed_event(OTHER_TURN_ID, 6, content="latest answer"),
+        _response_segment("latest answer"),
+        _completed_response(),
     )
-    conversation = StagedToolEventSequenceConversation(
+    conversation = StagedToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            AgentEvent(
-                type="text_delta",
-                event_id=1,
-                turn_id=TURN_ID,
-                created_at=NOW,
-                payload=TextDeltaPayload(delta=history),
-            ),
-            _turn_completed_event(TURN_ID, 2, content=history),
+            _response_delta(history),
+            _completed_response(),
         ),
         second_events,
-        pause_after=tuple((1, event_index) for event_index in range(1, 6)),
+        pause_after=tuple((1, event_index) for event_index in range(5)),
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("history"), "enter")
@@ -3251,13 +2632,16 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
         await pilot.press("ctrl+end")
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
         try:
-            await conversation.wait_after(1, 1)
+            await conversation.wait_after(1, 0)
             await pilot.pause()
             refreshed = asyncio.Event()
             app.call_after_refresh(refreshed.set)
             await refreshed.wait()
             async with asyncio.timeout(1):
                 while "candidate" not in _visible_screen_text(app):
+                    await pilot.pause()
+            async with asyncio.timeout(1):
+                while not display.is_vertical_scroll_end:
                     await pilot.pause()
             assert display.is_vertical_scroll_end
             historical_position = display.scroll_y
@@ -3270,12 +2654,12 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
                 assert not display.is_vertical_scroll_end
 
             expected_tool_rows: dict[int, list[str]] = {
-                2: [],
+                1: [],
+                2: ["Running: read_file\nArguments: Running read_file"],
                 3: ["Running: read_file\nArguments: Running read_file"],
                 4: ["Running: read_file\nArguments: Running read_file"],
-                5: ["Running: read_file\nArguments: Running read_file"],
             }
-            for previous_event, next_event in zip(range(1, 5), range(2, 6), strict=True):
+            for previous_event, next_event in zip(range(4), range(1, 5), strict=True):
                 conversation.continue_after(1, previous_event)
                 await conversation.wait_after(1, next_event)
                 await pilot.pause()
@@ -3303,7 +2687,7 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
                             await pilot.pause()
                     assert not app.query_one("#new-content").display
 
-            conversation.continue_after(1, 5)
+            conversation.continue_after(1, 4)
             await asyncio.wait_for(submission, timeout=1)
             await _wait_for_turn(app)
 
@@ -3334,39 +2718,22 @@ async def test_activity_group_resize_preserves_scroll_mode_anchor_and_input_focu
 ) -> None:
     history = "\n".join(f"history {index:02d}" for index in range(80))
     activity = "\n".join(f"activity {index:02d}" for index in range(50))
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            _model_call_completed_event(TURN_ID, 1, history, continues_with_tools=False),
-            _turn_completed_event(TURN_ID, 2, history),
+            _response_segment(history),
+            _completed_response(),
         ),
         (
-            _turn_started_event(OTHER_TURN_ID),
-            _model_call_completed_event(
-                OTHER_TURN_ID,
-                1,
-                activity,
-                continues_with_tools=True,
-            ),
-            _tool_started_event(
-                OTHER_TURN_ID,
-                2,
+            _response_segment(activity),
+            _tool_call(
                 "activity-call",
                 "read_file",
                 "Running read_file",
             ),
-            _tool_completed_event(
-                OTHER_TURN_ID,
-                3,
-                "activity-call",
-                "read_file",
-                "success",
-                "Finished read_file",
-            ),
-            _turn_completed_event(OTHER_TURN_ID, 4, "final"),
+            _completed_response(),
         ),
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(70, 22)) as pilot:
         await pilot.press(*list("history"), "enter")
@@ -3406,28 +2773,14 @@ async def test_activity_content_uses_main_vertical_scroll_and_keeps_code_horizon
     intermediate = f"```python\n{code_line}\n```\n\n" + "\n".join(
         f"activity {index:02d}" for index in range(60)
     )
-    conversation = ToolEventSequenceConversation(
+    conversation = ToolMessageSequenceRunSource(
         (
-            _turn_started_event(TURN_ID),
-            _model_call_completed_event(
-                TURN_ID,
-                1,
-                intermediate,
-                continues_with_tools=True,
-            ),
-            _tool_started_event(TURN_ID, 2, "activity-call", "read_file", "Running read_file"),
-            _tool_completed_event(
-                TURN_ID,
-                3,
-                "activity-call",
-                "read_file",
-                "success",
-                "Finished read_file",
-            ),
-            _turn_completed_event(TURN_ID, 4, "final"),
+            _response_segment(intermediate),
+            _tool_call("activity-call", "read_file", "Running read_file"),
+            _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(48, 20)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -3470,12 +2823,12 @@ async def test_streamed_markdown_preserves_reading_structure_and_link_urls() -> 
         "[documentation](https://example.com/docs)\n"
         "![architecture image](https://example.com/asset.png)\n"
     )
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas=tuple(content),
         completed_content=content,
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(100, 40)) as pilot:
         await pilot.press(*list("read"), "enter")
@@ -3498,13 +2851,13 @@ async def test_streamed_markdown_preserves_reading_structure_and_link_urls() -> 
 async def test_markdown_structure_is_visible_while_the_fenced_block_is_incomplete() -> None:
     partial = "# Heading\n\n- first item\n\n> quoted text\n\n```python\nvalue = 1"
     content = partial + "\n```\n"
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         pause_after_first_delta=True,
         deltas=(partial, "\n```\n"),
         completed_content=content,
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("progress"), "enter"))
@@ -3527,12 +2880,12 @@ async def test_markdown_structure_is_visible_while_the_fenced_block_is_incomplet
 @pytest.mark.asyncio
 async def test_high_frequency_deltas_are_preserved_until_the_terminal_marker() -> None:
     streamed_content = "draft-" * 300
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas=tuple(streamed_content),
         completed_content="# Complete\n\nExact final content.",
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await asyncio.wait_for(pilot.press(*list("burst"), "enter"), timeout=5)
@@ -3550,12 +2903,12 @@ async def test_high_frequency_deltas_are_preserved_until_the_terminal_marker() -
 async def test_long_markdown_code_lines_remain_unwrapped_in_a_narrow_terminal() -> None:
     code_line = "very_long_variable_name = " + "0123456789" * 8 + "TAIL"
     content = f"```python\n{code_line}\n```"
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas=tuple(content),
         completed_content=content,
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(48, 20)) as pilot:
         await pilot.press(*list("code"), "enter")
@@ -3578,13 +2931,13 @@ async def test_long_markdown_code_lines_remain_unwrapped_in_a_narrow_terminal() 
 @pytest.mark.asyncio
 async def test_incomplete_streamed_markdown_remains_visible_before_completion() -> None:
     content = "[documentation](https://example.com/docs)\n\n```python\nvalue = 1\n```"
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         pause_after_first_delta=True,
         deltas=("[documentation](", "https://example.com/docs)\n\n```python\n", "value = 1\n```"),
         completed_content=content,
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("partial"), "enter"))
@@ -3609,12 +2962,12 @@ async def test_incomplete_streamed_markdown_remains_visible_before_completion() 
 @pytest.mark.asyncio
 async def test_streamed_markdown_reflows_cjk_content_after_resize() -> None:
     content = "界" * 20
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas=tuple(content),
         completed_content=content,
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("cjk"), "enter")
@@ -3646,7 +2999,7 @@ async def test_terminal_outcomes_settle_markdown_and_allow_a_subsequent_turn(
     expected_partial: str,
     expected_status: str | None,
 ) -> None:
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas=("draft ", "content"),
         completed_content="Recovered response.",
         outcomes=(outcome, "completed"),
@@ -3654,7 +3007,7 @@ async def test_terminal_outcomes_settle_markdown_and_allow_a_subsequent_turn(
         failure_message="Model unavailable.",
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("first"), "enter")
@@ -3672,13 +3025,13 @@ async def test_terminal_outcomes_settle_markdown_and_allow_a_subsequent_turn(
 
 @pytest.mark.asyncio
 async def test_cancelled_terminal_marker_renders_the_cancelled_status() -> None:
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas=(),
         outcomes=("cancelled",),
         cancelled_content="Retained partial response.",
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("cancel"), "enter")
@@ -3691,12 +3044,12 @@ async def test_cancelled_terminal_marker_renders_the_cancelled_status() -> None:
 
 @pytest.mark.asyncio
 async def test_cancelled_terminal_marker_keeps_the_streamed_candidate_in_activity() -> None:
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas=("streamed candidate",),
         outcomes=("cancelled",),
         cancelled_content="authoritative partial",
     )
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("cancel"), "enter")
@@ -3717,9 +3070,9 @@ async def test_cancelled_terminal_marker_keeps_the_streamed_candidate_in_activit
 async def test_markdown_failure_still_closes_the_conversation_event_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conversation = FailingConversation()
+    conversation = FailingRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     markdown_stream = FailingMarkdownStream()
     monkeypatch.setattr(
         Markdown,
@@ -3740,9 +3093,9 @@ async def test_markdown_failure_still_closes_the_conversation_event_stream(
 async def test_runtime_cleanup_failure_does_not_mask_an_application_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conversation = FailingConversation()
+    conversation = FailingRunSource()
     runtime = FailingCloseRuntime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     markdown_stream = FailingMarkdownStream()
     monkeypatch.setattr(
         Markdown,
@@ -3946,9 +3299,9 @@ async def test_prepared_runtime_cancellation_preserves_partial_and_allows_next_t
 
 @pytest.mark.asyncio
 async def test_narrow_terminal_uses_full_message_width_for_readable_content() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     content = "0123456789ABCDEFGHIJ"
 
     async with app.run_test(size=(30, 16)) as pilot:
@@ -3960,9 +3313,9 @@ async def test_narrow_terminal_uses_full_message_width_for_readable_content() ->
 
 @pytest.mark.asyncio
 async def test_wide_terminal_constrains_messages_to_a_comfortable_line_width() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     terminal_width = 80
     content = "X" * 100
 
@@ -3978,9 +3331,9 @@ async def test_wide_terminal_constrains_messages_to_a_comfortable_line_width() -
 
 @pytest.mark.asyncio
 async def test_messages_are_side_aligned_with_role_accents_on_wide_terminals() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("user"), "enter")
@@ -4000,9 +3353,9 @@ async def test_messages_are_side_aligned_with_role_accents_on_wide_terminals() -
 
 @pytest.mark.asyncio
 async def test_cjk_double_width_content_reflows_when_terminal_is_resized() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     content = "界" * 20
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -4023,9 +3376,9 @@ async def test_cjk_double_width_content_reflows_when_terminal_is_resized() -> No
 
 @pytest.mark.asyncio
 async def test_role_accents_remain_visible_with_limited_ansi_colors() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     app.ansi_color = True
 
     async with app.run_test(size=(40, 18)) as pilot:
@@ -4043,9 +3396,9 @@ async def test_role_accents_remain_visible_without_terminal_color(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("NO_COLOR", "1")
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(40, 18)) as pilot:
         await pilot.press(*list("hello"), "enter")
@@ -4060,9 +3413,9 @@ async def test_role_accents_remain_visible_without_terminal_color(
 @pytest.mark.asyncio
 async def test_conversation_navigation_keys_keep_input_focus() -> None:
     content = "\n".join(f"line {index:02d} " + "x" * 30 for index in range(80))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("navigate"), "enter")
@@ -4091,9 +3444,9 @@ async def test_conversation_navigation_keys_keep_input_focus() -> None:
 @pytest.mark.asyncio
 async def test_mouse_scroll_keeps_input_focus_and_scrollbar_is_overflow_only() -> None:
     content = "\n".join(f"line {index:02d} " + "x" * 30 for index in range(80))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("scroll"), "enter")
@@ -4114,8 +3467,8 @@ async def test_mouse_scroll_keeps_input_focus_and_scrollbar_is_overflow_only() -
         assert display.is_vertical_scroll_end
         assert isinstance(app.screen.focused, TextArea)
 
-    empty_runtime = _runtime(ScriptedConversation())
-    empty_app = _terminal_app(cast(PreparedReplRuntime, empty_runtime))
+    empty_runtime = _runtime(ScriptedRunSource())
+    empty_app = _terminal_app(cast(PreparedRuntime, empty_runtime))
     async with empty_app.run_test(size=(60, 20)):
         empty_display = empty_app.query_one("#conversation-display")
         assert not empty_display.vertical_scrollbar.display
@@ -4124,9 +3477,9 @@ async def test_mouse_scroll_keeps_input_focus_and_scrollbar_is_overflow_only() -
 @pytest.mark.asyncio
 async def test_conversation_scrollbar_supports_pointer_dragging() -> None:
     content = "\n".join(f"line {index:02d}" for index in range(100))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("drag"), "enter")
@@ -4147,9 +3500,9 @@ async def test_conversation_scrollbar_supports_pointer_dragging() -> None:
 @pytest.mark.asyncio
 async def test_dragging_scrollbar_to_bottom_resumes_follow_mode() -> None:
     content = "\n".join(f"line {index:02d}" for index in range(100))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("seed"), "enter")
@@ -4177,12 +3530,12 @@ async def test_dragging_scrollbar_to_bottom_resumes_follow_mode() -> None:
 @pytest.mark.asyncio
 async def test_historical_streaming_pauses_follow_and_exposes_new_content() -> None:
     history = " ".join(f"history {index:02d}" for index in range(100))
-    conversation = ScriptedConversation(
+    conversation = ScriptedRunSource(
         deltas_by_submission=((history,), ("New ", "content.")),
         completed_contents=(history, "New content."),
     )
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("seed"), "enter")
@@ -4196,6 +3549,9 @@ async def test_historical_streaming_pauses_follow_and_exposes_new_content() -> N
             await pilot.pause()
             display = app.query_one("#conversation-display")
             assert display.max_scroll_y > 0
+            async with asyncio.timeout(1):
+                while not display.is_vertical_scroll_end:
+                    await pilot.pause()
             assert display.is_vertical_scroll_end
 
             await pilot.press("ctrl+home")
@@ -4226,9 +3582,9 @@ async def test_historical_streaming_pauses_follow_and_exposes_new_content() -> N
 @pytest.mark.asyncio
 async def test_historical_resize_preserves_a_visible_message_anchor() -> None:
     content = "\n".join(f"anchor {index:02d} " + "z" * 35 for index in range(50))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("resize"), "enter")
@@ -4253,18 +3609,23 @@ async def test_historical_resize_preserves_a_visible_message_anchor() -> None:
 @pytest.mark.asyncio
 async def test_bottom_follow_is_preserved_when_resize_reflows_content() -> None:
     content = "\n".join(f"line {index:02d} " + "x" * 60 for index in range(80))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("resize"), "enter")
         await _wait_for_turn(app)
         display = app.query_one("#conversation-display")
+        async with asyncio.timeout(1):
+            while not display.is_vertical_scroll_end:
+                await pilot.pause()
         assert display.is_vertical_scroll_end
 
         await pilot.resize_terminal(40, 24)
-        await pilot.pause()
+        async with asyncio.timeout(1):
+            while not display.is_vertical_scroll_end:
+                await pilot.pause()
 
         assert display.is_vertical_scroll_end
 
@@ -4272,9 +3633,9 @@ async def test_bottom_follow_is_preserved_when_resize_reflows_content() -> None:
 @pytest.mark.asyncio
 async def test_user_scroll_takes_over_from_rapid_resize_callbacks() -> None:
     content = "\n".join(f"resize {index:03d} " + "x" * 70 for index in range(90))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("resize"), "enter")
@@ -4284,12 +3645,17 @@ async def test_user_scroll_takes_over_from_rapid_resize_callbacks() -> None:
 
         for width, height in ((65, 20), (42, 18), (76, 22), (50, 16), (80, 24)):
             await pilot.press("ctrl+home")
+            async with asyncio.timeout(1):
+                while display.is_vertical_scroll_end:
+                    await pilot.pause()
             assert not display.is_vertical_scroll_end
             resize = asyncio.create_task(pilot.resize_terminal(width, height))
             await asyncio.sleep(0)
             await pilot.press("ctrl+end")
             await resize
-            await pilot.pause(0.01)
+            async with asyncio.timeout(1):
+                while not display.is_vertical_scroll_end:
+                    await pilot.pause()
             assert display.is_vertical_scroll_end
             assert display.following
 
@@ -4297,9 +3663,9 @@ async def test_user_scroll_takes_over_from_rapid_resize_callbacks() -> None:
 @pytest.mark.asyncio
 async def test_historical_resize_preserves_anchor_within_one_long_message() -> None:
     content = "\n".join(f"anchor {index:03d} " + "z" * 55 for index in range(80))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(100, 24)) as pilot:
         await pilot.press(*list("resize"), "enter")
@@ -4322,9 +3688,9 @@ async def test_historical_resize_preserves_anchor_within_one_long_message() -> N
 
 @pytest.mark.asyncio
 async def test_shutdown_settles_stream_worker_before_runtime_close() -> None:
-    conversation = BlockingConversation()
+    conversation = BlockingRunSource()
     runtime = CloseOrderingRuntime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("block"), "enter")
@@ -4337,9 +3703,9 @@ async def test_shutdown_settles_stream_worker_before_runtime_close() -> None:
 
 @pytest.mark.asyncio
 async def test_failed_stream_terminal_still_closes_runtime_once() -> None:
-    conversation = FailingCancellationCleanupConversation()
+    conversation = FailingCancellationCleanupRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("block"), "enter")
@@ -4361,7 +3727,7 @@ async def test_minimum_terminal_size_has_an_exact_20_by_10_boundary(
     size: tuple[int, int],
     undersized: bool,
 ) -> None:
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(ScriptedConversation())))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(ScriptedRunSource())))
 
     async with app.run_test(size=size):
         visible_text = _visible_screen_text(app)
@@ -4372,9 +3738,9 @@ async def test_minimum_terminal_size_has_an_exact_20_by_10_boundary(
 
 @pytest.mark.asyncio
 async def test_undersized_terminal_replaces_presentation_and_recovers_input() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(19, 9)) as pilot:
         size_state = app.query_one("#size-insufficient", Static)
@@ -4401,9 +3767,9 @@ async def test_undersized_terminal_replaces_presentation_and_recovers_input() ->
 
 @pytest.mark.asyncio
 async def test_undersized_recovery_preserves_completion_draft_history_and_focus() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -4434,9 +3800,9 @@ async def test_undersized_recovery_preserves_completion_draft_history_and_focus(
 
 @pytest.mark.asyncio
 async def test_undersized_recovery_preserves_active_turn_state() -> None:
-    conversation = BlockingConversation()
+    conversation = BlockingRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("block"), "enter")
@@ -4458,9 +3824,9 @@ async def test_undersized_recovery_preserves_active_turn_state() -> None:
 
 @pytest.mark.asyncio
 async def test_undersized_terminal_blocks_an_open_confirmation_until_recovery() -> None:
-    conversation = ConfirmationConversation()
+    conversation = ConfirmationRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -4496,9 +3862,9 @@ async def test_undersized_terminal_blocks_an_open_confirmation_until_recovery() 
 @pytest.mark.asyncio
 async def test_resize_back_from_undersized_terminal_restores_historical_anchor() -> None:
     content = "\n".join(f"anchor {index:02d} " + "z" * 35 for index in range(50))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("anchor"), "enter")
@@ -4528,9 +3894,9 @@ async def test_resize_back_from_undersized_terminal_restores_historical_anchor()
 @pytest.mark.asyncio
 async def test_resize_back_from_undersized_terminal_restores_bottom_follow() -> None:
     content = "\n".join(f"line {index:02d} " + "x" * 50 for index in range(50))
-    conversation = ScriptedConversation(deltas=(content,), completed_content=content)
+    conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("bottom"), "enter")
@@ -4567,7 +3933,7 @@ async def test_runtime_start_failure_restores_terminal_before_owner_cleanup() ->
             terminal_state["restored"] = True
 
     class RecordingRuntime(FailingStartRuntime):
-        def __init__(self, conversation: object) -> None:
+        def __init__(self, conversation: _ScriptedSource) -> None:
             super().__init__(conversation)
             self.close_saw_terminal_restored = False
 
@@ -4575,8 +3941,8 @@ async def test_runtime_start_failure_restores_terminal_before_owner_cleanup() ->
             self.close_saw_terminal_restored = terminal_state["restored"]
             await super().close()
 
-    runtime = RecordingRuntime(ScriptedConversation())
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    runtime = RecordingRuntime(ScriptedRunSource())
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     app.driver_class = RecordingDriver
 
     with pytest.raises(RuntimeError, match="runtime startup failed"):
@@ -4601,7 +3967,7 @@ async def test_runtime_cleanup_failure_still_restores_terminal_first() -> None:
             terminal_state["restored"] = True
 
     class RecordingRuntime(FailingCloseRuntime):
-        def __init__(self, conversation: object) -> None:
+        def __init__(self, conversation: _ScriptedSource) -> None:
             super().__init__(conversation)
             self.close_saw_terminal_restored = False
 
@@ -4609,8 +3975,8 @@ async def test_runtime_cleanup_failure_still_restores_terminal_first() -> None:
             self.close_saw_terminal_restored = terminal_state["restored"]
             await super().close()
 
-    runtime = RecordingRuntime(ScriptedConversation())
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    runtime = RecordingRuntime(ScriptedRunSource())
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     app.driver_class = RecordingDriver
 
     with pytest.raises(RuntimeError, match="runtime cleanup failed"):
@@ -4623,7 +3989,7 @@ async def test_runtime_cleanup_failure_still_restores_terminal_first() -> None:
 
 @pytest.mark.asyncio
 async def test_runtime_start_and_cleanup_failure_preserves_the_start_error() -> None:
-    class FailingStartAndCloseRuntime(FakeRuntime):
+    class FailingStartAndCloseRuntime(FakePreparedRuntime):
         async def start(self) -> None:
             self.start_calls += 1
             raise RuntimeError("runtime startup failed")
@@ -4632,8 +3998,8 @@ async def test_runtime_start_and_cleanup_failure_preserves_the_start_error() -> 
             self.close_calls += 1
             raise RuntimeError("runtime cleanup failed")
 
-    runtime = FailingStartAndCloseRuntime(ScriptedConversation())
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    runtime = FailingStartAndCloseRuntime(ScriptedRunSource())
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     app.driver_class = KeyboardLifecycleDriver
 
     with pytest.raises(RuntimeError, match="runtime startup failed") as raised:
@@ -4655,7 +4021,7 @@ async def test_terminal_start_failure_attempts_application_mode_restore() -> Non
             raise RuntimeError("terminal startup failed")
 
     KeyboardLifecycleDriver.operations = []
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(ScriptedConversation())))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(ScriptedRunSource())))
     app.driver_class = FailingStartDriver
 
     with pytest.raises(RuntimeError, match="terminal startup failed"):
@@ -4676,7 +4042,7 @@ async def test_terminal_stop_failure_still_restores_enhanced_keyboard_mode(
             raise RuntimeError("terminal cleanup failed")
 
     KeyboardLifecycleDriver.operations = []
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(ScriptedConversation())))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(ScriptedRunSource())))
     app.driver_class = FailingStopDriver
 
     with pytest.raises(RuntimeError, match="terminal cleanup failed"):
@@ -4703,9 +4069,9 @@ async def test_terminal_stop_failure_does_not_mask_an_application_body_failure()
             await super().on_mount()
             raise RuntimeError("application body failed")
 
-    runtime = _runtime(ScriptedConversation())
+    runtime = _runtime(ScriptedRunSource())
     app = _terminal_app(
-        cast(PreparedReplRuntime, runtime),
+        cast(PreparedRuntime, runtime),
         app_type=FailingBodyApp,
     )
     app.driver_class = FailingStopDriver
@@ -4797,8 +4163,8 @@ async def test_partial_terminal_stop_failure_restores_all_modes_before_runtime_c
             if self._restore_console is not None:
                 self._restore_console()
 
-    class RecordingRuntime(FakeRuntime):
-        def __init__(self, conversation: object) -> None:
+    class RecordingRuntime(FakePreparedRuntime):
+        def __init__(self, conversation: _ScriptedSource) -> None:
             super().__init__(conversation)
             self.close_saw_terminal_restored = False
 
@@ -4814,8 +4180,8 @@ async def test_partial_terminal_stop_failure_restores_all_modes_before_runtime_c
             }
             await super().close()
 
-    runtime = RecordingRuntime(ScriptedConversation())
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    runtime = RecordingRuntime(ScriptedRunSource())
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     app.driver_class = PartialStopDriver
 
     with pytest.raises(RuntimeError, match="terminal cleanup failed"):
@@ -4851,14 +4217,14 @@ def test_non_tty_terminal_streams_are_rejected_before_textual_starts(
     monkeypatch.setattr(TerminalConversationApp, "run", app_must_not_start)
 
     with pytest.raises(TerminalConversationError, match="interactive stdin, stdout, and stderr"):
-        run_terminal_conversation(cast(PreparedReplRuntime, object()))
+        run_terminal_conversation(cast(PreparedRuntime, object()))
 
 
 @pytest.mark.asyncio
 async def test_management_completion_supports_keyboard_filtering_and_escape() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -4912,7 +4278,7 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
 async def test_management_completion_keeps_the_composer_visible(
     size: tuple[int, int],
 ) -> None:
-    app = _terminal_app(cast(PreparedReplRuntime, _runtime(ScriptedConversation())))
+    app = _terminal_app(cast(PreparedRuntime, _runtime(ScriptedRunSource())))
 
     async with app.run_test(size=size) as pilot:
         await pilot.press("/")
@@ -4929,9 +4295,9 @@ async def test_management_completion_keeps_the_composer_visible(
 
 @pytest.mark.asyncio
 async def test_management_completion_mouse_selection_updates_the_composer() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("/")
@@ -6218,9 +5584,9 @@ async def test_management_error_row_preserves_later_command_interaction(
 
 @pytest.mark.asyncio
 async def test_completion_direction_keys_take_precedence_over_composer_and_input_history() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("previous"), "enter")
@@ -6244,9 +5610,9 @@ async def test_completion_direction_keys_take_precedence_over_composer_and_input
 
 @pytest.mark.asyncio
 async def test_completion_ctrl_c_closes_completion_before_idle_draft_behavior() -> None:
-    conversation = ScriptedConversation()
+    conversation = ScriptedRunSource()
     runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedReplRuntime, runtime))
+    app = _terminal_app(cast(PreparedRuntime, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("previous"), "enter")

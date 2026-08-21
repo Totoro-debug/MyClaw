@@ -12,7 +12,7 @@
 
 - 用户运行 `myclaw` 进入长驻前台 REPL。
 - 每个有效 REPL 启动准备一个新的 Workspace-scoped Conversation Session；未发送用户消息就退出时不持久化空 session。
-- Runtime Core 通过 Conversation Port、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界编排 Agent Run。
+- Runtime Core 通过 MessageBus、AgentLoop、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界编排 Agent Run。
 - Agent Home 固定为 `~/.myclaw/`，采用 file-first persistence。
 - REPL 支持 streaming、后台 Memory Task、Schedule Jobs、session resume 和管理 slash commands；Schedule actions 不请求 Tool Confirmation，Exec、Web 和 Workspace 外部路径按具体目标执行一次性确认。
 - 首版非交互管理只支持 `myclaw config`，不支持 one-shot 对话。
@@ -61,7 +61,7 @@
 40. 作为个人用户，我想配置无效时 `myclaw` 明确退出，所以不会进入半可用 REPL。
 41. 作为个人用户，我想仍可运行 `myclaw config` 查看坏配置，所以可以定位配置问题。
 42. 作为开发者，我想 Runtime Core 只负责编排，所以具体模型、工具和存储实现可以替换。
-43. 作为开发者，我想 Conversation Port 输出 typed Agent Events，所以 CLI 只负责交互和渲染。
+43. 作为开发者，我想 MessageBus 提供 typed inbound/outbound messages，AgentLoop 提供独立 control seam，所以 CLI 只负责交互和渲染。
 44. 作为开发者，我想 Management Port 处理管理命令，所以管理操作不会伪装成聊天。
 45. 作为开发者，我想 Tool Gateway 统一解析、prepare、拒绝、单次执行和结果封装，所以工具行为保持一致。
 46. 作为开发者，我想 provider adapter 使用官方 SDK，所以 streaming、tool calls 和错误语义更可控。
@@ -228,14 +228,14 @@
 - 每个 Job 使用由 `schedule_<job_id>` 派生的 Schedule Session，并使用专属 `schedule-sessions/` 分区；该 Session 不出现在 `/resume`。
 - Schedule Service 是唯一的 Job dispatcher，所有触发都通过共享 Agent Run 使用 `schedule` route，结果保留在 Schedule Session。
 - 同一 Job 在单 runtime 内不重入；不同 Job 可并发；不做跨进程协调，因此多个 runtime 可能重复触发。
-- Schedule 只在 runtime 存活时运行，不发送 Agent Event、完成提示或通知。
+- Schedule 只在 runtime 存活时运行，不发送前台 OutboundMessage、完成提示或通知。
 - legacy scheduled-work state 原样保留且永不读取、检测、迁移、重命名或删除。
 - 损坏的 Schedule state 在 scheduler 和 REPL 启动前以 `schedule_state_error`、修复提示和路径阻止 Runtime 启动。
 
 ## Testing Decisions
 
 - 测试只验证外部可观察行为，不绑定内部实现细节。
-- 优先测试最高 seam：Conversation Port、Management Port、Runtime Core、Memory Manager、Tool Gateway、active Session、Model Router/Provider Adapter。
+- 优先测试最高 seam：MessageBus/AgentLoop、Management Port、PreparedRuntime、Memory Manager、Tool Gateway、active Session、Model Router/Provider Adapter。
 - 测试使用 fake provider、fake tool、临时 Agent Home 和临时 Workspace，不调用真实模型 API。
 
 ### Required memory tests

@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import prepare_repl_runtime
+from myclaw.agent.runtime import prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -147,7 +147,7 @@ async def test_partial_scheduler_start_failure_closes_the_started_memory_loop(
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     memory_clock = BlockingSchedulerClock()
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -178,7 +178,7 @@ async def test_async_start_failure_defers_cleanup_to_the_lifecycle_owner(
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     memory_clock = BlockingSchedulerClock()
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -235,7 +235,7 @@ async def test_normal_repl_exit_closes_the_runtime_model_provider(
             ),
         )
     )
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -262,7 +262,7 @@ async def test_normal_eof_and_exit_shutdown_do_not_create_diagnostic_log(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -291,7 +291,7 @@ async def test_prepared_runtime_rejects_a_second_repl_invocation(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -336,7 +336,7 @@ async def test_runtime_run_preserves_the_primary_error_when_cleanup_also_fails(
             ),
         )
     )
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -360,7 +360,7 @@ async def test_external_runtime_close_waits_for_the_repl_and_input_to_stop(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -403,7 +403,7 @@ async def test_writer_failure_finishes_runtime_shutdown_without_task_leaks(
             ),
         )
     )
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -515,7 +515,7 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
     provider = InterruptibleProvider()
     memory_clock = BlockingSchedulerClock()
     scheduled_clock = BlockingSchedulerClock()
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),

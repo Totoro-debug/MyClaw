@@ -1,7 +1,6 @@
 """Reusable boundary fakes and pytest fixtures."""
 
 from tests.fixtures.clock import FakeClock
-from tests.fixtures.events import validate_agent_event_sequence
 from tests.fixtures.gateway import SingleToolGateway
 from tests.fixtures.provider import (
     ProviderCall,
@@ -23,6 +22,5 @@ __all__ = [
     "SingleToolGateway",
     "StreamScript",
     "unexpected_provider_factory",
-    "validate_agent_event_sequence",
     "write_schedule_state",
 ]

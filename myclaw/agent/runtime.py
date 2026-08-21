@@ -22,7 +22,6 @@ from myclaw.agent.prompts import (
     runtime_context,
     session_title_prompt,
 )
-from myclaw.agent.run import ToolResultExternalizer
 from myclaw.agent.runner import AgentRunnerRoute
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
@@ -237,9 +236,6 @@ class PreparedRuntime:
             raise failure
 
 
-PreparedReplRuntime = PreparedRuntime
-
-
 def prepare_runtime(
     *,
     agent_home: AgentHome,
@@ -278,38 +274,6 @@ def prepare_runtime(
             "Runtime composition failed type={}", type(error).__name__
         )
         raise
-
-
-def prepare_repl_runtime(
-    *,
-    agent_home: AgentHome,
-    workspace: Path,
-    configuration: UserConfiguration,
-    provider_factory: Callable[[ProviderConfiguration], ModelProvider],
-    now: Callable[[], datetime],
-    new_uuid: Callable[[], UUID],
-    retry_clock: RetryClock | None = None,
-    retry_jitter: Jitter | None = None,
-    memory_scheduler_clock: SchedulerClock | None = None,
-    schedule_scheduler_clock: ScheduleClock | None = None,
-    monotonic_now: Callable[[], float] = monotonic,
-    timezone_name: str | None = None,
-) -> PreparedReplRuntime:
-    """Compatibility entry point for the prepared REPL runtime."""
-    return prepare_runtime(
-        agent_home=agent_home,
-        workspace=workspace,
-        configuration=configuration,
-        provider_factory=provider_factory,
-        now=now,
-        new_uuid=new_uuid,
-        retry_clock=retry_clock,
-        retry_jitter=retry_jitter,
-        memory_scheduler_clock=memory_scheduler_clock,
-        schedule_scheduler_clock=schedule_scheduler_clock,
-        monotonic_now=monotonic_now,
-        timezone_name=timezone_name,
-    )
 
 
 def _prepare_runtime(
@@ -388,7 +352,7 @@ def _prepare_runtime(
         )
     )
 
-    def externalize_result_for(active_session: Session) -> ToolResultExternalizer:
+    def externalize_result_for(active_session: Session) -> Callable[[ToolResult], ToolResult]:
         return _build_tool_result_externalizer(
             session=active_session,
             max_tool_result_chars=configuration.runtime.max_tool_result_chars,
@@ -652,7 +616,7 @@ def _build_tool_result_externalizer(
     *,
     session: Session,
     max_tool_result_chars: int,
-) -> ToolResultExternalizer:
+) -> Callable[[ToolResult], ToolResult]:
     def externalize(result: ToolResult) -> ToolResult:
         if result.status != "success" or len(result.content) <= max_tool_result_chars:
             return result

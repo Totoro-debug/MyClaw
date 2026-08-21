@@ -10,7 +10,7 @@ import pytest
 
 import myclaw.utils.scheduler as scheduler_module
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
+from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -468,7 +468,7 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(NOW)
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -497,8 +497,8 @@ async def test_each_prepared_runtime_starts_a_fresh_memory_scheduler(
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     clock = ControlledClock(NOW)
 
-    def prepare_runtime() -> PreparedReplRuntime:
-        return prepare_repl_runtime(
+    def _make_runtime() -> PreparedRuntime:
+        return prepare_runtime(
             agent_home=home,
             workspace=workspace,
             configuration=ConfigLoader(home).load(),
@@ -523,8 +523,8 @@ async def test_each_prepared_runtime_starts_a_fresh_memory_scheduler(
         async def write_line(self, content: str) -> None:
             del content
 
-    await prepare_runtime().run(input_reader=ExitInput(), writer=SilentWriter())
-    await prepare_runtime().run(input_reader=ExitInput(), writer=SilentWriter())
+    await _make_runtime().run(input_reader=ExitInput(), writer=SilentWriter())
+    await _make_runtime().run(input_reader=ExitInput(), writer=SilentWriter())
 
     assert clock.sleeps == [5 * 60, 5 * 60]
 
@@ -690,7 +690,7 @@ async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
         streams=(StreamScript(events=(ModelCompleted(response=_response("Old snapshot.")),)),),
     )
     configuration = ConfigLoader(home).load()
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -717,7 +717,7 @@ async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
     restarted_provider = ScriptedFakeProvider(
         streams=(StreamScript(events=(ModelCompleted(response=_response("New snapshot.")),)),)
     )
-    restarted = prepare_repl_runtime(
+    restarted = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,
@@ -813,7 +813,7 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
             _response("Memory updated."),
         )
     )
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -862,7 +862,7 @@ async def test_periodic_failure_is_isolated_and_all_periodic_results_stay_silent
         )
     )
     clock = ControlledClock(NOW)
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),

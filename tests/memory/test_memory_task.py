@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from myclaw.agent.runtime import prepare_repl_runtime
+from myclaw.agent.runtime import prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -1046,7 +1046,7 @@ async def test_runtime_dream_uses_memory_route_with_static_default_fallback(
     summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("The user prefers concise status reports.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No durable update is needed."),))
-    runtime = prepare_repl_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=configuration,

@@ -9,7 +9,7 @@ import pytest
 from loguru import logger
 
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
+from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
@@ -119,12 +119,12 @@ def _runtime(
     provider: RuntimeProvider,
     *,
     config: str = VALID_CONFIG,
-) -> PreparedReplRuntime:
+) -> PreparedRuntime:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(config, encoding="utf-8")
     clock = FakeClock(NOW)
-    return prepare_repl_runtime(
+    return prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),

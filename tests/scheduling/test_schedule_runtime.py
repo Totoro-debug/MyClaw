@@ -18,7 +18,7 @@ from myclaw.agent.context import ContextBuilder
 from myclaw.agent.message_bus import OutboundMessage
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult
-from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
+from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -222,11 +222,11 @@ def _runtime(
     *,
     schedule_clock: ScheduleClock,
     config_text: str = VALID_CONFIG,
-) -> PreparedReplRuntime:
+) -> PreparedRuntime:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
-    return prepare_repl_runtime(
+    return prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -239,7 +239,7 @@ def _runtime(
 
 
 async def _submit_turn(
-    runtime: PreparedReplRuntime,
+    runtime: PreparedRuntime,
     text: str,
 ) -> tuple[OutboundMessage, ...]:
     return await collect_foreground_outbound(runtime, text)
@@ -257,7 +257,7 @@ def _schedule_state(workspace: Path) -> WorkspaceScheduleStore:
     return WorkspaceScheduleStore(WorkspaceState(Workspace.from_path(workspace)))
 
 
-def _tool_json(runtime: PreparedReplRuntime) -> list[dict[str, object]]:
+def _tool_json(runtime: PreparedRuntime) -> list[dict[str, object]]:
     return [
         cast(dict[str, object], json.loads(cast(str, message["content"])))
         for message in runtime.session.messages

@@ -4,27 +4,22 @@ from uuid import uuid4
 
 import pytest
 
-from myclaw.agent.context import ContextBuilder
-from myclaw.agent.workspace import Workspace
-from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.agent.runtime import prepare_runtime
 from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelResponse,
     ModelUsage,
 )
-from myclaw.session.conversation import StreamingConversationPort
-from myclaw.session.session import Session
-from myclaw.tools.core.edit_file import EditFileTool
-from myclaw.tools.core.write_file import WriteFileTool
 from myclaw.tools.tool_gateway import ModelToolCall
+from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
     ScriptedFakeProvider,
-    ScriptedFakeRouter,
-    SingleToolGateway,
     StreamScript,
 )
+from tests.runtime_bus import collect_foreground_outbound
 
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=timezone(timedelta(hours=8)))
 
@@ -36,9 +31,6 @@ async def test_foreground_mutations_execute_without_a_permission_pause(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
-    state.initialize(agent_home_root=agent_home)
-    session = Session.create(state, now=lambda: NOW, new_uuid=uuid4)
     target = workspace / "notes.txt"
     target.write_text("before", encoding="utf-8")
     calls = (
@@ -87,38 +79,29 @@ async def test_foreground_mutations_execute_without_a_permission_pause(
             ),
         )
     )
-    identity = Workspace.from_path(workspace)
-    gateway = SingleToolGateway(
-        (WriteFileTool(workspace=identity), EditFileTool(workspace=identity))
-    )
-    conversation = StreamingConversationPort(
-        model=ScriptedFakeRouter(provider),
-        session=session,
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
         now=lambda: NOW,
         new_uuid=uuid4,
-        tool_gateway=gateway,
-        context_builder=ContextBuilder(
-            identity,
-            "Asia/Shanghai",
-            clock=lambda: NOW,
-        ),
     )
+    confirmations: list[object] = []
+    runtime.control.bind_confirmation_callback(confirmations.append)
+    try:
+        await runtime.start()
+        messages = await collect_foreground_outbound(runtime, "Change the files.")
+    finally:
+        await runtime.close()
 
-    events = [event async for event in conversation.submit("Change the files.")]
-
-    assert [event.type for event in events] == [
-        "turn_started",
-        "model_call_completed",
-        "tool_started",
-        "tool_completed",
-        "tool_started",
-        "tool_completed",
-        "model_call_completed",
-        "turn_completed",
-    ]
+    assert confirmations == []
     assert (workspace / "created.txt").read_text(encoding="utf-8") == "must not be written"
     assert target.read_text(encoding="utf-8") == "after"
-    tool_messages = [message for message in session.messages if message["role"] == "tool"]
+    tool_messages = [message for message in runtime.session.messages if message["role"] == "tool"]
     assert [message["status"] for message in tool_messages] == ["success", "success"]
     follow_up = provider.stream_requests[1]
     model_results = [message for message in follow_up.messages if message["role"] == "tool"]
@@ -126,3 +109,4 @@ async def test_foreground_mutations_execute_without_a_permission_pause(
         ("write_file", "File written successfully."),
         ("edit_file", "File edited successfully."),
     ]
+    assert messages[-1].metadata == {"_streamed": True}

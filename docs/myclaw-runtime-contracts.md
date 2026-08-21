@@ -7,7 +7,7 @@
 - 目标版本：MyClaw `v0.1`
 - canonical source：`CONTEXT.md`
 - 产品行为来源：`docs/myclaw-personal-agent-prd.md`
-- 实施顺序来源：`docs/myclaw-implementation-plan.md`
+- 历史实施顺序记录：`docs/myclaw-implementation-plan.md`
 
 本文把已确认的产品行为细化为可直接实现的类型、文件 schema 和代码边界。来自 canonical 文档的行为与 D01-D16 已于 2026-07-11 一并接受；Issue #118/#130 固化了固定 Core Tool Catalog、BaseTool 管线、Workspace State 访问、Exec/Web/Schedule 行为和 Artifact 边界。本文对应章节以这些已批准规格为准。后续变更必须先更新本契约及受影响的 PRD/ADR。
 
@@ -321,7 +321,7 @@ timeout = 120
 - 第一行缺失、字段不是当前严格五字段 header、日期不是带 offset 的 ISO 8601、`last_consolidated` 为负数或 metadata 不合法：Session 不可恢复。
 - 任一 message line 非法、包含旧 line-marker/version fields、缺少 trailing `\n`，或文件为空：Session 不可恢复，不静默跳过、不做 partial-line repair，也不自动迁移。
 - `Session.load()` 是同步且严格的当前格式读取；picker 跳过不可恢复 Session，同时显示一条汇总警告；不得把损坏文件自动删除。
-- `persist()` 不等待 filesystem operation，不返回 task、acknowledgement 或 failure；普通写入异常不产生 Agent Event、Session Log 或其他诊断记录。
+- `persist()` 不等待 filesystem operation，不返回 task、acknowledgement 或 failure；普通写入异常不产生 `OutboundMessage`、Session Log 或其他诊断记录。
 - `close()` 标记 Session closed 后抑制过期异步 snapshot，最多同步尝试三次（间隔 `100 ms`、`200 ms`），最终失败静默吞掉。
 
 ## 6. Conversation Summary、Cursor 与 Long-term Memory
@@ -406,7 +406,7 @@ is accepted by ADR-0009 and does not provide cross-process coordination.
 - Store 在 Runtime-local lock 内构造 immutable candidate，严格序列化后通过同目录 atomic replacement 发布；写失败保留旧 authority 并 fault Store。
 - User Job 的 add/list/remove 由 `schedule` Tool 管理且不请求确认；Schedule Agent context 拒绝 add，list/remove 仍可用，公开定义按创建时间和 Job ID 稳定排序。
 - 每次触发通过共享 Agent Run 的 `schedule` route 运行；Schedule Session ID 派生为 `schedule_<job_id>`，Session 首次产生消息时才落盘到 `schedule-sessions/`。
-- Schedule Service 在一个 dispatcher 中处理动态变更、at/every/cron、重叠跳过、不同 Job 并发和 Runtime shutdown；不发送 Agent Event 或通知。
+- Schedule Service 在一个 dispatcher 中处理动态变更、at/every/cron、重叠跳过、不同 Job 并发和 Runtime shutdown；不发送前台 `OutboundMessage` 或通知。
 
 ## 8. Prompt、Runtime Context 与预算
 
@@ -550,62 +550,44 @@ adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不
 - rate limit、timeout、connection error、provider unavailable 可 retry。
 - tool calls、title fallback 本地处理和 Tool Gateway 不复用 model retry。
 
-## 10. Agent Event 与 Port 契约
+## 10. MessageBus、AgentLoop 与 AgentRunner 契约
 
-### 10.1 Event envelope
+### 10.1 Public foreground boundary
 
-所有事件共享：
+`AgentLoop` owns one foreground `MessageBus`. Terminal, headless REPL and
+other foreground consumers submit `InboundMessage` values and consume
+`OutboundMessage` values; they do not reach into Session, provider or Tool
+objects. The independent `AgentLoop.control` surface owns cancellation,
+confirmation callbacks and the current foreground projection. Management Port
+and its dispatcher remain a separate management boundary.
 
-```json
-{
-  "type": "text_delta",
-  "event_id": 3,
-  "turn_id": "550e8400-e29b-41d4-a716-446655440000",
-  "created_at": "2026-07-11T15:30:13.123+08:00",
-  "payload": {}
-}
-```
+### 10.2 AgentRunner
 
-- `event_id` 是 runtime 内单调递增 integer，仅用于排序，不持久化。
-- `turn_id` 标识当前前台 Agent Run。
-- CLI 只依赖 event，不读取 session、tool 或 provider 对象。
+`AgentRunner` is the bounded, Session-independent model/Tool execution shared
+by the foreground loop and Schedule. It receives the selected route and Tool
+Gateway dependencies and returns an `AgentRunnerResult`. One Agent Run remains
+the domain term for one Runner execution; it is not a transport or a public
+event envelope. Repair construction, Tool Result externalization and iterator
+cleanup are private implementation helpers and are not package interfaces.
 
-### 10.2 Event types
+### 10.3 Sparse outbound protocol
 
-| type | payload | 说明 |
-| --- | --- | --- |
-| `turn_started` | `{}` | 前台 turn 接受并开始 |
-| `text_delta` | `{delta}` | chat streaming 文本 |
-| `model_call_completed` | `{content, continues_with_tools}` | 一个已发布到 Session 的 model call 的完整文本和是否继续执行 Tool；非终态，不含 Tool、Provider、usage 或 route 元数据 |
-| `tool_started` | `{tool_call_id, tool_name, summary}` | 不含完整 arguments |
-| `confirmation_requested` | `{confirmation_id, tool_call_id, tool_name, reason, summary, details, warnings}` | 等待当前前台 Agent Run 的一次性确认 |
-| `tool_completed` | `{tool_call_id, tool_name, status, summary}` | 不含完整 raw result |
-| `turn_completed` | `{content, usage}` | 一个 turn 恰好一个终态 |
-| `turn_failed` | `{error}` | 安全的用户可见错误 |
-| `turn_cancelled` | `{partial_content}` | Ctrl+C 终态 |
+`OutboundMessage` has one of the following types:
 
-事件状态 summary 最长 240 字符。tool argument 和 raw result 不进入普通 tool activity event。Tool Confirmation 的规范化 details 只出现在 `confirmation_requested`，确认回复不进入 Session message。
+| type | metadata/use |
+| --- | --- |
+| `model_reasoning` | streamed reasoning deltas and `_stream_end` |
+| `model_response` | streamed response deltas, `_stream_end`, or `_streamed` completion |
+| `tool_call` | a Tool call projection with `tool_call_id` and raw `arguments` |
+| `system_control` | a `_streamed` terminal marker with `finish_reason` such as `cancelled`, `failed` or `max_iterations` |
 
-每个完成的 model call 恰好发出一个 `model_call_completed`，它出现在对应 Session publication 之后；当 `continues_with_tools` 为 true 时，它位于对应的 `tool_started` 事件之前。一个 Agent Run 仍恰好只有一个 `turn_completed`、`turn_failed` 或 `turn_cancelled` 终态事件。
-
-### 10.3 Conversation Port
-
-最小接口：
-
-```python
-class ConversationPort(Protocol):
-    def submit(self, text: str) -> AsyncIterator[AgentEvent]: ...
-    async def cancel_active_turn(self) -> None: ...
-    def respond_to_confirmation(
-        self,
-        confirmation_id: UUID,
-        decision: Literal["approved", "declined"],
-    ) -> None: ...
-```
-
-- 同一 port 同时只允许一个 foreground `submit`；REPL 自身串行化输入。
-- Conversation Port 不接受 session ID、route、provider 或 tool catalog 参数。
-- confirmation response 只绑定一个 confirmation identity 和精确的 Tool call；wrong、late 或 duplicate response 被拒绝，不产生持久化 permission。
+Foreground streaming may contain multiple delta messages, but each completed
+foreground run has exactly one terminal `_streamed` marker. Tool results and
+confirmation replies are not foreground bus payloads. A Tool confirmation is
+delivered through the `AgentLoop.control` callback and resolved by its direct
+Future-bound response; wrong, late and duplicate decisions do not authorize a
+different call. Schedule uses the same Runner/Gateway execution through
+`AgentLoop.run_schedule_job` and does not publish foreground messages.
 
 ### 10.4 Management Port
 
@@ -799,7 +781,7 @@ ErrorInfo(
 )
 ```
 
-`ErrorInfo` 仍用于 model、Agent Run 和 service-level error contract，不用于 `ToolError` 或 Tool Result。`ToolError` 只有安全的 message；cause、traceback、SDK response body 不写 Tool message 或 Agent Event，但在拥有明确 Session 的 MyClaw 边界可进入 Session Log。Session Log 不执行主动脱敏。
+`ErrorInfo` 仍用于 model、Agent Run 和 service-level error contract，不用于 `ToolError` 或 Tool Result。`ToolError` 只有安全的 message；cause、traceback、SDK response body 不写 Tool message 或 foreground `OutboundMessage`，但在拥有明确 Session 的 MyClaw 边界可进入 Session Log。Session Log 不执行主动脱敏。
 
 ### 13.2 稳定 code
 
@@ -862,8 +844,8 @@ CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`
 以下签名用于限定职责，不要求使用特定 ABC library。Conversation Session 的
 identity、messages、metadata、`last_consolidated` 和 complete snapshot
 persistence 由同一个 active `Session` instance 负责；Session 不暴露
-filesystem acknowledgement，也不承担 Conversation Port 或 Model Provider
-职责：
+filesystem acknowledgement，也不承担 MessageBus/AgentLoop 或 Model
+Provider 职责：
 
 ```python
 class Session:
@@ -912,7 +894,7 @@ Phase 0 应先把以下内容固化为 fixtures/snapshots：
 - 完成、中断、model failure、tool failure 后的完整 Session JSONL snapshots，以及 ordered async persist 和 bounded close。
 - summary schema exact-key assertion、index/cursor 起点和 batch 行为。
 - Schedule model strict round-trip、Schedule state strict-load、legacy state untouched 和 atomic mutation。
-- 全部 Agent Event payload schema 与事件顺序。
+- MessageBus sparse outbound schema、terminal marker 以及 AgentLoop control/Future 语义。
 - Model Provider scripted transcript：text deltas、tool call deltas、usage、retry-after、timeout、cancellation。
 - 固定 Catalog、BaseTool preparation order、file path boundary、Exec/Web confirmation 和 WebFetch redirect/IP cases。
 - complete atomic JSONL replacement、缺少 trailing newline、middle corruption、旧 schema rejection，以及 Summary/`last_consolidated` crash divergence。
