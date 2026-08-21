@@ -85,6 +85,11 @@ class MessageBus:
     ) -> None:
         self._inbound_changed_callback = callback
 
+    def _detach_inbound(self) -> None:
+        """Discard owner-held input without adding a Message Bus lifecycle state."""
+        self._inbound.clear()
+        self._inbound_changed_callback = None
+
     @staticmethod
     def _invoke_inbound_changed_callback(
         callback: Callable[[tuple[InboundMessage, ...]], None] | None,

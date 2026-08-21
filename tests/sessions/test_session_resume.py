@@ -156,19 +156,21 @@ async def test_resume_selects_the_loaded_session_for_the_runtime_owner(
     state = _state(workspace, agent_home)
     target = _session(state, SECOND_UUID, "Target session")
     target.close()
-    selected: list[Session] = []
+    selected: list[tuple[str, bool]] = []
+
+    async def replace_session(session_id: str, force: bool) -> None:
+        selected.append((session_id, force))
+
     service = ManagementViewService(
         home,
         workspace_state=state,
-        switch_session=selected.append,
+        replace_session=replace_session,
     )
 
     result = await service.resume(target.session_id)
 
     assert result.session_id == target.session_id
-    assert len(selected) == 1
-    assert selected[0].session_id == target.session_id
-    assert selected[0].messages == target.messages
+    assert selected == [(target.session_id, False)]
 
 
 class _ScriptedInput:
@@ -194,7 +196,7 @@ class _RecordingWriter:
 
 
 @pytest.mark.asyncio
-async def test_repl_resume_routes_the_next_input_through_the_selected_session(
+async def test_repl_resume_cannot_bypass_the_runtime_host_generation_owner(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -227,6 +229,7 @@ async def test_repl_resume_routes_the_next_input_through_the_selected_session(
         now=lambda: NOW,
         new_uuid=lambda: FIRST_UUID,
     )
+    initial_session_id = runtime.session_id
     await runtime.start()
     writer = _RecordingWriter()
     await run_repl(
@@ -238,9 +241,12 @@ async def test_repl_resume_routes_the_next_input_through_the_selected_session(
     )
     await runtime.close()
 
-    assert runtime.session_id == target.session_id
+    assert runtime.session_id == initial_session_id
     assert writer.operations[0][1].startswith("Resumable sessions:\n1. Target session |")
-    assert writer.operations[1] == ("line", f"Resumed session {target.session_id}.")
+    assert writer.operations[1] == (
+        "line",
+        "route_unavailable: Session resume is unavailable.",
+    )
     assert writer.operations[-1] == ("finish", "")
     assert [
         message["content"] for message in runtime.session.messages if message["role"] == "user"

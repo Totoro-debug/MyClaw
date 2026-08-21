@@ -139,7 +139,7 @@ class ScriptedInput:
 
 
 @pytest.mark.asyncio
-async def test_partial_scheduler_start_failure_closes_the_started_memory_loop(
+async def test_scheduler_preflight_failure_starts_no_runtime_tasks(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -164,13 +164,14 @@ async def test_partial_scheduler_start_failure_closes_the_started_memory_loop(
             await runtime.run(input_reader=UnusedInput(), writer=SilentWriter())
         await asyncio.sleep(0)
 
+        assert not memory_clock.sleep_started.is_set()
         assert asyncio.all_tasks() == baseline
     finally:
         await runtime.close()
 
 
 @pytest.mark.asyncio
-async def test_async_start_failure_defers_cleanup_to_the_lifecycle_owner(
+async def test_start_preflight_failure_requires_no_async_cleanup(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -197,18 +198,18 @@ async def test_async_start_failure_defers_cleanup_to_the_lifecycle_owner(
         with session_log(state, ambient_session_id):
             with pytest.raises(RuntimeError, match="Schedule Service clock failed to start"):
                 await runtime.start()
-        await memory_clock.sleep_started.wait()
+        assert not memory_clock.sleep_started.is_set()
         assert not memory_clock.sleep_stopped.is_set()
     finally:
         await runtime.close()
         log_capture.close()
 
-    assert memory_clock.sleep_stopped.is_set()
+    assert not memory_clock.sleep_stopped.is_set()
     assert asyncio.all_tasks() == baseline
     assert not (state.logs_directory / f"{ambient_session_id}.log").exists()
     content = log_capture.text
     assert content.count(" ERROR ") == 1
-    marker = "Runtime startup failed type=RuntimeError"
+    marker = "Runtime validation failed type=RuntimeError"
     assert content.count(marker) == 1
 
 

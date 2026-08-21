@@ -860,32 +860,58 @@ async def test_persist_request_failure_is_silent_and_terminal_stays_ordered(
 
 
 @pytest.mark.asyncio
-async def test_loop_closes_every_session_it_owned_after_idle_switch(
+async def test_loop_normal_close_saves_only_its_owned_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     loop, first = _runtime(tmp_path, _Router(()))
-    second = Session.create(first.workspace_state, now=_Clock().now)
     closed: list[str] = []
     first_close = first.close
-    second_close = second.close
 
     def close_first() -> None:
         closed.append(first.session_id)
         first_close()
 
-    def close_second() -> None:
-        closed.append(second.session_id)
-        second_close()
-
     monkeypatch.setattr(first, "close", close_first)
-    monkeypatch.setattr(second, "close", close_second)
 
-    loop.switch_session(second)
     await loop.close()
     loop._close_sessions()
 
-    assert closed == [first.session_id, second.session_id]
+    assert closed == [first.session_id]
+
+
+@pytest.mark.asyncio
+async def test_loop_abort_retains_cancelled_owned_tasks_until_cleanup_finishes(
+    tmp_path: Path,
+) -> None:
+    loop, _session = _runtime(tmp_path, _Router(()))
+    started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def cancellable_work() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release_cleanup.wait()
+            raise
+        finally:
+            cleanup_finished.set()
+
+    task = asyncio.create_task(cancellable_work())
+    loop._execution_task = task
+    await started.wait()
+
+    loop.abort()
+
+    assert task in loop._aborted_tasks
+    release_cleanup.set()
+    await cleanup_finished.wait()
+    tasks_drained = asyncio.Event()
+    task.add_done_callback(lambda _task: tasks_drained.set())
+    await tasks_drained.wait()
+    assert loop._aborted_tasks == set()
 
 
 @pytest.mark.asyncio

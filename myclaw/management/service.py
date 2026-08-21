@@ -1,6 +1,6 @@
 """Concrete read-only views exposed through the Management Port."""
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, cast
@@ -187,10 +187,6 @@ class RuntimeStatusService:
         self._started_at = monotonic()
         self._version = version
 
-    def use_session(self, session: Session) -> None:
-        """Make the selected Session the status authority."""
-        self._session = lambda: session
-
     async def status(self) -> RuntimeStatus:
         """Return all required runtime and current-session status fields."""
         session = self._session()
@@ -239,7 +235,7 @@ class ManagementViewService:
         *,
         status_service: RuntimeStatusService | None = None,
         workspace_state: WorkspaceState | None = None,
-        switch_session: Callable[[Session], None] | None = None,
+        replace_session: Callable[[str, bool], Awaitable[None]] | None = None,
         now: Callable[[], datetime] | None = None,
         memory_manager: _ManualMemoryManager | None = None,
         memory_store: MemoryStore | None = None,
@@ -247,13 +243,25 @@ class ManagementViewService:
         self._config = ConfigLoader(agent_home)
         self._status_service = status_service
         self._workspace_state = workspace_state
-        self._switch_session = switch_session
+        self._replace_session = replace_session
         self._now = now
         self._memory_manager = memory_manager
         self._memory_store = memory_store
+        self._aborted = False
+
+    def deactivate(self) -> None:
+        """Reject new Management work after its Runtime Generation is detached."""
+        self._aborted = True
+
+    def _ensure_active(self) -> None:
+        if self._aborted:
+            raise ManagementError(
+                ErrorInfo("route_unavailable", "Runtime Generation is no longer active.")
+            )
 
     async def config_view(self) -> ConfigView:
         """Return complete redacted User Configuration content."""
+        self._ensure_active()
         try:
             self._config.ensure_default()
             return self._config.view()
@@ -267,6 +275,7 @@ class ManagementViewService:
 
     async def memory_view(self) -> str:
         """Return the complete current Long-term Memory file."""
+        self._ensure_active()
         if self._memory_store is None:
             raise ManagementError(
                 ErrorInfo("route_unavailable", "Long-term Memory is unavailable.")
@@ -280,12 +289,14 @@ class ManagementViewService:
 
     async def dream(self) -> MemoryTaskResult:
         """Run one foreground Memory Task and return its safe summary."""
+        self._ensure_active()
         if self._memory_manager is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Memory Task is unavailable."))
         return await self._memory_manager.run_manual()
 
     async def status(self) -> RuntimeStatus:
         """Return the injected Runtime status snapshot."""
+        self._ensure_active()
         if self._status_service is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Runtime status is unavailable."))
         try:
@@ -301,6 +312,7 @@ class ManagementViewService:
 
     async def resumable_listing(self) -> SessionListingReport:
         """Return one atomic Session picker result including skipped diagnostics."""
+        self._ensure_active()
         workspace_state = self._workspace_state
         if workspace_state is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
@@ -355,11 +367,12 @@ class ManagementViewService:
             skipped_count=skipped_count,
         )
 
-    async def resume(self, session_id: str) -> ResumeResult:
+    async def resume(self, session_id: str, *, force: bool = False) -> ResumeResult:
         """Revalidate and select one Session from the current Workspace."""
+        self._ensure_active()
         workspace_state = self._workspace_state
-        switch_session = self._switch_session
-        if workspace_state is None or switch_session is None:
+        replace_session = self._replace_session
+        if workspace_state is None or replace_session is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
         sessions = await self.resumable_sessions()
         if session_id not in {summary.id for summary in sessions}:
@@ -369,22 +382,8 @@ class ManagementViewService:
                     "The selected Conversation Session is not resumable.",
                 )
             )
-        try:
-            session = Session.load(
-                workspace_state,
-                session_id,
-                partition=SessionStoragePartition.FOREGROUND,
-                now=self._now,
-            )
-        except (OSError, UnicodeError, ValueError) as error:
-            raise ManagementError(
-                ErrorInfo(
-                    "persistence_error",
-                    "The selected Conversation Session could not be loaded.",
-                )
-            ) from error
-        switch_session(session)
-        return ResumeResult(session_id=session.session_id)
+        await replace_session(session_id, force)
+        return ResumeResult(session_id=session_id)
 
 
 def _session_title(session: Session) -> str:

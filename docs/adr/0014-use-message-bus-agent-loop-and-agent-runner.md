@@ -102,6 +102,13 @@ remain. `ManagementPort` is unchanged.
 - Unbounded FIFOs provide no backpressure. This is accepted for the local single-user
   product and can be revisited only with a separate overload policy.
 
+## Amendment: Runtime Generation replacement (#172)
+
+Issue #172 supersedes only the earlier statement that `ManagementPort` is unchanged.
+Its `resume` operation may carry the Terminal-confirmed `force` flag to the outer
+Runtime Host. Management remains a Management-only boundary: it neither constructs
+Runtime components nor reaches into MessageBus internals.
+
 This decision supersedes the Conversation Port and Agent Event portions of ADR-0011
 and ADR-0013, and the ordinary no-retry and close-only persistence portions of
 ADR-0009. ADR-0010's fixed Tool catalog remains in force; only construction ownership

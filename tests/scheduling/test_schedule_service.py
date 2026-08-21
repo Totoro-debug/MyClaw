@@ -1164,6 +1164,93 @@ async def test_terminal_commit_keeps_job_active_until_store_operation_finishes(
 
 
 @pytest.mark.asyncio
+async def test_normal_close_awaits_an_in_flight_terminal_commit(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
+    await store.add_user_job(job)
+    original_commit_terminal = store.commit_terminal
+    commit_started = asyncio.Event()
+    release_commit = asyncio.Event()
+
+    async def blocked_commit_terminal(*args: object, **kwargs: object) -> ScheduleJob | None:
+        commit_started.set()
+        await release_commit.wait()
+        return await original_commit_terminal(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "commit_terminal", blocked_commit_terminal)
+    service = _service(
+        store=store,
+        callback=RecordingScheduleCallback(),
+        clock=ControlledClock(START),
+    )
+    service.start()
+    await commit_started.wait()
+
+    closing = asyncio.create_task(service.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    release_commit.set()
+    await closing
+
+    persisted = await store.snapshot()
+    assert persisted[0].state.last_status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_abort_cancels_an_in_flight_terminal_commit_without_losing_task_ownership(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    store = WorkspaceScheduleStore(state)
+    job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
+    await store.add_user_job(job)
+    commit_started = asyncio.Event()
+    commit_cancelled = asyncio.Event()
+    release_commit = asyncio.Event()
+    commit_finished = asyncio.Event()
+
+    async def blocked_commit_terminal(*args: object, **kwargs: object) -> ScheduleJob | None:
+        del args, kwargs
+        commit_started.set()
+        try:
+            await release_commit.wait()
+        except asyncio.CancelledError:
+            commit_cancelled.set()
+            raise
+        finally:
+            commit_finished.set()
+        raise AssertionError("aborted terminal commit was released instead of cancelled")
+
+    monkeypatch.setattr(store, "commit_terminal", blocked_commit_terminal)
+    service = _service(
+        store=store,
+        callback=RecordingScheduleCallback(),
+        clock=ControlledClock(START),
+    )
+
+    service.start()
+    await commit_started.wait()
+    owned_runs = tuple(service._run_tasks)
+    service.abort()
+    try:
+        await asyncio.wait_for(commit_cancelled.wait(), timeout=1)
+    finally:
+        release_commit.set()
+        await asyncio.wait_for(commit_finished.wait(), timeout=1)
+    await asyncio.gather(*owned_runs, return_exceptions=True)
+
+    assert await store.snapshot() == (job,)
+    assert not service._run_tasks
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancellation_keeps_at_job_pending(
     workspace: Path,
     agent_home: Path,

@@ -8,7 +8,7 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import prepare_runtime
+from myclaw.agent.runtime import RuntimeHost, prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -360,7 +360,7 @@ async def test_existing_session_turn_does_not_regenerate_its_title(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    runtime = prepare_runtime(
+    runtime = RuntimeHost(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -371,7 +371,7 @@ async def test_existing_session_turn_does_not_regenerate_its_title(
     await runtime.start()
     result = await runtime.management_dispatcher.resume(session.session_id)
     assert result.output == f"Resumed session {session.session_id}."
-    observed = await collect_foreground_outbound(runtime, "Continue this Session.")
+    observed = await collect_foreground_outbound(runtime.generation, "Continue this Session.")
     await asyncio.sleep(0)
 
     assert observed[-1].metadata == {"_streamed": True}
@@ -380,8 +380,8 @@ async def test_existing_session_turn_does_not_regenerate_its_title(
         str, provider.requests[0].messages[0]["content"]
     )
     assert "<tool_guidance>" in cast(str, provider.requests[0].messages[0]["content"])
-    assert runtime.session.metadata["title"] == "Existing title"
-    assert runtime.session.metadata["token_usage"] == {
+    assert runtime.generation.session.metadata["title"] == "Existing title"
+    assert runtime.generation.session.metadata["token_usage"] == {
         "model_calls": 2,
         "input_tokens": 3,
         "output_tokens": 2,

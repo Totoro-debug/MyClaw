@@ -9,7 +9,7 @@ import pytest
 from loguru import logger
 
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
+from myclaw.agent.runtime import PreparedRuntime, RuntimeHost, prepare_runtime
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.provider.models import (
@@ -464,38 +464,54 @@ async def test_runtime_shutdown_swallows_final_session_close_fault_after_router_
 
 
 @pytest.mark.asyncio
-async def test_runtime_close_releases_initial_and_resumed_sessions(
+async def test_runtime_replacement_abandons_old_and_normal_close_saves_target(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = _runtime(agent_home, workspace, RuntimeProvider(()))
-    initial = runtime.session
+    provider = RuntimeProvider(())
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    clock = FakeClock(NOW)
+    runtime = RuntimeHost(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=clock.now,
+        new_uuid=uuid4,
+        retry_clock=clock,
+    )
+    initial = runtime.generation.session
     target = Session.create(initial.workspace_state, now=lambda: NOW, new_uuid=uuid4)
     target.add_message("user", "Persisted target")
     target.close()
+    abandoned: list[str] = []
+    initial_abandon = initial.abandon
+
+    def abandon_initial() -> None:
+        abandoned.append(initial.session_id)
+        initial_abandon()
+
+    monkeypatch.setattr(initial, "abandon", abandon_initial)
 
     result = await runtime.management_dispatcher.resume(target.session_id)
     assert result.output == f"Resumed session {target.session_id}."
-    selected = runtime.session
+    selected = runtime.generation.session
     closed: list[str] = []
-    initial_close = initial.close
     selected_close = selected.close
-
-    def close_initial() -> None:
-        closed.append(initial.session_id)
-        initial_close()
 
     def close_selected() -> None:
         closed.append(selected.session_id)
         selected_close()
 
-    monkeypatch.setattr(initial, "close", close_initial)
     monkeypatch.setattr(selected, "close", close_selected)
 
     await runtime.close()
 
-    assert closed == [initial.session_id, selected.session_id]
+    assert abandoned == [initial.session_id]
+    assert closed == [selected.session_id]
 
 
 @pytest.mark.asyncio

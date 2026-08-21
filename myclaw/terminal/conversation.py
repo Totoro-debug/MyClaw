@@ -39,7 +39,7 @@ from textual.worker import Worker, WorkerError
 
 from myclaw.agent.loop import ConfirmationRequestView, TerminalAgentLoopControl
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
-from myclaw.agent.runtime import PreparedRuntime
+from myclaw.agent.runtime import PreparedRuntime, RuntimeBindings, RuntimeHost
 from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS, ManagementCommandResult
 from myclaw.management.service import SessionListingEntry
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
@@ -83,6 +83,15 @@ type _ControlAction = Literal["cancel_active_turn", "clear_draft", "drain_pendin
 type ConfirmationDecision = Literal["approved", "declined"]
 type _ToolRowStatus = Literal["running", "success", "error", "refused"]
 type _TerminalOutcome = Literal["completed", "cancelled", "failed"]
+
+
+class _ForceManagementDispatcher(Protocol):
+    async def resume(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+    ) -> ManagementCommandResult: ...
 
 
 class _DriverLifecycleHooks(Protocol):
@@ -417,6 +426,88 @@ class _SessionPickerScreen(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class _SessionSwitchConfirmationScreen(ModalScreen[bool]):
+    """Confirm replacing an active foreground Runtime Generation."""
+
+    CSS = """
+    _SessionSwitchConfirmationScreen {
+        align: center middle;
+        padding: 1 2;
+    }
+
+    #session-switch-panel {
+        width: 80%;
+        max-width: 72;
+        height: auto;
+        padding: 1 2;
+        border: round $warning;
+        background: $surface;
+    }
+
+    #session-switch-heading,
+    #session-switch-message {
+        width: 100%;
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #session-switch-heading {
+        text-style: bold;
+    }
+
+    #session-switch-actions {
+        width: 100%;
+        height: auto;
+        align: center middle;
+    }
+
+    #session-switch-actions Button {
+        margin: 0 1;
+        height: 3;
+    }
+    """
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("escape", "decline", "Decline", show=False),
+        Binding("ctrl+c", "decline", "Decline", show=False, priority=True),
+        Binding("left,up", "focus_decline", "Decline", show=False),
+        Binding("right,down", "focus_approve", "Approve", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__(id="session-switch-confirmation")
+
+    def compose(self) -> ComposeResult:
+        with Center():
+            with Vertical(id="session-switch-panel"):
+                yield Static("Switch Conversation Session?", id="session-switch-heading")
+                yield Static(
+                    "The active foreground run will be abandoned and its pending input discarded.",
+                    id="session-switch-message",
+                    markup=False,
+                )
+                with Horizontal(id="session-switch-actions"):
+                    yield Button("Decline", id="session-switch-decline")
+                    yield Button("Approve", variant="warning", id="session-switch-approve")
+
+    def on_mount(self) -> None:
+        self.query_one("#session-switch-decline", Button).focus()
+
+    @on(Button.Pressed)
+    def _button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.dismiss(event.button.id == "session-switch-approve")
+
+    def action_decline(self) -> None:
+        self.dismiss(False)
+
+    def action_focus_decline(self) -> None:
+        self.query_one("#session-switch-decline", Button).focus()
+
+    def action_focus_approve(self) -> None:
+        self.query_one("#session-switch-approve", Button).focus()
 
 
 class _MarkdownStream(Protocol):
@@ -1474,9 +1565,17 @@ class TerminalConversationApp(App[None]):
     """The two-region Textual application for one foreground Message Bus."""
 
     class ConfirmationRequested(Message):
-        def __init__(self, request: ConfirmationRequestView) -> None:
+        def __init__(
+            self,
+            request: ConfirmationRequestView,
+            *,
+            control: TerminalAgentLoopControl,
+            bus: MessageBus,
+        ) -> None:
             super().__init__()
             self.request = request
+            self.bound_control = control
+            self.bound_bus = bus
 
     CSS = """
     Screen {
@@ -1651,8 +1750,11 @@ class TerminalConversationApp(App[None]):
         start_runtime: Callable[[], Awaitable[None]],
         close_runtime: Callable[[], Awaitable[None]],
         monotonic: Callable[[], float] = monotonic_now,
+        runtime_host: RuntimeHost | None = None,
     ) -> None:
         super().__init__()
+        self._runtime_host = runtime_host
+        self._runtime_rebind_callback = self._rebind_runtime
         self._bus = bus
         self._control = control
         self._management_dispatcher = management_dispatcher
@@ -1672,6 +1774,7 @@ class TerminalConversationApp(App[None]):
         self._active_run_projection: _MessageBusRunProjection | None = None
         self._active_confirmation_id: UUID | None = None
         self._confirmation_result: asyncio.Future[ConfirmationDecision | None] | None = None
+        self._session_switch_result: asyncio.Future[bool | None] | None = None
         self._pending_inputs: deque[str] = deque()
         self._bus_snapshot: tuple[InboundMessage, ...] = ()
         self._consumed_runs: deque[_ConsumedRun] = deque()
@@ -1808,9 +1911,11 @@ class TerminalConversationApp(App[None]):
 
     async def on_mount(self) -> None:
         self._runtime_started = True
-        self._bus.set_inbound_changed_callback(self._on_inbound_snapshot)
+        if self._runtime_host is not None:
+            self._runtime_host.bind_terminal(self._runtime_rebind_callback)
+        self._bind_bus_callback(self._bus)
         self._bus_snapshot = await self._bus.inbound_snapshot()
-        self._control.bind_confirmation_callback(self._on_confirmation_requested)
+        self._bind_confirmation_callback(self._control, self._bus)
         await self._start_runtime()
         self._outbound_worker = self.run_worker(
             self._consume_outbound(),
@@ -1828,6 +1933,11 @@ class TerminalConversationApp(App[None]):
         confirmation_result = self._confirmation_result
         if confirmation_result is not None and not confirmation_result.done():
             confirmation_result.cancel()
+        session_switch_result = self._session_switch_result
+        if session_switch_result is not None and not session_switch_result.done():
+            session_switch_result.cancel()
+        if self._runtime_host is not None:
+            self._runtime_host.unbind_terminal(self._runtime_rebind_callback)
         self._bus.set_inbound_changed_callback(None)
         projection = self._active_run_projection
         self._active_run_projection = None
@@ -1876,6 +1986,103 @@ class TerminalConversationApp(App[None]):
                 "Additional Terminal Conversation cleanup failures",
                 cleanup_errors[1:],
             )
+
+    def _bind_bus_callback(self, bus: MessageBus) -> None:
+        def on_snapshot(snapshot: tuple[InboundMessage, ...]) -> None:
+            self._on_inbound_snapshot_for(bus, snapshot)
+
+        bus.set_inbound_changed_callback(on_snapshot)
+
+    def _bind_confirmation_callback(
+        self,
+        control: TerminalAgentLoopControl,
+        bus: MessageBus,
+    ) -> None:
+        def on_confirmation(request: ConfirmationRequestView) -> None:
+            self.post_message(
+                self.ConfirmationRequested(
+                    request,
+                    control=control,
+                    bus=bus,
+                )
+            )
+
+        control.bind_confirmation_callback(on_confirmation)
+
+    async def _stop_outbound_worker(self) -> None:
+        worker = self._outbound_worker
+        self._outbound_worker = None
+        if worker is None:
+            return
+        worker.cancel()
+        with suppress(WorkerError, CancelledError):
+            await worker.wait()
+
+    async def _clear_generation_projection(self) -> None:
+        self._pending_inputs.clear()
+        self._bus_snapshot = ()
+        active_projection = self._active_run_projection
+        if active_projection is not None:
+            active_projection.stop()
+        for run in self._consumed_runs:
+            run.projection.stop()
+        self._consumed_runs.clear()
+        self._run_ready = Event()
+        self._cancel_requested_turn = None
+        self._active_run_projection = None
+        self._active_confirmation_id = None
+        confirmation_result = self._confirmation_result
+        self._confirmation_result = None
+        if confirmation_result is not None and not confirmation_result.done():
+            confirmation_result.cancel()
+        if isinstance(self.screen, _ToolConfirmationScreen):
+            self.screen.dismiss("declined")
+        self._set_working(False)
+        self._refresh_pending_queue()
+        with suppress(NoMatches, NoScreen, ScreenStackError):
+            input_area = self.query_one("#conversation-input", _ConversationInput)
+            input_area.active_turn_token = None
+            input_area.read_only = False
+            input_area.text = ""
+        self._hide_command_completion()
+        display = self.query_one("#conversation-display", _ConversationDisplay)
+        await display.remove_children()
+
+    async def _rebind_runtime(self, bindings: RuntimeBindings) -> None:
+        """Replace all Terminal-owned generation seams before target display rebuild."""
+        if self._closing:
+            raise RuntimeError("Terminal Conversation is closing")
+        self._closing = True
+        old_bus = self._bus
+        old_bus.set_inbound_changed_callback(None)
+        await self._stop_outbound_worker()
+        await self._clear_generation_projection()
+
+        self._bus = bindings.bus
+        self._control = bindings.control
+        self._management_dispatcher = bindings.management_dispatcher
+        self._start_runtime = bindings.start
+        self._closing = False
+        try:
+            self._bind_bus_callback(self._bus)
+            self._bus_snapshot = await self._bus.inbound_snapshot()
+            self._bind_confirmation_callback(self._control, self._bus)
+            await self._start_runtime()
+            self._outbound_worker = self.run_worker(
+                self._consume_outbound(),
+                name="conversation-outbound",
+                group="conversation-outbound",
+                exclusive=True,
+                exit_on_error=False,
+            )
+            target_session_id = self._control.project_foreground_conversation().session_id
+            if not await self._replace_display_from_session(target_session_id):
+                raise RuntimeError(
+                    "Conversation Session authority changed during Runtime replacement"
+                )
+        except BaseException:
+            self._closing = True
+            raise
 
     @property
     def command_completion_visible(self) -> bool:
@@ -2126,13 +2333,23 @@ class TerminalConversationApp(App[None]):
         )
         self._refresh_pending_queue()
 
-    def _on_inbound_snapshot(self, snapshot: tuple[InboundMessage, ...]) -> None:
+    def _on_inbound_snapshot_for(
+        self,
+        bus: MessageBus,
+        snapshot: tuple[InboundMessage, ...],
+    ) -> None:
+        if bus is not self._bus or self._closing:
+            return
         previous = self._bus_snapshot
         self._bus_snapshot = snapshot
         removed = max(0, len(previous) - len(snapshot))
         if removed and not self._draining_inputs:
             self._promote_consumed_inputs(removed)
         self._refresh_pending_queue()
+
+    def _on_inbound_snapshot(self, snapshot: tuple[InboundMessage, ...]) -> None:
+        """Keep the direct test seam generation-bound as well as the host seam."""
+        self._on_inbound_snapshot_for(self._bus, snapshot)
 
     def _promote_consumed_inputs(self, count: int) -> None:
         promoted = False
@@ -2244,21 +2461,42 @@ class TerminalConversationApp(App[None]):
     def _on_confirmation_requested(self, request: ConfirmationRequestView) -> None:
         if self._closing:
             return
-        self.post_message(self.ConfirmationRequested(request))
+        self.post_message(
+            self.ConfirmationRequested(
+                request,
+                control=self._control,
+                bus=self._bus,
+            )
+        )
 
     @on(ConfirmationRequested)
     def _confirmation_requested(self, message: ConfirmationRequested) -> None:
         self.run_worker(
-            self._request_confirmation(message.request),
+            self._request_confirmation(
+                message.request,
+                message.bound_control,
+                message.bound_bus,
+            ),
             name="tool-confirmation",
             group="tool-confirmation",
             exclusive=True,
             exit_on_error=False,
         )
 
-    async def _request_confirmation(self, request: ConfirmationRequestView) -> None:
+    async def _request_confirmation(
+        self,
+        request: ConfirmationRequestView,
+        control: TerminalAgentLoopControl,
+        bus: MessageBus,
+    ) -> None:
+        if self._closing or control is not self._control or bus is not self._bus:
+            return
         if self._active_confirmation_id is not None:
-            self._respond_to_confirmation_if_pending(request.confirmation_id, "declined")
+            self._respond_to_confirmation_if_pending(
+                request.confirmation_id,
+                "declined",
+                control=control,
+            )
             return
         self._active_confirmation_id = request.confirmation_id
         input_area = self.query_one("#conversation-input", _ConversationInput)
@@ -2287,15 +2525,21 @@ class TerminalConversationApp(App[None]):
                     self._respond_to_confirmation_if_pending(
                         request.confirmation_id,
                         "declined",
+                        control=control,
                     )
             raise
         else:
-            self._respond_to_confirmation_if_pending(request.confirmation_id, decision)
+            self._respond_to_confirmation_if_pending(
+                request.confirmation_id,
+                decision,
+                control=control,
+            )
         finally:
             input_area.read_only = input_was_read_only
             if result is not None and self._confirmation_result is result:
                 self._confirmation_result = None
-            self._bus_snapshot = await self._bus.inbound_snapshot()
+            if bus is self._bus:
+                self._bus_snapshot = await bus.inbound_snapshot()
             self._refresh_pending_queue()
             if self._active_confirmation_id == request.confirmation_id:
                 self._active_confirmation_id = None
@@ -2304,9 +2548,12 @@ class TerminalConversationApp(App[None]):
         self,
         confirmation_id: UUID,
         decision: ConfirmationDecision,
+        *,
+        control: TerminalAgentLoopControl | None = None,
     ) -> bool:
         try:
-            self._control.respond_to_confirmation(confirmation_id, decision)
+            target_control = self._control if control is None else control
+            target_control.respond_to_confirmation(confirmation_id, decision)
         except ValueError:
             return False
         return True
@@ -2608,18 +2855,52 @@ class TerminalConversationApp(App[None]):
             exit_on_error=False,
         )
 
+    async def _confirm_active_session_switch(self) -> bool:
+        if self._session_switch_result is not None:
+            return False
+        await self._viable_size.wait()
+        result = asyncio.get_running_loop().create_future()
+        self._session_switch_result = result
+
+        def on_dismissed(value: bool | None) -> None:
+            if not result.done():
+                result.set_result(value)
+
+        try:
+            await self.push_screen(
+                _SessionSwitchConfirmationScreen(),
+                callback=on_dismissed,
+            )
+            return (await result) is True
+        finally:
+            if self._session_switch_result is result:
+                self._session_switch_result = None
+
     async def _resume_selected_session(
         self,
         session_id: str,
         input_area: _ConversationInput,
     ) -> None:
         try:
+            if self._control.project_foreground_conversation().session_id == session_id:
+                return
             dispatcher = self._management_dispatcher
             if dispatcher is None:
                 await self._mount_management_rows("/resume", "Session resume is unavailable.")
                 return
+            force = False
+            if self._control.has_active_run:
+                if not await self._confirm_active_session_switch():
+                    return
+                force = True
             try:
-                result = cast(ManagementCommandResult, await dispatcher.resume(session_id))
+                if force:
+                    result = await cast(_ForceManagementDispatcher, dispatcher).resume(
+                        session_id,
+                        force=True,
+                    )
+                else:
+                    result = cast(ManagementCommandResult, await dispatcher.resume(session_id))
             except Exception:
                 await self._mount_management_rows("/resume", "Session resume failed.")
                 return
@@ -2632,6 +2913,8 @@ class TerminalConversationApp(App[None]):
                     "/resume",
                     "Session resume did not select the requested Conversation Session.",
                 )
+                return
+            if self._runtime_host is not None:
                 return
             if not await self._replace_display_from_session(resumed_session_id):
                 await self._mount_management_rows(
@@ -3072,12 +3355,23 @@ def is_interactive_terminal() -> bool:
     )
 
 
-def run_terminal_conversation(runtime: PreparedRuntime) -> None:
+def run_terminal_conversation(runtime: PreparedRuntime | RuntimeHost) -> None:
     """Run a Terminal Conversation application around a prepared Runtime."""
     if not is_interactive_terminal():
         raise TerminalConversationError(
             "Terminal Conversation requires interactive stdin, stdout, and stderr TTYs."
         )
+    if isinstance(runtime, RuntimeHost):
+        bindings = runtime.bindings
+        TerminalConversationApp(
+            bus=bindings.bus,
+            control=bindings.control,
+            management_dispatcher=bindings.management_dispatcher,
+            start_runtime=runtime.start,
+            close_runtime=runtime.close,
+            runtime_host=runtime,
+        ).run()
+        return
     TerminalConversationApp(
         bus=runtime.bus,
         control=runtime.control,

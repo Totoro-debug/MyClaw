@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar, Literal, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 from xml.etree import ElementTree
 
 import pytest
@@ -32,7 +32,9 @@ from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 from myclaw.agent.loop import ConfirmationRequestView, ForegroundConversationProjection
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import PreparedRuntime
+from myclaw.agent.runtime import PreparedRuntime, RuntimeHost
+from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigLoader
 from myclaw.management.commands import ManagementCommandResult
 from myclaw.provider.models import (
     ModelCompleted,
@@ -60,12 +62,14 @@ from myclaw.tools.tool_gateway import (
 )
 from myclaw.utils.json_types import JsonObject
 from tests.agent.test_fixed_catalog_runtime import (
+    _BlockingClock,
     _response,
     _RuntimeProvider,
 )
 from tests.agent.test_fixed_catalog_runtime import (
     _runtime as _prepared_runtime,
 )
+from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ProviderCall
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
@@ -809,11 +813,12 @@ def _runtime(
 
 
 def _terminal_app(
-    runtime: PreparedRuntime,
+    runtime: PreparedRuntime | RuntimeHost,
     *,
     app_type: type[TerminalConversationApp] = TerminalConversationApp,
     monotonic: Callable[[], float] | None = None,
 ) -> TerminalConversationApp:
+    runtime_host = runtime if isinstance(runtime, RuntimeHost) else None
     if monotonic is None:
         return app_type(
             bus=runtime.bus,
@@ -821,6 +826,7 @@ def _terminal_app(
             management_dispatcher=runtime.management_dispatcher,
             start_runtime=runtime.start,
             close_runtime=runtime.close,
+            runtime_host=runtime_host,
         )
     return app_type(
         bus=runtime.bus,
@@ -829,6 +835,33 @@ def _terminal_app(
         start_runtime=runtime.start,
         close_runtime=runtime.close,
         monotonic=monotonic,
+        runtime_host=runtime_host,
+    )
+
+
+class _GenerationHost(RuntimeHost):
+    @property
+    def session(self) -> Session:
+        return self.generation.session
+
+
+def _generation_host(
+    agent_home: Path,
+    workspace: Path,
+    provider: _RuntimeProvider,
+) -> _GenerationHost:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    return _GenerationHost(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        memory_scheduler_clock=_BlockingClock(),
+        schedule_scheduler_clock=_BlockingClock(),
     )
 
 
@@ -4374,7 +4407,7 @@ async def test_empty_resume_picker_cancellation_preserves_existing_management_ro
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     app = _terminal_app(runtime)
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -4405,7 +4438,7 @@ async def test_resume_opens_a_picker_with_title_and_local_update_time(
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     older = Session.create(
         runtime.session.workspace_state,
         now=lambda: NOW.replace(hour=10),
@@ -4444,7 +4477,7 @@ async def test_resume_selection_rebuilds_the_display_from_the_selected_session(
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     target = Session.create(
         runtime.session.workspace_state,
         now=lambda: NOW,
@@ -4601,7 +4634,7 @@ async def test_resume_rebuilds_a_successful_tool_run_activity_group(
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(10))
     target = Session.create(
         runtime.session.workspace_state,
@@ -4683,7 +4716,7 @@ async def test_resume_groups_a_recognizable_tool_result_after_the_final_response
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(10))
     target = Session.create(
         runtime.session.workspace_state,
@@ -4763,7 +4796,7 @@ async def test_resume_uses_the_last_completed_no_tool_assistant_as_final_respons
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(12))
     target = Session.create(
         runtime.session.workspace_state,
@@ -4880,7 +4913,7 @@ async def test_resume_expands_cancelled_and_failed_activity_groups(
     expected_status: str,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(8))
     target = Session.create(
         runtime.session.workspace_state,
@@ -4956,7 +4989,7 @@ async def test_resume_keeps_unknown_outcome_expanded_without_inventing_status(
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(6))
     target = Session.create(
         runtime.session.workspace_state,
@@ -5009,7 +5042,7 @@ async def test_resume_clamps_reversed_historical_duration_to_zero(
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     target = Session.create(
         runtime.session.workspace_state,
         now=lambda: NOW,
@@ -5056,7 +5089,7 @@ async def test_resume_keeps_pre_user_messages_and_unclassifiable_runs_flat(
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     target = Session.create(
         runtime.session.workspace_state,
         now=lambda: NOW,
@@ -5122,7 +5155,7 @@ async def test_resume_picker_cancellation_and_outside_click_preserve_current_dis
     cancel_key: str,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     initial_session_id = runtime.session.session_id
     target = Session.create(
         runtime.session.workspace_state,
@@ -5171,7 +5204,7 @@ async def test_resume_picker_mouse_selection_switches_to_the_clicked_session(
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     target = Session.create(
         runtime.session.workspace_state,
         now=lambda: NOW,
@@ -5204,7 +5237,7 @@ async def test_resume_failure_after_a_stale_listing_preserves_the_current_displa
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     initial_session_id = runtime.session.session_id
     target = Session.create(
         runtime.session.workspace_state,
@@ -5245,7 +5278,7 @@ async def test_resume_picker_scrolls_in_management_order_and_selects_by_keyboard
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     sessions: list[Session] = []
     for index in range(24):
         session_now = NOW.replace(minute=index)
@@ -5292,7 +5325,7 @@ async def test_resume_picker_reports_corrupt_entries_without_mutating_them(
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     target = Session.create(
         runtime.session.workspace_state,
         now=lambda: NOW,
@@ -5336,7 +5369,7 @@ async def test_resume_listing_failure_preserves_session_and_existing_display(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     initial_session = runtime.session
     original_dispatch = runtime.management_dispatcher.dispatch
 
@@ -5346,7 +5379,7 @@ async def test_resume_listing_failure_preserves_session_and_existing_display(
                 handled=True,
                 output="persistence_error: Conversation Sessions could not be listed.",
             )
-        return cast(ManagementCommandResult, await original_dispatch(command))
+        return await original_dispatch(command)
 
     monkeypatch.setattr(runtime.management_dispatcher, "dispatch", dispatch_with_listing_failure)
     app = _terminal_app(runtime)
@@ -5374,7 +5407,7 @@ async def test_resume_requires_result_and_runtime_authority_to_agree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     initial_session = runtime.session
     target = Session.create(
         runtime.session.workspace_state,
@@ -5421,7 +5454,7 @@ async def test_unexpected_resume_exception_preserves_session_display_and_interac
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     initial_session = runtime.session
     target = Session.create(
         runtime.session.workspace_state,
@@ -5469,7 +5502,7 @@ async def test_resume_selection_serializes_input_until_rebuild_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     target = Session.create(
         runtime.session.workspace_state,
         now=lambda: NOW,
@@ -5480,12 +5513,20 @@ async def test_resume_selection_serializes_input_until_rebuild_finishes(
     target.close()
     resume_started = asyncio.Event()
     continue_resume = asyncio.Event()
+    resume_finished = asyncio.Event()
+    resume_errors: list[BaseException] = []
     original_resume = runtime.management_dispatcher.resume
 
     async def delayed_resume(session_id: str) -> ManagementCommandResult:
         resume_started.set()
         await continue_resume.wait()
-        return cast(ManagementCommandResult, await original_resume(session_id))
+        try:
+            return await original_resume(session_id)
+        except BaseException as error:
+            resume_errors.append(error)
+            raise
+        finally:
+            resume_finished.set()
 
     monkeypatch.setattr(runtime.management_dispatcher, "resume", delayed_resume)
     app = _terminal_app(runtime)
@@ -5505,8 +5546,14 @@ async def test_resume_selection_serializes_input_until_rebuild_finishes(
         assert app.screen.id == "_default"
 
         continue_resume.set()
+        await asyncio.wait_for(resume_finished.wait(), timeout=1)
+        assert resume_errors == []
         async with asyncio.timeout(2):
-            while runtime.session.session_id != target.session_id or input_area.read_only:
+            while (
+                runtime.session.session_id != target.session_id
+                or input_area.read_only
+                or "Delayed restored content." not in _visible_screen_text(app)
+            ):
                 await pilot.pause()
 
         assert "Delayed restored content." in _visible_screen_text(app)
@@ -5522,7 +5569,7 @@ async def test_resumed_long_history_starts_latest_and_preserves_runtime_input_hi
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _generation_host(agent_home, workspace, provider)
     target = Session.create(
         runtime.session.workspace_state,
         now=lambda: NOW,

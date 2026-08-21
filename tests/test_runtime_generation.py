@@ -1,0 +1,583 @@
+import asyncio
+from collections.abc import AsyncIterator, Sequence
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import cast
+from uuid import uuid4
+
+import pytest
+
+import myclaw.agent.runtime as runtime_module
+from myclaw.agent.message_bus import InboundMessage, OutboundMessage
+from myclaw.agent.runtime import RuntimeHost
+from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigLoader
+from myclaw.management.commands import ManagementCommandDispatcher
+from myclaw.management.service import SessionListingEntry
+from myclaw.provider.models import ModelContinuation, ModelStreamEvent, ReasoningEffort
+from myclaw.session.session import Session
+from myclaw.terminal.conversation import TerminalConversationApp
+from myclaw.tools.base import OpenAIToolSchema
+from tests.configuration.test_config import VALID_CONFIG
+from tests.fixtures import FakeClock
+from tests.test_runtime_active_session import RuntimeProvider
+
+LOCAL_OFFSET = timezone(timedelta(hours=8))
+NOW = datetime(2026, 8, 22, 10, 20, 30, 123000, tzinfo=LOCAL_OFFSET)
+
+
+class GatedProvider(RuntimeProvider):
+    def __init__(self) -> None:
+        super().__init__(())
+        self.stream_started = asyncio.Event()
+        self.release_stream = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+        self.close_finished = asyncio.Event()
+
+    async def stream(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+        continuation: ModelContinuation | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        self.stream_started.set()
+        await self.release_stream.wait()
+        async for event in super().stream(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_output=max_output,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+            continuation=continuation,
+        ):
+            yield event
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await self.release_close.wait()
+        self.close_finished.set()
+
+
+def _host(
+    agent_home: Path,
+    workspace: Path,
+    provider: RuntimeProvider,
+) -> RuntimeHost:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    clock = FakeClock(NOW)
+    return RuntimeHost(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=clock.now,
+        new_uuid=uuid4,
+        retry_clock=clock,
+    )
+
+
+@pytest.mark.asyncio
+async def test_target_generation_preparation_failure_preserves_old_generation(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    old_session = old.session
+    old_bus = old.bus
+    target = Session.create(
+        old_session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    target.add_message("user", "Persisted target")
+    target.close()
+
+    def fail_target_context(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("target validation failed")
+
+    monkeypatch.setattr(runtime_module, "ContextBuilder", fail_target_context)
+
+    result = await host.management_dispatcher.resume(target.session_id)
+
+    assert result.output == ("persistence_error: Conversation Session could not be prepared.")
+    assert host.generation is old
+    assert host.generation.session is old_session
+    assert host.generation.bus is old_bus
+    old_session.add_message("user", "Old generation remains usable")
+
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_target_scheduler_preflight_failure_preserves_the_started_old_generation(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    await host.start()
+    old = host.generation
+    old_bus = old.bus
+    old_consumer = old.agent_loop._consumer_task
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Target whose scheduler cannot be prepared")
+    target.close()
+
+    def fail_scheduler_construction(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("target scheduler validation failed")
+
+    monkeypatch.setattr(runtime_module, "MemoryTaskScheduler", fail_scheduler_construction)
+
+    result = await host.management_dispatcher.resume(target.session_id)
+
+    assert result.output == "persistence_error: Conversation Session could not be prepared."
+    assert host.generation is old
+    assert host.bus is old_bus
+    assert old.agent_loop._consumer_task is old_consumer
+    assert old_consumer is not None and not old_consumer.done()
+    await old_bus.put_inbound(InboundMessage(content="old generation remains live"))
+
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_abort_interrupts_an_in_progress_normal_close_before_final_session_save(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    runtime = host.generation
+    runtime.session.add_message("user", "Must not be saved by an aborted close")
+    session_path = (
+        runtime.session.workspace_state.sessions_directory / f"{runtime.session.session_id}.jsonl"
+    )
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def blocked_schedule_close() -> None:
+        close_started.set()
+        await release_close.wait()
+
+    monkeypatch.setattr(runtime.schedule_service, "close", blocked_schedule_close)
+    closing = asyncio.create_task(runtime.close())
+    await close_started.wait()
+
+    runtime.abort()
+    assert runtime._lifetime.close_task is not None
+    assert runtime._lifetime.close_task.cancelling()
+    release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    await runtime.close()
+    assert not session_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_pending_only_resume_replaces_every_generation_owned_component(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    old_bus = old.bus
+    old_components = (
+        old.agent_loop,
+        old.schedule_service,
+        old._schedule_store,
+        old._router,
+        old._runtime_memory,
+        old._memory_manager,
+        old._memory_scheduler,
+        old.agent_loop._tool_gateway,
+        old.agent_loop._runner,
+        old._management_service,
+        old.management_dispatcher,
+        tuple(old.agent_loop._tool_gateway._tools.values()),
+    )
+    await old_bus.put_inbound(InboundMessage(content="discard this pending input"))
+
+    target = Session.create(
+        old.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    target.add_message("user", "Persisted target")
+    target.close()
+
+    result = await host.management_dispatcher.resume(target.session_id)
+    assert result.resumed_session_id == target.session_id
+    replacement = host.generation
+
+    assert replacement is not old
+    assert replacement.session_id == target.session_id
+    replacement_components = (
+        replacement.agent_loop,
+        replacement.schedule_service,
+        replacement._schedule_store,
+        replacement._router,
+        replacement._runtime_memory,
+        replacement._memory_manager,
+        replacement._memory_scheduler,
+        replacement.agent_loop._tool_gateway,
+        replacement.agent_loop._runner,
+        replacement._management_service,
+        replacement.management_dispatcher,
+        tuple(replacement.agent_loop._tool_gateway._tools.values()),
+    )
+    assert replacement.bus is not old_bus
+    assert all(
+        new is not previous
+        for new, previous in zip(replacement_components, old_components, strict=True)
+    )
+    assert all(
+        new_tool is not old_tool
+        for new_tool, old_tool in zip(replacement_components[-1], old_components[-1], strict=True)
+    )
+
+    assert replacement.session.workspace_state is old.session.workspace_state
+    assert replacement.session.workspace_state is host._workspace_state
+    assert replacement._router._configuration is old._router._configuration is host._configuration
+    assert replacement._router._provider_factory is host._provider_factory
+    assert old._router._provider_factory is host._provider_factory
+    assert replacement._router._clock is old._router._clock is host._retry_clock
+    assert replacement.schedule_service._clock is host._schedule_scheduler_clock
+    assert old.schedule_service._clock is host._schedule_scheduler_clock
+    assert replacement._memory_scheduler._active is not None
+    assert old._memory_scheduler._active is not None
+    assert replacement._memory_scheduler._active._clock is host._memory_scheduler_clock
+    assert old._memory_scheduler._active._clock is host._memory_scheduler_clock
+    assert replacement._context_builder._workspace is host._workspace
+    assert old._context_builder._workspace is host._workspace
+    assert str(replacement._context_builder._timezone) == host._timezone_name
+    assert str(old._context_builder._timezone) == host._timezone_name
+    assert host._new_uuid is uuid4
+    for generation in (old, replacement):
+        assert generation.session._now is host._now
+        assert generation.agent_loop._now is host._now
+        assert generation._context_builder._clock is host._now
+        assert generation._management_service._now is host._now
+        assert generation._management_service._config.agent_home is host._agent_home
+        status_service = generation._management_service._status_service
+        assert status_service is not None
+        assert status_service._monotonic is host._monotonic_now
+    assert await old_bus.inbound_snapshot() == ()
+    with pytest.raises(RuntimeError, match="no longer active"):
+        _ = old.agent_loop.bus
+    with pytest.raises(RuntimeError, match="no longer active"):
+        _ = old.control.has_active_run
+    old_management = await old.management_dispatcher.dispatch("/status")
+    assert old_management.output == "route_unavailable: Runtime Generation is no longer active."
+    await old_bus.put_inbound(InboundMessage(content="late old input"))
+    assert await old_bus.inbound_snapshot() == (InboundMessage(content="late old input"),)
+    with pytest.raises(RuntimeError, match="abandoned"):
+        old.session.add_message("user", "old generation is detached")
+
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_rebinds_once_and_rebuilds_the_target_session(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    old_bus = old.bus
+    target = Session.create(
+        old.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    target.add_message("user", "Target display")
+    target.close()
+
+    app = TerminalConversationApp(
+        bus=host.bus,
+        control=host.control,
+        management_dispatcher=host.management_dispatcher,
+        start_runtime=host.start,
+        close_runtime=host.close,
+        runtime_host=host,
+    )
+    rebuilds: list[str] = []
+    original_rebuild = app._replace_display_from_session
+
+    async def record_rebuild(session_id: str) -> bool:
+        rebuilds.append(session_id)
+        return await original_rebuild(session_id)
+
+    app._replace_display_from_session = record_rebuild  # type: ignore[assignment]
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        async with asyncio.timeout(2):
+            while app.screen.id != "session-picker":
+                await pilot.pause()
+        await pilot.press("enter")
+        async with asyncio.timeout(2):
+            while host.generation.session_id != target.session_id or app._bus is old_bus:
+                await pilot.pause()
+
+        assert app._bus is host.bus
+        assert app._control is host.control
+        messages = app.query_one("#conversation-display").query(".user-message")
+        assert messages
+        assert any("Target display" in str(getattr(message, "content", "")) for message in messages)
+        assert rebuilds == [target.session_id]
+
+    assert old_bus is not host.bus
+
+
+@pytest.mark.asyncio
+async def test_concurrent_old_generation_resume_requests_cannot_replace_the_new_generation(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    targets: list[Session] = []
+    for content in ("First target", "Second target"):
+        target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+        target.add_message("user", content)
+        target.close()
+        targets.append(target)
+
+    original_listing = old._management_service.resumable_sessions
+    listing_call_count = 0
+    both_listings_started = asyncio.Event()
+    release_listings = asyncio.Event()
+
+    async def gated_listing() -> tuple[SessionListingEntry, ...]:
+        nonlocal listing_call_count
+        listing = await original_listing()
+        listing_call_count += 1
+        if listing_call_count == 2:
+            both_listings_started.set()
+        await release_listings.wait()
+        return listing
+
+    monkeypatch.setattr(old._management_service, "resumable_sessions", gated_listing)
+    dispatcher = cast(ManagementCommandDispatcher, old.management_dispatcher)
+    requests = tuple(
+        asyncio.create_task(dispatcher.resume(target.session_id)) for target in targets
+    )
+    await both_listings_started.wait()
+    release_listings.set()
+    results = await asyncio.gather(*requests)
+
+    successes = [result for result in results if result.resumed_session_id is not None]
+    assert len(successes) == 1
+    assert host.generation.session_id == successes[0].resumed_session_id
+    assert any(
+        result.output == "route_unavailable: Runtime Generation is no longer active."
+        for result in results
+    )
+
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_an_in_progress_replacement_and_closes_the_committed_target(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Committed before close")
+    target.close()
+    rebind_started = asyncio.Event()
+    release_rebind = asyncio.Event()
+
+    async def gated_rebind(bindings: runtime_module.RuntimeBindings) -> None:
+        rebind_started.set()
+        await release_rebind.wait()
+        await bindings.start()
+
+    host.bind_terminal(gated_rebind)
+    replacement = asyncio.create_task(host.management_dispatcher.resume(target.session_id))
+    await rebind_started.wait()
+    closing = asyncio.create_task(host.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+
+    release_rebind.set()
+    result = await replacement
+    await closing
+
+    assert result.resumed_session_id == target.session_id
+    assert host.generation.session_id == target.session_id
+    assert host._closed
+    assert host.generation.session._closed
+
+
+@pytest.mark.asyncio
+async def test_active_same_session_resume_is_a_no_op_without_confirmation_or_rebuild(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = GatedProvider()
+    host = _host(agent_home, workspace, provider)
+    old = host.generation
+    old.session.add_message("user", "Persist the current Session")
+    old.session.persist()
+    pending_persist = old.session._pending_persist
+    assert pending_persist is not None
+    await pending_persist
+
+    app = TerminalConversationApp(
+        bus=host.bus,
+        control=host.control,
+        management_dispatcher=host.management_dispatcher,
+        start_runtime=host.start,
+        close_runtime=host.close,
+        runtime_host=host,
+    )
+    async with app.run_test(size=(80, 24)) as pilot:
+        try:
+            await pilot.press(*list("active work"), "enter")
+            await asyncio.wait_for(provider.stream_started.wait(), timeout=2)
+            await pilot.press(*list("/resume"), "enter")
+            async with asyncio.timeout(2):
+                while app.screen.id != "session-picker":
+                    await pilot.pause()
+            await pilot.press("enter")
+            async with asyncio.timeout(2):
+                while (
+                    app._resume_worker is not None
+                    and not app._resume_worker.is_finished
+                    and app.screen.id != "session-switch-confirmation"
+                ):
+                    await pilot.pause()
+
+            assert app.screen.id != "session-switch-confirmation"
+            assert app._resume_worker is not None and app._resume_worker.is_finished
+            assert host.generation is old
+            assert app._bus is old.bus
+            assert any(
+                "active work" in str(getattr(message, "content", ""))
+                for message in app.query(".user-message")
+            )
+        finally:
+            provider.release_stream.set()
+            provider.release_close.set()
+
+
+@pytest.mark.asyncio
+async def test_active_resume_decline_keeps_the_old_generation_untouched(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = GatedProvider()
+    host = _host(agent_home, workspace, provider)
+    old = host.generation
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Decline target")
+    target.close()
+
+    app = TerminalConversationApp(
+        bus=host.bus,
+        control=host.control,
+        management_dispatcher=host.management_dispatcher,
+        start_runtime=host.start,
+        close_runtime=host.close,
+        runtime_host=host,
+    )
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("active work"), "enter")
+        await asyncio.wait_for(provider.stream_started.wait(), timeout=2)
+        old_bus = app._bus
+        await pilot.press(*list("/resume"), "enter")
+        async with asyncio.timeout(2):
+            while app.screen.id != "session-picker":
+                await pilot.pause()
+        await pilot.press("enter")
+        async with asyncio.timeout(2):
+            while app.screen.id != "session-switch-confirmation":
+                await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert host.generation is old
+        assert app._bus is old_bus
+        assert not provider.release_stream.is_set()
+        old.session.add_message("user", "Old generation is still usable")
+
+        provider.release_stream.set()
+        provider.release_close.set()
+
+
+@pytest.mark.asyncio
+async def test_active_resume_approval_detaches_without_waiting_for_provider_close(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = GatedProvider()
+    host = _host(agent_home, workspace, provider)
+    old = host.generation
+    old_bus = old.bus
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Approve target")
+    target.close()
+
+    app = TerminalConversationApp(
+        bus=host.bus,
+        control=host.control,
+        management_dispatcher=host.management_dispatcher,
+        start_runtime=host.start,
+        close_runtime=host.close,
+        runtime_host=host,
+    )
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("active work"), "enter")
+        await asyncio.wait_for(provider.stream_started.wait(), timeout=2)
+        await pilot.press(*list("/resume"), "enter")
+        async with asyncio.timeout(2):
+            while app.screen.id != "session-picker":
+                await pilot.pause()
+        await pilot.press("enter")
+        async with asyncio.timeout(2):
+            while app.screen.id != "session-switch-confirmation":
+                await pilot.pause()
+        await pilot.press("right", "enter")
+
+        async with asyncio.timeout(2):
+            while host.generation is old:
+                await pilot.pause()
+        assert host.generation.session_id == target.session_id
+        await asyncio.wait_for(provider.close_started.wait(), timeout=2)
+        assert not provider.close_finished.is_set()
+        assert app._bus is host.bus
+        assert app._bus is not old_bus
+        await old_bus.put_outbound(
+            OutboundMessage(
+                type="model_response",
+                content="late old output",
+                metadata={"_streamed": True},
+            )
+        )
+        await pilot.pause()
+        assert all(
+            "late old output" not in str(getattr(message, "content", ""))
+            for message in app.query(".assistant-message")
+        )
+
+        provider.release_close.set()
+        await asyncio.wait_for(provider.close_finished.wait(), timeout=2)

@@ -392,7 +392,6 @@ class Session:
         for pending in pending_tasks:
             if not pending.done():
                 pending.cancel()
-        self._persist_tasks.clear()
 
     def _serialized_state(self) -> bytes:
         header = {

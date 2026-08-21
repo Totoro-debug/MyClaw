@@ -203,9 +203,9 @@ class AgentLoop:
         self._runner = AgentRunner(model_router)
         self._max_iterations = max_iterations
         self._bus = MessageBus()
-        self._owned_sessions = [session]
         self._consumer_task: asyncio.Task[None] | None = None
         self._execution_task: asyncio.Task[None] | None = None
+        self._aborted_tasks: set[asyncio.Task[Any]] = set()
         self._execution_ready: asyncio.Event | None = None
         self._title_work: dict[str, _TitleWork] = {}
         self._pending_confirmation: _PendingConfirmation | None = None
@@ -213,10 +213,13 @@ class AgentLoop:
         self._cancel_requested = False
         self._closing = False
         self._closed = False
+        self._aborted = False
         self._last_foreground_route_status: ModelRouteStatus | None = None
 
     @property
     def bus(self) -> MessageBus:
+        if self._aborted:
+            raise RuntimeError("Agent Loop is no longer active")
         return self._bus
 
     @property
@@ -237,16 +240,22 @@ class AgentLoop:
 
     @property
     def has_active_run(self) -> bool:
+        if self._aborted:
+            raise RuntimeError("Agent Loop is no longer active")
         task = self._execution_task
         return task is not None and not task.done()
 
     @property
     def has_pending_confirmation(self) -> bool:
+        if self._aborted:
+            raise RuntimeError("Agent Loop is no longer active")
         pending = self._pending_confirmation
         return pending is not None and not pending.future.done()
 
     def project_foreground_conversation(self) -> ForegroundConversationProjection:
         """Return presentation data without exposing the owned Session."""
+        if self._aborted:
+            raise RuntimeError("Agent Loop is no longer active")
         return ForegroundConversationProjection(
             session_id=self._session.session_id,
             messages=tuple(deepcopy(message) for message in self._session.messages),
@@ -256,20 +265,30 @@ class AgentLoop:
         """Bind the synchronous foreground confirmation callback exactly once."""
         if self._confirmation_callback is not None:
             raise RuntimeError("Agent Loop confirmation callback is already bound")
-        if self._closed:
+        if self._closed or self._aborted:
             raise RuntimeError("Agent Loop is closed")
         if not callable(callback):
             raise TypeError("confirmation callback must be callable")
         self._confirmation_callback = callback
 
     async def start(self) -> None:
-        if self._closed:
+        self._prepare_start()
+        self._activate_prepared()
+
+    def _prepare_start(self) -> None:
+        """Validate activation without creating the foreground consumer task."""
+        if self._closed or self._aborted:
             raise RuntimeError("Agent Loop is closed")
+
+    def _activate_prepared(self) -> None:
+        """Activate a preflighted Loop using only infallible task creation."""
         if self._consumer_task is not None:
             return
         self._consumer_task = asyncio.create_task(self._consume_foreground())
 
     async def close(self) -> None:
+        if self._aborted:
+            return
         if self._closed:
             return
         self._closing = True
@@ -293,16 +312,60 @@ class AgentLoop:
         self._title_work.clear()
         self._closed = True
 
+    def abort(self) -> None:
+        """Synchronously detach this generation without persistence or repair."""
+        if self._aborted:
+            return
+        self._aborted = True
+        self._closing = True
+        self._cancel_pending_confirmation()
+        self._confirmation_callback = None
+        self._bus._detach_inbound()
+
+        for task in (self._consumer_task, self._execution_task):
+            self._retain_aborted_task(task)
+        for work in tuple(self._title_work.values()):
+            self._retain_aborted_task(work.task)
+        self._consumer_task = None
+        self._execution_task = None
+        self._execution_ready = None
+        self._title_work.clear()
+
+        try:
+            self._session.abandon()
+        except BaseException:
+            pass
+        self._closed = True
+
+    def _retain_aborted_task(self, task: asyncio.Task[Any] | None) -> None:
+        if task is None or task.done():
+            return
+        self._aborted_tasks.add(task)
+        task.add_done_callback(self._aborted_task_finished)
+        task.cancel()
+
+    def _aborted_task_finished(self, task: asyncio.Task[Any]) -> None:
+        self._aborted_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except BaseException as error:
+            logger.warning(
+                "Aborted Agent Loop task failed type={}",
+                type(error).__name__,
+            )
+
     def _close_sessions(self) -> None:
-        """Close every foreground Session retained across compatibility switches."""
-        for session in self._owned_sessions:
-            try:
-                session.close()
-            except BaseException:
-                pass
-        self._owned_sessions.clear()
+        """Close the foreground Session during normal awaited Runtime shutdown."""
+        try:
+            self._session.close()
+        except BaseException:
+            pass
 
     async def cancel_active_run(self) -> None:
+        if self._aborted:
+            raise RuntimeError("Agent Loop is no longer active")
         active = self._execution_task
         if active is None or active.done():
             return
@@ -319,6 +382,8 @@ class AgentLoop:
 
     async def run_schedule_job(self, job: ScheduleJob) -> None:
         """Execute one Schedule Job without using foreground state or output."""
+        if self._aborted:
+            raise RuntimeError("Agent Loop is no longer active")
         token = ScheduleTool._in_schedule_job.set(True)
         try:
             await self._execute_schedule_job(job)
@@ -356,7 +421,10 @@ class AgentLoop:
             finally:
                 if schedule_session is not None:
                     try:
-                        schedule_session.close()
+                        if self._aborted:
+                            schedule_session.abandon()
+                        else:
+                            schedule_session.close()
                     except Exception as error:
                         logger.error(
                             "Schedule Session close failed job_id={} type={}",
@@ -376,7 +444,8 @@ class AgentLoop:
         try:
             initial_messages = await context_preparer(session, deepcopy(current_user))
         except asyncio.CancelledError:
-            self._persist_schedule_cancelled_user(session, current_user, job)
+            if not self._aborted:
+                self._persist_schedule_cancelled_user(session, current_user, job)
             raise
         except ModelCallError as failure:
             self._persist_schedule_failure(session, current_user, failure.error)
@@ -446,6 +515,8 @@ class AgentLoop:
         confirmation_id: UUID,
         decision: ConfirmationDecision,
     ) -> None:
+        if self._aborted:
+            raise ValueError("Confirmation response is late or unknown")
         if decision not in {"approved", "declined"}:
             raise ValueError("confirmation decision must be approved or declined")
         pending = self._pending_confirmation
@@ -454,18 +525,6 @@ class AgentLoop:
         if pending.future.done():
             raise ValueError("Confirmation response is late or unknown")
         pending.future.set_result(decision)
-
-    def switch_session(self, session: Session) -> None:
-        if self._closed:
-            raise RuntimeError("Agent Loop is closed")
-        if self.has_active_run:
-            raise RuntimeError("Cannot switch Session during an active foreground run")
-        if not isinstance(session, Session):
-            raise TypeError("Agent Loop requires a Session")
-        if session.session_id == self._session.session_id:
-            return
-        self._session = session
-        self._owned_sessions.append(session)
 
     async def _consume_foreground(self) -> None:
         try:
@@ -490,6 +549,9 @@ class AgentLoop:
                     if self._execution_ready is execution_ready:
                         self._execution_ready = None
                     self._cancel_requested = False
+        except RuntimeError:
+            if not self._closing:
+                raise
         except asyncio.CancelledError:
             if not self._closing:
                 raise
@@ -745,6 +807,8 @@ class AgentLoop:
         self,
         request: ConfirmationRequest,
     ) -> ConfirmationDecision:
+        if self._aborted:
+            raise asyncio.CancelledError()
         if self._pending_confirmation is not None:
             raise RuntimeError("A foreground confirmation request is already pending")
         callback = self._confirmation_callback
@@ -832,7 +896,8 @@ class AgentLoop:
                     session.update_metadata(title=title, usage_delta=usage_delta)
             except asyncio.CancelledError:
                 if (
-                    coordination.prepared.done()
+                    not self._aborted
+                    and coordination.prepared.done()
                     and coordination.prepared.result()
                     and session.metadata.get("title") == "Untitled session"
                 ):

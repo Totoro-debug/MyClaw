@@ -67,6 +67,8 @@ class ModelRouter:
             ContextVar("myclaw_model_router_call_statuses", default=None)
         )
         self._close_task: asyncio.Task[None] | None = None
+        self._detached_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._aborted = False
 
     def route_status(self, requested_route: ModelRoute) -> ModelRouteStatus:
         """Return the current concrete route identity without provider credentials."""
@@ -190,23 +192,36 @@ class ModelRouter:
         raise AssertionError("Provider attempt budget exhausted without a terminal result")
 
     async def close(self) -> None:
+        if self._aborted:
+            return
         task = self._close_task
         if task is None:
             task = asyncio.create_task(self._close_providers())
             self._close_task = task
         await asyncio.shield(task)
 
+    def abort(self) -> None:
+        """Detach providers synchronously and close them as a best-effort task."""
+        if self._aborted:
+            return
+        self._aborted = True
+        providers = _unique_providers(tuple(self._providers.values()))
+        self._providers.clear()
+        if not providers:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("Detached Model Provider cleanup skipped without an event loop")
+            return
+        task = loop.create_task(self._close_detached_providers(providers))
+        self._detached_cleanup_tasks.add(task)
+        task.add_done_callback(self._detached_cleanup_finished)
+
     async def _close_providers(self) -> None:
         providers = tuple(self._providers.values())
         self._providers.clear()
-        closed: set[int] = set()
-        unique: list[ProviderImplementation] = []
-        for provider in providers:
-            identity = id(provider)
-            if identity in closed:
-                continue
-            closed.add(identity)
-            unique.append(provider)
+        unique = _unique_providers(providers)
         results = await asyncio.gather(
             *(provider.close() for provider in unique),
             return_exceptions=True,
@@ -216,6 +231,33 @@ class ModelRouter:
             raise failures[0]
         if failures:
             raise BaseExceptionGroup("Model Provider shutdown failed", failures)
+
+    async def _close_detached_providers(
+        self,
+        providers: tuple[ProviderImplementation, ...],
+    ) -> None:
+        results = await asyncio.gather(
+            *(provider.close() for provider in providers),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Detached Model Provider cleanup failed type={}",
+                    type(result).__name__,
+                )
+
+    def _detached_cleanup_finished(self, task: asyncio.Task[None]) -> None:
+        self._detached_cleanup_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except BaseException as error:
+            logger.warning(
+                "Detached Model Provider cleanup task failed type={}",
+                type(error).__name__,
+            )
 
     async def _recover_attempt(
         self,
@@ -260,7 +302,7 @@ class ModelRouter:
         return fallback
 
     def _provider(self, configuration: ProviderConfiguration) -> ProviderImplementation:
-        if self._close_task is not None:
+        if self._close_task is not None or self._aborted:
             raise RuntimeError("Model Router is closed")
         provider = self._providers.get(configuration.provider_id)
         if provider is None:
@@ -293,6 +335,20 @@ class ModelRouter:
         statuses = {} if current is None else dict(current)
         statuses[requested_route] = status
         self._current_call_statuses.set(statuses)
+
+
+def _unique_providers(
+    providers: tuple[ProviderImplementation, ...],
+) -> tuple[ProviderImplementation, ...]:
+    seen: set[int] = set()
+    unique: list[ProviderImplementation] = []
+    for provider in providers:
+        identity = id(provider)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(provider)
+    return tuple(unique)
 
 
 def _log_retry(

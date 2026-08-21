@@ -1043,3 +1043,46 @@ async def test_model_router_closes_each_provider_adapter_it_constructed() -> Non
 
     assert chat_provider.closed is True
     assert default_provider.closed is True
+
+
+@pytest.mark.asyncio
+async def test_model_router_abort_owns_and_safely_consumes_detached_provider_cleanup() -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class FailingCloseProvider(ScriptedFakeProvider):
+        async def close(self) -> None:
+            close_started.set()
+            try:
+                await release_close.wait()
+            finally:
+                close_finished.set()
+            raise RuntimeError("PRIVATE DETACHED PROVIDER FAILURE")
+
+    provider = FailingCloseProvider(streams=(StreamScript(events=(completed(),)),))
+    router = ModelRouter(
+        configuration=configuration(),
+        provider_factory=lambda _configuration: provider,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+    await collect(router.stream("default", **request()))
+    capture = capture_diagnostics()
+
+    router.abort()
+    await close_started.wait()
+    owned = getattr(router, "_detached_cleanup_tasks", None)
+    cleanup_consumed = asyncio.Event()
+    try:
+        assert owned is not None and len(owned) == 1
+        next(iter(owned)).add_done_callback(lambda _task: cleanup_consumed.set())
+    finally:
+        release_close.set()
+        await close_finished.wait()
+        await cleanup_consumed.wait()
+        capture.close()
+
+    assert owned == set()
+    assert "Detached Model Provider cleanup failed" in capture.event_text
+    assert "PRIVATE DETACHED PROVIDER FAILURE" not in capture.text

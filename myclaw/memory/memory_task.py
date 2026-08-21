@@ -287,9 +287,22 @@ class MemoryManager:
         )
         self._running = False
         self._running_cursor = 0
+        self._aborted = False
+        self._task: asyncio.Task[MemoryTaskResult | None] | None = None
+
+    def abort(self) -> None:
+        """Synchronously cancel an in-flight Memory Task for an abandoned generation."""
+        if self._aborted:
+            return
+        self._aborted = True
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
 
     async def run_manual(self) -> MemoryTaskResult:
         with without_session_log():
+            if self._aborted:
+                raise RuntimeError("Memory Task is no longer active")
             if self._running:
                 return MemoryTaskResult(
                     status="Memory Task is already running.",
@@ -304,26 +317,36 @@ class MemoryManager:
             self._running = True
             self._running_cursor = 0
             self._failure_diagnostic = None
+            task = asyncio.current_task()
+            self._task = task
             try:
                 result = await self._run_once()
                 self._log_failure(result)
                 return result
             finally:
                 self._running = False
+                if self._task is task:
+                    self._task = None
 
     async def run_periodic(self) -> MemoryTaskResult | None:
         with without_session_log():
+            if self._aborted:
+                raise RuntimeError("Memory Task is no longer active")
             if self._running:
                 return None
             self._running = True
             self._running_cursor = 0
             self._failure_diagnostic = None
+            task = asyncio.current_task()
+            self._task = task
             try:
                 result = await self._run_once()
                 self._log_failure(result)
                 return result
             finally:
                 self._running = False
+                if self._task is task:
+                    self._task = None
 
     async def _run_once(self) -> MemoryTaskResult:
         try:

@@ -42,7 +42,7 @@ class ManagementPort(Protocol):
 
     async def resumable_listing(self) -> SessionListingReport: ...
 
-    async def resume(self, session_id: str) -> ResumeResult: ...
+    async def resume(self, session_id: str, *, force: bool = False) -> ResumeResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,10 +158,10 @@ class ManagementCommandDispatcher:
             output=f"{prefix}{view.redacted_content}",
         )
 
-    async def resume(self, session_id: str) -> ManagementCommandResult:
+    async def resume(self, session_id: str, *, force: bool = False) -> ManagementCommandResult:
         with without_session_log():
             try:
-                result = await self._management.resume(session_id)
+                result = await self._management.resume(session_id, force=force)
             except ManagementError as management_error:
                 return ManagementCommandResult(
                     handled=True,

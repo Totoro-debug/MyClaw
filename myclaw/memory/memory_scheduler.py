@@ -28,19 +28,33 @@ class MemoryTaskScheduler:
         self._run_tasks: set[asyncio.Task[None]] = set()
         self._timezone: tzinfo | None = None
         self._closed = False
+        self._aborted = False
 
     def start(self) -> None:
-        if self._closed:
+        self._prepare_start()
+        self._activate_prepared()
+
+    def _prepare_start(self) -> None:
+        """Validate scheduler activation without creating owned tasks."""
+        if self._closed or self._aborted:
             raise RuntimeError("Memory Task scheduler is closed")
-        if self._loop_task is None:
-            startup = self._clock.now()
-            if startup.utcoffset() is None or startup.tzinfo is None:
-                raise ValueError("Memory Task scheduler clock must be timezone-aware")
-            self._timezone = startup.tzinfo
-            with without_session_log():
-                self._loop_task = asyncio.create_task(self._run())
+        if self._loop_task is not None:
+            return
+        startup = self._clock.now()
+        if startup.utcoffset() is None or startup.tzinfo is None:
+            raise ValueError("Memory Task scheduler clock must be timezone-aware")
+        self._timezone = startup.tzinfo
+
+    def _activate_prepared(self) -> None:
+        """Activate a preflighted scheduler using only task creation."""
+        if self._loop_task is not None:
+            return
+        with without_session_log():
+            self._loop_task = asyncio.create_task(self._run())
 
     async def close(self) -> None:
+        if self._aborted:
+            return
         with without_session_log():
             self._closed = True
             task = self._loop_task
@@ -56,6 +70,19 @@ class MemoryTaskScheduler:
                     result, asyncio.CancelledError
                 ):
                     logger.opt(exception=result).error("Memory Task scheduler cleanup failed")
+
+    def abort(self) -> None:
+        """Synchronously cancel scheduler work without awaiting a cleanup pass."""
+        if self._aborted:
+            return
+        self._aborted = True
+        self._closed = True
+        task = self._loop_task
+        if task is not None and not task.done():
+            task.cancel()
+        for run_task in tuple(self._run_tasks):
+            if not run_task.done():
+                run_task.cancel()
 
     async def _run(self) -> None:
         timezone = self._timezone

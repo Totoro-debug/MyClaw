@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from loguru import logger
@@ -27,9 +27,11 @@ from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
+from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import (
+    ManagementError,
     ManagementViewService,
     ResolvedChatStatus,
     RuntimeStatusInput,
@@ -51,11 +53,13 @@ from myclaw.provider.models import ModelProvider
 from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.projection import project_session_message
-from myclaw.session.session import Session
+from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.tool_gateway import ToolResult
 from myclaw.utils.scheduler import AsyncioSchedulerClock, SchedulerClock
+
+type SessionReplacement = Callable[[str, bool], Awaitable[None]]
 
 
 class _RuntimeSchedulerOwner:
@@ -67,15 +71,32 @@ class _RuntimeSchedulerOwner:
     ) -> None:
         self._factory = factory
         self._active: MemoryTaskScheduler | ScheduleService | None = None
+        self._aborted = False
 
     def start(self) -> None:
+        self.prepare()
+        self.activate_prepared()
+
+    def prepare(self) -> None:
+        """Construct and validate the scheduler without starting owned tasks."""
+        if self._aborted:
+            raise RuntimeError("Runtime scheduler is closed")
         scheduler = self._active
         if scheduler is None:
             scheduler = self._factory()
             self._active = scheduler
-        scheduler.start()
+        scheduler._prepare_start()
+
+    def activate_prepared(self) -> None:
+        """Activate the already validated scheduler."""
+        scheduler = self._active
+        if scheduler is None:
+            raise RuntimeError("Runtime scheduler was not prepared")
+        scheduler._activate_prepared()
 
     async def close(self) -> None:
+        if self._aborted:
+            return
         scheduler = self._active
         if scheduler is None:
             return
@@ -83,19 +104,40 @@ class _RuntimeSchedulerOwner:
         if self._active is scheduler:
             self._active = None
 
+    def abort(self) -> None:
+        """Synchronously cancel the active scheduler, if it was started."""
+        if self._aborted:
+            return
+        self._aborted = True
+        scheduler = self._active
+        if scheduler is not None:
+            scheduler.abort()
+
 
 @dataclass(slots=True)
 class _RuntimeLifetime:
     started: bool = False
+    aborted: bool = False
+    validated: bool = False
     close_task: asyncio.Task[None] | None = None
     shutdown_requested: asyncio.Event = field(default_factory=asyncio.Event)
     run_task: asyncio.Task[object] | None = None
     run_done: asyncio.Event | None = None
 
     def begin(self) -> None:
-        if self.started:
+        if self.started or self.aborted:
             raise RuntimeError("Prepared Runtime is closed")
         self.started = True
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeBindings:
+    """The generation-bound seams consumed by Terminal Conversation."""
+
+    bus: MessageBus
+    control: TerminalAgentLoopControl
+    management_dispatcher: ManagementDispatcher
+    start: Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +150,11 @@ class PreparedRuntime:
     _memory_scheduler: _RuntimeSchedulerOwner
     _router: ModelRouter
     _lifetime: _RuntimeLifetime
+    _schedule_store: WorkspaceScheduleStore
+    _runtime_memory: RuntimeMemory
+    _memory_manager: MemoryManager
+    _context_builder: ContextBuilder
+    _management_service: ManagementViewService
 
     @property
     def session_id(self) -> str:
@@ -125,16 +172,69 @@ class PreparedRuntime:
     def session(self) -> Session:
         return self.agent_loop.session
 
+    @property
+    def bindings(self) -> RuntimeBindings:
+        return RuntimeBindings(
+            bus=self.bus,
+            control=self.control,
+            management_dispatcher=self.management_dispatcher,
+            start=self.start,
+        )
+
+    def validate_unstarted(self) -> None:
+        """Validate injected scheduler seams without creating consumer tasks."""
+        with without_session_log():
+            try:
+                if self._lifetime.started or self._lifetime.aborted:
+                    raise RuntimeError("Runtime Generation is no longer preparable")
+                self.agent_loop._prepare_start()
+                self._memory_scheduler.prepare()
+                self.schedule_service._prepare_start()
+                self._lifetime.validated = True
+            except BaseException as error:
+                logger.opt(exception=error).error(
+                    "Runtime validation failed type={}", type(error).__name__
+                )
+                raise
+
     async def start(self) -> None:
+        if not self._lifetime.validated:
+            self.validate_unstarted()
         self._lifetime.begin()
         await self._start_schedulers()
 
+    def abort(self) -> None:
+        """Synchronously abandon this generation without final persistence."""
+        if self._lifetime.aborted:
+            return
+        self._lifetime.aborted = True
+        self._lifetime.started = True
+        self._lifetime.shutdown_requested.set()
+        self._management_service.deactivate()
+        self.agent_loop.abort()
+        self.schedule_service.abort()
+        self._memory_manager.abort()
+        self._memory_scheduler.abort()
+        self._router.abort()
+        closing = self._lifetime.close_task
+        if closing is not None and not closing.done():
+            closing.cancel()
+        running = self._lifetime.run_task
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if running is not None and running is not current and not running.done():
+            running.cancel()
+
     async def _start_schedulers(self) -> None:
+        if not self._lifetime.validated:
+            raise RuntimeError("Runtime Generation was not validated")
         with without_session_log():
             try:
-                await self.agent_loop.start()
-                self._memory_scheduler.start()
-                self.schedule_service.start()
+                self.agent_loop._activate_prepared()
+                self._memory_scheduler.activate_prepared()
+                self.schedule_service._activate_prepared()
             except BaseException as error:
                 logger.opt(exception=error).error(
                     "Runtime startup failed type={}", type(error).__name__
@@ -151,6 +251,8 @@ class PreparedRuntime:
         dispatcher = (
             self.management_dispatcher if management_dispatcher is None else management_dispatcher
         )
+        if not self._lifetime.validated:
+            self.validate_unstarted()
         self._lifetime.begin()
         running = asyncio.current_task()
         if running is None:
@@ -183,8 +285,11 @@ class PreparedRuntime:
             run_done.set()
 
     async def close(self) -> None:
+        if self._lifetime.aborted:
+            return
         task = self._lifetime.close_task
         if task is None:
+            self._management_service.deactivate()
             self._lifetime.started = True
             self._lifetime.shutdown_requested.set()
             running = self._lifetime.run_task
@@ -236,10 +341,241 @@ class PreparedRuntime:
             raise failure
 
 
+class RuntimeHost:
+    """Coordinate process-level inputs and replace one prepared generation."""
+
+    def __init__(
+        self,
+        *,
+        agent_home: AgentHome,
+        workspace: Path | Workspace,
+        configuration: UserConfiguration,
+        provider_factory: Callable[[ProviderConfiguration], ModelProvider],
+        now: Callable[[], datetime],
+        new_uuid: Callable[[], UUID],
+        retry_clock: RetryClock | None = None,
+        retry_jitter: Jitter | None = None,
+        memory_scheduler_clock: SchedulerClock | None = None,
+        schedule_scheduler_clock: ScheduleClock | None = None,
+        monotonic_now: Callable[[], float] = monotonic,
+        timezone_name: str | None = None,
+    ) -> None:
+        self._agent_home = agent_home
+        self._workspace = (
+            workspace if isinstance(workspace, Workspace) else Workspace.from_path(workspace)
+        )
+        self._workspace_state = WorkspaceState(self._workspace)
+        self._configuration = configuration
+        self._provider_factory = provider_factory
+        self._now = now
+        self._new_uuid = new_uuid
+        self._retry_clock = retry_clock
+        self._retry_jitter = retry_jitter
+        self._memory_scheduler_clock = (
+            memory_scheduler_clock
+            if memory_scheduler_clock is not None
+            else AsyncioSchedulerClock(now=now)
+        )
+        self._schedule_scheduler_clock = (
+            schedule_scheduler_clock
+            if schedule_scheduler_clock is not None
+            else AsyncioSchedulerClock(now=now)
+        )
+        self._monotonic_now = monotonic_now
+        self._timezone_name = get_localzone_name() if timezone_name is None else timezone_name
+        self._terminal_rebind: Callable[[RuntimeBindings], Awaitable[None]] | None = None
+        self._replacement_lock = asyncio.Lock()
+        self._closed = False
+        initial_token = object()
+        self._runtime_token = initial_token
+        self._runtime = prepare_runtime(
+            agent_home=agent_home,
+            workspace=self._workspace,
+            workspace_state=self._workspace_state,
+            configuration=configuration,
+            provider_factory=provider_factory,
+            now=now,
+            new_uuid=new_uuid,
+            retry_clock=retry_clock,
+            retry_jitter=retry_jitter,
+            memory_scheduler_clock=self._memory_scheduler_clock,
+            schedule_scheduler_clock=self._schedule_scheduler_clock,
+            monotonic_now=monotonic_now,
+            timezone_name=self._timezone_name,
+            replace_session=self._replacement_callback(initial_token),
+        )
+        try:
+            self._runtime.validate_unstarted()
+        except BaseException:
+            self._runtime.abort()
+            raise
+
+    @property
+    def generation(self) -> PreparedRuntime:
+        return self._runtime
+
+    @property
+    def bindings(self) -> RuntimeBindings:
+        return self._runtime.bindings
+
+    @property
+    def bus(self) -> MessageBus:
+        return self._runtime.bus
+
+    @property
+    def control(self) -> TerminalAgentLoopControl:
+        return self._runtime.control
+
+    @property
+    def management_dispatcher(self) -> ManagementCommandDispatcher:
+        return cast(ManagementCommandDispatcher, self._runtime.management_dispatcher)
+
+    async def start(self) -> None:
+        if self._closed:
+            raise RuntimeError("Runtime Host is closed")
+        await self._runtime.start()
+
+    async def close(self) -> None:
+        async with self._replacement_lock:
+            if self._closed:
+                return
+            self._closed = True
+            await self._runtime.close()
+
+    def bind_terminal(self, rebind: Callable[[RuntimeBindings], Awaitable[None]]) -> None:
+        """Register the sole Terminal binding callback for generation replacement."""
+        if self._terminal_rebind is not None:
+            raise RuntimeError("Runtime Host Terminal binding is already registered")
+        if not callable(rebind):
+            raise TypeError("Runtime Host Terminal binding must be callable")
+        self._terminal_rebind = rebind
+
+    def unbind_terminal(self, rebind: Callable[[RuntimeBindings], Awaitable[None]]) -> None:
+        if self._terminal_rebind is rebind:
+            self._terminal_rebind = None
+
+    def _replacement_callback(self, token: object) -> SessionReplacement:
+        async def replace_session(session_id: str, force: bool) -> None:
+            await self._replace_session(token, session_id, force)
+
+        return replace_session
+
+    def _prepare_target(self, session_id: str, token: object) -> PreparedRuntime:
+        target_session: Session | None = None
+        target_runtime: PreparedRuntime | None = None
+        try:
+            target_session = Session.load(
+                self._workspace_state,
+                session_id,
+                partition=SessionStoragePartition.FOREGROUND,
+                now=self._now,
+            )
+            target_runtime = prepare_runtime(
+                agent_home=self._agent_home,
+                workspace=self._workspace,
+                workspace_state=self._workspace_state,
+                configuration=self._configuration,
+                provider_factory=self._provider_factory,
+                now=self._now,
+                new_uuid=self._new_uuid,
+                retry_clock=self._retry_clock,
+                retry_jitter=self._retry_jitter,
+                memory_scheduler_clock=self._memory_scheduler_clock,
+                schedule_scheduler_clock=self._schedule_scheduler_clock,
+                monotonic_now=self._monotonic_now,
+                timezone_name=self._timezone_name,
+                session=target_session,
+                replace_session=self._replacement_callback(token),
+            )
+            target_runtime.validate_unstarted()
+            return target_runtime
+        except ManagementError:
+            if target_runtime is not None:
+                target_runtime.abort()
+            if target_session is not None:
+                target_session.abandon()
+            raise
+        except (OSError, UnicodeError, ValueError, WorkspaceStateError) as error:
+            if target_runtime is not None:
+                target_runtime.abort()
+            if target_session is not None:
+                target_session.abandon()
+            raise ManagementError(
+                ErrorInfo(
+                    "persistence_error",
+                    "Conversation Session could not be prepared.",
+                )
+            ) from error
+        except Exception as error:
+            if target_runtime is not None:
+                target_runtime.abort()
+            if target_session is not None:
+                target_session.abandon()
+            raise ManagementError(
+                ErrorInfo(
+                    "persistence_error",
+                    "Conversation Session could not be prepared.",
+                )
+            ) from error
+        except BaseException:
+            if target_runtime is not None:
+                target_runtime.abort()
+            if target_session is not None:
+                target_session.abandon()
+            raise
+
+    async def _replace_session(
+        self,
+        source_token: object,
+        session_id: str,
+        force: bool,
+    ) -> None:
+        async with self._replacement_lock:
+            if self._closed:
+                raise ManagementError(ErrorInfo("route_unavailable", "Runtime Host is closed."))
+            if source_token is not self._runtime_token:
+                raise ManagementError(
+                    ErrorInfo(
+                        "route_unavailable",
+                        "Runtime Generation is no longer active.",
+                    )
+                )
+            old = self._runtime
+            if session_id == old.session_id:
+                return
+            target_token = object()
+            target = self._prepare_target(session_id, target_token)
+            if old.control.has_active_run and not force:
+                target.abort()
+                raise ManagementError(
+                    ErrorInfo(
+                        "model_invalid_request",
+                        "An active foreground run must be confirmed before switching Sessions.",
+                    )
+                )
+
+            old.abort()
+            self._runtime = target
+            self._runtime_token = target_token
+            rebind = self._terminal_rebind
+            if rebind is None:
+                try:
+                    await target.start()
+                except BaseException:
+                    target.abort()
+                    raise
+                return
+            try:
+                await rebind(target.bindings)
+            except BaseException:
+                target.abort()
+                raise
+
+
 def prepare_runtime(
     *,
     agent_home: AgentHome,
-    workspace: Path,
+    workspace: Path | Workspace,
     configuration: UserConfiguration,
     provider_factory: Callable[[ProviderConfiguration], ModelProvider],
     now: Callable[[], datetime],
@@ -250,6 +586,9 @@ def prepare_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
+    session: Session | None = None,
+    workspace_state: WorkspaceState | None = None,
+    replace_session: SessionReplacement | None = None,
 ) -> PreparedRuntime:
     """Prepare one Runtime and record terminal composition failures once."""
     try:
@@ -266,6 +605,9 @@ def prepare_runtime(
             schedule_scheduler_clock=schedule_scheduler_clock,
             monotonic_now=monotonic_now,
             timezone_name=timezone_name,
+            session=session,
+            workspace_state=workspace_state,
+            replace_session=replace_session,
         )
     except WorkspaceStateError:
         raise
@@ -279,7 +621,7 @@ def prepare_runtime(
 def _prepare_runtime(
     *,
     agent_home: AgentHome,
-    workspace: Path,
+    workspace: Path | Workspace,
     configuration: UserConfiguration,
     provider_factory: Callable[[ProviderConfiguration], ModelProvider],
     now: Callable[[], datetime],
@@ -290,33 +632,47 @@ def _prepare_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
+    session: Session | None = None,
+    workspace_state: WorkspaceState | None = None,
+    replace_session: SessionReplacement | None = None,
 ) -> PreparedRuntime:
-    """Prepare a Session and defer provider construction until conversational input."""
-    workspace_identity = Workspace.from_path(workspace)
-    workspace_state = WorkspaceState(workspace_identity)
-    workspace_state.initialize(agent_home_root=agent_home.path)
-    schedule_store = WorkspaceScheduleStore(workspace_state)
+    """Prepare one unstarted Runtime Generation."""
+    workspace_identity = (
+        workspace if isinstance(workspace, Workspace) else Workspace.from_path(workspace)
+    )
+    active_workspace_state = (
+        WorkspaceState(workspace_identity) if workspace_state is None else workspace_state
+    )
+    if active_workspace_state.workspace is not workspace_identity:
+        raise ValueError("Runtime Workspace State must belong to the Runtime Workspace")
+    active_workspace_state.initialize(agent_home_root=agent_home.path)
+    schedule_store = WorkspaceScheduleStore(active_workspace_state)
     schedule_clock = (
         schedule_scheduler_clock
         if schedule_scheduler_clock is not None
         else AsyncioSchedulerClock(now=now)
     )
     schedule_service = ScheduleService(store=schedule_store, clock=schedule_clock)
-    long_term_memory = workspace_state.long_term_memory_path.read_text(encoding="utf-8")
+    long_term_memory = active_workspace_state.long_term_memory_path.read_text(encoding="utf-8")
     runtime_memory = RuntimeMemory(long_term_memory)
-    foreground_context = ContextBuilder(
-        workspace_identity,
-        get_localzone_name() if timezone_name is None else timezone_name,
-    )
+    resolved_timezone_name = get_localzone_name() if timezone_name is None else timezone_name
+    foreground_context = ContextBuilder(workspace_identity, resolved_timezone_name)
     set_context_clock = getattr(foreground_context, "set_clock", None)
     if callable(set_context_clock):
         set_context_clock(now)
-    memory_store = WorkspaceFileMemoryStore(workspace_state)
-    session = Session.create(
-        workspace_state,
-        now=now,
-        new_uuid=new_uuid,
-    )
+    memory_store = WorkspaceFileMemoryStore(active_workspace_state)
+    active_session = session
+    if active_session is None:
+        active_session = Session.create(
+            active_workspace_state,
+            now=now,
+            new_uuid=new_uuid,
+        )
+    elif (
+        active_session.workspace_state is not active_workspace_state
+        or active_session.storage_partition is not SessionStoragePartition.FOREGROUND
+    ):
+        raise ValueError("Runtime Session must belong to the foreground Runtime Workspace State")
     router = ModelRouter(
         configuration=configuration,
         provider_factory=provider_factory,
@@ -330,12 +686,12 @@ def _prepare_runtime(
             long_term_memory=memory_snapshot,
         )
 
-    summaries = WorkspaceJsonlSummaryStore(workspace_state)
+    summaries = WorkspaceJsonlSummaryStore(active_workspace_state)
     memory_manager = MemoryManager(
         router=router,
         summaries=summaries,
         memory=memory_store,
-        long_term_path=workspace_state.long_term_memory_path,
+        long_term_path=active_workspace_state.long_term_memory_path,
         batch_size=configuration.memory.batch_size,
         runtime_memory=runtime_memory,
     )
@@ -458,7 +814,7 @@ def _prepare_runtime(
 
     agent_loop = AgentLoop(
         workspace=workspace_identity,
-        session=session,
+        session=active_session,
         schedule_service=schedule_service,
         model_router=router,
         context_preparer=prepare_foreground_context,
@@ -496,21 +852,16 @@ def _prepare_runtime(
         schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
     )
 
-    def switch_session(selected_session: Session) -> None:
-        agent_loop.switch_session(selected_session)
-        status_service.use_session(agent_loop.session)
-
-    management_dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(
-            agent_home,
-            status_service=status_service,
-            workspace_state=workspace_state,
-            switch_session=switch_session,
-            now=now,
-            memory_manager=memory_manager,
-            memory_store=memory_store,
-        )
+    management_service = ManagementViewService(
+        agent_home,
+        status_service=status_service,
+        workspace_state=active_workspace_state,
+        replace_session=replace_session,
+        now=now,
+        memory_manager=memory_manager,
+        memory_store=memory_store,
     )
+    management_dispatcher = ManagementCommandDispatcher(management_service)
     return PreparedRuntime(
         agent_loop=agent_loop,
         management_dispatcher=management_dispatcher,
@@ -518,6 +869,11 @@ def _prepare_runtime(
         _memory_scheduler=memory_scheduler,
         _router=router,
         _lifetime=_RuntimeLifetime(),
+        _schedule_store=schedule_store,
+        _runtime_memory=runtime_memory,
+        _memory_manager=memory_manager,
+        _context_builder=foreground_context,
+        _management_service=management_service,
     )
 
 

@@ -989,6 +989,78 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
 
 
 @pytest.mark.asyncio
+async def test_scheduler_and_manager_abort_cancel_active_memory_work_without_awaiting(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    summaries = WorkspaceJsonlSummaryStore(_state(home))
+    await summaries.append("A pending summary.", NOW)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class CancellationAwareProvider(ScriptedFakeProvider):
+        async def complete(
+            self,
+            *,
+            messages: Sequence[dict[str, object]],
+            tools: Sequence[OpenAIToolSchema],
+            model: str = "test-model",
+            max_output: int = 1024,
+            temperature: float = 0.2,
+            reasoning_effort: ReasoningEffort | None = None,
+            timeout: int = 30,
+            continuation: ModelContinuation | None = None,
+        ) -> ModelResponse:
+            _record_complete(
+                self,
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_output=max_output,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                timeout=timeout,
+                continuation=continuation,
+            )
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            raise AssertionError("blocking Provider completed without cancellation")
+
+    provider = CancellationAwareProvider()
+    manager = _manager(home=home, router=_router(provider), summaries=summaries)
+    clock = ControlledClock(NOW)
+    scheduler = MemoryTaskScheduler(
+        manager=manager,
+        schedule="0 * * * *",
+        clock=clock,
+    )
+    scheduler.start()
+    await _wait_until(lambda: clock.sleeps == [50 * 60])
+    clock.advance(50 * 60)
+    await started.wait()
+    owned_runs = tuple(scheduler._run_tasks)
+    runs_drained = asyncio.Event()
+    for run in owned_runs:
+        run.add_done_callback(lambda _task: runs_drained.set())
+
+    scheduler.abort()
+    manager.abort()
+
+    await cancelled.wait()
+    await asyncio.gather(*owned_runs, return_exceptions=True)
+    await runs_drained.wait()
+    assert scheduler._aborted
+    assert not scheduler._run_tasks
+    with pytest.raises(RuntimeError, match="no longer active"):
+        await manager.run_manual()
+
+
+@pytest.mark.asyncio
 async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
     agent_home: Path,
     capsys: pytest.CaptureFixture[str],

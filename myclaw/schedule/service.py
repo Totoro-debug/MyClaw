@@ -76,6 +76,7 @@ class ScheduleService:
         self.on_schedule_job = on_schedule_job
         self._loop_task: asyncio.Task[None] | None = None
         self._run_tasks: set[asyncio.Task[None]] = set()
+        self._terminal_commit_tasks: set[asyncio.Task[ScheduleJob | None]] = set()
         self._active_job_ids: set[str] = set()
         self._consumed_at_jobs: set[str] = set()
         self._every_deadlines: dict[str, _EveryDeadline] = {}
@@ -86,12 +87,18 @@ class ScheduleService:
         self._faulted_event = asyncio.Event()
         self._close_task: asyncio.Task[None] | None = None
         self._faulted = False
+        self._aborted = False
         self._dispatcher_error_logged = False
         self._terminal_store_error_logged = False
 
     def start(self) -> None:
         """Start the single dispatcher; repeated starts are idempotent."""
-        if self._close_task is not None:
+        self._prepare_start()
+        self._activate_prepared()
+
+    def _prepare_start(self) -> None:
+        """Validate dispatcher activation without creating owned tasks."""
+        if self._close_task is not None or self._aborted:
             raise RuntimeError("Schedule Service is closed")
         if self._loop_task is not None:
             return
@@ -105,10 +112,17 @@ class ScheduleService:
         if current.tzinfo is None or current.utcoffset() is None:
             raise ValueError("Schedule Service clock must be timezone-aware")
         self._clock.monotonic()
+
+    def _activate_prepared(self) -> None:
+        """Activate a preflighted dispatcher using only task creation."""
+        if self._loop_task is not None or self._faulted:
+            return
         self._loop_task = asyncio.create_task(self._dispatch())
 
     async def close(self) -> None:
         """Cancel and await the dispatcher and every reserved Job run."""
+        if self._aborted:
+            return
         task = self._close_task
         if task is None:
             task = asyncio.create_task(self._close_owned_tasks())
@@ -126,12 +140,36 @@ class ScheduleService:
         """Return whether Runtime shutdown has requested Schedule execution cancellation."""
         return self._closing.is_set()
 
+    def abort(self) -> None:
+        """Synchronously detach Schedule work for an abandoned generation."""
+        if self._aborted:
+            return
+        self._aborted = True
+        self._closing.set()
+        self.on_schedule_job = None
+        loop_task = self._loop_task
+        if loop_task is not None and not loop_task.done():
+            loop_task.cancel()
+        for run_task in tuple(self._run_tasks):
+            if not run_task.done():
+                run_task.cancel()
+        for commit_task in tuple(self._terminal_commit_tasks):
+            if not commit_task.done():
+                commit_task.cancel()
+        self._active_job_ids.clear()
+        self._every_deadlines.clear()
+        self._cron_cursors.clear()
+
     async def add_user_job(self, job: ScheduleJob) -> ScheduleJob:
         """Add one user-owned Job through the Schedule persistence boundary."""
+        if self._aborted:
+            raise RuntimeError("Schedule Service is no longer active")
         return await self._store.add_user_job(job)
 
     async def public_snapshot(self) -> tuple[ScheduleJob, ...]:
         """Return the public user-owned Job snapshot."""
+        if self._aborted:
+            raise RuntimeError("Schedule Service is no longer active")
         return await self._store.public_snapshot()
 
     async def remove_user_job(
@@ -141,6 +179,8 @@ class ScheduleService:
         expected: ScheduleJob | None = None,
     ) -> bool:
         """Remove one user-owned Job with the Store's optimistic expectation."""
+        if self._aborted:
+            raise RuntimeError("Schedule Service is no longer active")
         return await self._store.remove_user_job(job_id, expected=expected)
 
     async def _close_owned_tasks(self) -> None:
@@ -445,6 +485,8 @@ class ScheduleService:
                 now_ms=finished_at_ms,
             )
         )
+        self._terminal_commit_tasks.add(operation)
+        operation.add_done_callback(self._terminal_commit_tasks.discard)
         cancellation: asyncio.CancelledError | None = None
         failure: BaseException | None = None
         while not operation.done():
