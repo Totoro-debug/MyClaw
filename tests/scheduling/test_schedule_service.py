@@ -1,25 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
-from myclaw.agent.context import ContextBuilder
-from myclaw.agent.run import (
-    AgentRun,
-    AgentRunCancelledPayload,
-    AgentRunCompletedPayload,
-    AgentRunEmitter,
-    AgentRunFailedPayload,
-    AgentRunModelCallCompletedPayload,
-    AgentRunStartedPayload,
-)
-from myclaw.agent.runtime import _ScheduleExecutionAdapter, prepare_repl_runtime
+from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -35,7 +25,7 @@ from myclaw.provider.models import (
     ReasoningEffort,
 )
 from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
-from myclaw.schedule.service import ScheduleService
+from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 from tests.configuration.test_config import VALID_CONFIG
@@ -78,182 +68,42 @@ class ControlledClock:
         self._now += timedelta(seconds=seconds)
 
 
-class RecordingAgentRun:
-    def __init__(self, *, block: bool = False) -> None:
+class RecordingScheduleCallback:
+    def __init__(
+        self,
+        *,
+        block: bool = False,
+        failure: ErrorInfo | None = None,
+        unexpected: bool = False,
+        cancelled: bool = False,
+        raise_first: bool = False,
+    ) -> None:
         self.calls: list[tuple[list[dict[str, object]], dict[str, object], str]] = []
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.second_started = asyncio.Event()
         self.block = block
+        self.failure = failure
+        self.unexpected = unexpected
+        self.cancelled = cancelled
+        self.raise_first = raise_first
 
-    async def run(
-        self,
-        messages: list[dict[str, object]],
-        current_user: dict[str, object],
-        *,
-        route: str,
-        emitter: AgentRunEmitter,
-        externalize_result: object | None = None,
-        cancel_requested: Callable[[], bool] | None = None,
-    ) -> list[dict[str, object]]:
-        del externalize_result, cancel_requested
-        self.calls.append((messages, current_user, route))
+    async def __call__(self, job: ScheduleJob) -> None:
+        current_user: dict[str, object] = {"role": "user", "content": job.message}
+        self.calls.append(([current_user.copy()], current_user, "schedule"))
         self.started.set()
+        if len(self.calls) > 1:
+            self.second_started.set()
         if self.block:
             await self.release.wait()
-        await emitter.emit(AgentRunStartedPayload())
-        await emitter.emit(
-            AgentRunModelCallCompletedPayload(
-                content="Done.",
-                continues_with_tools=False,
-            )
-        )
-        await emitter.emit(
-            AgentRunCompletedPayload(
-                content="Done.",
-                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            )
-        )
-        return [
-            {"role": "user", "content": current_user["content"]},
-            {
-                "role": "assistant",
-                "content": "Done.",
-                "tool_calls": [],
-                "status": "completed",
-                "error": None,
-                "token_usage": {
-                    "model_calls": 1,
-                    "input_tokens": 1,
-                    "output_tokens": 1,
-                    "total_tokens": 2,
-                },
-            },
-        ]
-
-
-class AwaitableRecordingAgentRun:
-    def __init__(self, timeline: list[str]) -> None:
-        self.calls: list[tuple[list[dict[str, object]], dict[str, object], str]] = []
-        self.started = asyncio.Event()
-        self._timeline = timeline
-
-    async def run(
-        self,
-        messages: list[dict[str, object]],
-        current_user: dict[str, object],
-        *,
-        route: str,
-        emitter: AgentRunEmitter,
-        cancel_requested: Callable[[], bool] | None = None,
-    ) -> list[dict[str, object]]:
-        del cancel_requested
-        self._timeline.append("run")
-        self.calls.append((messages, current_user, route))
-        self.started.set()
-        await emitter.emit(AgentRunStartedPayload())
-        await emitter.emit(
-            AgentRunCompletedPayload(
-                content="Done.",
-                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            )
-        )
-        return [
-            {"role": "user", "content": "Run this."},
-            {
-                "role": "assistant",
-                "content": "Done.",
-                "tool_calls": [],
-                "status": "completed",
-                "error": None,
-                "token_usage": {
-                    "model_calls": 1,
-                    "input_tokens": 1,
-                    "output_tokens": 1,
-                    "total_tokens": 2,
-                },
-            },
-        ]
-
-
-class OutcomeAwaitableAgentRun:
-    def __init__(
-        self,
-        terminal: AgentRunCompletedPayload | AgentRunFailedPayload | AgentRunCancelledPayload,
-        increment: list[dict[str, object]],
-    ) -> None:
-        self.terminal = terminal
-        self.increment = increment
-        self.started = asyncio.Event()
-
-    async def run(
-        self,
-        messages: list[dict[str, object]],
-        current_user: dict[str, object],
-        *,
-        route: str,
-        emitter: AgentRunEmitter,
-        cancel_requested: Callable[[], bool] | None = None,
-    ) -> list[dict[str, object]]:
-        del messages, current_user, route, cancel_requested
-        self.started.set()
-        await emitter.emit(AgentRunStartedPayload())
-        await emitter.emit(self.terminal)
-        return self.increment
-
-
-class RaisingAwaitableAgentRun:
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-
-    async def run(
-        self,
-        messages: list[dict[str, object]],
-        current_user: dict[str, object],
-        *,
-        route: str,
-        emitter: AgentRunEmitter,
-        cancel_requested: Callable[[], bool] | None = None,
-    ) -> list[dict[str, object]]:
-        del (
-            messages,
-            current_user,
-            route,
-            emitter,
-            cancel_requested,
-        )
-        self.started.set()
-        raise RuntimeError("unexpected Agent Run failure")
-
-
-class _BlockingScheduleRouter:
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self._never = asyncio.Event()
-
-    def route_status(self, route: str) -> None:
-        del route
-
-    def stream(
-        self,
-        route: str,
-        *,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[object],
-    ) -> AsyncIterator[ModelStreamEvent]:
-        del route, messages, tools
-        raise AssertionError("Schedule Agent Run must not stream")
-
-    async def complete(
-        self,
-        route: str,
-        *,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[object],
-    ) -> ModelResponse:
-        del route, messages, tools
-        self.started.set()
-        await self._never.wait()
-        raise AssertionError("Blocking Schedule Router was unexpectedly released")
+        if self.raise_first and len(self.calls) == 1:
+            raise RuntimeError("PRIVATE_JOB_EXCEPTION_BODY")
+        if self.unexpected:
+            raise RuntimeError("unexpected Schedule callback failure")
+        if self.cancelled:
+            raise asyncio.CancelledError
+        if self.failure is not None:
+            raise ScheduleJobExecutionError(self.failure)
 
 
 class ConcurrentScheduleAndForegroundProvider:
@@ -372,424 +222,11 @@ async def _wait_until(predicate: object) -> None:
     raise AssertionError("condition did not become true")
 
 
-async def _schedule_context(
-    session: Session,
-    current_user: dict[str, object],
-) -> list[dict[str, object]]:
-    del session
-    return [
-        {"role": "system", "content": "Schedule system"},
-        {"role": "user", "content": current_user["content"]},
-    ]
-
-
 def _service(**kwargs: Any) -> ScheduleService:
-    agent_run = kwargs.pop("agent_run")
-    workspace_state = kwargs.pop("workspace_state")
-    context_preparer = kwargs.pop("context_preparer", _schedule_context)
-    externalize_result_for = kwargs.pop("externalize_result_for", None)
+    callback = kwargs.pop("callback")
     service = ScheduleService(**kwargs)
-    adapter = _ScheduleExecutionAdapter(
-        workspace_state=workspace_state,
-        clock=kwargs["clock"],
-        agent_run=agent_run,
-        context_preparer=context_preparer,
-        externalize_result_for=externalize_result_for,
-        cancel_requested=service.cancellation_requested,
-    )
-    service.on_schedule_job = adapter.execute
+    service.on_schedule_job = callback
     return service
-
-
-@pytest.mark.asyncio
-async def test_overdue_at_runs_once_through_shared_agent_run_and_deletes_definition(
-    workspace: Path,
-    agent_home: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    store = WorkspaceScheduleStore(state)
-    await store.add_user_job(_job())
-    agent_run = RecordingAgentRun()
-    service = _service(
-        store=store, agent_run=agent_run, workspace_state=state, clock=ControlledClock(START)
-    )
-
-    service.start()
-    await agent_run.started.wait()
-    await service.close()
-
-    assert len(agent_run.calls) == 1
-    messages, current_user, route = agent_run.calls[0]
-    assert current_user == {"role": "user", "content": "Run this."}
-    assert route == "schedule"
-    assert messages[-1] == {"role": "user", "content": "Run this."}
-    assert (state.schedule_sessions_directory / f"schedule_{JOB_UUID}.jsonl").exists()
-    assert not (state.sessions_directory / f"schedule_{JOB_UUID}.jsonl").exists()
-    assert await store.snapshot() == ()
-    assert service.status_snapshot().to_dict() == {
-        "status": "available",
-        "active_job_count": 0,
-    }
-
-
-@pytest.mark.asyncio
-async def test_awaitable_schedule_run_prepares_context_and_persists_before_terminal_commit(
-    workspace: Path,
-    agent_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = _state(workspace, agent_home)
-    store = WorkspaceScheduleStore(state)
-    await store.add_user_job(
-        _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
-    )
-    timeline: list[str] = []
-
-    async def prepare_context(
-        session: Session,
-        current_user: dict[str, object],
-    ) -> list[dict[str, object]]:
-        del session
-        timeline.append("context")
-        return [
-            {"role": "system", "content": "Schedule system"},
-            {"role": "user", "content": current_user["content"]},
-        ]
-
-    original_append = Session.append_messages
-    original_persist = Session.persist
-    original_commit = store.commit_terminal
-
-    def fail_context_builder(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise AssertionError("Schedule Service must not construct ContextBuilder")
-
-    monkeypatch.setattr(ContextBuilder, "__init__", fail_context_builder)
-
-    def append_messages(session: Session, messages: list[dict[str, object]]) -> None:
-        timeline.append("append")
-        original_append(session, messages)
-
-    def persist(session: Session) -> None:
-        timeline.append("persist")
-        original_persist(session)
-
-    async def commit_terminal(
-        job_id: str,
-        *,
-        expected: ScheduleJob | None = None,
-        finished_at_ms: int,
-        status: Literal["ok", "error"],
-        error: str | None = None,
-        now_ms: int | None = None,
-    ) -> ScheduleJob | None:
-        timeline.append("terminal")
-        return await original_commit(
-            job_id,
-            expected=expected,
-            finished_at_ms=finished_at_ms,
-            status=status,
-            error=error,
-            now_ms=now_ms,
-        )
-
-    monkeypatch.setattr(Session, "append_messages", append_messages)
-    monkeypatch.setattr(Session, "persist", persist)
-    monkeypatch.setattr(store, "commit_terminal", commit_terminal)
-    agent_run = AwaitableRecordingAgentRun(timeline)
-    service = _service(
-        store=store,
-        agent_run=agent_run,
-        workspace_state=state,
-        clock=ControlledClock(START),
-        context_preparer=prepare_context,
-    )
-
-    service.start()
-    await agent_run.started.wait()
-    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
-    await service.close()
-
-    assert timeline == ["context", "run", "append", "persist", "terminal"]
-    messages, current_user, route = agent_run.calls[0]
-    assert messages == [
-        {"role": "system", "content": "Schedule system"},
-        {"role": "user", "content": "Run this."},
-    ]
-    assert current_user == {"role": "user", "content": "Run this."}
-    assert route == "schedule"
-    session = Session.load(
-        state,
-        f"schedule_{JOB_UUID}",
-        partition=SessionStoragePartition.SCHEDULE,
-    )
-    assert [message["role"] for message in session.messages] == ["user", "assistant"]
-
-
-@pytest.mark.asyncio
-async def test_failed_awaitable_schedule_run_persists_repair_before_error_state(
-    workspace: Path,
-    agent_home: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    store = WorkspaceScheduleStore(state)
-    job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
-    await store.add_user_job(job)
-    failure = AgentRunFailedPayload(
-        error=ErrorInfo(code="model_failed", message="The model request failed.")
-    )
-    run = OutcomeAwaitableAgentRun(
-        failure,
-        [
-            {"role": "user", "content": job.message},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [],
-                "status": "error",
-                "error": {"code": "model_failed", "message": "The model request failed."},
-                "token_usage": {
-                    "model_calls": 1,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "total_tokens": 0,
-                },
-            },
-        ],
-    )
-
-    async def prepare_context(
-        session: Session,
-        current_user: dict[str, object],
-    ) -> list[dict[str, object]]:
-        del session
-        return [
-            {"role": "system", "content": "Schedule system"},
-            {"role": "user", "content": current_user["content"]},
-        ]
-
-    service = _service(
-        store=store,
-        agent_run=run,
-        workspace_state=state,
-        clock=ControlledClock(START),
-        context_preparer=prepare_context,
-    )
-    service.start()
-    await run.started.wait()
-    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
-    await service.close()
-
-    saved = (await store.snapshot())[0]
-    assert saved.state.last_status == "error"
-    assert saved.state.last_error == "The model request failed."
-    session = Session.load(
-        state,
-        job.session_id,
-        partition=SessionStoragePartition.SCHEDULE,
-    )
-    assert session.messages[-1]["status"] == "error"
-
-
-@pytest.mark.asyncio
-async def test_unexpected_awaitable_failure_persists_repair_before_error_state(
-    workspace: Path,
-    agent_home: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    store = WorkspaceScheduleStore(state)
-    job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
-    await store.add_user_job(job)
-    run = RaisingAwaitableAgentRun()
-
-    async def prepare_context(
-        session: Session,
-        current_user: dict[str, object],
-    ) -> list[dict[str, object]]:
-        del session
-        return [
-            {"role": "system", "content": "Schedule system"},
-            {"role": "user", "content": current_user["content"]},
-        ]
-
-    service = _service(
-        store=store,
-        agent_run=run,
-        workspace_state=state,
-        clock=ControlledClock(START),
-        context_preparer=prepare_context,
-    )
-    service.start()
-    await run.started.wait()
-    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
-    await service.close()
-
-    saved = (await store.snapshot())[0]
-    assert saved.state.last_status == "error"
-    assert saved.state.last_error == "The model request failed."
-    session = Session.load(
-        state,
-        job.session_id,
-        partition=SessionStoragePartition.SCHEDULE,
-    )
-    assert session.messages[-1]["status"] == "error"
-
-
-@pytest.mark.asyncio
-async def test_cancelled_awaitable_schedule_run_persists_increment_but_keeps_job_pending(
-    workspace: Path,
-    agent_home: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    store = WorkspaceScheduleStore(state)
-    job = _job()
-    await store.add_user_job(job)
-    run = OutcomeAwaitableAgentRun(
-        AgentRunCancelledPayload(partial_content="Partial."),
-        [
-            {"role": "user", "content": job.message},
-            {
-                "role": "assistant",
-                "content": "Partial.",
-                "tool_calls": [],
-                "status": "interrupted",
-                "error": {
-                    "code": "turn_cancelled",
-                    "message": "Turn interrupted by user.",
-                },
-                "token_usage": {
-                    "model_calls": 1,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "total_tokens": 0,
-                },
-            },
-        ],
-    )
-
-    async def prepare_context(
-        session: Session,
-        current_user: dict[str, object],
-    ) -> list[dict[str, object]]:
-        del session
-        return [
-            {"role": "system", "content": "Schedule system"},
-            {"role": "user", "content": current_user["content"]},
-        ]
-
-    service = _service(
-        store=store,
-        agent_run=run,
-        workspace_state=state,
-        clock=ControlledClock(START),
-        context_preparer=prepare_context,
-    )
-    service.start()
-    await run.started.wait()
-    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
-    await service.close()
-
-    assert await store.snapshot() == (job,)
-    session = Session.load(
-        state,
-        job.session_id,
-        partition=SessionStoragePartition.SCHEDULE,
-    )
-    assert session.messages[-1]["status"] == "interrupted"
-
-
-@pytest.mark.asyncio
-async def test_production_awaitable_shutdown_persists_user_before_leaving_job_pending(
-    workspace: Path,
-    agent_home: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    store = WorkspaceScheduleStore(state)
-    job = _job()
-    await store.add_user_job(job)
-    router = _BlockingScheduleRouter()
-
-    async def prepare_context(
-        session: Session,
-        current_user: dict[str, object],
-    ) -> list[dict[str, object]]:
-        del session
-        return [
-            {"role": "system", "content": "Schedule system"},
-            {"role": "user", "content": current_user["content"]},
-        ]
-
-    service = _service(
-        store=store,
-        agent_run=AgentRun(model=router),
-        workspace_state=state,
-        clock=ControlledClock(START),
-        context_preparer=prepare_context,
-    )
-    service.start()
-    await router.started.wait()
-    await service.close()
-
-    assert await store.snapshot() == (job,)
-    session = Session.load(
-        state,
-        job.session_id,
-        partition=SessionStoragePartition.SCHEDULE,
-    )
-    assert [(message["role"], message["content"]) for message in session.messages] == [
-        ("user", job.message)
-    ]
-
-
-@pytest.mark.asyncio
-async def test_awaitable_shutdown_during_context_preparation_persists_user(
-    workspace: Path,
-    agent_home: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    store = WorkspaceScheduleStore(state)
-    job = _job()
-    await store.add_user_job(job)
-    run = OutcomeAwaitableAgentRun(
-        AgentRunCompletedPayload(
-            content="Unused.",
-            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-        ),
-        [],
-    )
-    context_started = asyncio.Event()
-    context_never_completes = asyncio.Event()
-
-    async def prepare_context(
-        session: Session,
-        current_user: dict[str, object],
-    ) -> list[dict[str, object]]:
-        del session, current_user
-        context_started.set()
-        await context_never_completes.wait()
-        raise AssertionError("Schedule context preparation was unexpectedly released")
-
-    service = _service(
-        store=store,
-        agent_run=run,
-        workspace_state=state,
-        clock=ControlledClock(START),
-        context_preparer=prepare_context,
-    )
-    service.start()
-    await context_started.wait()
-    await service.close()
-
-    assert not run.started.is_set()
-    assert await store.snapshot() == (job,)
-    session = Session.load(
-        state,
-        job.session_id,
-        partition=SessionStoragePartition.SCHEDULE,
-    )
-    assert [(message["role"], message["content"]) for message in session.messages] == [
-        ("user", job.message)
-    ]
 
 
 @pytest.mark.asyncio
@@ -808,23 +245,22 @@ async def test_cron_startup_ignores_match_at_startup_boundary(
     )
     await store.add_user_job(job)
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
     await clock.wait_started.wait()
-    assert agent_run.calls == []
+    assert callback.calls == []
 
     clock.advance(24 * 60 * 60 - 60)
     await asyncio.sleep(0)
-    assert agent_run.calls == []
+    assert callback.calls == []
     clock.advance(60)
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
     await service.close()
     saved = (await store.snapshot())[0]
@@ -848,19 +284,18 @@ async def test_cron_startup_skips_an_overdue_match_until_the_next_one(
     )
     await store.add_user_job(job)
     clock = ControlledClock(START + timedelta(minutes=30))
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
     await clock.wait_started.wait()
-    assert agent_run.calls == []
+    assert callback.calls == []
     clock.advance(30 * 60)
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await service.close()
 
 
@@ -881,11 +316,10 @@ async def test_cron_spring_gap_skips_the_nonexistent_local_time(
     await store.add_user_job(job)
     start = datetime(2026, 3, 8, 6, 0, tzinfo=UTC)
     clock = ControlledClock(start)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
@@ -893,10 +327,10 @@ async def test_cron_spring_gap_skips_the_nonexistent_local_time(
     await clock.wait_started.wait()
     clock.advance(2 * 60 * 60)
     await asyncio.sleep(0)
-    assert agent_run.calls == []
+    assert callback.calls == []
 
     clock.advance(22 * 60 * 60 + 30 * 60)
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await service.close()
 
 
@@ -916,22 +350,21 @@ async def test_cron_fall_overlap_runs_both_absolute_instants(
     )
     await store.add_user_job(job)
     clock = ControlledClock(datetime(2026, 11, 1, 4, 0, tzinfo=UTC))
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
     await clock.wait_started.wait()
     clock.advance(90 * 60)
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
 
     clock.advance(60 * 60)
-    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await _wait_until(lambda: len(callback.calls) == 2)
     await service.close()
 
 
@@ -951,11 +384,10 @@ async def test_cron_forward_wall_jump_skips_missed_occurrences(
     )
     await store.add_user_job(job)
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
@@ -965,10 +397,10 @@ async def test_cron_forward_wall_jump_skips_missed_occurrences(
     clock.advance(60)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    assert agent_run.calls == []
+    assert callback.calls == []
 
     clock.advance(59 * 60)
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await service.close()
 
 
@@ -988,28 +420,27 @@ async def test_cron_backward_wall_jump_does_not_repeat_an_absolute_occurrence(
     )
     await store.add_user_job(job)
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
     await clock.wait_started.wait()
     clock.advance(60 * 60)
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
 
     clock.jump_wall(-30 * 60)
     clock.advance(30 * 60)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    assert len(agent_run.calls) == 1
+    assert len(callback.calls) == 1
 
     clock.advance(60 * 60)
-    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await _wait_until(lambda: len(callback.calls) == 2)
     await service.close()
 
 
@@ -1029,11 +460,10 @@ async def test_cron_active_overlap_consumes_the_skipped_occurrence(
     )
     await store.add_user_job(job)
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun(block=True)
+    callback = RecordingScheduleCallback(block=True)
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
     capture = capture_diagnostics()
@@ -1043,28 +473,26 @@ async def test_cron_active_overlap_consumes_the_skipped_occurrence(
         await clock.wait_started.wait()
         clock.wait_started.clear()
         clock.advance(60)
-        await agent_run.started.wait()
+        await callback.started.wait()
         await clock.wait_started.wait()
         clock.wait_started.clear()
 
         clock.advance(60)
         await _wait_until(clock.wait_started.is_set)
-        assert len(agent_run.calls) == 1
+        assert len(callback.calls) == 1
 
-        agent_run.block = False
-        agent_run.release.set()
+        callback.block = False
+        callback.release.set()
         await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
-        assert len(agent_run.calls) == 1
+        assert len(callback.calls) == 1
 
         clock.advance(60)
-        await _wait_until(lambda: len(agent_run.calls) == 2)
+        await _wait_until(lambda: len(callback.calls) == 2)
         await service.close()
     finally:
         capture.close()
 
     assert capture.event_text.count("Schedule Job occurrence skipped while active") == 1
-    session_log_text = (state.logs_directory / f"{job.session_id}.log").read_text(encoding="utf-8")
-    assert session_log_text.count("Schedule Job occurrence skipped while active") == 1
 
 
 @pytest.mark.asyncio
@@ -1083,41 +511,20 @@ async def test_cron_failure_waits_for_the_next_match_without_retry(
     )
     await store.add_user_job(job)
 
-    class FailedRun(RecordingAgentRun):
-        async def run(
-            self,
-            messages: list[dict[str, object]],
-            current_user: dict[str, object],
-            *,
-            route: str,
-            emitter: AgentRunEmitter,
-            externalize_result: object | None = None,
-            cancel_requested: Callable[[], bool] | None = None,
-        ) -> list[dict[str, object]]:
-            del cancel_requested
-            self.calls.append((messages, current_user, route))
-            self.started.set()
-            await emitter.emit(AgentRunStartedPayload())
-            await emitter.emit(
-                AgentRunFailedPayload(
-                    error=ErrorInfo(code="model_failed", message="The model request failed.")
-                )
-            )
-            return []
-
     clock = ControlledClock(START)
-    agent_run = FailedRun()
+    callback = RecordingScheduleCallback(
+        failure=ErrorInfo(code="model_failed", message="The model request failed.")
+    )
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
     await clock.wait_started.wait()
     clock.advance(60)
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
     saved = (await store.snapshot())[0]
     assert saved.state.last_status == "error"
@@ -1125,9 +532,9 @@ async def test_cron_failure_waits_for_the_next_match_without_retry(
 
     clock.advance(30)
     await asyncio.sleep(0)
-    assert len(agent_run.calls) == 1
+    assert len(callback.calls) == 1
     clock.advance(30)
-    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await _wait_until(lambda: len(callback.calls) == 2)
     await service.close()
 
 
@@ -1141,31 +548,30 @@ async def test_overdue_every_commits_completion_and_restarts_interval_from_finis
     job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
     await store.add_user_job(job)
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
-    await agent_run.started.wait()
+    await callback.started.wait()
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
 
     saved = (await store.snapshot())[0]
-    assert len(agent_run.calls) == 1
+    assert len(callback.calls) == 1
     assert saved.state.last_status == "ok"
     assert saved.state.last_finished_at_ms == int(START.timestamp() * 1000)
 
     clock.advance(9)
     await asyncio.sleep(0)
-    assert len(agent_run.calls) == 1
+    assert len(callback.calls) == 1
     clock.advance(1)
-    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await _wait_until(lambda: len(callback.calls) == 2)
     await service.close()
 
-    assert len(agent_run.calls) == 2
+    assert len(callback.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -1178,22 +584,21 @@ async def test_future_every_uses_created_at_for_its_first_deadline(
     created_at_ms = int((START - timedelta(seconds=5)).timestamp() * 1000)
     await store.add_user_job(_every_job(created_at_ms=created_at_ms))
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
     await clock.wait_started.wait()
-    assert agent_run.calls == []
+    assert callback.calls == []
     clock.advance(4)
     await asyncio.sleep(0)
-    assert agent_run.calls == []
+    assert callback.calls == []
     clock.advance(1)
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await service.close()
 
 
@@ -1206,11 +611,10 @@ async def test_every_live_deadline_uses_monotonic_time_across_wall_clock_jump(
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(_every_job())
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
@@ -1218,12 +622,12 @@ async def test_every_live_deadline_uses_monotonic_time_across_wall_clock_jump(
     await clock.wait_started.wait()
     clock.jump_wall(60)
     await asyncio.sleep(0)
-    assert agent_run.calls == []
+    assert callback.calls == []
     clock.advance(9)
     await asyncio.sleep(0)
-    assert agent_run.calls == []
+    assert callback.calls == []
     clock.advance(1)
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await service.close()
 
 
@@ -1239,11 +643,10 @@ async def test_every_completion_starts_a_monotonic_interval_across_wall_clock_ju
     job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
     await store.add_user_job(job)
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
@@ -1259,12 +662,12 @@ async def test_every_completion_starts_a_monotonic_interval_across_wall_clock_ju
         await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
         await jump_task
 
-        assert len(agent_run.calls) == 1
+        assert len(callback.calls) == 1
         clock.advance(9)
         await asyncio.sleep(0)
-        assert len(agent_run.calls) == 1
+        assert len(callback.calls) == 1
         clock.advance(1)
-        await _wait_until(lambda: len(agent_run.calls) == 2)
+        await _wait_until(lambda: len(callback.calls) == 2)
     finally:
         await service.close()
 
@@ -1279,26 +682,25 @@ async def test_every_execution_time_is_included_before_the_next_start(
     job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
     await store.add_user_job(job)
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun(block=True)
+    callback = RecordingScheduleCallback(block=True)
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
-    await agent_run.started.wait()
+    await callback.started.wait()
     clock.advance(3)
-    agent_run.block = False
-    agent_run.release.set()
+    callback.block = False
+    callback.release.set()
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
 
     clock.advance(9)
     await asyncio.sleep(0)
-    assert len(agent_run.calls) == 1
+    assert len(callback.calls) == 1
     clock.advance(1)
-    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await _wait_until(lambda: len(callback.calls) == 2)
     await service.close()
 
 
@@ -1315,27 +717,26 @@ async def test_every_active_job_skips_due_occurrence_without_store_mutation(
     )
     await store.add_user_job(job)
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun(block=True)
+    callback = RecordingScheduleCallback(block=True)
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
-    await agent_run.started.wait()
+    await callback.started.wait()
     initial_revision = store.revision
     clock.advance(5)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    assert len(agent_run.calls) == 1
+    assert len(callback.calls) == 1
     assert store.revision == initial_revision
     assert (await store.snapshot())[0].state == ScheduleJobState()
 
-    agent_run.block = False
-    agent_run.release.set()
+    callback.block = False
+    callback.release.set()
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
     await service.close()
 
@@ -1356,20 +757,19 @@ async def test_different_every_jobs_run_concurrently(
         )
     )
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun(block=True)
+    callback = RecordingScheduleCallback(block=True)
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
-    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await _wait_until(lambda: len(callback.calls) == 2)
     assert service.status_snapshot().active_job_count == 2
 
-    agent_run.block = False
-    agent_run.release.set()
+    callback.block = False
+    callback.release.set()
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
     await service.close()
 
@@ -1384,39 +784,18 @@ async def test_every_safe_failure_commits_terminal_error_without_early_retry(
     job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
     await store.add_user_job(job)
 
-    class FailedRun(RecordingAgentRun):
-        async def run(
-            self,
-            messages: list[dict[str, object]],
-            current_user: dict[str, object],
-            *,
-            route: str,
-            emitter: AgentRunEmitter,
-            externalize_result: object | None = None,
-            cancel_requested: Callable[[], bool] | None = None,
-        ) -> list[dict[str, object]]:
-            del cancel_requested
-            self.calls.append((messages, current_user, route))
-            self.started.set()
-            await emitter.emit(AgentRunStartedPayload())
-            await emitter.emit(
-                AgentRunFailedPayload(
-                    error=ErrorInfo(code="model_failed", message="The model request failed.")
-                )
-            )
-            return []
-
     clock = ControlledClock(START)
-    agent_run = FailedRun()
+    callback = RecordingScheduleCallback(
+        failure=ErrorInfo(code="model_failed", message="The model request failed.")
+    )
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=clock,
     )
 
     service.start()
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
     saved = (await store.snapshot())[0]
     assert saved.state.last_status == "error"
@@ -1424,9 +803,9 @@ async def test_every_safe_failure_commits_terminal_error_without_early_retry(
 
     clock.advance(9)
     await asyncio.sleep(0)
-    assert len(agent_run.calls) == 1
+    assert len(callback.calls) == 1
     clock.advance(1)
-    await _wait_until(lambda: len(agent_run.calls) == 2)
+    await _wait_until(lambda: len(callback.calls) == 2)
     await service.close()
 
 
@@ -1447,16 +826,15 @@ async def test_overdue_every_restarts_once_from_persisted_last_completion(
     )
 
     store = WorkspaceScheduleStore(state)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=ControlledClock(START),
     )
 
     service.start()
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await service.close()
 
     assert (await store.snapshot())[0].state.last_status == "ok"
@@ -1470,19 +848,19 @@ async def test_revision_wakeup_dispatches_newly_added_at_job(
     state = _state(workspace, agent_home)
     store = WorkspaceScheduleStore(state)
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun()
-    service = _service(store=store, agent_run=agent_run, workspace_state=state, clock=clock)
+    callback = RecordingScheduleCallback()
+    service = _service(store=store, callback=callback, clock=clock)
     service.start()
     await asyncio.sleep(0)
 
     await store.add_user_job(_job(at_time="2026-08-07T13:00:00.000+00:00"))
     await asyncio.sleep(0)
-    assert agent_run.calls == []
+    assert callback.calls == []
     clock.advance(60 * 60)
-    await agent_run.started.wait()
+    await callback.started.wait()
     await service.close()
 
-    assert len(agent_run.calls) == 1
+    assert len(callback.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -1495,8 +873,8 @@ async def test_remove_before_reservation_prevents_the_at_run(
     job = _job(at_time="2026-08-07T13:00:00.000+00:00")
     await store.add_user_job(job)
     clock = ControlledClock(START)
-    agent_run = RecordingAgentRun()
-    service = _service(store=store, agent_run=agent_run, workspace_state=state, clock=clock)
+    callback = RecordingScheduleCallback()
+    service = _service(store=store, callback=callback, clock=clock)
     service.start()
     await asyncio.sleep(0)
 
@@ -1506,7 +884,7 @@ async def test_remove_before_reservation_prevents_the_at_run(
     await asyncio.sleep(0)
     await service.close()
 
-    assert agent_run.calls == []
+    assert callback.calls == []
     assert await store.snapshot() == ()
 
 
@@ -1529,11 +907,10 @@ async def test_due_candidates_are_revalidated_before_reservation(
         return await original_reserve_due(candidates)
 
     monkeypatch.setattr(store, "reserve_due", remove_before_reservation)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=ControlledClock(START),
     )
 
@@ -1541,7 +918,7 @@ async def test_due_candidates_are_revalidated_before_reservation(
     await asyncio.sleep(0)
     await service.close()
 
-    assert agent_run.calls == []
+    assert callback.calls == []
     assert await store.snapshot() == ()
 
 
@@ -1554,22 +931,21 @@ async def test_remove_after_reservation_allows_the_current_run_without_resurrect
     store = WorkspaceScheduleStore(state)
     job = _job()
     await store.add_user_job(job)
-    agent_run = RecordingAgentRun(block=True)
+    callback = RecordingScheduleCallback(block=True)
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=ControlledClock(START),
     )
     service.start()
-    await agent_run.started.wait()
+    await callback.started.wait()
 
     await store.remove_user_job(job.job_id, expected=job)
-    agent_run.release.set()
+    callback.release.set()
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
     await service.close()
 
-    assert len(agent_run.calls) == 1
+    assert len(callback.calls) == 1
     assert await store.snapshot() == ()
     assert service.status_snapshot().status == "available"
 
@@ -1583,15 +959,14 @@ async def test_terminal_at_removal_does_not_delete_a_replacement_job(
     store = WorkspaceScheduleStore(state)
     job = _job()
     await store.add_user_job(job)
-    agent_run = RecordingAgentRun(block=True)
+    callback = RecordingScheduleCallback(block=True)
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=ControlledClock(START),
     )
     service.start()
-    await agent_run.started.wait()
+    await callback.started.wait()
 
     await store.remove_user_job(job.job_id, expected=job)
     replacement = ScheduleJob(
@@ -1602,7 +977,7 @@ async def test_terminal_at_removal_does_not_delete_a_replacement_job(
         updated_at_ms=2,
     )
     await store.add_user_job(replacement)
-    agent_run.release.set()
+    callback.release.set()
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
     await service.close()
 
@@ -1626,16 +1001,15 @@ async def test_system_at_job_is_deleted_after_terminal_completion(
     )
     write_schedule_state(state, job)
     store = WorkspaceScheduleStore(state)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=ControlledClock(START),
     )
 
     service.start()
-    await agent_run.started.wait()
+    await callback.started.wait()
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
     await service.close()
 
@@ -1655,11 +1029,10 @@ async def test_store_fault_stops_dispatch_and_is_visible_in_status(
         raise OSError("injected replacement failure")
 
     store = WorkspaceScheduleStore(state, replace_text=fail_replace)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=ControlledClock(START),
     )
     service.start()
@@ -1669,7 +1042,7 @@ async def test_store_fault_stops_dispatch_and_is_visible_in_status(
     await asyncio.sleep(0)
     await service.close()
 
-    assert agent_run.calls == []
+    assert callback.calls == []
     assert service.status_snapshot().to_dict() == {
         "status": "faulted",
         "active_job_count": 0,
@@ -1691,18 +1064,17 @@ async def test_every_terminal_store_fault_preserves_previous_state_and_faults_se
         raise OSError("PRIVATE_TERMINAL_STORE_BODY")
 
     store = WorkspaceScheduleStore(state, replace_text=fail_replace)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     capture = capture_diagnostics()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=ControlledClock(START),
     )
 
     try:
         service.start()
-        await agent_run.started.wait()
+        await callback.started.wait()
         await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
         await service.close()
     finally:
@@ -1722,68 +1094,6 @@ async def test_every_terminal_store_fault_preserves_previous_state_and_faults_se
 
 
 @pytest.mark.asyncio
-async def test_safe_agent_failure_logs_one_warning_without_failure_message(
-    workspace: Path,
-    agent_home: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    store = WorkspaceScheduleStore(state)
-    await store.add_user_job(_job())
-
-    class FailedRun(RecordingAgentRun):
-        async def run(
-            self,
-            messages: list[dict[str, object]],
-            current_user: dict[str, object],
-            *,
-            route: str,
-            emitter: AgentRunEmitter,
-            externalize_result: object | None = None,
-            cancel_requested: Callable[[], bool] | None = None,
-        ) -> list[dict[str, object]]:
-            del cancel_requested
-            self.calls.append((messages, current_user, route))
-            self.started.set()
-            await emitter.emit(AgentRunStartedPayload())
-            await emitter.emit(
-                AgentRunFailedPayload(
-                    error=ErrorInfo(
-                        code="model_failed",
-                        message="PRIVATE_AGENT_FAILURE_MESSAGE",
-                    )
-                )
-            )
-            return []
-
-    agent_run = FailedRun()
-    capture = capture_diagnostics()
-    service = _service(
-        store=store,
-        agent_run=agent_run,
-        workspace_state=state,
-        clock=ControlledClock(START),
-    )
-
-    try:
-        service.start()
-        await agent_run.started.wait()
-        await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
-        await service.close()
-    finally:
-        capture.close()
-
-    assert capture.event_text.count("Schedule Job failed") == 1
-    assert "code=model_failed" in capture.event_text
-    assert "PRIVATE_AGENT_FAILURE_MESSAGE" not in capture.text
-    session_log_text = (state.logs_directory / f"{_job().session_id}.log").read_text(
-        encoding="utf-8"
-    )
-    assert session_log_text.count("Schedule Job failed") == 1
-    assert "code=model_failed" in session_log_text
-    assert "PRIVATE_AGENT_FAILURE_MESSAGE" not in session_log_text
-
-
-@pytest.mark.asyncio
 async def test_one_job_exception_does_not_stop_other_due_jobs(
     workspace: Path,
     agent_home: Path,
@@ -1793,53 +1103,23 @@ async def test_one_job_exception_does_not_stop_other_due_jobs(
     await store.add_user_job(_job())
     await store.add_user_job(_job(job_id=OTHER_UUID))
 
-    class FirstRunRaises(RecordingAgentRun):
-        def __init__(self) -> None:
-            super().__init__()
-            self.second_started = asyncio.Event()
-
-        async def run(
-            self,
-            messages: list[dict[str, object]],
-            current_user: dict[str, object],
-            *,
-            route: str,
-            emitter: AgentRunEmitter,
-            externalize_result: object | None = None,
-            cancel_requested: Callable[[], bool] | None = None,
-        ) -> list[dict[str, object]]:
-            del cancel_requested
-            self.calls.append((messages, current_user, route))
-            if len(self.calls) == 1:
-                raise RuntimeError("PRIVATE_JOB_EXCEPTION_BODY")
-            self.second_started.set()
-            await emitter.emit(AgentRunStartedPayload())
-            await emitter.emit(
-                AgentRunCompletedPayload(
-                    content="Done.",
-                    usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-                )
-            )
-            return []
-
-    agent_run = FirstRunRaises()
+    callback = RecordingScheduleCallback(raise_first=True)
     capture = capture_diagnostics()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=ControlledClock(START),
     )
 
     try:
         service.start()
-        await agent_run.second_started.wait()
+        await callback.second_started.wait()
         await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
         await service.close()
     finally:
         capture.close()
 
-    assert len(agent_run.calls) == 2
+    assert len(callback.calls) == 2
     assert await store.snapshot() == ()
     assert service.status_snapshot().status == "available"
     assert "PRIVATE_JOB_EXCEPTION_BODY" not in capture.text
@@ -1865,16 +1145,15 @@ async def test_terminal_commit_keeps_job_active_until_store_operation_finishes(
         return await original_commit_terminal(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(store, "commit_terminal", blocked_commit_terminal)
-    agent_run = RecordingAgentRun()
+    callback = RecordingScheduleCallback()
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=ControlledClock(START),
     )
 
     service.start()
-    await agent_run.started.wait()
+    await callback.started.wait()
     await commit_started.wait()
     assert service.status_snapshot().active_job_count == 1
 
@@ -1891,13 +1170,11 @@ async def test_shutdown_cancellation_keeps_at_job_pending(
     state = _state(workspace, agent_home)
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(_job())
-    agent_run = RecordingAgentRun(block=True)
-    service = _service(
-        store=store, agent_run=agent_run, workspace_state=state, clock=ControlledClock(START)
-    )
+    callback = RecordingScheduleCallback(block=True)
+    service = _service(store=store, callback=callback, clock=ControlledClock(START))
 
     service.start()
-    await agent_run.started.wait()
+    await callback.started.wait()
     await service.close()
 
     assert await store.snapshot() == (_job(),)
@@ -1912,16 +1189,15 @@ async def test_shutdown_cancellation_keeps_every_job_without_terminal_state(
     store = WorkspaceScheduleStore(state)
     job = _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
     await store.add_user_job(job)
-    agent_run = RecordingAgentRun(block=True)
+    callback = RecordingScheduleCallback(block=True)
     service = _service(
         store=store,
-        agent_run=agent_run,
-        workspace_state=state,
+        callback=callback,
         clock=ControlledClock(START),
     )
 
     service.start()
-    await agent_run.started.wait()
+    await callback.started.wait()
     await service.close()
 
     assert await store.snapshot() == (job,)
@@ -1932,7 +1208,7 @@ async def test_shutdown_cancellation_keeps_every_job_without_terminal_state(
 
 
 @pytest.mark.asyncio
-async def test_agent_run_cancelled_payload_keeps_at_job_pending(
+async def test_callback_cancelled_payload_keeps_at_job_pending(
     workspace: Path,
     agent_home: Path,
 ) -> None:
@@ -1940,29 +1216,10 @@ async def test_agent_run_cancelled_payload_keeps_at_job_pending(
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(_job())
 
-    class CancelledRun(RecordingAgentRun):
-        async def run(
-            self,
-            messages: list[dict[str, object]],
-            current_user: dict[str, object],
-            *,
-            route: str,
-            emitter: AgentRunEmitter,
-            externalize_result: object | None = None,
-            cancel_requested: Callable[[], bool] | None = None,
-        ) -> list[dict[str, object]]:
-            del cancel_requested
-            self.calls.append((messages, current_user, route))
-            await emitter.emit(AgentRunStartedPayload())
-            await emitter.emit(AgentRunCancelledPayload(partial_content=""))
-            return []
-
-    agent_run = CancelledRun()
-    service = _service(
-        store=store, agent_run=agent_run, workspace_state=state, clock=ControlledClock(START)
-    )
+    callback = RecordingScheduleCallback(cancelled=True)
+    service = _service(store=store, callback=callback, clock=ControlledClock(START))
     service.start()
-    await _wait_until(lambda: len(agent_run.calls) == 1)
+    await _wait_until(lambda: len(callback.calls) == 1)
     await service.close()
 
     assert await store.snapshot() == (_job(),)
@@ -2066,32 +1323,12 @@ async def test_failed_at_is_deleted_and_a_new_service_does_not_replay_it(
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(_job())
 
-    class FailedRun(RecordingAgentRun):
-        async def run(
-            self,
-            messages: list[dict[str, object]],
-            current_user: dict[str, object],
-            *,
-            route: str,
-            emitter: AgentRunEmitter,
-            externalize_result: object | None = None,
-            cancel_requested: Callable[[], bool] | None = None,
-        ) -> list[dict[str, object]]:
-            del cancel_requested
-            self.calls.append((messages, current_user, route))
-            await emitter.emit(AgentRunStartedPayload())
-            await emitter.emit(
-                AgentRunFailedPayload(
-                    error=ErrorInfo(code="model_failed", message="The model request failed.")
-                )
-            )
-            return []
-
-    first = FailedRun()
+    first = RecordingScheduleCallback(
+        failure=ErrorInfo(code="model_failed", message="The model request failed.")
+    )
     service = _service(
         store=store,
-        agent_run=first,
-        workspace_state=state,
+        callback=first,
         clock=ControlledClock(START),
     )
     service.start()
@@ -2101,11 +1338,10 @@ async def test_failed_at_is_deleted_and_a_new_service_does_not_replay_it(
     assert await store.snapshot() == ()
 
     restarted_store = WorkspaceScheduleStore(state)
-    second = RecordingAgentRun()
+    second = RecordingScheduleCallback()
     restarted = _service(
         store=restarted_store,
-        agent_run=second,
-        workspace_state=state,
+        callback=second,
         clock=ControlledClock(START),
     )
     restarted.start()

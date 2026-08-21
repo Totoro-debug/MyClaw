@@ -2,29 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-from myclaw.agent.run import (
-    AgentRunCompletedPayload,
-    AgentRunEmitter,
-    AgentRunRoute,
-    ToolResultExternalizer,
-)
-from myclaw.agent.runtime import _ScheduleExecutionAdapter
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
-from myclaw.provider.errors import ModelCallError
-from myclaw.provider.models import ModelUsage
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
-from myclaw.session.session import Session
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResult
 
@@ -252,112 +240,3 @@ async def test_schedule_service_callback_cancellation_leaves_job_pending(
     await service.close()
 
     assert await store.snapshot() == (job,)
-
-
-@pytest.mark.asyncio
-async def test_schedule_adapter_resets_guard_after_all_failure_and_cancellation_paths(
-    workspace: Path,
-    agent_home: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    service = ScheduleService(store=WorkspaceScheduleStore(state), clock=_Clock())
-
-    class AdapterRun:
-        def __init__(self, outcome: str) -> None:
-            self.outcome = outcome
-            self.started = asyncio.Event()
-            self.guard_values: list[bool] = []
-            self.never = asyncio.Event()
-
-        async def run(
-            self,
-            messages: Sequence[dict[str, Any]],
-            current_user: dict[str, Any],
-            *,
-            route: AgentRunRoute,
-            emitter: AgentRunEmitter,
-            externalize_result: ToolResultExternalizer | None = None,
-            cancel_requested: Callable[[], bool] | None = None,
-        ) -> list[dict[str, Any]]:
-            del messages, current_user, route, externalize_result, cancel_requested
-            self.guard_values.append(ScheduleTool._in_schedule_job.get())
-            self.started.set()
-            if self.outcome == "cancel":
-                await self.never.wait()
-            if self.outcome == "failure":
-                raise ModelCallError(ErrorInfo(code="model_failed", message="safe adapter failure"))
-            if self.outcome == "unexpected":
-                raise RuntimeError("PRIVATE_UNEXPECTED_FAILURE")
-            await emitter.emit(
-                AgentRunCompletedPayload(
-                    content="Done.",
-                    usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-                )
-            )
-            return [
-                {"role": "user", "content": "Run this."},
-                {
-                    "role": "assistant",
-                    "content": "Done.",
-                    "tool_calls": [],
-                    "status": "completed",
-                    "error": None,
-                    "token_usage": {
-                        "model_calls": 1,
-                        "input_tokens": 1,
-                        "output_tokens": 1,
-                        "total_tokens": 2,
-                    },
-                },
-            ]
-
-    async def prepare_context(
-        session: Session,
-        current_user: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        del session
-        return [{"role": "user", "content": current_user["content"]}]
-
-    async def execute_with(run: AdapterRun, job_id: str) -> None:
-        adapter = _ScheduleExecutionAdapter(
-            workspace_state=state,
-            clock=_Clock(),
-            agent_run=run,
-            context_preparer=prepare_context,
-            externalize_result_for=None,
-            cancel_requested=service.cancellation_requested,
-        )
-        job = ScheduleJob(
-            job_id=job_id,
-            message="Run this.",
-            schedule=JobSchedule.at("2026-08-07T13:00:00.000+00:00"),
-            created_at_ms=1,
-            updated_at_ms=1,
-        )
-        await adapter.execute(job)
-
-    success = AdapterRun("success")
-    await execute_with(success, "550e8400-e29b-41d4-a716-446655440000")
-    assert success.guard_values == [True]
-    assert ScheduleTool._in_schedule_job.get() is False
-
-    failure = AdapterRun("failure")
-    with pytest.raises(ScheduleJobExecutionError):
-        await execute_with(failure, "6fa459ea-ee8a-4ca4-894e-db77e160355e")
-    assert failure.guard_values == [True]
-    assert ScheduleTool._in_schedule_job.get() is False
-
-    unexpected = AdapterRun("unexpected")
-    with pytest.raises(ScheduleJobExecutionError):
-        await execute_with(unexpected, "45b76d6f-7d85-4b8d-8b51-0d0c88c6f85b")
-    assert unexpected.guard_values == [True]
-    assert ScheduleTool._in_schedule_job.get() is False
-
-    cancelled = AdapterRun("cancel")
-    task = asyncio.create_task(execute_with(cancelled, "9ba7b810-9dad-41d1-80b4-00c04fd430c8"))
-    await cancelled.started.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert cancelled.guard_values == [True]
-    assert ScheduleTool._in_schedule_job.get() is False

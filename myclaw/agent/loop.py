@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, NoReturn
 from uuid import UUID
 
 from loguru import logger
@@ -18,6 +18,7 @@ from myclaw.agent.message_bus import (
     OutboundMessage,
     OutboundMessageType,
 )
+from myclaw.agent.run import build_assistant_repair_message
 from myclaw.agent.runner import (
     AgentRunner,
     AgentRunnerResponseSegmentEnd,
@@ -30,9 +31,11 @@ from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelCompleted, ReasoningDelta, TextDelta
-from myclaw.schedule.service import ScheduleService
-from myclaw.session.session import Session
+from myclaw.schedule.model import ScheduleJob
+from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
+from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.tools.base import OpenAIToolSchema
+from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -41,6 +44,10 @@ from myclaw.tools.tool_gateway import (
 )
 
 type ForegroundContextPreparer = Callable[
+    [Session, dict[str, Any]],
+    Awaitable[list[dict[str, Any]]],
+]
+type ScheduleContextPreparer = Callable[
     [Session, dict[str, Any]],
     Awaitable[list[dict[str, Any]]],
 ]
@@ -102,6 +109,8 @@ class AgentLoop:
         context_preparer: ForegroundContextPreparer,
         now: Callable[[], datetime],
         max_iterations: int,
+        schedule_context_preparer: ScheduleContextPreparer | None = None,
+        schedule_now: Callable[[], datetime] | None = None,
         title_prompt: str | None = None,
         externalize_result_for: ResultExternalizerFactory | None = None,
     ) -> None:
@@ -115,10 +124,15 @@ class AgentLoop:
             raise TypeError("Agent Loop requires a context preparer")
         if not callable(now):
             raise TypeError("Agent Loop requires a clock")
+        if schedule_now is not None and not callable(schedule_now):
+            raise TypeError("Agent Loop Schedule clock must be callable")
 
         self._session = session
+        self._schedule_service = schedule_service
         self._context_preparer = context_preparer
+        self._schedule_context_preparer = schedule_context_preparer
         self._now = now
+        self._schedule_now = now if schedule_now is None else schedule_now
         self._title_prompt = title_prompt
         self._externalize_result_for = externalize_result_for
         self._tool_gateway = ToolGateway(
@@ -246,6 +260,130 @@ class AgentLoop:
             return
         active.cancel()
         await asyncio.gather(active, return_exceptions=True)
+
+    async def run_schedule_job(self, job: ScheduleJob) -> None:
+        """Execute one Schedule Job without using foreground state or output."""
+        token = ScheduleTool._in_schedule_job.set(True)
+        try:
+            await self._execute_schedule_job(job)
+        finally:
+            ScheduleTool._in_schedule_job.reset(token)
+
+    async def _execute_schedule_job(self, job: ScheduleJob) -> None:
+        schedule_session: Session | None = None
+        workspace_state = self._session.workspace_state
+        with session_log(workspace_state, job.session_id):
+            try:
+                try:
+                    schedule_session = Session.load(
+                        workspace_state,
+                        job.session_id,
+                        partition=SessionStoragePartition.SCHEDULE,
+                        now=self._schedule_now,
+                    )
+                except FileNotFoundError:
+                    schedule_session = Session.create_schedule(
+                        workspace_state,
+                        job.job_id,
+                        now=self._schedule_now,
+                    )
+                try:
+                    await self._run_schedule_agent(schedule_session, job)
+                except ScheduleJobExecutionError as failure:
+                    logger.warning(
+                        "Schedule Job failed job_id={} kind={} code={}",
+                        job.job_id,
+                        job.schedule.kind,
+                        failure.error.code,
+                    )
+                    raise
+            finally:
+                if schedule_session is not None:
+                    try:
+                        schedule_session.close()
+                    except Exception as error:
+                        logger.error(
+                            "Schedule Session close failed job_id={} type={}",
+                            job.job_id,
+                            type(error).__name__,
+                        )
+
+    async def _run_schedule_agent(self, session: Session, job: ScheduleJob) -> None:
+        current_user = {"role": "user", "content": job.message}
+        context_preparer = self._schedule_context_preparer
+        if context_preparer is None:
+            self._persist_schedule_failure(
+                session,
+                current_user,
+                ErrorInfo("model_failed", "The model request failed."),
+            )
+        try:
+            initial_messages = await context_preparer(session, deepcopy(current_user))
+        except asyncio.CancelledError:
+            self._persist_schedule_cancelled_user(session, current_user, job)
+            raise
+        except ModelCallError as failure:
+            self._persist_schedule_failure(session, current_user, failure.error)
+        except Exception:
+            self._persist_schedule_failure(
+                session,
+                current_user,
+                ErrorInfo("model_failed", "The model request failed."),
+            )
+
+        result = await self._runner.run(
+            initial_messages,
+            model="schedule",
+            tool_gateway=self._tool_gateway,
+            on_output=_discard_runner_output,
+            confirmation=None,
+            externalize_result=self._result_externalizer_for(session),
+            cancel_requested=self._schedule_service.cancellation_requested,
+            max_iterations=self._max_iterations,
+        )
+        session.append_messages([deepcopy(current_user), *deepcopy(result.messages)])
+        session.persist()
+
+        if result.finish_reason == "cancelled":
+            raise asyncio.CancelledError()
+        if result.finish_reason != "completed":
+            error = result.error or ErrorInfo("model_failed", "The model request failed.")
+            raise ScheduleJobExecutionError(error)
+
+    @staticmethod
+    def _persist_schedule_cancelled_user(
+        session: Session,
+        current_user: dict[str, Any],
+        job: ScheduleJob,
+    ) -> None:
+        try:
+            session.append_messages([current_user])
+            session.persist()
+        except Exception as error:
+            logger.error(
+                "Schedule cancellation persistence failed job_id={} type={}",
+                job.job_id,
+                type(error).__name__,
+            )
+
+    @staticmethod
+    def _persist_schedule_failure(
+        session: Session,
+        current_user: dict[str, Any],
+        error: ErrorInfo,
+    ) -> NoReturn:
+        session.append_messages(
+            [
+                deepcopy(current_user),
+                build_assistant_repair_message(
+                    content="",
+                    status="error",
+                    error=error,
+                ),
+            ]
+        )
+        session.persist()
+        raise ScheduleJobExecutionError(error)
 
     def respond_to_confirmation(
         self,
@@ -424,11 +562,7 @@ class AgentLoop:
         self,
         active_session: Session,
     ) -> Callable[[ToolResult], ToolResult] | None:
-        externalizer = (
-            None
-            if self._externalize_result_for is None
-            else self._externalize_result_for(active_session)
-        )
+        externalizer = self._result_externalizer_for(active_session)
         callback = self._tool_completion_callback
         if externalizer is None and callback is None:
             return None
@@ -440,6 +574,14 @@ class AgentLoop:
             return projected
 
         return observe
+
+    def _result_externalizer_for(
+        self,
+        active_session: Session,
+    ) -> Callable[[ToolResult], ToolResult] | None:
+        if self._externalize_result_for is None:
+            return None
+        return self._externalize_result_for(active_session)
 
     async def _publish_runner_output(self, event: object) -> None:
         if isinstance(event, ReasoningDelta):
@@ -681,7 +823,12 @@ class AgentLoop:
         )
 
 
-__all__ = ["AgentLoop", "ConfirmationCallback", "ForegroundContextPreparer"]
+__all__ = [
+    "AgentLoop",
+    "ConfirmationCallback",
+    "ForegroundContextPreparer",
+    "ScheduleContextPreparer",
+]
 
 
 def _legacy_logger() -> Any:
@@ -698,3 +845,7 @@ def _log_legacy_agent_failure(error: ErrorInfo) -> None:
         error.code,
         type(failure).__name__,
     )
+
+
+async def _discard_runner_output(event: object) -> None:
+    del event

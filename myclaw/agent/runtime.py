@@ -5,12 +5,11 @@ import json
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractContextManager
-from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any, NoReturn, Protocol, cast
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from loguru import logger
@@ -39,19 +38,8 @@ from myclaw.agent.prompts import (
     runtime_context,
     session_title_prompt,
 )
-from myclaw.agent.run import (
-    AgentRun,
-    AgentRunCancelledPayload,
-    AgentRunCompletedPayload,
-    AgentRunEmitter,
-    AgentRunFailedPayload,
-    AgentRunPayload,
-    AgentRunRoute,
-    AgentRunRouter,
-    ToolResultExternalizer,
-    build_assistant_repair_message,
-)
-from myclaw.agent.runner import AgentRunnerResult
+from myclaw.agent.run import AgentRunRouter, ToolResultExternalizer
+from myclaw.agent.runner import AgentRunnerResult, AgentRunnerRoute
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
@@ -76,25 +64,18 @@ from myclaw.memory.memory_task import (
     RuntimeMemory,
     WorkspaceFileMemoryStore,
 )
-from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import Jitter, ModelRouter, RetryClock
 from myclaw.provider.models import ModelProvider, ModelUsage
-from myclaw.schedule.model import ScheduleJob
-from myclaw.schedule.service import (
-    ScheduleClock,
-    ScheduleJobExecutionError,
-    ScheduleService,
-)
+from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.conversation import (
     ForegroundSummaryPreparer,
     StreamingConversationPort,
 )
 from myclaw.session.projection import project_session_message
-from myclaw.session.session import Session, SessionStoragePartition
+from myclaw.session.session import Session
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
-from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
     ConfirmationRequest,
     ToolGateway,
@@ -103,198 +84,9 @@ from myclaw.tools.tool_gateway import (
 )
 from myclaw.utils.scheduler import AsyncioSchedulerClock, SchedulerClock
 
-type _ScheduleContextPreparer = Callable[
-    [Session, dict[str, Any]],
-    Awaitable[list[dict[str, Any]]],
-]
-
 
 class _ClosableConversationPort(ConversationPort, Protocol):
     async def close(self) -> None: ...
-
-
-class _ScheduleAgentRun(Protocol):
-    async def run(
-        self,
-        messages: Sequence[dict[str, Any]],
-        current_user: dict[str, Any],
-        *,
-        route: AgentRunRoute,
-        emitter: AgentRunEmitter,
-        externalize_result: ToolResultExternalizer | None = None,
-        cancel_requested: Callable[[], bool] | None = None,
-    ) -> list[dict[str, Any]]: ...
-
-
-class _ScheduleRunEmitter:
-    """Consume background Agent Run progress while retaining its terminal outcome."""
-
-    def __init__(self) -> None:
-        self.terminal: (
-            AgentRunCompletedPayload | AgentRunFailedPayload | AgentRunCancelledPayload | None
-        ) = None
-
-    async def emit(self, payload: AgentRunPayload) -> None:
-        if isinstance(
-            payload,
-            (AgentRunCompletedPayload, AgentRunFailedPayload, AgentRunCancelledPayload),
-        ):
-            self.terminal = payload
-
-
-class _ScheduleExecutionAdapter:
-    """Bridge the transition Schedule callback to the existing Agent Run lifecycle."""
-
-    def __init__(
-        self,
-        *,
-        workspace_state: WorkspaceState,
-        clock: ScheduleClock,
-        agent_run: _ScheduleAgentRun,
-        context_preparer: _ScheduleContextPreparer,
-        externalize_result_for: Callable[[Session], ToolResultExternalizer] | None,
-        cancel_requested: Callable[[], bool],
-    ) -> None:
-        self._workspace_state = workspace_state
-        self._clock = clock
-        self._agent_run = agent_run
-        self._context_preparer = context_preparer
-        self._externalize_result_for = externalize_result_for
-        self._cancel_requested = cancel_requested
-
-    async def execute(self, job: ScheduleJob) -> None:
-        token = ScheduleTool._in_schedule_job.set(True)
-        try:
-            await self._execute_job(job)
-        finally:
-            ScheduleTool._in_schedule_job.reset(token)
-
-    async def _execute_job(self, job: ScheduleJob) -> None:
-        session: Session | None = None
-        with session_log(self._workspace_state, job.session_id):
-            try:
-                try:
-                    session = Session.load(
-                        self._workspace_state,
-                        job.session_id,
-                        partition=SessionStoragePartition.SCHEDULE,
-                        now=self._clock.now,
-                    )
-                except FileNotFoundError:
-                    session = Session.create_schedule(
-                        self._workspace_state,
-                        job.job_id,
-                        now=self._clock.now,
-                    )
-                try:
-                    await self._run_agent(session, job)
-                except ScheduleJobExecutionError as failure:
-                    logger.warning(
-                        "Schedule Job failed job_id={} kind={} code={}",
-                        job.job_id,
-                        job.schedule.kind,
-                        failure.error.code,
-                    )
-                    raise
-            finally:
-                if session is not None:
-                    try:
-                        session.close()
-                    except Exception as error:
-                        logger.error(
-                            "Schedule Session close failed job_id={} type={}",
-                            job.job_id,
-                            type(error).__name__,
-                        )
-
-    async def _run_agent(self, session: Session, job: ScheduleJob) -> None:
-        current_user = {"role": "user", "content": job.message}
-        try:
-            messages = await self._context_preparer(session, deepcopy(current_user))
-        except asyncio.CancelledError:
-            self._persist_cancelled_user(session, current_user, job)
-            raise
-        except ModelCallError as failure:
-            self._persist_failure(session, current_user, failure)
-        except Exception:
-            self._persist_failure(session, current_user, self._model_failure())
-
-        emitter = _ScheduleRunEmitter()
-        try:
-            if self._externalize_result_for is None:
-                increment = await self._agent_run.run(
-                    messages,
-                    current_user,
-                    route="schedule",
-                    emitter=emitter,
-                    cancel_requested=self._cancel_requested,
-                )
-            else:
-                increment = await self._agent_run.run(
-                    messages,
-                    current_user,
-                    route="schedule",
-                    emitter=emitter,
-                    externalize_result=self._externalize_result_for(session),
-                    cancel_requested=self._cancel_requested,
-                )
-        except asyncio.CancelledError:
-            raise
-        except ModelCallError as failure:
-            self._persist_failure(session, current_user, failure)
-        except Exception:
-            self._persist_failure(session, current_user, self._model_failure())
-
-        if not isinstance(increment, list) or emitter.terminal is None:
-            self._persist_failure(session, current_user, self._model_failure())
-
-        terminal = emitter.terminal
-        assert terminal is not None
-        session.append_messages(increment)
-        session.persist()
-        if isinstance(terminal, AgentRunCancelledPayload):
-            raise asyncio.CancelledError()
-        if isinstance(terminal, AgentRunFailedPayload):
-            raise ScheduleJobExecutionError(terminal.error)
-
-    def _persist_cancelled_user(
-        self,
-        session: Session,
-        current_user: dict[str, Any],
-        job: ScheduleJob,
-    ) -> None:
-        try:
-            session.append_messages([current_user])
-            session.persist()
-        except Exception as error:
-            logger.error(
-                "Schedule cancellation persistence failed job_id={} type={}",
-                job.job_id,
-                type(error).__name__,
-            )
-
-    @staticmethod
-    def _model_failure() -> ModelCallError:
-        return ModelCallError(ErrorInfo(code="model_failed", message="The model request failed."))
-
-    @staticmethod
-    def _persist_failure(
-        session: Session,
-        current_user: dict[str, Any],
-        failure: ModelCallError,
-    ) -> NoReturn:
-        session.append_messages(
-            [
-                deepcopy(current_user),
-                build_assistant_repair_message(
-                    content="",
-                    status="error",
-                    error=failure.error,
-                ),
-            ]
-        )
-        session.persist()
-        raise ScheduleJobExecutionError(failure.error)
 
 
 class _RuntimeSchedulerOwner:
@@ -1081,7 +873,6 @@ def _prepare_runtime(
         clock=retry_clock,
         jitter=retry_jitter,
     )
-    model = router
 
     def system_prompt_for(memory_snapshot: str) -> str:
         return chat_system_prompt(
@@ -1119,7 +910,7 @@ def _prepare_runtime(
 
     async def prepare_summary(
         active_session: Session,
-        route: AgentRunRoute,
+        route: AgentRunnerRoute,
         current_system_prompt: str,
         tools: tuple[OpenAIToolSchema, ...],
         current_user: dict[str, Any] | None = None,
@@ -1183,7 +974,7 @@ def _prepare_runtime(
             active_session,
             "schedule",
             current_system_prompt,
-            tuple(scheduled_tool_gateway.schemas),
+            tuple(agent_loop.tool_schemas),
             current_user,
         )
         history = active_session.messages[active_session.last_consolidated :]
@@ -1223,24 +1014,13 @@ def _prepare_runtime(
         context_preparer=prepare_foreground_context,
         now=now,
         max_iterations=configuration.runtime.max_iterations,
+        schedule_context_preparer=prepare_schedule_context,
+        schedule_now=schedule_clock.now,
         title_prompt=session_title_prompt(),
         externalize_result_for=externalize_result_for,
     )
 
-    scheduled_tool_gateway = ToolGateway(
-        workspace=workspace_identity,
-        schedule_service=schedule_service,
-    )
-    schedule_agent_run = AgentRun(model=model, tool_gateway=scheduled_tool_gateway)
-    schedule_adapter = _ScheduleExecutionAdapter(
-        workspace_state=workspace_state,
-        clock=schedule_clock,
-        agent_run=schedule_agent_run,
-        context_preparer=prepare_schedule_context,
-        externalize_result_for=externalize_result_for,
-        cancel_requested=schedule_service.cancellation_requested,
-    )
-    schedule_service.on_schedule_job = schedule_adapter.execute
+    schedule_service.on_schedule_job = agent_loop.run_schedule_job
 
     conversation = _AgentLoopConversationAdapter(
         loop=agent_loop,

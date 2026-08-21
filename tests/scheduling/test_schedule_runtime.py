@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, S
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -17,12 +17,16 @@ import pytest
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.events import AgentEvent
 from myclaw.agent.prompts import session_title_prompt
+from myclaw.agent.runner import AgentRunner, AgentRunnerResult
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
+from myclaw.memory.conversation_summary import (
+    ConversationSummaryManager,
+    WorkspaceJsonlSummaryStore,
+)
 from myclaw.memory.memory_task import WorkspaceFileMemoryStore
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -41,6 +45,7 @@ from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ProviderCall
+from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 NOW = datetime(2026, 8, 7, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -74,6 +79,7 @@ class _RuntimeProvider:
         schedule_responses: Iterable[ModelResponse] = (),
         memory_responses: Iterable[ModelResponse] = (),
         block_chat_call: int | None = None,
+        block_schedule_call: int | None = None,
     ) -> None:
         self._responses = {
             "chat": deque(chat_responses),
@@ -81,9 +87,13 @@ class _RuntimeProvider:
             "memory": deque(memory_responses),
         }
         self._block_chat_call = block_chat_call
+        self._block_schedule_call = block_schedule_call
         self._chat_call_count = 0
+        self._schedule_call_count = 0
         self.chat_block_started = asyncio.Event()
         self.release_chat = asyncio.Event()
+        self.schedule_block_started = asyncio.Event()
+        self.release_schedule = asyncio.Event()
         self.stream_requests: list[ProviderCall] = []
         self.complete_requests: list[ProviderCall] = []
         self.direct_complete_messages: list[
@@ -150,7 +160,13 @@ class _RuntimeProvider:
             timeout=timeout,
         )
         self.complete_requests.append(call)
-        return self._take("schedule" if len(tools) == 10 else "memory")
+        route = "schedule" if len(tools) == 10 else "memory"
+        if route == "schedule":
+            self._schedule_call_count += 1
+            if self._block_schedule_call == self._schedule_call_count:
+                self.schedule_block_started.set()
+                await self.release_schedule.wait()
+        return self._take(route)
 
     async def close(self) -> None:
         self.closed = True
@@ -185,6 +201,16 @@ def _schedule_tool_response(call_id: str, arguments: dict[str, object]) -> Model
             name="schedule",
             arguments=json.dumps(arguments, separators=(",", ":")),
         ),
+    )
+
+
+def _due_job(*, message: str = "Run this.") -> ScheduleJob:
+    return ScheduleJob(
+        job_id=str(JOB_UUID),
+        message=message,
+        schedule=JobSchedule.at("2026-08-07T03:59:00.000+00:00"),
+        created_at_ms=1,
+        updated_at_ms=1,
     )
 
 
@@ -775,3 +801,327 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
         assert all(cast(str, event.type) != "background_completed" for event in events)
     finally:
         await runtime.close()
+
+
+def test_runtime_binds_schedule_callback_to_agent_loop(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _RuntimeProvider()
+    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+
+    callback = runtime.schedule_service.on_schedule_job
+    assert callback is not None
+    assert getattr(callback, "__self__", None) is runtime.agent_loop
+    assert getattr(callback, "__func__", None) is runtime.agent_loop.run_schedule_job.__func__
+
+
+@pytest.mark.asyncio
+async def test_runtime_foreground_and_schedule_share_runner_and_gateway_identity(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _RuntimeProvider(
+        chat_responses=(_response("Foreground result."),),
+        schedule_responses=(_response("Schedule result."),),
+    )
+    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    observed: list[tuple[AgentRunner, object, str, object, object]] = []
+    original_run = AgentRunner.run
+
+    async def record_run(
+        runner: AgentRunner,
+        initial_messages: Sequence[dict[str, Any]],
+        **kwargs: Any,
+    ) -> AgentRunnerResult:
+        observed.append(
+            (
+                runner,
+                kwargs["tool_gateway"],
+                cast(str, kwargs["model"]),
+                kwargs["confirmation"],
+                kwargs["on_output"],
+            )
+        )
+        return await original_run(runner, initial_messages, **kwargs)
+
+    monkeypatch.setattr(AgentRunner, "run", record_run)
+    callback = runtime.schedule_service.on_schedule_job
+    assert callback is not None
+    await runtime.start()
+    try:
+        assert [event.type for event in await _submit_turn(runtime, "Run foreground.")][-1] == (
+            "turn_completed"
+        )
+        callback_result = await cast(Callable[..., Any], callback)(
+            _due_job(message="Run Schedule.")
+        )
+        assert callback_result is None
+    finally:
+        await runtime.close()
+
+    assert len(observed) == 2
+    assert observed[0][0] is observed[1][0]
+    assert observed[0][1] is observed[1][1]
+    assert [call[2] for call in observed] == ["chat", "schedule"]
+    assert observed[0][3] is not None
+    assert observed[1][3] is None
+    assert observed[0][4] is not observed[1][4]
+
+
+@pytest.mark.asyncio
+async def test_runtime_externalizers_keep_foreground_and_schedule_artifacts_separate(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    large_file = workspace / "large.txt"
+    large_file.parent.mkdir(parents=True, exist_ok=True)
+    large_file.write_text("x\n" * 4000, encoding="utf-8")
+    provider = _RuntimeProvider(
+        chat_responses=(
+            _response(
+                "",
+                tool_call=ModelToolCall(
+                    id="foreground_artifact",
+                    name="read_file",
+                    arguments='{"path":"large.txt","limit":10000}',
+                ),
+            ),
+            _response("Foreground artifact stored."),
+        ),
+        schedule_responses=(
+            _response(
+                "",
+                tool_call=ModelToolCall(
+                    id="schedule_artifact",
+                    name="read_file",
+                    arguments='{"path":"large.txt","limit":10000}',
+                ),
+            ),
+            _response("Schedule artifact stored."),
+        ),
+    )
+    config_text = VALID_CONFIG.replace(
+        "max_tool_result_chars = 60000", "max_tool_result_chars = 1000"
+    )
+    runtime = _runtime(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+        config_text=config_text,
+    )
+    callback = runtime.schedule_service.on_schedule_job
+    assert callback is not None
+    await runtime.start()
+    try:
+        await _submit_turn(runtime, "Read the large file in foreground.")
+        callback_result = await cast(Callable[..., Any], callback)(
+            _due_job(message="Read the large file in Schedule.")
+        )
+        assert callback_result is None
+        foreground_session_id = runtime.session.session_id
+        foreground_tool = next(
+            message for message in runtime.session.messages if message["role"] == "tool"
+        )
+    finally:
+        await runtime.close()
+
+    state = WorkspaceState(Workspace.from_path(workspace))
+    schedule_session = Session.load(
+        state,
+        f"schedule_{JOB_UUID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    schedule_tool = next(
+        message for message in schedule_session.messages if message["role"] == "tool"
+    )
+    foreground_artifact = cast(dict[str, object], foreground_tool["artifact"])
+    schedule_artifact = cast(dict[str, object], schedule_tool["artifact"])
+    assert set(foreground_artifact) == {"path", "total_chars", "preview_chars"}
+    assert set(schedule_artifact) == {"path", "total_chars", "preview_chars"}
+    assert foreground_artifact["path"] == (
+        f".myclaw/artifacts/{foreground_session_id}/foreground_artifact.txt"
+    )
+    assert schedule_artifact["path"] == (
+        f".myclaw/artifacts/schedule_{JOB_UUID}/schedule_artifact.txt"
+    )
+    assert (workspace / foreground_artifact["path"]).exists()
+    assert (workspace / schedule_artifact["path"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_runtime_schedule_session_uses_schedule_clock_for_persisted_timestamps(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    schedule_now = NOW + timedelta(hours=2)
+    provider = _RuntimeProvider(schedule_responses=(_response("Background result."),))
+    runtime = _runtime(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(schedule_now),
+    )
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Run at the Schedule clock time.",
+        schedule=JobSchedule.at("2026-08-07T05:59:00.000+00:00"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+
+    callback = runtime.schedule_service.on_schedule_job
+    assert callback is not None
+    try:
+        callback_result = await cast(Callable[..., Any], callback)(job)
+        assert callback_result is None
+    finally:
+        await runtime.close()
+
+    schedule_session = Session.load(
+        WorkspaceState(Workspace.from_path(workspace)),
+        job.session_id,
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    expected_timestamp = schedule_now.isoformat(timespec="milliseconds")
+    assert schedule_session.created_at == schedule_now
+    assert schedule_session.updated_at == schedule_now
+    assert {message["timestamp"] for message in schedule_session.messages} == {expected_timestamp}
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_during_schedule_model_persists_user_and_keeps_job_pending(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    job = _due_job(message="Block in the Schedule model.")
+    store = WorkspaceScheduleStore(state)
+    await store.add_user_job(job)
+    provider = _RuntimeProvider(
+        schedule_responses=(_response("Unused."),),
+        block_schedule_call=1,
+    )
+    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+
+    runtime.schedule_service.start()
+    await provider.schedule_block_started.wait()
+    await runtime.close()
+
+    assert await store.snapshot() == (job,)
+    schedule_session = Session.load(
+        state,
+        job.session_id,
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert [(message["role"], message["content"]) for message in schedule_session.messages] == [
+        ("user", job.message)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_during_schedule_preparation_persists_user(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    job = _due_job(message="Block in Schedule context preparation.")
+    store = WorkspaceScheduleStore(state)
+    await store.add_user_job(job)
+    provider = _RuntimeProvider(schedule_responses=(_response("Unused."),))
+    context_started = asyncio.Event()
+    context_never_completes = asyncio.Event()
+    original_prepare = ConversationSummaryManager.prepare
+
+    async def block_schedule_preparation(
+        manager: ConversationSummaryManager,
+        session: Session,
+        *,
+        current_user: dict[str, Any] | None = None,
+        continuation: Sequence[dict[str, Any]] = (),
+    ) -> Session:
+        if session.storage_partition is SessionStoragePartition.SCHEDULE:
+            context_started.set()
+            await context_never_completes.wait()
+        return await original_prepare(
+            manager,
+            session,
+            current_user=current_user,
+            continuation=continuation,
+        )
+
+    monkeypatch.setattr(ConversationSummaryManager, "prepare", block_schedule_preparation)
+    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+
+    runtime.schedule_service.start()
+    await context_started.wait()
+    await runtime.close()
+
+    assert provider.complete_requests == []
+    assert await store.snapshot() == (job,)
+    schedule_session = Session.load(
+        state,
+        job.session_id,
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert [(message["role"], message["content"]) for message in schedule_session.messages] == [
+        ("user", job.message)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_schedule_failure_logs_one_safe_session_warning(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = WorkspaceState(Workspace.from_path(workspace))
+    state.initialize(agent_home_root=agent_home)
+    job = _due_job(message="Fail safely during Schedule preparation.")
+    store = WorkspaceScheduleStore(state)
+    await store.add_user_job(job)
+    provider = _RuntimeProvider()
+    failure_started = asyncio.Event()
+    original_prepare = ConversationSummaryManager.prepare
+
+    async def fail_schedule_preparation(
+        manager: ConversationSummaryManager,
+        session: Session,
+        *,
+        current_user: dict[str, Any] | None = None,
+        continuation: Sequence[dict[str, Any]] = (),
+    ) -> Session:
+        if session.storage_partition is SessionStoragePartition.SCHEDULE:
+            failure_started.set()
+            raise RuntimeError("PRIVATE_SCHEDULE_PREPARATION_BODY")
+        return await original_prepare(
+            manager,
+            session,
+            current_user=current_user,
+            continuation=continuation,
+        )
+
+    monkeypatch.setattr(ConversationSummaryManager, "prepare", fail_schedule_preparation)
+    capture = capture_diagnostics()
+    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    try:
+        runtime.schedule_service.start()
+        await failure_started.wait()
+        await _wait_until(lambda: runtime.schedule_service.status_snapshot().active_job_count == 0)
+    finally:
+        await runtime.close()
+        capture.close()
+
+    assert await _schedule_state(workspace).snapshot() == ()
+    assert capture.event_text.count("Schedule Job failed") == 1
+    assert "code=model_failed" in capture.event_text
+    assert "PRIVATE_SCHEDULE_PREPARATION_BODY" not in capture.text
+    session_log_text = (state.logs_directory / f"{job.session_id}.log").read_text(encoding="utf-8")
+    assert session_log_text.count("Schedule Job failed") == 1
+    assert "code=model_failed" in session_log_text
+    assert "PRIVATE_SCHEDULE_PREPARATION_BODY" not in session_log_text
