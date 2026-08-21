@@ -7,7 +7,6 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.context import ContextBuilder
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
@@ -23,12 +22,12 @@ from myclaw.provider.models import (
     ModelUsage,
     ReasoningEffort,
 )
-from myclaw.session.conversation import StreamingConversationPort
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock, ProviderCall, ScriptedFakeRouter
+from tests.fixtures import FakeClock, ProviderCall
+from tests.runtime_bus import collect_foreground_outbound
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -124,7 +123,10 @@ class TitleFirstProvider:
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del tools, model, max_output, temperature, reasoning_effort, timeout
-        if messages and messages[0] == {"role": "system", "content": "Generate a title."}:
+        if messages and messages[0] == {
+            "role": "system",
+            "content": session_title_prompt(),
+        }:
             yield ModelCompleted(
                 response=ModelResponse(
                     message=AssistantModelMessage(content='"Generated before chat"'),
@@ -230,10 +232,19 @@ async def test_title_finishes_before_chat_when_direct_provider_exposes_route_sta
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state = WorkspaceState(Workspace.from_path(workspace))
-    state.initialize(agent_home_root=agent_home)
-    session = Session.create(state, now=lambda: NOW, new_uuid=lambda: SESSION_UUID)
     provider = TitleFirstProvider()
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=lambda: NOW,
+        new_uuid=iter((SESSION_UUID, TURN_UUID)).__next__,
+    )
+    session = runtime.session
     replacements: list[bytes] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
 
@@ -242,22 +253,8 @@ async def test_title_finishes_before_chat_when_direct_provider_exposes_route_sta
         replace(path, content)
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_replace)
-    conversation = StreamingConversationPort(
-        model=ScriptedFakeRouter(provider),
-        session=session,
-        now=lambda: NOW,
-        new_uuid=iter((TURN_UUID,)).__next__,
-        title_prompt="Generate a title.",
-        context_builder=ContextBuilder(
-            Workspace.from_path(workspace),
-            "Asia/Shanghai",
-            clock=lambda: NOW,
-        ),
-    )
-    events = conversation.submit("First input.")
-
-    assert (await anext(events)).type == "turn_started"
-    terminal = asyncio.create_task(anext(events))
+    await runtime.start()
+    terminal = asyncio.create_task(collect_foreground_outbound(runtime, "First input."))
     await provider.chat_started.wait()
     for _ in range(100):
         if session.metadata["title"] == "Generated before chat":
@@ -265,23 +262,22 @@ async def test_title_finishes_before_chat_when_direct_provider_exposes_route_sta
         await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    session_path = state.sessions_directory / f"{session.session_id}.jsonl"
+    session_path = workspace / ".myclaw" / "sessions" / f"{session.session_id}.jsonl"
     assert session.metadata["title"] == "Generated before chat"
     assert not session_path.exists()
     assert replacements == []
 
     provider.release_chat.set()
-    assert (await terminal).type == "model_call_completed"
-    assert (await anext(events)).type == "turn_completed"
-    with pytest.raises(StopAsyncIteration):
-        await anext(events)
+    messages = await terminal
+    assert messages[-1].type == "model_response"
+    assert messages[-1].metadata == {"_streamed": True}
     await asyncio.sleep(0)
 
     assert len(replacements) == 1
-    reloaded = Session.load(state, session.session_id)
+    reloaded = Session.load(session.workspace_state, session.session_id)
     assert reloaded.metadata["title"] == "Generated before chat"
     assert [message["role"] for message in reloaded.messages] == ["user", "assistant"]
-    await conversation.close()
+    await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -304,19 +300,14 @@ async def test_prepared_runtime_uses_an_isolated_chat_stream_for_session_title(
         retry_clock=clock,
     )
 
-    event_types = [
-        event.type async for event in runtime.conversation.submit("  First\t runtime input.  ")
-    ]
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, "  First\t runtime input.  ")
     for _ in range(100):
         if len(provider.requests) == 2 and runtime.session.metadata["title"] == "Runtime project":
             break
         await asyncio.sleep(0)
 
-    assert event_types == [
-        "turn_started",
-        "model_call_completed",
-        "turn_completed",
-    ]
+    assert messages[-1].metadata == {"_streamed": True}
     assert len(provider.requests) == 2
     title_request = next(
         request
@@ -338,6 +329,7 @@ async def test_prepared_runtime_uses_an_isolated_chat_stream_for_session_title(
         "total_tokens": 14,
     }
     assert [message["role"] for message in runtime.session.messages] == ["user", "assistant"]
+    await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -363,38 +355,36 @@ async def test_existing_session_turn_does_not_regenerate_its_title(
             "total_tokens": 2,
         },
     )
+    session.close()
     provider = ExistingSessionProvider()
-    conversation = StreamingConversationPort(
-        model=ScriptedFakeRouter(provider),
-        session=session,
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
         now=lambda: NOW,
         new_uuid=lambda: TURN_UUID,
-        title_prompt="Generate a title.",
-        context_builder=ContextBuilder(
-            Workspace.from_path(workspace),
-            "Asia/Shanghai",
-            clock=lambda: NOW,
-        ),
     )
-
-    observed = [event async for event in conversation.submit("Continue this Session.")]
+    await runtime.start()
+    result = await runtime.management_dispatcher.resume(session.session_id)
+    assert result.output == f"Resumed session {session.session_id}."
+    observed = await collect_foreground_outbound(runtime, "Continue this Session.")
     await asyncio.sleep(0)
 
-    assert [event.type for event in observed] == [
-        "turn_started",
-        "model_call_completed",
-        "turn_completed",
-    ]
+    assert observed[-1].metadata == {"_streamed": True}
     assert len(provider.requests) == 1
     assert "You are the MyClaw Personal Agent." in cast(
         str, provider.requests[0].messages[0]["content"]
     )
     assert "<tool_guidance>" in cast(str, provider.requests[0].messages[0]["content"])
-    assert session.metadata["title"] == "Existing title"
-    assert session.metadata["token_usage"] == {
+    assert runtime.session.metadata["title"] == "Existing title"
+    assert runtime.session.metadata["token_usage"] == {
         "model_calls": 2,
         "input_tokens": 3,
         "output_tokens": 2,
         "total_tokens": 5,
     }
-    await conversation.close()
+    await runtime.close()

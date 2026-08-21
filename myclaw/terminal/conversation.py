@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 from asyncio import CancelledError, Event, Task, create_task, sleep
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,7 +15,7 @@ from functools import partial
 from time import monotonic as monotonic_now
 from typing import ClassVar, Final, Literal, Protocol, cast
 from urllib.parse import urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from markdown_it import MarkdownIt
 from markdown_it.rules_core.state_core import StateCore
@@ -35,27 +37,13 @@ from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 from textual.worker import Worker, WorkerError
 
-from myclaw.agent.events import (
-    AgentEvent,
-    ConfirmationDecision,
-    ConfirmationRequestedPayload,
-    ModelCallCompletedPayload,
-    TextDeltaPayload,
-    ToolCompletedPayload,
-    ToolStartedPayload,
-    TurnCancelledPayload,
-    TurnCompletedPayload,
-    TurnFailedPayload,
-    TurnStartedPayload,
-)
+from myclaw.agent.loop import ConfirmationRequestView, TerminalAgentLoopControl
+from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runtime import PreparedRuntime
 from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS, ManagementCommandResult
 from myclaw.management.service import SessionListingEntry
-from myclaw.terminal._turn_stream import (
-    clear_current_task_cancellation,
-    close_event_stream,
-)
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
+from myclaw.terminal.repl import ManagementDispatcher
 
 __all__ = [
     "TerminalConversationApp",
@@ -80,6 +68,7 @@ _UNSAFE_TOOL_DETAIL_PATTERN = re.compile(
 )
 _ACTIVITY_EXPANDED_SYMBOL = "\u25bc"
 _ACTIVITY_COLLAPSED_SYMBOL = "\u25b6"
+_SPARSE_MARKERS = ("_stream_delta", "_stream_end", "_streamed")
 _TERMINAL_MODE_RESETS: Final = (
     ("\x1b[?2004h", "\x1b[?2004l"),
     ("\x1b[?1000h", "\x1b[?1000l"),
@@ -90,7 +79,8 @@ _TERMINAL_MODE_RESETS: Final = (
     ("\x1b[?1049h", "\x1b[?1049l"),
     ("\x1b[?25l", "\x1b[?25h"),
 )
-type _ControlAction = Literal["cancel_active_turn", "clear_draft", "exit"]
+type _ControlAction = Literal["cancel_active_turn", "clear_draft", "drain_pending", "exit"]
+type ConfirmationDecision = Literal["approved", "declined"]
 type _ToolRowStatus = Literal["running", "success", "error", "refused"]
 type _TerminalOutcome = Literal["completed", "cancelled", "failed"]
 
@@ -262,10 +252,15 @@ class _ConversationInput(TextArea):
             event.prevent_default()
             self.app.query_one("#conversation-display", _ConversationDisplay).navigate(event.key)
             return
+        if event.key == "up" and not self.text and getattr(self.app, "has_pending_input", False):
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.ControlAction(self, "drain_pending"))
+            return
         control_action: _ControlAction | None = None
         turn_token: object | None = None
         if event.key == "ctrl+c":
-            if self.read_only:
+            if self.active_turn_token is not None:
                 control_action = "cancel_active_turn"
                 turn_token = self.active_turn_token
                 if turn_token is not None:
@@ -283,10 +278,6 @@ class _ConversationInput(TextArea):
             event.stop()
             event.prevent_default()
             self.post_message(self.ControlAction(self, control_action, turn_token=turn_token))
-            return
-        if self.read_only:
-            event.stop()
-            event.prevent_default()
             return
         if event.key in {"up", "down"} and self._navigate_history(-1 if event.key == "up" else 1):
             event.stop()
@@ -1155,7 +1146,7 @@ class _ToolConfirmationScreen(ModalScreen[ConfirmationDecision]):
         Binding("right,down", "focus_approve", "Approve", show=False),
     ]
 
-    def __init__(self, request: ConfirmationRequestedPayload) -> None:
+    def __init__(self, request: ConfirmationRequestView) -> None:
         super().__init__(id=f"confirmation-{request.confirmation_id.hex}")
         self._request = request
 
@@ -1210,337 +1201,232 @@ class _ToolConfirmationScreen(ModalScreen[ConfirmationDecision]):
         self.query_one("#confirmation-approve", Button).focus()
 
 
-class _AgentRunProjection:
-    """Own the complete live UI projection for one Agent Run."""
+class _MessageBusRunProjection:
+    """Project one consumed MessageBus foreground run into the Terminal UI."""
 
-    def __init__(self, app: TerminalConversationApp) -> None:
+    def __init__(self, app: TerminalConversationApp, turn_id: UUID) -> None:
         self._app = app
+        self.turn_id = turn_id
         self._assistant: Markdown | None = None
-        self._stream: _CoalescedMarkdownStream | None = None
-        self._streamed_fragments: list[str] = []
-        self._classified_candidate: Markdown | None = None
+        self._response_stream: _CoalescedMarkdownStream | None = None
+        self._response_fragments: list[str] = []
+        self._reasoning: Markdown | None = None
+        self._reasoning_stream: _CoalescedMarkdownStream | None = None
         self._activity_group: _ActivityGroupState | None = None
-        self._tool_rows: dict[_ToolRowKey, _ToolRowState] = {}
-        self._closed_tool_turns: set[UUID] = set()
-        self._observed_tool_turns: set[UUID] = set()
-        self._resolved_confirmations: set[UUID] = set()
-        self._highest_event_id = -1
-        self._awaiting_tool_for_candidate = False
-        self._terminal_content: str | None = None
+        self._tool_rows: dict[str, _ToolRowState] = {}
+        self._terminal_content = ""
         self._terminal_status: str | None = None
         self._outcome: _TerminalOutcome | None = None
+        self._terminal_seen = False
         self._started_at: float | None = None
         self._elapsed = 0.0
         self._timer: Timer | None = None
 
-    async def consume(self, events: AsyncIterator[AgentEvent]) -> None:
-        """Consume and project one Run, including terminal reconciliation."""
-        cancelled = False
-        primary_error: BaseException | None = None
-        event_stream_failed = False
+    @property
+    def terminal_seen(self) -> bool:
+        return self._terminal_seen
 
-        while not cancelled and primary_error is None:
-            try:
-                event = await anext(events)
-            except StopAsyncIteration:
-                if self._outcome is None:
-                    event_stream_failed = True
-                break
-            except CancelledError as error:
-                primary_error = error
-                cancelled = True
-                break
-            except BaseException as error:
-                if self._app._closing:
-                    primary_error = error
-                elif self._outcome is None:
-                    event_stream_failed = True
-                break
-            try:
-                await self._process_event(event)
-            except CancelledError as error:
-                primary_error = error
-                cancelled = True
-            except BaseException as error:
-                primary_error = error
-            if self._outcome is not None:
-                break
+    def start(self) -> None:
+        """Start elapsed timing when AgentLoop consumes the inbound message."""
+        self._start_timing()
 
-        if event_stream_failed and self._outcome is None and not self._app._closing:
-            self._finish("failed")
-            self._terminal_status = "Turn failed."
-        elif cancelled:
-            self._terminal_content = "".join(self._streamed_fragments)
-            self._finish("cancelled")
-        elif primary_error is not None and self._outcome is None:
-            self._finish("failed")
+    async def consume(self, outbound: OutboundMessage) -> None:
+        if self._terminal_seen:
+            return
+        self._start_timing()
+        marker = self._sparse_marker(outbound.metadata)
+        if outbound.type == "model_reasoning":
+            if marker == "_stream_delta":
+                await self._append_reasoning(outbound.content)
+            elif marker == "_stream_end":
+                await self._stop_reasoning_stream()
+            else:
+                await self._fail_sparse_protocol()
+            return
+        if outbound.type == "model_response":
+            if marker == "_stream_delta":
+                await self._append_response(outbound.content)
+            elif marker == "_stream_end":
+                await self._stop_response_stream()
+            elif marker == "_streamed":
+                await self._finish_terminal("completed", "")
+            else:
+                await self._fail_sparse_protocol()
+            return
+        if outbound.type == "tool_call":
+            if marker is not None or any(key in outbound.metadata for key in _SPARSE_MARKERS):
+                await self._fail_sparse_protocol()
+                return
+            tool_call_id = outbound.metadata.get("tool_call_id")
+            arguments = outbound.metadata.get("arguments")
+            if not isinstance(tool_call_id, str) or not isinstance(arguments, str):
+                await self._fail_sparse_protocol()
+                return
+            await self._stop_response_stream()
+            if self._assistant is not None or self._response_fragments:
+                await self._move_response_to_activity("".join(self._response_fragments))
+            group = await self._ensure_activity_group()
+            if tool_call_id not in self._tool_rows:
+                row = await self._app._mount_tool_message(
+                    outbound.content,
+                    "running",
+                    "",
+                    self._app.query_one("#conversation-display", _ConversationDisplay),
+                    parent=group.content,
+                    raw_arguments=arguments,
+                )
+                self._tool_rows[tool_call_id] = _ToolRowState(row, outbound.content, "running")
+                self._app._scroll_to_latest()
+            return
+        if outbound.type == "system_control" and marker == "_streamed":
+            finish_reason = outbound.metadata.get("finish_reason")
+            if finish_reason not in {"cancelled", "failed", "max_iterations"}:
+                await self._fail_sparse_protocol()
+                return
+            outcome: _TerminalOutcome = "cancelled" if finish_reason == "cancelled" else "failed"
+            self._terminal_status = (
+                "Turn cancelled." if outcome == "cancelled" else outbound.content
+            )
+            await self._finish_terminal(outcome, outbound.content)
+            return
+        await self._fail_sparse_protocol()
 
-        cleanup_errors = await self._reconcile(cancelled, primary_error)
-        if cancelled:
-            clear_current_task_cancellation()
-        try:
-            await close_event_stream(events)
-        except BaseException as cleanup_error:
-            if not cancelled:
-                cleanup_errors.append(cleanup_error)
+    @staticmethod
+    def _sparse_marker(metadata: Mapping[str, object]) -> str | None:
+        present = [key for key in _SPARSE_MARKERS if key in metadata]
+        if len(present) != 1 or metadata[present[0]] is not True:
+            return None
+        return present[0]
+
+    async def _fail_sparse_protocol(self) -> None:
+        self._terminal_status = "Turn failed."
+        await self._finish_terminal("failed", "")
+
+    async def close(self) -> None:
+        await self._stop_response_stream()
+        await self._stop_reasoning_stream()
         self.stop()
 
-        if primary_error is not None:
-            if cleanup_errors:
-                cause: BaseException = (
-                    cleanup_errors[0]
-                    if len(cleanup_errors) == 1
-                    else BaseExceptionGroup("Turn cleanup failed", cleanup_errors)
-                )
-                raise primary_error from cause
-            raise primary_error
-        if len(cleanup_errors) == 1:
-            raise cleanup_errors[0]
-        if cleanup_errors:
-            raise cleanup_errors[0] from BaseExceptionGroup(
-                "Additional turn cleanup failures",
-                cleanup_errors[1:],
-            )
-
     def stop(self) -> None:
-        """Stop projection-owned background work without touching mounted output."""
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
 
-    async def _process_event(self, event: AgentEvent) -> None:
-        if self._outcome is not None:
+    async def _append_response(self, fragment: str) -> None:
+        if self._assistant is not None and self._response_stream is None:
             return
-        out_of_order = event.event_id <= self._highest_event_id
-        self._highest_event_id = max(self._highest_event_id, event.event_id)
-        if event.type == "turn_started":
-            payload = event.payload
-            if not isinstance(payload, TurnStartedPayload):
-                raise TypeError("turn_started event has an invalid payload")
-            self._start_timing()
-        elif event.type == "text_delta":
-            payload = event.payload
-            if not isinstance(payload, TextDeltaPayload):
-                raise TypeError("text_delta event has an invalid payload")
-            if out_of_order or (self._assistant is not None and self._stream is None):
-                return
-            self._classified_candidate = None
-            self._streamed_fragments.append(payload.delta)
-            if self._assistant is None:
-                self._assistant = await self._app._mount_assistant()
-                self._stream = _CoalescedMarkdownStream(
-                    Markdown.get_stream(self._assistant),
-                    content_changed=self._app._scroll_to_latest,
-                )
-            assert self._stream is not None
-            self._stream.write(payload.delta)
-        elif event.type == "model_call_completed":
-            payload = event.payload
-            if not isinstance(payload, ModelCallCompletedPayload):
-                raise TypeError("model_call_completed event has an invalid payload")
-            if payload.continues_with_tools:
-                if out_of_order and self._classified_candidate is None:
-                    return
-                self._streamed_fragments[:] = [payload.content]
-                await self._move_candidate_to_activity(
-                    payload.content,
-                    reconcile=out_of_order or self._awaiting_tool_for_candidate,
-                )
-                self._awaiting_tool_for_candidate = True
-            elif self._assistant is None:
-                if out_of_order:
-                    return
-                self._streamed_fragments[:] = [payload.content]
-                if payload.content:
-                    self._assistant = await self._app._mount_assistant(payload.content)
-                    self._app._scroll_to_latest()
+        self._response_fragments.append(fragment)
+        if self._assistant is None:
+            self._assistant = await self._app._mount_assistant()
+            self._response_stream = _CoalescedMarkdownStream(
+                Markdown.get_stream(self._assistant),
+                content_changed=self._app._scroll_to_latest,
+            )
+        assert self._response_stream is not None
+        self._response_stream.write(fragment)
+
+    async def _append_reasoning(self, fragment: str) -> None:
+        group = await self._ensure_activity_group()
+        if self._reasoning is None:
+            self._reasoning = await self._app._mount_assistant(
+                parent=group.content,
+            )
+            self._reasoning_stream = _CoalescedMarkdownStream(
+                Markdown.get_stream(self._reasoning),
+                content_changed=self._app._scroll_to_latest,
+            )
+        assert self._reasoning_stream is not None
+        self._reasoning_stream.write(fragment)
+
+    async def _stop_response_stream(self) -> None:
+        stream = self._response_stream
+        self._response_stream = None
+        if stream is not None:
+            await stream.stop()
+
+    async def _stop_reasoning_stream(self) -> None:
+        stream = self._reasoning_stream
+        self._reasoning_stream = None
+        if stream is not None:
+            await stream.stop()
+        self._reasoning = None
+
+    async def _finish_terminal(self, outcome: _TerminalOutcome, content: str) -> None:
+        if self._terminal_seen:
+            return
+        self._terminal_seen = True
+        self._terminal_content = content or "".join(self._response_fragments)
+        self._outcome = outcome
+        if self._started_at is not None:
+            self._elapsed = max(0.0, self._app._monotonic() - self._started_at)
+        if self._activity_group is not None:
+            self._activity_group.elapsed = self._elapsed
+        self.stop()
+        await self._stop_response_stream()
+        await self._stop_reasoning_stream()
+        await self._reconcile_terminal()
+
+    async def _reconcile_terminal(self) -> None:
+        if self._app._closing:
+            return
+        if self._outcome == "completed":
+            if self._terminal_content:
+                if self._assistant is None:
+                    self._assistant = await self._app._mount_assistant(self._terminal_content)
+                elif self._terminal_content != "".join(self._response_fragments):
+                    await self._assistant.update(self._terminal_content)
+                self._app._scroll_to_latest()
             else:
-                self._streamed_fragments[:] = [payload.content]
-                if self._stream is not None:
-                    await self._stream.stop()
-                    self._stream = None
-                await self._assistant.update(payload.content)
-                self._app._scroll_to_latest()
-        elif event.type == "tool_started":
-            payload = event.payload
-            if not isinstance(payload, ToolStartedPayload):
-                raise TypeError("tool_started event has an invalid payload")
-            self._observed_tool_turns.add(event.turn_id)
-            if self._assistant is not None or self._streamed_fragments:
-                await self._move_candidate_to_activity("".join(self._streamed_fragments))
-            self._awaiting_tool_for_candidate = False
-            group = await self._ensure_activity_group()
-            await self._show_tool_started(event.turn_id, payload, parent=group.content)
-        elif event.type == "confirmation_requested":
-            payload = event.payload
-            if not isinstance(payload, ConfirmationRequestedPayload):
-                raise TypeError("confirmation_requested event has an invalid payload")
-            if payload.confirmation_id in self._resolved_confirmations:
-                return
-            await self._app._request_confirmation(payload)
-            self._resolved_confirmations.add(payload.confirmation_id)
-        elif event.type == "tool_completed":
-            payload = event.payload
-            if not isinstance(payload, ToolCompletedPayload):
-                raise TypeError("tool_completed event has an invalid payload")
-            self._observed_tool_turns.add(event.turn_id)
-            group = await self._ensure_activity_group()
-            await self._show_tool_completed(event.turn_id, payload, parent=group.content)
-        elif event.type == "turn_completed":
-            payload = event.payload
-            if not isinstance(payload, TurnCompletedPayload):
-                raise TypeError("turn_completed event has an invalid payload")
-            self._terminal_content = payload.content
-            self._finish("completed")
-        elif event.type == "turn_cancelled":
-            payload = event.payload
-            if not isinstance(payload, TurnCancelledPayload):
-                raise TypeError("turn_cancelled event has an invalid payload")
-            self._terminal_content = payload.partial_content
-            self._terminal_status = "Turn cancelled."
-            self._finish("cancelled")
-        elif event.type == "turn_failed":
-            payload = event.payload
-            if not isinstance(payload, TurnFailedPayload):
-                raise TypeError("turn_failed event has an invalid payload")
-            self._terminal_status = payload.error.message
-            self._finish("failed")
-
-    async def _reconcile(
-        self,
-        cancelled: bool,
-        primary_error: BaseException | None,
-    ) -> list[BaseException]:
-        cleanup_errors: list[BaseException] = []
-        if not self._app._closing:
-            failure_reason = (
-                "Tool completion was not reported."
-                if self._outcome == "completed"
-                else "The Tool call was interrupted."
-                if self._outcome == "cancelled"
-                else "The Tool call ended with the turn failure."
-            )
-            try:
-                for turn_id in self._observed_tool_turns - self._closed_tool_turns:
-                    await self._finish_tool_turn(turn_id, failure_reason)
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        if self._stream is not None:
-            try:
-                await self._stream.stop()
-            except BaseException as cleanup_error:
-                if not cancelled:
-                    cleanup_errors.append(cleanup_error)
-            finally:
-                self._stream = None
-
-        if (
-            not self._app._closing
-            and self._outcome in {"cancelled", "failed"}
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            candidate = (
-                self._terminal_content
-                if self._outcome == "cancelled" and self._terminal_content is not None
-                else "".join(self._streamed_fragments)
-            )
-            try:
-                await self._move_candidate_to_activity(candidate)
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        if (
-            not self._app._closing
-            and self._outcome == "completed"
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            final_content = self._terminal_content or ""
-            try:
-                if final_content:
-                    if self._assistant is None:
-                        self._assistant = await self._app._mount_assistant()
-                    await self._assistant.update(final_content)
-                    self._app._scroll_to_latest()
-                elif self._assistant is not None:
-                    await self._remove_assistant_candidate(self._assistant)
+                if self._assistant is not None:
+                    await self._remove_assistant(self._assistant)
                     self._assistant = None
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        if (
-            not self._app._closing
-            and self._outcome is not None
-            and self._outcome != "completed"
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            try:
-                await self._app._mount_status(self._terminal_status or "Turn failed.")
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        elif (
-            not self._app._closing
-            and self._outcome == "completed"
-            and not self._terminal_content
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            try:
                 await self._app._mount_status("Completed with no response.")
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        if (
-            not self._app._closing
-            and self._outcome is not None
-            and self._activity_group is not None
-            and primary_error is None
-            and not cleanup_errors
-        ):
-            self._set_activity_group_terminal(self._outcome)
-            if self._outcome == "completed":
-                self._app._scroll_to_latest()
-        return cleanup_errors
+        else:
+            if self._assistant is not None or self._response_fragments:
+                await self._move_response_to_activity("".join(self._response_fragments))
+            reason = self._terminal_status or (
+                "Turn cancelled." if self._outcome == "cancelled" else "Turn failed."
+            )
+            await self._app._mount_status(reason)
+        if self._activity_group is not None:
+            self._set_activity_group_terminal(self._outcome or "failed")
+            self._app._scroll_to_latest()
 
-    async def _move_candidate_to_activity(
-        self,
-        content: str,
-        *,
-        reconcile: bool = False,
-    ) -> None:
-        if self._stream is not None:
-            await self._stream.stop()
-            self._stream = None
+    async def _move_response_to_activity(self, content: str) -> None:
         if not content:
             if self._assistant is not None:
-                await self._remove_assistant_candidate(self._assistant)
+                await self._remove_assistant(self._assistant)
                 self._assistant = None
-            if reconcile and self._classified_candidate is not None:
-                await self._remove_assistant_candidate(self._classified_candidate)
-                self._classified_candidate = None
-            self._streamed_fragments.clear()
+            self._response_fragments.clear()
             return
         group = await self._ensure_activity_group()
-        if reconcile and self._classified_candidate is not None:
-            await self._classified_candidate.update(content)
-            self._app._scroll_to_latest()
+        assistant = self._assistant
+        if assistant is None:
+            await self._app._mount_assistant(content, parent=group.content)
         else:
-            self._classified_candidate = await self._move_assistant_to_activity(
-                self._assistant,
-                content,
-                group,
-            )
+            await assistant.update(content)
+            row = assistant.parent
+            if not isinstance(row, Widget):
+                raise RuntimeError("Assistant Markdown is not mounted in a row")
+            self._app._reparent_mounted_widget(row, group.content)
         self._assistant = None
-        self._streamed_fragments.clear()
+        self._response_fragments.clear()
+        self._app._scroll_to_latest()
+
+    async def _remove_assistant(self, assistant: Markdown) -> None:
+        parent = assistant.parent
+        if isinstance(parent, Widget):
+            await parent.remove()
+        self._app._scroll_to_latest()
 
     async def _ensure_activity_group(self) -> _ActivityGroupState:
         if self._activity_group is not None:
             return self._activity_group
-        self._refresh_elapsed()
         display = self._app.query_one("#conversation-display", _ConversationDisplay)
         self._activity_group = await self._app._mount_activity_group(
             display,
-            expanded=self._started_at is None or self._outcome != "completed",
-            toggleable=self._started_at is not None and self._outcome is not None,
+            expanded=True,
+            toggleable=False,
             elapsed=self._elapsed,
         )
         return self._activity_group
@@ -1549,37 +1435,20 @@ class _AgentRunProjection:
         if self._started_at is not None:
             return
         self._started_at = self._app._monotonic()
-        self._timer = self._app.set_interval(
-            1.0,
-            self._refresh_elapsed,
-            name="agent-run-duration",
-        )
+        self._timer = self._app.set_interval(1.0, self._refresh_elapsed, name="agent-run-duration")
 
     def _refresh_elapsed(self) -> None:
         if self._started_at is None or self._outcome is not None:
             return
         self._elapsed = max(0.0, self._app._monotonic() - self._started_at)
-        self._update_group_heading()
-
-    def _finish(self, outcome: _TerminalOutcome) -> None:
-        if self._outcome is not None:
-            return
-        if self._started_at is not None:
-            self._elapsed = max(0.0, self._app._monotonic() - self._started_at)
-        self._outcome = outcome
-        self.stop()
-        self._update_group_heading()
-
-    def _update_group_heading(self) -> None:
-        if self._activity_group is None:
-            return
-        self._activity_group.elapsed = self._elapsed
-        self._activity_group.heading.update(
-            _activity_group_heading_text(
-                expanded=self._activity_group.expanded,
-                elapsed=self._elapsed,
+        if self._activity_group is not None:
+            self._activity_group.elapsed = self._elapsed
+            self._activity_group.heading.update(
+                _activity_group_heading_text(
+                    expanded=self._activity_group.expanded,
+                    elapsed=self._elapsed,
+                )
             )
-        )
 
     def _set_activity_group_terminal(self, outcome: _TerminalOutcome) -> None:
         group = self._activity_group
@@ -1589,121 +1458,25 @@ class _AgentRunProjection:
         group.expanded = outcome != "completed"
         group.content.display = group.expanded
         group.heading.update(
-            _activity_group_heading_text(
-                expanded=group.expanded,
-                elapsed=group.elapsed,
-            )
+            _activity_group_heading_text(expanded=group.expanded, elapsed=group.elapsed)
         )
 
-    async def _move_assistant_to_activity(
-        self,
-        assistant: Markdown | None,
-        content: str,
-        activity_group: _ActivityGroupState,
-    ) -> Markdown | None:
-        if not content:
-            if assistant is not None:
-                await self._remove_assistant_candidate(assistant)
-            return None
-        if assistant is None:
-            assistant = await self._app._mount_assistant(
-                content,
-                parent=activity_group.content,
-            )
-        else:
-            await assistant.update(content)
-            row = assistant.parent
-            if not isinstance(row, Widget):
-                raise RuntimeError("Assistant Markdown is not mounted in a row")
-            self._app._reparent_mounted_widget(row, activity_group.content)
-        self._app._scroll_to_latest()
-        return assistant
 
-    async def _remove_assistant_candidate(self, assistant: Markdown) -> None:
-        parent = assistant.parent
-        if isinstance(parent, Widget):
-            await parent.remove()
-        self._app._scroll_to_latest()
-
-    async def _show_tool_started(
-        self,
-        turn_id: UUID,
-        payload: ToolStartedPayload,
-        *,
-        parent: Widget,
-    ) -> None:
-        key = _ToolRowKey(turn_id, payload.tool_call_id)
-        if turn_id in self._closed_tool_turns or key in self._tool_rows:
-            return
-        await self._mount_tool_row(
-            key,
-            tool_name=payload.tool_name,
-            status="running",
-            summary=payload.summary,
-            parent=parent,
-        )
-
-    async def _show_tool_completed(
-        self,
-        turn_id: UUID,
-        payload: ToolCompletedPayload,
-        *,
-        parent: Widget,
-    ) -> None:
-        if turn_id in self._closed_tool_turns:
-            return
-        key = _ToolRowKey(turn_id, payload.tool_call_id)
-        state = self._tool_rows.get(key)
-        if state is None:
-            await self._mount_tool_row(
-                key,
-                tool_name=payload.tool_name,
-                status=payload.status,
-                summary=payload.summary,
-                parent=parent,
-            )
-            return
-        if state.status != "running":
-            return
-        state.status = payload.status
-        state.widget.update(_tool_row_content(payload.status, state.tool_name, payload.summary))
-        self._app._scroll_to_latest()
-
-    async def _mount_tool_row(
-        self,
-        key: _ToolRowKey,
-        *,
-        tool_name: str,
-        status: _ToolRowStatus,
-        summary: str,
-        parent: Widget,
-    ) -> None:
-        display = self._app.query_one("#conversation-display", _ConversationDisplay)
-        row = await self._app._mount_tool_message(
-            tool_name,
-            status,
-            summary,
-            display,
-            parent=parent,
-        )
-        self._tool_rows[key] = _ToolRowState(row, tool_name, status)
-        self._app._scroll_to_latest()
-
-    async def _finish_tool_turn(self, turn_id: UUID, failure_reason: str) -> None:
-        self._closed_tool_turns.add(turn_id)
-        changed = False
-        for key, state in self._tool_rows.items():
-            if key.turn_id != turn_id or state.status != "running":
-                continue
-            state.status = "error"
-            state.widget.update(_tool_row_content("error", state.tool_name, failure_reason))
-            changed = True
-        if changed:
-            self._app._scroll_to_latest()
+@dataclass(slots=True)
+class _ConsumedRun:
+    turn_id: UUID
+    user_text: str
+    projection: _MessageBusRunProjection
+    started: bool = False
 
 
 class TerminalConversationApp(App[None]):
-    """The two-region Textual application for one prepared Runtime."""
+    """The two-region Textual application for one foreground Message Bus."""
+
+    class ConfirmationRequested(Message):
+        def __init__(self, request: ConfirmationRequestView) -> None:
+            super().__init__()
+            self.request = request
 
     CSS = """
     Screen {
@@ -1844,6 +1617,15 @@ class TerminalConversationApp(App[None]):
         color: $text-muted;
     }
 
+    #pending-queue {
+        display: none;
+        height: auto;
+        max-height: 4;
+        width: 100%;
+        padding: 0 1;
+        color: $text-muted;
+    }
+
     #turn-status {
         display: none;
         height: 1;
@@ -1862,12 +1644,20 @@ class TerminalConversationApp(App[None]):
 
     def __init__(
         self,
-        runtime: PreparedRuntime,
         *,
+        bus: MessageBus,
+        control: TerminalAgentLoopControl,
+        management_dispatcher: ManagementDispatcher | None,
+        start_runtime: Callable[[], Awaitable[None]],
+        close_runtime: Callable[[], Awaitable[None]],
         monotonic: Callable[[], float] = monotonic_now,
     ) -> None:
         super().__init__()
-        self._runtime = runtime
+        self._bus = bus
+        self._control = control
+        self._management_dispatcher = management_dispatcher
+        self._start_runtime = start_runtime
+        self._close_runtime = close_runtime
         self._monotonic = monotonic
         self._runtime_started = False
         self._size_insufficient = False
@@ -1876,11 +1666,17 @@ class TerminalConversationApp(App[None]):
         self._viable_size = Event()
         self._viable_size.set()
         self._size_screen: _SizeInsufficientScreen | None = None
-        self._turn_worker: Worker[None] | None = None
+        self._outbound_worker: Worker[None] | None = None
         self._resume_worker: Worker[None] | None = None
         self._cancel_requested_turn: object | None = None
-        self._active_run_projection: _AgentRunProjection | None = None
+        self._active_run_projection: _MessageBusRunProjection | None = None
         self._active_confirmation_id: UUID | None = None
+        self._confirmation_result: asyncio.Future[ConfirmationDecision | None] | None = None
+        self._pending_inputs: deque[str] = deque()
+        self._bus_snapshot: tuple[InboundMessage, ...] = ()
+        self._consumed_runs: deque[_ConsumedRun] = deque()
+        self._run_ready = Event()
+        self._draining_inputs = False
         self._completion_options: tuple[str, ...] = ()
         self._completion_dismissed_text: str | None = None
         self._closing = False
@@ -1999,6 +1795,7 @@ class TerminalConversationApp(App[None]):
                 compact=True,
             ),
             Static("New content below", id="new-content", markup=False),
+            Static("", id="pending-queue", markup=False),
             Static("Working", id="turn-status", markup=False),
             _ConversationInput(id="conversation-input", placeholder="Message MyClaw"),
             id="conversation-input-region",
@@ -2011,23 +1808,37 @@ class TerminalConversationApp(App[None]):
 
     async def on_mount(self) -> None:
         self._runtime_started = True
-        await self._runtime.start()
+        self._bus.set_inbound_changed_callback(self._on_inbound_snapshot)
+        self._bus_snapshot = await self._bus.inbound_snapshot()
+        self._control.bind_confirmation_callback(self._on_confirmation_requested)
+        await self._start_runtime()
+        self._outbound_worker = self.run_worker(
+            self._consume_outbound(),
+            name="conversation-outbound",
+            group="conversation-outbound",
+            exclusive=True,
+            exit_on_error=False,
+        )
         if not self._size_insufficient:
             self.query_one(_ConversationInput).focus()
 
     async def on_unmount(self, event: Unmount) -> None:
         del event
         self._closing = True
+        confirmation_result = self._confirmation_result
+        if confirmation_result is not None and not confirmation_result.done():
+            confirmation_result.cancel()
+        self._bus.set_inbound_changed_callback(None)
         projection = self._active_run_projection
         self._active_run_projection = None
         if projection is not None:
             projection.stop()
         cleanup_errors: list[BaseException] = []
         try:
-            if self._turn_worker is not None:
-                self._turn_worker.cancel()
+            if self._outbound_worker is not None:
+                self._outbound_worker.cancel()
                 with suppress(WorkerError):
-                    await self._turn_worker.wait()
+                    await self._outbound_worker.wait()
             if self._resume_worker is not None:
                 self._resume_worker.cancel()
                 with suppress(WorkerError):
@@ -2038,7 +1849,7 @@ class TerminalConversationApp(App[None]):
             if self._runtime_started:
                 self._runtime_started = False
                 try:
-                    await self._runtime.close()
+                    await self._close_runtime()
                 except BaseException as runtime_error:
                     cleanup_errors.append(runtime_error)
 
@@ -2069,6 +1880,10 @@ class TerminalConversationApp(App[None]):
     @property
     def command_completion_visible(self) -> bool:
         return bool(self._completion_options)
+
+    @property
+    def has_pending_input(self) -> bool:
+        return bool(self._pending_inputs)
 
     @on(TextArea.Changed, "#conversation-input")
     def _input_changed(self, message: TextArea.Changed) -> None:
@@ -2229,7 +2044,6 @@ class TerminalConversationApp(App[None]):
         text = message.text
         if (
             not text.strip()
-            or message.text_area.read_only
             or self._size_insufficient
             or (self._resume_worker is not None and not self._resume_worker.is_finished)
         ):
@@ -2239,7 +2053,7 @@ class TerminalConversationApp(App[None]):
             self.exit()
             return
 
-        dispatcher = self._runtime.management_dispatcher
+        dispatcher = self._management_dispatcher
         if dispatcher is not None:
             result = cast(ManagementCommandResult, await dispatcher.dispatch(text))
             if result.handled:
@@ -2257,21 +2071,9 @@ class TerminalConversationApp(App[None]):
 
         message.text_area.remember_submission(text)
         message.text_area.text = ""
-        turn_token = object()
-        message.text_area.active_turn_token = turn_token
-        message.text_area.read_only = True
-        self._set_working(True)
-        display = self.query_one("#conversation-display", _ConversationDisplay)
-        await self._mount_user_message(text, display)
-        display.content_changed()
-
-        self._turn_worker = self.run_worker(
-            self._run_turn(text, message.text_area, turn_token),
-            name="conversation-turn",
-            group="conversation-turn",
-            exclusive=True,
-            exit_on_error=False,
-        )
+        self._pending_inputs.append(text)
+        self._refresh_pending_queue()
+        await self._bus.put_inbound(InboundMessage(content=text))
 
     @on(_ConversationInput.ControlAction)
     async def _handle_control_action(self, message: _ConversationInput.ControlAction) -> None:
@@ -2287,76 +2089,214 @@ class TerminalConversationApp(App[None]):
                 return
             self._cancel_requested_turn = turn_token
             try:
-                await self._runtime.conversation.cancel_active_turn()
+                await self._control.cancel_active_run()
             except Exception as error:
                 if self._cancel_requested_turn is turn_token:
                     self._cancel_requested_turn = None
                 self._handle_exception(error)
+            return
+        if message.action == "drain_pending":
+            await self._drain_pending_inputs(text_area)
             return
         if message.action == "clear_draft":
             text_area.text = ""
             return
         self.exit()
 
-    async def _run_turn(
-        self,
-        text: str,
-        text_area: _ConversationInput,
-        turn_token: object,
-    ) -> None:
+    async def _drain_pending_inputs(self, text_area: _ConversationInput) -> None:
+        if text_area.text or not self._pending_inputs:
+            return
+        pending_before = len(self._pending_inputs)
+        self._draining_inputs = True
         try:
-            await self._consume_turn(self._runtime.conversation.submit(text))
+            drained = await self._bus.drain_inbound()
+        finally:
+            self._draining_inputs = False
+        consumed_during_drain = max(0, pending_before - len(drained))
+        if consumed_during_drain:
+            self._promote_consumed_inputs(consumed_during_drain)
+        if not drained:
+            return
+        for _message in drained:
+            if self._pending_inputs:
+                self._pending_inputs.popleft()
+        text_area.text = "\n".join(message.content for message in drained)
+        text_area.move_cursor(
+            (len(text_area.document.lines) - 1, len(text_area.document.lines[-1]))
+        )
+        self._refresh_pending_queue()
+
+    def _on_inbound_snapshot(self, snapshot: tuple[InboundMessage, ...]) -> None:
+        previous = self._bus_snapshot
+        self._bus_snapshot = snapshot
+        removed = max(0, len(previous) - len(snapshot))
+        if removed and not self._draining_inputs:
+            self._promote_consumed_inputs(removed)
+        self._refresh_pending_queue()
+
+    def _promote_consumed_inputs(self, count: int) -> None:
+        promoted = False
+        for _ in range(count):
+            if not self._pending_inputs:
+                break
+            text = self._pending_inputs.popleft()
+            turn_id = UUID(int=uuid4().int)
+            projection = _MessageBusRunProjection(self, turn_id)
+            projection.start()
+            self._consumed_runs.append(
+                _ConsumedRun(
+                    turn_id=turn_id,
+                    user_text=text,
+                    projection=projection,
+                )
+            )
+            promoted = True
+            input_area = self.query_one("#conversation-input", _ConversationInput)
+            if input_area.active_turn_token is None:
+                input_area.active_turn_token = turn_id
+                self._set_working(True)
+        if promoted:
+            self._run_ready.set()
+
+    async def _consume_outbound(self) -> None:
+        try:
+            buffered: OutboundMessage | None = None
+            while not self._closing:
+                if not self._consumed_runs:
+                    buffered = await self._wait_for_consumed_run_or_discard_orphan()
+                if self._closing:
+                    return
+                if not self._consumed_runs:
+                    continue
+                run = self._consumed_runs[0]
+                if not run.started:
+                    await self._start_consumed_run(run)
+                outbound = buffered
+                buffered = None
+                if outbound is None:
+                    outbound = await self._bus.get_outbound()
+                await run.projection.consume(outbound)
+                if run.projection.terminal_seen:
+                    await run.projection.close()
+                    self._consumed_runs.popleft()
+                    self._finish_consumed_run(run)
         except CancelledError:
-            if self._closing:
+            if not self._closing:
                 raise
-            clear_current_task_cancellation()
-            await self._mount_status("Turn cancelled.")
         except Exception as error:
             self._handle_exception(error)
-        finally:
-            if text_area.active_turn_token is turn_token:
-                text_area.active_turn_token = None
-                if self._cancel_requested_turn is turn_token:
-                    self._cancel_requested_turn = None
-                self._set_working(False)
-                text_area.read_only = False
-                if not self._closing:
-                    with suppress(Exception):
-                        text_area.focus()
 
-    async def _consume_turn(self, events: AsyncIterator[AgentEvent]) -> None:
-        if self._active_run_projection is not None:
-            raise RuntimeError("An Agent Run projection is already active")
-        projection = _AgentRunProjection(self)
-        self._active_run_projection = projection
-        try:
-            await projection.consume(events)
-        finally:
-            projection.stop()
-            if self._active_run_projection is projection:
-                self._active_run_projection = None
+    async def _wait_for_consumed_run_or_discard_orphan(
+        self,
+    ) -> OutboundMessage | None:
+        while not self._closing and not self._consumed_runs:
+            self._run_ready.clear()
+            if self._consumed_runs:
+                break
+            run_ready = create_task(self._run_ready.wait())
+            outbound = create_task(self._bus.get_outbound())
+            try:
+                done, _ = await asyncio.wait(
+                    {run_ready, outbound},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if outbound in done:
+                    message = outbound.result()
+                    if run_ready in done or self._consumed_runs:
+                        return message
+                    continue
+            finally:
+                for task in (run_ready, outbound):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(run_ready, outbound, return_exceptions=True)
+        return None
 
-    async def _request_confirmation(self, request: ConfirmationRequestedPayload) -> None:
+    async def _start_consumed_run(self, run: _ConsumedRun) -> None:
+        display = self.query_one("#conversation-display", _ConversationDisplay)
+        await self._mount_user_message(run.user_text, display)
+        run.started = True
+        input_area = self.query_one("#conversation-input", _ConversationInput)
+        input_area.active_turn_token = run.turn_id
+        self._active_run_projection = run.projection
+        self._set_working(True)
+        display.content_changed()
+
+    def _finish_consumed_run(self, run: _ConsumedRun) -> None:
+        if self._active_run_projection is run.projection:
+            self._active_run_projection = None
+        input_area = self.query_one("#conversation-input", _ConversationInput)
+        if self._consumed_runs:
+            input_area.active_turn_token = self._consumed_runs[0].turn_id
+            self._set_working(True)
+            self._refresh_pending_queue()
+            return
+        if input_area.active_turn_token is run.turn_id:
+            input_area.active_turn_token = None
+        if self._cancel_requested_turn is run.turn_id:
+            self._cancel_requested_turn = None
+        self._set_working(False)
+        self._refresh_pending_queue()
+        if not self._closing:
+            with suppress(Exception):
+                input_area.focus()
+
+    def _on_confirmation_requested(self, request: ConfirmationRequestView) -> None:
+        if self._closing:
+            return
+        self.post_message(self.ConfirmationRequested(request))
+
+    @on(ConfirmationRequested)
+    def _confirmation_requested(self, message: ConfirmationRequested) -> None:
+        self.run_worker(
+            self._request_confirmation(message.request),
+            name="tool-confirmation",
+            group="tool-confirmation",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _request_confirmation(self, request: ConfirmationRequestView) -> None:
         if self._active_confirmation_id is not None:
             self._respond_to_confirmation_if_pending(request.confirmation_id, "declined")
             return
         self._active_confirmation_id = request.confirmation_id
+        input_area = self.query_one("#conversation-input", _ConversationInput)
+        input_was_read_only = input_area.read_only
+        input_area.read_only = True
+        result: asyncio.Future[ConfirmationDecision | None] | None = None
         try:
             await self._viable_size.wait()
-            dismissed = self.push_screen(
+            result = asyncio.get_running_loop().create_future()
+            self._confirmation_result = result
+
+            def on_dismissed(value: ConfirmationDecision | None) -> None:
+                if not result.done():
+                    result.set_result(value)
+
+            await self.push_screen(
                 _ToolConfirmationScreen(request),
-                wait_for_dismiss=True,
+                callback=on_dismissed,
             )
-            decision = await cast(Awaitable[ConfirmationDecision | None], dismissed)
+            decision = await result
             if decision not in {"approved", "declined"}:
                 decision = "declined"
         except BaseException:
-            with suppress(Exception):
-                self._respond_to_confirmation_if_pending(request.confirmation_id, "declined")
+            if not self._closing:
+                with suppress(Exception):
+                    self._respond_to_confirmation_if_pending(
+                        request.confirmation_id,
+                        "declined",
+                    )
             raise
         else:
             self._respond_to_confirmation_if_pending(request.confirmation_id, decision)
         finally:
+            input_area.read_only = input_was_read_only
+            if result is not None and self._confirmation_result is result:
+                self._confirmation_result = None
+            self._bus_snapshot = await self._bus.inbound_snapshot()
+            self._refresh_pending_queue()
             if self._active_confirmation_id == request.confirmation_id:
                 self._active_confirmation_id = None
 
@@ -2366,7 +2306,7 @@ class TerminalConversationApp(App[None]):
         decision: ConfirmationDecision,
     ) -> bool:
         try:
-            self._runtime.conversation.respond_to_confirmation(confirmation_id, decision)
+            self._control.respond_to_confirmation(confirmation_id, decision)
         except ValueError:
             return False
         return True
@@ -2378,6 +2318,8 @@ class TerminalConversationApp(App[None]):
     ) -> None:
         row = Horizontal(classes="message-row user-row")
         await display.mount(row)
+        if not row.is_attached:
+            await row._mounted_event.wait()
         await row.mount(
             Static(
                 content,
@@ -2404,6 +2346,8 @@ class TerminalConversationApp(App[None]):
         )
         row = Horizontal(classes="message-row assistant-row")
         await parent.mount(row)
+        if not row.is_attached:
+            await row._mounted_event.wait()
         await row.mount(assistant)
         return assistant
 
@@ -2423,13 +2367,14 @@ class TerminalConversationApp(App[None]):
             markup=False,
             classes="agent-run-activity-heading",
         )
-        container = Vertical(
-            heading,
-            Vertical(classes="agent-run-activity-content"),
-            classes="agent-run-activity-group",
-        )
+        container = Vertical(classes="agent-run-activity-group")
         await display.mount(container)
-        content = container.query_one(".agent-run-activity-content", Vertical)
+        if not container.is_attached:
+            await container._mounted_event.wait()
+        content = Vertical(classes="agent-run-activity-content")
+        await container.mount(heading, content)
+        if not content.is_attached:
+            await content._mounted_event.wait()
         state = _ActivityGroupState(
             heading=heading,
             content=content,
@@ -2487,9 +2432,10 @@ class TerminalConversationApp(App[None]):
         summary: str,
         display: _ConversationDisplay,
         parent: Widget | None = None,
+        raw_arguments: str | None = None,
     ) -> Static:
         row = Static(
-            _tool_row_content(status, tool_name, summary),
+            _tool_row_content(status, tool_name, summary, raw_arguments=raw_arguments),
             markup=False,
             classes="tool-row",
         )
@@ -2527,17 +2473,17 @@ class TerminalConversationApp(App[None]):
             self._scroll_to_latest()
 
     async def _replace_display_from_session(self, expected_session_id: str) -> bool:
-        authority = self._runtime.session
-        if authority.session_id != expected_session_id:
+        conversation_projection = self._control.project_foreground_conversation()
+        if conversation_projection.session_id != expected_session_id:
             return False
-        projected_messages = tuple(authority.messages)
-        if self._runtime.session is not authority:
+        projected_messages = conversation_projection.messages
+        if self._control.project_foreground_conversation().session_id != expected_session_id:
             return False
 
-        projection = self._active_run_projection
+        run_projection = self._active_run_projection
         self._active_run_projection = None
-        if projection is not None:
-            projection.stop()
+        if run_projection is not None:
+            run_projection.stop()
         display = self.query_one("#conversation-display", _ConversationDisplay)
         await display.remove_children()
         for partition in _persisted_message_partitions(projected_messages):
@@ -2573,7 +2519,7 @@ class TerminalConversationApp(App[None]):
                     Static(historical.terminal_status, markup=False, classes="turn-status")
                 )
         display.reset_to_latest()
-        return self._runtime.session is authority
+        return self._control.project_foreground_conversation().session_id == expected_session_id
 
     async def _mount_persisted_message(
         self,
@@ -2668,7 +2614,7 @@ class TerminalConversationApp(App[None]):
         input_area: _ConversationInput,
     ) -> None:
         try:
-            dispatcher = self._runtime.management_dispatcher
+            dispatcher = self._management_dispatcher
             if dispatcher is None:
                 await self._mount_management_rows("/resume", "Session resume is unavailable.")
                 return
@@ -2681,8 +2627,7 @@ class TerminalConversationApp(App[None]):
             if resumed_session_id != session_id:
                 await self._mount_management_rows("/resume", result.output)
                 return
-            authority = self._runtime.session
-            if authority.session_id != resumed_session_id:
+            if self._control.project_foreground_conversation().session_id != resumed_session_id:
                 await self._mount_management_rows(
                     "/resume",
                     "Session resume did not select the requested Conversation Session.",
@@ -2698,6 +2643,17 @@ class TerminalConversationApp(App[None]):
             if not self._closing:
                 with suppress(Exception):
                     input_area.focus()
+
+    def _refresh_pending_queue(self) -> None:
+        with suppress(NoMatches, NoScreen, ScreenStackError):
+            queue = self.query_one("#pending-queue", Static)
+            if not self._pending_inputs:
+                queue.update("")
+                queue.display = False
+                return
+            values = " | ".join(text.replace("\n", "↵") for text in self._pending_inputs)
+            queue.update(f"Pending ({len(self._pending_inputs)}): {values}")
+            queue.display = True
 
     def _set_working(self, working: bool) -> None:
         with suppress(NoMatches, NoScreen, ScreenStackError):
@@ -3000,7 +2956,7 @@ def _safe_confirmation_url(value: object) -> object:
     return rendered
 
 
-def _confirmation_detail_lines(request: ConfirmationRequestedPayload) -> tuple[str, ...]:
+def _confirmation_detail_lines(request: ConfirmationRequestView) -> tuple[str, ...]:
     details = request.details
     tool_name = request.tool_name.casefold()
     if tool_name == "exec" and "command" in details:
@@ -3030,10 +2986,18 @@ def _confirmation_detail_lines(request: ConfirmationRequestedPayload) -> tuple[s
     return tuple(_selected_parameter_lines(details, visible_names)) or ("Parameters: None",)
 
 
-def _tool_row_content(status: _ToolRowStatus, tool_name: str, summary: str) -> str:
+def _tool_row_content(
+    status: _ToolRowStatus,
+    tool_name: str,
+    summary: str,
+    *,
+    raw_arguments: str | None = None,
+) -> str:
     display_name = _concise_tool_name(tool_name)
     if status == "running":
-        return f"Running: {display_name}"
+        if raw_arguments is None:
+            return f"Running: {display_name}"
+        return f"Running: {display_name}\nArguments: {raw_arguments}"
     if status == "success":
         return f"Completed: {display_name}"
     if status == "refused":
@@ -3114,4 +3078,10 @@ def run_terminal_conversation(runtime: PreparedRuntime) -> None:
         raise TerminalConversationError(
             "Terminal Conversation requires interactive stdin, stdout, and stderr TTYs."
         )
-    TerminalConversationApp(runtime).run()
+    TerminalConversationApp(
+        bus=runtime.bus,
+        control=runtime.control,
+        management_dispatcher=runtime.management_dispatcher,
+        start_runtime=runtime.start,
+        close_runtime=runtime.close,
+    ).run()

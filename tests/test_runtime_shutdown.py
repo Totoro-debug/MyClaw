@@ -7,9 +7,8 @@ from uuid import uuid4
 
 import pytest
 
-from myclaw.agent.context import ContextBuilder
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import _DeferredConversationPort, prepare_repl_runtime
+from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -25,13 +24,9 @@ from myclaw.provider.models import (
     ReasoningEffort,
     TextDelta,
 )
-from myclaw.schedule.service import ScheduleService
-from myclaw.schedule.store import WorkspaceScheduleStore
-from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
-from myclaw.tools.tool_gateway import ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter, StreamScript
+from tests.fixtures import ScriptedFakeProvider, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 NOW = datetime(2026, 7, 13, 0, 30, tzinfo=timezone(timedelta(hours=8)))
@@ -39,19 +34,6 @@ NOW = datetime(2026, 7, 13, 0, 30, tzinfo=timezone(timedelta(hours=8)))
 
 def _session_id() -> str:
     return f"20260713-003000-000000_{uuid4()}"
-
-
-def _fixed_gateway(workspace: Path, agent_home: Path) -> ToolGateway:
-    identity = Workspace.from_path(workspace)
-    state = WorkspaceState(identity)
-    state.initialize(agent_home_root=agent_home)
-    return ToolGateway(
-        workspace=identity,
-        schedule_service=ScheduleService(
-            store=WorkspaceScheduleStore(state),
-            clock=_FixedScheduleClock(),
-        ),
-    )
 
 
 class _FixedScheduleClock:
@@ -103,6 +85,17 @@ class UnusedInput:
 
 class FailingInput:
     async def read(self) -> str | None:
+        raise LookupError("input failed")
+
+
+class CacheThenFailingInput:
+    def __init__(self) -> None:
+        self._read_count = 0
+
+    async def read(self) -> str | None:
+        if self._read_count == 0:
+            self._read_count += 1
+            return "Cache the provider."
         raise LookupError("input failed")
 
 
@@ -351,10 +344,8 @@ async def test_runtime_run_preserves_the_primary_error_when_cleanup_also_fails(
         now=lambda: NOW,
         new_uuid=uuid4,
     )
-    _ = [event async for event in runtime.conversation.submit("Cache the provider.")]
-
     with pytest.raises(LookupError, match="input failed") as raised:
-        await runtime.run(input_reader=FailingInput(), writer=SilentWriter())
+        await runtime.run(input_reader=CacheThenFailingInput(), writer=SilentWriter())
 
     assert isinstance(raised.value.__cause__, RuntimeError)
     assert str(raised.value.__cause__) == "provider cleanup failed"
@@ -434,230 +425,6 @@ async def test_writer_failure_finishes_runtime_shutdown_without_task_leaks(
 
     assert provider.closed
     assert asyncio.all_tasks() == baseline
-
-
-@pytest.mark.asyncio
-async def test_deferred_conversation_does_not_construct_after_close_during_pre_submit(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    before_started = asyncio.Event()
-    release_before = asyncio.Event()
-
-    async def before_submit() -> None:
-        before_started.set()
-        await release_before.wait()
-
-    async def submit() -> list[str]:
-        return [event.type async for event in conversation.submit("Do not construct after close.")]
-
-    home = AgentHome(agent_home)
-    home.initialize()
-    session = Session.create(WorkspaceState(Workspace.from_path(workspace)), now=lambda: NOW)
-    provider = ScriptedFakeProvider(
-        streams=(
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(content="Must not run."),
-                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-                            finish_reason="stop",
-                        )
-                    ),
-                )
-            ),
-        )
-    )
-    conversation = _DeferredConversationPort(
-        model=ScriptedFakeRouter(provider),
-        session=session,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-        title_prompt=session_title_prompt(),
-        tool_gateway=_fixed_gateway(workspace, agent_home),
-        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
-        before_submit=before_submit,
-        on_foreground_terminal=lambda: None,
-    )
-    submitting = asyncio.create_task(submit())
-    await before_started.wait()
-
-    try:
-        await conversation.close()
-        assert submitting.done()
-    finally:
-        release_before.set()
-        if not submitting.done():
-            submitting.cancel()
-        outcomes = await asyncio.gather(submitting, return_exceptions=True)
-
-    assert isinstance(outcomes[0], asyncio.CancelledError)
-    assert provider.stream_requests == []
-
-
-@pytest.mark.asyncio
-async def test_deferred_conversation_interrupts_pre_submit_without_closing_the_port(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    before_started = asyncio.Event()
-    release_first_before = asyncio.Event()
-    before_calls = 0
-
-    async def before_submit() -> None:
-        nonlocal before_calls
-        before_calls += 1
-        if before_calls == 1:
-            before_started.set()
-            await release_first_before.wait()
-
-    async def submit(text: str) -> list[str]:
-        return [event.type async for event in conversation.submit(text)]
-
-    home = AgentHome(agent_home)
-    home.initialize()
-    session = Session.create(WorkspaceState(Workspace.from_path(workspace)), now=lambda: NOW)
-    provider = ScriptedFakeProvider(
-        streams=(
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(content="Second turn completed."),
-                            usage=ModelUsage(input_tokens=2, output_tokens=2, total_tokens=4),
-                            finish_reason="stop",
-                        )
-                    ),
-                )
-            ),
-        )
-    )
-    conversation = _DeferredConversationPort(
-        model=ScriptedFakeRouter(provider),
-        session=session,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-        title_prompt=session_title_prompt(),
-        tool_gateway=_fixed_gateway(workspace, agent_home),
-        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
-        before_submit=before_submit,
-        on_foreground_terminal=lambda: None,
-    )
-    first_submit = asyncio.create_task(submit("Interrupt before materialization."))
-    await before_started.wait()
-
-    try:
-        await conversation.cancel_active_turn()
-        await conversation.cancel_active_turn()
-        await asyncio.sleep(0)
-
-        assert first_submit.done()
-        assert first_submit.cancelling() == 1
-    finally:
-        release_first_before.set()
-        if not first_submit.done():
-            first_submit.cancel()
-        first_outcome = (await asyncio.gather(first_submit, return_exceptions=True))[0]
-
-    assert isinstance(first_outcome, asyncio.CancelledError)
-    assert provider.stream_requests == []
-    assert await submit("Continue after interrupt.") == [
-        "turn_started",
-        "model_call_completed",
-        "turn_completed",
-    ]
-    await conversation.close()
-
-
-@pytest.mark.asyncio
-async def test_deferred_conversation_interrupts_later_pre_submit_with_an_existing_delegate(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    before_started = asyncio.Event()
-    release_before = asyncio.Event()
-    before_calls = 0
-
-    async def before_submit() -> None:
-        nonlocal before_calls
-        before_calls += 1
-        if before_calls == 2:
-            before_started.set()
-            await release_before.wait()
-
-    async def submit(text: str) -> list[str]:
-        return [event.type async for event in conversation.submit(text)]
-
-    home = AgentHome(agent_home)
-    home.initialize()
-    session = Session.create(WorkspaceState(Workspace.from_path(workspace)), now=lambda: NOW)
-    provider = ScriptedFakeProvider(
-        streams=(
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(content="Delegate materialized."),
-                            usage=ModelUsage(input_tokens=2, output_tokens=2, total_tokens=4),
-                            finish_reason="stop",
-                        )
-                    ),
-                )
-            ),
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(content="Continued after interrupt."),
-                            usage=ModelUsage(input_tokens=3, output_tokens=2, total_tokens=5),
-                            finish_reason="stop",
-                        )
-                    ),
-                )
-            ),
-        )
-    )
-    conversation = _DeferredConversationPort(
-        model=ScriptedFakeRouter(provider),
-        session=session,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-        title_prompt=session_title_prompt(),
-        tool_gateway=_fixed_gateway(workspace, agent_home),
-        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
-        before_submit=before_submit,
-        on_foreground_terminal=lambda: None,
-    )
-    assert await submit("Create the delegate.") == [
-        "turn_started",
-        "model_call_completed",
-        "turn_completed",
-    ]
-    blocked_submit = asyncio.create_task(submit("Interrupt before the second delegate call."))
-    await before_started.wait()
-
-    try:
-        await conversation.cancel_active_turn()
-        await conversation.cancel_active_turn()
-        await asyncio.sleep(0)
-
-        assert blocked_submit.done()
-        assert blocked_submit.cancelling() == 1
-    finally:
-        release_before.set()
-        if not blocked_submit.done():
-            blocked_submit.cancel()
-        blocked_outcome = (await asyncio.gather(blocked_submit, return_exceptions=True))[0]
-
-    assert isinstance(blocked_outcome, asyncio.CancelledError)
-    assert len(provider.stream_requests) == 1
-    assert await submit("Continue with the delegate.") == [
-        "turn_started",
-        "model_call_completed",
-        "turn_completed",
-    ]
-    await conversation.close()
 
 
 @pytest.mark.asyncio
@@ -765,18 +532,18 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
     await memory_clock.sleep_started.wait()
     await scheduled_clock.sleep_started.wait()
     try:
-        await runtime.conversation.cancel_active_turn()
+        await runtime.control.cancel_active_run()
         await input_reader.idle.wait()
         assert not memory_clock.sleep_stopped.is_set()
         assert not scheduled_clock.sleep_stopped.is_set()
 
-        await runtime.conversation.cancel_active_turn()
+        await runtime.control.cancel_active_run()
         await asyncio.sleep(0)
         assert not running.done()
         input_reader.release_second.set()
 
         await provider.started[1].wait()
-        await runtime.conversation.cancel_active_turn()
+        await runtime.control.cancel_active_run()
         await input_reader.waiting_for_exit.wait()
         assert running.cancelling() == 0
         assert not memory_clock.sleep_stopped.is_set()

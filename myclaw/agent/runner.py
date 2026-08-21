@@ -259,6 +259,11 @@ class AgentRunner:
                                 raise _model_failure()
                             response = event.response
                             await close_segment()
+                            if response.message.content and not partial_content:
+                                await start_segment("response")
+                                partial_content.append(response.message.content)
+                                await emit(TextDelta(delta=response.message.content))
+                                await close_segment()
                             break
                         if response is None:
                             raise _model_failure()

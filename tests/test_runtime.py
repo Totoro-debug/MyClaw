@@ -13,7 +13,6 @@ from loguru import logger
 
 import myclaw.agent.runtime as runtime_module
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.events import ConversationPort, ToolCompletedPayload, TurnFailedPayload
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
@@ -44,6 +43,7 @@ from tests.fixtures import (
     StreamScript,
     unexpected_provider_factory,
 )
+from tests.runtime_bus import collect_foreground_outbound
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -349,16 +349,19 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
     )
 
     private_input = " ".join(("private", "foreground", "input"))
-    events = [event async for event in runtime.conversation.submit(private_input)]
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, private_input)
     await runtime.close()
 
-    assert [event.type for event in events] == ["turn_started", "turn_failed"]
+    assert [(message.type, message.metadata.get("finish_reason")) for message in messages] == [
+        ("system_control", "failed"),
+    ]
     content = _session_log_text(workspace, runtime.session_id)
     records = [line for line in content.splitlines() if "myclaw.session.conversation:" in line]
     assert len(records) == 2
     assert "ModelCallError: The model request failed." in content
     assert "ModelCallError: No title response was scripted." in content
-    assert private_input not in repr(events)
+    assert private_input not in repr(messages)
     assert {name: (legacy_logs / name).read_bytes() for name in legacy_files} == legacy_files
 
 
@@ -387,11 +390,12 @@ async def test_concurrent_foreground_sessions_write_only_to_their_own_session_lo
 
     first_runtime = runtime_for(first_provider)
     second_runtime = runtime_for(second_provider)
+    await asyncio.gather(first_runtime.start(), second_runtime.start())
     first_submit = asyncio.create_task(
-        _collect_event_types(first_runtime.conversation, "First Session request.")
+        collect_foreground_outbound(first_runtime, "First Session request.")
     )
     second_submit = asyncio.create_task(
-        _collect_event_types(second_runtime.conversation, "Second Session request.")
+        collect_foreground_outbound(second_runtime, "Second Session request.")
     )
     await asyncio.wait_for(
         asyncio.gather(first_provider.started.wait(), second_provider.started.wait()),
@@ -399,21 +403,21 @@ async def test_concurrent_foreground_sessions_write_only_to_their_own_session_lo
     )
     release.set()
 
-    first_events, second_events = await asyncio.gather(first_submit, second_submit)
+    first_messages, second_messages = await asyncio.gather(first_submit, second_submit)
     await asyncio.gather(first_runtime.close(), second_runtime.close())
 
-    assert first_events == ["turn_started", "model_call_completed", "turn_completed"]
-    assert second_events == ["turn_started", "model_call_completed", "turn_completed"]
+    assert first_messages[-1].type == "model_response"
+    assert first_messages[-1].metadata == {"_streamed": True}
+    assert second_messages[-1].type == "model_response"
+    assert second_messages[-1].metadata == {"_streamed": True}
+    assert "FIRST_SESSION response" in "".join(message.content for message in first_messages)
+    assert "SECOND_SESSION response" in "".join(message.content for message in second_messages)
     first_log = _session_log_text(workspace, first_runtime.session_id)
     second_log = _session_log_text(workspace, second_runtime.session_id)
     assert "marker=FIRST_SESSION" in first_log
     assert "marker=SECOND_SESSION" not in first_log
     assert "marker=SECOND_SESSION" in second_log
     assert "marker=FIRST_SESSION" not in second_log
-
-
-async def _collect_event_types(conversation: ConversationPort, text: str) -> list[str]:
-    return [event.type async for event in conversation.submit(text)]
 
 
 @pytest.mark.asyncio
@@ -475,27 +479,19 @@ async def test_unavailable_session_log_preserves_events_session_and_tool_failure
     unavailable_logs = unavailable_workspace / ".myclaw" / "logs"
     unavailable_logs.write_text("Session Log unavailable", encoding="utf-8")
 
-    unavailable_events = [
-        event async for event in unavailable_runtime.conversation.submit("Fail-open request.")
-    ]
+    await unavailable_runtime.start()
+    unavailable_messages = await collect_foreground_outbound(
+        unavailable_runtime,
+        "Fail-open request.",
+    )
     await unavailable_runtime.close()
     unavailable_session = unavailable_runtime.session
 
-    assert [event.type for event in unavailable_events] == [
-        "turn_started",
-        "model_call_completed",
-        "tool_started",
-        "tool_completed",
-        "turn_failed",
-    ]
-    assert isinstance(unavailable_events[3].payload, ToolCompletedPayload)
-    assert unavailable_events[3].payload.status == "error"
-    assert unavailable_events[3].payload.summary == "The requested tool is not available."
-    assert isinstance(unavailable_events[-1].payload, TurnFailedPayload)
-    assert unavailable_events[-1].payload.error == ErrorInfo(
-        code="model_failed",
-        message="The model request failed.",
-    )
+    assert any(message.type == "tool_call" for message in unavailable_messages)
+    terminal = unavailable_messages[-1]
+    assert terminal.type == "system_control"
+    assert terminal.metadata["finish_reason"] == "failed"
+    assert terminal.content == "The model request failed."
     assert [message["role"] for message in unavailable_session.messages] == [
         "user",
         "assistant",
@@ -590,22 +586,14 @@ async def test_foreground_tool_diagnostics_preserve_boundary_exception_details(
         retry_clock=clock,
     )
 
-    events = [event async for event in runtime.conversation.submit(private_query)]
-    await runtime.conversation.close()
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, private_query)
+    await runtime.close()
 
-    assert [event.type for event in events] == [
-        "turn_started",
-        "model_call_completed",
-        "tool_started",
-        "tool_completed",
-        "model_call_completed",
-        "turn_completed",
-    ]
-    assert isinstance(events[3].payload, ToolCompletedPayload)
-    assert events[3].payload.status == "error"
-    assert events[3].payload.summary == "web_search could not complete the request."
-    assert private_query not in events[3].payload.summary
-    assert "PRIVATE_WEB_CREDENTIAL" not in events[3].payload.summary
+    tool_call = next(message for message in messages if message.type == "tool_call")
+    assert tool_call.metadata["arguments"] == json.dumps({"query": private_query})
+    assert all(private_query not in message.content for message in messages)
+    assert all("PRIVATE_WEB_CREDENTIAL" not in message.content for message in messages)
     content = _session_log_text(workspace, runtime.session_id)
     assert content.count("Tool execution failed name=web_search") == 1
     assert "Traceback (most recent call last):" in content
@@ -642,18 +630,16 @@ async def test_foreground_model_failure_keeps_event_safe_without_log_redaction(
 
     configure_process_logging()
     try:
-        events = [event async for event in runtime.conversation.submit(private_input)]
-        await runtime.conversation.close()
+        await runtime.start()
+        messages = await collect_foreground_outbound(runtime, private_input)
+        await runtime.close()
         terminal_output = capsys.readouterr().err
     finally:
         logger.remove()
 
-    assert [event.type for event in events] == ["turn_started", "turn_failed"]
-    assert isinstance(events[1].payload, TurnFailedPayload)
-    assert events[1].payload.error == ErrorInfo(
-        code="model_failed",
-        message="The model request failed.",
-    )
+    assert messages[-1].type == "system_control"
+    assert messages[-1].metadata["finish_reason"] == "failed"
+    assert messages[-1].content == "The model request failed."
     content = _session_log_text(workspace, runtime.session_id)
     assert content.count("Agent Run failed code=model_failed type=ModelCallError") == 1
     assert "Traceback (most recent call last):" in content
@@ -1107,14 +1093,12 @@ async def test_prepared_repl_uses_the_effective_fallback_route_budget(
         new_uuid=uuid4,
     )
 
-    events = [event async for event in runtime.conversation.submit("Use the fallback budget.")]
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, "Use the fallback budget.")
     await runtime.close()
 
-    assert [event.type for event in events] == [
-        "turn_started",
-        "model_call_completed",
-        "turn_completed",
-    ]
+    assert messages[-1].type == "model_response"
+    assert messages[-1].metadata == {"_streamed": True}
     assert provider.stream_requests
     for request in provider.stream_requests:
         assert request.model == "claude-model"

@@ -1,21 +1,15 @@
+from __future__ import annotations
+
+import asyncio
 from collections import deque
-from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
 
-from myclaw.agent.events import (
-    AgentEvent,
-    ConfirmationRequestedPayload,
-    TurnCompletedPayload,
-    TurnStartedPayload,
-)
-from myclaw.provider.models import ModelUsage
+from myclaw.agent.message_bus import MessageBus, OutboundMessage
 from myclaw.terminal.repl import run_repl
+from myclaw.tools.tool_gateway import ConfirmationRequest
 
-NOW = datetime(2026, 8, 7, 12, 0, 0, tzinfo=UTC)
-TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
 CONFIRMATION_UUID = UUID("16fd2706-8baf-4334-8c7f-ada847da0314")
 
 
@@ -43,67 +37,67 @@ class _Writer:
         self.lines.append(content)
 
 
-class _ConfirmationConversation:
-    def __init__(self) -> None:
-        self.submitted: list[str] = []
-        self.responses: list[tuple[UUID, str]] = []
-        self.request = ConfirmationRequestedPayload(
-            confirmation_id=CONFIRMATION_UUID,
-            turn_id=TURN_UUID,
-            tool_call_id="call_schedule",
-            tool_name="schedule",
-            summary="Add a Schedule Job",
-            details={"message": "Check the build", "every_seconds": 60},
-            warnings=("This changes Workspace State.",),
-        )
+class _Control:
+    has_active_run = False
+    has_pending_confirmation = True
 
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
-        self.submitted.append(text)
-        yield AgentEvent(
-            type="turn_started",
-            event_id=0,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=TurnStartedPayload(),
-        )
-        yield AgentEvent(
-            type="confirmation_requested",
-            event_id=1,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=self.request,
-        )
-        yield AgentEvent(
-            type="turn_completed",
-            event_id=2,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=TurnCompletedPayload(
-                content="Done.",
-                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            ),
-        )
+    def __init__(self) -> None:
+        self.callback: object | None = None
+        self.responses: list[tuple[UUID, str]] = []
+        self.response_ready = asyncio.Event()
+
+    def bind_confirmation_callback(self, callback: object) -> None:
+        self.callback = callback
+
+    async def cancel_active_run(self) -> None:
+        return None
 
     def respond_to_confirmation(self, confirmation_id: UUID, decision: str) -> None:
         self.responses.append((confirmation_id, decision))
+        self.response_ready.set()
 
-    async def cancel_active_turn(self) -> None:
-        return None
+
+async def _confirmation_producer(
+    bus: MessageBus,
+    control: _Control,
+    request: ConfirmationRequest,
+) -> None:
+    inbound = await bus.get_inbound()
+    assert inbound.content == "original request"
+    callback = control.callback
+    assert callable(callback)
+    callback(request)
+    await control.response_ready.wait()
+    await bus.put_outbound(OutboundMessage("model_response", "", {"_streamed": True}))
+
+
+def _request() -> ConfirmationRequest:
+    return ConfirmationRequest(
+        confirmation_id=CONFIRMATION_UUID,
+        tool_call_id="call_schedule",
+        tool_name="schedule",
+        summary="Add a Schedule Job",
+        details={"message": "Check the build", "every_seconds": 60},
+        warnings=("This changes Workspace State.",),
+    )
 
 
 @pytest.mark.asyncio
 async def test_repl_displays_normalized_confirmation_and_accepts_only_yes_or_no_contract() -> None:
-    conversation = _ConfirmationConversation()
+    bus = MessageBus()
+    control = _Control()
+    producer = asyncio.create_task(_confirmation_producer(bus, control, _request()))
     writer = _Writer()
 
     await run_repl(
-        conversation=conversation,
+        bus=bus,
+        control=control,
         input_reader=_Input(("original request", "not sure", " y ", "exit")),
         writer=writer,
     )
+    await producer
 
-    assert conversation.submitted == ["original request"]
-    assert conversation.responses == [(CONFIRMATION_UUID, "approved")]
+    assert control.responses == [(CONFIRMATION_UUID, "approved")]
     assert writer.deltas == []
     assert writer.finished == 1
     assert any("Add a Schedule Job" in line for line in writer.lines)
@@ -115,13 +109,17 @@ async def test_repl_displays_normalized_confirmation_and_accepts_only_yes_or_no_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reply", ("no", "n", ""))
 async def test_repl_confirmation_declines_on_no_or_empty_input(reply: str) -> None:
-    conversation = _ConfirmationConversation()
+    bus = MessageBus()
+    control = _Control()
+    producer = asyncio.create_task(_confirmation_producer(bus, control, _request()))
     writer = _Writer()
 
     await run_repl(
-        conversation=conversation,
+        bus=bus,
+        control=control,
         input_reader=_Input(("original request", reply, "exit")),
         writer=writer,
     )
+    await producer
 
-    assert conversation.responses == [(CONFIRMATION_UUID, "declined")]
+    assert control.responses == [(CONFIRMATION_UUID, "declined")]

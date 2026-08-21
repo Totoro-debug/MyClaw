@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,7 +15,7 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.events import AgentEvent
+from myclaw.agent.message_bus import OutboundMessage
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
@@ -46,6 +46,7 @@ from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ProviderCall
 from tests.fixtures.diagnostic_capture import capture_diagnostics
+from tests.runtime_bus import collect_foreground_outbound
 
 NOW = datetime(2026, 8, 7, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -237,25 +238,11 @@ def _runtime(
     )
 
 
-def _event_stream(runtime: PreparedReplRuntime, text: str) -> AsyncGenerator[AgentEvent, None]:
-    return cast(AsyncGenerator[AgentEvent, None], runtime.conversation.submit(text))
-
-
 async def _submit_turn(
     runtime: PreparedReplRuntime,
     text: str,
-) -> list[AgentEvent]:
-    events = _event_stream(runtime, text)
-    observed: list[AgentEvent] = []
-    try:
-        while True:
-            try:
-                event = await anext(events)
-            except StopAsyncIteration:
-                return observed
-            observed.append(event)
-    finally:
-        await events.aclose()
+) -> tuple[OutboundMessage, ...]:
+    return await collect_foreground_outbound(runtime, text)
 
 
 async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 3.0) -> None:
@@ -307,16 +294,14 @@ async def test_runtime_conversation_manages_schedule_jobs_without_confirmation(
     )
     await runtime.start()
     try:
-        added = await _submit_turn(runtime, "Schedule the report.")
-        assert not any(event.type == "confirmation_requested" for event in added)
+        await _submit_turn(runtime, "Schedule the report.")
 
         jobs = await _schedule_state(workspace).snapshot()
         assert len(jobs) == 1
         job_id = jobs[0].job_id
         assert jobs[0].message == "ship report"
 
-        listed = await _submit_turn(runtime, "List my Schedule Jobs.")
-        assert not any(event.type == "confirmation_requested" for event in listed)
+        await _submit_turn(runtime, "List my Schedule Jobs.")
         provider._responses["chat"][0] = _schedule_tool_response(
             "call_remove",
             {"action": "remove", "job_id": job_id},
@@ -333,8 +318,7 @@ async def test_runtime_conversation_manages_schedule_jobs_without_confirmation(
             ]
         }
 
-        removed = await _submit_turn(runtime, "Remove that Schedule Job.")
-        assert not any(event.type == "confirmation_requested" for event in removed)
+        await _submit_turn(runtime, "Remove that Schedule Job.")
         assert await _schedule_state(workspace).snapshot() == ()
         assert _tool_json(runtime)[-1]["action"] == "remove"
     finally:
@@ -752,7 +736,7 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
     await runtime.start()
     try:
         events = await _submit_turn(runtime, "Schedule this due task.")
-        assert [event.type for event in events][-1] == "turn_completed"
+        assert events[-1].metadata == {"_streamed": True}
         await _wait_until(
             lambda: (
                 len(provider.complete_requests) == 1
@@ -798,7 +782,12 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
         resume = await runtime.management_dispatcher.dispatch("/resume")
         assert resume.output is not None
         assert schedule_session_id not in resume.output
-        assert all(cast(str, event.type) != "background_completed" for event in events)
+        assert {message.type for message in events} <= {
+            "model_reasoning",
+            "model_response",
+            "tool_call",
+            "system_control",
+        }
     finally:
         await runtime.close()
 
@@ -851,9 +840,7 @@ async def test_runtime_foreground_and_schedule_share_runner_and_gateway_identity
     assert callback is not None
     await runtime.start()
     try:
-        assert [event.type for event in await _submit_turn(runtime, "Run foreground.")][-1] == (
-            "turn_completed"
-        )
+        assert (await _submit_turn(runtime, "Run foreground."))[-1].metadata == {"_streamed": True}
         callback_result = await cast(Callable[..., Any], callback)(
             _due_job(message="Run Schedule.")
         )

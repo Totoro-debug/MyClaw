@@ -13,10 +13,9 @@ from uuid import uuid4
 import pytest
 from loguru import logger
 
-from myclaw.agent.loop import AgentLoop
+from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
 from myclaw.agent.message_bus import InboundMessage, OutboundMessage
 from myclaw.agent.runner import AgentRunnerRouter
-from myclaw.agent.runtime import _AgentLoopConversationAdapter
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -37,7 +36,7 @@ from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
-from myclaw.tools.tool_gateway import ConfirmationRequest, ModelToolCall
+from myclaw.tools.tool_gateway import ModelToolCall
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 
@@ -285,6 +284,14 @@ async def _terminals(loop: AgentLoop, count: int) -> list[OutboundMessage]:
         if message.metadata.get("_streamed") is True:
             terminals.append(message)
     return terminals
+
+
+def test_agent_loop_exposes_public_control_seam(tmp_path: Path) -> None:
+    loop, _session = _runtime(tmp_path, _Router((_response("unused"),)))
+
+    assert loop.control is loop
+    assert loop.control.has_active_run is False
+    assert loop.control.has_pending_confirmation is False
 
 
 @pytest.mark.asyncio
@@ -549,10 +556,10 @@ async def test_loop_confirmation_uses_one_direct_pending_future_and_cancels_it(
         )
     )
     loop, _session = _runtime(tmp_path, router)
-    requests: list[ConfirmationRequest] = []
+    requests: list[ConfirmationRequestView] = []
     requested = asyncio.Event()
 
-    def on_confirmation(request: ConfirmationRequest) -> None:
+    def on_confirmation(request: ConfirmationRequestView) -> None:
         requests.append(request)
         requested.set()
 
@@ -793,14 +800,6 @@ async def test_append_failure_reports_safe_terminal_and_fifo_consumer_continues(
         tmp_path,
         _Router((_response("not committed"), _response("next completed"))),
     )
-    adapter = _AgentLoopConversationAdapter(
-        loop=loop,
-        now=_Clock().now,
-        new_uuid=uuid4,
-    )
-    loop.bind_confirmation_callback(adapter.on_confirmation_requested)
-    loop._bind_tool_completion_callback(adapter.on_tool_completed)
-    loop._bind_terminal_callback(adapter.on_terminal)
     append_calls = 0
     original_append = session.append_messages
 
@@ -812,28 +811,23 @@ async def test_append_failure_reports_safe_terminal_and_fifo_consumer_continues(
         original_append(messages)
 
     monkeypatch.setattr(session, "append_messages", fail_append)
+    await loop.start()
     try:
-        async with asyncio.timeout(1):
-            failed = [event async for event in adapter.submit("cannot commit")]
-            completed = [event async for event in adapter.submit("next input")]
+        await loop.bus.put_inbound(InboundMessage("cannot commit"))
+        failed = (await _terminals(loop, 1))[0]
+        await loop.bus.put_inbound(InboundMessage("next input"))
+        completed = (await _terminals(loop, 1))[0]
     finally:
-        await adapter.close()
+        await loop.close()
 
-    assert [event.type for event in failed] == [
-        "turn_started",
-        "model_call_completed",
-        "turn_failed",
-    ]
-    failure = failed[-1].payload
-    assert failure.error == ErrorInfo(  # type: ignore[union-attr]
-        "persistence_error",
-        "The Conversation Session could not be updated.",
-    )
-    assert [event.type for event in completed] == [
-        "turn_started",
-        "model_call_completed",
-        "turn_completed",
-    ]
+    assert failed.type == "system_control"
+    assert failed.metadata == {
+        "finish_reason": "failed",
+        "error_code": "persistence_error",
+        "_streamed": True,
+    }
+    assert completed.type == "model_response"
+    assert completed.metadata == {"_streamed": True}
     assert [message["content"] for message in session.messages if message["role"] == "user"] == [
         "next input"
     ]
@@ -895,40 +889,31 @@ async def test_loop_closes_every_session_it_owned_after_idle_switch(
 
 
 @pytest.mark.asyncio
-async def test_terminal_adapter_projects_completed_turn_without_session_access(
+async def test_direct_bus_projects_completed_turn_without_session_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     loop, _session = _runtime(tmp_path, _Router((_response("completed without deltas"),)))
-    adapter = _AgentLoopConversationAdapter(
-        loop=loop,
-        now=_Clock().now,
-        new_uuid=uuid4,
-    )
-    loop.bind_confirmation_callback(adapter.on_confirmation_requested)
-    loop._bind_tool_completion_callback(adapter.on_tool_completed)
-    loop._bind_terminal_callback(adapter.on_terminal)
 
     def reject_session_access(_loop: AgentLoop) -> Session:
         raise AssertionError("Terminal adapter must not access Session")
 
     monkeypatch.setattr(AgentLoop, "session", property(reject_session_access))
 
-    events = [event async for event in adapter.submit("foreground input")]
-    await adapter.close()
+    await loop.start()
+    try:
+        await loop.bus.put_inbound(InboundMessage("foreground input"))
+        observed: list[OutboundMessage] = []
+        while not observed or observed[-1].metadata.get("_streamed") is not True:
+            observed.append(await loop.bus.get_outbound())
+    finally:
+        await loop.close()
 
-    assert [event.type for event in events] == [
-        "turn_started",
-        "model_call_completed",
-        "turn_completed",
+    assert [(message.type, message.content, message.metadata) for message in observed] == [
+        ("model_response", "completed without deltas", {"_stream_delta": True}),
+        ("model_response", "", {"_stream_end": True}),
+        ("model_response", "", {"_streamed": True}),
     ]
-    completed = events[-1].payload
-    assert completed.content == "completed without deltas"  # type: ignore[union-attr]
-    assert completed.usage == ModelUsage(  # type: ignore[union-attr]
-        input_tokens=1,
-        output_tokens=1,
-        total_tokens=2,
-    )
 
 
 @pytest.mark.asyncio

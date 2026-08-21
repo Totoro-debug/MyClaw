@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol
 from uuid import UUID
 
 from loguru import logger
@@ -30,6 +30,7 @@ from myclaw.agent.workspace import Workspace
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
 from myclaw.provider.errors import ModelCallError
+from myclaw.provider.model_router import ModelRouteStatus
 from myclaw.provider.models import ModelCompleted, ReasoningDelta, TextDelta
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
@@ -52,9 +53,68 @@ type ScheduleContextPreparer = Callable[
     Awaitable[list[dict[str, Any]]],
 ]
 type ResultExternalizerFactory = Callable[[Session], Callable[[ToolResult], ToolResult]]
-type ConfirmationCallback = Callable[[ConfirmationRequest], None]
-type ToolCompletionCallback = Callable[[ToolResult], None]
-type TerminalCallback = Callable[[AgentRunnerResult | None], None]
+
+
+class ConfirmationRequestView(Protocol):
+    """Stable confirmation data exposed to a foreground control consumer."""
+
+    @property
+    def confirmation_id(self) -> UUID: ...
+
+    @property
+    def tool_call_id(self) -> str: ...
+
+    @property
+    def tool_name(self) -> str: ...
+
+    @property
+    def reason(self) -> str: ...
+
+    @property
+    def summary(self) -> str: ...
+
+    @property
+    def details(self) -> dict[str, Any]: ...
+
+    @property
+    def warnings(self) -> tuple[str, ...]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ForegroundConversationProjection:
+    """Presentation-safe snapshot of the active foreground conversation."""
+
+    session_id: str
+    messages: tuple[dict[str, Any], ...]
+
+
+class AgentLoopControl(Protocol):
+    """The independent foreground control surface owned by AgentLoop."""
+
+    @property
+    def has_active_run(self) -> bool: ...
+
+    @property
+    def has_pending_confirmation(self) -> bool: ...
+
+    async def cancel_active_run(self) -> None: ...
+
+    def bind_confirmation_callback(self, callback: ConfirmationCallback) -> None: ...
+
+    def respond_to_confirmation(
+        self,
+        confirmation_id: UUID,
+        decision: ConfirmationDecision,
+    ) -> None: ...
+
+
+class TerminalAgentLoopControl(AgentLoopControl, Protocol):
+    """Foreground control surface including Terminal history projection."""
+
+    def project_foreground_conversation(self) -> ForegroundConversationProjection: ...
+
+
+type ConfirmationCallback = Callable[[ConfirmationRequestView], None]
 
 _CANCELLED_MESSAGE = "MyClaw 已取消本轮对话。"
 
@@ -150,15 +210,22 @@ class AgentLoop:
         self._title_work: dict[str, _TitleWork] = {}
         self._pending_confirmation: _PendingConfirmation | None = None
         self._confirmation_callback: ConfirmationCallback | None = None
-        self._tool_completion_callback: ToolCompletionCallback | None = None
-        self._terminal_callback: TerminalCallback | None = None
         self._cancel_requested = False
         self._closing = False
         self._closed = False
+        self._last_foreground_route_status: ModelRouteStatus | None = None
 
     @property
     def bus(self) -> MessageBus:
         return self._bus
+
+    @property
+    def control(self) -> TerminalAgentLoopControl:
+        return self
+
+    @property
+    def last_foreground_route_status(self) -> ModelRouteStatus | None:
+        return self._last_foreground_route_status
 
     @property
     def session(self) -> Session:
@@ -178,33 +245,22 @@ class AgentLoop:
         pending = self._pending_confirmation
         return pending is not None and not pending.future.done()
 
+    def project_foreground_conversation(self) -> ForegroundConversationProjection:
+        """Return presentation data without exposing the owned Session."""
+        return ForegroundConversationProjection(
+            session_id=self._session.session_id,
+            messages=tuple(deepcopy(message) for message in self._session.messages),
+        )
+
     def bind_confirmation_callback(self, callback: ConfirmationCallback) -> None:
-        """Bind the synchronous UI callback once before the first foreground run."""
+        """Bind the synchronous foreground confirmation callback exactly once."""
         if self._confirmation_callback is not None:
             raise RuntimeError("Agent Loop confirmation callback is already bound")
         if self._closed:
             raise RuntimeError("Agent Loop is closed")
-        if self._consumer_task is not None:
-            raise RuntimeError("Agent Loop confirmation callback must be bound before start")
         if not callable(callback):
             raise TypeError("confirmation callback must be callable")
         self._confirmation_callback = callback
-
-    def _bind_tool_completion_callback(self, callback: ToolCompletionCallback) -> None:
-        """Bind the temporary single-consumer Terminal completion projection."""
-        if self._tool_completion_callback is not None:
-            raise RuntimeError("Agent Loop tool completion callback is already bound")
-        if not callable(callback):
-            raise TypeError("tool completion callback must be callable")
-        self._tool_completion_callback = callback
-
-    def _bind_terminal_callback(self, callback: TerminalCallback) -> None:
-        """Bind the temporary runtime status capture before terminal publication."""
-        if self._terminal_callback is not None:
-            raise RuntimeError("Agent Loop terminal callback is already bound")
-        if not callable(callback):
-            raise TypeError("terminal callback must be callable")
-        self._terminal_callback = callback
 
     async def start(self) -> None:
         if self._closed:
@@ -536,6 +592,7 @@ class AgentLoop:
                 cancel_requested=lambda: self._cancel_requested,
                 max_iterations=self._max_iterations,
             )
+            self._remember_foreground_route_status()
         except asyncio.CancelledError:
             if not self._cancel_requested:
                 raise
@@ -558,19 +615,29 @@ class AgentLoop:
         await self._publish_terminal(result)
         return True
 
+    def _remember_foreground_route_status(self) -> None:
+        current_call_status = getattr(self._model_router, "current_call_status", None)
+        if callable(current_call_status):
+            status = current_call_status("chat")
+            if isinstance(status, ModelRouteStatus):
+                self._last_foreground_route_status = status
+                return
+        route_status = getattr(self._model_router, "route_status", None)
+        if callable(route_status):
+            status = route_status("chat")
+            if isinstance(status, ModelRouteStatus):
+                self._last_foreground_route_status = status
+
     def _externalize_for_run(
         self,
         active_session: Session,
     ) -> Callable[[ToolResult], ToolResult] | None:
         externalizer = self._result_externalizer_for(active_session)
-        callback = self._tool_completion_callback
-        if externalizer is None and callback is None:
+        if externalizer is None:
             return None
 
         def observe(result: ToolResult) -> ToolResult:
             projected = result if externalizer is None else externalizer(result)
-            if callback is not None:
-                callback(projected)
             return projected
 
         return observe
@@ -623,8 +690,6 @@ class AgentLoop:
         raise TypeError(f"Unsupported Agent Runner output: {type(event).__name__}")
 
     async def _publish_terminal(self, result: AgentRunnerResult) -> None:
-        if self._terminal_callback is not None:
-            self._terminal_callback(result)
         if result.finish_reason == "completed":
             await self._bus.put_outbound(OutboundMessage("model_response", "", {"_streamed": True}))
             return
@@ -646,8 +711,6 @@ class AgentLoop:
     async def _publish_preparation_failure(self, error: ErrorInfo) -> None:
         if error.code != "turn_cancelled":
             _log_legacy_agent_failure(error)
-        if self._terminal_callback is not None:
-            self._terminal_callback(None)
         finish_reason = "cancelled" if error.code == "turn_cancelled" else "failed"
         await self._bus.put_outbound(
             OutboundMessage(
@@ -666,8 +729,6 @@ class AgentLoop:
             "persistence_error",
             "The Conversation Session could not be updated.",
         )
-        if self._terminal_callback is not None:
-            self._terminal_callback(result)
         await self._bus.put_outbound(
             OutboundMessage(
                 "system_control",
@@ -825,7 +886,9 @@ class AgentLoop:
 
 __all__ = [
     "AgentLoop",
+    "AgentLoopControl",
     "ConfirmationCallback",
+    "ConfirmationRequestView",
     "ForegroundContextPreparer",
     "ScheduleContextPreparer",
 ]

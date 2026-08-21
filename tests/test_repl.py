@@ -1,75 +1,25 @@
+from __future__ import annotations
+
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from uuid import UUID
+from dataclasses import dataclass
 
 import pytest
 
-from myclaw.agent.context import ContextBuilder
-from myclaw.agent.events import (
-    AgentEvent,
-    ModelCallCompletedPayload,
-    TextDeltaPayload,
-    TurnCompletedPayload,
-    TurnStartedPayload,
-)
-from myclaw.agent.run import AgentRunRouter
-from myclaw.agent.workspace import Workspace
-from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.config.agent_home import AgentHome
-from myclaw.management.commands import ManagementCommandDispatcher
-from myclaw.management.service import ManagementViewService
-from myclaw.memory.memory_task import WorkspaceFileMemoryStore
-from myclaw.provider.models import (
-    AssistantModelMessage,
-    ModelCompleted,
-    ModelContinuation,
-    ModelProvider,
-    ModelResponse,
-    ModelStreamEvent,
-    ModelUsage,
-    TextDelta,
-)
-from myclaw.session.conversation import StreamingConversationPort
-from myclaw.session.session import Session
+from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
+from myclaw.management.service import SessionListingEntry
 from myclaw.terminal.repl import run_repl
-from tests.fixtures import FakeClock, ScriptedFakeProvider, ScriptedFakeRouter, StreamScript
-
-LOCAL_OFFSET = timezone(timedelta(hours=8))
-NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
-SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
-TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
-SECOND_TURN_UUID = UUID("9b2c3a42-1d2e-4a1e-a827-61f36dc54713")
-SECOND_SESSION_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
 
 
-def _session(
-    workspace: Path,
-    now: Callable[[], datetime],
-    new_uuid: Callable[[], UUID],
-) -> Session:
-    return Session.create(
-        WorkspaceState(Workspace.from_path(workspace)),
-        now=now,
-        new_uuid=new_uuid,
-    )
-
-
-def _direct_model(provider: ModelProvider) -> AgentRunRouter:
-    return ScriptedFakeRouter(provider)
-
-
-class ScriptedReplInput:
-    def __init__(self, values: Iterable[str | None]) -> None:
+class _Input:
+    def __init__(self, values: tuple[str | None, ...]) -> None:
         self._values = deque(values)
 
     async def read(self) -> str | None:
         return self._values.popleft()
 
 
-class RecordingProgressiveWriter:
+class _Writer:
     def __init__(self) -> None:
         self.operations: list[tuple[str, str]] = []
 
@@ -83,426 +33,172 @@ class RecordingProgressiveWriter:
         self.operations.append(("line", content))
 
 
-class CancelOnFirstDeltaWriter(RecordingProgressiveWriter):
-    def __init__(self) -> None:
-        super().__init__()
-        self._cancelled = False
+class _Control:
+    has_active_run = False
+    has_pending_confirmation = False
 
-    async def write_delta(self, delta: str) -> None:
-        await super().write_delta(delta)
-        if not self._cancelled:
-            self._cancelled = True
-            raise asyncio.CancelledError
+    def __init__(self, bus: MessageBus) -> None:
+        self._bus = bus
+        self.cancel_calls = 0
+        self.confirmation_callback: object | None = None
 
+    def bind_confirmation_callback(self, callback: object) -> None:
+        self.confirmation_callback = callback
 
-class ModelCompletionReplConversation:
-    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
-        del text
-        yield AgentEvent(
-            type="turn_started",
-            event_id=0,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=TurnStartedPayload(),
-        )
-        yield AgentEvent(
-            type="text_delta",
-            event_id=1,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=TextDeltaPayload(delta="Answer."),
-        )
-        yield AgentEvent(
-            type="model_call_completed",
-            event_id=2,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=ModelCallCompletedPayload(
-                content="Answer.",
-                continues_with_tools=False,
-            ),
-        )
-        yield AgentEvent(
-            type="turn_completed",
-            event_id=3,
-            turn_id=TURN_UUID,
-            created_at=NOW,
-            payload=TurnCompletedPayload(
-                content="Answer.",
-                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            ),
+    async def cancel_active_run(self) -> None:
+        self.cancel_calls += 1
+        await self._bus.put_outbound(
+            OutboundMessage(
+                "system_control",
+                "MyClaw 已取消本轮对话。",
+                {"finish_reason": "cancelled", "_streamed": True},
+            )
         )
 
-    async def cancel_active_turn(self) -> None:
-        pass
-
-    def respond_to_confirmation(self, confirmation_id: UUID, decision: str) -> None:
+    def respond_to_confirmation(self, confirmation_id: object, decision: object) -> None:
         del confirmation_id, decision
 
 
+@dataclass(frozen=True)
+class _DispatchResult:
+    handled: bool
+    output: str | None = None
+    resume_sessions: tuple[SessionListingEntry, ...] | None = None
+
+
+class _Dispatcher:
+    async def dispatch(self, command: str) -> _DispatchResult:
+        if command.strip().casefold() == "/memory":
+            return _DispatchResult(handled=True, output="memory output")
+        return _DispatchResult(handled=False)
+
+    async def resume(self, session_id: str) -> _DispatchResult:
+        del session_id
+        return _DispatchResult(handled=True, output="resumed")
+
+
+async def _produce_for_inputs(
+    bus: MessageBus,
+    outputs: dict[str, tuple[OutboundMessage, ...]],
+) -> list[InboundMessage]:
+    observed: list[InboundMessage] = []
+    try:
+        while True:
+            inbound = await bus.get_inbound()
+            observed.append(inbound)
+            for message in outputs.get(inbound.content, ()):
+                await bus.put_outbound(message)
+    except asyncio.CancelledError:
+        return observed
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("inputs", [(None,), ("   ", "\t", None)])
-async def test_repl_without_nonblank_user_input_leaves_prepared_session_in_memory(
-    inputs: tuple[str | None, ...],
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    clock = FakeClock(NOW)
-    session = _session(workspace, clock.now, iter((SESSION_UUID,)).__next__)
-    provider = ScriptedFakeProvider()
-    conversation = StreamingConversationPort(
-        model=_direct_model(provider),
-        session=session,
-        now=clock.now,
-        new_uuid=iter(()).__next__,
-        context_builder=ContextBuilder(
-            Workspace.from_path(workspace),
-            "Asia/Shanghai",
-            clock=clock.now,
-        ),
-    )
-    writer = RecordingProgressiveWriter()
+async def test_repl_ignores_blank_and_exit_input_without_creating_inbound_messages() -> None:
+    bus = MessageBus()
+    writer = _Writer()
+    control = _Control(bus)
 
     await run_repl(
-        conversation=conversation,
-        input_reader=ScriptedReplInput(inputs),
+        bus=bus,
+        control=control,
+        input_reader=_Input(("  ", "\t", "quit")),
         writer=writer,
     )
 
-    assert not (workspace / ".myclaw" / "sessions").exists()
-    assert provider.stream_requests == []
-    assert provider.complete_requests == []
+    assert await bus.inbound_snapshot() == ()
     assert writer.operations == []
 
 
 @pytest.mark.asyncio
-async def test_repl_exit_and_quit_ignore_case_and_whitespace_without_materializing_messages(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
+async def test_repl_projects_sparse_segments_tool_arguments_and_one_terminal_marker() -> None:
+    bus = MessageBus()
+    await bus.put_outbound(OutboundMessage("model_response", "queued", {"_stream_delta": True}))
+    await bus.put_outbound(OutboundMessage("model_response", "", {"_stream_end": True}))
+    await bus.put_outbound(OutboundMessage("model_response", "", {"_streamed": True}))
+    writer = _Writer()
 
-    for command, session_uuid in (
-        ("  ExIt  ", SESSION_UUID),
-        ("\tQuIt\n", SECOND_SESSION_UUID),
-    ):
-        clock = FakeClock(NOW)
-        session = _session(workspace, clock.now, iter((session_uuid,)).__next__)
-        provider = ScriptedFakeProvider()
-        conversation = StreamingConversationPort(
-            model=_direct_model(provider),
-            session=session,
-            now=clock.now,
-            new_uuid=iter(()).__next__,
-            context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
-        )
-        writer = RecordingProgressiveWriter()
+    await run_repl(
+        bus=bus,
+        control=_Control(bus),
+        input_reader=_Input(("Hello", "exit")),
+        writer=writer,
+    )
 
-        await run_repl(
-            conversation=conversation,
-            input_reader=ScriptedReplInput((command, "/after-exit", None)),
-            writer=writer,
-        )
-
-        assert provider.stream_requests == []
-        assert provider.complete_requests == []
-        assert not (workspace / ".myclaw" / "sessions").exists()
-        assert writer.operations == []
+    assert writer.operations == [("delta", "queued"), ("finish", "")]
+    inbound = await bus.inbound_snapshot()
+    assert [(message.content, message.metadata) for message in inbound] == [("Hello", {})]
 
 
 @pytest.mark.asyncio
-async def test_repl_writes_each_text_delta_progressively_then_finishes_once(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    clock = FakeClock(NOW)
-    session = _session(workspace, clock.now, iter((SESSION_UUID,)).__next__)
-    response = ModelResponse(
-        message=AssistantModelMessage(content="I will inspect the files."),
-        usage=ModelUsage(input_tokens=120, output_tokens=24, total_tokens=144),
-        finish_reason="stop",
-    )
-    provider = ScriptedFakeProvider(
-        streams=[
-            StreamScript(
-                events=(
-                    TextDelta(delta="I will "),
-                    TextDelta(delta="inspect the files."),
-                    ModelCompleted(response=response),
+async def test_repl_keeps_unknown_slash_input_on_the_inbound_bus_and_dispatches_management() -> (
+    None
+):
+    bus = MessageBus()
+    producer = asyncio.create_task(
+        _produce_for_inputs(
+            bus,
+            {
+                "/unknown": (
+                    OutboundMessage("model_response", "ordinary", {"_stream_delta": True}),
+                    OutboundMessage("model_response", "", {"_streamed": True}),
                 )
-            )
-        ]
-    )
-    conversation = StreamingConversationPort(
-        model=_direct_model(provider),
-        session=session,
-        now=clock.now,
-        new_uuid=iter((TURN_UUID,)).__next__,
-        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
-    )
-    writer = RecordingProgressiveWriter()
-
-    await run_repl(
-        conversation=conversation,
-        input_reader=ScriptedReplInput(("Help me inspect this project.", None)),
-        writer=writer,
-    )
-
-    assert writer.operations == [
-        ("delta", "I will "),
-        ("delta", "inspect the files."),
-        ("finish", ""),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_repl_ignores_nonterminal_model_completion_without_duplicate_output() -> None:
-    writer = RecordingProgressiveWriter()
-
-    await run_repl(
-        conversation=ModelCompletionReplConversation(),
-        input_reader=ScriptedReplInput(("Answer this.", None)),
-        writer=writer,
-    )
-
-    assert writer.operations == [("delta", "Answer."), ("finish", "")]
-
-
-@pytest.mark.asyncio
-async def test_ctrl_c_during_stream_persists_partial_and_repl_runs_the_next_turn(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    clock = FakeClock(NOW)
-    session = _session(workspace, clock.now, iter((SESSION_UUID,)).__next__)
-    second_response = ModelResponse(
-        message=AssistantModelMessage(content="Second turn completed."),
-        usage=ModelUsage(input_tokens=14, output_tokens=4, total_tokens=18),
-        finish_reason="stop",
-    )
-    provider = ScriptedFakeProvider(
-        streams=(
-            StreamScript(events=(TextDelta(delta="Partial first turn"),)),
-            StreamScript(
-                events=(
-                    TextDelta(delta="Second turn completed."),
-                    ModelCompleted(response=second_response),
-                )
-            ),
+            },
         )
     )
-    conversation = StreamingConversationPort(
-        model=_direct_model(provider),
-        session=session,
-        now=clock.now,
-        new_uuid=iter((TURN_UUID, SECOND_TURN_UUID)).__next__,
-        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
-    )
-    writer = CancelOnFirstDeltaWriter()
+    writer = _Writer()
 
     await run_repl(
-        conversation=conversation,
-        input_reader=ScriptedReplInput(("First turn.", "Second turn.", None)),
+        bus=bus,
+        control=_Control(bus),
+        input_reader=_Input(("/memory", "/unknown", "exit")),
         writer=writer,
+        management_dispatcher=_Dispatcher(),
     )
+    producer.cancel()
+    observed = await asyncio.gather(producer, return_exceptions=True)
 
+    assert isinstance(observed[0], list)
+    assert [(message.content, message.metadata) for message in observed[0]] == [("/unknown", {})]
     assert writer.operations == [
-        ("delta", "Partial first turn"),
-        ("finish", ""),
-        ("delta", "Second turn completed."),
+        ("line", "memory output"),
+        ("delta", "ordinary"),
         ("finish", ""),
     ]
-    assert [
-        (message["role"], message.get("status"), message["content"]) for message in session.messages
-    ] == [
-        ("user", None, "First turn."),
-        ("assistant", "interrupted", "Partial first turn"),
-        ("user", None, "Second turn."),
-        ("assistant", "completed", "Second turn completed."),
-    ]
-    assert len(provider.stream_requests) == 2
 
 
 @pytest.mark.asyncio
-async def test_task_cancellation_during_foreground_is_cleared_before_next_input(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    class BlockingProvider:
-        def __init__(self) -> None:
-            self.waiting = asyncio.Event()
+async def test_repl_task_cancellation_requests_control_cancel_and_repairs_input_loop() -> None:
+    class BlockingProducer:
+        def __init__(self, bus: MessageBus) -> None:
+            self.bus = bus
+            self.delta_seen = asyncio.Event()
 
-        async def stream(
-            self,
-            *,
-            messages: Sequence[dict[str, object]],
-            tools: Sequence[object],
-            model: str,
-            max_output: int,
-            temperature: float,
-            reasoning_effort: str | None,
-            timeout: int,
-            continuation: ModelContinuation | None = None,
-        ) -> AsyncIterator[ModelStreamEvent]:
-            del (
-                messages,
-                tools,
-                model,
-                max_output,
-                temperature,
-                reasoning_effort,
-                timeout,
-                continuation,
+        async def run(self) -> None:
+            inbound = await self.bus.get_inbound()
+            assert inbound.content == "Start"
+            await self.bus.put_outbound(
+                OutboundMessage("model_response", "partial", {"_stream_delta": True})
             )
-            yield TextDelta(delta="Partial foreground")
-            self.waiting.set()
+            self.delta_seen.set()
             await asyncio.Event().wait()
 
-        async def complete(
-            self,
-            *,
-            messages: Sequence[dict[str, object]],
-            tools: Sequence[object],
-            model: str,
-            max_output: int,
-            temperature: float,
-            reasoning_effort: str | None,
-            timeout: int,
-            continuation: ModelContinuation | None = None,
-        ) -> ModelResponse:
-            raise AssertionError(f"Unexpected completion: {messages!r}")
-
-        async def close(self) -> None:
-            return None
-
-    class FirstThenExitInput:
-        def __init__(self) -> None:
-            self._calls = 0
-            self.waiting_for_exit = asyncio.Event()
-            self.release_exit = asyncio.Event()
-
-        async def read(self) -> str:
-            self._calls += 1
-            if self._calls == 1:
-                return "Start foreground."
-            self.waiting_for_exit.set()
-            await self.release_exit.wait()
-            return "exit"
-
-    home = AgentHome(agent_home)
-    home.initialize()
-    session = _session(workspace, lambda: NOW, iter((SESSION_UUID,)).__next__)
-    provider = BlockingProvider()
-    conversation = StreamingConversationPort(
-        model=_direct_model(provider),
-        session=session,
-        now=lambda: NOW,
-        new_uuid=iter((TURN_UUID,)).__next__,
-        context_builder=ContextBuilder(Workspace.from_path(workspace), "Asia/Shanghai"),
-    )
-    input_reader = FirstThenExitInput()
+    bus = MessageBus()
+    producer = BlockingProducer(bus)
+    producer_task = asyncio.create_task(producer.run())
+    control = _Control(bus)
     running = asyncio.create_task(
         run_repl(
-            conversation=conversation,
-            input_reader=input_reader,
-            writer=RecordingProgressiveWriter(),
+            bus=bus,
+            control=control,
+            input_reader=_Input(("Start", "exit")),
+            writer=_Writer(),
         )
     )
-    await provider.waiting.wait()
+    await producer.delta_seen.wait()
 
     running.cancel()
-    await input_reader.waiting_for_exit.wait()
+    await running
+    producer_task.cancel()
+    await asyncio.gather(producer_task, return_exceptions=True)
 
-    try:
-        assert not running.done()
-        assert running.cancelling() == 0
-    finally:
-        input_reader.release_exit.set()
-        await asyncio.gather(running, return_exceptions=True)
-
-
-@pytest.mark.asyncio
-async def test_repl_dispatches_handled_management_output_and_converses_on_unknown_slash(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
-    state.initialize(agent_home_root=Path.home() / ".myclaw")
-    clock = FakeClock(NOW)
-    session = _session(workspace, clock.now, iter((SESSION_UUID,)).__next__)
-    response = ModelResponse(
-        message=AssistantModelMessage(content="Ordinary slash input received."),
-        usage=ModelUsage(input_tokens=5, output_tokens=4, total_tokens=9),
-        finish_reason="stop",
-    )
-    provider = ScriptedFakeProvider(
-        streams=[
-            StreamScript(
-                events=(
-                    TextDelta(delta="Ordinary slash input received."),
-                    ModelCompleted(response=response),
-                )
-            )
-        ]
-    )
-    conversation = StreamingConversationPort(
-        model=_direct_model(provider),
-        session=session,
-        now=clock.now,
-        new_uuid=iter((TURN_UUID,)).__next__,
-        context_builder=ContextBuilder(
-            Workspace.from_path(workspace),
-            "Asia/Shanghai",
-            clock=clock.now,
-        ),
-    )
-    dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
-    )
-    writer = RecordingProgressiveWriter()
-
-    await run_repl(
-        conversation=conversation,
-        input_reader=ScriptedReplInput(("/memory", "/unknown", None)),
-        writer=writer,
-        management_dispatcher=dispatcher,
-    )
-
-    assert writer.operations == [
-        (
-            "line",
-            "# Long-term Memory\n\n## User Info\n\n## User Preference\n\n"
-            "## Project Fact\n\n## Lesson\n",
-        ),
-        ("delta", "Ordinary slash input received."),
-        ("finish", ""),
-    ]
-    assert len(provider.stream_requests) == 1
-    request = provider.stream_requests[0]
-    assert [message for message in request.messages if message["role"] != "system"] == [
-        {
-            "role": "user",
-            "content": (
-                "<runtime_context>\n"
-                "current_time: 2026-07-11T15:30:12.123+08:00\n"
-                f"session_id: {session.session_id}\n"
-                "</runtime_context>\n\n"
-                "<user_input>\n"
-                "/unknown\n"
-                "</user_input>"
-            ),
-        }
-    ]
-    assert [(message["role"], message["content"]) for message in session.messages] == [
-        ("user", "/unknown"),
-        ("assistant", "Ordinary slash input received."),
-    ]
+    assert control.cancel_calls == 1

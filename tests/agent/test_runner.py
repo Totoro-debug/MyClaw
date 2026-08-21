@@ -352,6 +352,43 @@ async def test_runner_returns_generated_increment_and_closes_response_segment() 
 
 
 @pytest.mark.asyncio
+async def test_runner_emits_completed_content_when_provider_omits_text_deltas() -> None:
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Completed without deltas"),
+                            usage=ModelUsage(input_tokens=3, output_tokens=2, total_tokens=5),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    events: list[object] = []
+
+    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+        [{"role": "user", "content": "Hello"}],
+        model="chat",
+        tool_gateway=None,
+        on_output=lambda event: _observe(events, event),
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+    )
+
+    assert result.final_content == "Completed without deltas"
+    assert [event.delta for event in events if isinstance(event, TextDelta)] == [
+        "Completed without deltas"
+    ]
+    assert isinstance(events[-1], AgentRunnerResponseSegmentEnd)
+
+
+@pytest.mark.asyncio
 async def test_router_internal_retry_consumes_one_runner_model_call() -> None:
     router = _RetryingRouter()
 

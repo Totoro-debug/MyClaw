@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 
-from myclaw.agent.events import AgentEvent, ConfirmationRequestedPayload
+from myclaw.agent.loop import ConfirmationRequestView
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedReplRuntime, prepare_repl_runtime
 from myclaw.config.agent_home import AgentHome
@@ -29,6 +29,7 @@ from myclaw.tools.core.web_fetch import JinaReaderClient
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures.provider import ProviderCall
+from tests.runtime_bus import collect_foreground_outbound
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 
@@ -145,22 +146,6 @@ def _runtime(
     )
 
 
-async def _drain_until_terminal(
-    events: AsyncIterator[AgentEvent],
-    runtime: PreparedReplRuntime,
-) -> list[AgentEvent]:
-    observed: list[AgentEvent] = []
-    async for event in events:
-        observed.append(event)
-        if event.type == "confirmation_requested":
-            assert isinstance(event.payload, ConfirmationRequestedPayload)
-            runtime.conversation.respond_to_confirmation(
-                event.payload.confirmation_id,
-                "approved",
-            )
-    return observed
-
-
 @pytest.mark.asyncio
 async def test_runtime_uses_fixed_catalog_for_provider_confirmation_and_persistence(
     agent_home: Path,
@@ -182,23 +167,22 @@ async def test_runtime_uses_fixed_catalog_for_provider_confirmation_and_persiste
         )
     )
     runtime = _runtime(agent_home, workspace, provider)
+    confirmations: list[ConfirmationRequestView] = []
+    runtime.control.bind_confirmation_callback(confirmations.append)
     try:
-        events = await _drain_until_terminal(runtime.conversation.submit("Read the file."), runtime)
+        await runtime.start()
+        turn = asyncio.create_task(collect_foreground_outbound(runtime, "Read the file."))
+        while not confirmations:
+            await asyncio.sleep(0)
+        confirmation = confirmations[0]
+        runtime.control.respond_to_confirmation(confirmation.confirmation_id, "approved")
+        messages = await turn
     finally:
         await runtime.close()
 
-    assert [event.type for event in events] == [
-        "turn_started",
-        "model_call_completed",
-        "tool_started",
-        "confirmation_requested",
-        "tool_completed",
-        "model_call_completed",
-        "turn_completed",
-    ]
-    assert isinstance(events[3].payload, ConfirmationRequestedPayload)
-    assert events[3].payload.turn_id == events[0].turn_id
-    assert events[3].payload.details["path"] != str(outside) or len(str(outside)) <= 256
+    assert any(message.type == "tool_call" for message in messages)
+    assert messages[-1].metadata == {"_streamed": True}
+    assert confirmation.details["path"] != str(outside) or len(str(outside)) <= 256
     assert provider.stream_requests
     assert [definition["function"]["name"] for definition in provider.stream_requests[0].tools] == [
         "read_file",
@@ -257,13 +241,12 @@ async def test_runtime_cancellation_reaches_an_active_fixed_catalog_tool(
         )
     )
     runtime = _runtime(agent_home, workspace, provider)
-    turn = asyncio.create_task(
-        _drain_until_terminal(runtime.conversation.submit("Fetch the URL."), runtime)
-    )
+    await runtime.start()
+    turn = asyncio.create_task(collect_foreground_outbound(runtime, "Fetch the URL."))
     try:
         await started.wait()
-        await runtime.conversation.cancel_active_turn()
-        events = await asyncio.wait_for(turn, timeout=1)
+        await runtime.control.cancel_active_run()
+        messages = await asyncio.wait_for(turn, timeout=1)
     finally:
         release.set()
         if not turn.done():
@@ -272,12 +255,9 @@ async def test_runtime_cancellation_reaches_an_active_fixed_catalog_tool(
         await runtime.close()
 
     assert cancelled.is_set()
-    assert [event.type for event in events] == [
-        "turn_started",
-        "model_call_completed",
-        "tool_started",
-        "turn_cancelled",
-    ]
+    assert any(message.type == "tool_call" for message in messages)
+    assert messages[-1].type == "system_control"
+    assert messages[-1].metadata["finish_reason"] == "cancelled"
     tool_messages = [message for message in runtime.session.messages if message["role"] == "tool"]
     assert len(tool_messages) == 1
     assert tool_messages[0]["status"] == "error"

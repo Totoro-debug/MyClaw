@@ -48,6 +48,7 @@ from tests.fixtures import (
     StreamScript,
 )
 from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
+from tests.runtime_bus import collect_foreground_outbound
 
 LOCAL = timezone(timedelta(hours=8))
 NOW = datetime(2026, 7, 11, 16, 10, tzinfo=LOCAL)
@@ -704,7 +705,7 @@ async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
     clock.advance(5 * 60)
     await _wait_until(lambda: len(provider.complete_requests) == 2)
     memory_view = await runtime.management_dispatcher.dispatch("/memory")
-    _ = [event async for event in runtime.conversation.submit("What do you remember?")]
+    _ = await collect_foreground_outbound(runtime, "What do you remember?")
     await runtime.close()
 
     first_chat = provider.stream_requests[0]
@@ -725,7 +726,8 @@ async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
         new_uuid=uuid4,
         memory_scheduler_clock=clock,
     )
-    _ = [event async for event in restarted.conversation.submit("What do you remember now?")]
+    await restarted.start()
+    _ = await collect_foreground_outbound(restarted, "What do you remember now?")
     await restarted.close()
 
     restarted_chat = restarted_provider.stream_requests[0]
@@ -820,8 +822,10 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
         new_uuid=uuid4,
     )
 
+    await runtime.start()
+
     async def collect_first_turn() -> None:
-        _ = [event async for event in runtime.conversation.submit("First input.")]
+        _ = await collect_foreground_outbound(runtime, "First input.")
 
     first_turn = asyncio.create_task(collect_first_turn())
     await first_started.wait()
@@ -830,7 +834,7 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
     assert updated_memory == state.long_term_memory_path.read_text(encoding="utf-8")
     release_first.set()
     await first_turn
-    _ = [event async for event in runtime.conversation.submit("Second input.")]
+    _ = await collect_foreground_outbound(runtime, "Second input.")
     await runtime.close()
 
     first_chat = provider.stream_requests[0]

@@ -8,15 +8,23 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent.events import AgentEvent, TurnCompletedPayload, TurnStartedPayload
+from myclaw.agent.runtime import prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
-from myclaw.management.commands import ManagementCommandDispatcher
+from myclaw.config.config import ConfigLoader
 from myclaw.management.service import ManagementViewService
-from myclaw.provider.models import ModelUsage
+from myclaw.provider.models import (
+    AssistantModelMessage,
+    ModelCompleted,
+    ModelResponse,
+    ModelUsage,
+)
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.terminal.repl import run_repl
+from tests.configuration.test_config import VALID_CONFIG
+from tests.fixtures import ScriptedFakeProvider, StreamScript
 
 NOW = datetime(2026, 8, 1, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 FIRST_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -330,37 +338,47 @@ async def test_repl_resume_routes_the_next_input_through_the_selected_session(
     home = AgentHome(agent_home)
     home.initialize()
     state = _state(workspace, agent_home)
-    initial = Session.create(state, now=lambda: NOW, new_uuid=lambda: FIRST_UUID)
     target = _session(state, SECOND_UUID, "Target session")
     target.close()
-    delegates: dict[str, _RecordingConversation] = {}
-
-    def build(session: Session) -> _RecordingConversation:
-        delegate = _RecordingConversation()
-        delegates[session.session_id] = delegate
-        return delegate
-
-    conversation = SwitchableConversationPort(session=initial, build_conversation=build)
-    management = ManagementCommandDispatcher(
-        ManagementViewService(
-            home,
-            workspace_state=state,
-            switch_session=conversation.switch_session,
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Continued answer."),
+                            usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
         )
     )
+    runtime = prepare_repl_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        now=lambda: NOW,
+        new_uuid=lambda: FIRST_UUID,
+    )
+    await runtime.start()
     writer = _RecordingWriter()
-
     await run_repl(
-        conversation=conversation,
+        bus=runtime.bus,
+        control=runtime.control,
         input_reader=_ScriptedInput(("/resume", "1", "Continue here", "exit")),
         writer=writer,
-        management_dispatcher=management,
+        management_dispatcher=runtime.management_dispatcher,
     )
+    await runtime.close()
 
-    assert conversation.session_id == target.session_id
-    assert delegates[target.session_id].submitted == ["Continue here"]
+    assert runtime.session_id == target.session_id
     assert writer.operations[0][1].startswith("Resumable sessions:\n1. Target session |")
     assert writer.operations[1] == ("line", f"Resumed session {target.session_id}.")
     assert writer.operations[-1] == ("finish", "")
-    assert not (state.sessions_directory / f"{initial.session_id}.jsonl").exists()
-    await conversation.close()
+    assert [
+        message["content"] for message in runtime.session.messages if message["role"] == "user"
+    ][-1] == ("Continue here")

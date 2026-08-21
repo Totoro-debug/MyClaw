@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
@@ -62,6 +63,9 @@ class ModelRouter:
         self._jitter = jitter
         self._providers: dict[str, ProviderImplementation] = {}
         self._route_statuses: dict[ModelRoute, ModelRouteStatus] = {}
+        self._current_call_statuses: ContextVar[dict[ModelRoute, ModelRouteStatus] | None] = (
+            ContextVar("myclaw_model_router_call_statuses", default=None)
+        )
         self._close_task: asyncio.Task[None] | None = None
 
     def route_status(self, requested_route: ModelRoute) -> ModelRouteStatus:
@@ -74,6 +78,11 @@ class ModelRouter:
             )
             self._route_statuses[requested_route] = status
         return status
+
+    def current_call_status(self, requested_route: ModelRoute) -> ModelRouteStatus | None:
+        """Return the route selected by the current task's latest logical call."""
+        statuses = self._current_call_statuses.get()
+        return None if statuses is None else statuses.get(requested_route)
 
     def stream(
         self,
@@ -244,7 +253,9 @@ class ModelRouter:
             requested_route=requested_route,
             used_default=True,
         )
-        self._route_statuses[requested_route] = _route_status(requested_route, fallback)
+        status = _route_status(requested_route, fallback)
+        self._route_statuses[requested_route] = status
+        self._remember_current_call_status(requested_route, status)
         _log_fallback(current, fallback, failure, attempt=attempt)
         return fallback
 
@@ -259,7 +270,9 @@ class ModelRouter:
 
     def _begin_call(self, requested_route: ModelRoute) -> ResolvedModelRoute:
         resolved = self._configuration.resolve_route(requested_route)
-        self._route_statuses[requested_route] = _route_status(requested_route, resolved)
+        status = _route_status(requested_route, resolved)
+        self._route_statuses[requested_route] = status
+        self._remember_current_call_status(requested_route, status)
         if resolved.used_default:
             logger.warning(
                 "Default Model Route selected code=route_unavailable requested_route={} "
@@ -270,6 +283,16 @@ class ModelRouter:
                 resolved.route.model,
             )
         return resolved
+
+    def _remember_current_call_status(
+        self,
+        requested_route: ModelRoute,
+        status: ModelRouteStatus,
+    ) -> None:
+        current = self._current_call_statuses.get()
+        statuses = {} if current is None else dict(current)
+        statuses[requested_route] = status
+        self._current_call_statuses.set(statuses)
 
 
 def _log_retry(

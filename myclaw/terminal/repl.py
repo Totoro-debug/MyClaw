@@ -1,24 +1,14 @@
-"""Injectable headless Conversation seam for Runtime regression coverage."""
+"""Injectable headless host for the Runtime Message Bus foreground seams."""
+
+from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
 from typing import Protocol
 
-from myclaw.agent.events import (
-    AgentEvent,
-    ConfirmationDecision,
-    ConfirmationRequestedPayload,
-    ConfirmationResponsePort,
-    ConversationPort,
-    TextDeltaPayload,
-    TurnFailedPayload,
-)
+from myclaw.agent.loop import AgentLoopControl, ConfirmationRequestView
+from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.management.service import SessionListingEntry
-from myclaw.terminal._turn_stream import (
-    clear_current_task_cancellation,
-    close_event_stream,
-)
 
 
 class ReplInput(Protocol):
@@ -52,13 +42,17 @@ class ManagementDispatcher(Protocol):
 
 async def run_repl(
     *,
-    conversation: ConversationPort,
+    bus: MessageBus,
+    control: AgentLoopControl,
     input_reader: ReplInput,
     writer: ProgressiveWriter,
     management_dispatcher: ManagementDispatcher | None = None,
     shutdown_requested: asyncio.Event | None = None,
 ) -> None:
-    """Read interactive input until EOF while preserving an unmaterialized empty Session."""
+    """Read input and consume the active Runtime MessageBus foreground run."""
+    confirmations: asyncio.Queue[ConfirmationRequestView] = asyncio.Queue()
+    control.bind_confirmation_callback(confirmations.put_nowait)
+
     while True:
         if shutdown_requested is not None and shutdown_requested.is_set():
             return
@@ -83,36 +77,28 @@ async def run_repl(
                         management_dispatcher=management_dispatcher,
                     )
                 continue
-        events = conversation.submit(text)
+
+        await bus.put_inbound(InboundMessage(content=text))
         try:
-            try:
-                await _render_turn(
-                    events,
-                    writer,
-                    input_reader=input_reader,
-                    confirmation=conversation,
-                )
-            except asyncio.CancelledError:
-                if shutdown_requested is not None and shutdown_requested.is_set():
-                    raise
-                clear_current_task_cancellation()
-                await conversation.cancel_active_turn()
-                await _render_turn(
-                    events,
-                    writer,
-                    input_reader=input_reader,
-                    confirmation=conversation,
-                )
-        except BaseException as primary_error:
-            try:
-                await close_event_stream(events)
-            except BaseException as cleanup_error:
-                raise primary_error from cleanup_error
-            raise
-        else:
-            await close_event_stream(events)
-            if shutdown_requested is None or not shutdown_requested.is_set():
-                clear_current_task_cancellation()
+            await _render_run(
+                bus=bus,
+                control=control,
+                confirmations=confirmations,
+                input_reader=input_reader,
+                writer=writer,
+            )
+        except asyncio.CancelledError:
+            if shutdown_requested is not None and shutdown_requested.is_set():
+                raise
+            await control.cancel_active_run()
+            _clear_current_task_cancellation()
+            await _render_run(
+                bus=bus,
+                control=control,
+                confirmations=confirmations,
+                input_reader=input_reader,
+                writer=writer,
+            )
 
 
 async def _choose_resume_session(
@@ -143,50 +129,77 @@ async def _choose_resume_session(
         return
 
 
-async def _render_turn(
-    events: AsyncIterator[AgentEvent],
-    writer: ProgressiveWriter,
+async def _render_run(
     *,
+    bus: MessageBus,
+    control: AgentLoopControl,
+    confirmations: asyncio.Queue[ConfirmationRequestView],
     input_reader: ReplInput,
-    confirmation: ConfirmationResponsePort,
+    writer: ProgressiveWriter,
 ) -> None:
-    async for event in events:
-        if event.type == "text_delta":
-            payload = event.payload
-            if not isinstance(payload, TextDeltaPayload):
-                raise TypeError("text_delta event has an invalid payload")
-            await writer.write_delta(payload.delta)
-        elif event.type == "confirmation_requested":
-            payload = event.payload
-            if not isinstance(payload, ConfirmationRequestedPayload):
-                raise TypeError("confirmation_requested event has an invalid payload")
-            await _respond_to_confirmation(
-                request=payload,
-                input_reader=input_reader,
-                writer=writer,
-                confirmation=confirmation,
+    while True:
+        outbound_task = asyncio.create_task(bus.get_outbound())
+        confirmation_task = asyncio.create_task(confirmations.get())
+        try:
+            done, pending = await asyncio.wait(
+                (outbound_task, confirmation_task),
+                return_when=asyncio.FIRST_COMPLETED,
             )
-        elif event.type in {"turn_completed", "turn_cancelled"}:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            if confirmation_task in done:
+                await _respond_to_confirmation(
+                    request=confirmation_task.result(),
+                    input_reader=input_reader,
+                    writer=writer,
+                    control=control,
+                )
+
+            if outbound_task in done:
+                outbound = outbound_task.result()
+                if await _render_outbound(outbound, writer):
+                    return
+        finally:
+            for task in (outbound_task, confirmation_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(outbound_task, confirmation_task, return_exceptions=True)
+
+
+async def _render_outbound(outbound: OutboundMessage, writer: ProgressiveWriter) -> bool:
+    if outbound.type in {"model_reasoning", "model_response"}:
+        if outbound.metadata.get("_stream_delta") is True:
+            await writer.write_delta(outbound.content)
+        if outbound.metadata.get("_streamed") is True:
             await writer.finish_turn()
-        elif event.type == "turn_failed":
-            payload = event.payload
-            if not isinstance(payload, TurnFailedPayload):
-                raise TypeError("turn_failed event has an invalid payload")
-            await writer.write_line(payload.error.message)
+            return True
+        return False
+    if outbound.type == "tool_call":
+        arguments = outbound.metadata.get("arguments", "")
+        await writer.write_line(f"Tool: {outbound.content}\nArguments: {arguments}")
+        return False
+    if outbound.metadata.get("_streamed") is True:
+        if outbound.metadata.get("finish_reason") != "cancelled":
+            await writer.write_line(outbound.content)
+        await writer.finish_turn()
+        return True
+    return False
 
 
 async def _respond_to_confirmation(
     *,
-    request: ConfirmationRequestedPayload,
+    request: ConfirmationRequestView,
     input_reader: ReplInput,
     writer: ProgressiveWriter,
-    confirmation: ConfirmationResponsePort,
+    control: AgentLoopControl,
 ) -> None:
     await writer.write_line(_format_confirmation_request(request))
     while True:
         response = await input_reader.read()
         if response is None:
-            decision: ConfirmationDecision = "declined"
+            decision = "declined"
             break
         normalized = response.strip().casefold()
         if normalized in {"yes", "y"}:
@@ -196,10 +209,10 @@ async def _respond_to_confirmation(
             decision = "declined"
             break
         await writer.write_line("Invalid confirmation response.")
-    confirmation.respond_to_confirmation(request.confirmation_id, decision)
+    control.respond_to_confirmation(request.confirmation_id, decision)  # type: ignore[arg-type]
 
 
-def _format_confirmation_request(request: ConfirmationRequestedPayload) -> str:
+def _format_confirmation_request(request: ConfirmationRequestView) -> str:
     details = json.dumps(
         request.details,
         ensure_ascii=False,
@@ -215,3 +228,13 @@ def _format_confirmation_request(request: ConfirmationRequestedPayload) -> str:
         lines.append(f"Warnings: {'; '.join(request.warnings)}")
     lines.append("Confirm? [yes/y, no/n]:")
     return "\n".join(lines)
+
+
+def _clear_current_task_cancellation() -> None:
+    current = asyncio.current_task()
+    if current is None:
+        return
+    uncancel = getattr(current, "uncancel", None)
+    if callable(uncancel):
+        while current.cancelling():
+            uncancel()

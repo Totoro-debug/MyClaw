@@ -31,6 +31,7 @@ from myclaw.session.session import Session, SessionStoragePartition
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ProviderCall, ScriptedFakeProvider, write_schedule_state
 from tests.fixtures.diagnostic_capture import capture_diagnostics
+from tests.runtime_bus import collect_foreground_outbound
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 OTHER_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
@@ -1301,11 +1302,9 @@ async def test_prepared_runtime_runs_foreground_while_every_job_is_active(
         await provider.schedule_started.wait()
         assert runtime.schedule_service.status_snapshot().active_job_count == 1
 
-        events = [
-            event async for event in runtime.conversation.submit("Run the foreground request.")
-        ]
+        messages = await collect_foreground_outbound(runtime, "Run the foreground request.")
 
-        assert events[-1].type == "turn_completed"
+        assert messages[-1].metadata == {"_streamed": True}
         assert runtime.schedule_service.status_snapshot().active_job_count == 1
         assert len(provider.complete_requests[0].tools) == 10
         assert provider.stream_requests

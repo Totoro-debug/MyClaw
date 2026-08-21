@@ -26,6 +26,7 @@ from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock, ProviderCall
+from tests.runtime_bus import collect_foreground_outbound
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 8, 4, 10, 20, 30, 123000, tzinfo=LOCAL_OFFSET)
@@ -157,14 +158,12 @@ async def test_runtime_routes_turn_title_status_and_close_through_one_active_ses
     assert runtime.session_id == session.session_id
     assert not (workspace / ".myclaw" / "sessions" / f"{session.session_id}.jsonl").exists()
 
-    events = [event async for event in runtime.conversation.submit("First input.")]
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, "First input.")
     await provider.title_started.wait()
 
-    assert [event.type for event in events] == [
-        "turn_started",
-        "model_call_completed",
-        "turn_completed",
-    ]
+    assert messages[-1].type == "model_response"
+    assert messages[-1].metadata == {"_streamed": True}
     assert [message["role"] for message in session.messages] == ["user", "assistant"]
     assert session.metadata["title"] == "Untitled session"
 
@@ -228,7 +227,8 @@ async def test_late_title_is_saved_by_the_next_complete_turn(
     runtime = _runtime(agent_home, workspace, provider)
     session = runtime.session
 
-    _ = [event async for event in runtime.conversation.submit("First input.")]
+    await runtime.start()
+    _ = await collect_foreground_outbound(runtime, "First input.")
     await provider.title_started.wait()
     await asyncio.sleep(0)
     assert Session.load(session.workspace_state, session.session_id).metadata["title"] == (
@@ -246,7 +246,7 @@ async def test_late_title_is_saved_by_the_next_complete_turn(
         "Untitled session"
     )
 
-    _ = [event async for event in runtime.conversation.submit("Second input.")]
+    _ = await collect_foreground_outbound(runtime, "Second input.")
     await asyncio.sleep(0)
 
     reloaded = Session.load(session.workspace_state, session.session_id)
@@ -289,13 +289,14 @@ async def test_runtime_rejects_tool_call_title_and_counts_its_usage(
     )
     runtime = _runtime(agent_home, workspace, provider)
 
-    events = [event async for event in runtime.conversation.submit("  First fallback title.  ")]
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, "  First fallback title.  ")
     for _ in range(100):
         if runtime.session.metadata["token_usage"]["model_calls"] == 2:
             break
         await asyncio.sleep(0)
 
-    assert events[-1].type == "turn_completed"
+    assert messages[-1].metadata == {"_streamed": True}
     assert runtime.session.metadata["title"] == "First fallback title."
     assert runtime.session.metadata["token_usage"] == {
         "model_calls": 2,
@@ -327,15 +328,14 @@ async def test_runtime_empty_normalized_title_uses_the_first_user_fallback(
     )
     runtime = _runtime(agent_home, workspace, provider)
 
-    events = [
-        event async for event in runtime.conversation.submit("  Meaningful first question.  ")
-    ]
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, "  Meaningful first question.  ")
     for _ in range(100):
         if runtime.session.metadata["token_usage"]["model_calls"] == 2:
             break
         await asyncio.sleep(0)
 
-    assert events[-1].type == "turn_completed"
+    assert messages[-1].metadata == {"_streamed": True}
     assert runtime.session.metadata["title"] == "Meaningful first question."
     assert runtime.session.metadata["token_usage"] == {
         "model_calls": 2,
@@ -364,7 +364,8 @@ async def test_runtime_shutdown_applies_first_user_title_fallback_before_final_s
     runtime = _runtime(agent_home, workspace, provider)
     session = runtime.session
 
-    _ = [event async for event in runtime.conversation.submit("  Shutdown fallback title.  ")]
+    await runtime.start()
+    _ = await collect_foreground_outbound(runtime, "  Shutdown fallback title.  ")
     await provider.title_started.wait()
     await runtime.close()
 
@@ -391,11 +392,18 @@ async def test_immediate_turn_cancellation_keeps_the_first_user_title_lifecycle(
     provider.delay_title = True
     runtime = _runtime(agent_home, workspace, provider)
     session = runtime.session
-    events = runtime.conversation.submit("  Cancelled first title.  ")
-
-    assert (await anext(events)).type == "turn_started"
-    await runtime.conversation.cancel_active_turn()
-    assert [event.type async for event in events] == ["turn_cancelled"]
+    await runtime.start()
+    turn = asyncio.create_task(collect_foreground_outbound(runtime, "  Cancelled first title.  "))
+    while not runtime.control.has_active_run:
+        await asyncio.sleep(0)
+    await runtime.control.cancel_active_run()
+    messages = await turn
+    assert messages[-1].type == "system_control"
+    assert messages[-1].metadata == {
+        "finish_reason": "cancelled",
+        "error_code": "turn_cancelled",
+        "_streamed": True,
+    }
     await asyncio.wait_for(provider.title_started.wait(), timeout=1)
     await runtime.close()
 
@@ -433,7 +441,8 @@ async def test_runtime_shutdown_swallows_final_session_close_fault_after_router_
         )
     )
     runtime = _runtime(agent_home, workspace, provider)
-    _ = [event async for event in runtime.conversation.submit("Trigger provider construction.")]
+    await runtime.start()
+    _ = await collect_foreground_outbound(runtime, "Trigger provider construction.")
     close_order: list[str] = []
     provider_close = provider.close
 
@@ -525,16 +534,10 @@ async def test_runtime_active_session_keeps_artifact_and_log_correlation_when_pe
         raise OSError("ordinary snapshot failure")
 
     monkeypatch.setattr(session, "persist", fail_persist)
-    events = [event async for event in runtime.conversation.submit("Inspect large.txt.")]
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, "Inspect large.txt.")
 
-    assert [event.type for event in events] == [
-        "turn_started",
-        "model_call_completed",
-        "tool_started",
-        "tool_completed",
-        "model_call_completed",
-        "turn_completed",
-    ]
+    assert messages[-1].metadata == {"_streamed": True}
     tool_message = session.messages[2]
     assert tool_message["role"] == "tool"
     artifact = tool_message["artifact"]
@@ -597,12 +600,13 @@ timeout = 30
     runtime = _runtime(agent_home, workspace, provider, config=config)
     session = runtime.session
 
-    events = [event async for event in runtime.conversation.submit("First input.")]
-    assert events[-1].type == "turn_completed"
-    events = [event async for event in runtime.conversation.submit("Second input.")]
-    assert events[-1].type == "turn_completed"
-    events = [event async for event in runtime.conversation.submit("Third input.")]
-    assert events[-1].type == "turn_completed"
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, "First input.")
+    assert messages[-1].metadata == {"_streamed": True}
+    messages = await collect_foreground_outbound(runtime, "Second input.")
+    assert messages[-1].metadata == {"_streamed": True}
+    messages = await collect_foreground_outbound(runtime, "Third input.")
+    assert messages[-1].metadata == {"_streamed": True}
     assert session.last_consolidated == 2
     assert (workspace / ".myclaw" / "memory" / "summary.jsonl").exists()
     chat_requests = provider.requests
