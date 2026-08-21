@@ -10,13 +10,25 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.model import JobSchedule, ScheduleJob
+from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.tools.core.schedule import ScheduleTool
-from myclaw.tools.tool_gateway import ModelToolCall
+from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
 from tests.fixtures import SingleToolGateway, write_schedule_state
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+
+
+class _ToolClock:
+    def now(self) -> datetime:
+        return NOW
+
+    def monotonic(self) -> float:
+        return 0.0
+
+    async def sleep(self, seconds: float) -> None:
+        del seconds
 
 
 def _store(
@@ -35,11 +47,17 @@ def _gateway(tool: ScheduleTool) -> SingleToolGateway:
     return SingleToolGateway((tool,))
 
 
+def _service(store: WorkspaceScheduleStore) -> ScheduleService:
+    return ScheduleService(store=store, clock=_ToolClock())
+
+
 def test_schema_exposes_the_three_actions_and_optional_schedule_branches(
     workspace: Path,
     agent_home: Path,
 ) -> None:
-    schema = ScheduleTool(store=_store(workspace, agent_home)).to_schema()["function"]["parameters"]
+    schema = ScheduleTool(schedule_service=_service(_store(workspace, agent_home))).to_schema()[
+        "function"
+    ]["parameters"]
 
     assert schema["required"] == ["action"]
     properties = schema["properties"]
@@ -63,7 +81,7 @@ async def test_add_uses_the_common_gateway_without_confirmation_and_ignores_lowe
     store = _store(workspace, agent_home)
     gateway = _gateway(
         ScheduleTool(
-            store=store,
+            schedule_service=_service(store),
             now=lambda: NOW,
             new_uuid=lambda: JOB_UUID,
         )
@@ -111,7 +129,7 @@ async def test_add_normalizes_cron_timezone_and_at_time_without_confirmation(
     uuids = iter((JOB_UUID, UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")))
     gateway = _gateway(
         ScheduleTool(
-            store=store,
+            schedule_service=_service(store),
             now=lambda: NOW,
             new_uuid=lambda: next(uuids),
         )
@@ -151,7 +169,9 @@ async def test_cron_accepts_valid_iana_timezone_alias(
     agent_home: Path,
 ) -> None:
     store = _store(workspace, agent_home)
-    gateway = _gateway(ScheduleTool(store=store, now=lambda: NOW, new_uuid=lambda: JOB_UUID))
+    gateway = _gateway(
+        ScheduleTool(schedule_service=_service(store), now=lambda: NOW, new_uuid=lambda: JOB_UUID)
+    )
 
     result = await gateway.call(
         ModelToolCall(
@@ -173,7 +193,9 @@ async def test_cron_defaults_to_utc_and_invalid_at_time_is_rejected(
     agent_home: Path,
 ) -> None:
     store = _store(workspace, agent_home)
-    gateway = _gateway(ScheduleTool(store=store, now=lambda: NOW, new_uuid=lambda: JOB_UUID))
+    gateway = _gateway(
+        ScheduleTool(schedule_service=_service(store), now=lambda: NOW, new_uuid=lambda: JOB_UUID)
+    )
 
     cron = await gateway.call(
         ModelToolCall(
@@ -210,7 +232,9 @@ async def test_add_rejects_invalid_cron_inputs_without_mutating_the_store(
     schedule_arguments: dict[str, object],
 ) -> None:
     store = _store(workspace, agent_home)
-    gateway = _gateway(ScheduleTool(store=store, now=lambda: NOW, new_uuid=lambda: JOB_UUID))
+    gateway = _gateway(
+        ScheduleTool(schedule_service=_service(store), now=lambda: NOW, new_uuid=lambda: JOB_UUID)
+    )
 
     result = await gateway.call(
         ModelToolCall(
@@ -271,7 +295,7 @@ async def test_list_returns_only_public_jobs_in_creation_then_id_order(
     await store.add_user_job(earlier)
 
     result = await _gateway(
-        ScheduleTool(store=store, now=lambda: NOW, new_uuid=lambda: JOB_UUID)
+        ScheduleTool(schedule_service=_service(store), now=lambda: NOW, new_uuid=lambda: JOB_UUID)
     ).call(ModelToolCall(id="call_list", name="schedule", arguments='{"action":"list"}'))
 
     assert result.status == "success"
@@ -319,7 +343,9 @@ async def test_remove_requires_canonical_uuid_and_hides_unknown_or_system_jobs(
     )
     store = _store(workspace, agent_home, hidden)
     await store.add_user_job(public)
-    gateway = _gateway(ScheduleTool(store=store, now=lambda: NOW, new_uuid=lambda: JOB_UUID))
+    gateway = _gateway(
+        ScheduleTool(schedule_service=_service(store), now=lambda: NOW, new_uuid=lambda: JOB_UUID)
+    )
 
     invalid = await gateway.call(
         ModelToolCall(
@@ -363,7 +389,7 @@ async def test_remove_requires_canonical_uuid_and_hides_unknown_or_system_jobs(
 
 
 @pytest.mark.asyncio
-async def test_scheduled_agent_rejects_add_but_permits_list_and_remove(
+async def test_scheduled_task_rejects_add_but_permits_list_and_remove(
     workspace: Path,
     agent_home: Path,
 ) -> None:
@@ -378,31 +404,37 @@ async def test_scheduled_agent_rejects_add_but_permits_list_and_remove(
     await store.add_user_job(existing)
     gateway = _gateway(
         ScheduleTool(
-            store=store,
-            scheduled_agent=True,
+            schedule_service=_service(store),
             now=lambda: NOW,
             new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
         )
     )
 
-    invalid_add = await gateway.call(
+    async def scheduled_call(tool_call: ModelToolCall) -> ToolResult:
+        token = ScheduleTool._in_schedule_job.set(True)
+        try:
+            return await gateway.call(tool_call)
+        finally:
+            ScheduleTool._in_schedule_job.reset(token)
+
+    invalid_add = await scheduled_call(
         ModelToolCall(
             id="call_invalid_scheduled_add",
             name="schedule",
             arguments='{"action":"add","every_seconds":60}',
         )
     )
-    add = await gateway.call(
+    add = await scheduled_call(
         ModelToolCall(
             id="call_scheduled_add",
             name="schedule",
             arguments='{"action":"add","message":"Recursive","every_seconds":60}',
         )
     )
-    listed = await gateway.call(
+    listed = await scheduled_call(
         ModelToolCall(id="call_scheduled_list", name="schedule", arguments='{"action":"list"}')
     )
-    removed = await gateway.call(
+    removed = await scheduled_call(
         ModelToolCall(
             id="call_scheduled_remove",
             name="schedule",

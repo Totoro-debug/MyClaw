@@ -19,7 +19,7 @@ from myclaw.agent.run import (
     AgentRunModelCallCompletedPayload,
     AgentRunStartedPayload,
 )
-from myclaw.agent.runtime import prepare_repl_runtime
+from myclaw.agent.runtime import _ScheduleExecutionAdapter, prepare_repl_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -384,8 +384,21 @@ async def _schedule_context(
 
 
 def _service(**kwargs: Any) -> ScheduleService:
-    kwargs.setdefault("context_preparer", _schedule_context)
-    return ScheduleService(**kwargs)
+    agent_run = kwargs.pop("agent_run")
+    workspace_state = kwargs.pop("workspace_state")
+    context_preparer = kwargs.pop("context_preparer", _schedule_context)
+    externalize_result_for = kwargs.pop("externalize_result_for", None)
+    service = ScheduleService(**kwargs)
+    adapter = _ScheduleExecutionAdapter(
+        workspace_state=workspace_state,
+        clock=kwargs["clock"],
+        agent_run=agent_run,
+        context_preparer=context_preparer,
+        externalize_result_for=externalize_result_for,
+        cancel_requested=service.cancellation_requested,
+    )
+    service.on_schedule_job = adapter.execute
+    return service
 
 
 @pytest.mark.asyncio

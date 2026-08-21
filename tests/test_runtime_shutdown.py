@@ -25,6 +25,7 @@ from myclaw.provider.models import (
     ReasoningEffort,
     TextDelta,
 )
+from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
@@ -46,8 +47,22 @@ def _fixed_gateway(workspace: Path, agent_home: Path) -> ToolGateway:
     state.initialize(agent_home_root=agent_home)
     return ToolGateway(
         workspace=identity,
-        schedule_store=WorkspaceScheduleStore(state),
+        schedule_service=ScheduleService(
+            store=WorkspaceScheduleStore(state),
+            clock=_FixedScheduleClock(),
+        ),
     )
+
+
+class _FixedScheduleClock:
+    def now(self) -> datetime:
+        return NOW
+
+    def monotonic(self) -> float:
+        return 0.0
+
+    async def sleep(self, seconds: float) -> None:
+        del seconds
 
 
 class BlockingSchedulerClock:

@@ -3,33 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
-from copy import deepcopy
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import Literal, Protocol
 from zoneinfo import ZoneInfo
 
 from croniter import croniter  # type: ignore[import-untyped]
 from loguru import logger
 
-from myclaw.agent.run import (
-    AgentRunCancelledPayload,
-    AgentRunCompletedPayload,
-    AgentRunEmitter,
-    AgentRunFailedPayload,
-    AgentRunPayload,
-    AgentRunRoute,
-    ToolResultExternalizer,
-    build_assistant_repair_message,
-)
-from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
-from myclaw.provider.errors import ModelCallError
 from myclaw.schedule.model import ScheduleJob
-from myclaw.schedule.store import ScheduleStoreFaultedError, WorkspaceScheduleStore
-from myclaw.session.session import Session, SessionStoragePartition
+from myclaw.schedule.store import (
+    ScheduleStaleRemovalError,
+    ScheduleStoreFaultedError,
+    WorkspaceScheduleStore,
+)
 
 ScheduleHealth = Literal["available", "faulted"]
 
@@ -44,39 +34,17 @@ class ScheduleClock(Protocol):
     async def sleep(self, seconds: float) -> None: ...
 
 
-type ScheduleContextPreparer = Callable[
-    [Session, dict[str, Any]],
-    Awaitable[list[dict[str, Any]]],
-]
+type ScheduleJobExecutor = Callable[[ScheduleJob], Awaitable[None]]
 
 
-class _AwaitableAgentRun(Protocol):
-    async def run(
-        self,
-        messages: Sequence[dict[str, Any]],
-        current_user: dict[str, Any],
-        *,
-        route: AgentRunRoute,
-        emitter: AgentRunEmitter,
-        externalize_result: ToolResultExternalizer | None = None,
-        cancel_requested: Callable[[], bool] | None = None,
-    ) -> list[dict[str, Any]]: ...
+class ScheduleJobExecutionError(Exception):
+    """A safe, structured failure returned by one scheduled Job execution."""
 
-
-class _ScheduleRunEmitter:
-    """Consume background Agent Run progress while retaining its terminal outcome."""
-
-    def __init__(self) -> None:
-        self.terminal: (
-            AgentRunCompletedPayload | AgentRunFailedPayload | AgentRunCancelledPayload | None
-        ) = None
-
-    async def emit(self, payload: AgentRunPayload) -> None:
-        if isinstance(
-            payload,
-            (AgentRunCompletedPayload, AgentRunFailedPayload, AgentRunCancelledPayload),
-        ):
-            self.terminal = payload
+    def __init__(self, error: ErrorInfo) -> None:
+        if not isinstance(error, ErrorInfo):
+            raise TypeError("Schedule Job execution errors require ErrorInfo")
+        self.error = error
+        super().__init__(error.message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,24 +62,18 @@ class ScheduleServiceStatus:
 
 
 class ScheduleService:
-    """Dispatch due at, every, and cron Jobs through the shared Agent Run boundary."""
+    """Own Schedule persistence and dispatch Jobs through one execution callback."""
 
     def __init__(
         self,
         *,
         store: WorkspaceScheduleStore,
-        agent_run: _AwaitableAgentRun,
-        workspace_state: WorkspaceState,
         clock: ScheduleClock,
-        context_preparer: ScheduleContextPreparer | None = None,
-        externalize_result_for: Callable[[Session], ToolResultExternalizer] | None = None,
+        on_schedule_job: ScheduleJobExecutor | None = None,
     ) -> None:
         self._store = store
-        self._agent_run = agent_run
-        self._workspace_state = workspace_state
         self._clock = clock
-        self._context_preparer = context_preparer
-        self._externalize_result_for = externalize_result_for
+        self.on_schedule_job = on_schedule_job
         self._loop_task: asyncio.Task[None] | None = None
         self._run_tasks: set[asyncio.Task[None]] = set()
         self._active_job_ids: set[str] = set()
@@ -133,6 +95,8 @@ class ScheduleService:
             raise RuntimeError("Schedule Service is closed")
         if self._loop_task is not None:
             return
+        if self.on_schedule_job is None:
+            raise RuntimeError("Schedule Service requires on_schedule_job before start")
         if self._faulted or self._store.health == "faulted":
             self._faulted = True
             self._faulted_event.set()
@@ -157,6 +121,27 @@ class ScheduleService:
             "faulted" if self._faulted or self._store.health == "faulted" else "available"
         )
         return ScheduleServiceStatus(status=health, active_job_count=len(self._active_job_ids))
+
+    def cancellation_requested(self) -> bool:
+        """Return whether Runtime shutdown has requested Schedule execution cancellation."""
+        return self._closing.is_set()
+
+    async def add_user_job(self, job: ScheduleJob) -> ScheduleJob:
+        """Add one user-owned Job through the Schedule persistence boundary."""
+        return await self._store.add_user_job(job)
+
+    async def public_snapshot(self) -> tuple[ScheduleJob, ...]:
+        """Return the public user-owned Job snapshot."""
+        return await self._store.public_snapshot()
+
+    async def remove_user_job(
+        self,
+        job_id: str,
+        *,
+        expected: ScheduleJob | None = None,
+    ) -> bool:
+        """Remove one user-owned Job with the Store's optimistic expectation."""
+        return await self._store.remove_user_job(job_id, expected=expected)
 
     async def _close_owned_tasks(self) -> None:
         self._closing.set()
@@ -401,135 +386,37 @@ class ScheduleService:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _run_job(self, job: ScheduleJob) -> None:
-        session: Session | None = None
         terminal: Literal["ok", "error"] | None = None
         terminal_error: str | None = None
-        terminal_code: str | None = None
         terminal_ready = False
-        with session_log(self._workspace_state, job.session_id):
-            try:
-                try:
-                    session = Session.load(
-                        self._workspace_state,
-                        job.session_id,
-                        partition=SessionStoragePartition.SCHEDULE,
-                        now=self._clock.now,
-                    )
-                except FileNotFoundError:
-                    session = Session.create_schedule(
-                        self._workspace_state,
-                        job.job_id,
-                        now=self._clock.now,
-                    )
-                run = self._agent_run
-                (
-                    terminal,
-                    terminal_error,
-                    terminal_code,
-                    terminal_ready,
-                ) = await self._run_awaitable_job(
-                    session,
-                    job,
-                    run,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                terminal = "error"
-                terminal_error = "Schedule Job execution failed."
-                logger.error(
-                    "Schedule Job execution failed job_id={} type={}",
-                    job.job_id,
-                    type(error).__name__,
-                )
-            finally:
-                try:
-                    if terminal is not None and terminal_ready:
-                        if terminal_code is not None:
-                            logger.warning(
-                                "Schedule Job failed job_id={} kind={} code={}",
-                                job.job_id,
-                                job.schedule.kind,
-                                terminal_code,
-                            )
-                        await self._commit_terminal(job, terminal, terminal_error)
-                finally:
-                    if session is not None:
-                        try:
-                            session.close()
-                        except Exception as error:
-                            logger.error(
-                                "Schedule Session close failed job_id={} type={}",
-                                job.job_id,
-                                type(error).__name__,
-                            )
-                    self._active_job_ids.discard(job.job_id)
-
-    async def _run_awaitable_job(
-        self,
-        session: Session,
-        job: ScheduleJob,
-        run: _AwaitableAgentRun,
-    ) -> tuple[Literal["ok", "error"] | None, str | None, str | None, bool]:
-        current_user = {"role": "user", "content": job.message}
-        context_preparer = self._context_preparer
         try:
-            if context_preparer is None:
-                raise RuntimeError("Schedule Agent Run requires a context preparer")
-            messages = await context_preparer(session, deepcopy(current_user))
+            callback = self.on_schedule_job
+            if callback is None:
+                raise RuntimeError("Schedule Service requires on_schedule_job before start")
+            await callback(job)
+            terminal = "ok"
+            terminal_ready = True
         except asyncio.CancelledError:
-            try:
-                session.append_messages([current_user])
-                session.persist()
-            except Exception as error:
-                logger.error(
-                    "Schedule cancellation persistence failed job_id={} type={}",
-                    job.job_id,
-                    type(error).__name__,
-                )
             raise
-        except ModelCallError as failure:
-            return _persist_schedule_failure(session, current_user, failure)
-        except Exception:
-            return _persist_schedule_failure(session, current_user, _schedule_model_failure())
-
-        emitter = _ScheduleRunEmitter()
-
-        try:
-            if self._externalize_result_for is None:
-                increment = await run.run(
-                    messages,
-                    current_user,
-                    route="schedule",
-                    emitter=emitter,
-                    cancel_requested=self._closing.is_set,
-                )
-            else:
-                increment = await run.run(
-                    messages,
-                    current_user,
-                    route="schedule",
-                    emitter=emitter,
-                    externalize_result=self._externalize_result_for(session),
-                    cancel_requested=self._closing.is_set,
-                )
-        except ModelCallError as failure:
-            return _persist_schedule_failure(session, current_user, failure)
-        except Exception:
-            return _persist_schedule_failure(session, current_user, _schedule_model_failure())
-        if not isinstance(increment, list):
-            return _persist_schedule_failure(session, current_user, _schedule_model_failure())
-        terminal = emitter.terminal
-        if terminal is None:
-            return _persist_schedule_failure(session, current_user, _schedule_model_failure())
-
-        session.append_messages(increment)
-        session.persist()
-        if isinstance(terminal, AgentRunCancelledPayload):
-            return None, None, None, False
-        if isinstance(terminal, AgentRunFailedPayload):
-            return "error", terminal.error.message, terminal.error.code, True
-        return "ok", None, None, True
+        except ScheduleJobExecutionError as failure:
+            terminal = "error"
+            terminal_error = failure.error.message
+            terminal_ready = True
+        except Exception as error:
+            terminal = "error"
+            terminal_error = "Schedule Job execution failed."
+            terminal_ready = True
+            logger.error(
+                "Schedule Job execution failed job_id={} type={}",
+                job.job_id,
+                type(error).__name__,
+            )
+        finally:
+            try:
+                if terminal is not None and terminal_ready:
+                    await self._commit_terminal(job, terminal, terminal_error)
+            finally:
+                self._active_job_ids.discard(job.job_id)
 
     async def _commit_terminal(
         self,
@@ -580,13 +467,14 @@ class ScheduleService:
             self._latch_fault()
             if not self._terminal_store_error_logged:
                 self._terminal_store_error_logged = True
-                logger.error(
-                    "Schedule terminal update failed job_id={} kind={} outcome={} type={}",
-                    job.job_id,
-                    job.schedule.kind,
-                    terminal,
-                    type(failure).__name__,
-                )
+                with session_log(self._store.workspace_state, job.session_id):
+                    logger.error(
+                        "Schedule terminal update failed job_id={} kind={} outcome={} type={}",
+                        job.job_id,
+                        job.schedule.kind,
+                        terminal,
+                        type(failure).__name__,
+                    )
         if cancellation is not None:
             raise cancellation
 
@@ -750,34 +638,6 @@ def _local_time_exists(value: datetime, zone: ZoneInfo) -> bool:
     return False
 
 
-def _schedule_failure_increment(
-    current_user: dict[str, Any],
-    failure: ModelCallError,
-) -> list[dict[str, Any]]:
-    return [
-        deepcopy(current_user),
-        build_assistant_repair_message(
-            content="",
-            status="error",
-            error=failure.error,
-        ),
-    ]
-
-
-def _schedule_model_failure() -> ModelCallError:
-    return ModelCallError(ErrorInfo(code="model_failed", message="The model request failed."))
-
-
-def _persist_schedule_failure(
-    session: Session,
-    current_user: dict[str, Any],
-    failure: ModelCallError,
-) -> tuple[Literal["error"], str, str, bool]:
-    session.append_messages(_schedule_failure_increment(current_user, failure))
-    session.persist()
-    return "error", failure.error.message, failure.error.code, True
-
-
 async def _await_shared(task: asyncio.Task[None]) -> None:
     cancellation: asyncio.CancelledError | None = None
     while not task.done():
@@ -795,4 +655,11 @@ async def _await_shared(task: asyncio.Task[None]) -> None:
         raise cancellation
 
 
-__all__ = ["ScheduleClock", "ScheduleService", "ScheduleServiceStatus"]
+__all__ = [
+    "ScheduleClock",
+    "ScheduleJobExecutionError",
+    "ScheduleJobExecutor",
+    "ScheduleService",
+    "ScheduleServiceStatus",
+    "ScheduleStaleRemovalError",
+]

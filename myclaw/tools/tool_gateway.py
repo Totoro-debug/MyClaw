@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 from loguru import logger
 
 from myclaw.agent.workspace import Workspace
-from myclaw.schedule.store import WorkspaceScheduleStore
+from myclaw.schedule.service import ScheduleService
 from myclaw.tools.base import (
     ArtifactReference,
     BaseTool,
@@ -228,15 +228,12 @@ class ToolGateway:
         self,
         *,
         workspace: Workspace,
-        schedule_store: WorkspaceScheduleStore,
-        scheduled_agent: bool = False,
+        schedule_service: ScheduleService,
     ) -> None:
         if not isinstance(workspace, Workspace):
             raise TypeError("Tool Gateway requires a Workspace")
-        if not isinstance(schedule_store, WorkspaceScheduleStore):
-            raise TypeError("Tool Gateway requires a WorkspaceScheduleStore")
-        if not isinstance(scheduled_agent, bool):
-            raise TypeError("scheduled_agent must be a boolean")
+        if not isinstance(schedule_service, ScheduleService):
+            raise TypeError("Tool Gateway requires a ScheduleService")
 
         tools: tuple[BaseTool, ...] = (
             ReadFileTool(workspace=workspace),
@@ -248,7 +245,7 @@ class ToolGateway:
             ExecTool(workspace=workspace),
             WebSearchTool(),
             WebFetchTool(),
-            ScheduleTool(store=schedule_store, scheduled_agent=scheduled_agent),
+            ScheduleTool(schedule_service=schedule_service),
         )
         self._tools = {tool.name: tool for tool in tools}
         self._schemas = [tool.to_schema() for tool in tools]

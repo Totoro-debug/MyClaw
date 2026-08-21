@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -9,7 +10,9 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
+from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
     ConfirmationChannel,
     ConfirmationDecision,
@@ -19,14 +22,27 @@ from myclaw.tools.tool_gateway import (
 )
 
 
-def _gateway(workspace: Path, agent_home: Path, *, scheduled_agent: bool = False) -> ToolGateway:
+class _Clock:
+    def now(self) -> datetime:
+        return datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+
+    def monotonic(self) -> float:
+        return 0.0
+
+    async def sleep(self, seconds: float) -> None:
+        del seconds
+
+
+def _gateway(workspace: Path, agent_home: Path) -> ToolGateway:
     identity = Workspace.from_path(workspace)
     state = WorkspaceState(identity)
     state.initialize(agent_home_root=agent_home)
     return ToolGateway(
         workspace=identity,
-        schedule_store=WorkspaceScheduleStore(state),
-        scheduled_agent=scheduled_agent,
+        schedule_service=ScheduleService(
+            store=WorkspaceScheduleStore(state),
+            clock=_Clock(),
+        ),
     )
 
 
@@ -77,22 +93,26 @@ async def test_foreground_and_scheduled_catalogs_always_include_web_and_exec(
     agent_home: Path,
 ) -> None:
     foreground = _gateway(workspace, agent_home)
-    scheduled = _gateway(workspace, agent_home, scheduled_agent=True)
+    scheduled = _gateway(workspace, agent_home)
 
     assert _names(foreground) == _names(scheduled)
-    refused = await scheduled.call(
-        ModelToolCall(
-            id="call_scheduled_add",
-            name="schedule",
-            arguments=json.dumps(
-                {
-                    "action": "add",
-                    "message": "should be refused",
-                    "every_seconds": 60,
-                }
-            ),
+    token = ScheduleTool._in_schedule_job.set(True)
+    try:
+        refused = await scheduled.call(
+            ModelToolCall(
+                id="call_scheduled_add",
+                name="schedule",
+                arguments=json.dumps(
+                    {
+                        "action": "add",
+                        "message": "should be refused",
+                        "every_seconds": 60,
+                    }
+                ),
+            )
         )
-    )
+    finally:
+        ScheduleTool._in_schedule_job.reset(token)
 
     assert refused.status == "refused"
     assert refused.content == "Schedule add is unavailable in scheduled Agent context."

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from datetime import UTC, datetime
-from typing import cast
+from typing import ClassVar, cast
 from uuid import UUID, uuid4
 
 from myclaw.schedule.model import JobSchedule, ScheduleJob
-from myclaw.schedule.store import ScheduleStaleRemovalError, WorkspaceScheduleStore
+from myclaw.schedule.service import ScheduleService, ScheduleStaleRemovalError
 from myclaw.tools.base import BaseTool, ToolError
 from myclaw.tools.schema import Schema
 from myclaw.utils.json_types import JsonObject
@@ -101,21 +102,21 @@ class ScheduleTool(BaseTool):
     name = "schedule"
     description = "Manage one-time and recurring Schedule Jobs."
     parameters = _ScheduleArgumentsSchema()
+    _in_schedule_job: ClassVar[ContextVar[bool]] = ContextVar(
+        "myclaw_schedule_tool_in_schedule_job",
+        default=False,
+    )
 
     def __init__(
         self,
         *,
-        store: WorkspaceScheduleStore,
-        scheduled_agent: bool = False,
+        schedule_service: ScheduleService,
         now: Callable[[], datetime] | None = None,
         new_uuid: Callable[[], UUID] | None = None,
     ) -> None:
-        if not isinstance(store, WorkspaceScheduleStore):
-            raise TypeError("Schedule Tool requires a WorkspaceScheduleStore")
-        if not isinstance(scheduled_agent, bool):
-            raise TypeError("scheduled_agent must be a boolean")
-        self._store = store
-        self._scheduled_agent = scheduled_agent
+        if not isinstance(schedule_service, ScheduleService):
+            raise TypeError("Schedule Tool requires a ScheduleService")
+        self._schedule_service = schedule_service
         self._now: Callable[[], datetime] = (lambda: datetime.now(UTC)) if now is None else now
         self._new_uuid: Callable[[], UUID] = uuid4 if new_uuid is None else new_uuid
 
@@ -161,7 +162,7 @@ class ScheduleTool(BaseTool):
         job_id: str | None = None,
     ) -> str | None:
         del message, every_seconds, cron_expr, timezone, at_time, job_id
-        if self._scheduled_agent and action == "add":
+        if self._in_schedule_job.get() and action == "add":
             return "Schedule add is unavailable in scheduled Agent context."
         return None
 
@@ -193,14 +194,14 @@ class ScheduleTool(BaseTool):
                 updated_at_ms=timestamp,
             )
             try:
-                await self._store.add_user_job(job)
+                await self._schedule_service.add_user_job(job)
             except Exception as error:
                 raise ToolError(_STATE_UPDATE_FAILED) from error
             return _json_content({"action": "add", "job": _public_job(job)})
 
         if action == "list":
             try:
-                jobs = await self._store.public_snapshot()
+                jobs = await self._schedule_service.public_snapshot()
             except Exception as error:
                 raise ToolError(_STATE_READ_FAILED) from error
             return _json_content({"jobs": [_public_job(job) for job in jobs]})
@@ -216,7 +217,10 @@ class ScheduleTool(BaseTool):
             if public_job is None:
                 raise ToolError(_NOT_FOUND)
             try:
-                removed = await self._store.remove_user_job(job_id, expected=public_job)
+                removed = await self._schedule_service.remove_user_job(
+                    job_id,
+                    expected=public_job,
+                )
             except ScheduleStaleRemovalError as error:
                 raise ToolError(_STALE_REMOVAL) from error
             except Exception as error:
@@ -280,7 +284,7 @@ class ScheduleTool(BaseTool):
 
     async def _current_public_job(self, job_id: str) -> ScheduleJob | None:
         try:
-            jobs = await self._store.public_snapshot()
+            jobs = await self._schedule_service.public_snapshot()
         except Exception as error:
             raise ToolError(_STATE_READ_FAILED) from error
         return next((job for job in jobs if job.job_id == job_id), None)
