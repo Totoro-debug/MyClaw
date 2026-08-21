@@ -48,7 +48,7 @@ from myclaw.agent.events import (
     TurnFailedPayload,
     TurnStartedPayload,
 )
-from myclaw.agent.runtime import PreparedReplRuntime
+from myclaw.agent.runtime import PreparedRuntime
 from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS, ManagementCommandResult
 from myclaw.management.service import SessionListingEntry
 from myclaw.terminal._turn_stream import (
@@ -1862,7 +1862,7 @@ class TerminalConversationApp(App[None]):
 
     def __init__(
         self,
-        runtime: PreparedReplRuntime,
+        runtime: PreparedRuntime,
         *,
         monotonic: Callable[[], float] = monotonic_now,
     ) -> None:
@@ -3108,7 +3108,7 @@ def is_interactive_terminal() -> bool:
     )
 
 
-def run_terminal_conversation(runtime: PreparedReplRuntime) -> None:
+def run_terminal_conversation(runtime: PreparedRuntime) -> None:
     """Run a Terminal Conversation application around a prepared Runtime."""
     if not is_interactive_terminal():
         raise TerminalConversationError(

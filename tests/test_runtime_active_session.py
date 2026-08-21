@@ -455,6 +455,41 @@ async def test_runtime_shutdown_swallows_final_session_close_fault_after_router_
 
 
 @pytest.mark.asyncio
+async def test_runtime_close_releases_initial_and_resumed_sessions(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(agent_home, workspace, RuntimeProvider(()))
+    initial = runtime.session
+    target = Session.create(initial.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Persisted target")
+    target.close()
+
+    result = await runtime.management_dispatcher.resume(target.session_id)
+    assert result.output == f"Resumed session {target.session_id}."
+    selected = runtime.session
+    closed: list[str] = []
+    initial_close = initial.close
+    selected_close = selected.close
+
+    def close_initial() -> None:
+        closed.append(initial.session_id)
+        initial_close()
+
+    def close_selected() -> None:
+        closed.append(selected.session_id)
+        selected_close()
+
+    monkeypatch.setattr(initial, "close", close_initial)
+    monkeypatch.setattr(selected, "close", close_selected)
+
+    await runtime.close()
+
+    assert closed == [initial.session_id, selected.session_id]
+
+
+@pytest.mark.asyncio
 async def test_runtime_active_session_keeps_artifact_and_log_correlation_when_persist_fails(
     agent_home: Path,
     workspace: Path,

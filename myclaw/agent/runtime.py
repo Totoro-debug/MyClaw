@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -9,14 +10,29 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any, NoReturn, Protocol
+from typing import Any, NoReturn, Protocol, cast
 from uuid import UUID
 
 from loguru import logger
 from tzlocal import get_localzone_name
 
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.events import AgentEvent, ConfirmationDecision, ConversationPort
+from myclaw.agent.events import (
+    AgentEvent,
+    ConfirmationDecision,
+    ConfirmationRequestedPayload,
+    ConversationPort,
+    ModelCallCompletedPayload,
+    TextDeltaPayload,
+    ToolCompletedPayload,
+    ToolStartedPayload,
+    TurnCancelledPayload,
+    TurnCompletedPayload,
+    TurnFailedPayload,
+    TurnStartedPayload,
+)
+from myclaw.agent.loop import AgentLoop
+from myclaw.agent.message_bus import InboundMessage, OutboundMessage
 from myclaw.agent.prompts import (
     chat_system_prompt,
     current_user_input,
@@ -35,11 +51,12 @@ from myclaw.agent.run import (
     ToolResultExternalizer,
     build_assistant_repair_message,
 )
+from myclaw.agent.runner import AgentRunnerResult
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
-from myclaw.errors import ErrorInfo
+from myclaw.errors import ErrorCode, ErrorInfo
 from myclaw.logging.session import session_log, without_session_log
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import (
@@ -61,7 +78,7 @@ from myclaw.memory.memory_task import (
 )
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import Jitter, ModelRouter, RetryClock
-from myclaw.provider.models import ModelProvider
+from myclaw.provider.models import ModelProvider, ModelUsage
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import (
     ScheduleClock,
@@ -75,17 +92,25 @@ from myclaw.session.conversation import (
 )
 from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.session.session_resume import SwitchableConversationPort
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
-from myclaw.tools.tool_gateway import ToolGateway, ToolResult
+from myclaw.tools.tool_gateway import (
+    ConfirmationRequest,
+    ToolGateway,
+    ToolResult,
+    ToolResultStatus,
+)
 from myclaw.utils.scheduler import AsyncioSchedulerClock, SchedulerClock
 
 type _ScheduleContextPreparer = Callable[
     [Session, dict[str, Any]],
     Awaitable[list[dict[str, Any]]],
 ]
+
+
+class _ClosableConversationPort(ConversationPort, Protocol):
+    async def close(self) -> None: ...
 
 
 class _ScheduleAgentRun(Protocol):
@@ -313,10 +338,11 @@ class _RuntimeLifetime:
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedReplRuntime:
+class PreparedRuntime:
     """An in-memory Session identity and its injectable REPL composition."""
 
-    conversation: SwitchableConversationPort
+    conversation: _ClosableConversationPort
+    agent_loop: AgentLoop
     management_dispatcher: ManagementDispatcher
     schedule_service: ScheduleService
     _memory_scheduler: _RuntimeSchedulerOwner
@@ -325,19 +351,20 @@ class PreparedReplRuntime:
 
     @property
     def session_id(self) -> str:
-        return self.conversation.session_id
+        return self.agent_loop.session.session_id
 
     @property
     def session(self) -> Session:
-        return self.conversation.session
+        return self.agent_loop.session
 
     async def start(self) -> None:
         self._lifetime.begin()
-        self._start_schedulers()
+        await self._start_schedulers()
 
-    def _start_schedulers(self) -> None:
+    async def _start_schedulers(self) -> None:
         with without_session_log():
             try:
+                await self.agent_loop.start()
                 self._memory_scheduler.start()
                 self.schedule_service.start()
             except BaseException as error:
@@ -365,7 +392,7 @@ class PreparedReplRuntime:
         self._lifetime.run_done = run_done
         try:
             try:
-                self._start_schedulers()
+                await self._start_schedulers()
                 await run_repl(
                     conversation=self.conversation,
                     input_reader=input_reader,
@@ -412,9 +439,12 @@ class PreparedReplRuntime:
             except BaseException as error:
                 failures.append(error)
 
+            conversation_close = getattr(self.conversation, "close", None)
+            if not callable(conversation_close):
+                raise RuntimeError("Prepared Runtime conversation does not support close")
             shutdowns: list[Awaitable[object]] = [
                 self._memory_scheduler.close(),
-                self.conversation.close(),
+                cast(Callable[[], Awaitable[None]], conversation_close)(),
             ]
             if run_done is not None:
                 shutdowns.append(run_done.wait())
@@ -426,10 +456,9 @@ class PreparedReplRuntime:
             except BaseException as error:
                 failures.append(error)
 
+            self.agent_loop._close_sessions()
             if not failures:
-                self._close_session()
                 return
-            self._close_session()
             failure = (
                 failures[0]
                 if len(failures) == 1
@@ -440,11 +469,8 @@ class PreparedReplRuntime:
             )
             raise failure
 
-    def _close_session(self) -> None:
-        try:
-            self.session.close()
-        except BaseException:
-            pass
+
+PreparedReplRuntime = PreparedRuntime
 
 
 class _DeferredConversationPort:
@@ -590,7 +616,353 @@ class _DeferredConversationPort:
         return bool(has_active_turn()) if callable(has_active_turn) else False
 
 
-def prepare_repl_runtime(
+class _AgentLoopConversationAdapter:
+    """Temporary Terminal bridge for the sparse foreground Message Bus protocol."""
+
+    def __init__(
+        self,
+        *,
+        loop: AgentLoop,
+        now: Callable[[], datetime],
+        new_uuid: Callable[[], UUID],
+    ) -> None:
+        self._loop = loop
+        self._now = now
+        self._new_uuid = new_uuid
+        self._close_task: asyncio.Task[None] | None = None
+        self._active = False
+        self._active_done: asyncio.Event | None = None
+        self._events: asyncio.Queue[object] | None = None
+        self._turn_id: UUID | None = None
+        self._next_event_id = 0
+        self._model_calls_emitted = 0
+        self._response_content: list[str] = []
+        self._pending_tool: tuple[str, str] | None = None
+        self._confirmation_ids: dict[str, UUID] = {}
+        self._confirmation_decisions: dict[UUID, ConfirmationDecision] = {}
+        self._terminal_seen = False
+        self._tool_results: dict[str, ToolResult] = {}
+        self._ready_events: deque[AgentEvent] = deque()
+        self._terminal_result: AgentRunnerResult | None = None
+
+    def has_active_turn(self) -> bool:
+        return self._active
+
+    def on_confirmation_requested(self, request: object) -> None:
+        if not isinstance(request, ConfirmationRequest):
+            raise TypeError("Agent Loop confirmation callback requires ConfirmationRequest")
+        event_queue = self._events
+        turn_id = self._turn_id
+        if event_queue is None or turn_id is None:
+            raise RuntimeError("No foreground Terminal turn is active")
+        confirmation_id = request.confirmation_id
+        self._confirmation_ids[request.tool_call_id] = confirmation_id
+        event_queue.put_nowait(
+            self._event(
+                "confirmation_requested",
+                ConfirmationRequestedPayload(
+                    confirmation_id=confirmation_id,
+                    turn_id=turn_id,
+                    tool_call_id=request.tool_call_id,
+                    tool_name=request.tool_name,
+                    reason=request.reason,
+                    summary=request.summary,
+                    details=request.details,
+                    warnings=request.warnings,
+                ),
+            )
+        )
+
+    async def submit(self, text: str) -> AsyncIterator[AgentEvent]:
+        if self._close_task is not None:
+            raise RuntimeError("Conversation Port is closed")
+        if not text.strip():
+            return
+        if self._active:
+            raise RuntimeError("A foreground turn is already active")
+        await self._loop.start()
+        active_done = asyncio.Event()
+        self._active = True
+        self._active_done = active_done
+        self._events = asyncio.Queue()
+        self._turn_id = self._new_uuid()
+        self._model_calls_emitted = 0
+        self._response_content = []
+        self._pending_tool = None
+        self._confirmation_ids.clear()
+        self._confirmation_decisions.clear()
+        self._terminal_seen = False
+        self._tool_results.clear()
+        self._ready_events.clear()
+        self._terminal_result = None
+        turn_id = self._turn_id
+        assert turn_id is not None
+        await self._loop.bus.put_inbound(InboundMessage(text))
+        await asyncio.sleep(0)
+        try:
+            yield self._event("turn_started", TurnStartedPayload())
+            while True:
+                if self._ready_events:
+                    yield self._ready_events.popleft()
+                    continue
+                outbound_task = asyncio.create_task(self._loop.bus.get_outbound())
+                legacy_task = asyncio.create_task(self._events.get())
+                done, pending = await asyncio.wait(
+                    (outbound_task, legacy_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if outbound_task in done:
+                    if legacy_task in done:
+                        self._remember_ready_event(legacy_task.result())
+                    outbound = outbound_task.result()
+                    outbound_events = self._events_from_outbound(outbound)
+                    if outbound.metadata.get("_streamed") is True:
+                        while self._ready_events:
+                            yield self._ready_events.popleft()
+                    for event in outbound_events:
+                        yield event
+                    if outbound.metadata.get("_streamed") is True:
+                        self._terminal_seen = True
+                        return
+                    continue
+                self._remember_ready_event(legacy_task.result())
+        finally:
+            if self._active:
+                if not self._terminal_seen:
+                    await self._loop.cancel_active_run()
+                self._active = False
+            active_done.set()
+            if self._active_done is active_done:
+                self._active_done = None
+            self._events = None
+            self._turn_id = None
+            self._ready_events.clear()
+
+    def _remember_ready_event(self, event: object) -> None:
+        if isinstance(event, AgentEvent):
+            self._ready_events.append(event)
+
+    async def cancel_active_turn(self) -> None:
+        await self._loop.cancel_active_run()
+
+    def on_tool_completed(self, result: ToolResult) -> None:
+        self._tool_results[result.tool_call_id] = result
+        pending = self._pending_tool
+        if pending is None or pending[0] != result.tool_call_id:
+            return
+        self._pending_tool = None
+        event_queue = self._events
+        if event_queue is not None:
+            event_queue.put_nowait(self._tool_event(result))
+
+    def on_terminal(self, result: AgentRunnerResult | None) -> None:
+        self._terminal_result = result
+
+    def respond_to_confirmation(
+        self,
+        confirmation_id: UUID,
+        decision: ConfirmationDecision,
+    ) -> None:
+        if confirmation_id not in self._confirmation_ids.values():
+            raise ValueError("No foreground confirmation request is pending")
+        self._confirmation_decisions[confirmation_id] = decision
+        self._loop.respond_to_confirmation(confirmation_id, decision)
+
+    async def close(self) -> None:
+        task = self._close_task
+        if task is None:
+            task = asyncio.create_task(self._close_owned())
+            self._close_task = task
+        await asyncio.shield(task)
+
+    async def _close_owned(self) -> None:
+        if self._active:
+            await self._loop.cancel_active_run()
+        active_done = self._active_done
+        if active_done is not None:
+            await active_done.wait()
+        await self._loop.close()
+
+    def _events_from_outbound(self, outbound: OutboundMessage) -> tuple[AgentEvent, ...]:
+        if outbound.type == "model_response" and outbound.metadata.get("_stream_delta") is True:
+            self._response_content.append(outbound.content)
+            return (
+                *self._flush_pending_tool(),
+                self._event("text_delta", TextDeltaPayload(outbound.content)),
+            )
+        if outbound.type == "model_reasoning":
+            return self._flush_pending_tool()
+        if outbound.type == "tool_call":
+            completed_tool = self._flush_pending_tool()
+            model_call = self._emit_model_call(continues_with_tools=True)
+            tool_call_id = outbound.metadata.get("tool_call_id")
+            if not isinstance(tool_call_id, str):
+                raise ValueError("Outbound tool call is missing tool_call_id")
+            tool_name = outbound.content
+            completed = self._tool_results.pop(tool_call_id, None)
+            if completed is None:
+                self._pending_tool = (tool_call_id, tool_name)
+            else:
+                self._pending_tool = None
+            return (
+                *completed_tool,
+                *((model_call,) if model_call is not None else ()),
+                self._event(
+                    "tool_started",
+                    ToolStartedPayload(
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                        summary=f"Running {tool_name}"[:240],
+                    ),
+                ),
+                *((self._tool_event(completed),) if completed is not None else ()),
+            )
+        if outbound.type == "model_response" and outbound.metadata.get("_streamed") is True:
+            result = self._terminal_result
+            if result is None:
+                raise RuntimeError("Completed foreground run is missing its terminal result")
+            completed_tool = self._flush_pending_tool()
+            completed_calls = self._emit_missing_completed_model_calls(result)
+            usage = self._turn_usage(result)
+            return (
+                *completed_tool,
+                *completed_calls,
+                self._event(
+                    "turn_completed",
+                    TurnCompletedPayload(
+                        content=result.final_content,
+                        usage=usage,
+                    ),
+                ),
+            )
+        if outbound.type == "system_control" and outbound.metadata.get("_streamed") is True:
+            finish_reason = outbound.metadata.get("finish_reason")
+            error_code = outbound.metadata.get("error_code")
+            if not isinstance(finish_reason, str) or not isinstance(error_code, str):
+                raise ValueError("Outbound system control terminal metadata is malformed")
+            completed_calls = (
+                self._emit_missing_completed_model_calls(self._terminal_result)
+                if error_code == "persistence_error" and self._terminal_result is not None
+                else ()
+            )
+            if finish_reason == "cancelled":
+                return (
+                    *completed_calls,
+                    self._event(
+                        "turn_cancelled",
+                        TurnCancelledPayload(partial_content="".join(self._response_content)),
+                    ),
+                )
+            return (
+                *completed_calls,
+                self._event(
+                    "turn_failed",
+                    TurnFailedPayload(ErrorInfo(cast(ErrorCode, error_code), outbound.content)),
+                ),
+            )
+        return ()
+
+    def _emit_model_call(self, *, continues_with_tools: bool) -> AgentEvent | None:
+        if self._events is None:
+            return None
+        event = self._event(
+            "model_call_completed",
+            ModelCallCompletedPayload(
+                content="".join(self._response_content),
+                continues_with_tools=continues_with_tools,
+            ),
+        )
+        self._model_calls_emitted += 1
+        self._response_content = []
+        return event
+
+    def _emit_missing_completed_model_calls(
+        self,
+        result: AgentRunnerResult,
+    ) -> tuple[AgentEvent, ...]:
+        assistants = [message for message in result.messages if message.get("role") == "assistant"]
+        events: list[AgentEvent] = []
+        while self._model_calls_emitted < len(assistants):
+            message = assistants[self._model_calls_emitted]
+            content = message.get("content")
+            self._response_content = [content] if isinstance(content, str) else []
+            event = self._emit_model_call(continues_with_tools=False)
+            if event is not None:
+                events.append(event)
+        return tuple(events)
+
+    def _flush_pending_tool(self) -> tuple[AgentEvent, ...]:
+        pending = self._pending_tool
+        if pending is None:
+            return ()
+        tool_call_id, tool_name = pending
+        confirmation_id = self._confirmation_ids.get(tool_call_id)
+        decision = (
+            None if confirmation_id is None else self._confirmation_decisions.get(confirmation_id)
+        )
+        status: ToolResultStatus = "refused" if decision == "declined" else "success"
+        event = (
+            self._event(
+                "tool_completed",
+                ToolCompletedPayload(
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    status=status,
+                    summary=(
+                        "Tool confirmation was declined."
+                        if status == "refused"
+                        else f"Finished {tool_name}"
+                    )[:240],
+                ),
+            ),
+        )
+        self._pending_tool = None
+        return event
+
+    def _tool_event(self, result: ToolResult) -> AgentEvent:
+        if result.status == "error":
+            summary = " ".join(result.content.split())[:240]
+        elif result.status == "refused":
+            summary = " ".join(result.content.split())[:240]
+        else:
+            summary = f"Finished {result.name}"[:240]
+        return self._event(
+            "tool_completed",
+            ToolCompletedPayload(
+                tool_call_id=result.tool_call_id,
+                tool_name=result.name,
+                status=result.status,
+                summary=summary,
+            ),
+        )
+
+    @staticmethod
+    def _turn_usage(result: AgentRunnerResult) -> ModelUsage:
+        return ModelUsage(
+            input_tokens=result.usage["input_tokens"],
+            output_tokens=result.usage["output_tokens"],
+            total_tokens=result.usage["total_tokens"],
+        )
+
+    def _event(self, event_type: str, payload: object) -> AgentEvent:
+        turn_id = self._turn_id
+        if turn_id is None:
+            raise RuntimeError("No foreground Terminal turn is active")
+        event = AgentEvent(
+            type=event_type,  # type: ignore[arg-type]
+            event_id=self._next_event_id,
+            turn_id=turn_id,
+            created_at=self._now(),
+            payload=payload,  # type: ignore[arg-type]
+        )
+        self._next_event_id += 1
+        return event
+
+
+def prepare_runtime(
     *,
     agent_home: AgentHome,
     workspace: Path,
@@ -604,10 +976,10 @@ def prepare_repl_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
-) -> PreparedReplRuntime:
+) -> PreparedRuntime:
     """Prepare one Runtime and record terminal composition failures once."""
     try:
-        return _prepare_repl_runtime(
+        return _prepare_runtime(
             agent_home=agent_home,
             workspace=workspace,
             configuration=configuration,
@@ -630,7 +1002,7 @@ def prepare_repl_runtime(
         raise
 
 
-def _prepare_repl_runtime(
+def prepare_repl_runtime(
     *,
     agent_home: AgentHome,
     workspace: Path,
@@ -645,6 +1017,38 @@ def _prepare_repl_runtime(
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
 ) -> PreparedReplRuntime:
+    """Compatibility entry point for the prepared REPL runtime."""
+    return prepare_runtime(
+        agent_home=agent_home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=provider_factory,
+        now=now,
+        new_uuid=new_uuid,
+        retry_clock=retry_clock,
+        retry_jitter=retry_jitter,
+        memory_scheduler_clock=memory_scheduler_clock,
+        schedule_scheduler_clock=schedule_scheduler_clock,
+        monotonic_now=monotonic_now,
+        timezone_name=timezone_name,
+    )
+
+
+def _prepare_runtime(
+    *,
+    agent_home: AgentHome,
+    workspace: Path,
+    configuration: UserConfiguration,
+    provider_factory: Callable[[ProviderConfiguration], ModelProvider],
+    now: Callable[[], datetime],
+    new_uuid: Callable[[], UUID],
+    retry_clock: RetryClock | None = None,
+    retry_jitter: Jitter | None = None,
+    memory_scheduler_clock: SchedulerClock | None = None,
+    schedule_scheduler_clock: ScheduleClock | None = None,
+    monotonic_now: Callable[[], float] = monotonic,
+    timezone_name: str | None = None,
+) -> PreparedRuntime:
     """Prepare a Session and defer provider construction until conversational input."""
     workspace_identity = Workspace.from_path(workspace)
     workspace_state = WorkspaceState(workspace_identity)
@@ -656,14 +1060,6 @@ def _prepare_repl_runtime(
         else AsyncioSchedulerClock(now=now)
     )
     schedule_service = ScheduleService(store=schedule_store, clock=schedule_clock)
-    tool_gateway = ToolGateway(
-        workspace=workspace_identity,
-        schedule_service=schedule_service,
-    )
-    scheduled_tool_gateway = ToolGateway(
-        workspace=workspace_identity,
-        schedule_service=schedule_service,
-    )
     long_term_memory = workspace_state.long_term_memory_path.read_text(encoding="utf-8")
     runtime_memory = RuntimeMemory(long_term_memory)
     foreground_context = ContextBuilder(
@@ -798,6 +1194,43 @@ def _prepare_repl_runtime(
             current_time=now(),
         )
 
+    async def prepare_foreground_context(
+        active_session: Session,
+        current_user: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        memory_snapshot = runtime_memory.snapshot()
+        current_system_prompt = system_prompt_for(memory_snapshot)
+        await prepare_summary(
+            active_session,
+            "chat",
+            current_system_prompt,
+            tuple(agent_loop.tool_schemas),
+            current_user,
+        )
+        history = active_session.messages[active_session.last_consolidated :]
+        return _project_foreground_messages(
+            foreground_context,
+            [*history, current_user],
+            session_id=active_session.session_id,
+            long_term_memory=memory_snapshot,
+        )
+
+    agent_loop = AgentLoop(
+        workspace=workspace_identity,
+        session=session,
+        schedule_service=schedule_service,
+        model_router=router,
+        context_preparer=prepare_foreground_context,
+        now=now,
+        max_iterations=configuration.runtime.max_iterations,
+        title_prompt=session_title_prompt(),
+        externalize_result_for=externalize_result_for,
+    )
+
+    scheduled_tool_gateway = ToolGateway(
+        workspace=workspace_identity,
+        schedule_service=schedule_service,
+    )
     schedule_agent_run = AgentRun(model=model, tool_gateway=scheduled_tool_gateway)
     schedule_adapter = _ScheduleExecutionAdapter(
         workspace_state=workspace_state,
@@ -808,11 +1241,18 @@ def _prepare_repl_runtime(
         cancel_requested=schedule_service.cancellation_requested,
     )
     schedule_service.on_schedule_job = schedule_adapter.execute
+
+    conversation = _AgentLoopConversationAdapter(
+        loop=agent_loop,
+        now=now,
+        new_uuid=new_uuid,
+    )
     foreground_chat_status: ResolvedChatStatus | None = None
 
-    def capture_foreground_chat_status() -> None:
+    def capture_foreground_terminal(result: AgentRunnerResult | None) -> None:
         nonlocal foreground_chat_status
         foreground_chat_status = _resolved_chat_status(router)
+        conversation.on_terminal(result)
 
     def current_foreground_chat_status() -> ResolvedChatStatus:
         return (
@@ -821,57 +1261,27 @@ def _prepare_repl_runtime(
             else foreground_chat_status
         )
 
-    def conversation_for(active_session: Session) -> ConversationPort:
-        async def prepare_foreground_summary(
-            current_session: Session,
-            current_user: dict[str, Any],
-        ) -> Session:
-            return await prepare_summary(
-                current_session,
-                "chat",
-                system_prompt_for(runtime_memory.snapshot()),
-                tuple(tool_gateway.schemas),
-                current_user,
-            )
+    agent_loop.bind_confirmation_callback(conversation.on_confirmation_requested)
+    agent_loop._bind_tool_completion_callback(conversation.on_tool_completed)
+    agent_loop._bind_terminal_callback(capture_foreground_terminal)
 
-        return _DeferredConversationPort(
-            model=model,
-            session=active_session,
-            now=now,
-            new_uuid=new_uuid,
-            title_prompt=session_title_prompt(),
-            tool_gateway=tool_gateway,
-            foreground_summary_preparer=prepare_foreground_summary,
-            context_builder=foreground_context,
-            memory_snapshot=runtime_memory.snapshot,
-            on_foreground_terminal=capture_foreground_chat_status,
-            externalize_result=_build_tool_result_externalizer(
-                session=active_session,
-                max_tool_result_chars=configuration.runtime.max_tool_result_chars,
-            ),
-        )
-
-    conversation = SwitchableConversationPort(
-        session=session,
-        build_conversation=conversation_for,
-    )
     status_service = RuntimeStatusService(
-        session=session,
+        session=agent_loop.session,
         resolved_chat=current_foreground_chat_status,
         next_input=lambda active_session: _runtime_status_input(
             active_session,
             context_builder=foreground_context,
             long_term_memory=runtime_memory.snapshot(),
             session_id=active_session.session_id,
-            tool_schemas=tuple(tool_gateway.schemas),
+            tool_schemas=agent_loop.tool_schemas,
         ),
         monotonic=monotonic_now,
         schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
     )
 
     def switch_session(selected_session: Session) -> None:
-        conversation.switch_session(selected_session)
-        status_service.use_session(conversation.session)
+        agent_loop.switch_session(selected_session)
+        status_service.use_session(agent_loop.session)
 
     management_dispatcher = ManagementCommandDispatcher(
         ManagementViewService(
@@ -884,8 +1294,9 @@ def _prepare_repl_runtime(
             memory_store=memory_store,
         )
     )
-    return PreparedReplRuntime(
+    return PreparedRuntime(
         conversation=conversation,
+        agent_loop=agent_loop,
         management_dispatcher=management_dispatcher,
         schedule_service=schedule_service,
         _memory_scheduler=memory_scheduler,

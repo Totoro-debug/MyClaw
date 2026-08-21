@@ -7,9 +7,7 @@ from uuid import uuid4
 import typer
 from rich.console import Console
 
-from myclaw.agent.runtime import (
-    prepare_repl_runtime,
-)
+from myclaw.agent.runtime import prepare_runtime
 from myclaw.agent.workspace_state import WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader
@@ -71,7 +69,7 @@ def main(context: typer.Context) -> None:
         )
         raise typer.Exit(code=2)
     try:
-        runtime = prepare_repl_runtime(
+        runtime = prepare_runtime(
             agent_home=loader.agent_home,
             workspace=Path.cwd(),
             configuration=configuration,

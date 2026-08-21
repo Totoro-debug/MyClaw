@@ -8,6 +8,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, Protocol
 
+from loguru import logger
+
 from myclaw.agent.run import (
     _append_run_message,
     _assistant_run_message,
@@ -372,6 +374,7 @@ class AgentRunner:
             if failure.error.code == "turn_cancelled" or is_cancel_requested():
                 cancelled_content = "".join(partial_content)
                 return finish_cancelled(final_content=cancelled_content)
+            _log_legacy_agent_failure(failure)
             failed_content = "".join(partial_content) if model == "chat" else ""
             _repair_failed_messages(
                 runtime_messages,
@@ -493,3 +496,14 @@ __all__ = [
     "AgentRunnerSegment",
     "AgentRunnerToolCallStarted",
 ]
+
+
+def _log_legacy_agent_failure(failure: ModelCallError) -> None:
+    def set_legacy_name(record: Any) -> None:
+        record["name"] = "myclaw.session.conversation"
+
+    logger.patch(set_legacy_name).opt(exception=failure).error(
+        "Agent Run failed code={} type={}",
+        failure.error.code,
+        type(failure).__name__,
+    )

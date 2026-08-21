@@ -748,7 +748,12 @@ def _validate_assistant_message(message: dict[str, Any]) -> None:
             raise ValueError("assistant error must contain a message")
     token_usage = message["token_usage"]
     _validate_token_usage(token_usage, field="assistant.token_usage")
-    if token_usage["model_calls"] != 1:
+    if token_usage["model_calls"] != 1 and not (
+        status == "error"
+        and token_usage["model_calls"] == 0
+        and error is not None
+        and error["code"] == "agent_iteration_limit"
+    ):
         raise ValueError("assistant.token_usage.model_calls must equal 1")
     if status != "error":
         if not message["content"] and not tool_calls:

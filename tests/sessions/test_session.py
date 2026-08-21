@@ -1187,6 +1187,26 @@ def test_assistant_status_error_content_and_model_call_contract_remains_coherent
             error=None,
             token_usage=dict(ZERO_USAGE),
         )
+    with pytest.raises(ValueError, match="model_calls"):
+        session.add_message(
+            "assistant",
+            "Failed",
+            tool_calls=[],
+            status="error",
+            error={"code": "model_failed", "message": "failed"},
+            token_usage=dict(ZERO_USAGE),
+        )
+
+    session.add_message(
+        "assistant",
+        "Iteration limit reached",
+        tool_calls=[],
+        status="error",
+        error={"code": "agent_iteration_limit", "message": "limit reached"},
+        token_usage=dict(ZERO_USAGE),
+    )
+
+    assert session.messages[-1]["error"]["code"] == "agent_iteration_limit"
 
 
 def test_load_current_five_field_jsonl_preserves_json_native_extensions(

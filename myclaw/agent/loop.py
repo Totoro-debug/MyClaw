@@ -1,0 +1,700 @@
+"""Serial foreground Agent Runner orchestration over the Runtime Message Bus."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+from uuid import UUID
+
+from loguru import logger
+
+from myclaw.agent.message_bus import (
+    InboundMessage,
+    MessageBus,
+    OutboundMessage,
+    OutboundMessageType,
+)
+from myclaw.agent.runner import (
+    AgentRunner,
+    AgentRunnerResponseSegmentEnd,
+    AgentRunnerResult,
+    AgentRunnerRouter,
+    AgentRunnerToolCallStarted,
+)
+from myclaw.agent.workspace import Workspace
+from myclaw.errors import ErrorInfo
+from myclaw.logging.session import session_log
+from myclaw.provider.errors import ModelCallError
+from myclaw.provider.models import ModelCompleted, ReasoningDelta, TextDelta
+from myclaw.schedule.service import ScheduleService
+from myclaw.session.session import Session
+from myclaw.tools.base import OpenAIToolSchema
+from myclaw.tools.tool_gateway import (
+    ConfirmationDecision,
+    ConfirmationRequest,
+    ToolGateway,
+    ToolResult,
+)
+
+type ForegroundContextPreparer = Callable[
+    [Session, dict[str, Any]],
+    Awaitable[list[dict[str, Any]]],
+]
+type ResultExternalizerFactory = Callable[[Session], Callable[[ToolResult], ToolResult]]
+type ConfirmationCallback = Callable[[ConfirmationRequest], None]
+type ToolCompletionCallback = Callable[[ToolResult], None]
+type TerminalCallback = Callable[[AgentRunnerResult | None], None]
+
+_CANCELLED_MESSAGE = "MyClaw 已取消本轮对话。"
+
+
+@dataclass(slots=True)
+class _PendingConfirmation:
+    request: ConfirmationRequest
+    future: asyncio.Future[ConfirmationDecision]
+
+
+@dataclass(slots=True)
+class _TitleCoordination:
+    preparation_started: asyncio.Event
+    prepared: asyncio.Future[bool]
+    log_ready: asyncio.Event
+    foreground_idle: asyncio.Event
+    active_foregrounds: int = 0
+
+    def attach_foreground(self) -> None:
+        self.active_foregrounds += 1
+        self.foreground_idle.clear()
+
+    def release_foreground(self) -> None:
+        self.active_foregrounds -= 1
+        if self.active_foregrounds == 0:
+            self.foreground_idle.set()
+
+    async def wait_until_foreground_idle(self) -> None:
+        while True:
+            await self.foreground_idle.wait()
+            await asyncio.sleep(0)
+            if self.active_foregrounds == 0:
+                return
+
+
+@dataclass(frozen=True, slots=True)
+class _TitleWork:
+    task: asyncio.Task[None]
+    coordination: _TitleCoordination
+
+
+class AgentLoop:
+    """Own the complete serial foreground execution path."""
+
+    def __init__(
+        self,
+        *,
+        workspace: Workspace,
+        session: Session,
+        schedule_service: ScheduleService,
+        model_router: AgentRunnerRouter,
+        context_preparer: ForegroundContextPreparer,
+        now: Callable[[], datetime],
+        max_iterations: int,
+        title_prompt: str | None = None,
+        externalize_result_for: ResultExternalizerFactory | None = None,
+    ) -> None:
+        if not isinstance(workspace, Workspace):
+            raise TypeError("Agent Loop requires a Workspace")
+        if not isinstance(session, Session):
+            raise TypeError("Agent Loop requires a foreground Session")
+        if not isinstance(schedule_service, ScheduleService):
+            raise TypeError("Agent Loop requires a Schedule Service for the foreground catalog")
+        if not callable(context_preparer):
+            raise TypeError("Agent Loop requires a context preparer")
+        if not callable(now):
+            raise TypeError("Agent Loop requires a clock")
+
+        self._session = session
+        self._context_preparer = context_preparer
+        self._now = now
+        self._title_prompt = title_prompt
+        self._externalize_result_for = externalize_result_for
+        self._tool_gateway = ToolGateway(
+            workspace=workspace,
+            schedule_service=schedule_service,
+        )
+        self._model_router = model_router
+        self._runner = AgentRunner(model_router)
+        self._max_iterations = max_iterations
+        self._bus = MessageBus()
+        self._owned_sessions = [session]
+        self._consumer_task: asyncio.Task[None] | None = None
+        self._execution_task: asyncio.Task[None] | None = None
+        self._execution_ready: asyncio.Event | None = None
+        self._title_work: dict[str, _TitleWork] = {}
+        self._pending_confirmation: _PendingConfirmation | None = None
+        self._confirmation_callback: ConfirmationCallback | None = None
+        self._tool_completion_callback: ToolCompletionCallback | None = None
+        self._terminal_callback: TerminalCallback | None = None
+        self._cancel_requested = False
+        self._closing = False
+        self._closed = False
+
+    @property
+    def bus(self) -> MessageBus:
+        return self._bus
+
+    @property
+    def session(self) -> Session:
+        return self._session
+
+    @property
+    def tool_schemas(self) -> tuple[OpenAIToolSchema, ...]:
+        return tuple(self._tool_gateway.schemas)
+
+    @property
+    def has_active_run(self) -> bool:
+        task = self._execution_task
+        return task is not None and not task.done()
+
+    @property
+    def has_pending_confirmation(self) -> bool:
+        pending = self._pending_confirmation
+        return pending is not None and not pending.future.done()
+
+    def bind_confirmation_callback(self, callback: ConfirmationCallback) -> None:
+        """Bind the synchronous UI callback once before the first foreground run."""
+        if self._confirmation_callback is not None:
+            raise RuntimeError("Agent Loop confirmation callback is already bound")
+        if self._closed:
+            raise RuntimeError("Agent Loop is closed")
+        if self._consumer_task is not None:
+            raise RuntimeError("Agent Loop confirmation callback must be bound before start")
+        if not callable(callback):
+            raise TypeError("confirmation callback must be callable")
+        self._confirmation_callback = callback
+
+    def _bind_tool_completion_callback(self, callback: ToolCompletionCallback) -> None:
+        """Bind the temporary single-consumer Terminal completion projection."""
+        if self._tool_completion_callback is not None:
+            raise RuntimeError("Agent Loop tool completion callback is already bound")
+        if not callable(callback):
+            raise TypeError("tool completion callback must be callable")
+        self._tool_completion_callback = callback
+
+    def _bind_terminal_callback(self, callback: TerminalCallback) -> None:
+        """Bind the temporary runtime status capture before terminal publication."""
+        if self._terminal_callback is not None:
+            raise RuntimeError("Agent Loop terminal callback is already bound")
+        if not callable(callback):
+            raise TypeError("terminal callback must be callable")
+        self._terminal_callback = callback
+
+    async def start(self) -> None:
+        if self._closed:
+            raise RuntimeError("Agent Loop is closed")
+        if self._consumer_task is not None:
+            return
+        self._consumer_task = asyncio.create_task(self._consume_foreground())
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closing = True
+        self._cancel_pending_confirmation()
+        active = self._execution_task
+        if active is not None and not active.done():
+            await self.cancel_active_run()
+
+        consumer = self._consumer_task
+        if consumer is not None and not consumer.done():
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+        self._consumer_task = None
+
+        title_work = tuple(self._title_work.values())
+        for work in title_work:
+            if not work.task.done():
+                work.task.cancel()
+        if title_work:
+            await asyncio.gather(*(work.task for work in title_work), return_exceptions=True)
+        self._title_work.clear()
+        self._closed = True
+
+    def _close_sessions(self) -> None:
+        """Close every foreground Session retained across compatibility switches."""
+        for session in self._owned_sessions:
+            try:
+                session.close()
+            except BaseException:
+                pass
+        self._owned_sessions.clear()
+
+    async def cancel_active_run(self) -> None:
+        active = self._execution_task
+        if active is None or active.done():
+            return
+        self._cancel_requested = True
+        self._cancel_pending_confirmation()
+        ready = self._execution_ready
+        if ready is not None and not ready.is_set():
+            await ready.wait()
+        await asyncio.sleep(0)
+        if active.done():
+            return
+        active.cancel()
+        await asyncio.gather(active, return_exceptions=True)
+
+    def respond_to_confirmation(
+        self,
+        confirmation_id: UUID,
+        decision: ConfirmationDecision,
+    ) -> None:
+        if decision not in {"approved", "declined"}:
+            raise ValueError("confirmation decision must be approved or declined")
+        pending = self._pending_confirmation
+        if pending is None or pending.request.confirmation_id != confirmation_id:
+            raise ValueError("Confirmation response is late or unknown")
+        if pending.future.done():
+            raise ValueError("Confirmation response is late or unknown")
+        pending.future.set_result(decision)
+
+    def switch_session(self, session: Session) -> None:
+        if self._closed:
+            raise RuntimeError("Agent Loop is closed")
+        if self.has_active_run:
+            raise RuntimeError("Cannot switch Session during an active foreground run")
+        if not isinstance(session, Session):
+            raise TypeError("Agent Loop requires a Session")
+        if session.session_id == self._session.session_id:
+            return
+        self._session = session
+        self._owned_sessions.append(session)
+
+    async def _consume_foreground(self) -> None:
+        try:
+            while not self._closing:
+                inbound = await self._bus.get_inbound()
+                if self._closing:
+                    break
+                execution_ready = asyncio.Event()
+                execution = asyncio.create_task(
+                    self._execute_foreground(inbound, execution_ready=execution_ready)
+                )
+                self._execution_task = execution
+                self._execution_ready = execution_ready
+                try:
+                    await execution
+                except asyncio.CancelledError:
+                    if not self._closing:
+                        raise
+                finally:
+                    if self._execution_task is execution:
+                        self._execution_task = None
+                    if self._execution_ready is execution_ready:
+                        self._execution_ready = None
+                    self._cancel_requested = False
+        except asyncio.CancelledError:
+            if not self._closing:
+                raise
+
+    async def _execute_foreground(
+        self,
+        inbound: InboundMessage,
+        *,
+        execution_ready: asyncio.Event,
+    ) -> None:
+        active_session = self._session
+        start_title = not active_session.messages
+        created_title_work = (
+            self._start_title_if_needed(active_session, inbound.content) if start_title else None
+        )
+        title_work = created_title_work or self._title_work.get(active_session.session_id)
+        if title_work is not None and title_work.task.done():
+            title_work = None
+        title_coordination = None if title_work is None else title_work.coordination
+        if title_coordination is not None:
+            title_coordination.attach_foreground()
+        committed = False
+        try:
+            if title_work is None:
+                with session_log(active_session):
+                    committed = await self._execute_foreground_logged(
+                        active_session,
+                        inbound,
+                        title_work=None,
+                        execution_ready=execution_ready,
+                    )
+            else:
+                assert title_coordination is not None
+                await title_coordination.log_ready.wait()
+                with logger.contextualize(session_id=active_session.session_id):
+                    committed = await self._execute_foreground_logged(
+                        active_session,
+                        inbound,
+                        title_work=title_work,
+                        execution_ready=execution_ready,
+                    )
+        finally:
+            execution_ready.set()
+            if title_coordination is not None:
+                title_coordination.release_foreground()
+            if created_title_work is not None:
+                created_coordination = created_title_work.coordination
+                if not created_coordination.prepared.done():
+                    created_coordination.prepared.set_result(False)
+                if not committed:
+                    if not created_title_work.task.done():
+                        created_title_work.task.cancel()
+                    await asyncio.gather(created_title_work.task, return_exceptions=True)
+                    if self._title_work.get(active_session.session_id) is created_title_work:
+                        self._title_work.pop(active_session.session_id)
+
+    async def _execute_foreground_logged(
+        self,
+        active_session: Session,
+        inbound: InboundMessage,
+        *,
+        title_work: _TitleWork | None,
+        execution_ready: asyncio.Event,
+    ) -> bool:
+        current_user = {"role": "user", "content": inbound.content}
+        if title_work is not None:
+            title_work.coordination.preparation_started.set()
+        execution_ready.set()
+        if not inbound.content.strip():
+            return False
+        try:
+            initial_messages = await self._context_preparer(
+                active_session,
+                deepcopy(current_user),
+            )
+        except asyncio.CancelledError:
+            if not self._cancel_requested:
+                raise
+            await self._publish_preparation_failure(ErrorInfo("turn_cancelled", _CANCELLED_MESSAGE))
+            return False
+        except ModelCallError as failure:
+            await self._publish_preparation_failure(failure.error)
+            return False
+        except Exception:
+            await self._publish_preparation_failure(
+                ErrorInfo("model_failed", "The model request failed.")
+            )
+            return False
+
+        if title_work is not None and not title_work.coordination.prepared.done():
+            title_work.coordination.prepared.set_result(True)
+        try:
+            result = await self._runner.run(
+                initial_messages,
+                model="chat",
+                tool_gateway=self._tool_gateway,
+                on_output=self._publish_runner_output,
+                confirmation=self._request_confirmation,
+                externalize_result=self._externalize_for_run(active_session),
+                cancel_requested=lambda: self._cancel_requested,
+                max_iterations=self._max_iterations,
+            )
+        except asyncio.CancelledError:
+            if not self._cancel_requested:
+                raise
+            await self._publish_preparation_failure(ErrorInfo("turn_cancelled", _CANCELLED_MESSAGE))
+            return False
+
+        try:
+            active_session.append_messages([deepcopy(current_user), *deepcopy(result.messages)])
+        except Exception as failure:
+            _legacy_logger().opt(exception=failure).error(
+                "Agent Run Session increment failed code=persistence_error type={}",
+                type(failure).__name__,
+            )
+            await self._publish_commit_failure(result)
+            return False
+        try:
+            active_session.persist()
+        except Exception:
+            pass
+        await self._publish_terminal(result)
+        return True
+
+    def _externalize_for_run(
+        self,
+        active_session: Session,
+    ) -> Callable[[ToolResult], ToolResult] | None:
+        externalizer = (
+            None
+            if self._externalize_result_for is None
+            else self._externalize_result_for(active_session)
+        )
+        callback = self._tool_completion_callback
+        if externalizer is None and callback is None:
+            return None
+
+        def observe(result: ToolResult) -> ToolResult:
+            projected = result if externalizer is None else externalizer(result)
+            if callback is not None:
+                callback(projected)
+            return projected
+
+        return observe
+
+    async def _publish_runner_output(self, event: object) -> None:
+        if isinstance(event, ReasoningDelta):
+            await self._bus.put_outbound(
+                OutboundMessage(
+                    "model_reasoning",
+                    event.delta,
+                    {"_stream_delta": True},
+                )
+            )
+            return
+        if isinstance(event, TextDelta):
+            await self._bus.put_outbound(
+                OutboundMessage(
+                    "model_response",
+                    event.delta,
+                    {"_stream_delta": True},
+                )
+            )
+            return
+        if isinstance(event, AgentRunnerResponseSegmentEnd):
+            outbound_type: OutboundMessageType = (
+                "model_reasoning" if event.segment == "reasoning" else "model_response"
+            )
+            await self._bus.put_outbound(OutboundMessage(outbound_type, "", {"_stream_end": True}))
+            return
+        if isinstance(event, AgentRunnerToolCallStarted):
+            await self._bus.put_outbound(
+                OutboundMessage(
+                    "tool_call",
+                    event.tool_name,
+                    {
+                        "tool_call_id": event.tool_call_id,
+                        "arguments": event.arguments,
+                    },
+                )
+            )
+            return
+        raise TypeError(f"Unsupported Agent Runner output: {type(event).__name__}")
+
+    async def _publish_terminal(self, result: AgentRunnerResult) -> None:
+        if self._terminal_callback is not None:
+            self._terminal_callback(result)
+        if result.finish_reason == "completed":
+            await self._bus.put_outbound(OutboundMessage("model_response", "", {"_streamed": True}))
+            return
+        error = result.error
+        if error is None:
+            error = ErrorInfo("model_failed", "The model request failed.")
+        await self._bus.put_outbound(
+            OutboundMessage(
+                "system_control",
+                error.message,
+                {
+                    "finish_reason": result.finish_reason,
+                    "error_code": error.code,
+                    "_streamed": True,
+                },
+            )
+        )
+
+    async def _publish_preparation_failure(self, error: ErrorInfo) -> None:
+        if error.code != "turn_cancelled":
+            _log_legacy_agent_failure(error)
+        if self._terminal_callback is not None:
+            self._terminal_callback(None)
+        finish_reason = "cancelled" if error.code == "turn_cancelled" else "failed"
+        await self._bus.put_outbound(
+            OutboundMessage(
+                "system_control",
+                error.message,
+                {
+                    "finish_reason": finish_reason,
+                    "error_code": error.code,
+                    "_streamed": True,
+                },
+            )
+        )
+
+    async def _publish_commit_failure(self, result: AgentRunnerResult) -> None:
+        error = ErrorInfo(
+            "persistence_error",
+            "The Conversation Session could not be updated.",
+        )
+        if self._terminal_callback is not None:
+            self._terminal_callback(result)
+        await self._bus.put_outbound(
+            OutboundMessage(
+                "system_control",
+                error.message,
+                {
+                    "finish_reason": "failed",
+                    "error_code": error.code,
+                    "_streamed": True,
+                },
+            )
+        )
+
+    async def _request_confirmation(
+        self,
+        request: ConfirmationRequest,
+    ) -> ConfirmationDecision:
+        if self._pending_confirmation is not None:
+            raise RuntimeError("A foreground confirmation request is already pending")
+        callback = self._confirmation_callback
+        if callback is None:
+            raise RuntimeError("Agent Loop confirmation callback is not bound")
+        future: asyncio.Future[ConfirmationDecision] = asyncio.get_running_loop().create_future()
+        pending = _PendingConfirmation(request=request, future=future)
+        self._pending_confirmation = pending
+        try:
+            callback(request)
+            return await future
+        finally:
+            if self._pending_confirmation is pending:
+                self._pending_confirmation = None
+
+    def _cancel_pending_confirmation(self) -> None:
+        pending = self._pending_confirmation
+        if pending is not None and not pending.future.done():
+            pending.future.cancel()
+
+    def _start_title_if_needed(
+        self,
+        session: Session,
+        content: str,
+    ) -> _TitleWork | None:
+        if (
+            self._title_prompt is None
+            or not content.strip()
+            or session.metadata.get("title") != "Untitled session"
+            or session.session_id in self._title_work
+        ):
+            return None
+        preparation_started = asyncio.Event()
+        prepared: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        log_ready = asyncio.Event()
+        foreground_idle = asyncio.Event()
+        foreground_idle.set()
+        coordination = _TitleCoordination(
+            preparation_started=preparation_started,
+            prepared=prepared,
+            log_ready=log_ready,
+            foreground_idle=foreground_idle,
+        )
+        task = asyncio.create_task(
+            self._generate_title(
+                session,
+                content,
+                coordination=coordination,
+            )
+        )
+        work = _TitleWork(
+            task=task,
+            coordination=coordination,
+        )
+        self._title_work[session.session_id] = work
+        task.add_done_callback(self._title_done)
+        return work
+
+    def _title_done(self, task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as error:
+            logger.opt(exception=error).error(
+                "Session title task failed type={}", type(error).__name__
+            )
+
+    async def _generate_title(
+        self,
+        session: Session,
+        content: str,
+        *,
+        coordination: _TitleCoordination,
+    ) -> None:
+        with session_log(session):
+            coordination.log_ready.set()
+            try:
+                await coordination.preparation_started.wait()
+                title, usage_delta = await self._resolve_title(content)
+                if (
+                    await coordination.prepared
+                    and session.metadata.get("title") == "Untitled session"
+                ):
+                    session.update_metadata(title=title, usage_delta=usage_delta)
+            except asyncio.CancelledError:
+                if (
+                    coordination.prepared.done()
+                    and coordination.prepared.result()
+                    and session.metadata.get("title") == "Untitled session"
+                ):
+                    session.update_metadata(title=Session._normalize_title(content))
+                raise
+            finally:
+                await coordination.wait_until_foreground_idle()
+
+    async def _resolve_title(self, content: str) -> tuple[str, dict[str, int] | None]:
+        title = Session._normalize_title(content)
+        usage_delta: dict[str, int] | None = None
+        events: Any = None
+        try:
+            events = self._router_stream_title(content)
+            async for event in events:
+                if not isinstance(event, ModelCompleted):
+                    continue
+                response = event.response
+                usage_delta = {"model_calls": 1, **response.usage.to_dict()}
+                if response.message.tool_calls:
+                    continue
+                candidate = Session._normalize_title_candidate(response.message.content)
+                if candidate:
+                    title = candidate
+                break
+        except Exception as error:
+            _legacy_logger().opt(exception=error).warning(
+                "Session title fallback selected type={}", type(error).__name__
+            )
+        finally:
+            if events is not None:
+                close = getattr(events, "aclose", None)
+                if close is not None:
+                    try:
+                        await close()
+                    except RuntimeError:
+                        pass
+        return title, usage_delta
+
+    def _router_stream_title(self, content: str) -> Any:
+        return self._model_router.stream(
+            "chat",
+            messages=[
+                {"role": "system", "content": self._title_prompt or ""},
+                {"role": "user", "content": Session._normalize_title(content)},
+            ],
+            tools=(),
+            continuation=None,
+        )
+
+
+__all__ = ["AgentLoop", "ConfirmationCallback", "ForegroundContextPreparer"]
+
+
+def _legacy_logger() -> Any:
+    def set_legacy_name(record: Any) -> None:
+        record["name"] = "myclaw.session.conversation"
+
+    return logger.patch(set_legacy_name)
+
+
+def _log_legacy_agent_failure(error: ErrorInfo) -> None:
+    failure = ModelCallError(error)
+    _legacy_logger().opt(exception=failure).error(
+        "Agent Run failed code={} type={}",
+        error.code,
+        type(failure).__name__,
+    )
