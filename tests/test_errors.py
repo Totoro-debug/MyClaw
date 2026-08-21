@@ -27,6 +27,7 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
             "memory_context_too_large",
             "interactive_terminal_required",
             "model_failed",
+            "agent_iteration_limit",
             "turn_cancelled",
             "tool_not_found",
             "tool_invalid_arguments",

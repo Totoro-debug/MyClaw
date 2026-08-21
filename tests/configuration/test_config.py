@@ -8,6 +8,7 @@ from myclaw.config.config import ConfigError, ConfigLoader
 
 EXPECTED_DEFAULT_CONFIG = """[runtime]
 max_tool_result_chars = 4096
+max_iterations = 50
 
 [memory]
 consolidation_message_threshold = 40

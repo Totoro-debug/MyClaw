@@ -76,6 +76,7 @@ _API_KEY_UNSAFE_REMAINDER_PATTERN: Final = re.compile(
 @dataclass(frozen=True, slots=True)
 class RuntimeConfiguration:
     max_tool_result_chars: int
+    max_iterations: int = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,10 +221,21 @@ def _string(value: object, field: str, *, nonempty: bool = False) -> str:
     return value
 
 
-def _integer(value: object, field: str, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
-        _invalid(field, f"must be an integer from {minimum} to {maximum}")
-    return value
+def _integer(value: object, field: str, minimum: int, maximum: int | None = None) -> int:
+    valid = (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and value >= minimum
+        and (maximum is None or value <= maximum)
+    )
+    if not valid:
+        rule = (
+            f"must be an integer from {minimum} to {maximum}"
+            if maximum is not None
+            else f"must be an integer at least {minimum}"
+        )
+        _invalid(field, rule)
+    return cast(int, value)
 
 
 def _number(value: object, field: str, minimum: float, maximum: float) -> float:
@@ -314,7 +326,12 @@ def _parse_runtime(document: Mapping[str, object]) -> RuntimeConfiguration:
             "runtime.max_tool_result_chars",
             1000,
             1_000_000,
-        )
+        ),
+        max_iterations=_integer(
+            table.get("max_iterations", 50),
+            "runtime.max_iterations",
+            50,
+        ),
     )
 
 
@@ -455,7 +472,7 @@ def _validate_defined_fields(document: Mapping[str, object]) -> None:
     _reject_unknown(document, {"runtime", "memory", "models"}, "")
 
     runtime = _table(document.get("runtime", {}), "runtime")
-    _reject_unknown(runtime, {"max_tool_result_chars"}, "runtime")
+    _reject_unknown(runtime, {"max_tool_result_chars", "max_iterations"}, "runtime")
 
     memory = _table(document.get("memory", {}), "memory")
     _reject_unknown(

@@ -555,19 +555,11 @@ class AgentRun:
         result: ToolResult,
         externalize_result: ToolResultExternalizer,
     ) -> ToolResult:
-        try:
-            return externalize_result(result)
-        except Exception as failure:
-            if self._on_artifact_failure is not None:
-                self._on_artifact_failure(failure, result.name)
-            return ToolResult(
-                tool_call_id=result.tool_call_id,
-                name=result.name,
-                status="error",
-                content=f"{result.name} result could not be stored.",
-                artifact=None,
-                confirmation=result.confirmation,
-            )
+        return _externalize_tool_result(
+            result,
+            externalize_result,
+            on_artifact_failure=self._on_artifact_failure,
+        )
 
     def _repair_awaitable_cancelled(
         self,
@@ -576,35 +568,12 @@ class AgentRun:
         partial_content: list[str],
         pending_tool_calls: list[ModelToolCall],
     ) -> None:
-        if partial_content:
-            _append_run_message(
-                runtime_messages,
-                increment,
-                build_assistant_repair_message(
-                    content="".join(partial_content),
-                    status="interrupted",
-                    error=ErrorInfo(
-                        code="turn_cancelled",
-                        message="Turn interrupted by user.",
-                    ),
-                ),
-            )
-        for tool_call in pending_tool_calls:
-            _append_run_message(
-                runtime_messages,
-                increment,
-                _tool_run_message(
-                    ToolResult(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        status="error",
-                        content="Tool call interrupted because the turn was cancelled.",
-                        artifact=None,
-                    )
-                ),
-            )
-        pending_tool_calls.clear()
-        partial_content.clear()
+        _repair_cancelled_messages(
+            runtime_messages,
+            increment,
+            partial_content,
+            pending_tool_calls,
+        )
 
     def _repair_awaitable_failed(
         self,
@@ -616,31 +585,14 @@ class AgentRun:
         stream: bool,
         failure: ModelCallError,
     ) -> None:
-        for tool_call in pending_tool_calls:
-            _append_run_message(
-                runtime_messages,
-                increment,
-                _tool_run_message(
-                    ToolResult(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        status="error",
-                        content="Tool call interrupted because the Agent Run failed.",
-                        artifact=None,
-                    )
-                ),
-            )
-        pending_tool_calls.clear()
-        _append_run_message(
+        _repair_failed_messages(
             runtime_messages,
             increment,
-            build_assistant_repair_message(
-                content="".join(partial_content) if stream else "",
-                status="error",
-                error=failure.error,
-            ),
+            partial_content,
+            pending_tool_calls,
+            stream=stream,
+            failure=failure,
         )
-        partial_content.clear()
 
     @staticmethod
     async def _call_tool(
@@ -727,6 +679,7 @@ def build_assistant_repair_message(
     content: str,
     status: Literal["interrupted", "error"],
     error: ErrorInfo,
+    model_calls: int = 1,
 ) -> dict[str, Any]:
     return {
         "role": "assistant",
@@ -735,7 +688,7 @@ def build_assistant_repair_message(
         "status": status,
         "error": {"code": error.code, "message": error.message},
         "token_usage": {
-            "model_calls": 1,
+            "model_calls": model_calls,
             "input_tokens": 0,
             "output_tokens": 0,
             "total_tokens": 0,
@@ -749,6 +702,100 @@ def _tool_run_message(result: ToolResult) -> dict[str, Any]:
 
 def _identity_tool_result(result: ToolResult) -> ToolResult:
     return result
+
+
+def _externalize_tool_result(
+    result: ToolResult,
+    externalize_result: ToolResultExternalizer,
+    *,
+    on_artifact_failure: Callable[[Exception, str], None] | None = None,
+) -> ToolResult:
+    try:
+        return externalize_result(result)
+    except Exception as failure:
+        if on_artifact_failure is not None:
+            on_artifact_failure(failure, result.name)
+        return ToolResult(
+            tool_call_id=result.tool_call_id,
+            name=result.name,
+            status="error",
+            content=f"{result.name} result could not be stored.",
+            artifact=None,
+            confirmation=result.confirmation,
+        )
+
+
+def _repair_cancelled_messages(
+    runtime_messages: list[dict[str, Any]],
+    increment: list[dict[str, Any]],
+    partial_content: list[str],
+    pending_tool_calls: list[ModelToolCall],
+) -> None:
+    if partial_content:
+        _append_run_message(
+            runtime_messages,
+            increment,
+            build_assistant_repair_message(
+                content="".join(partial_content),
+                status="interrupted",
+                error=ErrorInfo(
+                    code="turn_cancelled",
+                    message="Turn interrupted by user.",
+                ),
+            ),
+        )
+    for tool_call in pending_tool_calls:
+        _append_run_message(
+            runtime_messages,
+            increment,
+            _tool_run_message(
+                ToolResult(
+                    tool_call_id=tool_call.id,
+                    name=tool_call.name,
+                    status="error",
+                    content="Tool call interrupted because the turn was cancelled.",
+                    artifact=None,
+                )
+            ),
+        )
+    pending_tool_calls.clear()
+    partial_content.clear()
+
+
+def _repair_failed_messages(
+    runtime_messages: list[dict[str, Any]],
+    increment: list[dict[str, Any]],
+    partial_content: list[str],
+    pending_tool_calls: list[ModelToolCall],
+    *,
+    stream: bool,
+    failure: ModelCallError,
+) -> None:
+    for tool_call in pending_tool_calls:
+        _append_run_message(
+            runtime_messages,
+            increment,
+            _tool_run_message(
+                ToolResult(
+                    tool_call_id=tool_call.id,
+                    name=tool_call.name,
+                    status="error",
+                    content="Tool call interrupted because the Agent Run failed.",
+                    artifact=None,
+                )
+            ),
+        )
+    pending_tool_calls.clear()
+    _append_run_message(
+        runtime_messages,
+        increment,
+        build_assistant_repair_message(
+            content="".join(partial_content) if stream else "",
+            status="error",
+            error=failure.error,
+        ),
+    )
+    partial_content.clear()
 
 
 def _require_summary(value: str) -> None:
