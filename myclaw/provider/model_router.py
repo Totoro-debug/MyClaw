@@ -109,7 +109,7 @@ class ModelRouter:
         tools: Sequence[OpenAIToolSchema],
         continuation: ModelContinuation | None,
     ) -> AsyncIterator[ModelStreamEvent]:
-        resolved = self._begin_call(route)
+        resolved = self._begin_call(route, continuation=continuation)
         if continuation is not None and continuation.provider_id != resolved.provider.provider_id:
             continuation = None
 
@@ -164,7 +164,7 @@ class ModelRouter:
         tools: Sequence[OpenAIToolSchema],
         continuation: ModelContinuation | None,
     ) -> ModelResponse:
-        resolved = self._begin_call(route)
+        resolved = self._begin_call(route, continuation=continuation)
         if continuation is not None and continuation.provider_id != resolved.provider.provider_id:
             continuation = None
 
@@ -310,8 +310,15 @@ class ModelRouter:
             self._providers[configuration.provider_id] = provider
         return provider
 
-    def _begin_call(self, requested_route: ModelRoute) -> ResolvedModelRoute:
-        resolved = self._configuration.resolve_route(requested_route)
+    def _begin_call(
+        self,
+        requested_route: ModelRoute,
+        *,
+        continuation: ModelContinuation | None,
+    ) -> ResolvedModelRoute:
+        resolved = self._continuation_route(requested_route, continuation)
+        if resolved is None:
+            resolved = self._configuration.resolve_route(requested_route)
         status = _route_status(requested_route, resolved)
         self._route_statuses[requested_route] = status
         self._remember_current_call_status(requested_route, status)
@@ -325,6 +332,29 @@ class ModelRouter:
                 resolved.route.model,
             )
         return resolved
+
+    def _continuation_route(
+        self,
+        requested_route: ModelRoute,
+        continuation: ModelContinuation | None,
+    ) -> ResolvedModelRoute | None:
+        if continuation is None:
+            return None
+        previous = self.current_call_status(requested_route)
+        if previous is None or previous.provider_id != continuation.provider_id:
+            return None
+        resolved = self._configuration.resolve_route(previous.selected_route)
+        if (
+            resolved.selected_route != previous.selected_route
+            or resolved.provider.provider_id != previous.provider_id
+            or resolved.route.model != previous.model
+        ):
+            return None
+        return replace(
+            resolved,
+            requested_route=requested_route,
+            used_default=previous.selected_route != requested_route,
+        )
 
     def _remember_current_call_status(
         self,

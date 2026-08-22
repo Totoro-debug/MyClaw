@@ -99,6 +99,34 @@ def routed_configuration() -> UserConfiguration:
     )
 
 
+def same_provider_routed_configuration() -> UserConfiguration:
+    default = configuration()
+    provider = ProviderConfiguration(
+        provider_id="default-provider",
+        protocol="anthropic",
+        base_url="https://default.example/v1",
+        api_key="default-secret",
+        models=("default-model", "chat-model"),
+    )
+    chat_route = RouteConfiguration(
+        provider_id=provider.provider_id,
+        model="chat-model",
+        context_window=200_000,
+        max_output=8192,
+        temperature=0.1,
+        reasoning_effort="high",
+        timeout=90,
+    )
+    return UserConfiguration(
+        runtime=default.runtime,
+        memory=default.memory,
+        models=ModelsConfiguration(
+            providers={provider.provider_id: provider},
+            routes={**default.models.routes, "chat": chat_route},
+        ),
+    )
+
+
 def memory_configuration() -> UserConfiguration:
     default = configuration()
     memory_provider = ProviderConfiguration(
@@ -562,6 +590,67 @@ async def test_model_router_does_not_replay_continuation_to_a_fallback_provider(
 
 
 @pytest.mark.asyncio
+async def test_model_router_continues_the_selected_stream_route() -> None:
+    continuation = ModelContinuation(provider_id="default-provider", payload="default-state")
+    fallback_response = ModelCompleted(
+        response=ModelResponse(
+            message=AssistantModelMessage(content="Working"),
+            usage=ModelUsage(input_tokens=4, output_tokens=1, total_tokens=5),
+            finish_reason="tool_calls",
+            continuation=continuation,
+        )
+    )
+    chat_provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(events=(), error=permanent_failure()),
+            StreamScript(events=(), error=permanent_failure()),
+        )
+    )
+    default_provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(events=(fallback_response,)),
+            StreamScript(events=(completed(),)),
+        )
+    )
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+
+    first = await collect(router.stream("chat", **request()))
+    assert isinstance(first[-1], ModelCompleted)
+    observed = await collect(
+        router.stream(
+            "chat",
+            **request(),
+            continuation=first[-1].response.continuation,
+        )
+    )
+
+    assert observed == [completed()]
+    assert len(chat_provider.stream_requests) == 1
+    assert [call.model for call in default_provider.stream_requests] == [
+        "default-model",
+        "default-model",
+    ]
+    assert default_provider.stream_requests[1].continuation == continuation
+    assert router.current_call_status("chat") == ModelRouteStatus(
+        requested_route="chat",
+        selected_route="default",
+        provider_id="default-provider",
+        model="default-model",
+        context_window=100_000,
+        used_default=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_model_router_does_not_activate_continuation_after_stream_fallback() -> None:
     continuation = ModelContinuation(provider_id="default-provider", payload="default-state")
     chat_provider = ScriptedFakeProvider(
@@ -609,6 +698,53 @@ async def test_model_router_replays_continuation_across_same_provider_retries() 
         continuation,
         continuation,
     ]
+
+
+@pytest.mark.asyncio
+async def test_model_router_continues_the_selected_completion_model() -> None:
+    continuation = ModelContinuation(provider_id="default-provider", payload="default-state")
+    fallback_response = ModelResponse(
+        message=AssistantModelMessage(content="Working"),
+        usage=ModelUsage(input_tokens=4, output_tokens=1, total_tokens=5),
+        finish_reason="tool_calls",
+        continuation=continuation,
+    )
+    provider = ScriptedFakeProvider(
+        completions=(permanent_failure(), fallback_response, response())
+    )
+    router = ModelRouter(
+        configuration=same_provider_routed_configuration(),
+        provider_factory=lambda configuration: provider,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+
+    first = await router.complete("chat", **request())
+    observed = await router.complete(
+        "chat",
+        **request(),
+        continuation=first.continuation,
+    )
+
+    assert observed == response()
+    assert [call.model for call in provider.complete_requests] == [
+        "chat-model",
+        "default-model",
+        "default-model",
+    ]
+    assert [call.continuation for call in provider.complete_requests] == [
+        None,
+        None,
+        continuation,
+    ]
+    assert router.current_call_status("chat") == ModelRouteStatus(
+        requested_route="chat",
+        selected_route="default",
+        provider_id="default-provider",
+        model="default-model",
+        context_window=100_000,
+        used_default=True,
+    )
 
 
 @pytest.mark.asyncio
