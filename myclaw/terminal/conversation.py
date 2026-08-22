@@ -1301,6 +1301,7 @@ class _MessageBusRunProjection:
         self._assistant: Markdown | None = None
         self._response_stream: _CoalescedMarkdownStream | None = None
         self._response_fragments: list[str] = []
+        self._response_reopen_allowed = False
         self._reasoning: Markdown | None = None
         self._reasoning_stream: _CoalescedMarkdownStream | None = None
         self._activity_group: _ActivityGroupState | None = None
@@ -1330,7 +1331,10 @@ class _MessageBusRunProjection:
             if marker == "_stream_delta":
                 await self._append_reasoning(outbound.content)
             elif marker == "_stream_end":
+                reasoning_stream_active = self._reasoning_stream is not None
                 await self._stop_reasoning_stream()
+                if reasoning_stream_active:
+                    self._response_reopen_allowed = True
             else:
                 await self._fail_sparse_protocol()
             return
@@ -1405,7 +1409,13 @@ class _MessageBusRunProjection:
 
     async def _append_response(self, fragment: str) -> None:
         if self._assistant is not None and self._response_stream is None:
-            return
+            if not self._response_reopen_allowed:
+                return
+            self._response_stream = _CoalescedMarkdownStream(
+                Markdown.get_stream(self._assistant),
+                content_changed=self._app._scroll_to_latest,
+            )
+        self._response_reopen_allowed = False
         self._response_fragments.append(fragment)
         if self._assistant is None:
             self._assistant = await self._app._mount_assistant()
@@ -1430,6 +1440,7 @@ class _MessageBusRunProjection:
         self._reasoning_stream.write(fragment)
 
     async def _stop_response_stream(self) -> None:
+        self._response_reopen_allowed = False
         stream = self._response_stream
         self._response_stream = None
         if stream is not None:

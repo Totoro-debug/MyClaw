@@ -1841,6 +1841,37 @@ async def test_duplicate_or_late_model_completion_reconciles_grouped_candidate(
 
 
 @pytest.mark.asyncio
+async def test_reasoning_transition_reopens_the_completed_response_stream() -> None:
+    conversation = ToolMessageSequenceRunSource(
+        (
+            OutboundMessage("model_reasoning", "Reasoning A.", {"_stream_delta": True}),
+            OutboundMessage("model_reasoning", "", {"_stream_end": True}),
+            _response_delta("First answer."),
+            _response_segment(""),
+            OutboundMessage("model_reasoning", "Reasoning B.", {"_stream_delta": True}),
+            OutboundMessage("model_reasoning", "", {"_stream_end": True}),
+            _response_delta("Second answer."),
+            _response_segment(""),
+            _completed_response(),
+        )
+    )
+    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("inspect"), "enter")
+        await _wait_for_turn(app)
+
+        assistant_rows = list(app.query("#conversation-display > .assistant-row"))
+        assert len(assistant_rows) == 1
+        assert assistant_rows[0].query_one(Markdown).source == "First answer.Second answer."
+        activity = app.query_one(".agent-run-activity-content")
+        assert [markdown.source for markdown in activity.query(Markdown)] == [
+            "Reasoning A.",
+            "Reasoning B.",
+        ]
+
+
+@pytest.mark.asyncio
 async def test_late_delta_after_completed_candidate_does_not_reopen_its_stream() -> None:
     conversation = ToolMessageSequenceRunSource(
         (
