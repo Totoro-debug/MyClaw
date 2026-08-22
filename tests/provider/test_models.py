@@ -9,8 +9,31 @@ from myclaw.provider.models import (
     ModelUsage,
     ReasoningDelta,
     TextDelta,
+    last_assistant_message_index,
 )
 from myclaw.tools.tool_gateway import ModelToolCall
+
+
+def test_last_assistant_message_index_returns_the_last_assistant() -> None:
+    messages: list[dict[str, object]] = [
+        {"role": "user", "content": "First question"},
+        {"role": "assistant", "content": "First answer"},
+        {"role": "tool", "content": "Tool result"},
+        {"role": "assistant", "content": "Latest answer"},
+        {"role": "tool", "content": "Latest tool result"},
+    ]
+
+    assert last_assistant_message_index(messages) == 3
+
+
+def test_last_assistant_message_index_requires_an_assistant() -> None:
+    with pytest.raises(ValueError, match=r"^continuation requires an assistant message$"):
+        last_assistant_message_index(
+            [
+                {"role": "user", "content": "Question"},
+                {"role": "tool", "content": "Tool result"},
+            ]
+        )
 
 
 def test_model_usage_serializes_to_the_exact_contract_shape() -> None:

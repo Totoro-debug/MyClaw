@@ -31,6 +31,7 @@ from myclaw.provider.models import (
     ReasoningDelta,
     ReasoningEffort,
     TextDelta,
+    last_assistant_message_index,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -334,7 +335,9 @@ def _request_arguments(
     if messages and messages[0].get("role") == "system":
         system = messages[0].get("content", "")
         messages = messages[1:]
-    continuation_index = _last_assistant_index(messages) if continuation is not None else None
+    continuation_index = (
+        last_assistant_message_index(messages) if continuation is not None else None
+    )
     translated_messages = [
         _message_argument(
             message,
@@ -403,13 +406,6 @@ def _message_argument(
             ],
         }
     raise TypeError("Model message role is unsupported")
-
-
-def _last_assistant_index(messages: ModelMessages) -> int:
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "assistant":
-            return index
-    raise ValueError("continuation requires an assistant message")
 
 
 def _anthropic_continuation_content(

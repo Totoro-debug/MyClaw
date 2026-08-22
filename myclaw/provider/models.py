@@ -16,6 +16,14 @@ type ModelMessageDictionary = dict[str, Any]
 type ModelMessages = Sequence[ModelMessageDictionary]
 
 
+def last_assistant_message_index(messages: ModelMessages) -> int:
+    """Return the final assistant message position."""
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "assistant":
+            return index
+    raise ValueError("continuation requires an assistant message")
+
+
 @dataclass(frozen=True, slots=True)
 class ModelUsage:
     """Actual token usage reported by one model call."""

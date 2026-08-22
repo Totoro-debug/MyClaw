@@ -23,6 +23,7 @@ from myclaw.provider.models import (
     ReasoningDelta,
     ReasoningEffort,
     TextDelta,
+    last_assistant_message_index,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -335,7 +336,9 @@ def _request_arguments(
     provider_id: str,
     continuation: ModelContinuation | None,
 ) -> dict[str, object]:
-    continuation_index = _last_assistant_index(messages) if continuation is not None else None
+    continuation_index = (
+        last_assistant_message_index(messages) if continuation is not None else None
+    )
     arguments: dict[str, object] = {
         "max_tokens": max_output,
         "messages": [
@@ -380,13 +383,6 @@ def _continuation_from_reasoning(
     if not isinstance(reasoning, str) or not reasoning:
         return None
     return ModelContinuation(provider_id=provider_id, payload=reasoning)
-
-
-def _last_assistant_index(messages: ModelMessages) -> int:
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "assistant":
-            return index
-    raise ValueError("continuation requires an assistant message")
 
 
 def _openai_continuation_content(
