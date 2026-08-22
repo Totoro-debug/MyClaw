@@ -650,7 +650,7 @@ class AgentLoop:
                 tool_gateway=self._tool_gateway,
                 on_output=self._publish_runner_output,
                 confirmation=self._request_confirmation,
-                externalize_result=self._externalize_for_run(active_session),
+                externalize_result=self._result_externalizer_for(active_session),
                 cancel_requested=lambda: self._cancel_requested,
                 max_iterations=self._max_iterations,
             )
@@ -668,7 +668,7 @@ class AgentLoop:
                 "Agent Run Session increment failed code=persistence_error type={}",
                 type(failure).__name__,
             )
-            await self._publish_commit_failure(result)
+            await self._publish_commit_failure()
             return False
         try:
             active_session.persist()
@@ -689,20 +689,6 @@ class AgentLoop:
             status = route_status("chat")
             if isinstance(status, ModelRouteStatus):
                 self._last_foreground_route_status = status
-
-    def _externalize_for_run(
-        self,
-        active_session: Session,
-    ) -> Callable[[ToolResult], ToolResult] | None:
-        externalizer = self._result_externalizer_for(active_session)
-        if externalizer is None:
-            return None
-
-        def observe(result: ToolResult) -> ToolResult:
-            projected = result if externalizer is None else externalizer(result)
-            return projected
-
-        return observe
 
     def _result_externalizer_for(
         self,
@@ -786,7 +772,7 @@ class AgentLoop:
             )
         )
 
-    async def _publish_commit_failure(self, result: AgentRunnerResult) -> None:
+    async def _publish_commit_failure(self) -> None:
         error = ErrorInfo(
             "persistence_error",
             "The Conversation Session could not be updated.",
