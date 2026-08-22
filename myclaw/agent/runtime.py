@@ -73,10 +73,6 @@ class _RuntimeSchedulerOwner:
         self._active: MemoryTaskScheduler | ScheduleService | None = None
         self._aborted = False
 
-    def start(self) -> None:
-        self.prepare()
-        self.activate_prepared()
-
     def prepare(self) -> None:
         """Construct and validate the scheduler without starting owned tasks."""
         if self._aborted:
