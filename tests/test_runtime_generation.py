@@ -14,7 +14,13 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import SessionListingEntry
-from myclaw.provider.models import ModelContinuation, ModelStreamEvent, ReasoningEffort
+from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
+from myclaw.provider.models import (
+    ModelContinuation,
+    ModelResponse,
+    ModelStreamEvent,
+    ReasoningEffort,
+)
 from myclaw.session.session import Session
 from myclaw.terminal.conversation import TerminalConversationApp
 from myclaw.tools.base import OpenAIToolSchema
@@ -65,6 +71,45 @@ class GatedProvider(RuntimeProvider):
         self.close_started.set()
         await self.release_close.wait()
         self.close_finished.set()
+
+
+class GatedMemoryProvider(RuntimeProvider):
+    def __init__(self) -> None:
+        super().__init__(())
+        self.memory_started = asyncio.Event()
+        self.release_memory = asyncio.Event()
+        self.close_order: list[str] = []
+
+    async def complete(
+        self,
+        *,
+        messages: Sequence[dict[str, object]],
+        tools: Sequence[OpenAIToolSchema],
+        model: str,
+        max_output: int,
+        temperature: float,
+        reasoning_effort: ReasoningEffort | None,
+        timeout: int,
+        continuation: ModelContinuation | None = None,
+    ) -> ModelResponse:
+        self.memory_started.set()
+        await self.release_memory.wait()
+        response = await super().complete(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_output=max_output,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+            continuation=continuation,
+        )
+        self.close_order.append("dream finished")
+        return response
+
+    async def close(self) -> None:
+        self.close_order.append("router closed")
+        await super().close()
 
 
 def _host(
@@ -187,6 +232,42 @@ async def test_abort_interrupts_an_in_progress_normal_close_before_final_session
 
     await runtime.close()
     assert not session_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_normal_close_waits_for_an_in_progress_dream_before_closing_the_router(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = GatedMemoryProvider()
+    host = _host(agent_home, workspace, provider)
+    runtime = host.generation
+    summaries = WorkspaceJsonlSummaryStore(runtime.session.workspace_state)
+    await summaries.append("Pending summary for Long-term Memory.", NOW)
+    dream = asyncio.create_task(runtime.management_dispatcher.dispatch("/dream"))
+    await asyncio.wait_for(provider.memory_started.wait(), timeout=2)
+
+    closing = asyncio.create_task(runtime.close())
+    for _ in range(10):
+        await asyncio.sleep(0)
+    close_returned_early = closing.done()
+    provider.release_memory.set()
+    result = await asyncio.wait_for(dream, timeout=2)
+    await asyncio.wait_for(closing, timeout=2)
+    provider.close_order.append("runtime close returned")
+
+    assert not close_returned_early
+    assert result.output == (
+        "Processed 1 summary; Long-term Memory unchanged.\n"
+        "processed_count: 1\n"
+        "memory_updated: false\n"
+        "cursor: 1"
+    )
+    assert provider.close_order == [
+        "dream finished",
+        "router closed",
+        "runtime close returned",
+    ]
 
 
 @pytest.mark.asyncio

@@ -323,6 +323,11 @@ class PreparedRuntime:
             failures.extend(result for result in results if isinstance(result, BaseException))
 
             try:
+                await self._memory_manager.wait_until_idle()
+            except BaseException as error:
+                failures.append(error)
+
+            try:
                 await self._router.close()
             except BaseException as error:
                 failures.append(error)

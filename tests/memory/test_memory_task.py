@@ -26,6 +26,7 @@ from myclaw.memory.memory_task import (
     RuntimeMemory,
     WorkspaceFileMemoryStore,
 )
+from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
@@ -280,6 +281,38 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
     )
     assert provider.complete_requests == []
     assert not (agent_home / "logs").exists()
+
+
+@pytest.mark.asyncio
+async def test_wait_until_idle_returns_for_idle_and_current_memory_tasks(
+    agent_home: Path,
+) -> None:
+    class SelfWaitingSummaries:
+        manager: MemoryManager | None = None
+
+        async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]:
+            del cursor, limit
+            assert self.manager is not None
+            await self.manager.wait_until_idle()
+            return ()
+
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = _state(home)
+    summaries = SelfWaitingSummaries()
+    manager = MemoryManager(
+        router=_router(ScriptedFakeProvider()),
+        summaries=summaries,
+        memory=WorkspaceFileMemoryStore(state),
+        long_term_path=state.long_term_memory_path,
+        batch_size=10,
+    )
+    summaries.manager = manager
+
+    await manager.wait_until_idle()
+    result = await manager.run_manual()
+
+    assert result.status == "No pending summaries"
 
 
 @pytest.mark.asyncio

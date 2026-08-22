@@ -299,6 +299,13 @@ class MemoryManager:
         if task is not None and not task.done():
             task.cancel()
 
+    async def wait_until_idle(self) -> None:
+        """Wait for an in-flight Memory Task without cancelling its work."""
+        task = self._task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        await asyncio.shield(task)
+
     async def run_manual(self) -> MemoryTaskResult:
         with without_session_log():
             if self._aborted:
