@@ -2349,10 +2349,6 @@ class TerminalConversationApp(App[None]):
             self._promote_consumed_inputs(removed)
         self._refresh_pending_queue()
 
-    def _on_inbound_snapshot(self, snapshot: tuple[InboundMessage, ...]) -> None:
-        """Keep the direct test seam generation-bound as well as the host seam."""
-        self._on_inbound_snapshot_for(self._bus, snapshot)
-
     def _promote_consumed_inputs(self, count: int) -> None:
         promoted = False
         for _ in range(count):
@@ -2459,17 +2455,6 @@ class TerminalConversationApp(App[None]):
         if not self._closing:
             with suppress(Exception):
                 input_area.focus()
-
-    def _on_confirmation_requested(self, request: ConfirmationRequestView) -> None:
-        if self._closing:
-            return
-        self.post_message(
-            self.ConfirmationRequested(
-                request,
-                control=self._control,
-                bus=self._bus,
-            )
-        )
 
     @on(ConfirmationRequested)
     def _confirmation_requested(self, message: ConfirmationRequested) -> None:
