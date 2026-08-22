@@ -27,7 +27,7 @@ from myclaw.agent.runner import (
     _build_assistant_repair_message,
 )
 from myclaw.agent.workspace import Workspace
-from myclaw.errors import ErrorInfo
+from myclaw.errors import TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.logging.session import session_log
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouteStatus
@@ -115,9 +115,6 @@ class TerminalAgentLoopControl(AgentLoopControl, Protocol):
 
 
 type ConfirmationCallback = Callable[[ConfirmationRequestView], None]
-
-_CANCELLED_MESSAGE = "MyClaw 已取消本轮对话。"
-
 
 @dataclass(slots=True)
 class _PendingConfirmation:
@@ -630,7 +627,9 @@ class AgentLoop:
         except asyncio.CancelledError:
             if not self._cancel_requested:
                 raise
-            await self._publish_preparation_failure(ErrorInfo("turn_cancelled", _CANCELLED_MESSAGE))
+            await self._publish_preparation_failure(
+                ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
+            )
             return False
         except ModelCallError as failure:
             await self._publish_preparation_failure(failure.error)
@@ -658,7 +657,9 @@ class AgentLoop:
         except asyncio.CancelledError:
             if not self._cancel_requested:
                 raise
-            await self._publish_preparation_failure(ErrorInfo("turn_cancelled", _CANCELLED_MESSAGE))
+            await self._publish_preparation_failure(
+                ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
+            )
             return False
 
         try:

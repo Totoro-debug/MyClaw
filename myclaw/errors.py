@@ -58,6 +58,8 @@ STABLE_ERROR_CODES: frozenset[str] = frozenset(
     }
 )
 
+TURN_CANCELLED_MESSAGE = "MyClaw 已取消本轮对话。"
+
 
 @dataclass(frozen=True, slots=True)
 class ErrorInfo:

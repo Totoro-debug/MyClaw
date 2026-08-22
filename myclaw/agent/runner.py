@@ -10,7 +10,7 @@ from typing import Any, ClassVar, Literal, Protocol
 
 from loguru import logger
 
-from myclaw.errors import ErrorInfo
+from myclaw.errors import TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     ModelCompleted,
@@ -41,9 +41,6 @@ _MAX_ITERATIONS_MESSAGE = (
     "MyClaw 本轮对话已经达到最大循环次数，仍没有输出最终结果。"  # noqa: RUF001
     "可以再次尝试本次请求或者尝试给出更明确的任务目标。"
 )
-_CANCELLED_MESSAGE = "MyClaw 已取消本轮对话。"
-
-
 @dataclass(frozen=True, slots=True)
 class AgentRunnerResponseSegmentEnd:
     """End of one contiguous Provider-visible reasoning or response segment."""
@@ -472,7 +469,7 @@ def _cancelled_result(
         final_content=final_content,
         usage=usage,
         finish_reason="cancelled",
-        error=ErrorInfo("turn_cancelled", _CANCELLED_MESSAGE),
+        error=ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE),
     )
 
 
