@@ -116,6 +116,7 @@ class TerminalAgentLoopControl(AgentLoopControl, Protocol):
 
 type ConfirmationCallback = Callable[[ConfirmationRequestView], None]
 
+
 @dataclass(slots=True)
 class _PendingConfirmation:
     request: ConfirmationRequest

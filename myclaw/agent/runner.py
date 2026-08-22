@@ -41,6 +41,8 @@ _MAX_ITERATIONS_MESSAGE = (
     "MyClaw 本轮对话已经达到最大循环次数，仍没有输出最终结果。"  # noqa: RUF001
     "可以再次尝试本次请求或者尝试给出更明确的任务目标。"
 )
+
+
 @dataclass(frozen=True, slots=True)
 class AgentRunnerResponseSegmentEnd:
     """End of one contiguous Provider-visible reasoning or response segment."""
