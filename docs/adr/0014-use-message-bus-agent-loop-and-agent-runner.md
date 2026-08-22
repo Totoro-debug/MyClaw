@@ -4,6 +4,10 @@ status: accepted
 
 # Use Message Bus, Agent Loop, and Agent Runner
 
+> Historical context boundary: the Context paragraph records the pre-migration
+> architecture that motivated this decision. `AgentRun` in that paragraph is the old
+> implementation type; current `Agent Run` is only the domain execution concept.
+
 ## Context
 
 The current interactive path combines product orchestration, the model-and-Tool loop,
@@ -113,3 +117,34 @@ This decision supersedes the Conversation Port and Agent Event portions of ADR-0
 and ADR-0013, and the ordinary no-retry and close-only persistence portions of
 ADR-0009. ADR-0010's fixed Tool catalog remains in force; only construction ownership
 moves into Agent Loop.
+
+## Amendment: final post-#172 runtime state (#173)
+
+Issue #172 is the accepted implementation of the Runtime Generation replacement, and
+this amendment records the final current facts rather than reopening the decision:
+
+- `RuntimeHost` prepares and validates an unstarted target generation before synchronously
+  aborting the old one; terminal unbind/rebind and target start occur only after target
+  preparation succeeds. Same-session replacement is a no-op.
+- `PreparedRuntime.close()` is the normal awaited lifecycle and `PreparedRuntime.abort()`
+  is the synchronous forced-switch lifecycle. Abort calls `Session.abandon()`, cancels
+  generation-owned work without awaiting repair or persistence, and leaves detached
+  Provider cleanup best effort with failure logging only.
+- Message Bus exposes only its six async queue operations and one synchronous Inbound
+  callback binding. It has no independent close, abort, replay, broadcast, version, or
+  backpressure lifecycle.
+- If cancellation is requested after the fiftieth response's Tools finish, normal
+  cancellation wins; otherwise the Runner returns `agent_iteration_limit` without a
+  fifty-first model call.
+- The generation owns fresh Schedule Store/Service, Message Bus, Router, Runtime Memory,
+  Memory scheduler, Agent Loop, fixed Tools, shared Gateway/Runner, and Management
+  services. Agent Home, Workspace, configuration, Provider factory, clocks, and Terminal
+  application are process-level inputs reused across generations.
+- Schedule Service remains the only Store/management owner. Foreground and Schedule use
+  the same Gateway/Runner identities but isolated Session, context, cancellation, and
+  externalizer state. Schedule has no foreground Message Bus projection, passes
+  `confirmation=None`, and resets its recursive-add ContextVar token in `finally`.
+
+ADR-0010's fixed Tool catalog remains authoritative. No compatibility alias restores the
+deleted transport or lifecycle names, and no Python `AgentRun` class is part of the
+current package.

@@ -2,7 +2,7 @@
 
 ## Problem Statement
 
-用户需要一个参考 nanobot、但边界更加清晰的通用 Personal Agent。它应当是 local-first、single-user 的本地运行时，以命令行 REPL 为主要入口，支持持续前台运行、三层记忆、工具调用、Workspace 级会话隔离、模型路由、用户配置和自然语言定时任务。
+用户需要一个参考 nanobot、但边界更加清晰的通用 Personal Agent。它应当是 local-first、single-user 的本地运行时，以全屏 Terminal Conversation 为主要入口，支持持续前台运行、三层记忆、工具调用、Workspace 级会话隔离、模型路由、用户配置和自然语言定时任务。
 
 首版必须避免演变为多租户 Agent 平台、微服务系统、插件平台或后台 daemon。上层只依赖明确的代码接口边界，不需要了解底层模型 SDK、文件格式或工具实现。
 
@@ -10,20 +10,55 @@
 
 实现一个 Python 编写的 MyClaw Personal Agent runtime：
 
-- 用户运行 `myclaw` 进入长驻前台 REPL。
-- 每个有效 REPL 启动准备一个新的 Workspace-scoped Conversation Session；未发送用户消息就退出时不持久化空 session。
-- Runtime Core 通过 MessageBus、AgentLoop、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界编排 Agent Run。
+- 用户运行 `myclaw` 进入长驻前台 Terminal Conversation；非-TTY 启动以 `interactive_terminal_required` 拒绝，不回退到 headless prompt。
+- 每个有效 Terminal Conversation 启动准备一个新的 Workspace-scoped Conversation Session；未发送用户消息就退出时不持久化空 session。
+- Agent Loop 通过 Message Bus、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界编排 Agent Run；RuntimeHost 负责 Runtime Generation 生命周期。
 - Agent Home 固定为 `~/.myclaw/`，采用 file-first persistence。
-- REPL 支持 streaming、后台 Memory Task、Schedule Jobs、session resume 和管理 slash commands；Schedule actions 不请求 Tool Confirmation，Exec、Web 和 Workspace 外部路径按具体目标执行一次性确认。
+- Terminal Conversation 支持 streaming、前台 Agent Run 期间的 Inbound FIFO 排队、后台 Memory Task、Schedule Jobs、Session resume 和管理 slash commands；Schedule actions 不请求 Tool Confirmation，Exec、Web 和 Workspace 外部路径按具体目标执行一次性确认。
 - 首版非交互管理只支持 `myclaw config`，不支持 one-shot 对话。
+
+## Final runtime migration contract (#163–#173)
+
+以下是当前实现与发布验收使用的最终边界；历史实施计划中的旧 transport/type 名称不属于
+当前 API：
+
+- 一个 Agent Loop 拥有一个无界 FIFO Message Bus。公开的六个 async 操作是
+  `inbound_snapshot()`、`put_inbound()`、`get_inbound()`、`drain_inbound()`、
+  `put_outbound()`、`get_outbound()`；Inbound mutation 在释放 queue coordination 后把
+  immutable snapshot 同步交给一个 callback。Outbound 只有 `model_reasoning`、
+  `model_response`、`tool_call`、`system_control` 四种 type，使用互斥的 `_stream_delta`、
+  `_stream_end`、`_streamed` 三种 sparse marker；它只有一个 Terminal consumer，Tool
+  result、Schedule output、Memory Task output 永不进入 Outbound。Message Bus 没有独立
+  close、abort、replay、broadcast、version 或 backpressure lifecycle。
+- Agent Runner 的 constructor 只拥有 Model Router；它返回本次调用的 assistant/Tool
+  increment、final content、四字段 usage、finish reason 和 optional `ErrorInfo`。一次
+  iteration 是一次 model call 加该响应的全部顺序 Tool calls，Provider retry 不计数；
+  default/minimum `runtime.max_iterations` 为 50。第 50 次完成全部 Tools；若此时没有请求
+  normal cancellation，则返回 `agent_iteration_limit` 且不发起第 51 次 model call，取消
+  请求优先。`agent_iteration_limit` 与最大循环固定中文文案、`turn_cancelled` 与
+  `MyClaw 已取消本轮对话。` 均见 `CONTEXT.md` 和 runtime contracts。Provider-visible
+  reasoning 只保留 Provider 返回内容；opaque continuation 只在同一 Tool loop 内传递，
+  不进入 Session 或 Outbound。
+- Schedule Service 是唯一 Store/management owner；它在 Agent Loop 前创建，随后绑定
+  `on_schedule_job(job) -> None` callback。Foreground 与 Schedule 共享同一 Gateway/Runner
+  identity，但拥有独立 Session、context、cancel 和 externalizer state；Schedule 没有
+  confirmation channel 或 foreground Message Bus projection，使用 `confirmation=None`，并用
+  ContextVar token/finally 阻止递归 add。Schedule Artifact root 与 reference shape 保持不变。
+- 普通 Session snapshot 按顺序最多三次异步写入（失败后 `100 ms`、`200 ms` backoff）；
+  normal awaited close 仍做最多三次 final save；`Session.abandon()` 同步取消 pending
+  snapshots、禁止后续修改且不做 final save。`PreparedRuntime.abort()` 是 forced replacement
+  的同步生命周期，`RuntimeHost` 先 validate unstarted target 再 abort/rebind/start；旧
+  generation 的 detached Provider cleanup 是 best effort，已接受其不修复 active work、
+  可能丢失未持久化状态、Tool/Artifact orphan、Memory cursor skip、Schedule at-least-once
+  side effect 和 uptime reset 后果。
 
 ## User Stories
 
 1. 作为个人用户，我想在本地运行 MyClaw，所以我的个人 Agent 不依赖多租户平台。
-2. 作为个人用户，我想运行 `myclaw` 直接进入 REPL，所以命令行对话是自然的默认入口。
-3. 作为个人用户，我想在一个 REPL 中连续多轮对话，所以当前线程可以保留 Short-term Memory。
-4. 作为个人用户，我想每次有效 REPL 启动默认准备新 session，所以不同对话不会自动混在一起。
-5. 作为个人用户，我不想空 REPL 留下 session 文件，所以未发送消息时退出不会产生垃圾会话。
+2. 作为个人用户，我想运行 `myclaw` 直接进入 Terminal Conversation，所以命令行对话是自然的默认入口。
+3. 作为个人用户，我想在一个 Terminal Conversation 中连续多轮对话，所以当前线程可以保留 Short-term Memory。
+4. 作为个人用户，我想每次有效 Terminal Conversation 启动默认准备新 session，所以不同对话不会自动混在一起。
+5. 作为个人用户，我不想空 Terminal Conversation 留下 session 文件，所以未发送消息时退出不会产生垃圾会话。
 6. 作为个人用户，我想 session 按 Workspace 分组，所以不同项目的对话彼此隔离。
 7. 作为个人用户，我想通过 `/resume` 的交互式 picker 恢复当前 Workspace 的历史 session，所以可以继续旧对话。
 8. 作为个人用户，我想在 picker 中看到 session 标题和时间，所以可以识别需要恢复的对话。
@@ -31,7 +66,7 @@
 10. 作为个人用户，我想标题生成失败时仍有可读标题，所以 session 创建不会因辅助模型调用失败。
 11. 作为个人用户，我想主对话始终 streaming，所以能及时看到模型输出。
 12. 作为个人用户，我想 Ctrl+C 只取消当前 turn，所以后台任务不会被误取消。
-13. 作为个人用户，我想输入 `exit` 或 `quit` 退出 REPL，所以退出行为明确。
+13. 作为个人用户，我想输入 `exit` 或 `quit` 退出 Terminal Conversation，所以退出行为明确。
 14. 作为个人用户，我想 `/config` 查看当前配置，所以可以确认 runtime 和模型设置。
 15. 作为个人用户，我想 API key 在配置输出中默认脱敏，所以终端内容不会轻易泄露密钥。
 16. 作为个人用户，我想 `/status` 查看版本、chat model、运行时间、token 和 session 状态，所以可以理解当前 runtime 状况。
@@ -58,10 +93,10 @@
 37. 作为个人用户，我想具体 route 不可用时 fallback 到 default，所以系统有统一兜底。
 38. 作为个人用户，我想支持 Anthropic 和 OpenAI-compatible provider，所以可以使用不同模型服务。
 39. 作为个人用户，我想首次运行自动生成配置模板，所以能知道需要填写哪些内容。
-40. 作为个人用户，我想配置无效时 `myclaw` 明确退出，所以不会进入半可用 REPL。
+40. 作为个人用户，我想配置无效时 `myclaw` 明确退出，所以不会进入半可用 Terminal Conversation。
 41. 作为个人用户，我想仍可运行 `myclaw config` 查看坏配置，所以可以定位配置问题。
-42. 作为开发者，我想 Runtime Core 只负责编排，所以具体模型、工具和存储实现可以替换。
-43. 作为开发者，我想 MessageBus 提供 typed inbound/outbound messages，AgentLoop 提供独立 control seam，所以 CLI 只负责交互和渲染。
+42. 作为开发者，我想 Agent Loop 只负责编排，所以具体模型、工具和存储实现可以替换。
+43. 作为开发者，我想 Message Bus 提供 typed inbound/outbound messages，Agent Loop 提供独立 control seam，所以 CLI 只负责交互和渲染。
 44. 作为开发者，我想 Management Port 处理管理命令，所以管理操作不会伪装成聊天。
 45. 作为开发者，我想 Tool Gateway 统一解析、prepare、拒绝、单次执行和结果封装，所以工具行为保持一致。
 46. 作为开发者，我想 provider adapter 使用官方 SDK，所以 streaming、tool calls 和错误语义更可控。
@@ -74,19 +109,20 @@
 
 - 产品边界是 local-first、single-user 的 Personal Agent，不是多租户平台。
 - 首版实现语言为 Python 3.12+，采用 `pyproject.toml` 和仓库根目录下的 `myclaw/` 包布局，CLI 使用 Typer + Rich，并以 asyncio 作为并发基础。
-- 运行 `myclaw` 不带参数直接进入 REPL。
+- 运行 `myclaw` 不带参数直接进入 Terminal Conversation。
 - 首版没有 one-shot 对话命令、detached daemon、HTTP server 或 IPC server。
-- 每个 REPL invocation 创建一个独立 runtime。
+- 每个 Terminal Conversation invocation 创建一个独立 Runtime Lifetime；它在任一时刻拥有
+  一个 active Runtime Generation，并可在成功切换 Conversation Session 时替换该 generation。
 - 用户消息进入前台队列并串行执行；Memory Task 和 Schedule Jobs 在同一 runtime 内异步运行。
 - Ctrl+C 只取消当前前台 turn。
-- 输入 `exit` 或 `quit`（忽略前后空白、大小写不敏感）退出 REPL并立即取消后台任务。
-- 多个 REPL 可在同一 Workspace 运行，但首版不做跨进程协调；每个 runtime 独立启动后台调度器。
+- 输入 `exit` 或 `quit`（忽略前后空白、大小写不敏感）退出 Terminal Conversation 并立即取消后台任务。
+- 多个 Terminal Conversation 可在同一 Workspace 运行，但首版不做跨进程协调；每个 Runtime Generation 独立启动后台调度器。
 
 ### CLI and management
 
 - 非交互管理首版只支持 `myclaw config`。
 - 首版不要求 `myclaw --help` 作为产品能力。
-- REPL 内置 slash commands：`/config`、`/status`、`/resume`、`/memory`、`/dream`。
+- Terminal Conversation 内置 slash commands：`/config`、`/status`、`/resume`、`/memory`、`/dream`。
 - 只有内置 slash commands 进入 Management Port；其它 `/` 开头文本作为普通用户消息发送给模型。
 - `/config` 完整显示配置，但脱敏 plaintext API key。
 - 配置语法错误时，`myclaw config` 显示解析错误、配置路径和原文，并对明显 API key 行做文本级脱敏。
@@ -100,7 +136,7 @@
 ### Agent Home and persistence
 
 - Agent Home 固定为 `~/.myclaw/`，不支持覆盖或多个 profile。
-- 有效 REPL 启动在当前 Workspace 创建 `.myclaw/`、`memory/`、`sessions/` 和 Long-term Memory template；`myclaw config` 只处理 Agent Home。
+- 有效 Terminal Conversation 启动在当前 Workspace 创建 `.myclaw/`、`memory/`、`sessions/` 和 Long-term Memory template；`myclaw config` 只处理 Agent Home。
 - 技术诊断按 Conversation Session 写入 Workspace-owned Session Log；不维护 Agent Home 或 Workspace 级全局 Runtime Log。
 - 每种 Workspace State 写入遵守自身明确的持久化契约；只有声明 atomic replacement 的 Store 承诺原子发布，Tool Artifact 直接写入。Conversation Session 在 turn 完成后以完整 JSONL snapshot 一次 replacement。
 - User Configuration 位于 `~/.myclaw/config.toml`。
@@ -121,7 +157,7 @@
 - 后续行是 JSON-native OpenAI-style user、assistant、tool message dictionaries，公共字段为 role、content、local-time timestamp；不含通用 message ID、line type marker 或 schema version。
 - 每次 Session mutation 的持久化都是完整 compact JSONL atomic replacement；turn 内只改 active Session memory，terminal work 后 `persist()` ordered async scheduling，shutdown 由 `close()` bounded synchronous retry。
 - 普通异步 persistence failure 静默吞掉，不提供 acknowledgement、failure logging 或 stronger crash consistency；同一 runtime 内保证 snapshot order，不提供跨进程保护。
-- 新 REPL 准备新 session；第一条 user message 之前退出不持久化 session。
+- 新 Terminal Conversation 准备新 session；第一条 user message 之前退出不持久化 session。
 - Session title 在首条用户输入后异步使用 chat route 生成，不阻塞首轮回复。
 - 标题生成失败时使用截断的首条用户消息作为 fallback。
 - 生成标题和 fallback 都折叠空白并截断为最多 60 个 Unicode code points；结果为空时使用 `Untitled session`。
@@ -156,7 +192,7 @@
 - Memory Task 没有调用 `edit_file` 时视为 no update 并推进 Summary Cursor。
 - 需要编辑且成功时推进 cursor；编辑失败时不推进。
 - Memory Task 在单 runtime 内不重入：周期触发遇到运行中任务则跳过，`/dream` 遇到运行中任务则拒绝并提示。
-- 周期 Memory Task 成功或失败都不通知 REPL；手动 `/dream` 输出摘要状态。
+- 周期 Memory Task 成功或失败都不通知 Terminal Conversation；手动 `/dream` 输出摘要状态。
 - 主 Agent 的固定 file Tools 可访问 Workspace 内全部路径，包括 Workspace State；实际文件结果服从操作系统权限。Memory Task 仍只使用它的专用 Long-term Memory Tool。
 - Conversation Summary 在 global summary lock 内完成自己的 summary stream operation 后直接更新 active Session 的 `last_consolidated`；没有 pending journal 或启动恢复协议。crash 后 Summary 与 Session snapshot 可 divergence，且不提供跨进程协调。
 
@@ -167,7 +203,7 @@
 - `memory` 用于 Conversation Summary 和 Memory Task。
 - `schedule` 用于 Schedule Jobs。
 - 具体 route 缺失或不可用时总是 fallback 到 `default`。
-- `default` 不可用时，REPL 启动失败。
+- `default` 不可用时，Terminal Conversation 启动失败。
 - 每个 route 配置 provider_id、model、context_window、max_output、temperature、reasoning_effort、timeout。
 - provider adapter 对不支持的 reasoning_effort 静默忽略。
 - 每个逻辑 model call 最多执行 5 个 provider attempts，不是首次调用后再重试 5 次；requested route 与 default fallback 共享该 attempt budget。
@@ -177,6 +213,9 @@
 - 未知 protocol 的 provider 被忽略；引用它的 route 视为不可用并执行 fallback。
 - Anthropic adapter 使用官方 Anthropic SDK；OpenAI-compatible adapter 使用官方 OpenAI SDK。
 - chat route 的每次输出都必须 streaming；schedule 不要求 streaming。
+- `runtime.max_iterations` 缺省为 `50`，只接受非 `bool` 的 integer 且最小为 `50`，没有配置上限。
+- Anthropic thinking/signature 与 OpenAI-compatible `reasoning_content` 的 Provider-visible
+  reasoning 映射保持顺序；没有 reasoning 时不合成事件，opaque continuation 不进入 Session。
 
 ### User Configuration
 
@@ -188,12 +227,12 @@
 - 配置缺失时，只创建一个 ID 为 `openai-local` 的 OpenAI-compatible provider 模板（base URL、API key 和 model list 为空），并为 `default`、`chat`、`memory`、`schedule` 创建显式但不可用的 route 待填写段；四个 route 初始都引用 `openai-local`。随后退出并提示用户替换 Provider、model 和模型限制，或删除不需要定制的具体 route 以回退到 default；旧配置完全缺少 default route 时，错误消息必须指出 `[models.routes.default]`。
 - OpenAI-compatible provider 模板的 base_url 为空；所有 provider 的有效配置都要求 base_url。
 - `myclaw config` 在配置缺失时创建默认配置并显示脱敏内容。
-- 配置无法解析、模型配置不完整或 default route 不可用时，`myclaw` 启动 REPL 直接退出并显示用户可见错误。
+- 配置无法解析、模型配置不完整或 default route 不可用时，`myclaw` 启动 Terminal Conversation 直接退出并显示用户可见错误。
 - 不支持 Agent profile、session override、per-chat settings 或用户配置 identity/system prompt。
 
 ### Tool Gateway and fail-closed security
 
-- 所有 capability 都是具体 `BaseTool`；Runtime Core 在启动时注入稳定依赖并将完整 Tool Catalog 一次性注册到 Tool Gateway。
+- 所有 capability 都是具体 `BaseTool`；Agent Loop 在初始化时创建固定十工具 Catalog 和共享 Tool Gateway，Schedule Service 只拥有 Schedule Store/management boundary。
 - `BaseTool.to_schema()` 从直接公开注解、显式 required、默认值和 `ToolParam` 生成 OpenAI Function Calling schema；Model Request 保存缓存的 typed snapshot，Anthropic adapter 在内部转换。
 - `ToolGateway.call()` 是唯一公开入口，负责 raw JSON 解析、调用 BaseTool 固定 cast/Schema/参数/安全管线、一次性 Tool Confirmation、执行和扁平 Tool Result 封装；没有 dynamic registration、plugin/MCP、generic retry、per-call execution context 或 approval flag。
 - `ModelToolCall.arguments` 保留原始 JSON string；Tool Result 仅含 call ID、name、status、content 和可选 artifact/confirmation metadata，不含 nested error。
@@ -230,12 +269,12 @@
 - 同一 Job 在单 runtime 内不重入；不同 Job 可并发；不做跨进程协调，因此多个 runtime 可能重复触发。
 - Schedule 只在 runtime 存活时运行，不发送前台 OutboundMessage、完成提示或通知。
 - legacy scheduled-work state 原样保留且永不读取、检测、迁移、重命名或删除。
-- 损坏的 Schedule state 在 scheduler 和 REPL 启动前以 `schedule_state_error`、修复提示和路径阻止 Runtime 启动。
+- 损坏的 Schedule state 在 scheduler 和 Terminal Conversation 启动前以 `schedule_state_error`、修复提示和路径阻止 Runtime 启动。
 
 ## Testing Decisions
 
 - 测试只验证外部可观察行为，不绑定内部实现细节。
-- 优先测试最高 seam：MessageBus/AgentLoop、Management Port、PreparedRuntime、Memory Manager、Tool Gateway、active Session、Model Router/Provider Adapter。
+- 优先测试最高 seam：Message Bus/Agent Loop、Management Port、PreparedRuntime、Memory Manager、Tool Gateway、active Session、Model Router/Provider Adapter。
 - 测试使用 fake provider、fake tool、临时 Agent Home 和临时 Workspace，不调用真实模型 API。
 
 ### Required memory tests
@@ -254,7 +293,7 @@
 ### Required session tests
 
 - Session ID、Workspace-owned 文件路径、strict header 第一行和 JSON-native OpenAI-style messages。
-- 空 REPL 不持久化 session。
+- 空 Terminal Conversation 不持久化 session。
 - `/resume` 只列当前 Workspace sessions，并正确切换。
 - 每轮一次完整 JSONL replacement、snapshot freeze 和同 runtime ordered persistence。
 - empty Session lazy materialization、silent ordinary failure、bounded close retry 与 host filesystem fault seam。
@@ -281,8 +320,8 @@
 - `myclaw config` 的生成、完整展示和 API key 脱敏。
 - `/config`、`/status`、`/resume`、`/memory`、`/dream`。
 - 非内置 `/...` 文本发送给模型。
-- Ctrl+C、`exit`、`quit` 和 REPL 退出取消后台任务。
-- 多 REPL 不协调行为不应被测试误认为有跨进程锁保证。
+- Ctrl+C、`exit`、`quit` 和 Terminal Conversation 退出取消后台任务。
+- 多 Terminal Conversation 不协调行为不应被测试误认为有跨进程锁保证。
 
 ## Out of Scope
 
@@ -290,7 +329,7 @@
 - channel-first bot 平台。
 - one-shot 对话命令或 one-shot runtime。
 - detached daemon、系统服务、HTTP 或 IPC server。
-- 多 REPL、同 session、Memory Task、Schedule Job 的跨进程协调或锁。
+- 多 Terminal Conversation、同 session、Memory Task、Schedule Job 的跨进程协调或锁。
 - 微服务拆分。
 - MCP 工具扩展。
 - subagent/spawn 或多 Agent 编排。

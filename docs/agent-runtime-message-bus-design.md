@@ -1,11 +1,54 @@
 # Agent Message Bus and Runtime Refactoring Plan
 
-Status: design confirmed; legacy transport/runtime projection removal is implemented through Issue #171; Runtime Generation replacement remains Issue #172.
+Status: historical migration plan; Issues #163–#172 implemented the target architecture and
+Issue #173 records the release-ready current state below.
 
 This document retains the migration baseline and target-architecture record. References
 to legacy transport names below describe the pre-#171 comparison or deletion plan;
 the normative current contracts are in `docs/myclaw-runtime-contracts.md` and
 `CONTEXT.md`.
+
+## Current final state (#173)
+
+The plan below is retained for migration traceability. The active implementation and
+release evidence use these final facts:
+
+- Foreground production has one path: Terminal Conversation -> one Agent Loop -> one
+  Agent Runner, with one Agent Loop-owned Message Bus. Message Bus exposes exactly
+  `inbound_snapshot`, `put_inbound`, `get_inbound`, `drain_inbound`, `put_outbound`, and
+  `get_outbound`; Inbound mutations call one synchronous callback after releasing queue
+  coordination. Outbound is an unbounded FIFO with one Terminal consumer and only
+  `model_reasoning`, `model_response`, `tool_call`, and `system_control` messages.
+  Message Bus has no independent close, abort, replay, broadcast, version, or
+  backpressure lifecycle.
+- The sparse markers are mutually exclusive `_stream_delta`, `_stream_end`, and
+  `_streamed`. Tool calls carry the complete raw argument text; Tool results, Schedule
+  output, and Memory Task output never enter Outbound.
+- Agent Runner owns only Model Router, returns only its assistant/Tool increment, final
+  content, four-field usage, finish reason, and optional `ErrorInfo`, and treats one
+  model call plus all sequential Tool calls as one iteration. Provider retries do not
+  consume iterations. `runtime.max_iterations` defaults to and cannot be below `50`;
+  iteration 50 finishes all Tools and, unless normal cancellation has been requested,
+  returns the fixed `agent_iteration_limit` result without call 51. Cancellation takes
+  priority. Provider-visible reasoning is distinct from ordinary text; opaque
+  continuation stays inside the same Tool loop and never enters Session or Outbound.
+- Schedule Service is the only Store/management owner. It is created before Agent Loop;
+  Agent Loop creates the fixed catalog, one shared Gateway and one Runner, then binds
+  `on_schedule_job(job) -> None`. Foreground and Schedule share Gateway/Runner identity
+  but isolate Session, context, cancellation, and externalizer state. Schedule has no
+  confirmation channel or foreground Message Bus projection, uses `confirmation=None`,
+  and resets its recursive-add ContextVar token in `finally`; the Schedule Artifact root
+  and three-field reference shape are unchanged.
+- Ordinary Session snapshots are ordered complete replacements with at most three async
+  attempts and `100 ms`/`200 ms` backoff. Normal awaited close performs its bounded final
+  save; `Session.abandon()` is synchronous, idempotent, cancels pending snapshots, and
+  performs no final save. `PreparedRuntime.close()` is normal awaited shutdown while
+  `PreparedRuntime.abort()` is forced synchronous replacement. RuntimeHost validates the
+  target before abort/rebind/start; detached Provider cleanup is best effort and the
+  accepted loss/at-least-once tradeoffs are documented in the current contracts.
+
+Legacy names in the historical sections are quoted only to identify what was removed by
+#171. They do not describe active classes, imports, exports, or runtime paths.
 
 ## 1. Objective
 
@@ -21,29 +64,28 @@ At the same time, replace `ConversationPort` and `AgentEvent` transport with one
 isolate Schedule execution from foreground output, and make successful Session switches
 replace the entire Session-bound Runtime Generation.
 
-## 2. Code facts and impact baseline
+## 2. Historical pre-#163 code facts and impact baseline
 
-The implementation plan is based on the current repository rather than a proposed
-greenfield structure:
+The original implementation plan was based on the repository before the migration,
+not on the current source tree:
 
-- `myclaw/agent/runtime.py` owns `PreparedReplRuntime`, composition, lifecycle, Session,
+- `myclaw/agent/runtime.py` historically owned `PreparedReplRuntime`, composition, lifecycle, Session,
   schedulers, router shutdown, and the deferred/switchable Conversation Port.
-- `myclaw/agent/run.py` contains the current unbounded `while True` model-and-Tool loop,
+- `myclaw/agent/run.py` historically contained the unbounded `while True` model-and-Tool loop,
   cancellation repair, Tool execution, and Agent Run payload emission.
-- `myclaw/agent/events.py` defines `AgentEvent`, its payload family, emitters, and
+- `myclaw/agent/events.py` historically defined `AgentEvent`, its payload family, emitters, and
   `ConversationPort`; CodeGraph reports five production/test call sites for the port.
-- CodeGraph reports nineteen `AgentRun` call sites and eight `PreparedReplRuntime` call
+- The pre-migration CodeGraph report counted nineteen `AgentRun` call sites and eight `PreparedReplRuntime` call
   sites. The affected tests span agent, terminal, schedule, memory, Session, and runtime
   shutdown suites.
-- `Session.persist()` currently chains complete snapshots in order but makes one silent
-  asynchronous write attempt. `Session.close()` already has a three-attempt bounded
-  final save.
-- Schedule currently has its own service/store boundary and reuses the Agent path, but
+- The pre-migration `Session.persist()` chained complete snapshots in order but made one
+  silent asynchronous write attempt; the current contract adds three-attempt retry.
+- Schedule historically had its own service/store boundary and reused the Agent path, but
   the new composition must make the Service the only Store owner and bind execution
   through a callback after Agent Loop construction.
 - Tool Artifact persistence already uses the Session ID. The existing path and
   `ArtifactReference` shape do not need a schema migration.
-- Terminal Conversation and the headless REPL tests currently consume the Conversation
+- Terminal Conversation and the headless REPL tests historically consumed the Conversation
   Port and Agent Events, so transport deletion must be one deliberate cutover rather
   than a partial rename.
 

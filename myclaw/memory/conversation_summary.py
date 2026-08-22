@@ -197,9 +197,7 @@ class ConversationSummaryManager:
                 )
             )
         if current_user_index < len(short_term):
-            non_summarizable_messages = self._project_messages(
-                short_term[current_user_index:]
-            )
+            non_summarizable_messages = self._project_messages(short_term[current_user_index:])
             if _estimate_messages(non_summarizable_messages) >= available_input:
                 raise ModelCallError(
                     ErrorInfo(

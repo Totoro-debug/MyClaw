@@ -1,5 +1,11 @@
 # Contracts 模块化拆分执行计划
 
+> Historical execution record: this file preserves Issue #37's intermediate paths and
+> migration steps. Its `ConversationPort`/`AgentEvent` names are historical targets,
+> not active source, exports, or current normative contracts. The final runtime boundary
+> is defined by `CONTEXT.md`, `docs/myclaw-runtime-contracts.md`, and ADR-0014 after
+> Issues #163–#173.
+
 ## 文档状态
 
 - 状态：Completed（2026-07-18）

@@ -2,7 +2,7 @@
 
 Status: confirmed
 
-This document records the agreed user-facing contract for MyClaw's Command-line Conversation. It complements the domain glossary and ADRs; it does not redefine Runtime Core, Conversation Session, AgentLoop, AgentRunner, or the sparse MessageBus protocol.
+This document records the agreed user-facing contract for MyClaw's Command-line Conversation. It complements the domain glossary and ADRs; it does not redefine Agent Loop, Conversation Session, Agent Runner, or the sparse Message Bus protocol.
 
 ## Product Boundary
 
@@ -19,8 +19,8 @@ This document records the agreed user-facing contract for MyClaw's Command-line 
 - Assistant content renders as Markdown, including headings, lists, quotations, and code blocks. Incomplete streaming syntax may temporarily render as plain text and reflow as more content arrives.
 - Ordinary messages and Markdown links are not clickable. A rendered link includes its URL but the UI never opens a browser. The activity-group heading is the only clickable disclosure surface inside run content; clicking its Markdown, Tool rows, or scrollbars does not toggle the group.
 - Tool activity, Management Command output, failures, and cancellation appear as neutral full-width rows.
-- One live Tool row changes from running to its final status instead of appending separate start and completion rows. Tool arguments and full results are hidden by default; errors may show a wrapped reason.
-- Each foreground Agent Run has one activity group for the model and Tool work that precedes its final output. The group contains intermediate model output and the existing safe Tool activity summaries, including Exec activity; it never exposes full Tool arguments or results, an Exec command, stdout, or stderr beyond the existing Tool Confirmation contract.
+- One live Tool row changes from running to its final status instead of appending separate start and completion rows. The running Tool row displays the Tool name and complete raw Provider argument text; Tool results never enter the foreground Message Bus or terminal activity stream, and errors may show a wrapped safe reason.
+- Each foreground Agent Run has one activity group for the model and Tool work that precedes its final output. The group contains intermediate model output and Tool-call rows, including the complete raw arguments required by the Outbound contract; it never exposes Tool results, an Exec result, stdout, or stderr.
 - Every model call initially reuses the existing streamed Markdown presentation and delta-coalescing behavior in the normal conversation display. The AgentLoop emits a response `_stream_end` marker when that streamed segment is sealed; if the run then emits a `tool_call`, the sealed assistant message moves into the Agent Run activity group before Tool activity is added, while a run that reaches the terminal `_streamed` marker remains outside the group as the final assistant output. Provider-specific response details remain behind AgentRunner and the Model Router.
 - A response `_stream_end` marker is emitted before any corresponding `tool_call` output. It is nonterminal and does not change the Agent Run contract of exactly one terminal `_streamed` marker. The accumulated streamed text remains the candidate presented by the UI until the terminal outcome resolves the run.
 - Segment-end and Tool-call metadata expose no Provider response details or usage. The terminal `model_response` `_streamed` marker is the authoritative successful completion; a `system_control` `_streamed` marker is the authoritative failure or cancellation outcome.
@@ -66,9 +66,23 @@ This document records the agreed user-facing contract for MyClaw's Command-line 
 - Interactive completion candidates are clickable.
 - The input keeps the primary focus. Conversation scrolling does not move focus away from it.
 - The UI does not display the active Session title or model name. Model and Session details remain available through Management Commands.
-- During an active foreground turn the input remains visible but read-only, hides its editing cursor, and shows `Working` inside the input region. A second user message cannot be queued.
+- During an active foreground turn the input remains visible and editable. Enter submits each ordinary message to the Message Bus Inbound FIFO; pending messages appear only in a dedicated queue display while the current Agent Run continues. The `Working` status does not make the input read-only.
 - During an active turn, `Ctrl+C` cancels that turn. While idle, `Ctrl+C` clears a nonempty draft; with an empty draft it exits the UI. Entering `exit` or `quit` also exits.
 - With an empty input, `Ctrl+D` exits. With a nonempty draft it keeps the TextArea's normal delete behavior.
+
+## Pending Input Queue
+
+- The Terminal Conversation is the sole consumer of Message Bus Outbound and the queue
+  display is driven by the Inbound snapshot callback. The consumed head is removed from
+  the pending display and promoted to the conversation display when Agent Loop accepts it;
+  the currently executing message is never returned to input.
+- `Up` with non-empty input keeps normal TextArea behavior. `Up` with empty input and a
+  non-empty pending queue atomically calls `drain_inbound()`, discards the old metadata,
+  joins all drained contents with one newline in FIFO order, and places one editable value
+  in the input. A later Enter submits exactly one fresh empty-metadata Inbound Message.
+- `Up` with both empty input and an empty pending queue retains input-history navigation.
+  Management Commands, Tool Confirmation decisions, cancellation, and Session replacement
+  remain separate control paths and never become Inbound Messages.
 
 ## Confirmation And Commands
 
@@ -76,7 +90,7 @@ This document records the agreed user-facing contract for MyClaw's Command-line 
 - Tool Confirmation presents the confirmation reason and any safety warning without overwhelming the user. For Exec it shows the exact final shell command that will run. For every other Tool it shows a user-friendly Tool name and only the parsed effective parameters needed to judge the operation; it does not show raw JSON or a Tool result.
 - Resolving Tool Confirmation does not append a separate approval or refusal record to the activity group. The Tool row's eventual completed, failed, or rejected status remains the durable visible outcome.
 - `/resume` uses a scrollable selection modal ordered by most recently updated Session. Each clickable option shows only the Session title and updated time formatted in system-local `YYYY-MM-DD HH:mm`; the list has no search or filtering. Selecting a Conversation Session clears the display and rebuilds it from that Session's persisted user, assistant, and final Tool records, groups each user-message-bounded Agent Run into the same activity-group and final-output presentation used by the live display, then positions the view at the latest content. This grouping is a UI projection inferred from each user message and the messages that follow it until the next user message; Session storage does not gain a persisted Agent Run or turn identifier.
-- When a selected Session would replace an active foreground run, the UI presents one Approve/Decline confirmation. Decline leaves the old Session, queue, display, and active run unchanged; Approve replaces the complete Runtime Generation, discards old pending input, and rebuilds the selected Session without waiting for old-run repair or Provider shutdown. If target preparation fails, the old generation remains authoritative and the UI renders one safe error.
+- Selecting the already active Session is a no-op with no confirmation or display rebuild. A different Session with pending input but no active run replaces the complete Runtime Generation without prompting and discards the old pending input. When a different Session would replace an active foreground run, the UI presents exactly one Approve/Decline confirmation. Decline leaves the old Session, queue, display, and active run unchanged; Approve replaces the generation and rebuilds the selected Session without waiting for old-run repair or Provider shutdown. Target preparation happens first; if it fails, the old generation remains authoritative and the UI renders one safe error. After a successful replacement, the old Outbound consumer and references are discarded, so late output can reach only the old Message Bus and cannot render in the new Session.
 - `Esc` closes the `/resume` modal without changing the current Session, draft, or conversation display.
 - Clicking outside Tool Confirmation or `/resume` does not close the modal.
 - `Ctrl+C` is handled by the topmost surface before global behavior: it declines Tool Confirmation, cancels `/resume`, or closes command completion. Only when no such surface is open does it cancel an active turn, clear a draft, or exit.

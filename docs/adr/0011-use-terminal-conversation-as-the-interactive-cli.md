@@ -4,6 +4,10 @@ status: accepted
 
 # Use Terminal Conversation as the Interactive CLI
 
+> Superseded transport note: ADR-0014 and Issue #171 replaced the Conversation Port
+> statements below with direct Message Bus and Agent Loop control. The transport-specific
+> text remains here as the original accepted decision rather than being rewritten in place.
+
 Running `myclaw` without arguments starts the full-screen Terminal Conversation.
 There is no user-selectable plain REPL and no REPL fallback for redirected streams or
 unsupported terminals. Non-interactive Management Commands, currently `myclaw config`,

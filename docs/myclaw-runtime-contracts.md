@@ -96,7 +96,7 @@ D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D1
     <session_id>.log
 ```
 
-已确定：Agent Home 拥有 User Configuration；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 REPL 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`schedule.json`、Session、`.myclaw/artifacts/`、`schedule-sessions/` 和 `logs/` 按需创建。legacy scheduled-work state 原样保留且不读取、不检测、不迁移、不重命名或删除。`myclaw config` 不初始化 Workspace State。
+已确定：Agent Home 拥有 User Configuration；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 Terminal Conversation 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`schedule.json`、Session、`.myclaw/artifacts/`、`schedule-sessions/` 和 `logs/` 按需创建。legacy scheduled-work state 原样保留且不读取、不检测、不迁移、不重命名或删除。`myclaw config` 不初始化 Workspace State。
 
 `memory.md` 初始内容固定为：
 
@@ -135,7 +135,7 @@ Session technical diagnostics 位于 `<workspace>/.myclaw/logs/<session_id>.log`
 - 文件内容 flush 后尽可能 fsync；POSIX 在发布后同步 parent directory，host 明确不支持同步时保留可测试的 best-effort 分支。
 - Session snapshot：当前 runtime 的 active Session 在 turn 结束后捕获完整 JSON-native state，按 `persist()` 调用顺序异步进行一次 UTF-8 JSONL atomic replacement；取消不得打断已开始的 filesystem operation。
 - `Session.close()` 在 shutdown 中对最新非空 state 做最多三次同步 replacement attempt，普通异步失败和 close 最终失败均 silent，不产生 acknowledgement 或 failure log。
-- 不创建 Session 跨进程 lock file，不依赖文件锁，不承诺两个 REPL 写同一 Session 的顺序。
+- 不创建 Session 跨进程 lock file，不依赖文件锁，不承诺两个 Terminal Conversation processes 写同一 Session 的顺序。
 
 ## 4. User Configuration 契约
 
@@ -220,7 +220,7 @@ timeout = 120
 | `reasoning_effort` | `low`、`medium`、`high` | 可省略；不支持时 adapter 静默忽略 |
 | `timeout` | integer seconds，`1..600` | 必填 |
 
-启动时将未知顶层 table、未知字段和未知 route table 投影掉；`myclaw config` 仍报告这些未定义字段。未知 protocol provider 按 canonical 要求忽略；如果 default 因此不可用，REPL 启动失败。Tool Catalog 不接受用户配置的 enablement 或 replacement。
+启动时将未知顶层 table、未知字段和未知 route table 投影掉；`myclaw config` 仍报告这些未定义字段。未知 protocol provider 按 canonical 要求忽略；如果 default 因此不可用，Terminal Conversation 启动失败。Tool Catalog 不接受用户配置的 enablement 或 replacement。
 
 ### 4.3 首次生成模板
 
@@ -257,7 +257,7 @@ timeout = 120
 {"role":"user","content":"Help me inspect this project.","timestamp":"2026-07-11T15:30:12.200+08:00"}
 ```
 
-- `content` 是非空 string；只包含空白的 REPL 输入不创建 message，也不调用模型。`timestamp` 使用 system local timezone 的 ISO 8601 string。
+- `content` 是非空 string；只包含空白的 Terminal Conversation 输入不创建 message，也不调用模型。`timestamp` 使用 system local timezone 的 ISO 8601 string。
 - Runtime Context 是发给模型时临时 prepend 的内容，不写回 `content`。
 
 ### 5.3 Assistant message
@@ -321,8 +321,9 @@ timeout = 120
 - 第一行缺失、字段不是当前严格五字段 header、日期不是带 offset 的 ISO 8601、`last_consolidated` 为负数或 metadata 不合法：Session 不可恢复。
 - 任一 message line 非法、包含旧 line-marker/version fields、缺少 trailing `\n`，或文件为空：Session 不可恢复，不静默跳过、不做 partial-line repair，也不自动迁移。
 - `Session.load()` 是同步且严格的当前格式读取；picker 跳过不可恢复 Session，同时显示一条汇总警告；不得把损坏文件自动删除。
-- `persist()` 不等待 filesystem operation，不返回 task、acknowledgement 或 failure；普通写入异常不产生 `OutboundMessage`、Session Log 或其他诊断记录。
+- `persist()` 不等待 filesystem operation，不返回 task、acknowledgement 或 failure；每个按调用顺序排列的完整 snapshot 最多尝试三次，失败后异步等待 `100 ms`、`200 ms` 再重试；普通写入异常不产生 `OutboundMessage`、Session Log 或其他诊断记录。
 - `close()` 标记 Session closed 后抑制过期异步 snapshot，最多同步尝试三次（间隔 `100 ms`、`200 ms`），最终失败静默吞掉。
+- `abandon()` 是 forced Runtime Generation replacement 的同步边界：它幂等地取消 pending snapshots、禁止后续 Session mutation，不等待、不重试且不做 final save；普通 `close()` 不使用该语义。
 
 ## 6. Conversation Summary、Cursor 与 Long-term Memory
 
@@ -533,13 +534,13 @@ ModelUsage(
 
 成功的 `ModelResponse` 必须包含非空白 `message.content` 或至少一个 Tool call；两者都没有时，provider adapter 将响应规范化为不可重试的 `model_failed`。
 
-streaming contract 只向 Runtime Core 暴露：
+streaming contract 只向 Agent Loop 暴露：
 
 - `text_delta(delta)`：非空 text chunk，按顺序到达。
 - `completed(response)`：恰好一次，包含聚合后的 content、完整 tool calls 和 usage。
 - exception：在 `completed` 前终止 stream，由 router 转成统一错误。
 
-adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不解析 Anthropic content block 或 OpenAI chunk。
+adapter 内部负责聚合 provider-specific tool call deltas。Agent Loop 不解析 Anthropic content block 或 OpenAI chunk。
 
 ### 9.4 Retry
 
@@ -554,21 +555,31 @@ adapter 内部负责聚合 provider-specific tool call deltas。Runtime Core 不
 
 ### 10.1 Public foreground boundary
 
-`AgentLoop` owns one foreground `MessageBus`. Terminal, headless REPL and
-other foreground consumers submit `InboundMessage` values and consume
+`AgentLoop` owns one foreground `MessageBus`. Terminal Conversation and the
+internal headless `run_repl` test seam submit `InboundMessage` values and consume
 `OutboundMessage` values; they do not reach into Session, provider or Tool
 objects. The independent `AgentLoop.control` surface owns cancellation,
 confirmation callbacks and the current foreground projection. Management Port
 and its dispatcher remain a separate management boundary.
 
+Message Bus 的六个 async operations 恰好是 `inbound_snapshot()`、`put_inbound()`、
+`get_inbound()`、`drain_inbound()`、`put_outbound()` 和 `get_outbound()`。Inbound 使用
+`deque` 与一个 `asyncio.Condition` 保持 FIFO；put/get/drain 在 coordination 内捕获操作后的
+immutable tuple，释放 coordination 后同步调用一个可绑定或清除的 callback。Snapshot read
+不调用 callback；callback failure 只记录并忽略，不回滚 mutation。Outbound 是一个无界、
+single-consumer FIFO。Message Bus 不拥有独立 close、abort、replay、broadcast、version 或
+backpressure lifecycle；Tool result 永不进入 Outbound。
+
 ### 10.2 AgentRunner
 
 `AgentRunner` is the bounded, Session-independent model/Tool execution shared
 by the foreground loop and Schedule. It receives the selected route and Tool
-Gateway dependencies and returns an `AgentRunnerResult`. One Agent Run remains
-the domain term for one Runner execution; it is not a transport or a public
-event envelope. Repair construction, Tool Result externalization and iterator
-cleanup are private implementation helpers and are not package interfaces.
+Gateway dependencies and returns an `AgentRunnerResult`. Agent Run remains the
+domain term for one complete execution from input acceptance through Summary/context,
+one Runner invocation, Session increment and persistence request; it is not the deleted
+Python `AgentRun` type, a transport, or a public event envelope. Repair construction,
+Tool Result externalization and iterator cleanup are private implementation helpers and
+are not package interfaces.
 
 ### 10.3 Sparse outbound protocol
 
@@ -589,6 +600,12 @@ Future-bound response; wrong, late and duplicate decisions do not authorize a
 different call. Schedule uses the same Runner/Gateway execution through
 `AgentLoop.run_schedule_job` and does not publish foreground messages.
 
+Streaming metadata is sparse and mutually exclusive on each message:
+`{"_stream_delta": True}` marks one reasoning/response fragment,
+`{"_stream_end": True}` marks the end of one segment, and
+`{"_streamed": True}` marks the end of the whole foreground Agent Run. No marker is
+combined with another marker.
+
 ### 10.4 Management Port
 
 最小接口：
@@ -597,17 +614,69 @@ different call. Schedule uses the same Runner/Gateway execution through
 class ManagementPort(Protocol):
     async def config_view(self) -> ConfigView: ...
     async def status(self) -> RuntimeStatus: ...
-    async def resumable_sessions(self) -> tuple[SessionSummary, ...]: ...
+    async def resumable_listing(self) -> SessionListingReport: ...
     async def resume(self, session_id: str, *, force: bool = False) -> ResumeResult: ...
     async def memory_view(self) -> str: ...
     async def dream(self) -> MemoryTaskResult: ...
 ```
 
-- `resumable_sessions` 仅返回当前 Workspace 的 id、title、created_at、updated_at、message_count。
+- `resumable_listing` 的 `sessions` 仅包含当前 Workspace 的 id、title、created_at、
+  updated_at、message_count，并用 `skipped_count` 汇总损坏或不可读项。
 - `resume` 再次验证 session 属于当前 Workspace，不信任 UI 传入值；`force` 仅由
   Terminal 在确认 active foreground replacement 后传入，Management 不构造 Runtime。
 - `config_view` 已脱敏；Management Port 永不返回 plaintext API key。
 - `memory_view` 读取磁盘，不返回 runtime cache。
+
+### 10.5 Final Agent Runner and Provider boundary
+
+`AgentRunnerResult` 的 `messages` 只包含本次调用生成的 assistant/Tool increment，
+不包含 initial messages 或当前 user message。`final_content` 是本次调用的最终文本；
+`usage` 恰好包含 `model_calls`、`input_tokens`、`output_tokens`、`total_tokens`，均为
+非负整数且 `total_tokens == input_tokens + output_tokens`。`completed` 必须没有 error；
+`failed` 必须携带安全的 `ErrorInfo`；`cancelled` 必须使用 `turn_cancelled`；
+`max_iterations` 必须使用 `agent_iteration_limit`。正常失败或取消后的 increment
+必须是 Provider-valid 的 assistant/Tool 序列。
+
+一次 iteration 恰好是一次 model call 加上该响应请求的全部 Tool calls，Tool 按
+Provider 原始顺序逐个执行；Provider 内部 retry 不计入 iteration。默认和最小
+`runtime.max_iterations` 都是 `50`。第 50 次响应请求 Tools 时必须完成全部 Tools，随后
+若没有请求 normal cancellation，则返回 `max_iterations`，不进行第 51 次 Provider call，
+并使用以下固定文案；normal cancellation 优先：
+
+`MyClaw 本轮对话已经达到最大循环次数，仍没有输出最终结果。可以再次尝试本次请求或者尝试给出更明确的任务目标。`
+
+正常取消使用固定文案 `MyClaw 已取消本轮对话。`。Provider 返回的 reasoning 通过
+`ReasoningDelta` 只在 live callback/foreground Outbound 中可见；Anthropic thinking/signature
+blocks 与 OpenAI-compatible `reasoning_content` 可形成 opaque `ModelContinuation`，但该
+continuation 只在同一个 Tool loop 的下一次 Provider call 中使用，不进入 Session-shaped
+messages、Outbound 或持久化。
+
+### 10.6 Final Schedule and lifecycle boundary
+
+`ScheduleService` 是唯一的 Schedule Store/management owner。它必须在 Agent Loop 之前
+创建；Agent Loop 创建 Schedule Tool、固定 Catalog、共享 Tool Gateway 和 Agent Runner，
+再绑定 `on_schedule_job(job) -> None` callback，最后才启动 Service。Foreground 与 Schedule
+execution 使用同一 Gateway identity 和同一 Runner identity，但每次 Schedule execution
+拥有独立的 Schedule Session、context、cancellation 和 externalizer Session ID。Schedule
+没有 confirmation channel 或 foreground Message Bus projection，传入 `confirmation=None`，
+任何 Schedule output 都不进入 foreground Outbound。
+
+Schedule execution 通过 ContextVar token 设置 `ScheduleTool._in_schedule_job`，并在
+`finally` 中 reset；只有递归 `add` 被拒绝，foreground `add` 以及 Schedule `list`/`remove`
+仍可用。Schedule Artifact root 保持
+`.myclaw/artifacts/schedule_<job_id>/<tool_call_id>.txt`，reference shape 保持
+`path`、`total_chars`、`preview_chars` 三个字段。
+
+一个 Runtime Generation 包含 Store/Service、MessageBus、Router、Runtime Memory、Memory
+Task scheduler、Agent Loop、fixed Tools、shared Gateway/Runner 和 Management services。
+`PreparedRuntime.start()` 和 `close()` 是正常 awaited lifecycle；`PreparedRuntime.abort()`
+是 synchronous forced lifecycle。`RuntimeHost` 先构造并 validate unstarted target，再 abort
+old generation，解绑旧 bus/control、清理旧 Terminal projection、绑定并启动 target。
+Target preparation failure 不改变 old generation；abort 调用 `Session.abandon()`，不等待
+active Runner、persistence、Schedule、Memory 或 Provider shutdown。Provider cleanup 是
+detached best effort，只记录 failure；可接受丢失未持久化状态、未修复 active work、Tool
+side-effect/Artifact orphan、Memory cursor skip、Schedule at-least-once side effect 和
+uptime reset。普通 process shutdown 始终走 awaited `close()`。
 
 ## TOOL_SCHEMA：Tool Gateway 契约
 
@@ -635,10 +704,11 @@ ToolResult(
 
 ### 11.2 Catalog 与依赖所有权
 
-- Runtime Core 在启动时以 Workspace、具体 Schedule Store 和 scheduled-agent 标志构造 `ToolGateway`；Gateway 自己一次性构造固定十工具 Catalog，不暴露注册入口。
+- Agent Loop 在初始化时以 Workspace 和 Schedule Service 构造一个共享 `ToolGateway`；Gateway 自己一次性构造固定十工具 Catalog，不暴露注册入口。Schedule Service 只持有 Store/Job management ownership，Gateway 不接受第二套 Schedule Gateway。
 - Tool 调用不接收 session ID、Agent Home、lane、approval flag 或通用 execution context。
 - 没有独立 `Security` 模块；公共路径、DNS、截断和 Artifact 边界由 BaseTool 或共享小 helper 提供，具体 Tool 保留 capability-specific 规则。
-- Memory Task 使用标准 Tool Gateway 和仅含专用 Long-term Memory read/edit Tool 的 catalog。
+- Memory Task 使用合法且独立的专用 Tool Gateway，只注册 Long-term Memory read/edit Tool；
+  它不复用 foreground/Schedule 的共享 Gateway，也不形成第三条 Agent Runner execution path。
 - Tool Gateway 不在前台/后台之间加全局执行锁。
 - Tool Gateway 不设置统一 timeout、持久化 Tool Result 或持有 Workspace；Artifact 写入由 BaseTool 的结果处理能力完成。
 
@@ -810,7 +880,7 @@ ErrorInfo(
 | `memory_task_running` | Memory Task 不重入 | 否 |
 | `schedule_state_error` | Schedule state 损坏或不安全 | 否 |
 
-CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 REPL 继续时不退出进程。
+CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 Terminal Conversation 继续时不退出进程。
 
 ## 14. `/status` 契约
 
