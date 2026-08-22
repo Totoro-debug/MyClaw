@@ -64,6 +64,8 @@ class _DispatchResult:
     handled: bool
     output: str | None = None
     resume_sessions: tuple[SessionListingEntry, ...] | None = None
+    resumed_session_id: str | None = None
+    resume_skipped_count: int = 0
 
 
 class _Dispatcher:
@@ -72,8 +74,13 @@ class _Dispatcher:
             return _DispatchResult(handled=True, output="memory output")
         return _DispatchResult(handled=False)
 
-    async def resume(self, session_id: str) -> _DispatchResult:
-        del session_id
+    async def resume(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+    ) -> _DispatchResult:
+        del session_id, force
         return _DispatchResult(handled=True, output="resumed")
 
 

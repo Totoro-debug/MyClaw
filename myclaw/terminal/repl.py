@@ -33,11 +33,22 @@ class ManagementDispatchResult(Protocol):
     @property
     def resume_sessions(self) -> tuple[SessionListingEntry, ...] | None: ...
 
+    @property
+    def resumed_session_id(self) -> str | None: ...
+
+    @property
+    def resume_skipped_count(self) -> int: ...
+
 
 class ManagementDispatcher(Protocol):
     async def dispatch(self, command: str) -> ManagementDispatchResult: ...
 
-    async def resume(self, session_id: str) -> ManagementDispatchResult: ...
+    async def resume(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+    ) -> ManagementDispatchResult: ...
 
 
 async def run_repl(

@@ -5449,7 +5449,12 @@ async def test_resume_requires_result_and_runtime_authority_to_agree(
     target.add_message("user", "Must not be projected without authority.")
     target.close()
 
-    async def inconsistent_resume(session_id: str) -> ManagementCommandResult:
+    async def inconsistent_resume(
+        session_id: str,
+        *,
+        force: bool = False,
+    ) -> ManagementCommandResult:
+        del force
         return ManagementCommandResult(
             handled=True,
             output=f"Resumed session {session_id}.",
@@ -5496,8 +5501,12 @@ async def test_unexpected_resume_exception_preserves_session_display_and_interac
     target.add_message("user", "Must remain hidden after an exception.")
     target.close()
 
-    async def failing_resume(session_id: str) -> ManagementCommandResult:
-        del session_id
+    async def failing_resume(
+        session_id: str,
+        *,
+        force: bool = False,
+    ) -> ManagementCommandResult:
+        del session_id, force
         raise RuntimeError("private failure detail")
 
     monkeypatch.setattr(runtime.management_dispatcher, "resume", failing_resume)
@@ -5548,11 +5557,15 @@ async def test_resume_selection_serializes_input_until_rebuild_finishes(
     resume_errors: list[BaseException] = []
     original_resume = runtime.management_dispatcher.resume
 
-    async def delayed_resume(session_id: str) -> ManagementCommandResult:
+    async def delayed_resume(
+        session_id: str,
+        *,
+        force: bool = False,
+    ) -> ManagementCommandResult:
         resume_started.set()
         await continue_resume.wait()
         try:
-            return await original_resume(session_id)
+            return await original_resume(session_id, force=force)
         except BaseException as error:
             resume_errors.append(error)
             raise

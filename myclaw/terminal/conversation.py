@@ -40,7 +40,7 @@ from textual.worker import Worker, WorkerError
 from myclaw.agent.loop import ConfirmationRequestView, TerminalAgentLoopControl
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runtime import PreparedRuntime, RuntimeBindings, RuntimeHost
-from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS, ManagementCommandResult
+from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS
 from myclaw.management.service import SessionListingEntry
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
 from myclaw.terminal.repl import ManagementDispatcher
@@ -83,15 +83,6 @@ type _ControlAction = Literal["cancel_active_turn", "clear_draft", "drain_pendin
 type ConfirmationDecision = Literal["approved", "declined"]
 type _ToolRowStatus = Literal["running", "success", "error", "refused"]
 type _TerminalOutcome = Literal["completed", "cancelled", "failed"]
-
-
-class _ForceManagementDispatcher(Protocol):
-    async def resume(
-        self,
-        session_id: str,
-        *,
-        force: bool = False,
-    ) -> ManagementCommandResult: ...
 
 
 class _DriverLifecycleHooks(Protocol):
@@ -2273,7 +2264,7 @@ class TerminalConversationApp(App[None]):
 
         dispatcher = self._management_dispatcher
         if dispatcher is not None:
-            result = cast(ManagementCommandResult, await dispatcher.dispatch(text))
+            result = await dispatcher.dispatch(text)
             if result.handled:
                 message.text_area.remember_submission(text)
                 message.text_area.text = ""
@@ -2905,13 +2896,7 @@ class TerminalConversationApp(App[None]):
                     return
                 force = True
             try:
-                if force:
-                    result = await cast(_ForceManagementDispatcher, dispatcher).resume(
-                        session_id,
-                        force=True,
-                    )
-                else:
-                    result = cast(ManagementCommandResult, await dispatcher.resume(session_id))
+                result = await dispatcher.resume(session_id, force=force)
             except Exception:
                 await self._mount_management_rows("/resume", "Session resume failed.")
                 return
