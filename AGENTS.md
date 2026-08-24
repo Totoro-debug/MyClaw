@@ -1,3 +1,19 @@
+<!-- CODEGRAPH_START -->
+## CodeGraph
+
+CodeGraph indexes are local to each Git worktree. Before searching or reading code,
+ensure that the current worktree has an index:
+
+```powershell
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/ensure-codegraph.ps1
+```
+
+After the command succeeds, use `codegraph explore` or `codegraph node` before
+`rg`, `find`, or direct file reads. Do not reuse another worktree's `.codegraph`
+directory. If initialization fails, report the failure and then continue with the
+available repository tools.
+<!-- CODEGRAPH_END -->
+
 ## Agent 技能
 
 ### 问题跟踪
