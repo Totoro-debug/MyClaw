@@ -12,8 +12,8 @@ from typing import Literal, Protocol
 from myclaw.agent.prompts import blackboard_prompt
 from myclaw.provider.models import ModelMessages, ModelResponse
 from myclaw.tools.base import OpenAIToolSchema
+from myclaw.utils.validation import token_usage_validation_issue
 
-_USAGE_KEYS = frozenset({"model_calls", "input_tokens", "output_tokens", "total_tokens"})
 _DECISION_KEYS = frozenset({"action", "goal", "completion_boundary"})
 _NOT_PARSED = object()
 
@@ -104,13 +104,12 @@ class FramingResult:
 
         if self.usage_delta is None:
             return
-        if set(self.usage_delta) != _USAGE_KEYS:
+        usage_issue = token_usage_validation_issue(self.usage_delta)
+        if usage_issue == "fields":
             raise ValueError("Framing usage must contain exactly four fields")
-        if any(type(value) is not int or value < 0 for value in self.usage_delta.values()):
+        if usage_issue == "values":
             raise ValueError("Framing usage values must be nonnegative integers")
-        if self.usage_delta["total_tokens"] != (
-            self.usage_delta["input_tokens"] + self.usage_delta["output_tokens"]
-        ):
+        if usage_issue == "total":
             raise ValueError("Framing usage total_tokens must equal input plus output")
 
 

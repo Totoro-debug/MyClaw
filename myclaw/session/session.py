@@ -24,6 +24,7 @@ from myclaw.utils.validation import (
     require_nonnegative_int,
     require_uuid4,
     require_uuid4_string,
+    token_usage_validation_issue,
 )
 
 __all__ = ["Session", "SessionStoragePartition"]
@@ -870,12 +871,14 @@ def _validate_tool_message(message: dict[str, Any]) -> None:
 def _validate_token_usage(value: Any, *, field: str) -> None:
     if not isinstance(value, dict):
         raise TypeError(f"{field} must be a dictionary")
-    expected = {"model_calls", "input_tokens", "output_tokens", "total_tokens"}
-    if set(value) != expected:
+    issue = token_usage_validation_issue(value)
+    if issue == "fields":
         raise ValueError(f"{field} must contain exactly model_calls and token counters")
-    for key in expected:
-        require_nonnegative_int(value[key], field=f"{field}.{key}")
-    if value["total_tokens"] != value["input_tokens"] + value["output_tokens"]:
+    if issue == "values":
+        for key, member in value.items():
+            require_nonnegative_int(member, field=f"{field}.{key}")
+        raise AssertionError("token usage value issue did not identify an invalid field")
+    if issue == "total":
         raise ValueError(f"{field}.total_tokens must equal input_tokens + output_tokens")
 
 

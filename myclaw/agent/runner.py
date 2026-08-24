@@ -28,6 +28,7 @@ from myclaw.tools.tool_gateway import (
     ToolGateway,
     ToolResult,
 )
+from myclaw.utils.validation import token_usage_validation_issue
 
 type AgentRunnerRoute = Literal["chat", "schedule"]
 type AgentRunnerSegment = Literal["reasoning", "response"]
@@ -36,7 +37,6 @@ type AgentRunnerOutput = (
     ReasoningDelta | TextDelta | AgentRunnerResponseSegmentEnd | AgentRunnerToolCallStarted
 )
 
-_USAGE_KEYS = frozenset({"model_calls", "input_tokens", "output_tokens", "total_tokens"})
 _MAX_ITERATIONS_MESSAGE = (
     "MyClaw 本轮对话已经达到最大循环次数，仍没有输出最终结果。"  # noqa: RUF001
     "可以再次尝试本次请求或者尝试给出更明确的任务目标。"
@@ -105,12 +105,12 @@ class AgentRunnerResult:
     def __post_init__(self) -> None:
         if not isinstance(self.final_content, str):
             raise TypeError("final_content must be a string")
-        if set(self.usage) != _USAGE_KEYS:
+        usage_issue = token_usage_validation_issue(self.usage)
+        if usage_issue == "fields":
             raise ValueError("usage must contain exactly the four Agent Runner usage fields")
-        for value in self.usage.values():
-            if type(value) is not int or value < 0:
-                raise ValueError("usage values must be nonnegative integers")
-        if self.usage["total_tokens"] != (self.usage["input_tokens"] + self.usage["output_tokens"]):
+        if usage_issue == "values":
+            raise ValueError("usage values must be nonnegative integers")
+        if usage_issue == "total":
             raise ValueError("usage total_tokens must equal input_tokens + output_tokens")
 
         if self.finish_reason not in {"completed", "failed", "cancelled", "max_iterations"}:

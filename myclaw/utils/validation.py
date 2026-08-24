@@ -1,8 +1,33 @@
 """Shared validation for runtime values and persisted records."""
 
+from collections.abc import Mapping
 from datetime import datetime
 from math import isfinite
+from typing import Literal, cast
 from uuid import UUID
+
+_TOKEN_USAGE_FIELDS = frozenset({"model_calls", "input_tokens", "output_tokens", "total_tokens"})
+
+type TokenUsageValidationIssue = Literal["fields", "values", "total"]
+
+
+def token_usage_validation_issue(
+    value: Mapping[str, object],
+) -> TokenUsageValidationIssue | None:
+    """Classify violations of the shared four-field token usage contract."""
+    if set(value) != _TOKEN_USAGE_FIELDS:
+        return "fields"
+    if any(
+        type(member) is not int or member < 0
+        for member in (value[field] for field in _TOKEN_USAGE_FIELDS)
+    ):
+        return "values"
+    input_tokens = cast(int, value["input_tokens"])
+    output_tokens = cast(int, value["output_tokens"])
+    total_tokens = cast(int, value["total_tokens"])
+    if total_tokens != input_tokens + output_tokens:
+        return "total"
+    return None
 
 
 def require_nonnegative_int(value: int, *, field: str) -> None:
