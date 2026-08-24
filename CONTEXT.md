@@ -72,6 +72,14 @@ _Avoid_: Agent Loop, Conversation Session, Runtime Lifetime, Provider retry loop
 One complete Agent execution for one input against one Conversation Session, from accepting the input through Conversation Summary, context assembly, Agent Runner's model and Tool loop, Session increment, and persistence request. Agent Loop performs this flow for foreground input and publishes exactly one terminal Outbound Message; Schedule Service invokes an isolated callback that performs the same complete flow without using the foreground Message Bus. Agent Run is a domain execution concept, not the deleted legacy Python `AgentRun` type, and is not a Runtime Lifetime, Runtime Generation, individual model request, or Tool call.
 _Avoid_: Agent Turn, Runtime, Model call, Tool call
 
+**Blackboard**:
+A hidden task state attached to a Conversation Session and its foreground Agent Runs, containing exactly one current task goal and one explicit boundary that determines when the task is complete. It is reconsidered before each foreground Agent Run to clarify the current User Message, but does not control execution flow or expose a user-facing task-management surface.
+_Avoid_: Task list, plan, workflow state, progress tracker
+
+**Task Framing**:
+The interpretation of a new ordinary user input against the current Blackboard and the latest assistant response to keep, replace, or clear the current task definition. It defines intent and completion without decomposing work into subtasks or directing execution.
+_Avoid_: Task decomposition, planning, orchestration, progress update
+
 **Runtime Context**:
 Dynamic metadata added to a model call. Workspace path is assembled into the built-in identity system prompt, while current time, session ID, and similar per-turn metadata are prepended to the current user input.
 _Avoid_: User instruction, long-term memory, session message
