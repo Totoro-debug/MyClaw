@@ -5,12 +5,12 @@ from __future__ import annotations
 import builtins
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from fractions import Fraction
 from json import dumps
-from typing import Any, Literal, TypeGuard, cast
+from typing import Literal, TypeGuard, cast
 
 from myclaw.utils.json_types import JsonObject, JsonValue
 
@@ -79,15 +79,6 @@ class SchemaError:
 
     def __str__(self) -> str:
         return f"{self.path}: {self.message}"
-
-
-class SchemaValidationError(ValueError):
-    """Raised when a Schema value has one or more validation errors."""
-
-    def __init__(self, errors: Sequence[SchemaError]) -> None:
-        self.errors = tuple(errors)
-        message = "; ".join(str(error) for error in self.errors)
-        super().__init__(message or "Schema validation failed")
 
 
 class Schema:
@@ -409,21 +400,9 @@ class Schema:
             additional_properties=additional_properties,
         )
 
-    # Uppercase builder spellings are intentionally provided for declaration-heavy Tool modules.
-    String = string
-    Integer = integer
-    Number = number
-    Boolean = boolean
-    Array = array
-    Object = object
-
     @property
     def kind(self) -> SchemaKind:
         return self._kind
-
-    @property
-    def nullable(self) -> bool:
-        return self._nullable
 
     @property
     def has_default(self) -> bool:
@@ -438,14 +417,6 @@ class Schema:
     @property
     def properties(self) -> dict[str, Schema]:
         return {name: schema for name, schema in self._properties}
-
-    @property
-    def required(self) -> tuple[str, ...]:
-        return self._required
-
-    @property
-    def items(self) -> Schema | None:
-        return self._items
 
     def to_json_schema(self) -> JsonObject:
         """Return a detached JSON-compatible schema fragment."""
@@ -494,11 +465,6 @@ class Schema:
             )
         return result
 
-    def __eq__(self, other: builtins.object) -> bool:
-        if not isinstance(other, Schema):
-            return NotImplemented
-        return self.to_json_schema() == other.to_json_schema()
-
     def cast(self, value: builtins.object) -> builtins.object:
         """Apply only the safe conversions and recursively copy JSON values."""
         if value is None:
@@ -541,11 +507,6 @@ class Schema:
         errors: list[SchemaError] = []
         self._validate(value, path, errors)
         return errors
-
-    def validate_or_raise(self, value: builtins.object, *, path: str = "$") -> None:
-        errors = self.validate(value, path=path)
-        if errors:
-            raise SchemaValidationError(errors)
 
     def _validate(self, value: builtins.object, path: str, errors: list[SchemaError]) -> None:
         if value is None:
@@ -659,73 +620,6 @@ class Schema:
                 )
             else:
                 additional._validate(value[name], property_path, errors)
-
-
-def parameter[T](
-    schema: Schema | Mapping[str, Schema] | str | None = None,
-    field_schema: Schema | None = None,
-    **properties: Schema,
-) -> Callable[[T], T]:
-    """Declare the root parameter Schema on a Tool execute function.
-
-    The decorator intentionally does not wrap the function, so Python's
-    signature, coroutine identity, and abstract-method markers are preserved.
-    """
-    if callable(schema) and not isinstance(schema, (Schema, str)) and field_schema is None:
-        target = cast(Any, schema)
-        root = Schema.object({})
-        return cast(Callable[[T], T], _attach_schema(target, root))
-    root = _parameter_schema(schema, field_schema, properties)
-
-    def decorate(target: T) -> T:
-        return _attach_schema(target, root)
-
-    return decorate
-
-
-def _parameter_schema(
-    schema: Schema | Mapping[str, Schema] | str | None,
-    field_schema: Schema | None,
-    properties: Mapping[str, Schema],
-) -> Schema:
-    if isinstance(schema, Schema):
-        if field_schema is not None or properties:
-            raise TypeError("parameter root Schema cannot be combined with fields")
-        root = schema
-    elif isinstance(schema, Mapping):
-        if field_schema is not None:
-            raise TypeError("parameter field Schema cannot follow a mapping")
-        merged = dict(schema)
-        merged.update(properties)
-        root = Schema.object(merged)
-    elif isinstance(schema, str):
-        if field_schema is None:
-            raise TypeError("parameter field name requires a Schema")
-        merged = {schema: field_schema}
-        merged.update(properties)
-        root = Schema.object(merged)
-    elif schema is None:
-        if field_schema is not None:
-            raise TypeError("parameter field Schema requires a field name")
-        root = Schema.object(properties)
-    else:
-        raise TypeError("parameter declaration must use a Schema or object mapping")
-    if root.kind != "object":
-        raise TypeError("Tool parameters must use an object root Schema")
-    return root
-
-
-def _attach_schema[T](target: T, root: Schema) -> T:
-    target_value = cast(Any, target)
-    target_value.__tool_schema__ = root
-    target_value.parameters = root
-    if isinstance(target, type):
-        from abc import update_abstractmethods
-
-        update_abstractmethods(target)
-    else:
-        target_value.__parameters__ = root
-    return target
 
 
 def _matches_kind(kind: SchemaKind, value: object) -> bool:
@@ -855,24 +749,8 @@ def _require_json_value(value: object, name: str) -> object:
     raise TypeError(f"Schema {name} must be JSON-compatible")
 
 
-String = Schema.string
-Integer = Schema.integer
-Number = Schema.number
-Boolean = Schema.boolean
-Array = Schema.array
-Object = Schema.object
-
-
 __all__ = [
-    "Array",
-    "Boolean",
-    "Integer",
-    "Number",
-    "Object",
     "Schema",
     "SchemaError",
-    "SchemaValidationError",
-    "String",
     "ToolParam",
-    "parameter",
 ]

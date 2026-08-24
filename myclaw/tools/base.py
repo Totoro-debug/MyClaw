@@ -30,7 +30,7 @@ from uuid import uuid4
 from loguru import logger
 
 from myclaw.agent.workspace import Workspace
-from myclaw.tools.schema import Schema, ToolParam, parameter
+from myclaw.tools.schema import Schema, ToolParam
 from myclaw.utils.json_types import JsonObject, JsonValue
 from myclaw.utils.validation import require_nonnegative_int
 
@@ -208,19 +208,15 @@ class BaseTool(ABC):
         if execute is not None:
             _validate_execute(execute)
         if "parameters" not in cls.__dict__:
-            declared = _decorated_schema(execute)
-            if declared is not None:
-                cast(Any, cls).parameters = declared
+            try:
+                legacy = _schema_from_class(cls, execute)
+            except (TypeError, ValueError):
+                # Keep declaration errors at the public to_schema boundary for the bridge.
+                if _has_legacy_declaration(cls, execute):
+                    cast(Any, cls).parameters = Schema.object({})
+                    cast(Any, cls).__schema_declaration_invalid__ = True
             else:
-                try:
-                    legacy = _schema_from_class(cls, execute)
-                except (TypeError, ValueError):
-                    # Keep declaration errors at the public to_schema boundary for the bridge.
-                    if _has_legacy_declaration(cls, execute):
-                        cast(Any, cls).parameters = Schema.object({})
-                        cast(Any, cls).__schema_declaration_invalid__ = True
-                else:
-                    cast(Any, cls).parameters = legacy
+                cast(Any, cls).parameters = legacy
         update_abstractmethods(cls)
 
     if TYPE_CHECKING:
@@ -385,17 +381,13 @@ class BaseTool(ABC):
             raise TypeError("Tool name must be a non-empty string")
         if not isinstance(description, str) or not description:
             raise TypeError("Tool description must be a non-empty string")
-        decorated_schema = getattr(tool_type, "__tool_schema__", None)
-        if isinstance(decorated_schema, Schema):
-            schema = decorated_schema
+        if getattr(tool_type, _INVALID_SCHEMA_MARKER, False):
+            _schema_from_class(tool_type, getattr(tool_type, "execute", None))
+        inferred_schema = getattr(tool_type, "parameters", _MISSING)
+        if isinstance(inferred_schema, Schema):
+            schema = inferred_schema
         else:
-            if getattr(tool_type, _INVALID_SCHEMA_MARKER, False):
-                _schema_from_class(tool_type, getattr(tool_type, "execute", None))
-            inferred_schema = getattr(tool_type, "parameters", _MISSING)
-            if isinstance(inferred_schema, Schema):
-                schema = inferred_schema
-            else:
-                schema = _schema_from_class(tool_type, getattr(tool_type, "execute", None))
+            schema = _schema_from_class(tool_type, getattr(tool_type, "execute", None))
         if schema.kind != "object":
             raise TypeError("Tool parameters must use an object root Schema")
         return {
@@ -432,13 +424,6 @@ def _validate_execute(execute: object) -> None:
         ) from error
     if return_annotation is not str:
         raise TypeError("Concrete Tool execute() must declare a string return")
-
-
-def _decorated_schema(execute: object) -> Schema | None:
-    if execute is None:
-        return None
-    declared = getattr(execute, "__tool_schema__", None)
-    return declared if isinstance(declared, Schema) else None
 
 
 def _schema_from_class(tool_type: type[object], execute: object) -> Schema:
@@ -610,7 +595,6 @@ __all__ = [
     "is_public_ip",
     "is_workspace_path",
     "normalize_public_ip",
-    "parameter",
     "resolve_tool_path",
     "truncate_text",
 ]

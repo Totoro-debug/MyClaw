@@ -9,7 +9,6 @@ import pytest
 
 from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool, PreparedToolCall, ToolError, ToolParam
-from myclaw.tools.schema import Object, String, parameter
 
 
 class _RepresentativeTool(BaseTool):
@@ -153,23 +152,6 @@ def test_tool_error_contains_only_a_public_safe_message() -> None:
     assert not hasattr(error, "code")
 
 
-def test_base_tool_is_abstract_and_parameter_decorator_injects_root_schema() -> None:
-    declared = Object({"text": String()}, required=("text",))
-
-    class DecoratedTool(BaseTool):
-        name = "decorated"
-        description = "A decorated Tool."
-
-        @parameter(declared)
-        async def execute(self, *, text: str) -> str:
-            return text
-
-    assert inspect.isabstract(BaseTool)
-    assert not inspect.isabstract(DecoratedTool)
-    assert DecoratedTool.parameters == declared
-    assert DecoratedTool().to_schema()["function"]["parameters"] == declared.to_json_schema()
-
-
 @pytest.mark.asyncio
 async def test_base_tool_prepare_returns_normalized_arguments_and_safety_reason() -> None:
     observed: list[tuple[str, int, bool]] = []
@@ -225,33 +207,6 @@ def test_tool_with_parameters_but_without_execution_remains_abstract() -> None:
     assert inspect.isabstract(ParametersOnlyTool)
     with pytest.raises(TypeError, match="abstract method 'execute'"):
         cast(Any, ParametersOnlyTool)()
-
-
-def test_class_parameter_decorator_replaces_failed_legacy_inference() -> None:
-    declared = Object({"value": String()}, required=("value",))
-
-    @parameter(declared)
-    class DecoratedTool(BaseTool):
-        name = "class_decorated"
-        description = "A class-decorated Tool."
-        value: Annotated[str, "legacy metadata is irrelevant"]
-
-        async def execute(self, *, value: str) -> str:
-            return value
-
-    assert not inspect.isabstract(DecoratedTool)
-    assert DecoratedTool().to_schema() == {
-        "type": "function",
-        "function": {
-            "name": "class_decorated",
-            "description": "A class-decorated Tool.",
-            "parameters": {
-                "type": "object",
-                "properties": {"value": {"type": "string"}},
-                "required": ["value"],
-            },
-        },
-    }
 
 
 def test_base_tool_result_handler_writes_a_bounded_workspace_artifact(
