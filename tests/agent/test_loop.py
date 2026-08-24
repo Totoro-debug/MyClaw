@@ -39,7 +39,7 @@ from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
-from tests.fixtures import DeterministicTaskFramingEvaluator
+from tests.fixtures import BlockingTaskFramingEvaluator, DeterministicTaskFramingEvaluator
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 
@@ -123,23 +123,6 @@ class _FramingFake:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
-
-
-class _BlockingFramer:
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-
-    async def frame(
-        self,
-        *,
-        previous: Blackboard | None,
-        last_assistant_content: str,
-        current_user_input: str,
-    ) -> FramingResult:
-        del previous, last_assistant_content, current_user_input
-        self.started.set()
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
 
 
 class _InvalidResultFramer:
@@ -1600,7 +1583,7 @@ async def test_invalid_and_model_failed_framing_statuses_fail_open_and_clear_on_
 async def test_framing_cancellation_reclaims_first_title_task_without_commit(
     tmp_path: Path,
 ) -> None:
-    framer = _BlockingFramer()
+    framer = BlockingTaskFramingEvaluator()
     loop, session = _runtime(
         tmp_path,
         _ConcurrentTitleRouter(),
