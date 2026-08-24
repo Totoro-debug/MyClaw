@@ -212,10 +212,10 @@ def _extract_decision(content: str) -> object:
     if "```" in stripped:
         return _NOT_PARSED
 
-    candidates = _balanced_json_candidates(content)
-    if not candidates:
+    candidate = _first_balanced_json_object(content)
+    if candidate is None:
         return _NOT_PARSED
-    return _loads_json(candidates[0])
+    return _loads_json(candidate)
 
 
 def _loads_json(content: str) -> object:
@@ -255,8 +255,7 @@ def _fenced_json(content: str) -> object:
     return _loads_json(match.group(1).strip())
 
 
-def _balanced_json_candidates(content: str) -> list[str]:
-    candidates: list[str] = []
+def _first_balanced_json_object(content: str) -> str | None:
     start: int | None = None
     depth = 0
     in_string = False
@@ -284,9 +283,8 @@ def _balanced_json_candidates(content: str) -> list[str]:
         elif character == "}" and depth > 0:
             depth -= 1
             if depth == 0 and start is not None:
-                candidates.append(content[start : index + 1])
-                start = None
-    return candidates
+                return content[start : index + 1]
+    return None
 
 
 def _reduce_decision(
