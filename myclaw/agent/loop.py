@@ -12,7 +12,14 @@ from uuid import UUID
 
 from loguru import logger
 
-from myclaw.agent.blackboard import Blackboard
+from myclaw.agent.blackboard import (
+    Blackboard,
+    FramingResult,
+    TaskFramer,
+    TaskFramingEvaluator,
+    decode_blackboard,
+    encode_blackboard,
+)
 from myclaw.agent.message_bus import (
     InboundMessage,
     MessageBus,
@@ -175,6 +182,7 @@ class AgentLoop:
         schedule_service: ScheduleService,
         model_router: AgentRunnerRouter,
         context_preparer: ForegroundContextPreparer,
+        task_framer: TaskFramingEvaluator | None = None,
         now: Callable[[], datetime],
         max_iterations: int,
         schedule_context_preparer: ScheduleContextPreparer | None = None,
@@ -190,6 +198,8 @@ class AgentLoop:
             raise TypeError("Agent Loop requires a Schedule Service for the foreground catalog")
         if not callable(context_preparer):
             raise TypeError("Agent Loop requires a context preparer")
+        if task_framer is not None and not callable(getattr(task_framer, "frame", None)):
+            raise TypeError("Agent Loop requires a task framing evaluator")
         if not callable(now):
             raise TypeError("Agent Loop requires a clock")
         if schedule_now is not None and not callable(schedule_now):
@@ -198,6 +208,7 @@ class AgentLoop:
         self._session = session
         self._schedule_service = schedule_service
         self._context_preparer = context_preparer
+        self._task_framer = TaskFramer(model_router) if task_framer is None else task_framer
         self._schedule_context_preparer = schedule_context_preparer
         self._now = now
         self._schedule_now = now if schedule_now is None else schedule_now
@@ -630,10 +641,36 @@ class AgentLoop:
         execution_ready.set()
         if not inbound.content.strip():
             return False
+
+        previous_blackboard = decode_blackboard(active_session.metadata.get("blackboard"))
+        last_assistant_content = _latest_assistant_content(active_session)
+        try:
+            framing_result = await self._task_framer.frame(
+                previous=previous_blackboard,
+                last_assistant_content=last_assistant_content,
+                current_user_input=inbound.content,
+            )
+            if not isinstance(framing_result, FramingResult):
+                raise TypeError("Task Framing evaluator returned an invalid result")
+        except asyncio.CancelledError:
+            if not self._cancel_requested:
+                raise
+            await self._publish_preparation_failure(
+                ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
+            )
+            return False
+
+        if framing_result.status != "resolved":
+            _runtime_logger().warning(
+                "Task Framing degraded status={}",
+                framing_result.status,
+            )
+        staged_blackboard = framing_result.blackboard
         try:
             initial_messages = await self._context_preparer(
                 active_session,
                 deepcopy(current_user),
+                blackboard=staged_blackboard,
             )
         except asyncio.CancelledError:
             if not self._cancel_requested:
@@ -673,8 +710,22 @@ class AgentLoop:
             )
             return False
 
+        if staged_blackboard is None:
+            metadata_updates = None
+            metadata_removals: tuple[str, ...] = ("blackboard",)
+        else:
+            encoded_blackboard = encode_blackboard(staged_blackboard)
+            assert encoded_blackboard is not None
+            metadata_updates = {"blackboard": encoded_blackboard}
+            metadata_removals = ()
+
         try:
-            active_session.append_messages([deepcopy(current_user), *deepcopy(result.messages)])
+            active_session.append_messages(
+                [deepcopy(current_user), *deepcopy(result.messages)],
+                metadata_updates=metadata_updates,
+                metadata_removals=metadata_removals,
+                usage_delta=framing_result.usage_delta,
+            )
         except Exception as failure:
             _runtime_logger().opt(exception=failure).error(
                 "Agent Run Session increment failed code=persistence_error type={}",
@@ -975,3 +1026,13 @@ def _log_agent_failure(error: ErrorInfo) -> None:
 
 async def _discard_runner_output(event: object) -> None:
     del event
+
+
+def _latest_assistant_content(session: Session) -> str:
+    for message in reversed(session.messages):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+    return ""

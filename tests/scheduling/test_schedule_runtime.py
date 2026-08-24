@@ -44,7 +44,7 @@ from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock, ProviderCall
+from tests.fixtures import DeterministicTaskFramingEvaluator, FakeClock, ProviderCall
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 from tests.runtime_bus import collect_foreground_outbound
 
@@ -235,6 +235,7 @@ def _runtime(
         new_uuid=lambda: JOB_UUID,
         memory_scheduler_clock=_BlockingClock(NOW),
         schedule_scheduler_clock=schedule_clock,
+        task_framer=DeterministicTaskFramingEvaluator(),
     )
 
 

@@ -13,7 +13,7 @@ from uuid import UUID
 from loguru import logger
 from tzlocal import get_localzone_name
 
-from myclaw.agent.blackboard import Blackboard
+from myclaw.agent.blackboard import Blackboard, TaskFramingEvaluator
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import AgentLoop, TerminalAgentLoopControl
 from myclaw.agent.message_bus import MessageBus
@@ -592,6 +592,7 @@ def prepare_runtime(
     session: Session | None = None,
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
+    task_framer: TaskFramingEvaluator | None = None,
 ) -> PreparedRuntime:
     """Prepare one Runtime and record terminal composition failures once."""
     try:
@@ -611,6 +612,7 @@ def prepare_runtime(
             session=session,
             workspace_state=workspace_state,
             replace_session=replace_session,
+            task_framer=task_framer,
         )
     except WorkspaceStateError:
         raise
@@ -638,6 +640,7 @@ def _prepare_runtime(
     session: Session | None = None,
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
+    task_framer: TaskFramingEvaluator | None = None,
 ) -> PreparedRuntime:
     """Prepare one unstarted Runtime Generation."""
     workspace_identity = (
@@ -838,6 +841,7 @@ def _prepare_runtime(
         schedule_now=schedule_clock.now,
         title_prompt=session_title_prompt(),
         externalize_result_for=externalize_result_for,
+        task_framer=task_framer,
     )
 
     schedule_service.on_schedule_job = agent_loop.run_schedule_job

@@ -5,18 +5,19 @@ import json
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import pytest
 from loguru import logger
 
-from myclaw.agent.blackboard import Blackboard
+from myclaw.agent.blackboard import Blackboard, FramingResult, TaskFramingEvaluator
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
 from myclaw.agent.message_bus import InboundMessage, OutboundMessage
-from myclaw.agent.runner import AgentRunnerRouter
+from myclaw.agent.runner import AgentRunnerResult, AgentRunnerRouter
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -38,6 +39,7 @@ from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
+from tests.fixtures import DeterministicTaskFramingEvaluator
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 
@@ -87,6 +89,69 @@ class _Router:
     ) -> ModelResponse:
         del route, messages, tools, continuation
         raise AssertionError("unexpected direct completion")
+
+
+class _FramingFake:
+    def __init__(
+        self,
+        outcomes: Sequence[FramingResult | BaseException] = (),
+    ) -> None:
+        self._outcomes = deque(outcomes)
+        self.calls: list[tuple[Blackboard | None, str, str]] = []
+
+    async def frame(
+        self,
+        *,
+        previous: Blackboard | None,
+        last_assistant_content: str,
+        current_user_input: str,
+    ) -> FramingResult:
+        self.calls.append((previous, last_assistant_content, current_user_input))
+        if self._outcomes:
+            outcome = self._outcomes.popleft()
+        else:
+            outcome = FramingResult(
+                blackboard=None,
+                usage_delta={
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                status="resolved",
+            )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class _BlockingFramer:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def frame(
+        self,
+        *,
+        previous: Blackboard | None,
+        last_assistant_content: str,
+        current_user_input: str,
+    ) -> FramingResult:
+        del previous, last_assistant_content, current_user_input
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class _InvalidResultFramer:
+    async def frame(
+        self,
+        *,
+        previous: Blackboard | None,
+        last_assistant_content: str,
+        current_user_input: str,
+    ) -> FramingResult:
+        del previous, last_assistant_content, current_user_input
+        return cast(FramingResult, object())
 
 
 class _MaxRouter(_Router):
@@ -226,13 +291,23 @@ class _EventRouter(_Router):
         return replay()
 
 
-def _response(content: str, *, tool_call: ModelToolCall | None = None) -> ModelResponse:
+def _response(
+    content: str,
+    *,
+    tool_call: ModelToolCall | None = None,
+    input_tokens: int = 1,
+    output_tokens: int = 1,
+) -> ModelResponse:
     return ModelResponse(
         message=AssistantModelMessage(
             content=content,
             tool_calls=() if tool_call is None else (tool_call,),
         ),
-        usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+        usage=ModelUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        ),
         finish_reason="stop",
     )
 
@@ -243,6 +318,13 @@ def _runtime(
     *,
     context_preparer: Callable[[Session, dict[str, Any]], Awaitable[list[dict[str, Any]]]]
     | None = None,
+    context_preparer_with_blackboard: Callable[
+        [Session, dict[str, Any], Blackboard | None],
+        Awaitable[list[dict[str, Any]]],
+    ]
+    | None = None,
+    task_framer: TaskFramingEvaluator | None = None,
+    use_default_task_framer: bool = False,
     title_prompt: str | None = None,
 ) -> tuple[AgentLoop, Session]:
     agent_home = AgentHome(tmp_path / "agent-home")
@@ -254,13 +336,19 @@ def _runtime(
     session = Session.create(state, now=_Clock().now)
     schedule = ScheduleService(store=WorkspaceScheduleStore(state), clock=_Clock())
     selected_context_preparer = _context if context_preparer is None else context_preparer
+    selected_context_preparer_with_blackboard = context_preparer_with_blackboard
 
     async def prepare(
         active_session: Session,
         current_user: dict[str, Any],
         blackboard: Blackboard | None = None,
     ) -> list[dict[str, Any]]:
-        assert blackboard is None
+        if selected_context_preparer_with_blackboard is not None:
+            return await selected_context_preparer_with_blackboard(
+                active_session,
+                current_user,
+                blackboard,
+            )
         return await selected_context_preparer(active_session, current_user)
 
     loop = AgentLoop(
@@ -271,6 +359,7 @@ def _runtime(
         context_preparer=prepare,
         now=_Clock().now,
         max_iterations=50,
+        task_framer=(None if use_default_task_framer else task_framer or _FramingFake()),
         title_prompt=title_prompt,
     )
     return loop, session
@@ -316,10 +405,14 @@ async def test_loop_consumes_foreground_inputs_fifo_and_publishes_one_terminal_e
     original_append = Session.append_messages
     original_persist = Session.persist
 
-    def append_messages(active: Session, messages: list[dict[str, Any]]) -> None:
+    def append_messages(
+        active: Session,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
         nonlocal append_calls
         append_calls += 1
-        original_append(active, messages)
+        original_append(active, messages, **kwargs)
 
     def persist(active: Session) -> None:
         nonlocal persist_calls
@@ -400,17 +493,34 @@ async def test_loop_commits_failed_runner_result_once_before_one_safe_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    staged = Blackboard(goal="Failed goal", completion_boundary="Failed boundary")
+    framing_usage = {
+        "model_calls": 1,
+        "input_tokens": 4,
+        "output_tokens": 2,
+        "total_tokens": 6,
+    }
     router = _Router((ModelCallError(ErrorInfo("model_failed", "provider failed")),))
-    loop, session = _runtime(tmp_path, router)
+    loop, session = _runtime(
+        tmp_path,
+        router,
+        task_framer=_FramingFake(
+            (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
+        ),
+    )
     append_calls = 0
     persist_calls = 0
     original_append = Session.append_messages
     original_persist = Session.persist
 
-    def append_messages(active: Session, messages: list[dict[str, Any]]) -> None:
+    def append_messages(
+        active: Session,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
         nonlocal append_calls
         append_calls += 1
-        original_append(active, messages)
+        original_append(active, messages, **kwargs)
 
     def persist(active: Session) -> None:
         nonlocal persist_calls
@@ -435,6 +545,16 @@ async def test_loop_commits_failed_runner_result_once_before_one_safe_terminal(
         assert persist_calls == 1
         assert [message["role"] for message in session.messages] == ["user", "assistant"]
         assert session.messages[-1]["status"] == "error"
+        assert session.metadata["blackboard"] == {
+            "goal": staged.goal,
+            "completion_boundary": staged.completion_boundary,
+        }
+        assert session.metadata["token_usage"] == {
+            "model_calls": 2,
+            "input_tokens": 4,
+            "output_tokens": 2,
+            "total_tokens": 6,
+        }
     finally:
         await loop.close()
 
@@ -444,17 +564,34 @@ async def test_loop_commits_max_iteration_repair_once_before_safe_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    staged = Blackboard(goal="Bounded goal", completion_boundary="Bounded boundary")
+    framing_usage = {
+        "model_calls": 1,
+        "input_tokens": 4,
+        "output_tokens": 2,
+        "total_tokens": 6,
+    }
     router = _MaxRouter()
-    loop, session = _runtime(tmp_path, router)
+    loop, session = _runtime(
+        tmp_path,
+        router,
+        task_framer=_FramingFake(
+            (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
+        ),
+    )
     append_calls = 0
     persist_calls = 0
     original_append = Session.append_messages
     original_persist = Session.persist
 
-    def append_messages(active: Session, messages: list[dict[str, Any]]) -> None:
+    def append_messages(
+        active: Session,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
         nonlocal append_calls
         append_calls += 1
-        original_append(active, messages)
+        original_append(active, messages, **kwargs)
 
     def persist(active: Session) -> None:
         nonlocal persist_calls
@@ -482,10 +619,14 @@ async def test_loop_commits_max_iteration_repair_once_before_safe_terminal(
         assert append_calls == 1
         assert persist_calls == 1
         assert session.metadata["token_usage"] == {
-            "model_calls": 50,
-            "input_tokens": 50,
-            "output_tokens": 50,
-            "total_tokens": 100,
+            "model_calls": 51,
+            "input_tokens": 54,
+            "output_tokens": 52,
+            "total_tokens": 106,
+        }
+        assert session.metadata["blackboard"] == {
+            "goal": staged.goal,
+            "completion_boundary": staged.completion_boundary,
         }
         assert session.messages[-1]["status"] == "error"
         assert session.messages[-1]["error"]["code"] == "agent_iteration_limit"
@@ -500,16 +641,35 @@ async def test_loop_cancellation_repairs_and_keeps_the_next_queued_input(
 ) -> None:
     started = asyncio.Event()
     router = _BlockingRouter(started)
-    loop, session = _runtime(tmp_path, router)
+    staged = Blackboard(goal="Cancelled goal", completion_boundary="Cancelled boundary")
+    framing_result = FramingResult(
+        blackboard=staged,
+        usage_delta={
+            "model_calls": 1,
+            "input_tokens": 4,
+            "output_tokens": 2,
+            "total_tokens": 6,
+        },
+        status="resolved",
+    )
+    loop, session = _runtime(
+        tmp_path,
+        router,
+        task_framer=_FramingFake((framing_result, framing_result)),
+    )
     append_calls = 0
     persist_calls = 0
     original_append = Session.append_messages
     original_persist = Session.persist
 
-    def append_messages(active: Session, messages: list[dict[str, Any]]) -> None:
+    def append_messages(
+        active: Session,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
         nonlocal append_calls
         append_calls += 1
-        original_append(active, messages)
+        original_append(active, messages, **kwargs)
 
     def persist(active: Session) -> None:
         nonlocal persist_calls
@@ -543,6 +703,16 @@ async def test_loop_cancellation_repairs_and_keeps_the_next_queued_input(
             "cancelled input",
             "queued input",
         ]
+        assert session.metadata["blackboard"] == {
+            "goal": staged.goal,
+            "completion_boundary": staged.completion_boundary,
+        }
+        assert session.metadata["token_usage"] == {
+            "model_calls": 3,
+            "input_tokens": 9,
+            "output_tokens": 5,
+            "total_tokens": 14,
+        }
     finally:
         await loop.close()
 
@@ -806,25 +976,97 @@ async def test_append_failure_reports_safe_terminal_and_fifo_consumer_continues(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    previous = Blackboard(goal="Previous goal", completion_boundary="Previous boundary")
+    staged = Blackboard(goal="Staged goal", completion_boundary="Staged boundary")
+    framing_usage = {
+        "model_calls": 1,
+        "input_tokens": 5,
+        "output_tokens": 2,
+        "total_tokens": 7,
+    }
     loop, session = _runtime(
         tmp_path,
-        _Router((_response("not committed"), _response("next completed"))),
+        _Router(()),
+        task_framer=_FramingFake(
+            (
+                FramingResult(
+                    blackboard=staged,
+                    usage_delta=framing_usage,
+                    status="resolved",
+                ),
+                FramingResult(
+                    blackboard=None,
+                    usage_delta=None,
+                    status="model_failed",
+                ),
+            )
+        ),
     )
-    append_calls = 0
-    original_append = session.append_messages
+    session.update_metadata(
+        title="Existing title",
+        blackboard={
+            "goal": previous.goal,
+            "completion_boundary": previous.completion_boundary,
+        },
+        usage_delta={
+            "model_calls": 2,
+            "input_tokens": 11,
+            "output_tokens": 4,
+            "total_tokens": 15,
+        },
+    )
+    before_messages = deepcopy(session.messages)
+    before_metadata = deepcopy(session.metadata)
+    results = deque(
+        (
+            AgentRunnerResult(
+                messages=[{"role": "assistant", "content": "invalid increment"}],
+                final_content="invalid increment",
+                usage={
+                    "model_calls": 1,
+                    "input_tokens": 3,
+                    "output_tokens": 1,
+                    "total_tokens": 4,
+                },
+            ),
+            AgentRunnerResult(
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": "next completed",
+                        "tool_calls": [],
+                        "status": "completed",
+                        "error": None,
+                        "token_usage": {
+                            "model_calls": 1,
+                            "input_tokens": 2,
+                            "output_tokens": 1,
+                            "total_tokens": 3,
+                        },
+                    }
+                ],
+                final_content="next completed",
+                usage={
+                    "model_calls": 1,
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "total_tokens": 3,
+                },
+            ),
+        )
+    )
 
-    def fail_append(messages: list[dict[str, Any]]) -> None:
-        nonlocal append_calls
-        append_calls += 1
-        if append_calls == 1:
-            raise OSError("private append detail")
-        original_append(messages)
+    async def run(*args: Any, **kwargs: Any) -> AgentRunnerResult:
+        del args, kwargs
+        return results.popleft()
 
-    monkeypatch.setattr(session, "append_messages", fail_append)
+    monkeypatch.setattr(loop._runner, "run", run)
     await loop.start()
     try:
         await loop.bus.put_inbound(InboundMessage("cannot commit"))
         failed = (await _terminals(loop, 1))[0]
+        assert session.messages == before_messages
+        assert session.metadata == before_metadata
         await loop.bus.put_inbound(InboundMessage("next input"))
         completed = (await _terminals(loop, 1))[0]
     finally:
@@ -922,6 +1164,33 @@ async def test_loop_abort_retains_cancelled_owned_tasks_until_cleanup_finishes(
     task.add_done_callback(lambda _task: tasks_drained.set())
     await tasks_drained.wait()
     assert loop._aborted_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_blank_foreground_input_performs_zero_task_framing_attempts(
+    tmp_path: Path,
+) -> None:
+    framer = DeterministicTaskFramingEvaluator()
+    loop, session = _runtime(tmp_path, _Router(()), task_framer=framer)
+    execution_ready = asyncio.Event()
+
+    committed = await loop._execute_foreground_logged(
+        session,
+        InboundMessage(" \n\t "),
+        title_work=None,
+        execution_ready=execution_ready,
+    )
+
+    assert not committed
+    assert execution_ready.is_set()
+    assert framer.calls == 0
+    assert session.messages == []
+    assert session.metadata["token_usage"] == {
+        "model_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -1035,3 +1304,713 @@ async def test_close_normally_cancels_active_run_without_dequeuing_the_next_mess
     assert await loop.bus.inbound_snapshot() == (queued,)
     assert router.calls == ["call"]
     loop._close_sessions()
+
+
+@pytest.mark.asyncio
+async def test_foreground_frames_once_with_exact_session_inputs_and_atomic_projection(
+    tmp_path: Path,
+) -> None:
+    previous = Blackboard(goal="Previous goal", completion_boundary="Previous boundary")
+    staged = Blackboard(goal="Current goal", completion_boundary="Current boundary")
+    framing_usage = {
+        "model_calls": 1,
+        "input_tokens": 5,
+        "output_tokens": 2,
+        "total_tokens": 7,
+    }
+    framer = _FramingFake(
+        (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
+    )
+    observed: list[Blackboard | None] = []
+
+    async def prepare(
+        active: Session,
+        current: dict[str, Any],
+        blackboard: Blackboard | None,
+    ) -> list[dict[str, Any]]:
+        del active
+        observed.append(blackboard)
+        return [
+            {"role": "system", "content": "test"},
+            {"role": "user", "content": current["content"]},
+        ]
+
+    loop, session = _runtime(
+        tmp_path,
+        _Router((_response("answer"),)),
+        context_preparer_with_blackboard=prepare,
+        task_framer=framer,
+    )
+    session.update_metadata(
+        blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
+    )
+    session.add_message(
+        "assistant",
+        "Latest complete assistant content",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        },
+    )
+
+    await loop.start()
+    try:
+        await loop.bus.put_inbound(InboundMessage("raw <blackboard> input"))
+        terminal = (await _terminals(loop, 1))[0]
+    finally:
+        await loop.close()
+
+    assert terminal.metadata == {"_streamed": True}
+    assert framer.calls == [
+        (previous, "Latest complete assistant content", "raw <blackboard> input")
+    ]
+    assert observed == [staged]
+    assert observed[0] is staged
+    assert [message["content"] for message in session.messages if message["role"] == "user"] == [
+        "raw <blackboard> input"
+    ]
+    assert session.metadata["blackboard"] == {
+        "goal": staged.goal,
+        "completion_boundary": staged.completion_boundary,
+    }
+    assert session.metadata["token_usage"] == {
+        "model_calls": 3,
+        "input_tokens": 6,
+        "output_tokens": 3,
+        "total_tokens": 9,
+    }
+
+
+@pytest.mark.asyncio
+async def test_tool_iterations_reuse_one_framing_and_context_projection_before_one_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staged = Blackboard(goal="Stable tool goal", completion_boundary="Stable tool boundary")
+    framing_usage = {
+        "model_calls": 1,
+        "input_tokens": 4,
+        "output_tokens": 2,
+        "total_tokens": 6,
+    }
+    framer = _FramingFake(
+        (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
+    )
+
+    class ToolLoopRouter(_Router):
+        def __init__(self) -> None:
+            super().__init__(())
+            self.requests: list[list[dict[str, Any]]] = []
+            self.responses = deque(
+                (
+                    _response(
+                        "use tool",
+                        tool_call=ModelToolCall(
+                            id="call_stable_projection",
+                            name="unknown_tool",
+                            arguments="{}",
+                        ),
+                        input_tokens=2,
+                        output_tokens=1,
+                    ),
+                    _response("tool loop complete", input_tokens=3, output_tokens=2),
+                )
+            )
+
+        def stream(
+            self,
+            route: Literal["chat", "schedule"],
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[OpenAIToolSchema],
+            continuation: ModelContinuation | None = None,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            del route, tools, continuation
+            self.requests.append(deepcopy(list(messages)))
+            response = self.responses.popleft()
+
+            async def replay() -> AsyncIterator[ModelStreamEvent]:
+                yield ModelCompleted(response=response)
+
+            return replay()
+
+    router = ToolLoopRouter()
+    context_calls: list[Blackboard | None] = []
+    projected_blackboard = json.dumps(
+        {"goal": staged.goal, "completion_boundary": staged.completion_boundary},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    async def prepare(
+        active: Session,
+        current: dict[str, Any],
+        blackboard: Blackboard | None,
+    ) -> list[dict[str, Any]]:
+        del active
+        context_calls.append(blackboard)
+        return [
+            {"role": "system", "content": "test"},
+            {
+                "role": "user",
+                "content": f'{current["content"]}\n<blackboard>{projected_blackboard}</blackboard>',
+            },
+        ]
+
+    loop, session = _runtime(
+        tmp_path,
+        router,
+        context_preparer_with_blackboard=prepare,
+        task_framer=framer,
+    )
+    append_calls = 0
+    original_append = session.append_messages
+
+    def append_messages(messages: list[dict[str, Any]], **kwargs: Any) -> None:
+        nonlocal append_calls
+        append_calls += 1
+        assert kwargs["usage_delta"] == framing_usage
+        original_append(messages, **kwargs)
+
+    monkeypatch.setattr(session, "append_messages", append_messages)
+    await loop.start()
+    try:
+        await loop.bus.put_inbound(InboundMessage("raw tool input"))
+        terminal = (await _terminals(loop, 1))[0]
+    finally:
+        await loop.close()
+
+    assert terminal.metadata == {"_streamed": True}
+    assert framer.calls == [(None, "", "raw tool input")]
+    assert context_calls == [staged]
+    assert context_calls[0] is staged
+    assert len(router.requests) == 2
+    assert all(request[1]["content"].endswith(f"<blackboard>{projected_blackboard}</blackboard>") for request in router.requests)
+    assert append_calls == 1
+    assert [message["role"] for message in session.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert session.messages[0]["content"] == "raw tool input"
+    assert session.metadata["blackboard"] == {
+        "goal": staged.goal,
+        "completion_boundary": staged.completion_boundary,
+    }
+    assert session.metadata["token_usage"] == {
+        "model_calls": 3,
+        "input_tokens": 9,
+        "output_tokens": 5,
+        "total_tokens": 14,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "usage_delta", "expected_framing_usage"),
+    [
+        (
+            "invalid_response",
+            {
+                "model_calls": 1,
+                "input_tokens": 4,
+                "output_tokens": 1,
+                "total_tokens": 5,
+            },
+            {
+                "model_calls": 1,
+                "input_tokens": 4,
+                "output_tokens": 1,
+                "total_tokens": 5,
+            },
+        ),
+        (
+            "model_failed",
+            None,
+            {"model_calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        ),
+    ],
+)
+async def test_invalid_and_model_failed_framing_statuses_fail_open_and_clear_on_commit(
+    tmp_path: Path,
+    status: str,
+    usage_delta: dict[str, int] | None,
+    expected_framing_usage: dict[str, int],
+) -> None:
+    previous = Blackboard(goal="Old goal", completion_boundary="Old boundary")
+    framer = _FramingFake(
+        (
+            FramingResult(
+                blackboard=None,
+                usage_delta=usage_delta,
+                status=status,  # type: ignore[arg-type]
+            ),
+        )
+    )
+    observed: list[Blackboard | None] = []
+
+    async def prepare(
+        active: Session,
+        current: dict[str, Any],
+        blackboard: Blackboard | None,
+    ) -> list[dict[str, Any]]:
+        del active, current
+        observed.append(blackboard)
+        return [{"role": "system", "content": "test"}]
+
+    loop, session = _runtime(
+        tmp_path,
+        _Router((_response("raw answer"),)),
+        context_preparer_with_blackboard=prepare,
+        task_framer=framer,
+    )
+    session.update_metadata(
+        blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
+    )
+
+    await loop.start()
+    try:
+        await loop.bus.put_inbound(InboundMessage("continue without parsed framing"))
+        terminal = (await _terminals(loop, 1))[0]
+    finally:
+        await loop.close()
+
+    assert terminal.metadata == {"_streamed": True}
+    assert framer.calls == [(previous, "", "continue without parsed framing")]
+    assert observed == [None]
+    assert "blackboard" not in session.metadata
+    assert session.metadata["token_usage"] == {
+        "model_calls": expected_framing_usage["model_calls"] + 1,
+        "input_tokens": expected_framing_usage["input_tokens"] + 1,
+        "output_tokens": expected_framing_usage["output_tokens"] + 1,
+        "total_tokens": expected_framing_usage["total_tokens"] + 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_framing_cancellation_reclaims_first_title_task_without_commit(
+    tmp_path: Path,
+) -> None:
+    framer = _BlockingFramer()
+    loop, session = _runtime(
+        tmp_path,
+        _ConcurrentTitleRouter(),
+        task_framer=framer,
+        title_prompt="Generate a title",
+    )
+
+    await loop.start()
+    await loop.bus.put_inbound(InboundMessage("cancel before the Agent Run"))
+    await framer.started.wait()
+    await loop.cancel_active_run()
+    terminal = (await _terminals(loop, 1))[0]
+    await loop.close()
+
+    assert terminal.metadata == {
+        "finish_reason": "cancelled",
+        "error_code": "turn_cancelled",
+        "_streamed": True,
+    }
+    assert session.messages == []
+    assert session.metadata["title"] == "Untitled session"
+    assert session.metadata["token_usage"] == {
+        "model_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    assert not loop._title_work
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("framer", "error_type", "match"),
+    [
+        (_FramingFake((RuntimeError("private framing failure"),)), RuntimeError, "private"),
+        (_InvalidResultFramer(), TypeError, "invalid result"),
+    ],
+)
+async def test_framing_contract_errors_propagate_and_reclaim_first_title_task(
+    tmp_path: Path,
+    framer: TaskFramingEvaluator,
+    error_type: type[Exception],
+    match: str,
+) -> None:
+    router = _ConcurrentTitleRouter()
+    loop, session = _runtime(
+        tmp_path,
+        router,
+        task_framer=framer,
+        title_prompt="Generate a title",
+    )
+    before_messages = deepcopy(session.messages)
+    before_metadata = deepcopy(session.metadata)
+    execution_ready = asyncio.Event()
+
+    with pytest.raises(error_type, match=match):
+        await loop._execute_foreground(
+            InboundMessage("framing implementation error"),
+            execution_ready=execution_ready,
+        )
+
+    outbound = asyncio.create_task(loop.bus.get_outbound())
+    done, _ = await asyncio.wait((outbound,), timeout=0)
+    assert not done
+    outbound.cancel()
+    await asyncio.gather(outbound, return_exceptions=True)
+    assert execution_ready.is_set()
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+    assert session.metadata["title"] == "Untitled session"
+    assert "chat" not in router.calls
+    assert not loop._title_work
+
+
+@pytest.mark.asyncio
+async def test_context_failure_after_framing_preserves_previous_blackboard_and_usage(
+    tmp_path: Path,
+) -> None:
+    previous = Blackboard(goal="Previous goal", completion_boundary="Previous boundary")
+    staged = Blackboard(goal="Staged goal", completion_boundary="Staged boundary")
+    framer = _FramingFake(
+        (
+            FramingResult(
+                blackboard=staged,
+                usage_delta={
+                    "model_calls": 1,
+                    "input_tokens": 4,
+                    "output_tokens": 2,
+                    "total_tokens": 6,
+                },
+                status="resolved",
+            ),
+        )
+    )
+
+    async def fail_context(
+        active: Session,
+        current: dict[str, Any],
+        blackboard: Blackboard | None,
+    ) -> list[dict[str, Any]]:
+        del active, current, blackboard
+        raise ModelCallError(ErrorInfo("model_failed", "context failed"))
+
+    loop, session = _runtime(
+        tmp_path,
+        _Router(()),
+        context_preparer_with_blackboard=fail_context,
+        task_framer=framer,
+    )
+    session.update_metadata(
+        blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
+    )
+    before_usage = session.metadata["token_usage"]
+
+    await loop.start()
+    try:
+        await loop.bus.put_inbound(InboundMessage("context fails after framing"))
+        terminal = (await _terminals(loop, 1))[0]
+    finally:
+        await loop.close()
+
+    assert terminal.metadata["finish_reason"] == "failed"
+    assert session.metadata["blackboard"] == {
+        "goal": previous.goal,
+        "completion_boundary": previous.completion_boundary,
+    }
+    assert session.metadata["token_usage"] == before_usage
+    assert session.messages == []
+
+
+@pytest.mark.asyncio
+async def test_context_cancellation_after_framing_preserves_previous_blackboard_and_usage(
+    tmp_path: Path,
+) -> None:
+    previous = Blackboard(goal="Previous goal", completion_boundary="Previous boundary")
+    staged = Blackboard(goal="Staged goal", completion_boundary="Staged boundary")
+    framer = _FramingFake(
+        (
+            FramingResult(
+                blackboard=staged,
+                usage_delta={
+                    "model_calls": 1,
+                    "input_tokens": 4,
+                    "output_tokens": 2,
+                    "total_tokens": 6,
+                },
+                status="resolved",
+            ),
+        )
+    )
+    started = asyncio.Event()
+
+    async def block_context(
+        active: Session,
+        current: dict[str, Any],
+        blackboard: Blackboard | None,
+    ) -> list[dict[str, Any]]:
+        del active, current, blackboard
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    loop, session = _runtime(
+        tmp_path,
+        _Router(()),
+        context_preparer_with_blackboard=block_context,
+        task_framer=framer,
+    )
+    session.update_metadata(
+        blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
+    )
+    before_usage = session.metadata["token_usage"]
+
+    await loop.start()
+    await loop.bus.put_inbound(InboundMessage("context cancellation after framing"))
+    await started.wait()
+    await loop.cancel_active_run()
+    terminal = (await _terminals(loop, 1))[0]
+    await loop.close()
+
+    assert terminal.metadata == {
+        "finish_reason": "cancelled",
+        "error_code": "turn_cancelled",
+        "_streamed": True,
+    }
+    assert session.metadata["blackboard"] == {
+        "goal": previous.goal,
+        "completion_boundary": previous.completion_boundary,
+    }
+    assert session.metadata["token_usage"] == before_usage
+    assert session.messages == []
+
+
+@pytest.mark.asyncio
+async def test_title_usage_is_preserved_when_title_finishes_before_foreground_commit(
+    tmp_path: Path,
+) -> None:
+    staged = Blackboard(goal="Current goal", completion_boundary="Current boundary")
+    framing_usage = {
+        "model_calls": 1,
+        "input_tokens": 5,
+        "output_tokens": 2,
+        "total_tokens": 7,
+    }
+    framer = _FramingFake(
+        (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
+    )
+    router = _ConcurrentTitleRouter()
+    loop, session = _runtime(
+        tmp_path,
+        router,
+        task_framer=framer,
+        title_prompt="Generate a title",
+    )
+
+    await loop.start()
+    try:
+        await loop.bus.put_inbound(InboundMessage("title and foreground race"))
+        await router.chat_started.wait()
+        for _ in range(100):
+            if session.metadata["title"] != "Untitled session":
+                break
+            await asyncio.sleep(0)
+
+        assert session.metadata["title"] == "Generated while chat blocked"
+        assert session.metadata["token_usage"] == {
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        }
+
+        router.release_chat.set()
+        terminal = (await _terminals(loop, 1))[0]
+    finally:
+        router.release_chat.set()
+        await loop.close()
+
+    assert terminal.metadata == {"_streamed": True}
+    assert session.metadata["blackboard"] == {
+        "goal": staged.goal,
+        "completion_boundary": staged.completion_boundary,
+    }
+    assert session.metadata["token_usage"] == {
+        "model_calls": 3,
+        "input_tokens": 7,
+        "output_tokens": 4,
+        "total_tokens": 11,
+    }
+
+
+@pytest.mark.asyncio
+async def test_foreground_commit_preserves_staged_framing_until_slow_title_finishes(
+    tmp_path: Path,
+) -> None:
+    staged = Blackboard(goal="Current goal", completion_boundary="Current boundary")
+    framer = _FramingFake(
+        (
+            FramingResult(
+                blackboard=staged,
+                usage_delta={
+                    "model_calls": 1,
+                    "input_tokens": 5,
+                    "output_tokens": 2,
+                    "total_tokens": 7,
+                },
+                status="resolved",
+            ),
+        )
+    )
+    router = _SlowTitleLogRouter()
+    loop, session = _runtime(
+        tmp_path,
+        router,
+        task_framer=framer,
+        title_prompt="Generate a title",
+    )
+
+    await loop.start()
+    await loop.bus.put_inbound(InboundMessage("foreground commits first"))
+    terminal = (await _terminals(loop, 1))[0]
+    await router.title_started.wait()
+
+    assert terminal.metadata == {"_streamed": True}
+    assert session.metadata["title"] == "Untitled session"
+    assert session.metadata["blackboard"] == {
+        "goal": staged.goal,
+        "completion_boundary": staged.completion_boundary,
+    }
+    assert session.metadata["token_usage"] == {
+        "model_calls": 2,
+        "input_tokens": 6,
+        "output_tokens": 3,
+        "total_tokens": 9,
+    }
+
+    router.release_title.set()
+    for _ in range(100):
+        if session.metadata["title"] == "Slow title":
+            break
+        await asyncio.sleep(0)
+    await loop.close()
+
+    assert session.metadata["title"] == "Slow title"
+    assert session.metadata["token_usage"] == {
+        "model_calls": 3,
+        "input_tokens": 7,
+        "output_tokens": 4,
+        "total_tokens": 11,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "previous", "expected"),
+    [
+        (
+            {"action": "keep", "goal": None, "completion_boundary": None},
+            Blackboard(goal="Previous goal", completion_boundary="Previous boundary"),
+            Blackboard(goal="Previous goal", completion_boundary="Previous boundary"),
+        ),
+        (
+            {
+                "action": "replace",
+                "goal": "Default goal",
+                "completion_boundary": "Default boundary",
+            },
+            None,
+            Blackboard(goal="Default goal", completion_boundary="Default boundary"),
+        ),
+        (
+            {"action": "clear", "goal": None, "completion_boundary": None},
+            Blackboard(goal="Previous goal", completion_boundary="Previous boundary"),
+            None,
+        ),
+    ],
+)
+async def test_default_agent_loop_wiring_reduces_keep_replace_and_clear(
+    tmp_path: Path,
+    decision: dict[str, object],
+    previous: Blackboard | None,
+    expected: Blackboard | None,
+) -> None:
+    class DefaultRouter(_Router):
+        def __init__(self) -> None:
+            super().__init__((_response("main answer"),))
+            self.direct_calls: list[
+                tuple[str, Sequence[dict[str, Any]], Sequence[OpenAIToolSchema]]
+            ] = []
+
+        async def complete(
+            self,
+            route: Literal["chat", "schedule"],
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[OpenAIToolSchema],
+            continuation: ModelContinuation | None = None,
+        ) -> ModelResponse:
+            del continuation
+            self.direct_calls.append((route, messages, tools))
+            return _response(
+                json.dumps(decision, separators=(",", ":")),
+                input_tokens=5,
+                output_tokens=2,
+            )
+
+    router = DefaultRouter()
+    loop, session = _runtime(tmp_path, router, use_default_task_framer=True)
+    if previous is not None:
+        session.update_metadata(
+            blackboard={
+                "goal": previous.goal,
+                "completion_boundary": previous.completion_boundary,
+            }
+        )
+
+    await loop.start()
+    try:
+        await loop.bus.put_inbound(InboundMessage("default wiring input"))
+        terminal = (await _terminals(loop, 1))[0]
+    finally:
+        await loop.close()
+
+    assert terminal.metadata == {"_streamed": True}
+    assert len(router.direct_calls) == 1
+    route, messages, tools = router.direct_calls[0]
+    assert route == "chat"
+    assert tools == ()
+    assert messages[1]["content"] == json.dumps(
+        {
+            "previous_blackboard": (
+                None
+                if previous is None
+                else {
+                    "goal": previous.goal,
+                    "completion_boundary": previous.completion_boundary,
+                }
+            ),
+            "last_assistant_content": "",
+            "current_user_input": "default wiring input",
+        },
+        separators=(",", ":"),
+    )
+    if expected is None:
+        assert "blackboard" not in session.metadata
+    else:
+        assert session.metadata["blackboard"] == {
+            "goal": expected.goal,
+            "completion_boundary": expected.completion_boundary,
+        }
+    assert session.metadata["token_usage"] == {
+        "model_calls": 2,
+        "input_tokens": 6,
+        "output_tokens": 3,
+        "total_tokens": 9,
+    }

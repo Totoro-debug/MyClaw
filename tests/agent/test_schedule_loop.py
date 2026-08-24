@@ -11,7 +11,7 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.blackboard import Blackboard
+from myclaw.agent.blackboard import Blackboard, TaskFramingEvaluator
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import InboundMessage
 from myclaw.agent.workspace import Workspace
@@ -33,6 +33,7 @@ from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
+from tests.fixtures import DeterministicTaskFramingEvaluator
 
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
 JOB_ID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -259,6 +260,7 @@ def _loop(
         Awaitable[list[dict[str, Any]]],
     ] = _schedule_context,
     externalize_result_for: Callable[[Session], Callable[[ToolResult], ToolResult]] | None = None,
+    task_framer: TaskFramingEvaluator | None = None,
 ) -> tuple[AgentLoop, WorkspaceState, ScheduleService]:
     workspace = Workspace.from_path(tmp_path / "workspace")
     workspace.path.mkdir(parents=True)
@@ -266,12 +268,16 @@ def _loop(
     state.initialize(agent_home_root=tmp_path / "agent-home")
     foreground = Session.create(state, now=lambda: NOW)
     service = ScheduleService(store=WorkspaceScheduleStore(state), clock=_Clock())
+    selected_task_framer = (
+        DeterministicTaskFramingEvaluator() if task_framer is None else task_framer
+    )
     loop = AgentLoop(
         workspace=workspace,
         session=foreground,
         schedule_service=service,
         model_router=router,
         context_preparer=_foreground_context,
+        task_framer=selected_task_framer,
         schedule_context_preparer=schedule_context_preparer,
         now=lambda: NOW,
         max_iterations=50,
@@ -315,7 +321,8 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
     tmp_path: Path,
 ) -> None:
     router = _ScheduleRouter()
-    loop, state, _ = _loop(tmp_path, router)
+    framer = DeterministicTaskFramingEvaluator()
+    loop, state, _ = _loop(tmp_path, router, task_framer=framer)
 
     outbound = asyncio.create_task(loop.bus.get_outbound())
     await loop.run_schedule_job(_job())
@@ -337,6 +344,7 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
     assert schedule_session.messages[-1]["content"] == "scheduled result"
     assert router.routes == ["schedule"]
     assert router.requests[0][1] == 10
+    assert framer.calls == 0
 
 
 @pytest.mark.asyncio
@@ -674,6 +682,7 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
         schedule_service=service,
         model_router=router,
         context_preparer=_foreground_context,
+        task_framer=DeterministicTaskFramingEvaluator(),
         schedule_context_preparer=_schedule_context,
         now=lambda: NOW,
         max_iterations=50,

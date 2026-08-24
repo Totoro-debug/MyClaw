@@ -28,6 +28,7 @@ from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.core.web_fetch import JinaReaderClient
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
+from tests.fixtures import DeterministicTaskFramingEvaluator
 from tests.fixtures.provider import ProviderCall
 from tests.runtime_bus import collect_foreground_outbound
 
@@ -143,6 +144,7 @@ def _runtime(
         new_uuid=uuid4,
         memory_scheduler_clock=_BlockingClock(),
         schedule_scheduler_clock=_BlockingClock(),
+        task_framer=DeterministicTaskFramingEvaluator(),
     )
 
 

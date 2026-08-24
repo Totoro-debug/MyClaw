@@ -1,6 +1,10 @@
 """Reusable boundary fakes and pytest fixtures."""
 
 from tests.fixtures.clock import FakeClock
+from tests.fixtures.framing import (
+    BlockingTaskFramingEvaluator,
+    DeterministicTaskFramingEvaluator,
+)
 from tests.fixtures.gateway import SingleToolGateway
 from tests.fixtures.provider import (
     ProviderCall,
@@ -13,6 +17,8 @@ from tests.fixtures.schedule import write_schedule_state
 from tests.fixtures.tool import FakeTool, FakeToolCall
 
 __all__ = [
+    "BlockingTaskFramingEvaluator",
+    "DeterministicTaskFramingEvaluator",
     "FakeClock",
     "FakeTool",
     "FakeToolCall",

@@ -40,6 +40,7 @@ from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
+    DeterministicTaskFramingEvaluator,
     FakeClock,
     ScriptedFakeProvider,
     StreamScript,
@@ -263,6 +264,32 @@ async def test_foreground_context_uses_one_staged_blackboard_for_summary_and_cha
     await runtime.close()
 
 
+@pytest.mark.asyncio
+async def test_management_command_performs_zero_task_framing_attempts(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    framer = DeterministicTaskFramingEvaluator()
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=unexpected_provider_factory,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        task_framer=framer,
+    )
+
+    result = await runtime.management_dispatcher.dispatch("/status")
+    await runtime.close()
+
+    assert result.output is not None
+    assert framer.calls == 0
+
+
 def test_runtime_composition_rejects_invalid_discovered_iana_before_provider_call(
     agent_home: Path,
     workspace: Path,
@@ -413,6 +440,7 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
         now=clock.now,
         new_uuid=iter((SESSION_UUID, TURN_UUID)).__next__,
         retry_clock=clock,
+        task_framer=DeterministicTaskFramingEvaluator(),
     )
 
     private_input = " ".join(("private", "foreground", "input"))
@@ -457,6 +485,7 @@ async def test_concurrent_foreground_sessions_write_only_to_their_own_session_lo
             provider_factory=lambda _: provider,
             now=FakeClock(NOW).now,
             new_uuid=uuid4,
+            task_framer=DeterministicTaskFramingEvaluator(),
         )
 
     first_runtime = runtime_for(first_provider)
@@ -836,6 +865,170 @@ async def test_prepared_repl_uses_the_chat_model_route(
         request.reasoning_effort,
         request.timeout,
     ) == ("chat-model", 4096, 0.1, "high", 90)
+
+
+@pytest.mark.asyncio
+async def test_default_task_framer_uses_model_router_retry_before_one_foreground_run(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(CHAT_ROUTE_CONFIG, encoding="utf-8")
+    clock = FakeClock(NOW)
+    retryable_failure = ModelCallError(
+        ErrorInfo(
+            code="provider_timeout",
+            message="The provider timed out.",
+            retryable=True,
+        )
+    )
+    framing_response = ModelResponse(
+        message=AssistantModelMessage(
+            content=(
+                '{"action":"replace","goal":"Retried framing goal",'
+                '"completion_boundary":"Retried framing boundary"}'
+            )
+        ),
+        usage=ModelUsage(input_tokens=5, output_tokens=2, total_tokens=7),
+        finish_reason="stop",
+    )
+    main_response = ModelResponse(
+        message=AssistantModelMessage(content="Retried framing main response."),
+        usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
+        finish_reason="stop",
+    )
+    provider = ScriptedFakeProvider(
+        completions=(retryable_failure, framing_response),
+        streams=(StreamScript(events=(ModelCompleted(response=main_response),)),),
+    )
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=clock.now,
+        new_uuid=uuid4,
+        retry_clock=clock,
+    )
+    runtime.session.add_message("user", "Existing turn prevents title work.")
+
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, "Retry framing once.")
+    await runtime.close()
+
+    assert messages[-1].metadata == {"_streamed": True}
+    assert len(provider.complete_requests) == 2
+    assert clock.sleeps == [0.5]
+    assert [request.model for request in provider.complete_requests] == [
+        "chat-model",
+        "chat-model",
+    ]
+    assert all(request.tools == () for request in provider.complete_requests)
+    assert all(request.continuation is None for request in provider.complete_requests)
+    assert provider.complete_requests[0].messages == provider.complete_requests[1].messages
+    assert json.loads(cast(str, provider.complete_requests[0].messages[1]["content"])) == {
+        "previous_blackboard": None,
+        "last_assistant_content": "",
+        "current_user_input": "Retry framing once.",
+    }
+    assert len(provider.stream_requests) == 1
+    assert runtime.session.metadata["blackboard"] == {
+        "goal": "Retried framing goal",
+        "completion_boundary": "Retried framing boundary",
+    }
+    assert runtime.session.metadata["token_usage"] == {
+        "model_calls": 2,
+        "input_tokens": 9,
+        "output_tokens": 4,
+        "total_tokens": 13,
+    }
+
+
+@pytest.mark.asyncio
+async def test_default_task_framer_uses_model_router_default_fallback(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(CHAT_ROUTE_CONFIG, encoding="utf-8")
+    fallback_failure = ModelCallError(
+        ErrorInfo(
+            code="provider_auth_error",
+            message="The configured provider rejected authentication.",
+        )
+    )
+    framing_response = ModelResponse(
+        message=AssistantModelMessage(
+            content=(
+                '{"action":"replace","goal":"Fallback framing goal",'
+                '"completion_boundary":"Fallback framing boundary"}'
+            )
+        ),
+        usage=ModelUsage(input_tokens=6, output_tokens=2, total_tokens=8),
+        finish_reason="stop",
+    )
+    main_response = ModelResponse(
+        message=AssistantModelMessage(content="Fallback framing main response."),
+        usage=ModelUsage(input_tokens=3, output_tokens=1, total_tokens=4),
+        finish_reason="stop",
+    )
+    chat_provider = ScriptedFakeProvider(
+        completions=(fallback_failure,),
+        streams=(StreamScript(events=(ModelCompleted(response=main_response),)),),
+    )
+    default_provider = ScriptedFakeProvider(completions=(framing_response,))
+    provider_ids: list[str] = []
+
+    def provider_factory(configuration: ProviderConfiguration) -> ModelProvider:
+        provider_ids.append(configuration.provider_id)
+        if configuration.provider_id == "chat-provider":
+            return chat_provider
+        return default_provider
+
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=provider_factory,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    runtime.session.add_message("user", "Existing turn prevents title work.")
+
+    await runtime.start()
+    messages = await collect_foreground_outbound(runtime, "Fallback framing once.")
+    await runtime.close()
+
+    assert messages[-1].metadata == {"_streamed": True}
+    assert provider_ids == ["chat-provider", "anthropic-default"]
+    assert len(chat_provider.complete_requests) == 1
+    assert len(default_provider.complete_requests) == 1
+    framing_requests = [
+        chat_provider.complete_requests[0],
+        default_provider.complete_requests[0],
+    ]
+    assert all(request.tools == () for request in framing_requests)
+    assert all(request.continuation is None for request in framing_requests)
+    assert framing_requests[0].messages == framing_requests[1].messages
+    assert json.loads(cast(str, framing_requests[0].messages[1]["content"])) == {
+        "previous_blackboard": None,
+        "last_assistant_content": "",
+        "current_user_input": "Fallback framing once.",
+    }
+    assert len(chat_provider.stream_requests) == 1
+    assert default_provider.stream_requests == []
+    assert runtime.session.metadata["blackboard"] == {
+        "goal": "Fallback framing goal",
+        "completion_boundary": "Fallback framing boundary",
+    }
+    assert runtime.session.metadata["token_usage"] == {
+        "model_calls": 2,
+        "input_tokens": 9,
+        "output_tokens": 3,
+        "total_tokens": 12,
+    }
 
 
 @pytest.mark.asyncio

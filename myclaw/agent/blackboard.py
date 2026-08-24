@@ -83,10 +83,25 @@ class FramingResult:
     status: Literal["resolved", "invalid_response", "model_failed"]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.status, str):
+            raise TypeError("Framing status must be a string")
         if self.status not in {"resolved", "invalid_response", "model_failed"}:
             raise ValueError("Framing status is invalid")
         if self.blackboard is not None and not isinstance(self.blackboard, Blackboard):
             raise TypeError("Framing blackboard must be a Blackboard or None")
+        if self.usage_delta is not None and not isinstance(self.usage_delta, dict):
+            raise TypeError("Framing usage must be a dictionary or None")
+        if self.status == "resolved":
+            if self.usage_delta is None:
+                raise ValueError("Resolved framing must include usage")
+        elif self.status == "invalid_response":
+            if self.blackboard is not None:
+                raise ValueError("Invalid framing response cannot include a Blackboard")
+            if self.usage_delta is None:
+                raise ValueError("Invalid framing response must include usage")
+        elif self.blackboard is not None or self.usage_delta is not None:
+            raise ValueError("Failed framing cannot include a Blackboard or usage")
+
         if self.usage_delta is None:
             return
         if set(self.usage_delta) != _USAGE_KEYS:
@@ -97,6 +112,18 @@ class FramingResult:
             self.usage_delta["input_tokens"] + self.usage_delta["output_tokens"]
         ):
             raise ValueError("Framing usage total_tokens must equal input plus output")
+
+
+class TaskFramingEvaluator(Protocol):
+    """Public seam for evaluating one foreground input's task framing."""
+
+    async def frame(
+        self,
+        *,
+        previous: Blackboard | None,
+        last_assistant_content: str,
+        current_user_input: str,
+    ) -> FramingResult: ...
 
 
 class TaskFramer:
@@ -286,6 +313,7 @@ __all__ = [
     "Blackboard",
     "FramingResult",
     "TaskFramer",
+    "TaskFramingEvaluator",
     "TaskFramingModelRouter",
     "decode_blackboard",
     "encode_blackboard",

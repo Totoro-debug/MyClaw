@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from myclaw.agent.message_bus import InboundMessage
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import prepare_runtime
 from myclaw.agent.workspace import Workspace
@@ -26,7 +27,12 @@ from myclaw.provider.models import (
 )
 from myclaw.tools.base import OpenAIToolSchema
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider, StreamScript
+from tests.fixtures import (
+    BlockingTaskFramingEvaluator,
+    DeterministicTaskFramingEvaluator,
+    ScriptedFakeProvider,
+    StreamScript,
+)
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 NOW = datetime(2026, 7, 13, 0, 30, tzinfo=timezone(timedelta(hours=8)))
@@ -136,6 +142,64 @@ class ScriptedInput:
 
     async def read(self) -> str | None:
         return self._values.popleft()
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_cancels_blocked_framing_and_reclaims_title_work(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    provider = ScriptedFakeProvider()
+    framer = BlockingTaskFramingEvaluator()
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        task_framer=framer,
+    )
+
+    await runtime.start()
+    await runtime.bus.put_inbound(InboundMessage("Blocked framing during shutdown"))
+    await framer.started.wait()
+    execution_task = runtime.agent_loop._execution_task
+    assert execution_task is not None
+    title_work = tuple(runtime.agent_loop._title_work.values())
+    assert len(title_work) == 1
+    title_task = title_work[0].task
+    execution_done = asyncio.Event()
+    title_done = asyncio.Event()
+    execution_task.add_done_callback(lambda _task: execution_done.set())
+    title_task.add_done_callback(lambda _task: title_done.set())
+
+    await runtime.close()
+
+    await asyncio.wait_for(framer.cancelled.wait(), timeout=3)
+    await asyncio.wait_for(execution_done.wait(), timeout=3)
+    await asyncio.wait_for(title_done.wait(), timeout=3)
+    terminal = await asyncio.wait_for(runtime.bus.get_outbound(), timeout=3)
+    assert terminal.metadata == {
+        "finish_reason": "cancelled",
+        "error_code": "turn_cancelled",
+        "_streamed": True,
+    }
+    assert runtime.session.messages == []
+    assert runtime.session.metadata["title"] == "Untitled session"
+    assert runtime.session.metadata["token_usage"] == {
+        "model_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    assert runtime.agent_loop._execution_task is None
+    assert runtime.agent_loop._title_work == {}
+    assert runtime.agent_loop._aborted_tasks == set()
+    assert provider.closed
 
 
 @pytest.mark.asyncio
@@ -525,6 +589,7 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
         new_uuid=uuid4,
         memory_scheduler_clock=memory_clock,
         schedule_scheduler_clock=scheduled_clock,
+        task_framer=DeterministicTaskFramingEvaluator(),
     )
     input_reader = ControlledInput()
     log_capture = capture_diagnostics()

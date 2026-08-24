@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 from loguru import logger
 
+from myclaw.agent.message_bus import InboundMessage
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedRuntime, RuntimeHost, prepare_runtime
 from myclaw.config.agent_home import AgentHome
@@ -25,7 +26,12 @@ from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock, ProviderCall
+from tests.fixtures import (
+    BlockingTaskFramingEvaluator,
+    DeterministicTaskFramingEvaluator,
+    FakeClock,
+    ProviderCall,
+)
 from tests.runtime_bus import collect_foreground_outbound
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -132,6 +138,7 @@ def _runtime(
         now=clock.now,
         new_uuid=uuid4,
         retry_clock=clock,
+        task_framer=DeterministicTaskFramingEvaluator(),
     )
 
 
@@ -512,6 +519,83 @@ async def test_runtime_replacement_abandons_old_and_normal_close_saves_target(
 
     assert abandoned == [initial.session_id]
     assert closed == [selected.session_id]
+
+
+@pytest.mark.asyncio
+async def test_forced_runtime_replacement_cancels_blocked_framing_without_late_session_writes(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RuntimeProvider(
+        (
+            ModelResponse(
+                message=AssistantModelMessage(content="Target generation response."),
+                usage=ModelUsage(input_tokens=5, output_tokens=2, total_tokens=7),
+                finish_reason="stop",
+            ),
+        )
+    )
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    clock = FakeClock(NOW)
+    runtime = RuntimeHost(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=clock.now,
+        new_uuid=uuid4,
+        retry_clock=clock,
+    )
+    old_runtime = runtime.generation
+    old_session = old_runtime.session
+    old_messages = json.loads(json.dumps(old_session.messages))
+    old_metadata = json.loads(json.dumps(old_session.metadata))
+    target = Session.create(old_session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Persisted target")
+    target.close()
+    framer = BlockingTaskFramingEvaluator()
+    monkeypatch.setattr(old_runtime.agent_loop, "_task_framer", framer)
+
+    await runtime.start()
+    await old_runtime.bus.put_inbound(InboundMessage("Blocked old generation input"))
+    await framer.started.wait()
+    execution_task = old_runtime.agent_loop._execution_task
+    assert execution_task is not None
+    title_work = tuple(old_runtime.agent_loop._title_work.values())
+    assert len(title_work) == 1
+    title_task = title_work[0].task
+    execution_done = asyncio.Event()
+    title_done = asyncio.Event()
+    execution_task.add_done_callback(lambda _task: execution_done.set())
+    title_task.add_done_callback(lambda _task: title_done.set())
+
+    resumed = await runtime.management_dispatcher.resume(target.session_id, force=True)
+
+    assert resumed.output == f"Resumed session {target.session_id}."
+    await asyncio.wait_for(framer.cancelled.wait(), timeout=3)
+    await asyncio.wait_for(execution_done.wait(), timeout=3)
+    await asyncio.wait_for(title_done.wait(), timeout=3)
+    assert old_runtime.agent_loop._execution_task is None
+    assert old_runtime.agent_loop._title_work == {}
+    assert old_runtime.agent_loop._aborted_tasks == set()
+    assert old_session.messages == old_messages
+    assert old_session.metadata == old_metadata
+
+    selected = runtime.generation
+    messages = await collect_foreground_outbound(selected, "Target generation input")
+
+    assert messages[-1].metadata == {"_streamed": True}
+    assert [
+        message["content"]
+        for message in selected.session.messages
+        if message["role"] == "user"
+    ] == ["Persisted target", "Target generation input"]
+    assert old_session.messages == old_messages
+    assert old_session.metadata == old_metadata
+    await runtime.close()
 
 
 @pytest.mark.asyncio

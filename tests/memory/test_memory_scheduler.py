@@ -41,6 +41,7 @@ from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.scheduler import AsyncioSchedulerClock
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
+    DeterministicTaskFramingEvaluator,
     FakeClock,
     ProviderCall,
     ScriptedFakeProvider,
@@ -468,6 +469,7 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(NOW)
+    framer = DeterministicTaskFramingEvaluator()
     runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
@@ -476,6 +478,7 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
         now=clock.now,
         new_uuid=uuid4,
         memory_scheduler_clock=clock,
+        task_framer=framer,
     )
 
     await runtime.start()
@@ -485,6 +488,7 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
     await runtime.close()
 
     assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
+    assert framer.calls == 0
 
 
 @pytest.mark.asyncio
@@ -506,6 +510,7 @@ async def test_each_prepared_runtime_starts_a_fresh_memory_scheduler(
             now=clock.now,
             new_uuid=uuid4,
             memory_scheduler_clock=clock,
+            task_framer=DeterministicTaskFramingEvaluator(),
         )
 
     class ExitInput:
@@ -698,6 +703,7 @@ async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
         now=clock.now,
         new_uuid=uuid4,
         memory_scheduler_clock=clock,
+        task_framer=DeterministicTaskFramingEvaluator(),
     )
 
     await runtime.start()
@@ -725,6 +731,7 @@ async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
         now=clock.now,
         new_uuid=uuid4,
         memory_scheduler_clock=clock,
+        task_framer=DeterministicTaskFramingEvaluator(),
     )
     await restarted.start()
     _ = await collect_foreground_outbound(restarted, "What do you remember now?")
@@ -820,6 +827,7 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
         provider_factory=lambda _configuration: provider,
         now=lambda: NOW,
         new_uuid=uuid4,
+        task_framer=DeterministicTaskFramingEvaluator(),
     )
 
     await runtime.start()

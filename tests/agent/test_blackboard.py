@@ -8,6 +8,7 @@ import pytest
 
 from myclaw.agent.blackboard import (
     Blackboard,
+    FramingResult,
     TaskFramer,
     TaskFramingModelRouter,
     decode_blackboard,
@@ -90,6 +91,116 @@ def _decision(
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def _usage() -> dict[str, int]:
+    return {
+        "model_calls": 1,
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "total_tokens": 10,
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "blackboard", "usage_delta"),
+    [
+        ("resolved", None, _usage()),
+        (
+            "resolved",
+            Blackboard(goal="Goal", completion_boundary="Boundary"),
+            _usage(),
+        ),
+        ("invalid_response", None, _usage()),
+        ("model_failed", None, None),
+    ],
+)
+def test_framing_result_accepts_the_complete_legal_state_table(
+    status: str,
+    blackboard: Blackboard | None,
+    usage_delta: dict[str, int] | None,
+) -> None:
+    result = FramingResult(
+        blackboard=blackboard,
+        usage_delta=usage_delta,
+        status=status,  # type: ignore[arg-type]
+    )
+
+    assert result.status == status
+    assert result.blackboard is blackboard
+    assert result.usage_delta == usage_delta
+
+
+@pytest.mark.parametrize(
+    ("blackboard", "usage_delta", "status", "error_type", "match"),
+    [
+        (None, _usage(), 1, TypeError, "status must be a string"),
+        (None, _usage(), "unknown", ValueError, "status is invalid"),
+        (object(), _usage(), "resolved", TypeError, "Blackboard or None"),
+        (None, [], "resolved", TypeError, "dictionary or None"),
+        (None, None, "resolved", ValueError, "must include usage"),
+        (
+            Blackboard(goal="Goal", completion_boundary="Boundary"),
+            _usage(),
+            "invalid_response",
+            ValueError,
+            "cannot include a Blackboard",
+        ),
+        (None, None, "invalid_response", ValueError, "must include usage"),
+        (
+            Blackboard(goal="Goal", completion_boundary="Boundary"),
+            None,
+            "model_failed",
+            ValueError,
+            "cannot include a Blackboard or usage",
+        ),
+        (None, _usage(), "model_failed", ValueError, "cannot include a Blackboard or usage"),
+        (
+            None,
+            {"model_calls": 1},
+            "resolved",
+            ValueError,
+            "exactly four fields",
+        ),
+        (
+            None,
+            {
+                "model_calls": True,
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "total_tokens": 10,
+            },
+            "resolved",
+            ValueError,
+            "nonnegative integers",
+        ),
+        (
+            None,
+            {
+                "model_calls": 1,
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "total_tokens": 11,
+            },
+            "resolved",
+            ValueError,
+            "must equal input plus output",
+        ),
+    ],
+)
+def test_framing_result_rejects_every_invalid_state_combination(
+    blackboard: object,
+    usage_delta: object,
+    status: object,
+    error_type: type[Exception],
+    match: str,
+) -> None:
+    with pytest.raises(error_type, match=match):
+        FramingResult(
+            blackboard=blackboard,  # type: ignore[arg-type]
+            usage_delta=usage_delta,  # type: ignore[arg-type]
+            status=status,  # type: ignore[arg-type]
+        )
 
 
 def test_blackboard_canonicalizes_and_round_trips_without_truncation() -> None:

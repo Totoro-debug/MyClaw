@@ -29,7 +29,12 @@ from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ProviderCall, ScriptedFakeProvider, write_schedule_state
+from tests.fixtures import (
+    DeterministicTaskFramingEvaluator,
+    ProviderCall,
+    ScriptedFakeProvider,
+    write_schedule_state,
+)
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 from tests.runtime_bus import collect_foreground_outbound
 
@@ -1382,6 +1387,7 @@ async def test_prepared_runtime_runs_foreground_while_every_job_is_active(
         now=lambda: START,
         new_uuid=uuid4,
         schedule_scheduler_clock=ControlledClock(START),
+        task_framer=DeterministicTaskFramingEvaluator(),
     )
 
     await runtime.start()
