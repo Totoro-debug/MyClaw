@@ -134,9 +134,9 @@ def test_active_support_contract_matches_host_neutral_release_evidence() -> None
     assert decision_path.exists()
     decision = decision_path.read_text(encoding="utf-8").lower()
     assert "status: accepted" in decision
-    assert "supersedes adr-0006" in decision
-    for boundary in ("filesystem", "owned process tree"):
-        assert boundary in decision
+    assert "filesystem" in decision
+    assert "process tree" not in decision
+    assert "owned-process" not in decision
     assert "runtime log locking" not in decision
 
     active_paths = (
@@ -156,3 +156,30 @@ def test_active_support_contract_matches_host_neutral_release_evidence() -> None
         "no platform gate",
     ):
         assert claim in support
+
+
+def test_superseded_design_documents_are_absent() -> None:
+    superseded = (
+        ROOT / "Procedure.md",
+        ROOT / "docs" / "agent-runtime-message-bus-design.md",
+        ROOT / "docs" / "contracts-modularization-execution-plan.md",
+        ROOT / "docs" / "myclaw-implementation-plan.md",
+        ROOT / "docs" / "research" / "agent-tool-calling-parameter-validation.md",
+        ROOT / "docs" / "research" / "terminal-tui-library-selection.md",
+        ROOT / "docs" / "adr" / "0003-shell-permission-is-not-os-sandbox.md",
+        ROOT / "docs" / "adr" / "0004-use-two-slot-runtime-log.md",
+        ROOT / "docs" / "adr" / "0006-support-windows-only.md",
+        ROOT / "docs" / "adr" / "0011-use-terminal-conversation-as-the-interactive-cli.md",
+        ROOT / "docs" / "adr" / "0012-use-textual-and-capability-gated-enhanced-keyboard-input.md",
+        ROOT / "docs" / "adr" / "0013-emit-model-call-completion-for-run-projection.md",
+    )
+
+    assert not [path for path in superseded if path.exists()]
+
+
+def test_current_adrs_have_unique_numbers_and_accepted_status() -> None:
+    decisions = sorted((ROOT / "docs" / "adr").glob("*.md"))
+    numbers = [path.name.split("-", 1)[0] for path in decisions]
+
+    assert len(numbers) == len(set(numbers))
+    assert all("status: accepted" in path.read_text(encoding="utf-8").lower() for path in decisions)

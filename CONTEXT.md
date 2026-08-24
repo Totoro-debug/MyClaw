@@ -1,169 +1,169 @@
 # Personal Agent Runtime
 
-This context defines the language for a local-first, single-user personal Agent runtime inspired by nanobot.
+This context defines the language for a local-first, single-user Personal Agent runtime inspired by nanobot.
 
 ## Language
 
 **Personal Agent**:
-A host-neutral, local-first, single-user Agent runtime that can run continuously for one person and expose a command-line conversation interface as its primary entry point. Windows x64 is the currently validated environment; macOS Intel and Apple Silicon are intended compatibility targets but remain unverified. Remote APIs or chat channels, if present, are adapters to the same runtime rather than separate products.
+A local-first, single-user Agent runtime that works continuously for one person through a Command-line Conversation.
 _Avoid_: Bot platform, multi-tenant assistant, channel-first agent, agent platform
 
 **Agent Home**:
-The fixed `~/.myclaw/` location for the current operating-system account that stores global User Configuration and legacy Runtime Log files for the Personal Agent. Session technical diagnostics belong to Workspace State rather than Agent Home.
+The fixed account-global home of one Personal Agent installation, separate from every Workspace and Conversation Session.
 _Avoid_: Project workspace, session directory, install directory, configurable data root
 
 **Workspace**:
-The current user-selected working directory for a Personal Agent interaction, identified by its normalized absolute path under the host's native path semantics without inferring a Git root or searching ancestor directories. It owns the Personal Agent's non-global persistent state in its reserved `.myclaw/` directory; file capabilities resolve paths within the Workspace, including Workspace State, while operating-system permissions remain authoritative and Workspace cwd validation remains neither a filesystem sandbox nor a network sandbox.
+The user-selected directory that scopes one Personal Agent interaction and owns its non-global state and file capabilities.
 _Avoid_: Agent Home, install directory, session directory, project ID
 
 **Workspace State**:
-The persistent Personal Agent state owned by exactly one Workspace and stored in `<workspace>/.myclaw/`. It includes Conversation Session history, the Memory System, Schedule Job state, Tool Artifacts, and lazily-created Session Logs, but never User Configuration; it is reserved local runtime state rather than ordinary Workspace content, is initialized with a Git ignore rule while remaining portable when the whole Workspace directory is copied, and is accessible to the fixed file Tools through normal Workspace path resolution.
+Persistent Personal Agent state owned by exactly one Workspace rather than by the installation or operating-system account.
 _Avoid_: Agent Home, project source, global state, cache
 
 **Message Bus**:
-The transient, in-process pair of unbounded FIFO message queues owned by one Agent Loop, with no independent close, abort, replay, broadcast, version, or backpressure lifecycle. Its six asynchronous operations are `inbound_snapshot()`, `put_inbound()`, `get_inbound()`, `drain_inbound()`, `put_outbound()`, and `get_outbound()`. Inbound stores ordinary user input waiting for serial processing; each mutation synchronously pushes the resulting immutable snapshot to one registered queue UI callback after releasing queue coordination, while snapshot reads do not invoke it. Outbound stores only the foreground reasoning, response, Tool-call, and system-control presentation messages selected for one Terminal Conversation consumer; it is an unbounded single-consumer FIFO, and Tool results, Schedule Job output, and Memory Task output never enter this bus.
+The transient pair of Inbound and Outbound queues owned by one Agent Loop for foreground conversation flow.
 _Avoid_: persistent event log, broadcast bus, Schedule queue
 
 **Inbound Message**:
-One ordinary user input waiting in Message Bus Inbound, represented only by textual `content` and an empty `metadata` dictionary in the current product. Pending messages may be drained together into the terminal input, permanently removed from Inbound, joined with newlines for editing, and submitted again as one new message with fresh empty metadata; the currently executing message is unaffected.
+One ordinary user input waiting in the Message Bus for serial foreground processing.
 _Avoid_: Management Command, Tool Confirmation, cancellation command, Agent Event
 
 **Outbound Message**:
-A transient foreground execution message placed in Message Bus Outbound for the Terminal Conversation's sole consumer. Its only types are `model_reasoning`, `model_response`, `tool_call`, and `system_control`, represented by textual `content` and runtime `metadata`. The sparse markers are mutually exclusive: `_stream_delta` marks one incremental reasoning/response fragment, `_stream_end` marks the end of one streamed segment, and `_streamed` marks the end of the whole Agent Run. System control represents a failed, cancelled, or maximum-iterations result. Tool calls expose the Tool name, call ID, and complete raw Provider argument text, while Tool results remain inside Agent Runner and the Conversation Session increment and never enter Outbound; Outbound Messages are not persisted.
+One transient presentation message emitted by an Agent Loop for its Command-line Conversation.
 _Avoid_: Agent Event, Session message, diagnostic log, broadcast event
 
 **Agent Run Activity Group**:
-A user-visible group of non-final model output and Tool activity belonging to one foreground Agent Run, kept distinct from that run's final output. It is a presentation of Agent Run progress rather than a separate conversation or persisted Session entity.
+A user-visible group of non-final model output and Tool activity belonging to one foreground Agent Run, distinct from that run's final output.
 _Avoid_: Conversation, Agent Run, event log, transcript
 
 **Command-line Conversation**:
-The primary user-facing way to talk with the Personal Agent, presented as a full-screen terminal UI when `myclaw` runs without arguments. It has two primary regions: a scrollable conversation display above and a bottom input area; user messages align right, assistant messages align left, neutral full-width rows show operational events, and Tool Confirmation temporarily replaces the input area with a blocking decision UI. The input area remains editable during an active foreground run so Enter can queue more ordinary messages and Up can drain all pending messages back for newline-joined editing; Ctrl+C cancels only the active run. Each valid start prepares a new Conversation Session by default; a session is not persisted if the UI exits before any user message, and one process reuses its session across inputs. Only built-in slash commands are handled by the Management Port; other inputs beginning with `/` are treated as ordinary user messages and sent to the model. Users can run `/resume` to choose and switch to a prior session from the current Workspace; switching clears the conversation display and rebuilds it from the target Session's persisted messages and final Tool states rather than attempting to recreate transient Outbound Messages. The previous session is retained if it has messages and can be discarded if empty.
+The primary user-facing conversation with the Personal Agent, presented as a full-screen terminal experience.
 _Avoid_: Terminal session, shell command, chat channel, one-shot command, plain REPL
 
 **Management Command**:
-An explicit command for managing configuration, status, session resume, or memory without relying on natural-language conversation. In the first version, non-interactive management supports only `myclaw config` for config inspection and does not require `myclaw --help` as a product feature; if the configuration is missing, it generates the default configuration and displays its redacted content, while Terminal Conversation slash commands are `/config`, `/status`, `/resume`, `/memory`, and `/dream`. `/config` is read-only, displays configuration fields completely except for redacted plaintext API keys by default; when configuration parsing fails, it shows the parse error, path, and raw file content with text-level redaction of obvious API key lines; `/status` reports version, chat model, runtime uptime, estimated token state, current Session message count, `last_consolidated`, and current-Session cumulative model usage. Memory management can fully display the latest on-disk Long-term Memory through `/memory` without pagination and manually trigger a Memory Task through `/dream`, but cannot directly edit Long-term Memory in the first version; Schedule Jobs have no explicit management commands in the first version, and Session title rename or regeneration commands are out of scope.
+An explicit user command for inspecting or changing runtime-managed state without relying on natural-language conversation.
 _Avoid_: Tool call, chat instruction, task management, one-shot conversation
 
 **Management Port**:
-A code-level boundary used by Management Commands to inspect or modify configuration, session metadata, Schedule Jobs, and memory without depending on storage implementation details.
+The boundary through which Management Commands use runtime capabilities without knowing their storage or implementation details.
 _Avoid_: Message Bus, direct file access, admin API
 
 **Runtime Lifetime**:
-The lifecycle of one Terminal Conversation process. It owns exactly one active Runtime Generation at a time and may replace that generation when the user switches Conversation Session; separate Terminal Conversation processes in the same Workspace remain uncoordinated, including Session Log writes. Background work only lives while the process is running. User messages are queued and processed serially in the foreground Agent Loop, while Memory Tasks and Schedule Jobs run asynchronously inside the active generation. Ctrl+C normally cancels only the active foreground run; normal process exit uses awaited close, while a confirmed Session replacement uses synchronous forced abort. Entering `exit` or `quit` with surrounding whitespace ignored and case-insensitive matching exits Terminal Conversation and immediately cancels running background tasks. There is no detached daemon runtime or one-shot runtime in the first version.
+The lifetime of one Command-line Conversation process, including every Runtime Generation it owns over time.
 _Avoid_: Detached mode, daemon mode, persistent background process, one-shot command
 
 **Runtime Generation**:
-One complete prepared set of generation-owned components for the currently selected Conversation Session: Workspace Schedule Store/Service, Message Bus, Model Router, Runtime Memory and managers, Memory Task scheduler, Agent Loop, fixed Tools, shared Tool Gateway, Agent Runner, and management services. Agent Home, Workspace, loaded configuration, Provider factory, clocks, and Terminal application are process-level inputs. A successful Session switch first builds and validates an unstarted target generation, then synchronously aborts the old generation before terminal unbind/rebind and target start. Abort abandons the old Session, cancels owned foreground/Schedule/Memory/persistence work without waiting, discards old bus input/output and confirmation state, and performs detached best-effort Provider cleanup that logs failures only. Forced replacement may lose unpersisted Session state, skip Memory updates under the existing Cursor contract, leave Tool side effects or Artifacts, repeat Schedule Job side effects, and reset runtime uptime.
+One replaceable set of Session-bound runtime components owned by a Runtime Lifetime.
 _Avoid_: Runtime Lifetime, Conversation Session, Agent Run
 
 **Session Log**:
-Workspace-owned technical diagnostics for one Conversation Session, stored lazily under `<workspace>/.myclaw/logs/<session_id>.log` through an explicit validated Session context. WARNING and ERROR records use a Loguru file sink with an unbounded enqueue queue, UTF-8 output, exact 10 MiB rotation, and at most one retained historical file per Session. Sink setup and writes are fail-open, setup retries on the next context, and context exit removes the sink after an infinite drain. Same-Session concurrency is intentionally unsupported; no registry, lock, or cross-process coordination is provided. There is no per-record fsync, active redaction, or control escaping. Legacy Agent Home Runtime Log files remain untouched and are not updated.
+Workspace-owned technical diagnostics associated with one Conversation Session rather than with the whole installation.
 _Avoid_: Runtime Log, Conversation log, chat transcript, audit log, activity feed
 
 **Agent Loop**:
-The product-level, long-lived foreground orchestrator that owns one Message Bus and serially consumes its Inbound Messages. It holds injected runtime components such as Context Builder, active Conversation Session, Model Router, Runtime Memory, and Schedule Service; initializes the fixed Tool instances and shared Tool Gateway; prepares and recovers each Agent Run; invokes Agent Runner; persists the resulting Session increment; and publishes foreground Outbound Messages. After a Tool Gateway call, Agent Loop asks BaseTool to externalize an oversized successful result before Conversation Session persistence; it does not roll artifacts back if later persistence fails. Schedule Service may invoke a separately isolated Schedule execution callback that reuses Agent Loop resources without using its foreground Session, Message Bus, or cancellation state; Memory Tasks remain independent.
+The product orchestrator that owns foreground state, consumes Inbound Messages serially, invokes Agent Runs, and publishes Outbound Messages.
 _Avoid_: Agent Runner, Runtime Lifetime, model loop, Schedule Service
 
 **Agent Runner**:
-A reusable, Session-independent ReAct execution engine whose constructor owns only its Model Router. Agent Loop invokes it with initial model messages, a `chat` or `schedule` route, the shared Tool Gateway, output callback, optional confirmation, per-Session result externalizer, cancellation check, and maximum iterations. It returns only this invocation's generated assistant/Tool increment, final content, usage with exactly `model_calls`, `input_tokens`, `output_tokens`, and `total_tokens` (all nonnegative and total equal to input plus output), a `completed`, `failed`, `cancelled`, or `max_iterations` finish reason, and optional structured `ErrorInfo`; the increment excludes initial messages and the current user message and is repaired into a Provider-valid sequence on normal failure/cancellation. One iteration consists of one model call followed by all Tool calls requested by that response in their original sequential order; Provider retries do not consume an iteration. The configured maximum defaults to 50 and cannot be lower than 50. The fiftieth model response completes all its requested Tools and, unless normal cancellation has been requested, returns `agent_iteration_limit` without a fifty-first model call, using the exact maximum text `MyClaw 本轮对话已经达到最大循环次数，仍没有输出最终结果。可以再次尝试本次请求或者尝试给出更明确的任务目标。`; normal cancellation takes priority and uses `turn_cancelled` and `MyClaw 已取消本轮对话。`.
+A reusable, Session-independent engine that performs one bounded model-and-Tool loop for an Agent Run.
 _Avoid_: Agent Loop, Conversation Session, Runtime Lifetime, Provider retry loop
 
 **Agent Run**:
-One complete Agent execution for one input against one Conversation Session, from accepting the input through Conversation Summary, context assembly, Agent Runner's model and Tool loop, Session increment, and persistence request. Agent Loop performs this flow for foreground input and publishes exactly one terminal Outbound Message; Schedule Service invokes an isolated callback that performs the same complete flow without using the foreground Message Bus. Agent Run is a domain execution concept, not the deleted legacy Python `AgentRun` type, and is not a Runtime Lifetime, Runtime Generation, individual model request, or Tool call.
+One complete Agent execution for one input against one Conversation Session, from input acceptance through its final outcome and persistence request.
 _Avoid_: Agent Turn, Runtime, Model call, Tool call
 
 **Blackboard**:
-A hidden task state attached to a Conversation Session and its foreground Agent Runs, containing exactly one current task goal and one explicit boundary that determines when the task is complete. It is reconsidered before each foreground Agent Run to clarify the current User Message, but does not control execution flow or expose a user-facing task-management surface.
+A hidden task definition attached to a Conversation Session and its foreground Agent Runs, containing one current goal and one completion boundary. It supports interpretation without controlling execution or exposing a task-management surface.
 _Avoid_: Task list, plan, workflow state, progress tracker
 
 **Task Framing**:
-The interpretation of a new ordinary user input against the current Blackboard and the latest assistant response to keep, replace, or clear the current task definition. It defines intent and completion without decomposing work into subtasks or directing execution.
+The interpretation of a new ordinary user input against the current Blackboard and latest assistant response to keep, replace, or clear the current task definition.
 _Avoid_: Task decomposition, planning, orchestration, progress update
 
 **Runtime Context**:
-Dynamic metadata added to a model call. Workspace path is assembled into the built-in identity system prompt, while current time, session ID, and similar per-turn metadata are prepended to the current user input.
-_Avoid_: User instruction, long-term memory, session message
+Dynamic facts about the current runtime and Agent Run supplied to a model call but not authored by the user.
+_Avoid_: User instruction, Long-term Memory, Session message
 
 **System Prompt**:
-The chat and schedule Model Routes' system-level context composed of the built-in identity prompt, Long-term Memory, and tool guidance; Conversation Summary generation does not inject Long-term Memory. If these system-level parts exceed the model context budget, the request fails with a user-facing configuration or memory-size error rather than silently trimming Long-term Memory.
-_Avoid_: Runtime context, user message, conversation summary
+The stable system-level context that establishes Personal Agent identity, memory, and capability guidance for a model call.
+_Avoid_: Runtime Context, user message, Conversation Summary
 
 **Conversation Session**:
-A durable conversational thread owned by one Workspace and represented during a foreground Runtime by one active `Session` instance. The Session ID uses an automatic system-local timestamp plus UUID4 and its title is generated asynchronously after the first user input without blocking the first chat response, falling back to a truncated first-user-message title if title generation fails; title generation is not a message but counts toward cumulative usage. Each Session is persisted as `.myclaw\sessions\<session_id>.jsonl` only after it has a message. The first JSONL line is a strict header with exactly `session_id`, `created_at`, `updated_at`, `last_consolidated`, and `metadata`; later lines are JSON-native user, assistant, and tool message dictionaries with `role`, `content`, and local-time `timestamp` plus provider-relevant fields and JSON-compatible extensions. During a turn the active Session is the in-memory authority. After terminal turn work, `persist()` captures a complete deep-copied state and schedules an ordered atomic replacement with at most three asynchronous attempts, with asynchronous 100 ms and 200 ms backoff; exhausted failures remain silent and a later complete snapshot may persist the still-authoritative in-memory state. `close()` makes at most three bounded synchronous final-save attempts with the same 100 ms and 200 ms delays. `abandon()` is synchronous, idempotent, cancels pending snapshots, rejects later mutation, and performs no final save or retry. A user-confirmed forced Session switch uses `abandon()`; active work is cancelled without waiting, and any state not already on disk may be lost. There is no acknowledgement, user-facing persistence error, or stronger crash consistency guarantee. A late title may wait for a later turn or close, and Summary state may diverge from `last_consolidated` after a crash. Existing schema-versioned files are unsupported, with no migration or version dispatch, and separate Terminal Conversation processes are not coordinated. Final model failures are persisted as assistant error messages, and tool execution failures are persisted as flat tool results containing status, content, and an optional artifact reference without a nested error field. Assistant Tool calls preserve the provider's raw JSON argument text. If a turn is interrupted normally, completed assistant or tool messages are retained, streamed partial assistant content is persisted as an interrupted/error assistant message, and unfinished tool calls are materialized as tool error results; a forced Session switch deliberately skips this repair and does not roll back completed Tool side effects or orphaned Artifacts. Assistant messages may carry both content and tool call requests in the same OpenAI-style message, and tool messages carry the corresponding result or refusal. Provider-visible reasoning may be retained transiently inside one Tool-use loop when required by the Provider protocol, but it is not persisted as a Conversation Session message. The pre-#38 Tool-call object and nested Tool-error JSONL shapes are intentionally not accepted as backward-compatible input.
-_Avoid_: Chat ID, terminal session, workspace, runtime checkpoint, background task
+A durable conversational thread owned by one Workspace and represented by one active in-memory Session authority during foreground execution.
+_Avoid_: Chat ID, terminal session, Workspace, runtime checkpoint, background task
 
 **Memory System**:
-The three-layer memory structure owned independently by each Workspace: Short-term Memory, Conversation Summary, and Long-term Memory.
+The three-layer memory structure owned by a Workspace: Short-term Memory, Conversation Summary, and Long-term Memory.
 _Avoid_: Single memory store, vector memory, raw transcript archive
 
 **Short-term Memory**:
-The unconsolidated suffix of a Conversation Session used to continue the current thread.
-_Avoid_: Chat log, transcript, prompt history, full session file
+The unconsolidated suffix of a Conversation Session used to continue its current thread.
+_Avoid_: Chat log, transcript, prompt history, full Session file
 
 **`last_consolidated`**:
-The mutable nonnegative message position held by the active Conversation Session. Messages before this position have already been summarized into Conversation Summary; Short-term Memory is the suffix beginning at this position. Conversation Summary assigns it directly and does not coordinate it with a Session snapshot through a journal or transaction.
-_Avoid_: checkpoint, bookmark, session ID
+The position in a Conversation Session separating messages already represented by Conversation Summary from Short-term Memory.
+_Avoid_: checkpoint, bookmark, Session ID
 
 **Conversation Summary**:
-A Workspace-owned ordered summary stream stored at `.myclaw\memory\summary.jsonl` for earlier Conversation Session messages that have crossed `last_consolidated` after the context window limit or a configured turn-count boundary is reached. Summary compression runs synchronously in the outer Runtime before each foreground or Schedule Agent Run when either the effective Agent Run Model Route's context window limit or the configured total-message-count boundary is reached; it never runs from inside the model and Tool loop. It uses the memory Model Route with default fallback, and if the fallback model also fails, the Agent Run fails with a user-facing error. Token-budget compression selects roughly half the budget worth of early messages, and message-count compression selects roughly half the threshold worth of early messages; in both cases the cutoff is advanced to the next user message, falling back to the nearest previous user message if no later user exists, and messages before that user are summarized so the retained suffix starts at a user message. Conversation Summary updates `last_consolidated` directly after its own stream operation. The original Session messages may remain stored, but summary entries do not retain source Session or message-range identity, do not immediately trigger Memory Task, and are not directly injected into the main chat model context. A crash or failed Session snapshot may leave summary content and `last_consolidated` divergent, so summary work can repeat or be omitted.
-_Avoid_: Long-term memory, raw history, manual note, session memory
+A Workspace-owned ordered stream of compact summaries derived from earlier Conversation Session messages.
+_Avoid_: Long-term Memory, raw history, manual note, Session memory
 
 **Long-term Memory**:
-A Workspace-level durable memory stored at `.myclaw\memory\memory.md`, initialized at startup as a template with its four sections if missing, periodically considered from that Workspace's Conversation Summary by background processing, and updated only when the model judges that stable information should be retained. It is one structured Markdown document shared only across sessions in the same Workspace, loaded into Runtime at startup and fully injected as part of the system prompt for Agent runs without a first-version size cap; a successful Memory Task modification refreshes the Runtime's cached copy, while each Agent run keeps the one cached snapshot captured at its start so a refresh affects only later runs. It is divided into User Info, User Preference, Project Fact, and Lesson.
-_Avoid_: Raw history, session archive, manual notes, vector database, conversation summary
+A Workspace-level durable memory of stable information intended to influence later Agent behavior across Conversation Sessions.
+_Avoid_: Raw history, Session archive, manual notes, vector database, Conversation Summary
 
 **Memory Task**:
-A task scheduled by User Configuration using a cron expression in the system local timezone or manually triggered by the `/dream` Management Command that uses the memory Model Route and a standard Tool Gateway containing only dedicated `read_file` and `edit_file` capabilities for the current Workspace's Long-term Memory, while the Memory Manager reads that Workspace's Summary Cursor and a globally configured batch size of Conversation Summary entries before constructing the memory prompt; the default batch size is 10. For a nonempty batch it persists the batch's final Summary Cursor before any model call; a Cursor failure aborts before model or Memory work, while any later model, Tool, cancellation, or Long-term Memory failure leaves the advanced Cursor unchanged and does not retry that batch. The dedicated edit capability is limited to the exact Long-term Memory file and remains separate from the main catalog's Workspace-scoped `edit_file` capability. Memory Task does not receive a Conversation Session ID, persist Tool Results, or create Tool Artifacts. Scheduled runs execute silently in the background while manual runs block in the foreground and report summary status without full memory diffs, a run that does not call edit_file is treated as no update, the default schedule is hourly, and Memory Task does not run concurrently with another Memory Task; scheduled triggers are skipped while a prior run is active, and manual triggers are rejected with a user-facing message if a Memory Task is already running; `/dream` returns `No pending summaries` without calling the model when there are no unprocessed Conversation Summary entries.
-_Avoid_: Chat turn, session compression, full agent run
+A background or manually triggered task that considers new Conversation Summary entries for incorporation into Long-term Memory.
+_Avoid_: Chat turn, Session compression, full Agent Run
 
 **Summary Cursor**:
-The Workspace-owned persisted Conversation Summary index stored at `.myclaw\memory\.cursor` through which a Memory Task has consumed that Workspace's summary entries. A Memory Task persists the new Cursor before attempting any corresponding Long-term Memory update, and the Cursor never rolls back even when that update fails, so consumed summaries may permanently produce no Long-term Memory change. This Memory Task position is separate from the active Session's `last_consolidated`.
+The Workspace-owned position through which Memory Tasks have consumed the Conversation Summary stream.
 _Avoid_: Session position, checkpoint
 
 **Lesson**:
 A reusable experience that should change future Agent behavior or design judgment.
-_Avoid_: Conversation summary, activity log, task note
+_Avoid_: Conversation Summary, activity log, task note
 
 **Tool Gateway**:
-The only public Tool invocation boundary. Agent Loop constructs one fixed catalog of `BaseTool` instances during initialization; the Gateway caches their annotation-derived OpenAI Function Calling schemas and returns defensive schema snapshots. `ToolGateway.call()` parses raw JSON argument text, resolves the Tool, projects declared parameters, performs the allowed safe conversions and schema validation, runs concrete argument and safety checks, obtains any required one-shot Tool Confirmation through an injected per-run channel, executes once, and returns an immutable normalized result. Shared path, DNS, traversal, truncation, and Artifact behavior lives in BaseTool or small shared helpers; capability-specific rules remain in concrete Tools. The Gateway has no dynamic registration, plugin or MCP hooks, generic retry, global timeout, concurrency lock, Workspace ownership, persistence, or Artifact externalization.
-_Avoid_: Direct tool registry, plugin executor, shell wrapper
+The sole public boundary for resolving, validating, authorizing, executing, and normalizing Tool calls.
+_Avoid_: Direct Tool registry, plugin executor, shell wrapper
 
 **Tool Confirmation**:
-A host-mediated, one-shot user decision bound to one validated Tool call in one live Agent Run. Agent Loop owns one pending Future and the Terminal temporarily replaces ordinary input with the blocking decision UI; the response is resolved by the call-bound confirmation ID and is never an Inbound Message or Session record. Interactive conversations present the normalized effective operation and accept `approved` or `declined`, while Schedule passes `confirmation=None`, so confirmation-required Tools return their normal refusal without touching foreground UI.
+A host-mediated, one-shot user decision bound to one validated Tool call in one live Agent Run.
 _Avoid_: Permission Policy, model approval, chat reply, persistent approval
 
 **Tool Catalog**:
-The ordered set of concrete `BaseTool` capabilities registered once with a Tool Gateway. The main catalog always contains, in order, Read File, Write File, Edit File, List Dir, Glob, Grep, Exec, Web Search, Web Fetch, and Schedule. There is no User Configuration enablement switch, dynamic registration, plugin, MCP, or subagent entry. Memory Task may construct a separate Gateway containing only its dedicated Long-term Memory Tools; it does not mutate the main catalog. Foreground and Schedule executions share the main Gateway; Schedule Tool uses task-local Schedule execution context to refuse recursive Job creation without affecting concurrent foreground calls. Schedule add/list/remove actions do not request confirmation, while unsafe paths and Exec/Web safety boundaries use the common one-shot confirmation protocol.
+The ordered set of concrete capabilities available through a Tool Gateway.
 _Avoid_: Plugin list, command list, model tools, subagent registry, MCP registry
 
 **Tool Artifact**:
-An external `.txt` file named from the tool_call_id and stored under `.myclaw\artifacts\<session_id>\` when a successful Tool result exceeds the global `runtime.max_tool_result_chars` threshold, which defaults to 4096 characters. Foreground and Schedule Sessions use the same Artifact root; Schedule Session IDs carry their canonical `schedule_` prefix. The per-run externalizer supplies the active Session ID, while the shared Tool Gateway does not infer Artifact ownership or read Schedule execution context. BaseTool writes the raw result and returns an immutable content/reference pair with a bounded prefix preview; the reference shape is exactly `{"path": ".myclaw/artifacts/<session_id>/<id>.txt", "total_chars": int, "preview_chars": int}` and uses a UUID filename fallback for an invalid call ID. Errors and refusals remain inline. There is no separate Artifact module, commit, rollback, callback, cleanup, or ownership lifecycle, so a successful artifact write may leave an accepted orphan file if later Conversation Session persistence fails.
+A durable external representation of an oversized successful Tool result associated with one Conversation Session.
 _Avoid_: Tool result, attachment, memory entry
 
 **Schedule**:
-The domain module encompassing persistent scheduled tasks and the service that manages and runs them.
+The domain encompassing persistent scheduled tasks and the service that manages and runs them.
 _Avoid_: Scheduled Work, a single scheduled task, the scheduling service
 
 **Schedule Job**:
-One Workspace-owned persistent task in the Schedule module, expressed as an `at`, `every`, or `cron` schedule and identified by a UUID `job_id`. A user-sourced Job is managed through natural-language Agent Tools, while a system-sourced Job is Runtime-owned and hidden from those public management operations; every Job derives one persistent Conversation Session ID as `schedule_<job_id>`, reuses that Session across executions, and retains it when the Job is deleted. Its Session and Memory behavior is identical to every other Conversation Session, with no separate lifecycle. Schedule-owned Sessions are not listed or selectable through the foreground `/resume` command.
+One Workspace-owned persistent task in the Schedule domain with its own execution timing and Conversation Session.
 _Avoid_: Schedule, Scheduled Work, shell cron job, reminder
 
 **Schedule Service**:
-The service that is the only Schedule Job management boundary and Store owner, and triggers due Jobs through an `on_schedule_job(job) -> None` callback assigned after Agent Loop initialization and before the Service starts. Agent Loop constructs the fixed Tool catalog, one shared Tool Gateway, and one Agent Runner; foreground and Schedule runs use those same Gateway and Runner identities but receive independent Schedule Session, context, cancellation, and externalizer state. Schedule has no confirmation channel or foreground Message Bus projection: the callback passes `confirmation=None`, publishes no foreground Outbound messages, and sets `ScheduleTool._in_schedule_job` with a ContextVar token that is always reset in `finally`; only recursive `add` is refused, while concurrent foreground `add` and scheduled `list`/`remove` remain available. Schedule Tool receives this Service directly and cannot access the Schedule Store. Schedule Artifacts keep the unchanged `.myclaw/artifacts/schedule_<job_id>/<tool_call_id>.txt` root and the existing three-field reference shape.
+The sole management and execution boundary for Schedule Jobs within one Runtime Generation.
 _Avoid_: Schedule, Schedule Job, detached background process
 
 **Permission Policy**:
-The concrete Tool safety checks for one normalized invocation; there is no separate Security or Permission Policy module. Tool Confirmation supplies explicit per-invocation consent but does not replace capability checks or create persistent approval. Relative and absolute file paths resolve under the current Workspace, including Workspace State; a resolved external path requires confirmation and actual operating-system permissions decide the result. Exec checks its bounded destructive-command, working-directory, and DNS rules before launching one Bash process. WebSearch and WebFetch are fixed Catalog capabilities; WebFetch validates every resolved target and redirect. Confirmation is never a claim of OS-level filesystem, network, or process isolation.
+The Tool-specific safety rules that determine whether one normalized invocation can run directly, requires Tool Confirmation, or must be refused.
 _Avoid_: Tool switch, safety flag, enablement
 
 **Model Route**:
-A named model purpose strictly limited to default, chat, memory, or schedule; route tables with other names in User Configuration are undefined fields and are discarded. User configuration maps each route to a provider ID, one model from that provider's model catalog, context window, max output, temperature, reasoning effort, and timeout; provider adapters silently ignore reasoning effort when unsupported, and each logical model call uses at most five provider attempts with exponential backoff and provider retry-after support. The requested route and default fallback share that attempt budget; fallback occurs when a specific route is missing, statically unusable, or returns a permanent route/provider-unavailable error, while invalid requests, context overflow, and cancellation do not fallback. The chat route covers main conversation and Session title generation, the memory route covers both Conversation Summary generation and Memory Task updates, and the schedule route covers Schedule Jobs.
+A named model purpose that resolves a model request without exposing Provider selection to its caller.
 _Avoid_: Model string, provider selection, backend, ad hoc route
 
 **Model Provider**:
-A concrete LLM backend identified by a kebab-case provider ID and configured with protocol, required base URL, plaintext API key, and a model catalog represented as a list of model IDs. The first version supports the `anthropic` and `openai-compatible` protocols; providers with unknown protocols are ignored.
-_Avoid_: Model route, model string, gateway
+A configured backend that implements model calls for one or more Model Routes.
+_Avoid_: Model Route, model string, gateway
 
 **User Configuration**:
-The single global TOML configuration for one Personal Agent installation, stored at `~/.myclaw/config.toml`. It is organized around runtime, models, and memory sections, with model providers under `[models.providers.<provider_id>]` and model routes under `[models.routes.<route>]`; the fixed Tool Catalog is not configurable. Fields and tables outside that defined schema are discarded during runtime loading, while `myclaw config` reports undefined fields for inspection. If missing, the CLI generates a default configuration with one `openai-local` OpenAI-compatible provider scaffold whose base URL, API key, and model catalog are empty plus explicit unusable scaffolds for the default, chat, memory, and schedule Model Routes, then exits and asks the user to replace the placeholder values or remove purpose-specific routes before starting. If the configuration cannot be parsed, a defined field is structurally invalid, or `[models.routes.default]` is absent, running `myclaw` to start Terminal Conversation exits with a user-facing configuration error rather than entering a repair mode; Model Route provider/model usability is evaluated only when that route is first used, while non-interactive `myclaw config` remains available for inspecting configuration.
-_Avoid_: Agent profile, session override, per-chat settings, identity prompt, repair mode
+The single account-global configuration that selects runtime, model, and memory behavior for a Personal Agent installation.
+_Avoid_: Agent profile, Session override, per-chat settings, identity prompt, repair mode

@@ -4,31 +4,6 @@ status: accepted
 
 # Use Host Adapters for Portable Runtime Behavior
 
-MyClaw uses host-native behavior without a supported-platform allowlist. Windows
-selects the Windows adapters; every other host attempts the POSIX adapters and lets
-missing operating-system capabilities fail at the operation that needs them. This
-decision supersedes ADR-0006 while retaining that document as the historical record
-of the former Windows-only release.
+MyClaw has no supported-platform gate. Windows selects native Windows filesystem behavior, while other hosts attempt the POSIX filesystem behavior and fail at the operation that needs an unavailable capability. Native path conversion, object and redirection checks, containment, atomic replacement, and host-appropriate synchronization are concentrated in the host filesystem module.
 
-Operating-system differences are concentrated behind two deep modules: filesystem
-operations and owned process tree execution. The filesystem
-module owns native I/O paths, object-type and redirection checks, containment,
-create-only publication, atomic replacement, and host-appropriate synchronization.
-Shell execution uses Windows Job Objects or a POSIX process session and
-process group behind one owned-process interface. These adapters use only the Python
-standard library.
-
-Workspace identity is the normalized absolute path under the current host's native
-path semantics. Workspace State remains `<workspace>/.myclaw/` with unchanged record
-formats and lifecycle. Copying a complete Workspace carries its Workspace State;
-Agent Home remains local to the operating-system account and owns User Configuration;
-legacy Runtime Log files there are preserved without being opened.
-
-The installed `myclaw` command enters the Typer application directly. Packaging emits
-one pure-Python `py3-none-any` wheel and performs no operating-system version,
-architecture, or platform-tag gate at startup.
-
-Windows x64 is the currently validated environment. macOS Intel and Apple Silicon are
-intended compatibility targets but remain unverified until the same pytest and
-installed-wheel gates run natively there. The POSIX adapter may be attempted on Linux
-and other POSIX hosts, but this decision makes no formal support claim for them.
+Exec launches one direct Bash subprocess with best-effort cleanup of that process. Packaging emits one `py3-none-any` wheel; Windows x64 is currently validated, macOS Intel and Apple Silicon remain intended but unverified, and no formal support claim is made for other POSIX hosts.

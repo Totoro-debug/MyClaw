@@ -13,14 +13,14 @@
 - 用户运行 `myclaw` 进入长驻前台 Terminal Conversation；非-TTY 启动以 `interactive_terminal_required` 拒绝，不回退到 headless prompt。
 - 每个有效 Terminal Conversation 启动准备一个新的 Workspace-scoped Conversation Session；未发送用户消息就退出时不持久化空 session。
 - Agent Loop 通过 Message Bus、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界编排 Agent Run；RuntimeHost 负责 Runtime Generation 生命周期。
+- 每个非空普通前台输入在 Agent Run 前经过隔离的 Task Framing，用一个隐藏 Blackboard 明确当前任务目标与完成边界。
 - Agent Home 固定为 `~/.myclaw/`，采用 file-first persistence。
 - Terminal Conversation 支持 streaming、前台 Agent Run 期间的 Inbound FIFO 排队、后台 Memory Task、Schedule Jobs、Session resume 和管理 slash commands；Schedule actions 不请求 Tool Confirmation，Exec、Web 和 Workspace 外部路径按具体目标执行一次性确认。
 - 首版非交互管理只支持 `myclaw config`，不支持 one-shot 对话。
 
-## Final runtime migration contract (#163–#173)
+## Current Runtime Contract
 
-以下是当前实现与发布验收使用的最终边界；历史实施计划中的旧 transport/type 名称不属于
-当前 API：
+以下是当前实现与发布验收使用的边界：
 
 - 一个 Agent Loop 拥有一个无界 FIFO Message Bus。公开的六个 async 操作是
   `inbound_snapshot()`、`put_inbound()`、`get_inbound()`、`drain_inbound()`、
@@ -30,13 +30,18 @@
   `_stream_end`、`_streamed` 三种 sparse marker；它只有一个 Terminal consumer，Tool
   result、Schedule output、Memory Task output 永不进入 Outbound。Message Bus 没有独立
   close、abort、replay、broadcast、version 或 backpressure lifecycle。
+- 每个非空普通 foreground input 使用 `chat` Model Route 做一次无 Tools、无 continuation
+  的 Task Framing completion。输入只包含上一个 Blackboard、最新 assistant content
+  和当前 raw user input；结果 keep、replace 或 clear 由 `goal` 与
+  `completion_boundary` 组成的唯一 Blackboard。暂存结果只投影到当前
+  model-visible user message 末尾，persisted user message 保持 raw input。
 - Agent Runner 的 constructor 只拥有 Model Router；它返回本次调用的 assistant/Tool
   increment、final content、四字段 usage、finish reason 和 optional `ErrorInfo`。一次
   iteration 是一次 model call 加该响应的全部顺序 Tool calls，Provider retry 不计数；
   default/minimum `runtime.max_iterations` 为 50。第 50 次完成全部 Tools；若此时没有请求
   normal cancellation，则返回 `agent_iteration_limit` 且不发起第 51 次 model call，取消
   请求优先。`agent_iteration_limit` 与最大循环固定中文文案、`turn_cancelled` 与
-  `MyClaw 已取消本轮对话。` 均见 `CONTEXT.md` 和 runtime contracts。Provider-visible
+  `MyClaw 已取消本轮对话。` 均由 runtime contracts 定义。Provider-visible
   reasoning 只保留 Provider 返回内容；opaque continuation 只在同一 Tool loop 内传递，
   不进入 Session 或 Outbound。
 - Schedule Service 是唯一 Store/management owner；它在 Agent Loop 前创建，随后绑定
@@ -102,6 +107,7 @@
 46. 作为开发者，我想 provider adapter 使用官方 SDK，所以 streaming、tool calls 和错误语义更可控。
 47. 作为开发者，我想用 fake provider 和 fake tool 测试，所以自动化测试不依赖真实 API。
 48. 作为开发者，我想首版不支持 MCP 和 subagent，所以能先稳定核心 runtime 边界。
+49. 作为个人用户，我想 Agent 在连续输入中保持一个隐藏的当前任务目标和完成边界，所以追加、修正、替换或取消请求能被稳定解释而不需要可见任务管理器。
 
 ## Implementation Decisions
 
@@ -114,6 +120,8 @@
 - 每个 Terminal Conversation invocation 创建一个独立 Runtime Lifetime；它在任一时刻拥有
   一个 active Runtime Generation，并可在成功切换 Conversation Session 时替换该 generation。
 - 用户消息进入前台队列并串行执行；Memory Task 和 Schedule Jobs 在同一 runtime 内异步运行。
+- 每个非空普通前台输入在 Agent Run 前做 Task Framing；Management Command、Schedule 和 Memory 路径不做任务框定。
+- Blackboard 只解释当前任务，不分解子任务、不控制 Agent Runner、不授权 Tool，且没有命令、Tool、event 或 UI 表面。
 - Ctrl+C 只取消当前前台 turn。
 - 输入 `exit` 或 `quit`（忽略前后空白、大小写不敏感）退出 Terminal Conversation 并立即取消后台任务。
 - 多个 Terminal Conversation 可在同一 Workspace 运行，但首版不做跨进程协调；每个 Runtime Generation 独立启动后台调度器。
@@ -153,7 +161,7 @@
 - Workspace State 不派生 slug；Session history directory 为 `<workspace>/.myclaw/sessions/`。
 - Session ID 使用系统本地时间戳 + UUID4，固定格式为 `YYYYMMDD-HHMMSS-ffffff_<uuid4>`。
 - Session 文件为 `<workspace>/.myclaw/sessions/<session_id>.jsonl`。
-- JSONL 第一行是严格 header，恰好包含 `session_id`、`created_at`、`updated_at`、`last_consolidated` 和 `metadata`；metadata 当前包含 title 与 cumulative `token_usage`。
+- JSONL 第一行是严格 header，恰好包含 `session_id`、`created_at`、`updated_at`、`last_consolidated` 和 `metadata`；metadata 包含 title、cumulative `token_usage` 与可选的当前 `blackboard`。
 - 后续行是 JSON-native OpenAI-style user、assistant、tool message dictionaries，公共字段为 role、content、local-time timestamp；不含通用 message ID、line type marker 或 schema version。
 - 每次 Session mutation 的持久化都是完整 compact JSONL atomic replacement；turn 内只改 active Session memory，terminal work 后 `persist()` ordered async scheduling，shutdown 由 `close()` bounded synchronous retry。
 - 普通异步 persistence failure 静默吞掉，不提供 acknowledgement、failure logging 或 stronger crash consistency；同一 runtime 内保证 snapshot order，不提供跨进程保护。
@@ -168,6 +176,17 @@
 - assistant content 和 tool_calls 可存在于同一 assistant message。
 - 模型最终失败写 assistant error message；工具失败或拒绝写 tool error/result message。
 - 旧 Session schema unsupported；无 migration、compatibility reader、lazy upgrade 或 version dispatch。缺少完整 snapshot trailing newline 或包含非法 header/message 时 Session 不可恢复且不会被自动删除。
+- `metadata.blackboard` 只有 `goal` 和 `completion_boundary` 两个非空 string 字段；加载时的 malformed optional value 按无 Blackboard 处理，新的 metadata mutation 则拒绝非法形状。
+
+### Task Framing and Blackboard
+
+- 每个非空普通 foreground user input 在 Conversation Summary 与主 Agent Runner 之前做一次隔离 Task Framing；Management Command、Schedule Job 和 Memory Task 不进入该路径。
+- Task Framing 只读取上一个 Blackboard、Session 中最新 assistant message 的完整 content 和当前 raw input，不接收全部历史、Long-term Memory 或 Tools。
+- strict decision 只能 keep、replace 或 clear；Blackboard 恰好包含经过 trim 的非空 `goal` 与 `completion_boundary`，不设字符数上限。
+- staged Blackboard 只附加在当前 model-visible user message 最后一个 Runtime-owned `<blackboard>` block 中；persisted user message 始终是 raw input。
+- Blackboard 只提供任务解释，不是任务列表、计划、workflow state 或 Tool 授权边界。
+- completed Task Framing 的 usage 与 staged Blackboard 只随已接受的主 Agent Run increment 一起 commit。正常 failed、cancelled 或 max-iterations Runner result 仍有已接受 increment；主运行准备失败或取消保留旧 Blackboard。
+- invalid framing response 和 framing model failure 都降级为无 Blackboard 的 raw input；若主 increment 随后 commit，当前 Blackboard 被清除。
 
 ### Memory system
 
@@ -199,7 +218,7 @@
 ### Model routing and providers
 
 - Route 名称严格固定为 `default`、`chat`、`memory`、`schedule`；其它 route table 按未定义字段投影掉。
-- `chat` 用于主对话和 Session title。
+- `chat` 用于主对话、Task Framing 和 Session title。
 - `memory` 用于 Conversation Summary 和 Memory Task。
 - `schedule` 用于 Schedule Jobs。
 - 具体 route 缺失或不可用时总是 fallback 到 `default`。
@@ -274,8 +293,18 @@
 ## Testing Decisions
 
 - 测试只验证外部可观察行为，不绑定内部实现细节。
-- 优先测试最高 seam：Message Bus/Agent Loop、Management Port、PreparedRuntime、Memory Manager、Tool Gateway、active Session、Model Router/Provider Adapter。
+- 优先测试最高 seam：Message Bus/Agent Loop、Task Framing、Management Port、PreparedRuntime、Memory Manager、Tool Gateway、active Session、Model Router/Provider Adapter。
 - 测试使用 fake provider、fake tool、临时 Agent Home 和临时 Workspace，不调用真实模型 API。
+
+### Required Task Framing tests
+
+- Blackboard strict encode/decode、whitespace normalization、无长度截断与 malformed loaded metadata 按 absence 处理。
+- keep、replace、clear 及所有非法 action/field/state combination。
+- direct JSON、单一 Markdown fence、外层 prose 的首个平衡 object，以及 malformed/multiple-fence rejection。
+- framing retry、default fallback、model failure、invalid response、cancellation 和 Runtime replacement。
+- staged Blackboard 在 Summary/context 重建中保持同一值，只投影到当前 model input，不改变 persisted raw user message。
+- accepted Runner result 的 Blackboard/usage atomic commit，以及 preparation failure/cancellation 的旧状态保留。
+- Management、Schedule 和 Memory 路径零 Task Framing call，Blackboard 不影响 Tool Confirmation 或授权。
 
 ### Required memory tests
 
@@ -333,6 +362,7 @@
 - 微服务拆分。
 - MCP 工具扩展。
 - subagent/spawn 或多 Agent 编排。
+- 可见任务列表、计划器、workflow/progress tracker 或由 Blackboard 控制执行。
 - 用户可配置 identity/system prompt。
 - Agent profiles、session overrides、per-chat settings。
 - Session list/view/delete/rename 管理命令。
@@ -354,6 +384,8 @@
 - ADR 0001 记录 file-first local persistence。
 - ADR 0002 记录固定 Agent Home `~/.myclaw/`。
 - ADR-0010 记录 Exec 的 Workspace cwd、destructive/DNS 确认边界及首版不提供 OS 级 sandbox；Exec 没有 allowlist，已知风险形状请求一次性确认。
+- ADR-0014 记录 Message Bus、Agent Loop、Agent Runner 和 Runtime Generation 边界。
+- ADR-0015 记录 Session Blackboard 与 foreground Task Framing 边界。
 - `docs/myclaw-runtime-contracts.md` 是已接受的首版 schema、Port、事件和错误契约。
 - `CONTEXT.md` 是最终 canonical language；本 PRD 的实现术语应与其保持一致。
 - GitHub issue：<https://github.com/Totoro-debug/myclaw/issues/1>；本文件仍是需求的本地 canonical source。

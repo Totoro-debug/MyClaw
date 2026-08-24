@@ -5,11 +5,10 @@
 - 状态：`Accepted`
 - 接受日期：`2026-07-11`
 - 目标版本：MyClaw `v0.1`
-- canonical source：`CONTEXT.md`
+- 领域语言：`CONTEXT.md`
 - 产品行为来源：`docs/myclaw-personal-agent-prd.md`
-- 历史实施顺序记录：`docs/myclaw-implementation-plan.md`
 
-本文把已确认的产品行为细化为可直接实现的类型、文件 schema 和代码边界。来自 canonical 文档的行为与 D01-D16 已于 2026-07-11 一并接受；Issue #118/#130 固化了固定 Core Tool Catalog、BaseTool 管线、Workspace State 访问、Exec/Web/Schedule 行为和 Artifact 边界。本文对应章节以这些已批准规格为准。后续变更必须先更新本契约及受影响的 PRD/ADR。
+本文把已确认的产品行为细化为当前实现的类型、文件 schema 和代码边界。后续产品或架构变更必须先更新本契约及受影响的 PRD/ADR。
 
 本文不新增 one-shot、daemon、HTTP/IPC、MCP、subagent、跨进程协调、用户可配置安全策略或用户自定义 identity。
 
@@ -47,28 +46,29 @@
 - provider 返回的 tool call ID 原样保存在 message 中，不在业务层重新命名。
 - Tool Artifact 文件名直接使用只含 ASCII 字母、数字、下划线和连字符的 tool call ID；其他 ID 使用 UUID4。Artifact 路径固定为 Workspace State 下 `.myclaw/artifacts/<session_id>/<id>.txt`。
 
-## 2. Phase 0 已接受决策表
+## 2. Accepted Design Decisions
 
-| ID | 已接受的决定 | 理由 | 同步文档 |
-| --- | --- | --- | --- |
-| D01 | Python 最低版本为 3.12，采用 `pyproject.toml` + 根目录 `myclaw/` 包布局 | asyncio、typing 和 timezone 能力成熟，降低兼容分支 | 实施计划 |
-| D02 | Runtime loading 投影掉未知配置字段；`myclaw config` 报告未定义字段；未知 provider protocol 仍按 PRD 忽略 | 保持运行时配置兼容，同时让配置命令暴露拼写错误 | PRD 可补充 |
-| D03 | memory message threshold 默认 `40` 条 | 足够早地覆盖长会话，又不会在短对话频繁摘要 | PRD 可补充 |
-| D04 | Schedule state 文件名为 `schedule.json` | 与 canonical Schedule module 一致，legacy state 不参与升级 | PRD/Issue #116 |
-| D05 | Session title 最长 `60` 个 Unicode code points | picker 可读且不需要终端宽度参与持久化 | PRD 可补充 |
-| D06 | Summary index 从 `1` 开始，缺失 `.cursor` 等价于 `0` | cursor 语义是“已处理到的最大 index”，直观且易恢复 | PRD 可补充 |
-| D07 | model retry 的“最多 5 次”解释为每个逻辑 model call 最多 `5 attempts`，不是首次调用后再重试 5 次 | 限制最坏延迟和费用，与英文 canonical 的 five attempts 一致 | PRD |
-| D08 | route fallback 发生在具体 route 缺失、配置不可用或返回永久 route/provider 不可用错误时；同一 route 的临时错误先在 5-attempt budget 内重试 | 避免两个 route 各重试 5 次导致不可控延迟 | PRD |
-| D09 | token estimate 使用 `ceil(UTF-8 byte length / 4)`，展示估算输入 token、context window 和占比 | provider-neutral，明确它只是估算值 | PRD 可补充 |
-| D10 | WebSearch 使用无凭据的内置 adapter，首选 DuckDuckGo；后端和 enablement 不进入持久化配置契约 | 固定 Catalog 保持可预测，adapter 可替换 | PRD |
-| D11 | Exec 使用单次 Bash 和固定 destructive/DNS safety checks；没有 allowlist，也不宣称 OS sandbox | 规则可审计，同时不把 cwd 检查误称为进程隔离 | PRD/ADR-0010 |
-| D12 | Session 只接受完整当前 JSONL snapshot；缺少尾随换行、非法 header/message 或旧 schema 都拒绝加载，不做尾行修复 | 完整 atomic replacement 简化 Session authority；不静默修复或迁移不支持的历史格式 | ADR-0009 |
-| D13 | Conversation Summary 直接更新 Session 的 `last_consolidated`，不创建 pending journal 或跨文件恢复协议 | 接受 Summary 与 Session snapshot 在 crash 后 divergence，以保持 Session 接口小且无 persistence acknowledgement | ADR-0009 |
-| D14 | Tool Artifact 由 BaseTool 在成功结果超过全局 `4096` 字符阈值时直接写入 `.myclaw/artifacts/<session>/<id>.txt`，preview 受同一阈值限制 | 让模型上下文有统一硬上限，同时保留完整结果 | PRD/ADR-0010 |
-| D15 | 配置、持久化、模型与服务级错误使用稳定 error code；`ToolError` 与 Tool Result 仅使用安全 message | Tool 消息与模型消费格式保持扁平，其他上层逻辑仍不依赖易变终端文案 | 实施契约/Issue #38 |
-| D16 | 首版 Exec 不宣称提供 OS 级文件系统/网络或进程隔离；只对 cwd、destructive 命令和 URL DNS 做具体检查 | 仅校验 cwd 无法约束 Bash 子进程访问绝对路径，不能制造虚假的 sandbox 保证 | PRD/ADR-0010 |
+| ID | 已接受的决定 | 理由 |
+| --- | --- | --- |
+| D01 | Python 最低版本为 3.12，采用 `pyproject.toml` + 根目录 `myclaw/` 包布局 | asyncio、typing 和 timezone 能力成熟，降低兼容分支 |
+| D02 | Runtime loading 投影掉未知配置字段；`myclaw config` 报告未定义字段；未知 provider protocol 按 PRD 忽略 | 保持运行时配置兼容，同时暴露拼写错误 |
+| D03 | memory message threshold 默认 `40` 条 | 足够早地覆盖长会话，且不在短对话中频繁摘要 |
+| D04 | Schedule state 文件名为 `schedule.json` | 与 Schedule domain 一致，legacy state 不参与升级 |
+| D05 | Session title 最长 `60` 个 Unicode code points | picker 可读且不让终端宽度参与持久化 |
+| D06 | Summary index 从 `1` 开始，缺失 `.cursor` 等价于 `0` | cursor 表示已处理的最大 index，语义直接 |
+| D07 | 每个逻辑 model call 最多 `5 attempts` | 限制最坏延迟和费用 |
+| D08 | 具体 route 缺失、不可用或返回永久 route/provider 错误时 fallback；临时错误在共享 5-attempt budget 内重试 | 避免 requested/default route 分别耗尽一套 budget |
+| D09 | token estimate 使用 `ceil(UTF-8 byte length / 4)` | 提供 provider-neutral 估算且不混入真实 usage |
+| D10 | WebSearch 使用无凭据的内置 adapter，后端和 enablement 不进入配置 | 固定 Catalog 保持可预测，adapter 可替换 |
+| D11 | Exec 使用单次 Bash 和固定 destructive/DNS safety checks；没有 allowlist 或 OS sandbox 声明 | 规则可审计，不把 cwd 检查误称为进程隔离 |
+| D12 | Session 只接受完整当前 JSONL snapshot，拒绝旧或损坏形状 | 完整 atomic replacement 简化 Session authority |
+| D13 | Conversation Summary 直接更新 `last_consolidated`，不建立跨文件 journal | 接受 crash 后 divergence，保持 Session 接口小且无 persistence acknowledgement |
+| D14 | BaseTool 在成功结果超过 `4096` 字符时写入 `.myclaw/artifacts/<session>/<id>.txt` | 限制模型上下文同时保留完整结果 |
+| D15 | 配置、持久化、模型与服务错误使用稳定 code；Tool Error/Result 使用安全扁平 message | 上层逻辑不依赖易变终端文案 |
+| D16 | Exec 不提供 OS 级文件系统、网络或进程隔离 | cwd 和字符串检查不能制造虚假 sandbox 保证 |
+| D17 | 每个非空普通前台输入在 Agent Run 前做 Task Framing，Blackboard 与 usage 只随已接受 increment 提交 | 在跨输入保留一个明确任务边界，不引入计划或执行控制产品 |
 
-D01-D16 均为首版实现契约，其中 D04、D07、D08、D10、D11、D12、D13、D16 是已显式接受的产品或风险边界；Session snapshot 细节由 ADR-0009 补充。
+D01-D17 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Framing 边界由本文后续章节与对应 ADR 定义。
 
 ## 3. Agent Home 与 Workspace
 
@@ -240,13 +240,14 @@ timeout = 120
 第一行必须是：
 
 ```json
-{"session_id":"20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000","created_at":"2026-07-11T15:30:12.123+08:00","updated_at":"2026-07-11T15:31:02.456+08:00","last_consolidated":0,"metadata":{"title":"MyClaw implementation","token_usage":{"model_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0}}}
+{"session_id":"20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000","created_at":"2026-07-11T15:30:12.123+08:00","updated_at":"2026-07-11T15:31:02.456+08:00","last_consolidated":0,"metadata":{"title":"MyClaw implementation","token_usage":{"model_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0},"blackboard":{"goal":"Inspect the project","completion_boundary":"Report the findings"}}}
 ```
 
 规则：
 
 - `last_consolidated` 是从 `0` 开始的 message boundary，表示前多少条 Session messages 已被 Conversation Summary 覆盖；Short-term Memory 是 `messages[last_consolidated:]`。Conversation Summary 直接赋值，不调用 cursor-specific method，也不通过 journal 与 Session snapshot 协调。
-- `metadata` 当前拥有 `title` 与 `token_usage`；`token_usage` 包含主 chat、Tool loop、title、Conversation Summary 和与当前 Session 直接相关的辅助调用。Memory Task 不接收 Conversation Session；Schedule Job 的模型调用计入其 Schedule Session，不计入当前前台 Session。
+- `metadata` 必须拥有 `title` 与 `token_usage`，并可选拥有当前 `blackboard`。`token_usage` 包含主 chat、Tool loop、Task Framing、title、Conversation Summary 和与当前 Session 直接相关的辅助调用。Memory Task 不接收 Conversation Session；Schedule Job 的模型调用计入其 Schedule Session，不计入当前前台 Session。
+- `blackboard` 恰好包含 `goal` 与 `completion_boundary` 两个经过 trim 后的非空 string，不设字符数上限。Session load 将 malformed optional Blackboard 当作缺失并从内存 metadata 移除；`update_metadata()` 和 Agent Loop commit 必须拒绝非法形状。
 - `total_tokens` 必须等于 `input_tokens + output_tokens`。provider 未返回某项时该项为 `0`，不得用估算值混入实际 usage。
 - 每次成功持久化都是完整 compact UTF-8 JSONL atomic replacement，header 与所有 message lines 一起提交；不存在逐消息写入或 metadata-only rewrite。
 - 当前 header 必须恰好包含 `session_id`、`created_at`、`updated_at`、`last_consolidated`、`metadata`。旧 schema unsupported，不 migration、不 version dispatch。
@@ -258,7 +259,7 @@ timeout = 120
 ```
 
 - `content` 是非空 string；只包含空白的 Terminal Conversation 输入不创建 message，也不调用模型。`timestamp` 使用 system local timezone 的 ISO 8601 string。
-- Runtime Context 是发给模型时临时 prepend 的内容，不写回 `content`。
+- Runtime Context 与 Runtime-owned Blackboard block 是发给模型时临时组装的内容，不写回 `content`。
 
 ### 5.3 Assistant message
 
@@ -434,16 +435,23 @@ session_id: <session_id>
 <user_input>
 <raw user content>
 </user_input>
+
+<blackboard>
+{"goal":"Inspect the project","completion_boundary":"Report the findings"}
+</blackboard>
 ```
 
 - session JSONL 只保存 raw user content，不保存上述 wrapper。
 - 历史 user messages 不重复添加新的 Runtime Context。
 - Workspace 已在 identity prompt 中，不在每轮 wrapper 重复。
+- `<blackboard>` 只在 staged Blackboard 存在时追加，且必须是当前 user message 最后一个 Runtime-owned block。User raw content 中的相同 markup 不作为 Blackboard。
+- Foreground system prompt 明确 Blackboard 只是目标/完成边界解释，不能授权文件、网络、Exec 或任何 Tool 操作。
 - Schedule Job 不额外注入旧任务 ID 字段；Memory Task 使用专门 prompt，不伪装成 chat user input。
 
 ### 8.3 专用 prompts
 
 - Session title：只接收规范化后的首条 user content，不注入 Long-term Memory、tools 或 conversation history。
+- Task Framing：只接收 previous Blackboard、latest assistant content 和 current raw user input 组成的 compact JSON，使用独立 system prompt 且 `tools=()`。
 - Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory 或 Tool Catalog。
 - Memory Task：接收 Summary Cursor 后的 batch 和四分区维护规则，并只暴露 restricted memory tools。
 - Schedule Job：使用 chat/schedule system composition，把 Job message 作为 Schedule Session 的普通 user message。
@@ -471,7 +479,7 @@ logical purpose -> requested route -> usable route config -> provider adapter
 ```
 
 - route purpose 是 `default | chat | memory | schedule`。
-- chat 用于主对话和 title；memory 用于 summary 和 Memory Task；schedule 用于 Schedule Jobs。
+- chat 用于主对话、Task Framing 和 title；memory 用于 summary 和 Memory Task；schedule 用于 Schedule Jobs。
 - chat request 必须调用 streaming provider contract；memory/schedule 可调用 complete contract。
 - requested route 与 default 指向同一配置时只尝试一次。
 - default 不可用时 runtime startup 失败。
@@ -570,18 +578,59 @@ immutable tuple，释放 coordination 后同步调用一个可绑定或清除的
 single-consumer FIFO。Message Bus 不拥有独立 close、abort、replay、broadcast、version 或
 backpressure lifecycle；Tool result 永不进入 Outbound。
 
-### 10.2 AgentRunner
+### 10.2 Task Framing and Blackboard
+
+`AgentLoop` 在每个非空普通 foreground `InboundMessage` 的主 Agent Run 准备前调用一次 `TaskFramingEvaluator`。Management Command、Schedule execution、Conversation Summary 模型调用和 Memory Task 不自行做 Task Framing；Conversation Summary/context preparation 使用该轮已 staged 的同一 Blackboard。
+
+最小值与接口形状：
+
+```python
+@dataclass(frozen=True, slots=True)
+class Blackboard:
+    goal: str
+    completion_boundary: str
+
+@dataclass(frozen=True, slots=True)
+class FramingResult:
+    blackboard: Blackboard | None
+    usage_delta: dict[str, int] | None
+    status: Literal["resolved", "invalid_response", "model_failed"]
+
+class TaskFramingEvaluator(Protocol):
+    async def frame(
+        self,
+        *,
+        previous: Blackboard | None,
+        last_assistant_content: str,
+        current_user_input: str,
+    ) -> FramingResult: ...
+```
+
+Task Framing 使用 `ModelRouter.complete("chat", ..., tools=())`，因此复用 chat route 的总共五次 attempt budget、retry、default fallback 与 cancellation，但不传 Tools 或 continuation。模型只接收 previous Blackboard、Session 中最新 assistant message 的完整 content 和 current raw user input 组成的 compact JSON。
+
+返回 decision 只能是：
+
+- `keep`：使用 previous Blackboard；previous 为 `None` 时该 decision 无效。
+- `replace`：提供恰好 `action`、`goal`、`completion_boundary`；两个值 trim 后必须非空。
+- `clear`：清除 Blackboard，且不得附带 goal/boundary。
+
+解析器按顺序接受完整 raw JSON、一个 Markdown fenced JSON，或外层 prose 中的第一个平衡 JSON object；多个/破损 fence、多余字段、错误类型或违反 action invariant 都是 `invalid_response`。`resolved` 必须有四字段 usage，Blackboard 可为 `None`；`invalid_response` 必须有 usage 且 Blackboard 为 `None`；`model_failed` 的 Blackboard 和 usage 都为 `None`。
+
+resolved Blackboard 被 staged 给当前 foreground Agent Run。Model-visible current user message 保留 raw input 并在末尾追加一个 compact `<blackboard>` block；Session user message 只保存 raw input。Blackboard 不进入 Outbound，不允许 Tool 读写，也不能改变 Tool Confirmation 或其他安全判断。
+
+Agent Loop 只通过一次 `Session.append_messages()` 把主 Runner increment、Task Framing usage 和 `metadata.blackboard` update/removal 一起提交。正常 `failed`、`cancelled` 和 `max_iterations` 结果含有已接受且修复后的 increment，因此仍提交 staged state。Context/Summary/Runner 准备失败或取消保留 previous Blackboard；`invalid_response` 或 `model_failed` 在主 increment 成功提交时清除当前 Blackboard。
+
+### 10.3 AgentRunner
 
 `AgentRunner` is the bounded, Session-independent model/Tool execution shared
 by the foreground loop and Schedule. It receives the selected route and Tool
 Gateway dependencies and returns an `AgentRunnerResult`. Agent Run remains the
 domain term for one complete execution from input acceptance through Summary/context,
-one Runner invocation, Session increment and persistence request; it is not the deleted
-Python `AgentRun` type, a transport, or a public event envelope. Repair construction,
+one Runner invocation, Session increment and persistence request. Repair construction,
 Tool Result externalization and iterator cleanup are private implementation helpers and
 are not package interfaces.
 
-### 10.3 Sparse outbound protocol
+### 10.4 Sparse outbound protocol
 
 `OutboundMessage` has one of the following types:
 
@@ -606,7 +655,7 @@ Streaming metadata is sparse and mutually exclusive on each message:
 `{"_streamed": True}` marks the end of the whole foreground Agent Run. No marker is
 combined with another marker.
 
-### 10.4 Management Port
+### 10.5 Management Port
 
 最小接口：
 
@@ -627,7 +676,7 @@ class ManagementPort(Protocol):
 - `config_view` 已脱敏；Management Port 永不返回 plaintext API key。
 - `memory_view` 读取磁盘，不返回 runtime cache。
 
-### 10.5 Final Agent Runner and Provider boundary
+### 10.6 Agent Runner and Provider Boundary
 
 `AgentRunnerResult` 的 `messages` 只包含本次调用生成的 assistant/Tool increment，
 不包含 initial messages 或当前 user message。`final_content` 是本次调用的最终文本；
@@ -651,7 +700,7 @@ blocks 与 OpenAI-compatible `reasoning_content` 可形成 opaque `ModelContinua
 continuation 只在同一个 Tool loop 的下一次 Provider call 中使用，不进入 Session-shaped
 messages、Outbound 或持久化。
 
-### 10.6 Final Schedule and lifecycle boundary
+### 10.7 Schedule and Lifecycle Boundary
 
 `ScheduleService` 是唯一的 Schedule Store/management owner。它必须在 Agent Loop 之前
 创建；Agent Loop 创建 Schedule Tool、固定 Catalog、共享 Tool Gateway 和 Agent Runner，
@@ -921,13 +970,37 @@ Provider 职责：
 ```python
 class Session:
     @classmethod
-    def create(cls, workspace_state: WorkspaceState) -> "Session": ...
+    def create(
+        cls,
+        workspace_state: WorkspaceState,
+        *,
+        now: Callable[[], datetime] | None = None,
+        new_uuid: Callable[[], UUID] | None = None,
+        partition: SessionStoragePartition = SessionStoragePartition.FOREGROUND,
+        job_id: UUID | str | None = None,
+    ) -> "Session": ...
     @classmethod
-    def load(cls, workspace_state: WorkspaceState, session_id: str) -> "Session": ...
+    def load(
+        cls,
+        workspace_state: WorkspaceState,
+        session_id: str,
+        *,
+        partition: SessionStoragePartition | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> "Session": ...
     def add_message(self, role: str, content: str, **fields: JsonValue) -> None: ...
+    def append_messages(
+        self,
+        messages: list[dict[str, JsonValue]],
+        *,
+        metadata_updates: dict[str, JsonValue] | None = None,
+        metadata_removals: tuple[str, ...] = (),
+        usage_delta: dict[str, int] | None = None,
+    ) -> None: ...
     def update_metadata(self, metadata: dict[str, JsonValue] | None = None, **updates: JsonValue) -> None: ...
     def persist(self) -> None: ...
     def close(self) -> None: ...
+    def abandon(self) -> None: ...
 
 class SummaryStore(Protocol):
     async def append(self, content: str, timestamp: datetime) -> SummaryEntry: ...
@@ -957,7 +1030,7 @@ Schema casting、参数校验、安全检查和结果截断/Artifact 写入属�
 
 ## 16. 契约测试清单
 
-Phase 0 应先把以下内容固化为 fixtures/snapshots：
+当前契约测试固化以下 fixtures/snapshots：
 
 - 默认 config template 与一个完整有效 config。
 - config unknown field、unknown route、unknown protocol 和 redaction cases。
@@ -966,6 +1039,7 @@ Phase 0 应先把以下内容固化为 fixtures/snapshots：
 - summary schema exact-key assertion、index/cursor 起点和 batch 行为。
 - Schedule model strict round-trip、Schedule state strict-load、legacy state untouched 和 atomic mutation。
 - MessageBus sparse outbound schema、terminal marker 以及 AgentLoop control/Future 语义。
+- Blackboard/FramingResult strict shape、Task Framing decision table、current-input-only projection、usage/metadata atomic commit 和非前台路径排除。
 - Model Provider scripted transcript：text deltas、tool call deltas、usage、retry-after、timeout、cancellation。
 - 固定 Catalog、BaseTool preparation order、file path boundary、Exec/Web confirmation 和 WebFetch redirect/IP cases。
 - complete atomic JSONL replacement、缺少 trailing newline、middle corruption、旧 schema rejection，以及 Summary/`last_consolidated` crash divergence。
@@ -974,4 +1048,4 @@ Phase 0 应先把以下内容固化为 fixtures/snapshots：
 
 ## 17. 确认记录
 
-D01-D16 已于 2026-07-11 全部接受；Session snapshot 契约由 ADR-0009 于 2026-08-04 接受。ADR-0010（Issue #130）明确 supersede ADR-0003、ADR-0005 和 ADR-0007 中受影响的 Tool、Workspace State 和 owned-process 条款。本文 `TOOL_SCHEMA` 是 Python 类型、持久化实现与 contract fixtures 的直接输入。
+D01-D17、Session snapshot、固定 Tool Catalog、Message Bus/Agent Loop/Agent Runner 以及 Session Blackboard Task Framing 均为当前已接受契约。本文 `TOOL_SCHEMA` 与各持久化 schema 是 Python 类型、实现和 contract fixtures 的直接输入。

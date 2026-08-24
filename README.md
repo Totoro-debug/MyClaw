@@ -125,9 +125,10 @@ the reserved `.myclaw` directory beneath that Workspace:
     .cursor
   sessions/
     <session_id>.jsonl
-    artifacts/<session_id>/<encoded_tool_call_id>.txt
   schedule-sessions/
     <schedule_session_id>.jsonl
+  artifacts/
+    <session_id>/<encoded_tool_call_id>.txt
   logs/
     <session_id>.log
 ```
@@ -141,7 +142,12 @@ do not edit active Session, Summary, Summary Cursor, or Schedule state files.
 
 Each foreground Runtime has one active Conversation Session. Its in-memory messages
 are ordinary JSON-compatible dictionaries and its metadata is a JSON-compatible
-dictionary. A nonempty Session is written as a complete compact JSONL snapshot: the
+dictionary containing a required title and cumulative token usage, plus an optional
+Blackboard with exactly `goal` and `completion_boundary`. Before each nonempty ordinary
+foreground input, Task Framing derives that Blackboard through the configured chat route
+without tools. The raw user input is persisted unchanged; the Blackboard is shown only
+to the current model call, does not authorize execution, and is omitted when framing
+cannot produce a valid result. A nonempty Session is written as a complete compact JSONL snapshot: the
 first line has exactly `session_id`, `created_at`, `updated_at`, `last_consolidated`,
 and `metadata`, and each later line is a user, assistant, or tool message with a
 local-time `timestamp`. Session state is changed in memory during a turn; after terminal

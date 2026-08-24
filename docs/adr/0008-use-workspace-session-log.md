@@ -2,21 +2,8 @@
 status: accepted
 ---
 
-# Use a Workspace-owned Session Log
+# Use a Workspace-Owned Session Log
 
-Session technical diagnostics belong to the owning Workspace and Conversation Session.
-An explicit Session context validates the existing Session ID rule, prepares
-`.myclaw/logs` lazily, and registers a Loguru file sink at `<session_id>.log`. The
-sink uses WARNING threshold, enqueue, UTF-8, catch isolation, 10,485,760-byte
-rotation, and retention of one historical file. Sink registration failures are
-fail-open and retried on the next context; context exit removes the sink and lets
-Loguru drain its queue without a custom deadline. Same-Session concurrency is
-deliberately unsupported and is not coordinated by a registry or lock. This decision
-supersedes ADR-0004; legacy Agent Home Runtime Log files are preserved but no longer
-updated by the production entry point.
+Technical diagnostics belong to one Workspace and Conversation Session and are stored lazily at `.myclaw/logs/<session_id>.log`. A validated Session context owns a Loguru WARNING-level UTF-8 sink with enqueue enabled, 10 MiB rotation, and retention of one historical file; setup is fail-open and retried on the next context, while context exit removes the sink and allows its queue to drain without a custom deadline.
 
-This replacement intentionally accepts an unbounded queue, infinite drain, no
-per-record fsync, weaker crash durability, no active redaction, no control escaping,
-and per-Session retention without a Workspace-wide size bound. The Loguru default text
-format is diagnostic output rather than a stable record protocol. MyClaw does not
-bridge third-party standard-library logging records into Session Logs.
+Same-Session concurrency is unsupported. The design accepts an unbounded queue, infinite drain, no per-record fsync, no active redaction, no control escaping, and per-Session retention without a Workspace-wide size bound. Legacy Agent Home Runtime Log files remain untouched.

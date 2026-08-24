@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # Use Textual for the Terminal Conversation
 
-MyClaw uses Textual `>=8.2.8,<9`, rather than prompt-toolkit or Urwid, to host the full-screen Command-line Conversation because Textual provides the required Markdown streaming, responsive scrolling, mouse input, modal confirmation, asyncio integration, and application-level test support in one framework. MyClaw also owns a narrow enhanced-keyboard adapter at this host boundary because modifier-aware Enter input depends on terminal protocol negotiation and is not guaranteed by Textual alone; terminals that cannot distinguish `Shift+Enter` or deliver `Alt+Enter` use `Ctrl+J` as the reliable newline fallback. This adds runtime dependencies and a terminal-capability contract but avoids maintaining the entire rendering and interaction stack in project code.
+MyClaw uses Textual `>=8.2.8,<9` and Rich `>=14.2.0,<15` for the full-screen application lifecycle, Markdown, scrolling, modal interaction, mouse input, and headless UI tests. A narrow capability-gated keyboard adapter handles modifier-aware Enter reports and restoration; unsupported terminals use `Ctrl+J` as the reliable newline fallback.

@@ -132,4 +132,3 @@ This document records the agreed user-facing contract for MyClaw's Command-line 
 - [Implementation spec: GitHub Issue #131](https://github.com/Totoro-debug/MyClaw/issues/131)
 - [ADR-0011: Use a Full-Screen Terminal Conversation](./adr/0011-use-full-screen-terminal-conversation.md)
 - [ADR-0012: Use Textual for the Terminal Conversation](./adr/0012-use-textual-for-terminal-conversation.md)
-- [Terminal TUI library selection research](./research/terminal-tui-library-selection.md)
