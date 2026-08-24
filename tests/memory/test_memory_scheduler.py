@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -584,29 +585,30 @@ async def test_local_schedule_wait_uses_elapsed_time_across_daylight_saving_chan
     assert clock.sleeps == [40 * 60]
 
 
-def test_production_scheduler_clock_uses_the_rule_bearing_system_timezone(
+def test_production_scheduler_clock_captures_a_rule_bearing_local_zone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    zone = SpringForwardTimezone()
-    monkeypatch.setattr(scheduler_module, "_system_timezone", lambda: zone)
-    instants = iter(
-        (
-            datetime(2026, 3, 8, 6, 50, tzinfo=UTC),
-            datetime(2026, 3, 8, 7, 30, tzinfo=UTC),
-        )
+    zone = ZoneInfo("America/New_York")
+    monkeypatch.setattr(scheduler_module, "get_localzone", lambda: zone)
+    instants = (
+        datetime(2026, 3, 8, 6, 50, tzinfo=UTC),
+        datetime(2026, 3, 8, 7, 30, tzinfo=UTC),
     )
-    clock = AsyncioSchedulerClock(now=lambda: next(instants))
+    pending = iter(instants)
+    clock = AsyncioSchedulerClock(now=lambda: next(pending))
 
     before_transition = clock.now()
     after_transition = clock.now()
 
-    assert before_transition.tzinfo is zone
+    assert before_transition.tzinfo == zone
+    assert before_transition.astimezone(UTC) == instants[0]
     assert (before_transition.hour, before_transition.minute, before_transition.utcoffset()) == (
         1,
         50,
         timedelta(hours=-5),
     )
-    assert after_transition.tzinfo is zone
+    assert after_transition.tzinfo == zone
+    assert after_transition.astimezone(UTC) == instants[1]
     assert (after_transition.hour, after_transition.minute, after_transition.utcoffset()) == (
         3,
         30,
@@ -614,40 +616,24 @@ def test_production_scheduler_clock_uses_the_rule_bearing_system_timezone(
     )
 
 
-def test_standard_library_system_timezone_adapter_resolves_each_instant(
+def test_production_scheduler_clock_supports_a_non_dst_local_zone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    host_zone = SpringForwardTimezone()
+    zone = ZoneInfo("Asia/Shanghai")
+    monkeypatch.setattr(scheduler_module, "get_localzone", lambda: zone)
+    instant = datetime(2026, 7, 11, 8, 10, tzinfo=UTC)
+    clock = AsyncioSchedulerClock(now=lambda: instant)
 
-    def host_local(value: datetime) -> datetime:
-        if value.tzinfo is None:
-            return value.replace(tzinfo=host_zone)
-        return value.astimezone(host_zone)
+    local = clock.now()
 
-    monkeypatch.setattr(scheduler_module, "_host_local", host_local)
-    instants = iter(
-        (
-            datetime(2026, 3, 8, 6, 50, tzinfo=UTC),
-            datetime(2026, 3, 8, 7, 30, tzinfo=UTC),
-        )
+    assert local.tzinfo == zone
+    assert local.astimezone(UTC) == instant
+    assert (local.hour, local.minute, local.utcoffset()) == (
+        16,
+        10,
+        timedelta(hours=8),
     )
-    clock = AsyncioSchedulerClock(now=lambda: next(instants))
-
-    before_transition = clock.now()
-    after_transition = clock.now()
-
-    assert (before_transition.hour, before_transition.minute, before_transition.utcoffset()) == (
-        1,
-        50,
-        timedelta(hours=-5),
-    )
-    assert before_transition.dst() == timedelta(0)
-    assert (after_transition.hour, after_transition.minute, after_transition.utcoffset()) == (
-        3,
-        30,
-        timedelta(hours=-4),
-    )
-    assert after_transition.dst() == timedelta(hours=1)
+    assert local.dst() == timedelta(0)
 
 
 @pytest.mark.asyncio
