@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,7 +13,6 @@ from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
-    ConfirmationChannel,
     ConfirmationDecision,
     ConfirmationRequest,
     ModelToolCall,
@@ -140,33 +138,6 @@ async def test_fixed_gateway_calls_core_tool_and_returns_unified_result(
         "content": "hello\r\n",
         "artifact": None,
     }
-
-
-@pytest.mark.asyncio
-async def test_confirmation_cancellation_propagates_and_invalidates_the_request(
-    workspace: Path,
-    agent_home: Path,
-) -> None:
-    outside = (workspace.parent / "cancelled-read.txt").resolve()
-    outside.write_text("outside", encoding="utf-8")
-    channel = ConfirmationChannel()
-    task = asyncio.create_task(
-        _gateway(workspace, agent_home).call(
-            ModelToolCall(
-                id="call_cancelled",
-                name="read_file",
-                arguments=json.dumps({"path": str(outside)}),
-            ),
-            confirmation=channel,
-        )
-    )
-    request = await channel.next_request()
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    with pytest.raises(ValueError, match="late or unknown"):
-        channel.respond_to_confirmation(request.confirmation_id, "approved")
 
 
 @pytest.mark.asyncio

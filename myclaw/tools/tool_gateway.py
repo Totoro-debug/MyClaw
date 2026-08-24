@@ -162,65 +162,6 @@ class ToolResult:
         return result
 
 
-class ConfirmationChannel:
-    """In-memory interactive channel for one live Agent Run."""
-
-    def __init__(self) -> None:
-        self._requests: asyncio.Queue[ConfirmationRequest | None] = asyncio.Queue()
-        self._pending: dict[UUID, asyncio.Future[ConfirmationDecision]] = {}
-        self._consumed: set[UUID] = set()
-        self._closed = False
-
-    async def __call__(self, request: ConfirmationRequest) -> ConfirmationDecision:
-        if self._closed:
-            raise RuntimeError("Confirmation channel is closed")
-        if request.confirmation_id in self._pending or request.confirmation_id in self._consumed:
-            raise ValueError("Confirmation request is already pending or consumed")
-
-        future: asyncio.Future[ConfirmationDecision] = asyncio.get_running_loop().create_future()
-        self._pending[request.confirmation_id] = future
-        await self._requests.put(request)
-        try:
-            return await future
-        finally:
-            self._pending.pop(request.confirmation_id, None)
-            self._consumed.add(request.confirmation_id)
-
-    async def next_request(self) -> ConfirmationRequest:
-        """Return the next live request for the interactive host."""
-        while True:
-            if self._closed:
-                raise RuntimeError("Confirmation channel is closed")
-            request = await self._requests.get()
-            if request is None:
-                self._requests.put_nowait(None)
-                raise RuntimeError("Confirmation channel is closed")
-            future = self._pending.get(request.confirmation_id)
-            if future is not None and not future.done():
-                return request
-
-    def respond_to_confirmation(
-        self,
-        confirmation_id: UUID,
-        decision: ConfirmationDecision,
-    ) -> None:
-        if decision not in {"approved", "declined"}:
-            raise ValueError("confirmation decision must be approved or declined")
-        future = self._pending.get(confirmation_id)
-        if future is None or future.done():
-            raise ValueError("Confirmation response is late or unknown")
-        future.set_result(decision)
-
-    def close(self) -> None:
-        """Invalidate pending requests and wake request observers."""
-        if self._closed:
-            return
-        self._closed = True
-        for future in self._pending.values():
-            future.cancel()
-        self._requests.put_nowait(None)
-
-
 class ToolGateway:
     """Create and invoke the fixed ten-Tool Catalog."""
 
@@ -483,7 +424,6 @@ def _result(
 
 
 __all__ = [
-    "ConfirmationChannel",
     "ConfirmationDecision",
     "ConfirmationRequest",
     "ConfirmationRequester",
