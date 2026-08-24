@@ -740,6 +740,398 @@ def test_append_messages_commits_a_valid_increment_in_order_with_timestamps_and_
     }
 
 
+def test_append_messages_commits_blackboard_and_combined_usage_atomically(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state, now=lambda: CREATED_AT)
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "Inspect this project."},
+        {
+            "role": "assistant",
+            "content": "I will inspect it.",
+            "tool_calls": [],
+            "status": "completed",
+            "error": None,
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "total_tokens": 15,
+            },
+        },
+        {
+            "role": "tool",
+            "content": "README.md",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "status": "success",
+        },
+    ]
+    metadata_updates: dict[str, Any] = {
+        "blackboard": {
+            "goal": "  Review the project  ",
+            "completion_boundary": "  Review is complete  ",
+        },
+        "future": {"nested": ["value"]},
+    }
+    usage_delta = {
+        "model_calls": 1,
+        "input_tokens": 5,
+        "output_tokens": 2,
+        "total_tokens": 7,
+    }
+    original_messages = copy.deepcopy(messages)
+    original_updates = copy.deepcopy(metadata_updates)
+
+    session.append_messages(
+        messages,
+        metadata_updates=metadata_updates,
+        usage_delta=usage_delta,
+    )
+
+    assert [message["role"] for message in session.messages] == ["user", "assistant", "tool"]
+    assert session.metadata["blackboard"] == {
+        "goal": "Review the project",
+        "completion_boundary": "Review is complete",
+    }
+    assert session.metadata["future"] == {"nested": ["value"]}
+    assert session.metadata["token_usage"] == {
+        "model_calls": 2,
+        "input_tokens": 17,
+        "output_tokens": 5,
+        "total_tokens": 22,
+    }
+    assert messages == original_messages
+    assert metadata_updates == original_updates
+
+    session.close()
+    path = state.sessions_directory / f"{session.session_id}.jsonl"
+    header = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert header["metadata"]["blackboard"] == {
+        "goal": "Review the project",
+        "completion_boundary": "Review is complete",
+    }
+
+
+def test_append_messages_removes_blackboard_and_omits_it_from_round_trip(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state, now=lambda: CREATED_AT)
+    session.append_messages(
+        [{"role": "user", "content": "Start the review."}],
+        metadata_updates={
+            "blackboard": {
+                "goal": "Review the project",
+                "completion_boundary": "Review is complete",
+            }
+        },
+    )
+    session.append_messages(
+        [{"role": "user", "content": "Cancel the review."}],
+        metadata_removals=("blackboard",),
+    )
+
+    session.close()
+    path = state.sessions_directory / f"{session.session_id}.jsonl"
+    header = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+
+    assert "blackboard" not in header["metadata"]
+    assert "blackboard" not in Session.load(state, session.session_id).metadata
+
+
+def test_append_messages_preserves_latest_title_and_usage_before_accumulating(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.update_metadata(
+        title="Generated title",
+        usage_delta={
+            "model_calls": 2,
+            "input_tokens": 8,
+            "output_tokens": 4,
+            "total_tokens": 12,
+        },
+    )
+
+    session.append_messages(
+        [{"role": "user", "content": "Continue the review."}],
+        metadata_updates={
+            "blackboard": {
+                "goal": "Review the project",
+                "completion_boundary": "Review is complete",
+            }
+        },
+        usage_delta={
+            "model_calls": 1,
+            "input_tokens": 5,
+            "output_tokens": 2,
+            "total_tokens": 7,
+        },
+    )
+
+    assert session.metadata["title"] == "Generated title"
+    assert session.metadata["token_usage"] == {
+        "model_calls": 3,
+        "input_tokens": 13,
+        "output_tokens": 6,
+        "total_tokens": 19,
+    }
+
+
+@pytest.mark.parametrize(
+    ("metadata_updates", "metadata_removals", "match"),
+    [
+        (
+            {"blackboard": {"goal": "Goal", "completion_boundary": "Boundary"}},
+            ("blackboard",),
+            "same key",
+        ),
+        ({}, ("title",), "required"),
+        ({}, ("token_usage",), "required"),
+        (
+            {
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                }
+            },
+            (),
+            "token usage",
+        ),
+        # update_metadata already reserves these names as token usage aliases.
+        ({"token_usage_delta": {}}, (), "token usage"),
+        ({"usage_delta": {}}, (), "token usage"),
+    ],
+)
+def test_append_messages_rejects_conflicting_required_and_usage_metadata_patches(
+    agent_home: Path,
+    workspace: Path,
+    metadata_updates: dict[str, Any],
+    metadata_removals: tuple[str, ...],
+    match: str,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+    original_updates = copy.deepcopy(metadata_updates)
+
+    with pytest.raises(ValueError, match=match):
+        session.append_messages(
+            [{"role": "user", "content": "Rejected patch."}],
+            metadata_updates=metadata_updates,
+            metadata_removals=metadata_removals,
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+    assert metadata_updates == original_updates
+
+
+@pytest.mark.parametrize(
+    ("messages", "metadata_updates", "usage_delta", "match"),
+    [
+        (
+            [
+                {"role": "user", "content": "Before the invalid record."},
+                {"role": "assistant", "content": "Missing durable fields."},
+            ],
+            {"future": {"nested": ["value"]}},
+            {"model_calls": 1, "input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            "assistant message is missing",
+        ),
+        (
+            [{"role": "user", "content": "Invalid Blackboard."}],
+            {"blackboard": {"goal": "", "completion_boundary": "Boundary"}},
+            None,
+            "metadata.blackboard",
+        ),
+        (
+            [{"role": "user", "content": "Invalid usage."}],
+            {"future": {"nested": ["value"]}},
+            {"model_calls": True, "input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            "usage_delta",
+        ),
+        (
+            [{"role": "user", "content": "Invalid usage total."}],
+            {"future": {"nested": ["value"]}},
+            {"model_calls": 1, "input_tokens": 2, "output_tokens": 1, "total_tokens": 99},
+            "usage_delta",
+        ),
+        (
+            [{"role": "user", "content": "Invalid extension."}],
+            {"future": {"invalid": {1, 2}}},
+            None,
+            "metadata_updates",
+        ),
+    ],
+)
+def test_append_messages_leaves_session_and_inputs_unchanged_on_candidate_failure(
+    agent_home: Path,
+    workspace: Path,
+    messages: list[dict[str, Any]],
+    metadata_updates: dict[str, Any],
+    usage_delta: dict[str, Any] | None,
+    match: str,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "Existing history")
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+    original_messages = copy.deepcopy(messages)
+    original_updates = copy.deepcopy(metadata_updates)
+    original_usage = copy.deepcopy(usage_delta)
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        session.append_messages(
+            messages,
+            metadata_updates=metadata_updates,
+            usage_delta=usage_delta,
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+    assert messages == original_messages
+    assert metadata_updates == original_updates
+    assert usage_delta == original_usage
+
+
+def test_append_messages_does_not_commit_before_metadata_comparison_finishes(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    class EqualityFailure(str):
+        def __eq__(self, other: object) -> bool:
+            del other
+            raise RuntimeError("metadata comparison failed")
+
+        __hash__ = str.__hash__
+
+    session = Session.create(_state(workspace, agent_home))
+    session.update_metadata(unstable=EqualityFailure("stored"))
+    stored_value = session.metadata["unstable"]
+    metadata_container = session.metadata
+    messages_container = session.messages
+
+    # Keep the hostile extension first so equality is exercised before changed usage.
+    title = session.metadata["title"]
+    token_usage = session.metadata["token_usage"]
+    session.metadata.clear()
+    session.metadata.update(
+        unstable=stored_value,
+        title=title,
+        token_usage=token_usage,
+    )
+    before_keys = tuple(session.metadata)
+    before_title = session.metadata["title"]
+    before_usage = copy.deepcopy(session.metadata["token_usage"])
+
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "Prepared but not committed.",
+            "tool_calls": [],
+            "status": "completed",
+            "error": None,
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "total_tokens": 3,
+            },
+        }
+    ]
+    metadata_updates = {"unstable": EqualityFailure("candidate")}
+    usage_delta = {
+        "model_calls": 1,
+        "input_tokens": 5,
+        "output_tokens": 2,
+        "total_tokens": 7,
+    }
+    original_messages = copy.deepcopy(messages)
+    update_value = metadata_updates["unstable"]
+    original_usage_delta = copy.deepcopy(usage_delta)
+
+    with pytest.raises(RuntimeError, match="metadata comparison failed"):
+        session.append_messages(
+            messages,
+            metadata_updates=metadata_updates,
+            usage_delta=usage_delta,
+        )
+
+    assert session.messages is messages_container
+    assert len(session.messages) == 0
+    assert session.metadata is metadata_container
+    assert tuple(session.metadata) == before_keys
+    assert session.metadata["title"] == before_title
+    assert session.metadata["token_usage"] == before_usage
+    assert session.metadata["unstable"] is stored_value
+    assert messages == original_messages
+    assert metadata_updates["unstable"] is update_value
+    assert usage_delta == original_usage_delta
+
+
+@pytest.mark.parametrize(
+    ("metadata_updates", "metadata_removals", "usage_delta", "match"),
+    [
+        ([], (), None, "metadata_updates"),
+        ({1: "invalid"}, (), None, "metadata_updates"),
+        ({"future": {"enabled": True}}, [], None, "metadata_removals"),
+        ({"future": {"enabled": True}}, (1,), None, "metadata_removals"),
+        ({"future": {"enabled": True}}, (), [], "usage_delta"),
+    ],
+)
+def test_append_messages_validates_optional_argument_containers_before_use(
+    agent_home: Path,
+    workspace: Path,
+    metadata_updates: object,
+    metadata_removals: object,
+    usage_delta: object,
+    match: str,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        session.append_messages(
+            [{"role": "user", "content": "Invalid optional arguments."}],
+            metadata_updates=metadata_updates,  # type: ignore[arg-type]
+            metadata_removals=metadata_removals,  # type: ignore[arg-type]
+            usage_delta=usage_delta,  # type: ignore[arg-type]
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+
+
+def test_update_metadata_rejects_malformed_blackboard_without_mutating_state_or_input(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    patch = {
+        "blackboard": {"goal": "", "completion_boundary": "Boundary"},
+        "future": {"nested": ["value"]},
+    }
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+    original_patch = copy.deepcopy(patch)
+
+    with pytest.raises(ValueError, match=r"metadata\.blackboard"):
+        session.update_metadata(patch)
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+    assert patch == original_patch
+
+
 def test_append_messages_leaves_state_unchanged_when_a_middle_message_is_invalid(
     agent_home: Path,
     workspace: Path,
@@ -1259,6 +1651,67 @@ def test_load_current_five_field_jsonl_preserves_json_native_extensions(
     assert loaded.last_consolidated == 2
     assert loaded.metadata == header["metadata"]
     assert loaded.messages == messages
+
+
+def test_load_canonicalizes_a_valid_blackboard_metadata_value(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    header = _header(
+        metadata={
+            "title": "Project review",
+            "token_usage": dict(ZERO_USAGE),
+            "blackboard": {
+                "goal": "  Review the project  ",
+                "completion_boundary": "  Review is complete  ",
+            },
+        }
+    )
+    _write_jsonl(state, [header])
+
+    loaded = Session.load(state, SESSION_ID)
+
+    assert loaded.metadata["blackboard"] == {
+        "goal": "Review the project",
+        "completion_boundary": "Review is complete",
+    }
+
+
+@pytest.mark.parametrize(
+    "blackboard",
+    [
+        None,
+        "not an object",
+        {"goal": "goal"},
+        {"completion_boundary": "boundary"},
+        {"goal": "goal", "completion_boundary": "boundary", "extra": True},
+        {"goal": 1, "completion_boundary": "boundary"},
+        {"goal": "goal", "completion_boundary": False},
+        {"goal": "", "completion_boundary": "boundary"},
+        {"goal": "   ", "completion_boundary": "boundary"},
+        {"goal": "goal", "completion_boundary": ""},
+        {"goal": "goal", "completion_boundary": "\t\n"},
+    ],
+)
+def test_load_treats_malformed_blackboard_metadata_as_absent(
+    agent_home: Path,
+    workspace: Path,
+    blackboard: object,
+) -> None:
+    state = _state(workspace, agent_home)
+    header = _header(
+        metadata={
+            "title": "Project review",
+            "token_usage": dict(ZERO_USAGE),
+            "blackboard": blackboard,
+        }
+    )
+    _write_jsonl(state, [header])
+
+    loaded = Session.load(state, SESSION_ID)
+
+    assert "blackboard" not in loaded.metadata
 
 
 @pytest.mark.parametrize(

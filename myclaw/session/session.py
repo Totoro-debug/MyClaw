@@ -39,6 +39,7 @@ class SessionStoragePartition(StrEnum):
 _HEADER_FIELDS = frozenset(
     {"session_id", "created_at", "updated_at", "last_consolidated", "metadata"}
 )
+_TOKEN_USAGE_PATCH_KEYS = frozenset({"token_usage", "token_usage_delta", "usage_delta"})
 _SESSION_ID_PATTERN = re.compile(
     r"(?P<timestamp>\d{8}-\d{6}-\d{6})_"
     r"(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
@@ -281,14 +282,50 @@ class Session:
         if updated_usage is not None:
             self.metadata["token_usage"] = updated_usage
 
-    def append_messages(self, messages: list[dict[str, Any]]) -> None:
+    def append_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        metadata_updates: dict[str, Any] | None = None,
+        metadata_removals: tuple[str, ...] = (),
+        usage_delta: dict[str, int] | None = None,
+    ) -> None:
         """Atomically append a validated Agent Run increment."""
         self._ensure_not_abandoned()
         if not isinstance(messages, list):
             raise TypeError("messages must be a list")
 
+        copied_updates = _copy_metadata_updates(metadata_updates)
+        removals = _validate_metadata_removals(metadata_removals)
+        conflict = set(copied_updates).intersection(removals)
+        if conflict:
+            raise ValueError("metadata updates and removals cannot target the same key")
+        required_removals = {"title", "token_usage"}.intersection(removals)
+        if required_removals:
+            raise ValueError("required Session metadata cannot be removed")
+        usage_patch = _TOKEN_USAGE_PATCH_KEYS.intersection(copied_updates)
+        if usage_patch:
+            raise ValueError("token usage must be supplied through usage_delta")
+
+        copied_usage_delta: dict[str, Any] | None = None
+        if usage_delta is not None:
+            if not isinstance(usage_delta, dict):
+                raise TypeError("usage_delta must be a dictionary")
+            copied_usage_delta = _copy_json_object(usage_delta, field="usage_delta")
+            _validate_token_usage(copied_usage_delta, field="usage_delta")
+
+        candidate_metadata = copy.deepcopy(self.metadata)
+        _validate_metadata(candidate_metadata)
+        candidate_metadata.update(copied_updates)
+        for key in removals:
+            candidate_metadata.pop(key, None)
+        _validate_metadata(candidate_metadata)
+
+        updated_usage = copy.deepcopy(candidate_metadata["token_usage"])
+        if copied_usage_delta is not None:
+            updated_usage = _accumulate_token_usage(updated_usage, copied_usage_delta)
+
         prepared: list[dict[str, Any]] = []
-        updated_usage: dict[str, int] | None = None
         for index, record in enumerate(messages):
             if not isinstance(record, dict):
                 raise TypeError(f"messages[{index}] must be a dictionary")
@@ -303,16 +340,19 @@ class Session:
             prepared.append(copied)
 
             if copied["role"] == "assistant":
-                if updated_usage is None:
-                    updated_usage = copy.deepcopy(self.metadata.get("token_usage"))
                 updated_usage = _accumulate_token_usage(
                     updated_usage,
                     copied["token_usage"],
                 )
 
+        candidate_metadata["token_usage"] = updated_usage
+        _validate_metadata(candidate_metadata)
+        metadata_changed = candidate_metadata != self.metadata
+
         self.messages.extend(prepared)
-        if updated_usage is not None:
-            self.metadata["token_usage"] = updated_usage
+        if metadata_changed:
+            self.metadata.clear()
+            self.metadata.update(candidate_metadata)
 
     def update_metadata(self, metadata: dict[str, Any] | None = None, **updates: Any) -> None:
         """Apply a copied shallow metadata patch and accumulate token usage deltas."""
@@ -324,6 +364,7 @@ class Session:
             patch.update(metadata)
         patch.update(updates)
         copied_patch = _copy_json_object(patch, field="metadata")
+        _normalize_blackboard_metadata(copied_patch, invalid_is_absent=False)
 
         token_delta = copied_patch.pop("token_usage_delta", None)
         if token_delta is None and "usage_delta" in copied_patch:
@@ -626,7 +667,7 @@ def _parse_header(
     metadata = record["metadata"]
     if not isinstance(metadata, dict):
         raise ValueError("Session metadata must be an object")
-    metadata_copy = _copy_json_object(cast(dict[str, Any], metadata), field="metadata")
+    metadata_copy = _copy_loaded_metadata(cast(dict[str, Any], metadata))
     _validate_metadata(metadata_copy)
     return session_id, created_at, updated_at, last_consolidated, metadata_copy
 
@@ -661,6 +702,49 @@ def _validate_metadata(metadata: dict[str, Any]) -> None:
     if not title or " ".join(title.split()) != title or len(title) > 60:
         raise ValueError("metadata.title is not normalized")
     _validate_token_usage(metadata.get("token_usage"), field="metadata.token_usage")
+    _normalize_blackboard_metadata(metadata, invalid_is_absent=False)
+
+
+def _copy_loaded_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    copied = copy.deepcopy(metadata)
+    _normalize_blackboard_metadata(copied, invalid_is_absent=True)
+    return _copy_json_object(copied, field="metadata")
+
+
+def _normalize_blackboard_metadata(
+    metadata: dict[str, Any],
+    *,
+    invalid_is_absent: bool,
+) -> None:
+    if "blackboard" not in metadata:
+        return
+    from myclaw.agent.blackboard import decode_blackboard, encode_blackboard
+
+    blackboard = decode_blackboard(metadata["blackboard"])
+    if blackboard is None:
+        if invalid_is_absent:
+            del metadata["blackboard"]
+            return
+        raise ValueError("metadata.blackboard must be a valid Blackboard")
+    encoded = encode_blackboard(blackboard)
+    assert encoded is not None
+    metadata["blackboard"] = encoded
+
+
+def _copy_metadata_updates(value: dict[str, Any] | None) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError("metadata_updates must be a dictionary")
+    return _copy_json_object(value, field="metadata_updates")
+
+
+def _validate_metadata_removals(value: tuple[str, ...]) -> frozenset[str]:
+    if not isinstance(value, tuple):
+        raise TypeError("metadata_removals must be a tuple")
+    if any(not isinstance(key, str) for key in value):
+        raise TypeError("metadata_removals must contain only strings")
+    return frozenset(value)
 
 
 def _copy_json_object(value: dict[str, Any], *, field: str) -> dict[str, Any]:
