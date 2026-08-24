@@ -59,6 +59,7 @@ from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.tool_gateway import ToolResult
+from myclaw.utils.async_tasks import await_task_preserving_cancellation
 from myclaw.utils.scheduler import AsyncioSchedulerClock, SchedulerClock
 
 type SessionReplacement = Callable[[str, bool], Awaitable[None]]
@@ -301,7 +302,7 @@ class PreparedRuntime:
             self._lifetime.close_task = task
             if running is not None and running is not current and not running.done():
                 running.cancel()
-        await _await_shared_shutdown(task)
+        await await_task_preserving_cancellation(task)
 
     async def _close_owned_resources(self, run_done: asyncio.Event | None) -> None:
         with without_session_log():
@@ -1070,25 +1071,3 @@ def _runtime_status_input(
         ),
         runtime_context=runtime_context_value,
     )
-
-
-async def _await_shared_shutdown(task: asyncio.Task[None]) -> None:
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            if task.cancelled():
-                break
-            if cancellation is None:
-                cancellation = error
-        except BaseException:
-            break
-    try:
-        task.result()
-    except BaseException as cleanup_error:
-        if cancellation is not None:
-            raise cancellation from cleanup_error
-        raise
-    if cancellation is not None:
-        raise cancellation

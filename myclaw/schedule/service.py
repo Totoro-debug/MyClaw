@@ -20,6 +20,7 @@ from myclaw.schedule.store import (
     ScheduleStoreFaultedError,
     WorkspaceScheduleStore,
 )
+from myclaw.utils.async_tasks import await_task_preserving_cancellation
 
 ScheduleHealth = Literal["available", "faulted"]
 
@@ -127,7 +128,7 @@ class ScheduleService:
         if task is None:
             task = asyncio.create_task(self._close_owned_tasks())
             self._close_task = task
-        await _await_shared(task)
+        await await_task_preserving_cancellation(task)
 
     def status_snapshot(self) -> ScheduleServiceStatus:
         """Return health and active reservations without exposing Job details."""
@@ -678,23 +679,6 @@ def _local_time_exists(value: datetime, zone: ZoneInfo) -> bool:
         if round_trip == naive:
             return True
     return False
-
-
-async def _await_shared(task: asyncio.Task[None]) -> None:
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as caught:
-            cancellation = caught
-    try:
-        task.result()
-    except BaseException as error:
-        if cancellation is not None:
-            raise cancellation from error
-        raise
-    if cancellation is not None:
-        raise cancellation
 
 
 __all__ = [

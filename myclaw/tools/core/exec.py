@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool, ToolError, ToolParam, truncate_text
 from myclaw.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
+from myclaw.utils.async_tasks import await_task_preserving_cancellation
 
 _BASH: Final[str] = "bash"
 _OUTPUT_LIMIT: Final[int] = 4000
@@ -211,7 +212,7 @@ async def _spawn_process(*, command: str, cwd: os.PathLike[str]) -> ExecProcess:
     except asyncio.CancelledError as cancellation:
         cleanup = asyncio.create_task(_cleanup_cancelled_spawn(spawning))
         try:
-            await _await_task_preserving_cancellation(cleanup)
+            await await_task_preserving_cancellation(cleanup)
         except asyncio.CancelledError:
             raise
         except BaseException:
@@ -312,7 +313,7 @@ async def _cleanup_without_replacing_cancellation(
 ) -> None:
     cleanup = asyncio.create_task(_cleanup_process(process, communication))
     try:
-        await _await_task_preserving_cancellation(cleanup)
+        await await_task_preserving_cancellation(cleanup)
     except asyncio.CancelledError:
         raise
     except BaseException:
@@ -324,29 +325,7 @@ async def _cleanup_preserving_cancellation(
     communication: asyncio.Task[tuple[bytes | None, bytes | None]] | None,
 ) -> tuple[bytes, bytes]:
     cleanup = asyncio.create_task(_cleanup_process(process, communication))
-    return await _await_task_preserving_cancellation(cleanup)
-
-
-async def _await_task_preserving_cancellation[T](task: asyncio.Task[T]) -> T:
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            if task.cancelled():
-                break
-            cancellation = error
-        except BaseException:
-            break
-    try:
-        result = task.result()
-    except BaseException as error:
-        if cancellation is not None:
-            raise cancellation from error
-        raise
-    if cancellation is not None:
-        raise cancellation
-    return result
+    return await await_task_preserving_cancellation(cleanup)
 
 
 def _communication_output(
