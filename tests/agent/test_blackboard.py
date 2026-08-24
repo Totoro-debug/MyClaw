@@ -205,7 +205,7 @@ def test_framing_result_rejects_every_invalid_state_combination(
 
 def test_blackboard_canonicalizes_and_round_trips_without_truncation() -> None:
     goal = "  保留全部目标 " + ("x" * 4096) + "  "
-    boundary = "  完成边界 {with braces} and \\\"quotes\\\"  "
+    boundary = '  完成边界 {with braces} and \\"quotes\\"  '
     value = Blackboard(goal=goal, completion_boundary=boundary)
 
     assert value.goal == goal.strip()
@@ -307,17 +307,24 @@ async def test_frame_preserves_empty_last_assistant_content_as_json_string() -> 
     assert isinstance(messages, Sequence)
     user_message = messages[1]
     assert user_message["content"] == (
-        '{"previous_blackboard":null,"last_assistant_content":"",'
-        '"current_user_input":"cancel"}'
+        '{"previous_blackboard":null,"last_assistant_content":"","current_user_input":"cancel"}'
     )
 
 
 @pytest.mark.parametrize(
     ("action", "previous", "expected"),
     [
-        ("keep", Blackboard(goal="Goal", completion_boundary="Boundary"), Blackboard(goal="Goal", completion_boundary="Boundary")),
+        (
+            "keep",
+            Blackboard(goal="Goal", completion_boundary="Boundary"),
+            Blackboard(goal="Goal", completion_boundary="Boundary"),
+        ),
         ("keep", None, None),
-        ("replace", Blackboard(goal="Old", completion_boundary="Old boundary"), Blackboard(goal="New", completion_boundary="New boundary")),
+        (
+            "replace",
+            Blackboard(goal="Old", completion_boundary="Old boundary"),
+            Blackboard(goal="New", completion_boundary="New boundary"),
+        ),
         ("replace", None, Blackboard(goal="New", completion_boundary="New boundary")),
         ("clear", Blackboard(goal="Goal", completion_boundary="Boundary"), None),
         ("clear", None, None),
@@ -397,6 +404,55 @@ async def test_balanced_scan_handles_quoted_braces_escaped_quotes_and_backslashe
     )
 
 
+@pytest.mark.asyncio
+async def test_balanced_scan_ignores_an_unmatched_quote_before_the_first_object() -> None:
+    router = _FakeRouter(
+        _response(
+            'Provider says "decision: {"action":"clear","goal":null,"completion_boundary":null}'
+        )
+    )
+
+    result = await TaskFramer(router).frame(
+        previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
+        last_assistant_content="Last answer",
+        current_user_input="Current input",
+    )
+
+    assert result.status == "resolved"
+    assert result.blackboard is None
+    assert result.usage_delta == {
+        "model_calls": 1,
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "total_tokens": 10,
+    }
+
+
+@pytest.mark.asyncio
+async def test_balanced_scan_does_not_skip_an_earlier_braced_prose_fragment() -> None:
+    router = _FakeRouter(
+        _response(
+            "Provider note {not JSON} then "
+            '{"action":"clear","goal":null,"completion_boundary":null}'
+        )
+    )
+
+    result = await TaskFramer(router).frame(
+        previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
+        last_assistant_content="Last answer",
+        current_user_input="Current input",
+    )
+
+    assert result.status == "invalid_response"
+    assert result.blackboard is None
+    assert result.usage_delta == {
+        "model_calls": 1,
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "total_tokens": 10,
+    }
+
+
 @pytest.mark.parametrize(
     "response_content",
     [
@@ -420,11 +476,13 @@ async def test_balanced_scan_handles_quoted_braces_escaped_quotes_and_backslashe
         '{"action":"replace","goal":"goal","completion_boundary":""}',
         '{"action":"replace","goal":"goal","completion_boundary":"   "}',
         '{"action":"replace","goal":"goal","completion_boundary":NaN}',
+        '{"action":"replace","goal":"goal","completion_boundary":Infinity}',
+        '{"action":"replace","goal":"goal","completion_boundary":-Infinity}',
         '{"action":"replace","goal":"first","goal":"second","completion_boundary":"boundary"}',
         '{"action":"replace","goal":"goal"}',
         '{"action":"replace","goal":"goal","completion_boundary":"boundary","extra":true}',
         '{"task":"replace","goal":"goal","completion_boundary":"boundary"}',
-        '{"action":"replace","goal":"goal","completion_boundary":"boundary"} prose {"action":"clear","goal":null,"completion_boundary":null}',
+        '{"action":"replace","goal":"goal"} prose {"action":"clear","goal":null,"completion_boundary":null}',
         "```json\n" + _decision("replace", "Goal", "Boundary") + " trailing prose\n```",
     ],
 )
@@ -432,6 +490,74 @@ async def test_balanced_scan_handles_quoted_braces_escaped_quotes_and_backslashe
 async def test_frame_rejects_repairs_guesses_and_ambiguous_or_invalid_decisions(
     response_content: str,
 ) -> None:
+    router = _FakeRouter(_response(response_content))
+
+    result = await TaskFramer(router).frame(
+        previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
+        last_assistant_content="Last answer",
+        current_user_input="Current input",
+    )
+
+    assert result.status == "invalid_response"
+    assert result.blackboard is None
+    assert result.usage_delta == {
+        "model_calls": 1,
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "total_tokens": 10,
+    }
+
+
+@pytest.mark.parametrize(
+    ("first", "trailing", "expected"),
+    [
+        (
+            _decision("clear", None, None),
+            " prose " + _decision("replace", "Ignored", "Ignored boundary"),
+            None,
+        ),
+        (
+            _decision("replace", "New goal", "New boundary"),
+            ' prose {"ignored":true}',
+            Blackboard(goal="New goal", completion_boundary="New boundary"),
+        ),
+        (
+            _decision("clear", None, None),
+            " prose {unclosed",
+            None,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_frame_uses_first_balanced_object_and_preserves_usage(
+    first: str,
+    trailing: str,
+    expected: Blackboard | None,
+) -> None:
+    router = _FakeRouter(_response(f"prefix {first}{trailing}"))
+
+    result = await TaskFramer(router).frame(
+        previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
+        last_assistant_content="Last answer",
+        current_user_input="Current input",
+    )
+
+    assert result.status == "resolved"
+    assert result.blackboard == expected
+    assert result.usage_delta == {
+        "model_calls": 1,
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "total_tokens": 10,
+    }
+
+
+@pytest.mark.asyncio
+async def test_frame_rejects_a_later_valid_object_when_the_first_is_invalid() -> None:
+    response_content = (
+        '{"action":"replace","goal":"","completion_boundary":"invalid"} prose '
+        '{"action":"clear","goal":null,"completion_boundary":null}'
+    )
     router = _FakeRouter(_response(response_content))
 
     result = await TaskFramer(router).frame(

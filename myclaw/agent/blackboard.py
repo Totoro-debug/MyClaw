@@ -213,7 +213,7 @@ def _extract_decision(content: str) -> object:
         return _NOT_PARSED
 
     candidates = _balanced_json_candidates(content)
-    if len(candidates) != 1:
+    if not candidates:
         return _NOT_PARSED
     return _loads_json(candidates[0])
 
@@ -262,6 +262,13 @@ def _balanced_json_candidates(content: str) -> list[str]:
     in_string = False
     escaped = False
     for index, character in enumerate(content):
+        if start is None:
+            if character == "{":
+                start = index
+                depth = 1
+                in_string = False
+                escaped = False
+            continue
         if in_string:
             if escaped:
                 escaped = False
@@ -273,8 +280,6 @@ def _balanced_json_candidates(content: str) -> list[str]:
         if character == '"':
             in_string = True
         elif character == "{":
-            if depth == 0:
-                start = index
             depth += 1
         elif character == "}" and depth > 0:
             depth -= 1

@@ -54,9 +54,7 @@ def _resolved_imports(
 
 
 def _is_blackboard_module(module: str) -> bool:
-    return module == "myclaw.agent.blackboard" or module.startswith(
-        "myclaw.agent.blackboard."
-    )
+    return module == "myclaw.agent.blackboard" or module.startswith("myclaw.agent.blackboard.")
 
 
 def test_prompts_do_not_import_blackboard() -> None:

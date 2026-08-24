@@ -589,9 +589,7 @@ async def test_forced_runtime_replacement_cancels_blocked_framing_without_late_s
 
     assert messages[-1].metadata == {"_streamed": True}
     assert [
-        message["content"]
-        for message in selected.session.messages
-        if message["role"] == "user"
+        message["content"] for message in selected.session.messages if message["role"] == "user"
     ] == ["Persisted target", "Target generation input"]
     assert old_session.messages == old_messages
     assert old_session.metadata == old_metadata

@@ -1458,7 +1458,7 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
             {"role": "system", "content": "test"},
             {
                 "role": "user",
-                "content": f'{current["content"]}\n<blackboard>{projected_blackboard}</blackboard>',
+                "content": f"{current['content']}\n<blackboard>{projected_blackboard}</blackboard>",
             },
         ]
 
@@ -1490,7 +1490,10 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
     assert context_calls == [staged]
     assert context_calls[0] is staged
     assert len(router.requests) == 2
-    assert all(request[1]["content"].endswith(f"<blackboard>{projected_blackboard}</blackboard>") for request in router.requests)
+    assert all(
+        request[1]["content"].endswith(f"<blackboard>{projected_blackboard}</blackboard>")
+        for request in router.requests
+    )
     assert append_calls == 1
     assert [message["role"] for message in session.messages] == [
         "user",
