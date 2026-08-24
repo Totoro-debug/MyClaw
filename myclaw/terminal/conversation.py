@@ -100,12 +100,6 @@ class TerminalConversationError(RuntimeError):
     """A Terminal Conversation cannot run with the supplied terminal streams."""
 
 
-@dataclass(frozen=True, slots=True)
-class _ToolRowKey:
-    turn_id: UUID
-    tool_call_id: str
-
-
 @dataclass(slots=True)
 class _ToolRowState:
     widget: Static

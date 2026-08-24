@@ -127,17 +127,6 @@ class UserConfiguration:
     memory: MemoryConfiguration
     models: ModelsConfiguration
 
-    def configured_route(self, requested_route: str) -> RouteConfiguration:
-        """Return structural settings without evaluating provider usability."""
-        _require_supported_route(requested_route)
-        route = self.models.routes.get(requested_route)
-        if route is not None:
-            return route
-        default = self.models.routes.get("default")
-        if default is None:
-            raise _route_unavailable_error(self.models)
-        return default
-
     def resolve_route(self, requested_route: str) -> ResolvedModelRoute:
         """Resolve a Model Route, falling back to a usable default when permitted."""
         _require_supported_route(requested_route)
