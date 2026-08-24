@@ -360,10 +360,20 @@ async def test_runtime_schedule_uses_its_own_complete_context_projection(
     messages, tools = provider.direct_complete_messages[0]
     assert messages[0]["role"] == "system"
     assert str(workspace) in cast(str, messages[0]["content"])
+    assert "The final <blackboard> block" not in cast(str, messages[0]["content"])
     assert messages[-1]["role"] == "user"
-    assert "Run this." in cast(str, messages[-1]["content"])
-    assert NOW.isoformat(timespec="milliseconds") in cast(str, messages[-1]["content"])
-    assert f"schedule_{JOB_UUID}" in cast(str, messages[-1]["content"])
+    assert messages[-1] == {
+        "role": "user",
+        "content": (
+            "<runtime_context>\n"
+            f"current_time: {NOW.isoformat(timespec='milliseconds')}\n"
+            f"session_id: schedule_{JOB_UUID}\n"
+            "</runtime_context>\n\n"
+            "<user_input>\n"
+            "Run this.\n"
+            "</user_input>"
+        ),
+    }
     assert all("timestamp" not in message for message in messages)
     assert [definition["function"]["name"] for definition in tools] == [
         "read_file",

@@ -8,7 +8,8 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from myclaw.agent.prompts import chat_system_prompt, current_user_input
+from myclaw.agent.blackboard import Blackboard, encode_blackboard
+from myclaw.agent.prompts import current_user_input, foreground_chat_system_prompt
 from myclaw.agent.workspace import Workspace
 from myclaw.session.projection import project_session_message
 
@@ -39,12 +40,15 @@ class ContextBuilder:
         current_user: dict[str, Any],
         session_id: str,
         long_term_memory: str,
+        *,
+        blackboard: Blackboard | None = None,
     ) -> list[dict[str, Any]]:
         """Build system-first context without mutating any caller-owned message."""
+        blackboard_projection = encode_blackboard(blackboard)
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
-                "content": chat_system_prompt(
+                "content": foreground_chat_system_prompt(
                     workspace=self._workspace.path,
                     long_term_memory=long_term_memory,
                 ),
@@ -62,6 +66,7 @@ class ContextBuilder:
                     content=deepcopy(current_user["content"]),
                     current_time=self._current_time(),
                     session_id=session_id,
+                    blackboard_projection=blackboard_projection,
                 ),
             }
         )

@@ -12,6 +12,7 @@ from uuid import UUID
 
 from loguru import logger
 
+from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.message_bus import (
     InboundMessage,
     MessageBus,
@@ -44,10 +45,19 @@ from myclaw.tools.tool_gateway import (
     ToolResult,
 )
 
-type ForegroundContextPreparer = Callable[
-    [Session, dict[str, Any]],
-    Awaitable[list[dict[str, Any]]],
-]
+
+class ForegroundContextPreparer(Protocol):
+    """Prepare foreground context with an optional staged Blackboard."""
+
+    def __call__(
+        self,
+        session: Session,
+        current_user: dict[str, Any],
+        /,
+        blackboard: Blackboard | None = None,
+    ) -> Awaitable[list[dict[str, Any]]]: ...
+
+
 type ScheduleContextPreparer = Callable[
     [Session, dict[str, Any]],
     Awaitable[list[dict[str, Any]]],

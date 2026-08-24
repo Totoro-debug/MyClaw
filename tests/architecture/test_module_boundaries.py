@@ -22,6 +22,76 @@ def _imports(path: Path) -> tuple[tuple[str, int], ...]:
     return tuple(imports)
 
 
+def _resolved_imports(
+    source: str,
+    *,
+    package: tuple[str, ...],
+) -> tuple[tuple[str, int], ...]:
+    tree = ast.parse(source)
+    imports: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend((alias.name, node.lineno) for alias in node.names)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level:
+            retained = len(package) - node.level + 1
+            base = package[: max(0, retained)]
+        else:
+            base = ()
+        if node.module is not None:
+            base = (*base, *node.module.split("."))
+        module = ".".join(base)
+        if module:
+            imports.append((module, node.lineno))
+        imports.extend(
+            (".".join((*base, alias.name)), node.lineno)
+            for alias in node.names
+            if base or alias.name
+        )
+    return tuple(imports)
+
+
+def _is_blackboard_module(module: str) -> bool:
+    return module == "myclaw.agent.blackboard" or module.startswith(
+        "myclaw.agent.blackboard."
+    )
+
+
+def test_prompts_do_not_import_blackboard() -> None:
+    path = PACKAGE_ROOT / "agent" / "prompts.py"
+    violations = [
+        f"{path.relative_to(PROJECT_ROOT)}:{line} imports {module}"
+        for module, line in _resolved_imports(
+            path.read_text(encoding="utf-8"),
+            package=("myclaw", "agent"),
+        )
+        if _is_blackboard_module(module)
+    ]
+
+    assert violations == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import myclaw.agent.blackboard",
+        "from myclaw.agent.blackboard import Blackboard",
+        "from myclaw.agent import blackboard",
+        "from .blackboard import Blackboard",
+        "from . import blackboard",
+        "def load():\n    import myclaw.agent.blackboard",
+        "if TYPE_CHECKING:\n    from . import blackboard",
+    ],
+)
+def test_import_scanner_resolves_blackboard_dependency_forms(source: str) -> None:
+    assert any(
+        _is_blackboard_module(module)
+        for module, _ in _resolved_imports(source, package=("myclaw", "agent"))
+    )
+
+
 def test_production_code_does_not_import_removed_contracts_package() -> None:
     violations = [
         f"{path.relative_to(PROJECT_ROOT)}:{line} imports {module}"

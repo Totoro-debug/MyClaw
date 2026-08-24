@@ -13,12 +13,14 @@ from uuid import UUID
 from loguru import logger
 from tzlocal import get_localzone_name
 
+from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import AgentLoop, TerminalAgentLoopControl
 from myclaw.agent.message_bus import MessageBus
 from myclaw.agent.prompts import (
     chat_system_prompt,
     current_user_input,
+    foreground_chat_system_prompt,
     runtime_context,
     session_title_prompt,
 )
@@ -687,6 +689,12 @@ def _prepare_runtime(
             long_term_memory=memory_snapshot,
         )
 
+    def foreground_system_prompt_for(memory_snapshot: str) -> str:
+        return foreground_chat_system_prompt(
+            workspace=workspace_identity.path,
+            long_term_memory=memory_snapshot,
+        )
+
     summaries = WorkspaceJsonlSummaryStore(active_workspace_state)
     memory_manager = MemoryManager(
         router=router,
@@ -721,6 +729,7 @@ def _prepare_runtime(
         current_system_prompt: str,
         tools: tuple[OpenAIToolSchema, ...],
         current_user: dict[str, Any] | None = None,
+        blackboard: Blackboard | None = None,
     ) -> Session:
         effective_route = configuration.resolve_route(route).route
         if route == "chat":
@@ -738,6 +747,7 @@ def _prepare_runtime(
                     messages,
                     session_id=active_session.session_id,
                     long_term_memory=runtime_memory.snapshot(),
+                    blackboard=blackboard,
                 )
         else:
 
@@ -795,15 +805,17 @@ def _prepare_runtime(
     async def prepare_foreground_context(
         active_session: Session,
         current_user: dict[str, Any],
+        blackboard: Blackboard | None = None,
     ) -> list[dict[str, Any]]:
         memory_snapshot = runtime_memory.snapshot()
-        current_system_prompt = system_prompt_for(memory_snapshot)
+        current_system_prompt = foreground_system_prompt_for(memory_snapshot)
         await prepare_summary(
             active_session,
             "chat",
             current_system_prompt,
             tuple(agent_loop.tool_schemas),
             current_user,
+            blackboard=blackboard,
         )
         history = active_session.messages[active_session.last_consolidated :]
         return _project_foreground_messages(
@@ -811,6 +823,7 @@ def _prepare_runtime(
             [*history, current_user],
             session_id=active_session.session_id,
             long_term_memory=memory_snapshot,
+            blackboard=blackboard,
         )
 
     agent_loop = AgentLoop(
@@ -884,6 +897,7 @@ def _project_foreground_messages(
     *,
     session_id: str,
     long_term_memory: str,
+    blackboard: Blackboard | None = None,
 ) -> list[dict[str, Any]]:
     history, current_user, current_user_index = _current_turn(messages, lane="Foreground")
     projected = context.build_messages(
@@ -891,6 +905,7 @@ def _project_foreground_messages(
         current_user=current_user,
         session_id=session_id,
         long_term_memory=long_term_memory,
+        blackboard=blackboard,
     )
     projected.extend(_project_continuation(messages, current_user_index))
     return projected

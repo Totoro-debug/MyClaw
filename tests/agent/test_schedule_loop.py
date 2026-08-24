@@ -11,6 +11,7 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import InboundMessage
 from myclaw.agent.workspace import Workspace
@@ -282,7 +283,9 @@ def _loop(
 async def _foreground_context(
     session: Session,
     current_user: dict[str, Any],
+    blackboard: Blackboard | None = None,
 ) -> list[dict[str, Any]]:
+    assert blackboard is None
     del session, current_user
     return [{"role": "system", "content": "foreground system"}]
 

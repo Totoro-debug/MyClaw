@@ -4,7 +4,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfoNotFoundError
 
@@ -12,7 +12,9 @@ import pytest
 from loguru import logger
 
 import myclaw.agent.runtime as runtime_module
+from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
+from myclaw.agent.loop import ForegroundContextPreparer
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
 from myclaw.agent.workspace import Workspace
@@ -194,6 +196,71 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
     await runtime.close()
 
     assert discovered_names == ["Asia/Shanghai"]
+
+
+@pytest.mark.asyncio
+async def test_foreground_context_uses_one_staged_blackboard_for_summary_and_chat_projection(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(home).load()
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=configuration,
+        provider_factory=lambda _: ScriptedFakeProvider(),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    blackboard = Blackboard(goal="Current task", completion_boundary="Current boundary")
+    observed: list[Blackboard | None] = []
+    original_projector = runtime_module._project_foreground_messages
+
+    def recording_projector(
+        context: ContextBuilder,
+        messages: Sequence[dict[str, Any]],
+        *,
+        session_id: str,
+        long_term_memory: str,
+        blackboard: Blackboard | None = None,
+    ) -> list[dict[str, Any]]:
+        observed.append(blackboard)
+        return original_projector(
+            context,
+            messages,
+            session_id=session_id,
+            long_term_memory=long_term_memory,
+            blackboard=blackboard,
+        )
+
+    monkeypatch.setattr(runtime_module, "_project_foreground_messages", recording_projector)
+    preparer: ForegroundContextPreparer = runtime.agent_loop._context_preparer
+
+    projected_without_blackboard = await preparer(
+        runtime.session,
+        {"role": "user", "content": "Raw input"},
+    )
+
+    assert observed
+    assert all(value is None for value in observed)
+    assert "<blackboard>" not in projected_without_blackboard[-1]["content"]
+    observed.clear()
+
+    projected = await preparer(
+        runtime.session,
+        {"role": "user", "content": "Raw input"},
+        blackboard,
+    )
+
+    assert len(observed) >= 2
+    assert all(value is blackboard for value in observed)
+    assert "<blackboard>" in projected[-1]["content"]
+    assert runtime.session.messages == []
+    await runtime.close()
 
 
 def test_runtime_composition_rejects_invalid_discovered_iana_before_provider_call(

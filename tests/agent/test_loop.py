@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 from loguru import logger
 
+from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
 from myclaw.agent.message_bus import InboundMessage, OutboundMessage
 from myclaw.agent.runner import AgentRunnerRouter
@@ -252,7 +253,16 @@ def _runtime(
     state.initialize(agent_home_root=agent_home.path)
     session = Session.create(state, now=_Clock().now)
     schedule = ScheduleService(store=WorkspaceScheduleStore(state), clock=_Clock())
-    prepare = _context if context_preparer is None else context_preparer
+    selected_context_preparer = _context if context_preparer is None else context_preparer
+
+    async def prepare(
+        active_session: Session,
+        current_user: dict[str, Any],
+        blackboard: Blackboard | None = None,
+    ) -> list[dict[str, Any]]:
+        assert blackboard is None
+        return await selected_context_preparer(active_session, current_user)
+
     loop = AgentLoop(
         workspace=workspace,
         session=session,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import PurePath
 
@@ -10,13 +11,28 @@ from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 
-def current_user_input(*, content: str, current_time: datetime, session_id: str) -> str:
-    """Wrap only the current raw user input with dynamic Runtime Context."""
-    return render_template(
+def current_user_input(
+    *,
+    content: str,
+    current_time: datetime,
+    session_id: str,
+    blackboard_projection: dict[str, str] | None = None,
+) -> str:
+    """Wrap the raw input and optionally append one encoded Blackboard block."""
+    rendered = render_template(
         "current-user-input.md",
         runtime_context=runtime_context(current_time=current_time, session_id=session_id),
         user_input=render_template("user-input.md", content=content),
     )
+    if blackboard_projection is None:
+        return rendered
+    serialized = json.dumps(
+        blackboard_projection,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return f"{rendered}\n\n<blackboard>\n{serialized}\n</blackboard>"
 
 
 def runtime_context(*, current_time: datetime, session_id: str) -> str:
@@ -34,6 +50,16 @@ def chat_system_prompt(*, workspace: PurePath, long_term_memory: str) -> str:
         "foreground-chat-system-prompt.md",
         identity=render_template("builtin-identity.md", workspace=workspace),
         long_term_memory=long_term_memory,
+    )
+
+
+def foreground_chat_system_prompt(*, workspace: PurePath, long_term_memory: str) -> str:
+    """Add Foreground-only Blackboard interpretation guidance to the base prompt."""
+    return "\n\n".join(
+        (
+            chat_system_prompt(workspace=workspace, long_term_memory=long_term_memory),
+            render_template("blackboard-guidance.md"),
+        )
     )
 
 

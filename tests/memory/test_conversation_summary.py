@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
 from myclaw.agent.workspace import Workspace
@@ -708,6 +709,61 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
     assert session.last_consolidated == 4
     assert session.messages == original_messages
     assert [entry.content for entry in await summaries.after(0, 10)] == ["Lane summary."]
+
+
+@pytest.mark.asyncio
+async def test_foreground_summary_budget_uses_blackboard_without_persisting_projection(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = _session_with_history(state)
+    blackboard = Blackboard(
+        goal="Keep the current task framed.",
+        completion_boundary="The raw input remains the only persisted user message.",
+    )
+    context = ContextBuilder(Workspace.from_path(workspace), "UTC", clock=lambda: NOW)
+    provider = ScriptedFakeProvider(completions=(_response("Summary without Blackboard."),))
+    summaries = WorkspaceJsonlSummaryStore(state)
+    projected_calls: list[list[dict[str, Any]]] = []
+
+    def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        projected = _project_foreground_messages(
+            context,
+            messages,
+            session_id=session.session_id,
+            long_term_memory="memory",
+            blackboard=blackboard,
+        )
+        projected_calls.append(deepcopy(projected))
+        return projected
+
+    await _manager(
+        provider,
+        summaries,
+        threshold=4,
+        project_messages=project_messages,
+    ).prepare(
+        session,
+        current_user={"role": "user", "content": "Incoming raw input."},
+    )
+
+    assert projected_calls
+    assert any(
+        "<blackboard>" in str(message.get("content"))
+        for projection in projected_calls
+        for message in projection
+        if message["role"] == "user"
+    )
+    summary_request = provider.complete_requests[0]
+    summary_input = summary_request.messages[1]["content"]
+    assert isinstance(summary_input, str)
+    assert "<blackboard>" not in summary_input
+    assert blackboard.goal not in summary_input
+    assert blackboard.completion_boundary not in summary_input
+    assert all("blackboard" not in message for message in session.messages)
+    assert [entry.content for entry in await summaries.after(0, 10)] == [
+        "Summary without Blackboard."
+    ]
 
 
 @pytest.mark.asyncio
