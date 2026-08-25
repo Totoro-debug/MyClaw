@@ -11,3 +11,5 @@ The main Tool Catalog is fixed in this order: Read File, Write File, Edit File, 
 File Tools use normal Workspace path resolution, including Workspace State, and external targets require exact-call confirmation. Exec runs one direct Bash process with bounded destructive-command, cwd, timeout, and DNS checks; MyClaw does not claim process-tree ownership or OS-level filesystem, network, or process isolation.
 
 `BaseTool` externalizes oversized successful results beneath `.myclaw/artifacts/<session_id>/<tool_call_id>.txt`, using a UUID fallback for an invalid call ID. Artifacts have no separate module, commit, rollback, cleanup, or ownership lifecycle.
+
+ADR-0016 defines a confirmation-free `read_file` boundary for canonical paths beneath `~/.myclaw/skills`; it does not add or dynamically register a Tool.

@@ -88,6 +88,18 @@ _Avoid_: User instruction, Long-term Memory, Session message
 The stable system-level context that establishes Personal Agent identity, memory, and capability guidance for a model call.
 _Avoid_: Runtime Context, user message, Conversation Summary
 
+**Skill**:
+A named, discoverable instruction package that guides an Agent Run through existing capabilities without registering Tools or expanding permissions.
+_Avoid_: Tool, Plugin, Management Command, capability extension
+
+**Skill Catalog**:
+The ordered set of valid Skill metadata available for discovery without loading the corresponding Skill instructions.
+_Avoid_: Tool Catalog, command list, loaded Skill content
+
+**Skill Invocation**:
+The selection and application of one Skill's instructions to a foreground Agent Run, initiated explicitly by the user or autonomously by the model.
+_Avoid_: Management Command, Tool capability, Skill discovery
+
 **Conversation Session**:
 A durable conversational thread owned by one Workspace and represented by one active in-memory Session authority during foreground execution.
 _Avoid_: Chat ID, terminal session, Workspace, runtime checkpoint, background task

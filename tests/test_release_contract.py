@@ -1,8 +1,110 @@
 import ast
+import re
+import subprocess
 import tomllib
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+import yaml  # type: ignore[import-untyped]
 
 ROOT = Path(__file__).resolve().parents[1]
+PROTECTED_SKILL_PLAN = Path("docs/skill-module-implementation-plan.md")
+
+_ACTIVE_SKILL_CONTRACTS = (
+    ROOT / "CONTEXT.md",
+    ROOT / "docs" / "myclaw-personal-agent-prd.md",
+    ROOT / "docs" / "myclaw-runtime-contracts.md",
+    ROOT / "docs" / "terminal-conversation-ui-design.md",
+    ROOT / "docs" / "release-readiness.md",
+)
+_ACTIVE_ADRS = tuple(
+    ROOT / "docs" / "adr" / name
+    for name in (
+        "0001-file-first-local-persistence.md",
+        "0002-fixed-agent-home.md",
+        "0005-store-workspace-state-in-workspace.md",
+        "0007-use-host-adapters.md",
+        "0008-use-workspace-session-log.md",
+        "0009-active-session-snapshot-persistence.md",
+        "0010-fixed-tool-catalog-and-base-tool-boundaries.md",
+        "0011-use-full-screen-terminal-conversation.md",
+        "0012-use-textual-for-terminal-conversation.md",
+        "0014-use-message-bus-agent-loop-and-agent-runner.md",
+        "0015-use-session-blackboard-task-framing.md",
+        "0016-use-agent-home-skill-catalog-and-progressive-loading.md",
+    )
+)
+_OBSOLETE_SKILL_MARKERS = (
+    "adr-0016 proposes",
+    "只有内置 slash commands 进入 management port",
+    "其它 `/` 开头文本作为普通用户消息发送给模型",
+)
+
+# The tracked corpus uses these simple inline/reference target forms. This is not a
+# complete CommonMark parser, and deliberately does not claim to be one.
+_INLINE_MARKDOWN_LINK = re.compile(
+    r"!?\[[^\]\n]*\]\((?P<target><[^>\n]+>|[^)\s\n]+)"
+    r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\)"
+)
+_REFERENCE_MARKDOWN_LINK = re.compile(r"(?m)^\s*\[[^\]\n]+\]:\s*(?P<target><[^>\n]+>|\S+)")
+
+
+def _tracked_markdown_paths() -> tuple[Path, ...]:
+    output = subprocess.check_output(
+        ("git", "ls-files", "-z", "--", "*.md"),
+        cwd=ROOT,
+    ).decode("utf-8")
+    return tuple(ROOT / Path(relative) for relative in output.split("\0") if relative)
+
+
+def _markdown_link_targets(content: str) -> tuple[str, ...]:
+    return tuple(
+        match.group("target").removeprefix("<").removesuffix(">")
+        for pattern in (_INLINE_MARKDOWN_LINK, _REFERENCE_MARKDOWN_LINK)
+        for match in pattern.finditer(content)
+    )
+
+
+def _local_markdown_path(target: str) -> str | None:
+    if target.startswith("#"):
+        return None
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc:
+        return None
+    path = unquote(parsed.path)
+    return path or None
+
+
+def _adr_status(path: Path) -> object:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines and lines[0] == "---", path
+    try:
+        closing = lines.index("---", 1)
+    except ValueError as error:
+        raise AssertionError(f"{path} has no closing frontmatter delimiter") from error
+    frontmatter = yaml.safe_load("\n".join(lines[1:closing]))
+    assert isinstance(frontmatter, dict), path
+    return frontmatter.get("status")
+
+
+def _markdown_section(content: str, heading: str) -> str:
+    lines = content.splitlines()
+    marker = f"### {heading}"
+    start = lines.index(marker) + 1
+    end = next(
+        (index for index in range(start, len(lines)) if lines[index].startswith("### ")),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def _glossary_definition(content: str, term: str) -> str:
+    marker = f"**{term}**:\n"
+    _before, found, remainder = content.partition(marker)
+    assert found, term
+    definition, found, _after = remainder.partition("\n_Avoid_:")
+    assert found, term
+    return " ".join(definition.casefold().split())
 
 
 def test_distribution_declares_supported_loguru_release_range() -> None:
@@ -182,4 +284,78 @@ def test_current_adrs_have_unique_numbers_and_accepted_status() -> None:
     numbers = [path.name.split("-", 1)[0] for path in decisions]
 
     assert len(numbers) == len(set(numbers))
-    assert all("status: accepted" in path.read_text(encoding="utf-8").lower() for path in decisions)
+    assert all(_adr_status(path) == "accepted" for path in decisions)
+
+
+def test_tracked_markdown_local_links_resolve() -> None:
+    tracked = _tracked_markdown_paths()
+    relative_paths = {path.relative_to(ROOT).as_posix() for path in tracked}
+    assert PROTECTED_SKILL_PLAN.as_posix() not in relative_paths
+
+    missing: list[str] = []
+    for source in tracked:
+        content = source.read_text(encoding="utf-8")
+        for target in _markdown_link_targets(content):
+            local_path = _local_markdown_path(target)
+            if local_path is None:
+                continue
+            candidate = (source.parent / local_path).resolve()
+            if not candidate.exists():
+                missing.append(f"{source.relative_to(ROOT)}: {target} -> {candidate}")
+
+    assert missing == []
+
+
+def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
+    skill_adr = _ACTIVE_ADRS[-1]
+    active_contracts = (*_ACTIVE_SKILL_CONTRACTS, *_ACTIVE_ADRS)
+    tracked = set(_tracked_markdown_paths())
+
+    assert not [path for path in active_contracts if path not in tracked]
+    assert _adr_status(skill_adr) == "accepted"
+
+    adr = skill_adr.read_text(encoding="utf-8").casefold()
+    manual_contract = next(
+        paragraph for paragraph in adr.split("\n\n") if "user slash invocation" in paragraph
+    )
+    for claim in (
+        "read and revalidate the complete `skill.md`",
+        "instruction body after its frontmatter",
+        "complete raw document are not projected",
+    ):
+        assert claim in manual_contract
+
+    context = (ROOT / "CONTEXT.md").read_text(encoding="utf-8")
+    glossary_contract = {
+        "Skill": (
+            "named, discoverable instruction package",
+            "existing capabilities",
+            "without registering tools or expanding permissions",
+        ),
+        "Skill Catalog": (
+            "ordered set of valid skill metadata",
+            "without loading the corresponding skill instructions",
+        ),
+        "Skill Invocation": (
+            "selection and application",
+            "foreground agent run",
+            "explicitly by the user or autonomously by the model",
+        ),
+    }
+    for term, claims in glossary_contract.items():
+        definition = _glossary_definition(context, term)
+        assert all(claim in definition for claim in claims), term
+
+    prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
+    management_contract = _markdown_section(prd, "CLI and management").casefold()
+    for claim in (
+        "only management commands enter the management port",
+        "exact valid skill slash invocation remains an ordinary foreground agent run",
+        "unknown or non-matching slash input remains ordinary input",
+    ):
+        assert claim in management_contract
+
+    for path in active_contracts:
+        content = path.read_text(encoding="utf-8").casefold()
+        stale = [marker for marker in _OBSOLETE_SKILL_MARKERS if marker in content]
+        assert stale == [], f"{path}: {stale}"

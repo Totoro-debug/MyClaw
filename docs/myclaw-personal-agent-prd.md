@@ -131,7 +131,7 @@
 - 非交互管理首版只支持 `myclaw config`。
 - 首版不要求 `myclaw --help` 作为产品能力。
 - Terminal Conversation 内置 slash commands：`/config`、`/status`、`/resume`、`/memory`、`/dream`。
-- 只有内置 slash commands 进入 Management Port；其它 `/` 开头文本作为普通用户消息发送给模型。
+- Only Management Commands enter the Management Port. An exact valid Skill slash invocation remains an ordinary foreground Agent Run; unknown or non-matching slash input remains ordinary input.
 - `/config` 完整显示配置，但脱敏 plaintext API key。
 - 配置语法错误时，`myclaw config` 显示解析错误、配置路径和原文，并对明显 API key 行做文本级脱敏。
 - `/status` 显示版本、chat model、runtime uptime、估算 token 状态、当前 Session 消息数、`last_consolidated` 和当前 Session 累计 model usage。
