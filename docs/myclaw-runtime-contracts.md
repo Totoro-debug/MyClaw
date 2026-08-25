@@ -77,6 +77,9 @@ D01-D17 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Fra
 ```text
 ~/.myclaw/
   config.toml
+  skills/
+    <skill-directory>/
+      SKILL.md
 
 <workspace>/.myclaw/
   .gitignore
@@ -96,7 +99,13 @@ D01-D17 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Fra
     <session_id>.log
 ```
 
-已确定：Agent Home 拥有 User Configuration；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 Terminal Conversation 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`schedule.json`、Session、`.myclaw/artifacts/`、`schedule-sessions/` 和 `logs/` 按需创建。legacy scheduled-work state 原样保留且不读取、不检测、不迁移、不重命名或删除。`myclaw config` 不初始化 Workspace State。
+已确定：Agent Home 拥有 User Configuration 和可选的 user-authored Skill root；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 Terminal Conversation 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`schedule.json`、Session、`.myclaw/artifacts/`、`schedule-sessions/` 和 `logs/` 按需创建。legacy scheduled-work state 原样保留且不读取、不检测、不迁移、不重命名或删除。`myclaw config` 不初始化 Workspace State。`AgentHome.initialize()` 只创建 Agent Home root，不创建缺失的 `skills/`。
+
+#### 3.1.1 Skill Catalog discovery
+
+`~/.myclaw/skills/` 缺失或为空时，Skill Catalog 是空 snapshot。Catalog 只扫描其一级子目录中名为 `SKILL.md` 的 instruction file；不会把嵌套目录作为独立候选。frontmatter 必须从文件首行的独占 `---` 开始，并以之后的独占 `---` 结束；其内容使用安全 YAML mapping 解析，`name` 和 `description` 必须是字符串。trim 后，`name` 必须匹配 `[a-z_-][a-z0-9_-]{0,63}`，`description` 必须为 1 到 1024 个 Unicode code points。
+
+每个候选的 instruction path 必须是可读 UTF-8 普通文件，并在 canonical Skill root 内；canonical root 外的 symlink/reparse target、缺失文件、非 UTF-8 metadata 和其他 malformed metadata 均跳过。跳过时只记录安全的 candidate path 与 reason，不记录 instruction body。候选按 canonical path 字符串升序评估；reserved Management Command names 和重复 Skill names 不进入 snapshot，同名时保留第一个有效候选。Catalog 只保留 immutable 的 name、trimmed description 和 canonical absolute `SKILL.md` path，不缓存正文，也不注册 Tool。
 
 `memory.md` 初始内容固定为：
 
@@ -117,7 +126,7 @@ D01-D17 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Fra
 1. Workspace identity 是启动 cwd 按当前 host 原生路径语义进行词法规范化后的绝对路径；不解析 Git root，也不搜索祖先目录或通过 filesystem alias 改变归属。
 2. Windows 保留 Drive、UNC 与 extended path 行为；POSIX 使用原生绝对路径语义。相对路径被拒绝为 Workspace identity。
 3. Workspace 不派生第二层名称。非全局状态直接位于 `<workspace>/.myclaw/`。
-4. Agent Home 仅保留全局 User Configuration 与 untouched legacy Runtime Log files；旧的非全局数据不读取、不迁移、不删除。
+4. Agent Home 仅保留全局 User Configuration、user-authored Skill root 与 untouched legacy Runtime Log files；旧的非全局数据不读取、不迁移、不删除。
 
 ### 3.3 Session Log
 
@@ -726,6 +735,12 @@ active Runner、persistence、Schedule、Memory 或 Provider shutdown。Provider
 detached best effort，只记录 failure；可接受丢失未持久化状态、未修复 active work、Tool
 side-effect/Artifact orphan、Memory cursor skip、Schedule at-least-once side effect 和
 uptime reset。普通 process shutdown 始终走 awaited `close()`。
+
+Runtime Lifetime 还拥有一个由 Agent Home Skill root 构建的 immutable Skill Catalog snapshot。
+同一 Runtime Lifetime 的 Runtime Generation replacement（包括 `/resume`）复用该 snapshot，
+不得重新扫描 Skill 目录；只有新的 Runtime Lifetime 才重新发现目录内容。该 Catalog foundation
+本身不改变 foreground prompt、Tool permission、Management Command、slash invocation、
+Schedule 或 Terminal UI 契约。
 
 ## TOOL_SCHEMA：Tool Gateway 契约
 

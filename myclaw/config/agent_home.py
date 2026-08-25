@@ -18,6 +18,11 @@ class AgentHome:
         """Return the canonical production Agent Home."""
         return cls(Path.home() / ".myclaw")
 
+    @property
+    def skills_directory(self) -> Path:
+        """Return the user-authored Skill root without creating it."""
+        return self.path / "skills"
+
     def initialize(self) -> None:
         """Create the global Agent Home root for configuration state."""
         self.path.mkdir(parents=True, exist_ok=True)

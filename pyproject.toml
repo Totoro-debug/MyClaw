@@ -20,6 +20,7 @@ dependencies = [
     "ddgs>=9,<10",
     "loguru>=0.7.3,<0.8",
     "openai>=2.37,<3",
+    "PyYAML>=6,<7",
     "rich>=14.2.0,<15",
     "tomlkit>=0.13,<0.14",
     "textual>=8.2.8,<9",
