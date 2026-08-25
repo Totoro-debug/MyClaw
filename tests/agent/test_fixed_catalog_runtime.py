@@ -205,6 +205,48 @@ async def test_runtime_uses_fixed_catalog_for_provider_confirmation_and_persiste
 
 
 @pytest.mark.asyncio
+async def test_runtime_reads_known_skill_path_without_confirmation(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    skill_file = agent_home / "skills" / "review" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_bytes(b"---\nname: review\n---\nbody\n")
+    provider = _RuntimeProvider(
+        (
+            _response(
+                content="",
+                tool_call=ModelToolCall(
+                    id="call_skill_read",
+                    name="read_file",
+                    arguments=json.dumps({"path": str(skill_file)}),
+                ),
+            ),
+            _response(content="Done."),
+        )
+    )
+    runtime = _runtime(agent_home, workspace, provider)
+    confirmations: list[ConfirmationRequestView] = []
+
+    def approve(request: ConfirmationRequestView) -> None:
+        confirmations.append(request)
+        runtime.control.respond_to_confirmation(request.confirmation_id, "approved")
+
+    runtime.control.bind_confirmation_callback(approve)
+    try:
+        await runtime.start()
+        await collect_foreground_outbound(runtime, "Read the skill.")
+    finally:
+        await runtime.close()
+
+    assert confirmations == []
+    tool_messages = [message for message in runtime.session.messages if message["role"] == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0]["content"] == "---\nname: review\n---\nbody\n"
+    assert tool_messages[0]["status"] == "success"
+
+
+@pytest.mark.asyncio
 async def test_runtime_cancellation_reaches_an_active_fixed_catalog_tool(
     agent_home: Path,
     workspace: Path,

@@ -207,6 +207,125 @@ async def test_workspace_state_and_absolute_internal_paths_use_host_permissions(
 
 
 @pytest.mark.asyncio
+async def test_read_file_allows_canonical_skill_root_without_confirmation(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    identity = Workspace.from_path(workspace)
+    skill_root = tmp_path / "agent-home" / "skills"
+    skill_file = skill_root / "review" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_bytes(b"---\nname: review\n---\nbody\n")
+    requests: list[ConfirmationRequest] = []
+
+    async def unexpected_confirmation(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "declined"
+
+    gateway = _gateway(
+        ReadFileTool(workspace=identity, skill_root=skill_root),
+        confirmation=unexpected_confirmation,
+    )
+
+    result = await gateway.call(_call("read_file", {"path": str(skill_file)}))
+
+    assert (result.status, result.content) == ("success", "---\nname: review\n---\nbody\n")
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_read_file_missing_skill_target_skips_confirmation(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    identity = Workspace.from_path(workspace)
+    skill_root = tmp_path / "agent-home" / "skills"
+    missing = skill_root / "review" / "SKILL.md"
+    requests: list[ConfirmationRequest] = []
+
+    async def unexpected_confirmation(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "declined"
+
+    gateway = _gateway(
+        ReadFileTool(workspace=identity, skill_root=skill_root),
+        confirmation=unexpected_confirmation,
+    )
+
+    result = await gateway.call(_call("read_file", {"path": str(missing)}))
+
+    assert result.status == "error"
+    assert "Read File failed" in result.content
+    assert requests == []
+    assert not skill_root.exists()
+
+
+@pytest.mark.asyncio
+async def test_read_file_keeps_other_agent_home_paths_confirmed(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    identity = Workspace.from_path(workspace)
+    agent_home = tmp_path / "agent-home"
+    config = agent_home / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b"[runtime]\nmax_tool_result_chars = 4096\n")
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    gateway = _gateway(
+        ReadFileTool(workspace=identity, skill_root=agent_home / "skills"),
+        confirmation=approve,
+    )
+
+    result = await gateway.call(_call("read_file", {"path": str(config)}))
+
+    assert (result.status, result.content) == (
+        "success",
+        "[runtime]\nmax_tool_result_chars = 4096\n",
+    )
+    assert len(requests) == 1
+    assert "outside the Workspace" in requests[0].reason
+
+
+@pytest.mark.asyncio
+async def test_read_file_skill_root_escape_requires_confirmation(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    agent_home = tmp_path / "agent-home"
+    external = tmp_path / "external"
+    workspace.mkdir()
+    skill_root = agent_home / "skills"
+    skill_root.mkdir(parents=True)
+    external.mkdir()
+    outside = external / "SKILL.md"
+    outside.write_bytes(b"outside skill\n")
+    escape = skill_root / "escape"
+    try:
+        escape.symlink_to(external, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"directory links unavailable: {error}")
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    gateway = _gateway(
+        ReadFileTool(workspace=Workspace.from_path(workspace), skill_root=skill_root),
+        confirmation=approve,
+    )
+
+    result = await gateway.call(_call("read_file", {"path": str(escape / "SKILL.md")}))
+
+    assert (result.status, result.content) == ("success", "outside skill\n")
+    assert len(requests) == 1
+    assert "outside the Workspace" in requests[0].reason
+
+
+@pytest.mark.asyncio
 async def test_external_targets_require_confirmation_and_bind_the_exact_call(
     workspace: Path,
     tmp_path: Path,

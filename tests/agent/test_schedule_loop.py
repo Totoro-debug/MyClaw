@@ -255,6 +255,7 @@ def _loop(
     tmp_path: Path,
     router: _ScheduleRouter,
     *,
+    skill_root: Path | None = None,
     schedule_context_preparer: Callable[
         [Session, dict[str, Any]],
         Awaitable[list[dict[str, Any]]],
@@ -273,6 +274,7 @@ def _loop(
     )
     loop = AgentLoop(
         workspace=workspace,
+        skill_root=skill_root,
         session=foreground,
         schedule_service=service,
         model_router=router,
@@ -583,6 +585,42 @@ async def test_schedule_confirmation_required_tool_is_refused_without_foreground
     assert tool_message["confirmation"]["decision"] is None
     assert confirmation_requests == []
     assert loop.has_pending_confirmation is False
+
+
+@pytest.mark.asyncio
+async def test_schedule_agent_reads_known_skill_path_via_shared_gateway(tmp_path: Path) -> None:
+    skill_root = tmp_path / "agent-home" / "skills"
+    skill_file = skill_root / "review" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_bytes(b"---\nname: review\n---\nbody\n")
+    router = _ScheduleRouter(
+        _tool_response(
+            call_id="scheduled_skill_read",
+            name="read_file",
+            arguments={"path": str(skill_file)},
+        ),
+        _ScheduleRouter._response(),
+    )
+    loop, state, _ = _loop(tmp_path, router, skill_root=skill_root)
+    confirmation_requests: list[object] = []
+    loop.bind_confirmation_callback(confirmation_requests.append)
+
+    await loop.run_schedule_job(_job())
+
+    await _assert_no_outbound(loop)
+    schedule_session = Session.load(
+        state,
+        f"schedule_{JOB_ID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    tool_messages = [message for message in schedule_session.messages if message["role"] == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0]["status"] == "success"
+    assert tool_messages[0]["content"] == "---\nname: review\n---\nbody\n"
+    assert confirmation_requests == []
+    assert loop.has_pending_confirmation is False
+    assert router.routes == ["schedule", "schedule"]
+    assert [tool_count for _, tool_count in router.requests] == [10, 10]
 
 
 @pytest.mark.asyncio

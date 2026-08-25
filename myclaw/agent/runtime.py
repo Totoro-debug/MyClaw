@@ -832,6 +832,7 @@ def _prepare_runtime(
 
     agent_loop = AgentLoop(
         workspace=workspace_identity,
+        skill_root=agent_home.skills_directory,
         session=active_session,
         schedule_service=schedule_service,
         model_router=router,

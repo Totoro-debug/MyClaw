@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, NoReturn, Protocol
 from uuid import UUID
 
@@ -178,6 +179,7 @@ class AgentLoop:
         self,
         *,
         workspace: Workspace,
+        skill_root: Path | None = None,
         session: Session,
         schedule_service: ScheduleService,
         model_router: AgentRunnerRouter,
@@ -217,6 +219,7 @@ class AgentLoop:
         self._tool_gateway = ToolGateway(
             workspace=workspace,
             schedule_service=schedule_service,
+            skill_root=skill_root,
         )
         self._model_router = model_router
         self._runner = AgentRunner(model_router)

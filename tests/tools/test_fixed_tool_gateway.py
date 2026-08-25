@@ -31,7 +31,12 @@ class _Clock:
         del seconds
 
 
-def _gateway(workspace: Path, agent_home: Path) -> ToolGateway:
+def _gateway(
+    workspace: Path,
+    agent_home: Path,
+    *,
+    skill_root: Path | None = None,
+) -> ToolGateway:
     identity = Workspace.from_path(workspace)
     state = WorkspaceState(identity)
     state.initialize(agent_home_root=agent_home)
@@ -41,6 +46,7 @@ def _gateway(workspace: Path, agent_home: Path) -> ToolGateway:
             store=WorkspaceScheduleStore(state),
             clock=_Clock(),
         ),
+        skill_root=skill_root,
     )
 
 
@@ -83,6 +89,35 @@ def test_fixed_catalog_order_and_detached_definitions(
     assert not hasattr(gateway, "register_tools")
     assert not hasattr(gateway, "for_run")
     assert not any(name in vars(gateway) for name in ("workspace", "schedule_store"))
+
+
+@pytest.mark.asyncio
+async def test_fixed_gateway_reads_skill_root_without_confirmation(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    skill_file = agent_home / "skills" / "review" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_bytes(b"---\nname: review\n---\nbody\n")
+    requests: list[ConfirmationRequest] = []
+
+    async def unexpected_confirmation(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "declined"
+
+    gateway = _gateway(workspace, agent_home, skill_root=agent_home / "skills")
+    result = await gateway.call(
+        ModelToolCall(
+            id="call_skill_read",
+            name="read_file",
+            arguments=json.dumps({"path": str(skill_file)}),
+        ),
+        confirmation=unexpected_confirmation,
+    )
+
+    assert (result.status, result.content) == ("success", "---\nname: review\n---\nbody\n")
+    assert requests == []
+    assert len(gateway.schemas) == 10
 
 
 @pytest.mark.asyncio

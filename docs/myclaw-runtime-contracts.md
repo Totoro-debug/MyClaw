@@ -768,7 +768,7 @@ ToolResult(
 
 ### 11.2 Catalog 与依赖所有权
 
-- Agent Loop 在初始化时以 Workspace 和 Schedule Service 构造一个共享 `ToolGateway`；Gateway 自己一次性构造固定十工具 Catalog，不暴露注册入口。Schedule Service 只持有 Store/Job management ownership，Gateway 不接受第二套 Schedule Gateway。
+- Agent Loop 在初始化时以 Workspace、Schedule Service 和 canonical Agent Home Skill root 构造一个共享 `ToolGateway`；Gateway 自己一次性构造固定十工具 Catalog，不暴露注册入口。Schedule Service 只持有 Store/Job management ownership，Gateway 不接受第二套 Schedule Gateway。
 - Tool 调用不接收 session ID、Agent Home、lane、approval flag 或通用 execution context。
 - 没有独立 `Security` 模块；公共路径、DNS、截断和 Artifact 边界由 BaseTool 或共享小 helper 提供，具体 Tool 保留 capability-specific 规则。
 - Memory Task 使用合法且独立的专用 Tool Gateway，只注册 Long-term Memory read/edit Tool；
@@ -795,10 +795,12 @@ ToolResult(
 
 - Workspace 内 read/list/search：allow。
 - Workspace 及其中 Workspace State 的 read/list/write/edit：allow，实际结果服从操作系统权限。
-- 解析到 Workspace 外的 file path：请求一次性确认；无确认通道或拒绝时 refused。
+- 仅 `read_file` 对 canonical `~/.myclaw/skills` root 下的已知 path 免确认；Skill root 缺失时不创建目录，缺失目标继续返回普通 `read_file` error。
+- `read_file` 的 Skill-root 判断在请求 path canonical resolve 后进行；解析到 root 外的 symlink/reparse target 仍请求一次性确认。
+- 解析到 Workspace 外且不在上述 canonical Skill root 的 file path：请求一次性确认；无确认通道或拒绝时 refused。
 - 当前 session 的 artifact directory：按相同 Workspace 路径规则处理，没有额外 MyClaw 权限层。
 
-共享路径 helper 使用 host path semantics 解析 Workspace root 和请求目标，再按 canonical path 判断是否在 Workspace 内；内部目标直接交给具体 OS 操作，外部目标先确认。没有中央 `Security` 类型筛选或额外 device/named-pipe/non-regular blanket policy。
+共享路径 helper 使用 host path semantics 解析 Workspace root 和请求目标，再按 canonical path 判断是否在 Workspace 内；`read_file` 额外判断 canonical Skill root，内部目标直接交给具体 OS 操作，外部目标先确认。没有中央 `Security` 类型筛选或额外 device/named-pipe/non-regular blanket policy。
 
 ### 11.4 Exec Tool
 
@@ -895,11 +897,14 @@ BaseTool 在 `status == "success"` 且结果长度严格超过 `runtime.max_tool
 | Long-term Memory read | allow | allow | allow |
 | Long-term Memory edit | allow, subject to OS permissions | allow, subject to OS permissions | allow，仅精确文件 |
 | Current-session artifact read | allow | allow | 不在 catalog |
+| Canonical Agent Home Skill root (`read_file` only) | allow | allow，限已知 path | 不在 catalog |
 | Agent Home internal state read/write | 按普通 Workspace path rules | Workspace 内 allow；外部 refused/error | 不在 catalog；owned stores 自行操作 |
 | Exec | allow or one-shot confirmation by concrete safety check | allow；需要确认时 refused | 不在 catalog |
 | WebSearch/WebFetch | allow or one-shot confirmation by concrete target check | allow；需要确认时 refused | 不在 catalog |
 | Schedule add/list/remove | allow | allow, except `add` is refused | 不在 catalog |
 | Workspace 之外 | one-shot confirmation or OS error | refused/error（无确认通道） | refused/error |
+
+上述 Skill-root carve-out 只扩展既有 `read_file` 的 generic path safety；它不提供 Skill discovery、Skill invocation、目录监听或新的 Tool API。Foreground 与 Schedule 共用同一 Gateway，因此 Schedule 可以读取已知 canonical Skill path，但没有 metadata/prompt 投影或确认通道。
 
 当前 Tool 契约没有 centralized Permission Policy、`ask`、approval flag 或 invocation ContextVar。前台 Exec、Web 和 Workspace 外部路径的确认是一次性、精确绑定到当前 normalized call 的 Tool Confirmation；Schedule Agent 没有确认通道，因此需要确认的操作会被拒绝，而 Schedule actions 自身不请求确认。无效参数、越界访问和执行失败返回 message-only `error`。Tool Result 不携带 error code 或嵌套 `ErrorInfo`，可携带 confirmation metadata。
 

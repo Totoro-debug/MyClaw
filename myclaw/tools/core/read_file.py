@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated
 
 from myclaw.agent.workspace import Workspace
@@ -25,8 +26,9 @@ class ReadFileTool(BaseTool):
         ToolParam(description="Maximum lines to return.", minimum=1, maximum=10000),
     ] = 2000
 
-    def __init__(self, *, workspace: Workspace) -> None:
+    def __init__(self, *, workspace: Workspace, skill_root: Path | None = None) -> None:
         self._workspace = workspace
+        self._skill_root = None if skill_root is None else Path(skill_root).resolve(strict=False)
 
     async def check_safety(  # type: ignore[override]
         self,
@@ -36,7 +38,11 @@ class ReadFileTool(BaseTool):
         limit: int,
     ) -> str | None:
         del offset, limit
-        return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
+        return self.workspace_path_safety_reason(
+            workspace=self._workspace,
+            requested=path,
+            additional_roots=() if self._skill_root is None else (self._skill_root,),
+        )
 
     async def execute(self, *, path: str, offset: int, limit: int) -> str:
         target = self.resolve_path_argument(workspace=self._workspace, requested=path)

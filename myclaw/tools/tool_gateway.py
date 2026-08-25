@@ -7,6 +7,7 @@ import json
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, cast
 from uuid import UUID, uuid4
 
@@ -170,6 +171,7 @@ class ToolGateway:
         *,
         workspace: Workspace,
         schedule_service: ScheduleService,
+        skill_root: Path | None = None,
     ) -> None:
         if not isinstance(workspace, Workspace):
             raise TypeError("Tool Gateway requires a Workspace")
@@ -177,7 +179,7 @@ class ToolGateway:
             raise TypeError("Tool Gateway requires a ScheduleService")
 
         tools: tuple[BaseTool, ...] = (
-            ReadFileTool(workspace=workspace),
+            ReadFileTool(workspace=workspace, skill_root=skill_root),
             WriteFileTool(workspace=workspace),
             EditFileTool(workspace=workspace),
             ListDirTool(workspace=workspace),

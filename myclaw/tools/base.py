@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import re
 from abc import ABC, abstractmethod, update_abstractmethods
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from copy import deepcopy
 from dataclasses import dataclass
 from ipaddress import IPv6Address, ip_address
@@ -253,11 +253,17 @@ class BaseTool(ABC):
         *,
         workspace: Workspace | Path,
         requested: str | Path,
+        additional_roots: Collection[Path] = (),
     ) -> str | None:
-        """Return the shared confirmation reason for a resolved external path."""
+        """Return the shared confirmation reason for a path outside allowed roots."""
         resolved = self.resolve_path_argument(workspace=workspace, requested=requested)
         try:
             contained = is_workspace_path(workspace, resolved)
+            if not contained:
+                contained = any(
+                    resolved.is_relative_to(Path(root).resolve(strict=False))
+                    for root in additional_roots
+                )
         except (OSError, RuntimeError, ValueError) as error:
             raise self._path_resolution_error(error) from error
         return None if contained else _EXTERNAL_PATH_SAFETY_REASON
