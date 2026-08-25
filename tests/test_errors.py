@@ -8,6 +8,7 @@ from myclaw.errors import (
     ErrorCode,
     ErrorInfo,
 )
+from myclaw.skills.catalog import SkillUnavailableError
 
 
 def test_turn_cancelled_message_is_the_stable_user_visible_contract() -> None:
@@ -40,6 +41,7 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
             "tool_refused",
             "tool_failed",
             "memory_task_running",
+            "skill_unavailable",
         }
     )
     error = ErrorInfo(
@@ -57,3 +59,11 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
     }
     with pytest.raises(ValueError, match="stable error code"):
         ErrorInfo(code=cast(ErrorCode, "new_unaccepted_code"), message="Not accepted.")
+
+
+def test_skill_unavailable_error_exposes_the_stable_error_info() -> None:
+    error = ErrorInfo(code="skill_unavailable", message="Skill body is unavailable.")
+    failure = SkillUnavailableError(error)
+
+    assert failure.error is error
+    assert str(failure) == error.message

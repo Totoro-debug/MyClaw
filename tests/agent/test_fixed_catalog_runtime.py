@@ -24,6 +24,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ReasoningEffort,
 )
+from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.core.web_fetch import JinaReaderClient
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -131,10 +132,12 @@ def _runtime(
     agent_home: Path,
     workspace: Path,
     provider: _RuntimeProvider,
+    *,
+    config_text: str = VALID_CONFIG,
 ) -> PreparedRuntime:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
     return prepare_runtime(
         agent_home=home,
         workspace=workspace,
@@ -244,6 +247,112 @@ async def test_runtime_reads_known_skill_path_without_confirmation(
     assert len(tool_messages) == 1
     assert tool_messages[0]["content"] == "---\nname: review\n---\nbody\n"
     assert tool_messages[0]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_runtime_advertises_and_persists_multiple_autonomous_skill_reads(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    first = agent_home / "skills" / "first" / "SKILL.md"
+    second = agent_home / "skills" / "second" / "SKILL.md"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_bytes(
+        b"---\nname: first\ndescription: First instructions\n---\nfirst body\nsecond body\n"
+    )
+    second_body = b"---\nname: second\ndescription: Second instructions\n---\n" + b"x" * 1600
+    second.write_bytes(second_body)
+    config_text = VALID_CONFIG.replace(
+        "max_tool_result_chars = 60000", "max_tool_result_chars = 1000"
+    )
+    provider = _RuntimeProvider(
+        (
+            _response(
+                content="",
+                tool_call=ModelToolCall(
+                    id="first-page-one",
+                    name="read_file",
+                    arguments=json.dumps({"path": str(first), "offset": 1, "limit": 1}),
+                ),
+            ),
+            _response(
+                content="",
+                tool_call=ModelToolCall(
+                    id="first-page-two",
+                    name="read_file",
+                    arguments=json.dumps({"path": str(first), "offset": 2, "limit": 2}),
+                ),
+            ),
+            _response(
+                content="",
+                tool_call=ModelToolCall(
+                    id="second-full",
+                    name="read_file",
+                    arguments=json.dumps({"path": str(second), "offset": 1, "limit": 10000}),
+                ),
+            ),
+            _response(content="Used both Skills."),
+        )
+    )
+    runtime = _runtime(agent_home, workspace, provider, config_text=config_text)
+    session_id = runtime.session.session_id
+    try:
+        await runtime.start()
+        messages = await collect_foreground_outbound(runtime, "Use both Skills.")
+    finally:
+        await runtime.close()
+
+    assert messages[-1].metadata == {"_streamed": True}
+    assert len(provider.stream_requests) == 4
+    system_prompt = provider.stream_requests[0].messages[0]["content"]
+    assert isinstance(system_prompt, str)
+    assert system_prompt.count("<skill_catalog>") == 1
+    metadata_lines = [line for line in system_prompt.splitlines() if line.startswith("{")]
+    assert [json.loads(line) for line in metadata_lines] == [
+        {
+            "name": "first",
+            "description": "First instructions",
+            "path": str(first.resolve()),
+        },
+        {
+            "name": "second",
+            "description": "Second instructions",
+            "path": str(second.resolve()),
+        },
+    ]
+    assert all(
+        [definition["function"]["name"] for definition in request.tools]
+        == [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "glob",
+            "grep",
+            "exec",
+            "web_search",
+            "web_fetch",
+            "schedule",
+        ]
+        for request in provider.stream_requests
+    )
+
+    tool_messages = [message for message in runtime.session.messages if message["role"] == "tool"]
+    assert [message["content"] for message in tool_messages[:2]] == [
+        "---\n",
+        "name: first\ndescription: First instructions\n",
+    ]
+    assert len(tool_messages) == 3
+    artifact = tool_messages[2]["artifact"]
+    assert isinstance(artifact, dict)
+    assert artifact["total_chars"] == len(second_body.decode("utf-8"))
+    artifact_path = workspace / str(artifact["path"])
+    assert artifact_path.read_bytes() == second_body
+
+    persisted = Session.load(runtime.session.workspace_state, session_id)
+    persisted_tools = [message for message in persisted.messages if message["role"] == "tool"]
+    assert persisted_tools == tool_messages
 
 
 @pytest.mark.asyncio

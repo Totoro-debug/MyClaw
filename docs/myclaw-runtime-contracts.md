@@ -105,7 +105,19 @@ D01-D17 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Fra
 
 `~/.myclaw/skills/` 缺失或为空时，Skill Catalog 是空 snapshot。Catalog 只扫描其一级子目录中名为 `SKILL.md` 的 instruction file；不会把嵌套目录作为独立候选。frontmatter 必须从文件首行的独占 `---` 开始，并以之后的独占 `---` 结束；其内容使用安全 YAML mapping 解析，`name` 和 `description` 必须是字符串。trim 后，`name` 必须匹配 `[a-z_-][a-z0-9_-]{0,63}`，`description` 必须为 1 到 1024 个 Unicode code points。
 
-每个候选的 instruction path 必须是可读 UTF-8 普通文件，并在 canonical Skill root 内；canonical root 外的 symlink/reparse target、缺失文件、非 UTF-8 metadata 和其他 malformed metadata 均跳过。跳过时只记录安全的 candidate path 与 reason，不记录 instruction body。候选按 canonical path 字符串升序评估；reserved Management Command names 和重复 Skill names 不进入 snapshot，同名时保留第一个有效候选。Catalog 只保留 immutable 的 name、trimmed description 和 canonical absolute `SKILL.md` path，不缓存正文，也不注册 Tool。
+每个候选的 instruction path 必须是可读普通文件并在 canonical Skill root 内；frontmatter bytes 必须是 UTF-8。canonical root 外的 symlink/reparse target、缺失文件、非 UTF-8 metadata 和其他 malformed metadata 均跳过。跳过时只记录安全的 candidate path 与 reason，不记录 instruction body；正文 bytes 留待 `read_body()` 验证。候选按 canonical path 字符串升序评估；reserved Management Command names 和重复 Skill names 不进入 snapshot，同名时保留第一个有效候选。Catalog 只保留 immutable 的 name、trimmed description 和 canonical absolute `SKILL.md` path，不缓存正文，也不注册 Tool。
+
+Runtime Lifetime 只能通过当前 snapshot 中的完整 `SkillMetadata` 读取正文：
+
+```python
+class SkillUnavailableError(Exception):
+    error: ErrorInfo
+
+class SkillCatalog:
+    def read_body(self, metadata: SkillMetadata) -> str: ...
+```
+
+`read_body()` 拒绝不存在或不完全匹配当前 snapshot 的 metadata，不接受任意 path。它先打开文件，再以 host-native descriptor identity 校验 opened/current object 均为普通文件、device/inode 一致且当前 canonical path 仍在 Catalog root 内；普通 hardlink 保持可读，不套用持久化 owned-file 的 single-link 限制。一次调用只从该已验证 descriptor 读取一份 bytes，并从这份 bytes 完成 UTF-8 decode、严格 frontmatter 重解析、canonical path/name/description 重校验和正文提取；正文不缓存。缺失、不可读、非 UTF-8、frontmatter/YAML 无效、canonical containment 失效或 metadata mismatch 均映射为 `SkillUnavailableError`，其公开 `error` 使用稳定的 `skill_unavailable` code 和非空安全消息，底层异常只作为 cause。
 
 `memory.md` 初始内容固定为：
 
@@ -423,13 +435,15 @@ is accepted by ADR-0009 and does not provide cross-process coordination.
 
 ### 8.1 Chat 与 Schedule System Prompt
 
-chat 和 schedule 的 system-level context 按以下固定顺序组装：
+chat 和 schedule 的共有 system-level context 按以下固定顺序组装：
 
 1. 内置 identity prompt，其中包含 normalized absolute Workspace。
 2. 完整的 runtime-startup Long-term Memory snapshot，以明确的 `<long_term_memory>` delimiter 包裹。
 3. 固定 Tool Catalog 的 guidance，以明确的 `<tool_guidance>` delimiter 包裹。
 
 User Configuration 不得插入或替换 identity/system prompt。缓存的 OpenAI-format Tool schema snapshots 通过 provider 的结构化 tools 字段发送，不把 JSON schema 重复拼入自然语言 guidance。
+
+Foreground chat 在上述共有部分之后按当前 Runtime Lifetime 的 Catalog order 追加一个 `<skill_catalog>` metadata-only block。每个 Skill 是独占一行的 compact JSON object，字段顺序固定为 name、description、path；JSON 文本中的 `&`、`<`、`>` 使用 Unicode escape，确保 metadata 不能产生 literal block delimiter。该 block 只指导模型使用普通 `read_file` 读取已知 canonical absolute path；模型需要更多内容时可按 `offset`/`limit` 继续分页，不需要证明 EOF，Runtime 不缓存 Skill body。Foreground consolidation/budget projection 与最终 chat request 使用同一 Catalog block；这不改变 Conversation Summary provider 的独立 prompt，后者仍接收 `0` 个 Skill metadata。Schedule prompt 不追加 Skill metadata。
 
 ### 8.2 当前 user input 的 Runtime Context
 
@@ -461,9 +475,9 @@ session_id: <session_id>
 
 - Session title：只接收规范化后的首条 user content，不注入 Long-term Memory、tools 或 conversation history。
 - Task Framing：只接收 previous Blackboard、latest assistant content 和 current raw user input 组成的 compact JSON，使用独立 system prompt 且 `tools=()`。
-- Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory 或 Tool Catalog。
+- Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory、Tool Catalog 或 Skill metadata。
 - Memory Task：接收 Summary Cursor 后的 batch 和四分区维护规则，并只暴露 restricted memory tools。
-- Schedule Job：使用 chat/schedule system composition，把 Job message 作为 Schedule Session 的普通 user message。
+- Schedule Job：使用共有 chat/schedule system composition，把 Job message 作为 Schedule Session 的普通 user message，不接收 Skill metadata。Session title、Task Framing 和 Memory Task 同样不接收 Skill metadata。
 
 prompt 文本存放在独立、可版本追踪的 package resources；测试断言组成部分和是否注入，不锁死整段自然语言文案。
 
@@ -738,9 +752,11 @@ uptime reset。普通 process shutdown 始终走 awaited `close()`。
 
 Runtime Lifetime 还拥有一个由 Agent Home Skill root 构建的 immutable Skill Catalog snapshot。
 同一 Runtime Lifetime 的 Runtime Generation replacement（包括 `/resume`）复用该 snapshot，
-不得重新扫描 Skill 目录；只有新的 Runtime Lifetime 才重新发现目录内容。该 Catalog foundation
-本身不改变 foreground prompt、Tool permission、Management Command、slash invocation、
-Schedule 或 Terminal UI 契约。
+不得重新扫描 Skill 目录；只有新的 Runtime Lifetime 才重新发现目录内容。Foreground chat
+只接收该 snapshot 的 metadata 投影，并通过普通 `read_file` 按需读取正文；不启用
+always/manual，不缓存正文，不增加 Skill-specific Tool、invocation 或 EOF 语义。该 Catalog
+不改变 Tool permission、Management Command、slash invocation、Schedule 或 Terminal UI
+契约。
 
 ## TOOL_SCHEMA：Tool Gateway 契约
 
@@ -797,6 +813,7 @@ ToolResult(
 - Workspace 及其中 Workspace State 的 read/list/write/edit：allow，实际结果服从操作系统权限。
 - 仅 `read_file` 对 canonical `~/.myclaw/skills` root 下的已知 path 免确认；Skill root 缺失时不创建目录，缺失目标继续返回普通 `read_file` error。
 - `read_file` 的 Skill-root 判断在请求 path canonical resolve 后进行；解析到 root 外的 symlink/reparse target 仍请求一次性确认。
+- Foreground model 读取已发现的 Skill 正文仍使用普通 `read_file`；长正文沿用既有 pagination 和 Tool Artifact/Session persistence 规则，不引入 Skill-specific Tool、body cache 或 EOF check。
 - 解析到 Workspace 外且不在上述 canonical Skill root 的 file path：请求一次性确认；无确认通道或拒绝时 refused。
 - 当前 session 的 artifact directory：按相同 Workspace 路径规则处理，没有额外 MyClaw 权限层。
 
@@ -948,6 +965,7 @@ ErrorInfo(
 | `tool_failed` | 工具执行失败 | 否 |
 | `memory_task_running` | Memory Task 不重入 | 否 |
 | `schedule_state_error` | Schedule state 损坏或不安全 | 否 |
+| `skill_unavailable` | Skill 正文缺失、不可读、非 UTF-8 或 metadata/path 校验失败 | 否 |
 
 CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 Terminal Conversation 继续时不退出进程。
 
@@ -1061,7 +1079,7 @@ Schema casting、参数校验、安全检查和结果截断/Artifact 写入属�
 - MessageBus sparse outbound schema、terminal marker 以及 AgentLoop control/Future 语义。
 - Blackboard/FramingResult strict shape、Task Framing decision table、current-input-only projection、usage/metadata atomic commit 和非前台路径排除。
 - Model Provider scripted transcript：text deltas、tool call deltas、usage、retry-after、timeout、cancellation。
-- 固定 Catalog、BaseTool preparation order、file path boundary、Exec/Web confirmation 和 WebFetch redirect/IP cases。
+- 固定 Catalog、Runtime Lifetime Skill snapshot/read_body、foreground-only metadata projection、BaseTool preparation order、file path boundary、Exec/Web confirmation 和 WebFetch redirect/IP cases。
 - complete atomic JSONL replacement、缺少 trailing newline、middle corruption、旧 schema rejection，以及 Summary/`last_consolidated` crash divergence。
 
 契约测试断言稳定 code、结构和文件内容；终端文案除脱敏与必需信息外不做全文 snapshot，以免实现被展示细节锁死。

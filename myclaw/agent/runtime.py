@@ -31,7 +31,10 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
-from myclaw.management.commands import ManagementCommandDispatcher
+from myclaw.management.commands import (
+    SUPPORTED_MANAGEMENT_COMMANDS,
+    ManagementCommandDispatcher,
+)
 from myclaw.management.service import (
     ManagementError,
     ManagementViewService,
@@ -56,6 +59,7 @@ from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
+from myclaw.skills.catalog import SkillCatalog, discover_skills
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.tool_gateway import ToolResult
@@ -154,6 +158,7 @@ class PreparedRuntime:
     _memory_manager: MemoryManager
     _context_builder: ContextBuilder
     _management_service: ManagementViewService
+    _skill_catalog: SkillCatalog
 
     @property
     def session_id(self) -> str:
@@ -387,6 +392,11 @@ class RuntimeHost:
         )
         self._monotonic_now = monotonic_now
         self._timezone_name = get_localzone_name() if timezone_name is None else timezone_name
+        self._skill_catalog = discover_skills(
+            agent_home=agent_home,
+            reserved_names=SUPPORTED_MANAGEMENT_COMMANDS,
+            enable_always_load=False,
+        )
         self._terminal_rebind: Callable[[RuntimeBindings], Awaitable[None]] | None = None
         self._replacement_lock = asyncio.Lock()
         self._closed = False
@@ -406,6 +416,7 @@ class RuntimeHost:
             schedule_scheduler_clock=self._schedule_scheduler_clock,
             monotonic_now=monotonic_now,
             timezone_name=self._timezone_name,
+            skill_catalog=self._skill_catalog,
             replace_session=self._replacement_callback(initial_token),
         )
         try:
@@ -488,6 +499,7 @@ class RuntimeHost:
                 schedule_scheduler_clock=self._schedule_scheduler_clock,
                 monotonic_now=self._monotonic_now,
                 timezone_name=self._timezone_name,
+                skill_catalog=self._skill_catalog,
                 session=target_session,
                 replace_session=self._replacement_callback(token),
             )
@@ -590,6 +602,7 @@ def prepare_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
+    skill_catalog: SkillCatalog | None = None,
     session: Session | None = None,
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
@@ -610,6 +623,7 @@ def prepare_runtime(
             schedule_scheduler_clock=schedule_scheduler_clock,
             monotonic_now=monotonic_now,
             timezone_name=timezone_name,
+            skill_catalog=skill_catalog,
             session=session,
             workspace_state=workspace_state,
             replace_session=replace_session,
@@ -638,12 +652,20 @@ def _prepare_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
+    skill_catalog: SkillCatalog | None = None,
     session: Session | None = None,
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
     task_framer: TaskFramingEvaluator | None = None,
 ) -> PreparedRuntime:
     """Prepare one unstarted Runtime Generation."""
+    active_skill_catalog = skill_catalog
+    if active_skill_catalog is None:
+        active_skill_catalog = discover_skills(
+            agent_home=agent_home,
+            reserved_names=SUPPORTED_MANAGEMENT_COMMANDS,
+            enable_always_load=False,
+        )
     workspace_identity = (
         workspace if isinstance(workspace, Workspace) else Workspace.from_path(workspace)
     )
@@ -663,10 +685,22 @@ def _prepare_runtime(
     long_term_memory = active_workspace_state.long_term_memory_path.read_text(encoding="utf-8")
     runtime_memory = RuntimeMemory(long_term_memory)
     resolved_timezone_name = get_localzone_name() if timezone_name is None else timezone_name
-    foreground_context = ContextBuilder(workspace_identity, resolved_timezone_name)
+    foreground_context = ContextBuilder(
+        workspace_identity,
+        resolved_timezone_name,
+        skill_catalog=active_skill_catalog,
+    )
     set_context_clock = getattr(foreground_context, "set_clock", None)
     if callable(set_context_clock):
         set_context_clock(now)
+    summary_context = ContextBuilder(
+        workspace_identity,
+        resolved_timezone_name,
+        skill_catalog=active_skill_catalog,
+    )
+    set_summary_clock = getattr(summary_context, "set_clock", None)
+    if callable(set_summary_clock):
+        set_summary_clock(now)
     memory_store = WorkspaceFileMemoryStore(active_workspace_state)
     active_session = session
     if active_session is None:
@@ -697,6 +731,14 @@ def _prepare_runtime(
         return foreground_chat_system_prompt(
             workspace=workspace_identity.path,
             long_term_memory=memory_snapshot,
+            skill_catalog=active_skill_catalog,
+        )
+
+    def summary_system_prompt_for(memory_snapshot: str) -> str:
+        return foreground_chat_system_prompt(
+            workspace=workspace_identity.path,
+            long_term_memory=memory_snapshot,
+            skill_catalog=active_skill_catalog,
         )
 
     summaries = WorkspaceJsonlSummaryStore(active_workspace_state)
@@ -747,7 +789,7 @@ def _prepare_runtime(
                         system_prompt=current_system_prompt,
                     )
                 return _project_foreground_messages(
-                    foreground_context,
+                    summary_context,
                     messages,
                     session_id=active_session.session_id,
                     long_term_memory=runtime_memory.snapshot(),
@@ -812,7 +854,7 @@ def _prepare_runtime(
         blackboard: Blackboard | None = None,
     ) -> list[dict[str, Any]]:
         memory_snapshot = runtime_memory.snapshot()
-        current_system_prompt = foreground_system_prompt_for(memory_snapshot)
+        current_system_prompt = summary_system_prompt_for(memory_snapshot)
         await prepare_summary(
             active_session,
             "chat",
@@ -894,6 +936,7 @@ def _prepare_runtime(
         _memory_manager=memory_manager,
         _context_builder=foreground_context,
         _management_service=management_service,
+        _skill_catalog=active_skill_catalog,
     )
 
 

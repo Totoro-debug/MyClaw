@@ -12,6 +12,7 @@ import yaml  # type: ignore[import-untyped]
 from loguru import logger
 
 from myclaw.config.agent_home import AgentHome
+from myclaw.errors import ErrorInfo
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _NAME_PATTERN = re.compile(r"[a-z_-][a-z0-9_-]{0,63}")
@@ -32,6 +33,14 @@ class SkillEntry:
 
     metadata: SkillMetadata
     always_body: str | None
+
+
+class SkillUnavailableError(Exception):
+    """A complete Skill body could not be read from its catalog snapshot."""
+
+    def __init__(self, error: ErrorInfo) -> None:
+        self.error = error
+        super().__init__(error.message)
 
 
 class SkillCatalog:
@@ -57,6 +66,40 @@ class SkillCatalog:
     def get(self, name: str) -> SkillEntry | None:
         """Return the entry for an exact Skill name, when present."""
         return self._by_name.get(name)
+
+    def read_body(self, metadata: SkillMetadata) -> str:
+        """Read and revalidate one catalog Skill body without retaining it."""
+        if not isinstance(metadata, SkillMetadata):
+            raise _skill_unavailable()
+        entry = self._by_name.get(metadata.name)
+        if entry is None or entry.metadata != metadata:
+            raise _skill_unavailable()
+
+        try:
+            io_path = HOST_FILESYSTEM.path_for_io(metadata.path)
+            with io_path.open("rb") as stream:
+                path = HOST_FILESYSTEM.require_opened_contained_regular_file(
+                    stream.fileno(),
+                    metadata.path,
+                    within=self._root,
+                )
+                if path != metadata.path:
+                    raise ValueError("Skill path no longer matches the catalog snapshot")
+                raw_content = stream.read()
+            if not path.is_relative_to(self._root):
+                raise ValueError("Skill path is no longer contained by the catalog root")
+        except (OSError, RuntimeError, ValueError) as error:
+            raise _skill_unavailable() from error
+
+        try:
+            content = raw_content.decode("utf-8")
+        except UnicodeError as error:
+            raise _skill_unavailable() from error
+
+        parsed, body = _parse_document(content, path)
+        if parsed is None or parsed != metadata:
+            raise _skill_unavailable()
+        return body
 
 
 def discover_skills(
@@ -154,6 +197,31 @@ def _read_metadata(instruction: Path, path: Path) -> tuple[SkillMetadata | None,
         return None, "frontmatter is not valid UTF-8"
     except yaml.YAMLError:
         return None, "frontmatter YAML is invalid"
+    return _validate_metadata(document, path)
+
+
+def _parse_document(content: str, path: Path) -> tuple[SkillMetadata | None, str]:
+    lines = content.splitlines(keepends=True)
+    if not lines or not _is_text_delimiter(lines[0]):
+        return None, content
+    frontmatter: list[str] = []
+    body_start = None
+    for index, line in enumerate(lines[1:], start=1):
+        if _is_text_delimiter(line):
+            body_start = index + 1
+            break
+        frontmatter.append(line)
+    if body_start is None:
+        return None, content
+    try:
+        document: object = yaml.safe_load("".join(frontmatter))
+    except yaml.YAMLError:
+        return None, content
+    metadata, _reason = _validate_metadata(document, path)
+    return metadata, "".join(lines[body_start:])
+
+
+def _validate_metadata(document: object, path: Path) -> tuple[SkillMetadata | None, str]:
     if not isinstance(document, Mapping):
         return None, "frontmatter root is not a mapping"
     name = document.get("name")
@@ -165,7 +233,7 @@ def _read_metadata(instruction: Path, path: Path) -> tuple[SkillMetadata | None,
     if not _NAME_PATTERN.fullmatch(normalized_name) or not 1 <= len(normalized_description) <= 1024:
         return None, "name or description is outside the accepted bounds"
     return (
-        SkillMetadata(
+        _metadata(
             name=normalized_name,
             description=normalized_description,
             path=path,
@@ -174,12 +242,30 @@ def _read_metadata(instruction: Path, path: Path) -> tuple[SkillMetadata | None,
     )
 
 
+def _metadata(*, name: str, description: str, path: Path) -> SkillMetadata:
+    return SkillMetadata(name=name, description=description, path=path)
+
+
 def _is_delimiter(line: bytes) -> bool:
     return line.rstrip(b"\r\n") == b"---"
+
+
+def _is_text_delimiter(line: str) -> bool:
+    return line.rstrip("\r\n") == "---"
+
+
+def _skill_unavailable() -> SkillUnavailableError:
+    return SkillUnavailableError(ErrorInfo("skill_unavailable", "Skill body is unavailable."))
 
 
 def _log_invalid(candidate: Path, reason: str) -> None:
     logger.warning("Skipping invalid Skill candidate path={} reason={}", candidate, reason)
 
 
-__all__ = ["SkillCatalog", "SkillEntry", "SkillMetadata", "discover_skills"]
+__all__ = [
+    "SkillCatalog",
+    "SkillEntry",
+    "SkillMetadata",
+    "SkillUnavailableError",
+    "discover_skills",
+]

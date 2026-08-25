@@ -262,17 +262,42 @@ class HostFilesystem:
         self, descriptor: int, path: Path, *, within: Path
     ) -> Path:
         """Require an open descriptor to match its stable owned regular-file path."""
+        return self._require_opened_regular_file(
+            descriptor,
+            path,
+            within=within,
+            require_single_link=True,
+        )
+
+    def require_opened_contained_regular_file(
+        self, descriptor: int, path: Path, *, within: Path
+    ) -> Path:
+        """Require an open descriptor to match its contained regular-file path."""
+        return self._require_opened_regular_file(
+            descriptor,
+            path,
+            within=within,
+            require_single_link=False,
+        )
+
+    def _require_opened_regular_file(
+        self,
+        descriptor: int,
+        path: Path,
+        *,
+        within: Path,
+        require_single_link: bool,
+    ) -> Path:
         owned_root = self._require_owned_root(within)
         opened = os.fstat(descriptor)
         current = path.lstat()
         resolved = self._resolved_existing_path(path)
         if (
             not self._adapter.is_regular_file(opened)
-            or opened.st_nlink != 1
             or not self._adapter.is_regular_file(current)
-            or current.st_nlink != 1
             or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
             or not resolved.is_relative_to(owned_root)
+            or (require_single_link and (opened.st_nlink != 1 or current.st_nlink != 1))
         ):
             _raise_unsafe(path)
         return resolved

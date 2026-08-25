@@ -15,7 +15,7 @@ import myclaw.agent.runtime as runtime_module
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import ForegroundContextPreparer
-from myclaw.agent.prompts import session_title_prompt
+from myclaw.agent.prompts import conversation_summary_prompt, session_title_prompt
 from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
@@ -36,6 +36,7 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.session.session import Session
+from myclaw.skills.catalog import SkillCatalog
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
@@ -174,14 +175,22 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     discovered_names: list[str] = []
+    catalog_presence: list[bool] = []
     context_builder = ContextBuilder
 
     def recording_context_builder(
         runtime_workspace: Workspace,
         timezone_name: str,
+        *,
+        skill_catalog: SkillCatalog | None = None,
     ) -> ContextBuilder:
         discovered_names.append(timezone_name)
-        return context_builder(runtime_workspace, timezone_name)
+        catalog_presence.append(skill_catalog is not None)
+        return context_builder(
+            runtime_workspace,
+            timezone_name,
+            skill_catalog=skill_catalog,
+        )
 
     monkeypatch.setattr(runtime_module, "get_localzone_name", lambda: "Asia/Shanghai")
     monkeypatch.setattr(runtime_module, "ContextBuilder", recording_context_builder)
@@ -196,7 +205,124 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
     )
     await runtime.close()
 
-    assert discovered_names == ["Asia/Shanghai"]
+    assert discovered_names == ["Asia/Shanghai", "Asia/Shanghai"]
+    assert catalog_presence == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_foreground_skill_catalog_is_included_in_the_exact_budget_guard(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    config_text = VALID_CONFIG.replace("context_window = 200000", "context_window = 4096")
+    config_text = config_text.replace("max_output = 8192", "max_output = 1024")
+    (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
+    for index in range(12):
+        instruction = agent_home / "skills" / f"skill-{index:02d}" / "SKILL.md"
+        instruction.parent.mkdir(parents=True)
+        instruction.write_text(
+            f"---\nname: skill-{index:02d}\ndescription: {'x' * 1024}\n---\nbody\n",
+            encoding="utf-8",
+        )
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=unexpected_provider_factory,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    preparer: ForegroundContextPreparer = runtime.agent_loop._context_preparer
+
+    try:
+        with pytest.raises(ModelCallError) as raised:
+            await preparer(runtime.session, {"role": "user", "content": "Use a Skill."})
+    finally:
+        await runtime.close()
+
+    assert raised.value.error.code == "memory_context_too_large"
+    assert runtime.session.messages == []
+
+
+@pytest.mark.asyncio
+async def test_conversation_summary_provider_keeps_skill_metadata_out_of_its_prompt(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    config_text = VALID_CONFIG.replace(
+        "consolidation_message_threshold = 50", "consolidation_message_threshold = 4"
+    )
+    (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Private catalog marker\n---\nprivate body\n",
+        encoding="utf-8",
+    )
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Earlier turns summarized."),
+                usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
+                finish_reason="stop",
+            ),
+        )
+    )
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    runtime.session.add_message("user", "Question one")
+    runtime.session.add_message(
+        "assistant",
+        "Answer one",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    runtime.session.add_message("user", "Question two")
+    runtime.session.add_message(
+        "assistant",
+        "Answer two",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        },
+    )
+    preparer: ForegroundContextPreparer = runtime.agent_loop._context_preparer
+
+    try:
+        projected = await preparer(
+            runtime.session,
+            {"role": "user", "content": "Question three"},
+        )
+    finally:
+        await runtime.close()
+
+    assert len(provider.complete_requests) == 1
+    summary_messages = provider.complete_requests[0].messages
+    assert summary_messages[0]["content"] == conversation_summary_prompt()
+    assert "Private catalog marker" not in json.dumps(summary_messages)
+    assert "<skill_catalog>" in cast(str, projected[0]["content"])
 
 
 @pytest.mark.asyncio

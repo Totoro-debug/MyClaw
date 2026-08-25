@@ -16,9 +16,11 @@ from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import SessionListingEntry
 from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
 from myclaw.provider.models import (
+    AssistantModelMessage,
     ModelContinuation,
     ModelResponse,
     ModelStreamEvent,
+    ModelUsage,
     ReasoningEffort,
 )
 from myclaw.session.session import Session
@@ -26,10 +28,19 @@ from myclaw.terminal.conversation import TerminalConversationApp
 from myclaw.tools.base import OpenAIToolSchema
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import FakeClock
+from tests.runtime_bus import collect_foreground_outbound
 from tests.test_runtime_active_session import RuntimeProvider
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 8, 22, 10, 20, 30, 123000, tzinfo=LOCAL_OFFSET)
+
+
+def _chat_response(content: str) -> ModelResponse:
+    return ModelResponse(
+        message=AssistantModelMessage(content=content),
+        usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+        finish_reason="stop",
+    )
 
 
 class GatedProvider(RuntimeProvider):
@@ -130,6 +141,62 @@ def _host(
         new_uuid=uuid4,
         retry_clock=clock,
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_host_reuses_skill_snapshot_across_generation_replacement(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    first_skill = agent_home / "skills" / "first" / "SKILL.md"
+    first_skill.parent.mkdir(parents=True)
+    first_skill.write_bytes(b"---\nname: first\ndescription: Original first\n---\n")
+    provider = RuntimeProvider((_chat_response("First run."), _chat_response("Second run.")))
+    host = _host(agent_home, workspace, provider)
+    await host.start()
+    try:
+        await collect_foreground_outbound(host.generation, "Initial request")
+
+        target = Session.create(
+            host.generation.session.workspace_state,
+            now=lambda: NOW,
+            new_uuid=uuid4,
+        )
+        target.add_message("user", "Persisted target")
+        target.close()
+        first_skill.write_bytes(b"---\nname: first\ndescription: Changed first\n---\n")
+        second_skill = agent_home / "skills" / "second" / "SKILL.md"
+        second_skill.parent.mkdir(parents=True)
+        second_skill.write_bytes(b"---\nname: second\ndescription: New second\n---\n")
+
+        result = await host.management_dispatcher.resume(target.session_id)
+        assert result.resumed_session_id == target.session_id
+        await collect_foreground_outbound(host.generation, "Replacement request")
+    finally:
+        await host.close()
+
+    chat_requests = [request for request in provider.requests if len(request.tools) == 10]
+    assert len(chat_requests) == 2
+    for request in chat_requests:
+        system_prompt = request.messages[0]["content"]
+        assert isinstance(system_prompt, str)
+        assert "Original first" in system_prompt
+        assert "Changed first" not in system_prompt
+        assert "second" not in system_prompt
+
+    fresh_provider = RuntimeProvider((_chat_response("Fresh run."),))
+    fresh_host = _host(agent_home, workspace, fresh_provider)
+    await fresh_host.start()
+    try:
+        await collect_foreground_outbound(fresh_host.generation, "Fresh request")
+    finally:
+        await fresh_host.close()
+
+    fresh_request = next(request for request in fresh_provider.requests if len(request.tools) == 10)
+    fresh_system_prompt = fresh_request.messages[0]["content"]
+    assert isinstance(fresh_system_prompt, str)
+    assert "Changed first" in fresh_system_prompt
+    assert "New second" in fresh_system_prompt
 
 
 @pytest.mark.asyncio

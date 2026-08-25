@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,8 @@ from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
 from myclaw.agent.workspace import Workspace
+from myclaw.config.agent_home import AgentHome
+from myclaw.skills.catalog import discover_skills
 
 FIXED_UTC = datetime(2026, 8, 16, 4, 5, 6, 789000, tzinfo=UTC)
 FIXED_TOOL_GUIDANCE = "\n".join(
@@ -133,6 +136,43 @@ def test_context_builder_builds_system_history_and_current_user_in_order(
         ),
     }
     assert all("timestamp" not in message for message in messages)
+
+
+def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: planner\ndescription: Plan the work\n---\nprivate body\n")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    builder = ContextBuilder(Workspace.from_path(workspace), "UTC", skill_catalog=catalog)
+
+    messages = builder.build_messages(
+        history=[],
+        current_user={"role": "user", "content": "Plan this."},
+        session_id="session-id",
+        long_term_memory="memory",
+    )
+
+    system_prompt = messages[0]["content"]
+    assert isinstance(system_prompt, str)
+    assert "<skill_catalog>" in system_prompt
+    metadata_lines = [line for line in system_prompt.splitlines() if line.startswith("{")]
+    assert [json.loads(line) for line in metadata_lines] == [
+        {
+            "name": "planner",
+            "description": "Plan the work",
+            "path": str(instruction.resolve()),
+        }
+    ]
+    assert "ordinary read_file" in system_prompt
+    assert "continue" in system_prompt
+    assert "private body" not in system_prompt
 
 
 def test_context_builder_projects_tool_and_interrupted_history_without_mutating_inputs(

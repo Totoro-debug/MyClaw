@@ -12,6 +12,7 @@ from myclaw.agent.blackboard import Blackboard, encode_blackboard
 from myclaw.agent.prompts import current_user_input, foreground_chat_system_prompt
 from myclaw.agent.workspace import Workspace
 from myclaw.session.projection import project_session_message
+from myclaw.skills.catalog import SkillCatalog
 
 
 class ContextBuilder:
@@ -23,12 +24,16 @@ class ContextBuilder:
         timezone_name: str,
         *,
         clock: Callable[[], datetime] | None = None,
+        skill_catalog: SkillCatalog | None = None,
     ) -> None:
         if not isinstance(workspace, Workspace):
             raise TypeError("Context Builder requires a Workspace")
+        if skill_catalog is not None and not isinstance(skill_catalog, SkillCatalog):
+            raise TypeError("Context Builder requires a Skill Catalog")
         self._workspace = workspace
         self._timezone = ZoneInfo(timezone_name)
         self._clock = clock
+        self._skill_catalog = skill_catalog
 
     def set_clock(self, clock: Callable[[], datetime] | None) -> None:
         """Override the clock used while composing Runtime Context in tests."""
@@ -51,6 +56,7 @@ class ContextBuilder:
                 "content": foreground_chat_system_prompt(
                     workspace=self._workspace.path,
                     long_term_memory=long_term_memory,
+                    skill_catalog=self._skill_catalog,
                 ),
             }
         ]

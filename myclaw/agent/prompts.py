@@ -7,8 +7,15 @@ from datetime import datetime
 from pathlib import PurePath
 
 from myclaw.memory.records import SummaryEntry
+from myclaw.skills.catalog import SkillCatalog
 from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
+
+_SKILL_METADATA_TRANSLATION: dict[int, str] = {
+    ord("&"): r"\u0026",
+    ord("<"): r"\u003c",
+    ord(">"): r"\u003e",
+}
 
 
 def current_user_input(
@@ -53,14 +60,36 @@ def chat_system_prompt(*, workspace: PurePath, long_term_memory: str) -> str:
     )
 
 
-def foreground_chat_system_prompt(*, workspace: PurePath, long_term_memory: str) -> str:
-    """Add Foreground-only Blackboard interpretation guidance to the base prompt."""
-    return "\n\n".join(
-        (
-            chat_system_prompt(workspace=workspace, long_term_memory=long_term_memory),
-            render_template("blackboard-guidance.md"),
+def foreground_chat_system_prompt(
+    *,
+    workspace: PurePath,
+    long_term_memory: str,
+    skill_catalog: SkillCatalog | None = None,
+) -> str:
+    """Compose the foreground prompt with optional Skill metadata and Blackboard guidance."""
+    sections = [chat_system_prompt(workspace=workspace, long_term_memory=long_term_memory)]
+    if skill_catalog is not None and skill_catalog.entries:
+        entries = "\n".join(
+            _skill_metadata_json(
+                name=entry.metadata.name,
+                description=entry.metadata.description,
+                path=str(entry.metadata.path),
+            )
+            for entry in skill_catalog.entries
         )
+        sections.append(render_template("skill-catalog.md", entries=entries))
+    sections.append(render_template("blackboard-guidance.md"))
+    return "\n\n".join(sections)
+
+
+def _skill_metadata_json(*, name: str, description: str, path: str) -> str:
+    serialized = json.dumps(
+        {"name": name, "description": description, "path": path},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
     )
+    return serialized.translate(_SKILL_METADATA_TRANSLATION)
 
 
 def session_title_prompt() -> str:

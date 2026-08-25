@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.skills.catalog import discover_skills
+from myclaw.skills.catalog import SkillUnavailableError, discover_skills
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 
@@ -436,3 +437,221 @@ def test_phase_one_does_not_interpret_always_load_metadata(agent_home: Path) -> 
 
     assert len(catalog.entries) == 1
     assert catalog.entries[0].always_body is None
+
+
+def test_read_body_returns_the_complete_current_skill_body(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "reader" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        b"---\nname: reader\ndescription: Read the body\n---\nfirst line\nsecond line\n"
+    )
+
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+
+    assert catalog.read_body(catalog.entries[0].metadata) == "first line\nsecond line\n"
+
+
+def test_read_body_rejects_metadata_changed_after_discovery(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "stale" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: stale\ndescription: Original\n---\nbody\n")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    instruction.write_bytes(b"---\nname: stale\ndescription: Changed\n---\nbody\n")
+
+    with pytest.raises(SkillUnavailableError) as failure:
+        catalog.read_body(catalog.entries[0].metadata)
+
+    assert failure.value.error.code == "skill_unavailable"
+    assert str(failure.value) == failure.value.error.message
+
+
+def test_read_body_maps_missing_target_to_skill_unavailable(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "missing" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: missing\ndescription: Missing\n---\nbody\n")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    instruction.unlink()
+
+    with pytest.raises(SkillUnavailableError) as failure:
+        catalog.read_body(catalog.entries[0].metadata)
+
+    assert failure.value.error.code == "skill_unavailable"
+
+
+def test_read_body_maps_unreadable_target_to_skill_unavailable(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = agent_home / "skills" / "unreadable" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: unreadable\ndescription: Unreadable\n---\nbody\n")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+
+    def deny_open(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise PermissionError("denied by test")
+
+    monkeypatch.setattr(Path, "open", deny_open)
+
+    with pytest.raises(SkillUnavailableError) as failure:
+        catalog.read_body(catalog.entries[0].metadata)
+
+    assert failure.value.error.code == "skill_unavailable"
+
+
+def test_read_body_maps_non_utf8_content_to_skill_unavailable(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "binary" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: binary\ndescription: Binary\n---\n\xffbody\n")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+
+    with pytest.raises(SkillUnavailableError) as failure:
+        catalog.read_body(catalog.entries[0].metadata)
+
+    assert failure.value.error.code == "skill_unavailable"
+
+
+def test_read_body_does_not_cache_the_body(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "fresh" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: fresh\ndescription: Fresh\n---\nfirst\n")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    metadata = catalog.entries[0].metadata
+    assert catalog.read_body(metadata) == "first\n"
+
+    instruction.write_bytes(b"---\nname: fresh\ndescription: Fresh\n---\nsecond\n")
+
+    assert catalog.read_body(metadata) == "second\n"
+
+
+def test_read_body_keeps_regular_hardlinks_readable(agent_home: Path) -> None:
+    outside = agent_home.parent / "shared-skill.md"
+    outside.write_bytes(b"---\nname: linked\ndescription: Linked body\n---\nbody\n")
+    instruction = agent_home / "skills" / "linked" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    try:
+        instruction.hardlink_to(outside)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"hard links unavailable: {error}")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+
+    assert catalog.read_body(catalog.entries[0].metadata) == "body\n"
+
+
+def test_read_body_uses_one_opened_descriptor_instead_of_a_second_path_read(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = agent_home / "skills" / "stable" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: stable\ndescription: Stable body\n---\noriginal\n")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    path_reads: list[Path] = []
+
+    def substitute_path_read(path: Path) -> bytes:
+        path_reads.append(path)
+        return b"---\nname: stable\ndescription: Stable body\n---\noutside\n"
+
+    monkeypatch.setattr(Path, "read_bytes", substitute_path_read)
+
+    assert catalog.read_body(catalog.entries[0].metadata) == "original\n"
+    assert path_reads == []
+
+
+def test_read_body_rejects_a_symlink_replacement_after_open(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = agent_home / "skills" / "stable" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: stable\ndescription: Stable body\n---\noriginal\n")
+    outside = agent_home.parent / "replacement.md"
+    outside.write_bytes(b"---\nname: stable\ndescription: Stable body\n---\noutside\n")
+    probe = instruction.parent / "link-probe"
+    try:
+        probe.symlink_to(outside)
+        probe.unlink()
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"file links unavailable: {error}")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    validate_opened = HOST_FILESYSTEM.require_opened_contained_regular_file
+
+    def replace_before_validation(descriptor: int, path: Path, *, within: Path) -> Path:
+        instruction.unlink()
+        instruction.symlink_to(outside)
+        return validate_opened(descriptor, path, within=within)
+
+    monkeypatch.setattr(
+        HOST_FILESYSTEM,
+        "require_opened_contained_regular_file",
+        replace_before_validation,
+    )
+
+    with pytest.raises(SkillUnavailableError) as failure:
+        catalog.read_body(catalog.entries[0].metadata)
+
+    assert failure.value.error.code == "skill_unavailable"
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        b"---\nname: 1-invalid\ndescription: Stable body\n---\nbody\n",
+        b"---\nname: stable\ndescription: ''\n---\nbody\n",
+        b"---\n- name\n- stable\n---\nbody\n",
+    ),
+)
+def test_read_body_uses_the_same_metadata_rules_as_discovery(
+    agent_home: Path,
+    replacement: bytes,
+) -> None:
+    instruction = agent_home / "skills" / "stable" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: stable\ndescription: Stable body\n---\nbody\n")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    instruction.write_bytes(replacement)
+
+    with pytest.raises(SkillUnavailableError) as failure:
+        catalog.read_body(catalog.entries[0].metadata)
+
+    assert failure.value.error.code == "skill_unavailable"
