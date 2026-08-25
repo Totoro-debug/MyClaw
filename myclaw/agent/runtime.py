@@ -60,7 +60,7 @@ from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.skills.catalog import SkillCatalog, discover_skills
+from myclaw.skills.catalog import ManualSkillInvocation, SkillCatalog, discover_skills
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.tool_gateway import ToolResult
@@ -791,6 +791,8 @@ def _prepare_runtime(
         tools: tuple[OpenAIToolSchema, ...],
         current_user: dict[str, Any] | None = None,
         blackboard: Blackboard | None = None,
+        *,
+        manual_invocation: ManualSkillInvocation | None = None,
     ) -> Session:
         effective_route = configuration.resolve_route(route).route
         if route == "chat":
@@ -803,12 +805,21 @@ def _prepare_runtime(
                         messages,
                         system_prompt=current_system_prompt,
                     )
+                if manual_invocation is None:
+                    return _project_foreground_messages(
+                        summary_context,
+                        messages,
+                        session_id=active_session.session_id,
+                        long_term_memory=runtime_memory.snapshot(),
+                        blackboard=blackboard,
+                    )
                 return _project_foreground_messages(
                     summary_context,
                     messages,
                     session_id=active_session.session_id,
                     long_term_memory=runtime_memory.snapshot(),
                     blackboard=blackboard,
+                    manual_invocation=manual_invocation,
                 )
         else:
 
@@ -867,6 +878,8 @@ def _prepare_runtime(
         active_session: Session,
         current_user: dict[str, Any],
         blackboard: Blackboard | None = None,
+        *,
+        manual_invocation: ManualSkillInvocation | None = None,
     ) -> list[dict[str, Any]]:
         memory_snapshot = runtime_memory.snapshot()
         current_system_prompt = summary_system_prompt_for(memory_snapshot)
@@ -877,19 +890,30 @@ def _prepare_runtime(
             tuple(agent_loop.tool_schemas),
             current_user,
             blackboard=blackboard,
+            manual_invocation=manual_invocation,
         )
         history = active_session.messages[active_session.last_consolidated :]
+        if manual_invocation is None:
+            return _project_foreground_messages(
+                foreground_context,
+                [*history, current_user],
+                session_id=active_session.session_id,
+                long_term_memory=memory_snapshot,
+                blackboard=blackboard,
+            )
         return _project_foreground_messages(
             foreground_context,
             [*history, current_user],
             session_id=active_session.session_id,
             long_term_memory=memory_snapshot,
             blackboard=blackboard,
+            manual_invocation=manual_invocation,
         )
 
     agent_loop = AgentLoop(
         workspace=workspace_identity,
         skill_root=agent_home.skills_directory,
+        skill_catalog=active_skill_catalog,
         session=active_session,
         schedule_service=schedule_service,
         model_router=router,
@@ -997,6 +1021,7 @@ def _project_foreground_messages(
     session_id: str,
     long_term_memory: str,
     blackboard: Blackboard | None = None,
+    manual_invocation: ManualSkillInvocation | None = None,
 ) -> list[dict[str, Any]]:
     history, current_user, current_user_index = _current_turn(messages, lane="Foreground")
     projected = context.build_messages(
@@ -1005,6 +1030,7 @@ def _project_foreground_messages(
         session_id=session_id,
         long_term_memory=long_term_memory,
         blackboard=blackboard,
+        manual_invocation=manual_invocation,
     )
     projected.extend(_project_continuation(messages, current_user_index))
     return projected

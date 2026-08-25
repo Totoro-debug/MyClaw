@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import PurePath
 
 from myclaw.memory.records import SummaryEntry
-from myclaw.skills.catalog import SkillCatalog
+from myclaw.skills.catalog import ManualSkillInvocation, SkillCatalog
 from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
 
@@ -24,13 +24,25 @@ def current_user_input(
     current_time: datetime,
     session_id: str,
     blackboard_projection: dict[str, str] | None = None,
+    manual_invocation: ManualSkillInvocation | None = None,
 ) -> str:
-    """Wrap the raw input and optionally append one encoded Blackboard block."""
-    rendered = render_template(
-        "current-user-input.md",
-        runtime_context=runtime_context(current_time=current_time, session_id=session_id),
-        user_input=render_template("user-input.md", content=content),
-    )
+    """Wrap one current user projection and optionally append Runtime-owned blocks."""
+    if manual_invocation is None:
+        rendered = render_template(
+            "current-user-input.md",
+            runtime_context=runtime_context(current_time=current_time, session_id=session_id),
+            user_input=render_template("user-input.md", content=content),
+        )
+    else:
+        rendered = (
+            f"{runtime_context(current_time=current_time, session_id=session_id)}\n\n"
+            "<skill_instructions>\n"
+            f"{_skill_manual_json(manual_invocation)}\n"
+            "</skill_instructions>\n\n"
+            "<user_request>\n"
+            f"{_skill_request_json(manual_invocation.request)}\n"
+            "</user_request>"
+        )
     if blackboard_projection is None:
         return rendered
     serialized = json.dumps(
@@ -107,6 +119,22 @@ def _skill_always_json(*, name: str, body: str) -> str:
         allow_nan=False,
     )
     return serialized.translate(_SKILL_METADATA_TRANSLATION)
+
+
+def _skill_manual_json(invocation: ManualSkillInvocation) -> str:
+    serialized = json.dumps(
+        {"name": invocation.metadata.name, "body": invocation.body},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return serialized.translate(_SKILL_METADATA_TRANSLATION)
+
+
+def _skill_request_json(request: str) -> str:
+    return json.dumps(
+        request, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).translate(_SKILL_METADATA_TRANSLATION)
 
 
 def session_title_prompt() -> str:

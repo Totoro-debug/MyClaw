@@ -2,6 +2,7 @@ import asyncio
 import json
 from collections import deque
 from collections.abc import AsyncIterator, Iterable, Sequence
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -41,7 +42,12 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.session.session import Session
-from myclaw.skills.catalog import SkillCatalog, discover_skills
+from myclaw.skills.catalog import (
+    ManualSkillInvocation,
+    SkillCatalog,
+    SkillMetadata,
+    discover_skills,
+)
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
@@ -519,6 +525,157 @@ async def test_foreground_context_uses_one_staged_blackboard_for_summary_and_cha
     assert "<blackboard>" in projected[-1]["content"]
     assert runtime.session.messages == []
     await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_body_counts_in_foreground_token_budget_but_not_summary_provider(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    config_text = VALID_CONFIG.replace(
+        "consolidation_message_threshold = 50", "consolidation_message_threshold = 100"
+    )
+    config_text = config_text.replace("context_window = 200000", "context_window = 4096")
+    config_text = config_text.replace("max_output = 8192", "max_output = 512")
+    (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: planner\ndescription: Plan work\n---\nmetadata body\n")
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelResponse(
+                message=AssistantModelMessage(content="Earlier turns summarized."),
+                usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
+                finish_reason="stop",
+            ),
+        )
+    )
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    runtime.session.add_message("user", "Question one")
+    runtime.session.add_message(
+        "assistant",
+        "Answer one",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={"model_calls": 1, "input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    runtime.session.add_message("user", "Question two")
+    runtime.session.add_message(
+        "assistant",
+        "Answer two",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={"model_calls": 1, "input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    invocation = ManualSkillInvocation(
+        metadata=SkillMetadata(
+            name="planner",
+            description="Plan work",
+            path=instruction.resolve(),
+        ),
+        request="REQUEST-MARKER",
+        body="MANUAL-BODY-MARKER" + ("b" * 9_000),
+    )
+    preparer: ForegroundContextPreparer = runtime.agent_loop._context_preparer
+
+    try:
+        projected = await preparer(
+            runtime.session,
+            {"role": "user", "content": "/planner REQUEST-MARKER"},
+            manual_invocation=invocation,
+        )
+    finally:
+        await runtime.close()
+
+    assert len(provider.complete_requests) == 1
+    assert runtime.session.last_consolidated > 0
+    summary_payload = json.dumps(provider.complete_requests[0].messages)
+    assert "MANUAL-BODY-MARKER" not in summary_payload
+    assert "REQUEST-MARKER" not in summary_payload
+    current_content = cast(str, projected[-1]["content"])
+    assert (
+        "MANUAL-BODY-MARKER"
+        in json.loads(
+            current_content.split("<skill_instructions>\n", 1)[1].split(
+                "\n</skill_instructions>", 1
+            )[0]
+        )["body"]
+    )
+    assert "REQUEST-MARKER" in json.loads(
+        current_content.split("<user_request>\n", 1)[1].split("\n</user_request>", 1)[0]
+    )
+    assert runtime.session.messages[0]["content"] == "Question one"
+
+
+@pytest.mark.asyncio
+async def test_oversized_manual_body_returns_context_overflow_without_provider_or_commit(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    config_text = VALID_CONFIG.replace(
+        "consolidation_message_threshold = 50", "consolidation_message_threshold = 100"
+    )
+    config_text = config_text.replace("context_window = 200000", "context_window = 4096")
+    config_text = config_text.replace("max_output = 8192", "max_output = 512")
+    (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\n" + ("b" * 20_000),
+        encoding="utf-8",
+    )
+    provider = ScriptedFakeProvider()
+    framer = DeterministicTaskFramingEvaluator()
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: provider,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        task_framer=framer,
+    )
+    runtime.session.add_message("user", "Earlier question")
+    runtime.session.add_message(
+        "assistant",
+        "Earlier answer",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={"model_calls": 1, "input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    before_messages = deepcopy(runtime.session.messages)
+    before_metadata = deepcopy(runtime.session.metadata)
+
+    try:
+        await runtime.start()
+        outbound = await collect_foreground_outbound(runtime, "/planner request")
+    finally:
+        await runtime.close()
+
+    assert outbound[-1].metadata == {
+        "finish_reason": "failed",
+        "error_code": "model_context_overflow",
+        "_streamed": True,
+    }
+    assert provider.complete_requests == []
+    assert provider.stream_requests == []
+    assert framer.calls == 1
+    assert runtime.session.messages == before_messages
+    assert runtime.session.metadata == before_metadata
 
 
 @pytest.mark.asyncio

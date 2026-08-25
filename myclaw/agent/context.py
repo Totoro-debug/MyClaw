@@ -12,7 +12,7 @@ from myclaw.agent.blackboard import Blackboard, encode_blackboard
 from myclaw.agent.prompts import current_user_input, foreground_chat_system_prompt
 from myclaw.agent.workspace import Workspace
 from myclaw.session.projection import project_session_message
-from myclaw.skills.catalog import SkillCatalog
+from myclaw.skills.catalog import ManualSkillInvocation, SkillCatalog
 
 
 class ContextBuilder:
@@ -47,8 +47,13 @@ class ContextBuilder:
         long_term_memory: str,
         *,
         blackboard: Blackboard | None = None,
+        manual_invocation: ManualSkillInvocation | None = None,
     ) -> list[dict[str, Any]]:
         """Build system-first context without mutating any caller-owned message."""
+        if manual_invocation is not None and not isinstance(
+            manual_invocation, ManualSkillInvocation
+        ):
+            raise TypeError("Context Builder requires a Manual Skill Invocation")
         blackboard_projection = encode_blackboard(blackboard)
         messages: list[dict[str, Any]] = [
             {
@@ -73,6 +78,7 @@ class ContextBuilder:
                     current_time=self._current_time(),
                     session_id=session_id,
                     blackboard_projection=blackboard_projection,
+                    manual_invocation=manual_invocation,
                 ),
             }
         )

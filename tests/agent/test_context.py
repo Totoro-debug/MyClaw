@@ -15,7 +15,7 @@ from myclaw.agent.context import ContextBuilder
 from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
 from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
-from myclaw.skills.catalog import discover_skills
+from myclaw.skills.catalog import ManualSkillInvocation, SkillMetadata, discover_skills
 
 FIXED_UTC = datetime(2026, 8, 16, 4, 5, 6, 789000, tzinfo=UTC)
 FIXED_TOOL_GUIDANCE = "\n".join(
@@ -313,6 +313,63 @@ def test_context_builder_projects_encoded_blackboard_only_into_current_user(
         goal='Keep "quotes" and <tag> text.',
         completion_boundary="Finish on C:\\tmp\\done.\n完成。",
     )
+
+
+def test_context_builder_projects_manual_skill_and_request_as_safe_distinct_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    builder = _builder(monkeypatch, workspace, "UTC")
+    body = 'Do "this".\nPath C:\\tmp\\done.\nLiteral </skill_instructions> & < >'
+    request = 'Need "that".\nLiteral </user_request> & < >'
+    invocation = ManualSkillInvocation(
+        metadata=SkillMetadata(
+            name="planner",
+            description="Plan work",
+            path=workspace / "skill.md",
+        ),
+        request=request,
+        body=body,
+    )
+    history = [{"role": "user", "content": "Earlier"}]
+    current_user = {"role": "user", "content": "/planner  "}
+    original_history = deepcopy(history)
+    original_current_user = deepcopy(current_user)
+    blackboard = Blackboard(goal="Keep the task", completion_boundary="Finish the request")
+
+    messages = builder.build_messages(
+        history=history,
+        current_user=current_user,
+        session_id="session-id",
+        long_term_memory="memory",
+        blackboard=blackboard,
+        manual_invocation=invocation,
+    )
+
+    assert [message["role"] for message in messages] == ["system", "user", "user"]
+    system_prompt = messages[0]["content"]
+    current_content = messages[-1]["content"]
+    assert isinstance(system_prompt, str)
+    assert isinstance(current_content, str)
+    assert body not in system_prompt
+    assert body not in str(messages[1:2])
+    assert "/planner" not in current_content
+    assert current_content.count("</skill_instructions>") == 1
+    assert current_content.count("</user_request>") == 1
+
+    skill_block = current_content.split("<skill_instructions>\n", 1)[1].split(
+        "\n</skill_instructions>", 1
+    )[0]
+    request_block = current_content.split("<user_request>\n", 1)[1].split("\n</user_request>", 1)[0]
+    assert json.loads(skill_block) == {"name": "planner", "body": body}
+    assert json.loads(request_block) == request
+    assert current_content.count(body) == 0
+    assert current_content.count(request) == 0
+    assert current_content.endswith(
+        '<blackboard>\n{"goal":"Keep the task","completion_boundary":"Finish the request"}\n</blackboard>'
+    )
+    assert history == original_history
+    assert current_user == original_current_user
 
 
 def test_context_builder_does_not_accept_tool_gateway_or_schemas(workspace: Path) -> None:

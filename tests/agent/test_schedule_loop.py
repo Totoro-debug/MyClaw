@@ -30,6 +30,7 @@ from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
+from myclaw.skills.catalog import ManualSkillInvocation
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
@@ -292,8 +293,11 @@ async def _foreground_context(
     session: Session,
     current_user: dict[str, Any],
     blackboard: Blackboard | None = None,
+    *,
+    manual_invocation: ManualSkillInvocation | None = None,
 ) -> list[dict[str, Any]]:
     assert blackboard is None
+    assert manual_invocation is None
     del session, current_user
     return [{"role": "system", "content": "foreground system"}]
 

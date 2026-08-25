@@ -37,6 +37,11 @@ from myclaw.provider.models import (
 from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session
+from myclaw.skills.catalog import (
+    ManualSkillInvocation,
+    SkillCatalog,
+    discover_skills,
+)
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.fixtures import BlockingTaskFramingEvaluator, DeterministicTaskFramingEvaluator
@@ -306,9 +311,15 @@ def _runtime(
         Awaitable[list[dict[str, Any]]],
     ]
     | None = None,
+    context_preparer_with_invocation: Callable[
+        [Session, dict[str, Any], Blackboard | None, ManualSkillInvocation | None],
+        Awaitable[list[dict[str, Any]]],
+    ]
+    | None = None,
     task_framer: TaskFramingEvaluator | None = None,
     use_default_task_framer: bool = False,
     title_prompt: str | None = None,
+    skill_catalog: SkillCatalog | None = None,
 ) -> tuple[AgentLoop, Session]:
     agent_home = AgentHome(tmp_path / "agent-home")
     agent_home.initialize()
@@ -320,12 +331,21 @@ def _runtime(
     schedule = ScheduleService(store=WorkspaceScheduleStore(state), clock=_Clock())
     selected_context_preparer = _context if context_preparer is None else context_preparer
     selected_context_preparer_with_blackboard = context_preparer_with_blackboard
+    selected_context_preparer_with_invocation = context_preparer_with_invocation
 
     async def prepare(
         active_session: Session,
         current_user: dict[str, Any],
         blackboard: Blackboard | None = None,
+        manual_invocation: ManualSkillInvocation | None = None,
     ) -> list[dict[str, Any]]:
+        if selected_context_preparer_with_invocation is not None:
+            return await selected_context_preparer_with_invocation(
+                active_session,
+                current_user,
+                blackboard,
+                manual_invocation,
+            )
         if selected_context_preparer_with_blackboard is not None:
             return await selected_context_preparer_with_blackboard(
                 active_session,
@@ -336,6 +356,7 @@ def _runtime(
 
     loop = AgentLoop(
         workspace=workspace,
+        skill_catalog=skill_catalog,
         session=session,
         schedule_service=schedule,
         model_router=router,
@@ -428,6 +449,154 @@ async def test_loop_consumes_foreground_inputs_fifo_and_publishes_one_terminal_e
         assert persist_calls == 3
     finally:
         await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded_user(
+    tmp_path: Path,
+) -> None:
+    raw_input = "/planner Do the work"
+    body = "Follow the plan.\n"
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        ("---\nname: planner\ndescription: Plan work\n---\n" + body).encode("utf-8")
+    )
+    catalog = discover_skills(
+        agent_home=AgentHome(tmp_path / "agent-home"),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    router = _Router((_response("Generated title"), _response("Completed")))
+    framer = _FramingFake()
+    observed: list[tuple[dict[str, Any], ManualSkillInvocation | None]] = []
+
+    async def prepare(
+        active_session: Session,
+        current_user: dict[str, Any],
+        blackboard: Blackboard | None,
+        manual_invocation: ManualSkillInvocation | None,
+    ) -> list[dict[str, Any]]:
+        del active_session, blackboard
+        observed.append((deepcopy(current_user), manual_invocation))
+        assert manual_invocation is not None
+        return [
+            {"role": "system", "content": "test"},
+            {
+                "role": "user",
+                "content": f"<skill>{manual_invocation.body}</skill>"
+                f"<request>{manual_invocation.request}</request>",
+            },
+        ]
+
+    loop, session = _runtime(
+        tmp_path,
+        router,
+        context_preparer_with_invocation=prepare,
+        task_framer=framer,
+        title_prompt="Generate a title",
+        skill_catalog=catalog,
+    )
+    await loop.start()
+    try:
+        await loop.bus.put_inbound(InboundMessage(raw_input))
+        await _terminals(loop, 1)
+    finally:
+        await loop.close()
+
+    assert len(router.calls) == 2
+    assert raw_input in router.calls
+    assert f"<skill>{body}</skill><request>Do the work</request>" in router.calls
+    assert framer.calls == [(None, "", raw_input)]
+    assert observed[0][0] == {"role": "user", "content": raw_input}
+    assert observed[0][1] is not None
+    assert observed[0][1].body == body
+    assert observed[0][1].request == "Do the work"
+    assert [message["content"] for message in session.messages if message["role"] == "user"] == [
+        raw_input
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_kind",
+    ("missing", "unreadable", "non_utf8", "metadata_mismatch"),
+)
+async def test_real_manual_skill_file_failures_short_circuit_then_recover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    body = "PRIVATE MANUAL BODY\n"
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\n" + body,
+        encoding="utf-8",
+    )
+    catalog = discover_skills(
+        agent_home=AgentHome(tmp_path / "agent-home"),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+
+    if failure_kind == "missing":
+        instruction.unlink()
+    elif failure_kind == "unreadable":
+
+        def fail_instruction_open(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise PermissionError("injected unreadable Skill")
+
+        monkeypatch.setattr(Path, "open", fail_instruction_open)
+    elif failure_kind == "non_utf8":
+        instruction.write_bytes(
+            b"---\nname: planner\ndescription: Plan work\n---\n" + b"PRIVATE\xffBODY\n"
+        )
+    else:
+        instruction.write_text(
+            "---\nname: planner\ndescription: Changed metadata\n---\n" + body,
+            encoding="utf-8",
+        )
+
+    router = _Router((_response("Recovered title"), _response("After failure")))
+    framer = _FramingFake()
+    loop, session = _runtime(
+        tmp_path,
+        router,
+        task_framer=framer,
+        title_prompt="Generate a title",
+        skill_catalog=catalog,
+    )
+    before_metadata = deepcopy(session.metadata)
+    diagnostics = capture_diagnostics()
+    try:
+        await loop.start()
+        await loop.bus.put_inbound(InboundMessage("/planner request"))
+        failure = await _terminals(loop, 1)
+
+        assert failure[0].metadata == {
+            "finish_reason": "failed",
+            "error_code": "skill_unavailable",
+            "_streamed": True,
+        }
+        assert router.calls == []
+        assert framer.calls == []
+        assert session.messages == []
+        assert session.metadata == before_metadata
+        assert body not in diagnostics.text
+
+        await loop.bus.put_inbound(InboundMessage("ordinary input"))
+        await _terminals(loop, 1)
+    finally:
+        await loop.close()
+        diagnostics.close()
+
+    assert router.calls == ["ordinary input", "ordinary input"]
+    assert framer.calls == [(None, "", "ordinary input")]
+    assert [message["content"] for message in session.messages if message["role"] == "user"] == [
+        "ordinary input"
+    ]
 
 
 @pytest.mark.asyncio

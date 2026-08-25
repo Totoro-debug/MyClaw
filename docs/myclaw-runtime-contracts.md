@@ -455,6 +455,14 @@ Foreground chat 在上述共有部分之后按当前 Runtime Lifetime 的 Catalo
 
 Foreground 的 metadata projection 与最终 chat request 使用同一 Catalog block；这不改变 Conversation Summary provider 的独立 prompt，后者仍接收 `0` 个 Skill metadata 或 body。
 
+手动 Skill invocation 是独立的 foreground loading path：只有 raw input 在字符 `0` 以 `/` 开始、且第一个
+Unicode whitespace 之前的 token 与 Catalog 中的 Skill name 完全一致（区分大小写）时才匹配。无 delimiter
+时 request 为空；匹配 delimiter 只移除一个，其后的空格、换行和其它字符逐字保留。匹配后 Agent Loop
+在创建 Session title work 之前调用同一个 `SkillCatalog.read_body()` complete-read seam；该读取从当前
+bytes 完成 UTF-8、frontmatter、canonical path 和 metadata revalidation。missing、unreadable、non-UTF-8
+或 metadata mismatch 以 `skill_unavailable` 结束当前 turn，不启动 title、Task Framing 或 foreground
+provider，也不增加 Session message。
+
 ### 8.2 当前 user input 的 Runtime Context
 
 发给 chat/schedule model 的当前 user message临时转换为：
@@ -474,6 +482,14 @@ session_id: <session_id>
 </blackboard>
 ```
 
+成功的手动 invocation 不把 raw slash input 放进 model-visible current user，而是使用一个独立的
+`<skill_instructions>` compact JSON object（`name`、`body`）和一个独立的 `<user_request>` compact JSON
+string。body、request 的换行、引号、反斜杠及 literal closing delimiter 均由 JSON 编码承载，`&`、`<`、`>`
+使用 Unicode escape；两个真实 closing delimiter 各只有一个。该 ephemeral projection 只存在于本次
+foreground user message，Skill body 不进入 System Prompt；raw slash input 仍是唯一持久化的 Session user
+message。若同一 entry 已有 #184 的 frozen `always_body`，它仍按 always System contract 出现，manual user
+projection 不会去重、覆盖或额外修改该既有 block。
+
 - session JSONL 只保存 raw user content，不保存上述 wrapper。
 - 历史 user messages 不重复添加新的 Runtime Context。
 - Workspace 已在 identity prompt 中，不在每轮 wrapper 重复。
@@ -485,6 +501,7 @@ session_id: <session_id>
 
 - Session title：只接收规范化后的首条 user content，不注入 Long-term Memory、tools 或 conversation history。
 - Task Framing：只接收 previous Blackboard、latest assistant content 和 current raw user input 组成的 compact JSON，使用独立 system prompt 且 `tools=()`。
+- Manual Skill invocation：Title 与 Task Framing 继续接收 current raw slash input；只有最终 foreground context 接收 typed invocation。手动 body 与 extracted request 在同一个 current `user` message 的不同 JSON-delimited blocks 中各出现一次，不能写入 Session、Blackboard 或 System Prompt；unknown/non-matching slash input 继续 ordinary foreground input。
 - Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory、Tool Catalog、Skill metadata 或 Skill body。
 - Memory Task：接收 Summary Cursor 后的 batch 和四分区维护规则，并只暴露 restricted memory tools。
 - Schedule Job：使用共有 chat/schedule system composition，把 Job message 作为 Schedule Session 的普通 user message，不接收 Skill metadata。Session title、Task Framing 和 Memory Task 同样不接收 Skill metadata。
@@ -496,6 +513,7 @@ prompt 文本存放在独立、可版本追踪的 package resources；测试断�
 - 可用输入预算为已解析 chat route 的 `context_window - max_output`。
 - Runtime startup 在读取当前 Long-term Memory 后、构造 provider/router/AgentLoop 或启动任何 task 前执行 always preflight；只有 final Catalog 至少有一个 `always_body` 时才执行。它使用与最终 Foreground chat 完全相同的 `foreground_chat_system_prompt(workspace, long_term_memory, skill_catalog)`，并通过现有 `estimate_input_tokens`（所有 UTF-8 bytes 合计后向上取整 `/ 4`）估算 `RuntimeStatusInput` 的 system prompt projection；`estimated == available` 允许，`estimated > available` 抛出独立 `SkillContextTooLargeError`，稳定 code 为 `skill_context_too_large`，正文不截断。每个 Generation 可用同一 frozen Catalog 和当代 Long-term Memory 重做该 preflight，但不得重扫目录或重读 body；direct `prepare_runtime` 与 `RuntimeHost` 使用同一 seam。
 - 估算对象包含 system prompt、retained session messages、当前 Runtime Context、user input 和结构化 tool definitions。
+- foreground manual invocation 的 body/request 通过 transient typed projection 计入 retained-current budget 与 cutoff；实际 Summary provider 仍只接收选中的 raw historical Session records，不接收手动 Skill instructions 或 request。
 - 在每次 chat route model call 前检查预算和 `consolidation_message_threshold`，包括一个 tool loop 中后续的 chat model call。
 - consolidation 只能选择当前 turn 之前的早期消息，不得拆走正在执行的 assistant/tool call chain。
 - token 触发先选择约输入预算一半的早期消息；message threshold 触发先选择约 threshold 一半的早期消息，再按 canonical 规则把 retained suffix 对齐到 user message。

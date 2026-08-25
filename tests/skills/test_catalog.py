@@ -619,6 +619,129 @@ def test_read_body_returns_the_complete_current_skill_body(agent_home: Path) -> 
     assert catalog.read_body(catalog.entries[0].metadata) == "first line\nsecond line\n"
 
 
+def test_resolve_manual_returns_the_complete_body_for_an_exact_slash_name(
+    agent_home: Path,
+) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n")
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+
+    invocation = catalog.resolve_manual("/planner")
+
+    assert invocation is not None
+    assert invocation.metadata == catalog.entries[0].metadata
+    assert invocation.request == ""
+    assert invocation.body == "Follow the plan.\n"
+
+
+@pytest.mark.parametrize(
+    "delimiter",
+    (" ", "\t", "\r", "\n", "\u2003"),
+)
+def test_resolve_manual_removes_only_the_first_unicode_whitespace_delimiter(
+    agent_home: Path,
+    delimiter: str,
+) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
+        encoding="utf-8",
+    )
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    request = f"{delimiter}  keep\n\tthis"
+
+    invocation = catalog.resolve_manual(f"/planner{request}")
+
+    assert invocation is not None
+    assert invocation.request == "  keep\n\tthis"
+
+
+def test_resolve_manual_reads_a_matching_body_once(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
+        encoding="utf-8",
+    )
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    reads: list[object] = []
+    original_read_body = catalog.read_body
+
+    def read_body(metadata: object) -> str:
+        reads.append(metadata)
+        return original_read_body(metadata)  # type: ignore[arg-type]
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(catalog, "read_body", read_body)
+    try:
+        invocation = catalog.resolve_manual("/planner do it")
+    finally:
+        monkeypatch.undo()
+
+    assert invocation is not None
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize(
+    "raw_input",
+    ("planner", " /planner", "/Planner", "/plan", "/unknown", "/config"),
+)
+def test_resolve_manual_does_not_read_non_matching_input(
+    agent_home: Path,
+    raw_input: str,
+) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
+        encoding="utf-8",
+    )
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=("/config",),
+        enable_always_load=False,
+    )
+    reads: list[object] = []
+
+    def read_body(metadata: object) -> str:
+        reads.append(metadata)
+        return "unexpected"
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(catalog, "read_body", read_body)
+    try:
+        assert catalog.resolve_manual(raw_input) is None
+    finally:
+        monkeypatch.undo()
+
+    assert reads == []
+
+
+def test_resolve_manual_rejects_non_string_input(agent_home: Path) -> None:
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+
+    with pytest.raises(TypeError, match="Skill input must be a string"):
+        catalog.resolve_manual(cast(str, object()))
+
+
 def test_read_body_rejects_metadata_changed_after_discovery(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "stale" / "SKILL.md"
     instruction.parent.mkdir(parents=True)

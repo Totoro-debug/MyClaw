@@ -44,6 +44,7 @@ from myclaw.provider.models import ModelCompleted, ReasoningDelta, TextDelta
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
+from myclaw.skills.catalog import ManualSkillInvocation, SkillCatalog, SkillUnavailableError
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
@@ -63,6 +64,8 @@ class ForegroundContextPreparer(Protocol):
         current_user: dict[str, Any],
         /,
         blackboard: Blackboard | None = None,
+        *,
+        manual_invocation: ManualSkillInvocation | None = None,
     ) -> Awaitable[list[dict[str, Any]]]: ...
 
 
@@ -180,6 +183,7 @@ class AgentLoop:
         *,
         workspace: Workspace,
         skill_root: Path | None = None,
+        skill_catalog: SkillCatalog | None = None,
         session: Session,
         schedule_service: ScheduleService,
         model_router: AgentRunnerRouter,
@@ -206,8 +210,11 @@ class AgentLoop:
             raise TypeError("Agent Loop requires a clock")
         if schedule_now is not None and not callable(schedule_now):
             raise TypeError("Agent Loop Schedule clock must be callable")
+        if skill_catalog is not None and not isinstance(skill_catalog, SkillCatalog):
+            raise TypeError("Agent Loop requires a Skill Catalog")
 
         self._session = session
+        self._skill_catalog = skill_catalog
         self._schedule_service = schedule_service
         self._context_preparer = context_preparer
         self._task_framer = TaskFramer(model_router) if task_framer is None else task_framer
@@ -585,6 +592,14 @@ class AgentLoop:
         execution_ready: asyncio.Event,
     ) -> None:
         active_session = self._session
+        manual_invocation = None
+        if self._skill_catalog is not None:
+            try:
+                manual_invocation = self._skill_catalog.resolve_manual(inbound.content)
+            except SkillUnavailableError as failure:
+                await self._publish_preparation_failure(failure.error)
+                execution_ready.set()
+                return
         start_title = not active_session.messages
         created_title_work = (
             self._start_title_if_needed(active_session, inbound.content) if start_title else None
@@ -603,6 +618,7 @@ class AgentLoop:
                         active_session,
                         inbound,
                         title_work=None,
+                        manual_invocation=manual_invocation,
                         execution_ready=execution_ready,
                     )
             else:
@@ -613,6 +629,7 @@ class AgentLoop:
                         active_session,
                         inbound,
                         title_work=title_work,
+                        manual_invocation=manual_invocation,
                         execution_ready=execution_ready,
                     )
         finally:
@@ -636,6 +653,7 @@ class AgentLoop:
         inbound: InboundMessage,
         *,
         title_work: _TitleWork | None,
+        manual_invocation: ManualSkillInvocation | None = None,
         execution_ready: asyncio.Event,
     ) -> bool:
         current_user = {"role": "user", "content": inbound.content}
@@ -670,11 +688,20 @@ class AgentLoop:
             )
         staged_blackboard = framing_result.blackboard
         try:
-            initial_messages = await self._context_preparer(
-                active_session,
-                deepcopy(current_user),
-                blackboard=staged_blackboard,
-            )
+            context_user = deepcopy(current_user)
+            if manual_invocation is None:
+                initial_messages = await self._context_preparer(
+                    active_session,
+                    context_user,
+                    blackboard=staged_blackboard,
+                )
+            else:
+                initial_messages = await self._context_preparer(
+                    active_session,
+                    context_user,
+                    blackboard=staged_blackboard,
+                    manual_invocation=manual_invocation,
+                )
         except asyncio.CancelledError:
             if not self._cancel_requested:
                 raise

@@ -36,6 +36,15 @@ class SkillEntry:
     always_body: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ManualSkillInvocation:
+    """One validated manual Skill invocation for a foreground Agent Run."""
+
+    metadata: SkillMetadata
+    request: str
+    body: str
+
+
 class SkillUnavailableError(Exception):
     """A complete Skill body could not be read from its catalog snapshot."""
 
@@ -71,6 +80,33 @@ class SkillCatalog:
     def read_body(self, metadata: SkillMetadata) -> str:
         """Read and revalidate one catalog Skill body without retaining it."""
         return _read_complete_body(self, metadata, require_always=False)
+
+    def resolve_manual(self, raw_input: str) -> ManualSkillInvocation | None:
+        """Resolve one exact slash invocation and load its current complete body."""
+        if not isinstance(raw_input, str):
+            raise TypeError("Skill input must be a string")
+        if not raw_input.startswith("/"):
+            return None
+
+        token = raw_input[1:]
+        delimiter = next(
+            (index for index, character in enumerate(token) if character.isspace()),
+            None,
+        )
+        if delimiter is None:
+            name = token
+            request = ""
+        else:
+            name = token[:delimiter]
+            request = token[delimiter + 1 :]
+        entry = self.get(name)
+        if entry is None:
+            return None
+        return ManualSkillInvocation(
+            metadata=entry.metadata,
+            request=request,
+            body=self.read_body(entry.metadata),
+        )
 
 
 def discover_skills(
@@ -325,6 +361,7 @@ def _log_invalid(candidate: Path, reason: str) -> None:
 
 
 __all__ = [
+    "ManualSkillInvocation",
     "SkillCatalog",
     "SkillEntry",
     "SkillMetadata",
