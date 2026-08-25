@@ -155,6 +155,9 @@ async def test_runtime_host_reuses_skill_snapshot_across_generation_replacement(
     first_skill.write_bytes(b"---\nname: first\ndescription: Original first\n---\n")
     provider = RuntimeProvider((_chat_response("First run."), _chat_response("Second run.")))
     host = _host(agent_home, workspace, provider)
+    initial_metadata = host.bindings.skill_metadata
+    assert tuple(metadata.name for metadata in initial_metadata) == ("first",)
+    assert initial_metadata[0].description == "Original first"
     await host.start()
     try:
         await collect_foreground_outbound(host.generation, "Initial request")
@@ -173,6 +176,7 @@ async def test_runtime_host_reuses_skill_snapshot_across_generation_replacement(
 
         result = await host.management_dispatcher.resume(target.session_id)
         assert result.resumed_session_id == target.session_id
+        assert host.bindings.skill_metadata == initial_metadata
         await collect_foreground_outbound(host.generation, "Replacement request")
     finally:
         await host.close()

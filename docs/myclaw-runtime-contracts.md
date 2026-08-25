@@ -508,6 +508,28 @@ projection 不会去重、覆盖或额外修改该既有 block。
 
 prompt 文本存放在独立、可版本追踪的 package resources；测试断言组成部分和是否注入，不锁死整段自然语言文案。
 
+### 8.3a Shared Slash Completion
+
+Terminal Conversation reuses one presentation-only completion surface for Management Commands
+and Skill metadata. It shows candidates only when the composer text starts with `/` at character
+zero and contains no character for which `str.isspace()` is true. The five Management Commands
+remain first in their fixed order, with these stable labels and descriptions: `/config - View User
+Configuration`, `/status - View Runtime Status`, `/resume - Resume a Conversation Session`,
+`/memory - View Long-term Memory`, and `/dream - Process pending Conversation Summaries`. Valid
+Skills follow in the immutable Runtime Lifetime Catalog order and use `/name - description`.
+
+The display label is independent from the insertion value. Skill descriptions are user-controlled:
+their whitespace runs are folded to one ASCII space for a markup-disabled, single-line OptionList
+label, with no change to the retained SkillMetadata. The UI applies no-wrap/ellipsis rendering so
+long labels do not change candidate row height or obscure the composer. A Management Command
+inserts its original command token; an exact Management Command Enter selection may submit through
+the existing dispatcher. A Skill selection through mouse, Enter, or the completion Tab shortcut
+inserts exactly `/<name> `, closes the popup, restores input focus, and creates zero Message Bus
+inbound messages; it never submits or dispatches the Skill. A Management prefix selection only
+completes the composer. RuntimeBindings exposes only an ordered
+`tuple[SkillMetadata, ...]` projection, and generation rebind replaces the UI projection and clears
+old candidate state while reusing the same Runtime Lifetime Catalog snapshot.
+
 ### 8.4 Context budget 与 consolidation
 
 - 可用输入预算为已解析 chat route 的 `context_window - max_output`。
@@ -787,7 +809,8 @@ Runtime Lifetime 还拥有一个由 Agent Home Skill root 构建的 immutable Sk
 不缓存按需正文，不增加 Skill-specific Tool、invocation 或 EOF 语义。Generation replacement
 只对同一 snapshot 和当代 Long-term Memory 重做 startup budget preflight，不重扫目录或重读
 always body；新的 Runtime Lifetime 才重新发现目录内容。该 Catalog 不改变 Tool permission、
-Management Command、slash invocation、Schedule 或 Terminal UI 契约。
+Management Command dispatch、slash invocation、Schedule 或 Message Bus 契约；共享 completion
+的 presentation 与 selection 规则见 8.3a。
 
 ## TOOL_SCHEMA：Tool Gateway 契约
 

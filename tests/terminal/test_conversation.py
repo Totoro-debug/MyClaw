@@ -45,6 +45,7 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.session.session import Session
+from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.conversation import (
     TerminalConversationApp,
     TerminalConversationError,
@@ -4298,14 +4299,22 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
         visible_commands = [
             text
             for text, _x, _y in _screenshot_text_nodes(app)
-            if text in {"/config", "/status", "/resume", "/memory", "/dream"}
+            if text.startswith(
+                (
+                    "/config - ",
+                    "/status - ",
+                    "/resume - ",
+                    "/memory - ",
+                    "/dream - ",
+                )
+            )
         ]
         assert visible_commands == [
-            "/config",
-            "/status",
-            "/resume",
-            "/memory",
-            "/dream",
+            "/config - View User Configuration",
+            "/status - View Runtime Status",
+            "/resume - Resume a Conversation Session",
+            "/memory - View Long-term Memory",
+            "/dream - Process pending Conversation Summaries",
         ]
         assert any(text == "/" for text, _x, _y in _screenshot_text_nodes(app))
         assert app.screen.focused is input_area
@@ -4314,27 +4323,48 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
 
         assert input_area.text == "/status"
         assert app.screen.focused is input_area
+        assert runtime.inbound_history == []
+        assert conversation.submissions == []
 
         await pilot.press("ctrl+c", "/", "down", "up", "enter")
 
         assert input_area.text == "/config"
+        assert runtime.inbound_history == []
+        assert conversation.submissions == []
 
         await pilot.press("ctrl+c", "/", "escape")
 
         assert input_area.text == "/"
         assert not any(
-            text in {"/config", "/status", "/resume", "/memory", "/dream"}
+            text.startswith(
+                (
+                    "/config - ",
+                    "/status - ",
+                    "/resume - ",
+                    "/memory - ",
+                    "/dream - ",
+                )
+            )
             for text, _x, _y in _screenshot_text_nodes(app)
         )
         assert app.screen.focused is input_area
 
         await pilot.press("m")
+        await pilot.pause()
 
         assert [
             text
             for text, _x, _y in _screenshot_text_nodes(app)
-            if text in {"/config", "/status", "/resume", "/memory", "/dream"}
-        ] == ["/memory"]
+            if text.startswith(
+                (
+                    "/config - ",
+                    "/status - ",
+                    "/resume - ",
+                    "/memory - ",
+                    "/dream - ",
+                )
+            )
+        ] == ["/memory - View Long-term Memory"]
 
 
 @pytest.mark.asyncio
@@ -4348,13 +4378,41 @@ async def test_management_completion_keeps_the_composer_visible(
         await pilot.press("/")
 
         visible_nodes = _screenshot_text_nodes(app)
-        assert [
-            text
-            for text, _x, _y in visible_nodes
-            if text in {"/config", "/status", "/resume", "/memory", "/dream"}
-        ] == ["/config", "/status", "/resume", "/memory", "/dream"]
+        completion = app.query_one("#command-completion", OptionList)
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert completion.option_count == 5
+        assert completion.virtual_size.height == completion.option_count
+        assert all("\n" not in str(option.prompt) for option in completion.options)
+        assert completion.region.bottom <= input_area.region.y
+        assert not completion.region.overlaps(input_area.region)
+        if size == (80, 24):
+            assert [
+                text
+                for text, _x, _y in visible_nodes
+                if text.startswith(
+                    (
+                        "/config - ",
+                        "/status - ",
+                        "/resume - ",
+                        "/memory - ",
+                        "/dream - ",
+                    )
+                )
+            ] == [
+                "/config - View User Configuration",
+                "/status - View Runtime Status",
+                "/resume - Resume a Conversation Session",
+                "/memory - View Long-term Memory",
+                "/dream - Process pending Conversation Summaries",
+            ]
+        else:
+            assert all(
+                completion.render_line(index).text.endswith("\u2026")
+                for index in range(completion.option_count)
+            )
         assert any(text == "/" for text, _x, _y in visible_nodes)
-        assert isinstance(app.screen.focused, TextArea)
+        assert input_area.display
+        assert app.screen.focused is input_area
 
 
 @pytest.mark.asyncio
@@ -4371,9 +4429,221 @@ async def test_management_completion_mouse_selection_updates_the_composer() -> N
         assert app.query_one("#conversation-input", TextArea).text == "/status"
         assert isinstance(app.screen.focused, TextArea)
         assert not any(
-            text in {"/config", "/resume", "/memory", "/dream"}
+            text.startswith(
+                (
+                    "/config - ",
+                    "/resume - ",
+                    "/memory - ",
+                    "/dream - ",
+                )
+            )
             for text, _x, _y in _screenshot_text_nodes(app)
         )
+
+
+@pytest.mark.asyncio
+async def test_skill_completion_merges_after_management_commands_with_safe_labels() -> None:
+    conversation = ScriptedRunSource()
+    runtime = cast(PreparedRuntime, _runtime(conversation))
+    skills = (
+        SkillMetadata(
+            name="alpha",
+            description="First line\n\t[bold] stays literal",
+            path=Path("C:/agent-home/skills/alpha/SKILL.md"),
+        ),
+        SkillMetadata(
+            name="bravo",
+            description="Second\u2003line",
+            path=Path("C:/agent-home/skills/bravo/SKILL.md"),
+        ),
+    )
+    app = TerminalConversationApp(
+        bus=runtime.bus,
+        control=runtime.control,
+        management_dispatcher=runtime.management_dispatcher,
+        start_runtime=runtime.start,
+        close_runtime=runtime.close,
+        skill_metadata=skills,
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("/")
+        await pilot.pause()
+
+        completion = app.query_one("#command-completion", OptionList)
+        assert [str(option.prompt) for option in completion.options] == [
+            "/config - View User Configuration",
+            "/status - View Runtime Status",
+            "/resume - Resume a Conversation Session",
+            "/memory - View Long-term Memory",
+            "/dream - Process pending Conversation Summaries",
+            "/alpha - First line [bold] stays literal",
+            "/bravo - Second line",
+        ]
+        assert app.query_one("#conversation-input", TextArea).text == "/"
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", ((80, 24), (30, 12), (20, 10)))
+async def test_skill_completion_labels_are_single_line_at_narrow_sizes_and_stop_on_whitespace(
+    size: tuple[int, int],
+) -> None:
+    long_name = "a" * 64
+    description_chunk = "segment\n\t[bold] \\path\u2003"
+    long_description = (description_chunk * ((1024 // len(description_chunk)) + 1))[:1024]
+    assert len(long_description) == 1024
+    runtime = cast(PreparedRuntime, _runtime(ScriptedRunSource()))
+    app = TerminalConversationApp(
+        bus=runtime.bus,
+        control=runtime.control,
+        management_dispatcher=runtime.management_dispatcher,
+        start_runtime=runtime.start,
+        close_runtime=runtime.close,
+        skill_metadata=(
+            SkillMetadata(
+                name=long_name,
+                description=long_description,
+                path=Path("C:/agent-home/skills/long/SKILL.md"),
+            ),
+        ),
+    )
+
+    async with app.run_test(size=size) as pilot:
+        await pilot.press("/")
+        await pilot.pause()
+
+        completion = app.query_one("#command-completion", OptionList)
+        input_area = app.query_one("#conversation-input", TextArea)
+        skill_label = str(completion.options[-1].prompt)
+        assert skill_label.startswith(f"/{long_name} - ")
+        assert "\n" not in skill_label
+        assert "\t" not in skill_label
+        assert "[bold]" in skill_label
+        assert "\\path" in skill_label
+        assert completion.virtual_size.height == completion.option_count
+        assert completion.region.bottom <= input_area.region.y
+        assert not completion.region.overlaps(input_area.region)
+        assert input_area.text == "/"
+        assert input_area.display
+        assert app.screen.focused is input_area
+
+        await pilot.press(*(("down",) * 5))
+        await pilot.pause()
+        assert completion.render_line(
+            completion.scrollable_content_region.height - 1
+        ).text.endswith("\u2026")
+
+        input_area.text = "/\u2003"
+        await pilot.pause()
+        assert not completion.display
+        assert not completion.options
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ("enter", "exact-enter", "tab", "mouse"))
+async def test_skill_completion_selection_inserts_only_the_skill_invocation(
+    selection: Literal["enter", "exact-enter", "tab", "mouse"],
+) -> None:
+    conversation = ScriptedRunSource()
+    fake_runtime = _runtime(conversation)
+    runtime = cast(PreparedRuntime, fake_runtime)
+    app = TerminalConversationApp(
+        bus=runtime.bus,
+        control=runtime.control,
+        management_dispatcher=runtime.management_dispatcher,
+        start_runtime=runtime.start,
+        close_runtime=runtime.close,
+        skill_metadata=(
+            SkillMetadata(
+                name="alpha",
+                description="First skill",
+                path=Path("C:/agent-home/skills/alpha/SKILL.md"),
+            ),
+        ),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("/")
+        await pilot.pause()
+
+        if selection == "mouse":
+            await pilot.press("a")
+            await pilot.pause()
+            await pilot.click("#command-completion", offset=(2, 1))
+        elif selection == "exact-enter":
+            await pilot.press(*list("alpha"), "enter")
+        else:
+            await pilot.press(*(("down",) * 5), selection)
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        completion = app.query_one("#command-completion", OptionList)
+        assert input_area.text == "/alpha "
+        assert not completion.display
+        assert not completion.options
+        assert app.screen.focused is input_area
+        assert fake_runtime.inbound_history == []
+        assert conversation.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_rebind_clears_stale_skill_completion_state(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    first_skill = agent_home / "skills" / "first" / "SKILL.md"
+    first_skill.parent.mkdir(parents=True)
+    first_skill.write_bytes(b"---\nname: first\ndescription: Original first\n---\n")
+    runtime = _generation_host(agent_home, workspace, _RuntimeProvider(()))
+    bindings = runtime.bindings
+    app = TerminalConversationApp(
+        bus=bindings.bus,
+        control=bindings.control,
+        management_dispatcher=bindings.management_dispatcher,
+        start_runtime=runtime.start,
+        close_runtime=runtime.close,
+        runtime_host=runtime,
+        skill_metadata=bindings.skill_metadata,
+    )
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.add_message("user", "Persisted target")
+    target.close()
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("/", *(("down",) * 5))
+        completion = app.query_one("#command-completion", OptionList)
+        assert completion.highlighted == 5
+
+        first_skill.write_bytes(b"---\nname: first\ndescription: Changed first\n---\n")
+        second_skill = agent_home / "skills" / "second" / "SKILL.md"
+        second_skill.parent.mkdir(parents=True)
+        second_skill.write_bytes(b"---\nname: second\ndescription: New second\n---\n")
+        result = await runtime.management_dispatcher.resume(target.session_id)
+        await pilot.pause()
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert result.resumed_session_id == target.session_id
+        assert input_area.text == ""
+        assert not completion.display
+        assert not completion.options
+        assert completion.highlighted is None
+
+        await pilot.press("/")
+        await pilot.pause()
+        assert [str(option.prompt) for option in completion.options] == [
+            "/config - View User Configuration",
+            "/status - View Runtime Status",
+            "/resume - Resume a Conversation Session",
+            "/memory - View Long-term Memory",
+            "/dream - Process pending Conversation Summaries",
+            "/first - Original first",
+        ]
+        assert completion.highlighted == 0
+        assert app.screen.focused is input_area
 
 
 @pytest.mark.asyncio
@@ -4403,7 +4673,7 @@ async def test_supported_management_commands_use_the_prepared_runtime_without_se
         await pilot.press("ctrl+home")
 
         visible_text = _visible_screen_text(app)
-        assert f"Command: {command}" in visible_text
+        assert visible_text.count(f"Command: {command}") == 1
         assert output_marker in visible_text
         assert runtime.session is original_session
         assert original_session.messages == []
@@ -5690,7 +5960,9 @@ async def test_completion_direction_keys_take_precedence_over_composer_and_input
             await pilot.press(direction)
             assert input_area.cursor_location == cursor_before
             assert input_area.text == "/"
-            assert any(text == "/config" for text, _x, _y in _screenshot_text_nodes(app))
+            assert any(
+                text.startswith("/config - ") for text, _x, _y in _screenshot_text_nodes(app)
+            )
 
         await pilot.press("up", "down")
         assert input_area.text == "/"
@@ -5712,14 +5984,22 @@ async def test_completion_ctrl_c_closes_completion_before_idle_draft_behavior() 
         input_area = app.query_one("#conversation-input", TextArea)
         await pilot.press("/")
         await pilot.pause()
-        assert any(text == "/config" for text, _x, _y in _screenshot_text_nodes(app))
+        assert any(text.startswith("/config - ") for text, _x, _y in _screenshot_text_nodes(app))
 
         await pilot.press("ctrl+c")
         await pilot.pause()
 
         assert input_area.text == "/"
         assert not any(
-            text in {"/config", "/status", "/resume", "/memory", "/dream"}
+            text.startswith(
+                (
+                    "/config - ",
+                    "/status - ",
+                    "/resume - ",
+                    "/memory - ",
+                    "/dream - ",
+                )
+            )
             for text, _x, _y in _screenshot_text_nodes(app)
         )
         assert app.is_running

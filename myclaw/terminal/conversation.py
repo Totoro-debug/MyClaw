@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from functools import partial
 from time import monotonic as monotonic_now
 from typing import ClassVar, Final, Literal, Protocol, cast
@@ -20,6 +21,7 @@ from uuid import UUID, uuid4
 from markdown_it import MarkdownIt
 from markdown_it.rules_core.state_core import StateCore
 from markdown_it.token import Token
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
@@ -42,6 +44,7 @@ from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runtime import PreparedRuntime, RuntimeBindings, RuntimeHost
 from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS
 from myclaw.management.service import SessionListingEntry
+from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
 from myclaw.terminal.repl import ManagementDispatcher
 
@@ -59,6 +62,13 @@ _CONVERSATION_NAVIGATION_KEYS = frozenset({"pageup", "pagedown", "ctrl+home", "c
 _FAILURE_REASON_MAX_CHARS = 120
 _TOOL_NAME_MAX_CHARS = 80
 _GENERIC_TOOL_FAILURE_REASON = "The operation did not complete."
+_MANAGEMENT_COMMAND_DESCRIPTIONS: Final[dict[str, str]] = {
+    "/config": "View User Configuration",
+    "/status": "View Runtime Status",
+    "/resume": "Resume a Conversation Session",
+    "/memory": "View Long-term Memory",
+    "/dream": "Process pending Conversation Summaries",
+}
 _UNSAFE_TOOL_DETAIL_PATTERN = re.compile(
     r"(?:^\s*[\[{])|(?:[\"'][^\"']+[\"']\s*:)|"
     r"(?:\b(?:api[_-]?key|authorization|bearer|password|secret|token)\b)|"
@@ -236,6 +246,11 @@ class _ConversationInput(TextArea):
             event.prevent_default()
             completion.accept_command_completion()
             return
+        if event.key == "tab" and completion.command_completion_visible:
+            event.stop()
+            event.prevent_default()
+            completion.accept_command_completion(submit_exact=False)
+            return
         if event.key == "ctrl+c" and completion.command_completion_visible:
             event.stop()
             event.prevent_default()
@@ -306,7 +321,33 @@ class _CommandCompletionHost(Protocol):
 
     def dismiss_command_completion(self) -> None: ...
 
-    def accept_command_completion(self) -> None: ...
+    def accept_command_completion(self, *, submit_exact: bool = True) -> None: ...
+
+
+class _CompletionCandidateKind(StrEnum):
+    MANAGEMENT = "management"
+    SKILL = "skill"
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletionCandidate:
+    """Typed presentation data for one completion option."""
+
+    kind: _CompletionCandidateKind
+    token: str
+    description: str
+    insert_text: str
+
+    @property
+    def display_label(self) -> Text:
+        """Return a markup-disabled, single-line label for OptionList."""
+        description = " ".join(self.description.split())
+        return Text(
+            f"{self.token} - {description}",
+            no_wrap=True,
+            overflow="ellipsis",
+            end="",
+        )
 
 
 class _CommandCompletion(OptionList):
@@ -1664,6 +1705,8 @@ class TerminalConversationApp(App[None]):
         offset: 0 -7;
         width: 100%;
         max-height: 7;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
         background: transparent;
         border: round $panel;
     }
@@ -1747,10 +1790,12 @@ class TerminalConversationApp(App[None]):
         close_runtime: Callable[[], Awaitable[None]],
         monotonic: Callable[[], float] = monotonic_now,
         runtime_host: RuntimeHost | None = None,
+        skill_metadata: tuple[SkillMetadata, ...] = (),
     ) -> None:
         super().__init__()
         self._runtime_host = runtime_host
         self._runtime_rebind_callback = self._rebind_runtime
+        self._skill_metadata = tuple(skill_metadata)
         self._bus = bus
         self._control = control
         self._management_dispatcher = management_dispatcher
@@ -1776,7 +1821,7 @@ class TerminalConversationApp(App[None]):
         self._consumed_runs: deque[_ConsumedRun] = deque()
         self._run_ready = Event()
         self._draining_inputs = False
-        self._completion_options: tuple[str, ...] = ()
+        self._completion_options: tuple[_CompletionCandidate, ...] = ()
         self._completion_dismissed_text: str | None = None
         self._closing = False
         self._application_error: Exception | None = None
@@ -2058,6 +2103,7 @@ class TerminalConversationApp(App[None]):
         self._control = bindings.control
         self._management_dispatcher = bindings.management_dispatcher
         self._start_runtime = bindings.start
+        self._skill_metadata = tuple(bindings.skill_metadata)
         self._closing = False
         try:
             self._bind_bus_callback(self._bus)
@@ -2184,7 +2230,7 @@ class TerminalConversationApp(App[None]):
         self._hide_command_completion(remember_text=input_area.text)
         input_area.focus()
 
-    def accept_command_completion(self) -> None:
+    def accept_command_completion(self, *, submit_exact: bool = True) -> None:
         if not self._completion_options:
             return
         completion = self.query_one("#command-completion", _CommandCompletion)
@@ -2192,21 +2238,25 @@ class TerminalConversationApp(App[None]):
         index = 0 if highlighted is None else highlighted
         selected = self._completion_options[index]
         input_area = self.query_one("#conversation-input", _ConversationInput)
-        should_submit = input_area.text == selected
+        should_submit = (
+            submit_exact
+            and selected.kind is _CompletionCandidateKind.MANAGEMENT
+            and input_area.text == selected.insert_text
+        )
         self._select_command_completion(index)
         if should_submit:
-            self.post_message(_ConversationInput.Submitted(input_area, selected))
+            self.post_message(_ConversationInput.Submitted(input_area, selected.insert_text))
 
     def _select_command_completion(self, index: int) -> None:
         if not self._completion_options:
             return
         selected = self._completion_options[index]
         input_area = self.query_one("#conversation-input", _ConversationInput)
-        input_area.text = selected
+        input_area.text = selected.insert_text
         input_area.move_cursor(
             (len(input_area.document.lines) - 1, len(input_area.document.lines[-1]))
         )
-        self._hide_command_completion(remember_text=selected)
+        self._hide_command_completion(remember_text=selected.insert_text)
         input_area.focus()
 
     def _refresh_command_completion(self, text: str) -> None:
@@ -2214,12 +2264,14 @@ class TerminalConversationApp(App[None]):
             self._hide_command_completion()
             return
         self._completion_dismissed_text = None
-        candidates = _management_command_candidates(text)
+        candidates = _completion_candidates(text, self._skill_metadata)
         if not candidates:
             self._hide_command_completion()
             return
         completion = self.query_one("#command-completion", _CommandCompletion)
-        completion.set_options(candidates)
+        completion.set_options(
+            Option(candidate.display_label, id=candidate.token) for candidate in candidates
+        )
         completion.highlighted = 0
         completion.display = True
         self._completion_options = candidates
@@ -2938,10 +2990,33 @@ def _friendly_name(name: str, *, fallback: str) -> str:
     )
 
 
-def _management_command_candidates(text: str) -> tuple[str, ...]:
-    if not text.startswith("/") or "\n" in text or " " in text or "\t" in text:
+def _completion_candidates(
+    text: str,
+    skill_metadata: tuple[SkillMetadata, ...],
+) -> tuple[_CompletionCandidate, ...]:
+    if not text.startswith("/") or any(character.isspace() for character in text):
         return ()
-    return tuple(command for command in SUPPORTED_MANAGEMENT_COMMANDS if command.startswith(text))
+    management = tuple(
+        _CompletionCandidate(
+            kind=_CompletionCandidateKind.MANAGEMENT,
+            token=command,
+            description=_MANAGEMENT_COMMAND_DESCRIPTIONS[command],
+            insert_text=command,
+        )
+        for command in SUPPORTED_MANAGEMENT_COMMANDS
+        if command.startswith(text)
+    )
+    skills = tuple(
+        _CompletionCandidate(
+            kind=_CompletionCandidateKind.SKILL,
+            token=f"/{metadata.name}",
+            description=metadata.description,
+            insert_text=f"/{metadata.name} ",
+        )
+        for metadata in skill_metadata
+        if f"/{metadata.name}".startswith(text)
+    )
+    return management + skills
 
 
 def _session_picker_label(session: SessionListingEntry) -> str:
@@ -3345,12 +3420,15 @@ def run_terminal_conversation(runtime: PreparedRuntime | RuntimeHost) -> None:
             start_runtime=runtime.start,
             close_runtime=runtime.close,
             runtime_host=runtime,
+            skill_metadata=bindings.skill_metadata,
         ).run()
         return
+    bindings = runtime.bindings
     TerminalConversationApp(
         bus=runtime.bus,
         control=runtime.control,
         management_dispatcher=runtime.management_dispatcher,
         start_runtime=runtime.start,
         close_runtime=runtime.close,
+        skill_metadata=bindings.skill_metadata,
     ).run()

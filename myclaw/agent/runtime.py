@@ -60,7 +60,12 @@ from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.skills.catalog import ManualSkillInvocation, SkillCatalog, discover_skills
+from myclaw.skills.catalog import (
+    ManualSkillInvocation,
+    SkillCatalog,
+    SkillMetadata,
+    discover_skills,
+)
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.tool_gateway import ToolResult
@@ -150,6 +155,7 @@ class RuntimeBindings:
     control: TerminalAgentLoopControl
     management_dispatcher: ManagementDispatcher
     start: Callable[[], Awaitable[None]]
+    skill_metadata: tuple[SkillMetadata, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +198,7 @@ class PreparedRuntime:
             control=self.control,
             management_dispatcher=self.management_dispatcher,
             start=self.start,
+            skill_metadata=tuple(entry.metadata for entry in self._skill_catalog.entries),
         )
 
     def validate_unstarted(self) -> None:

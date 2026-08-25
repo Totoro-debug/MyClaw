@@ -61,9 +61,11 @@ This document records the agreed user-facing contract for MyClaw's Command-line 
 - `Shift+Enter` and `Alt+Enter` insert a newline when the host terminal reports either chord distinctly. `Ctrl+J` is the reliable newline fallback.
 - Bracketed paste inserts the complete pasted text, including newlines, without submitting it.
 - Input history lasts for the current Runtime only and is not persisted. When the input is empty, `Up` and `Down` browse that history.
-- Typing `/` offers completion only for `/config`, `/status`, `/resume`, `/memory`, and `/dream`.
-- Direction keys always control the topmost open surface. When command completion is open, `Up` and `Down` move through candidates, `Enter` selects, and `Esc` closes it; input history receives `Up` and `Down` only when no overlay or completion is open and the input is empty.
-- Interactive completion candidates are clickable.
+- Typing `/` opens the shared completion window only while the input starts with `/` at character zero and contains no Unicode whitespace. The five Management Commands remain first in fixed order and display `/config - View User Configuration`, `/status - View Runtime Status`, `/resume - Resume a Conversation Session`, `/memory - View Long-term Memory`, and `/dream - Process pending Conversation Summaries`. Valid Skills follow in Skill Catalog order and display `/<name> - <description>`.
+- Candidate display labels are separate from composer insertion values. Skill descriptions are rendered as markup-disabled single-line text with whitespace runs folded to one ASCII space; no-wrap/ellipsis keeps long labels from changing row height or covering the composer.
+- Direction keys always control the topmost open surface. When command completion is open, `Up` and `Down` move through candidates, `Enter` selects, `Tab` accepts the highlighted completion, and `Esc` closes it; input history receives `Up` and `Down` only when no overlay or completion is open and the input is empty.
+- Management Command selection preserves exact Enter submission and prefix-only completion. Mouse, Enter, or Tab selection of a Skill inserts exactly `/<name> `, closes the window, keeps input focused, and never submits the composer.
+- Interactive completion candidates are clickable; Skill selection by click has the same insertion and non-submission behavior as keyboard selection.
 - The input keeps the primary focus. Conversation scrolling does not move focus away from it.
 - The UI does not display the active Session title or model name. Model and Session details remain available through Management Commands.
 - During an active foreground turn the input remains visible and editable. Enter submits each ordinary message to the Message Bus Inbound FIFO; pending messages appear only in a dedicated queue display while the current Agent Run continues. The `Working` status does not make the input read-only.
