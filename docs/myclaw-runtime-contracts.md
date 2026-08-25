@@ -105,7 +105,9 @@ D01-D17 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Fra
 
 `~/.myclaw/skills/` 缺失或为空时，Skill Catalog 是空 snapshot。Catalog 只扫描其一级子目录中名为 `SKILL.md` 的 instruction file；不会把嵌套目录作为独立候选。frontmatter 必须从文件首行的独占 `---` 开始，并以之后的独占 `---` 结束；其内容使用安全 YAML mapping 解析，`name` 和 `description` 必须是字符串。trim 后，`name` 必须匹配 `[a-z_-][a-z0-9_-]{0,63}`，`description` 必须为 1 到 1024 个 Unicode code points。
 
-每个候选的 instruction path 必须是可读普通文件并在 canonical Skill root 内；frontmatter bytes 必须是 UTF-8。canonical root 外的 symlink/reparse target、缺失文件、非 UTF-8 metadata 和其他 malformed metadata 均跳过。跳过时只记录安全的 candidate path 与 reason，不记录 instruction body；正文 bytes 留待 `read_body()` 验证。候选按 canonical path 字符串升序评估；reserved Management Command names 和重复 Skill names 不进入 snapshot，同名时保留第一个有效候选。Catalog 只保留 immutable 的 name、trimmed description 和 canonical absolute `SKILL.md` path，不缓存正文，也不注册 Tool。
+每个候选的 instruction path 必须是可读普通文件并在 canonical Skill root 内；frontmatter bytes 必须是 UTF-8。canonical root 外的 symlink/reparse target、缺失文件、非 UTF-8 metadata 和其他 malformed metadata 均跳过。跳过时只记录安全的 candidate path 与 reason，不记录 instruction body；正文 bytes 留待 `read_body()` 验证。候选按 canonical path 字符串升序评估；reserved Management Command names 和重复 Skill names 不进入 snapshot，同名时保留第一个有效候选。Catalog 只保留 immutable 的 name、trimmed description 和 canonical absolute `SKILL.md` path，不注册 Tool。
+
+`runtime.enable_skill_always_load` 是 boolean，默认 `false`。关闭时 discovery 只解析用于 metadata 的 frontmatter，不解释、告警或读取 `always` 正文。开启时，YAML boolean `always: true` 的候选先进入 metadata snapshot，再在 Catalog module 内读取同一份完整 UTF-8 document bytes；该次读取必须同时重新验证当前 `name`、`description`、canonical `path` 和 `always is True`。读取期间 opt-in 状态、metadata 或路径发生变化时 fail closed 为 `SkillUnavailableError`，不得把版本 A 的 opt-in 决策与版本 B 的正文拼接。YAML non-boolean `always` 只产生一次安全 warning 并保持 metadata-only，不记录正文；`false`、缺失或空值保持 metadata-only。只有完成全部校验后才发布唯一 immutable final Catalog，Generation 不暴露中间 snapshot。
 
 Runtime Lifetime 只能通过当前 snapshot 中的完整 `SkillMetadata` 读取正文：
 
@@ -117,7 +119,7 @@ class SkillCatalog:
     def read_body(self, metadata: SkillMetadata) -> str: ...
 ```
 
-`read_body()` 拒绝不存在或不完全匹配当前 snapshot 的 metadata，不接受任意 path。它先打开文件，再以 host-native descriptor identity 校验 opened/current object 均为普通文件、device/inode 一致且当前 canonical path 仍在 Catalog root 内；普通 hardlink 保持可读，不套用持久化 owned-file 的 single-link 限制。一次调用只从该已验证 descriptor 读取一份 bytes，并从这份 bytes 完成 UTF-8 decode、严格 frontmatter 重解析、canonical path/name/description 重校验和正文提取；正文不缓存。缺失、不可读、非 UTF-8、frontmatter/YAML 无效、canonical containment 失效或 metadata mismatch 均映射为 `SkillUnavailableError`，其公开 `error` 使用稳定的 `skill_unavailable` code 和非空安全消息，底层异常只作为 cause。
+`read_body()` 拒绝不存在或不完全匹配当前 snapshot 的 metadata，不接受任意 path。它先打开文件，再以 host-native descriptor identity 校验 opened/current object 均为普通文件、device/inode 一致且当前 canonical path 仍在 Catalog root 内；普通 hardlink 保持可读，不套用持久化 owned-file 的 single-link 限制。一次调用只从该已验证 descriptor 读取一份 bytes，并从这份 bytes 完成 UTF-8 decode、严格 frontmatter 重解析、canonical path/name/description 重校验和正文提取；普通按需 `read_body()` 正文不缓存。always freeze 复用同一 Catalog module 内的完整-document 读取/重校验实现，但把成功正文保存在 final immutable snapshot 中。缺失、不可读、非 UTF-8、frontmatter/YAML 无效、canonical containment 失效、metadata mismatch 或 always opt-in mismatch 均映射为 `SkillUnavailableError`，其公开 `error` 使用稳定的 `skill_unavailable` code 和非空安全消息，底层异常只作为 cause。
 
 `memory.md` 初始内容固定为：
 
@@ -165,6 +167,8 @@ Session technical diagnostics 位于 `<workspace>/.myclaw/logs/<session_id>.log`
 ```toml
 [runtime]
 max_tool_result_chars = 4096
+max_iterations = 50
+enable_skill_always_load = false
 
 [memory]
 consolidation_message_threshold = 40
@@ -224,6 +228,8 @@ timeout = 120
 | 字段 | 类型/范围 | 默认/要求 |
 | --- | --- | --- |
 | `runtime.max_tool_result_chars` | integer，`1000..1000000` | 默认 `4096` |
+| `runtime.max_iterations` | integer，至少 `50` | 默认 `50` |
+| `runtime.enable_skill_always_load` | boolean | 默认 `false`；仅控制 startup always-load freeze |
 | `memory.consolidation_message_threshold` | integer，`4..10000` | 默认 `40` |
 | `memory.batch_size` | integer，`1..1000` | 默认 `10` |
 | `memory.schedule` | 5-field cron string | 默认 `0 * * * *` |
@@ -443,7 +449,11 @@ chat 和 schedule 的共有 system-level context 按以下固定顺序组装：
 
 User Configuration 不得插入或替换 identity/system prompt。缓存的 OpenAI-format Tool schema snapshots 通过 provider 的结构化 tools 字段发送，不把 JSON schema 重复拼入自然语言 guidance。
 
-Foreground chat 在上述共有部分之后按当前 Runtime Lifetime 的 Catalog order 追加一个 `<skill_catalog>` metadata-only block。每个 Skill 是独占一行的 compact JSON object，字段顺序固定为 name、description、path；JSON 文本中的 `&`、`<`、`>` 使用 Unicode escape，确保 metadata 不能产生 literal block delimiter。该 block 只指导模型使用普通 `read_file` 读取已知 canonical absolute path；模型需要更多内容时可按 `offset`/`limit` 继续分页，不需要证明 EOF，Runtime 不缓存 Skill body。Foreground consolidation/budget projection 与最终 chat request 使用同一 Catalog block；这不改变 Conversation Summary provider 的独立 prompt，后者仍接收 `0` 个 Skill metadata。Schedule prompt 不追加 Skill metadata。
+Foreground chat 在上述共有部分之后按当前 Runtime Lifetime 的 Catalog order 追加一个 `<skill_catalog>` metadata-only block。每个 Skill 是独占一行的 compact JSON object，字段顺序固定为 name、description、path；JSON 文本中的 `&`、`<`、`>` 使用 Unicode escape，确保 metadata 不能产生 literal block delimiter。该 block 只指导模型使用普通 `read_file` 读取已知 canonical absolute path；模型需要更多内容时可按 `offset`/`limit` 继续分页，不需要证明 EOF。
+
+当 final Catalog 至少有一个 `always_body is not None` 时，Foreground chat 随后按相同 Catalog order 追加一个 `<skill_always_load>` intentional System block。每个 opted-in Skill 是一行 compact JSON object，字段顺序固定为 name、body；body 的换行、引号、反斜杠及任意文字（包括类似 closing delimiter 的文字）由 JSON 字符串编码承载，`&`、`<`、`>` 使用 Unicode escape。模板的真实 `</skill_always_load>` closing delimiter 恰好一个；Runtime 不做 raw interpolation，也不截断 body。Foreground consolidation/budget projection 与最终 chat request 使用完全相同的编码后 prompt。该 always body 只进入 Foreground chat：Schedule、Session title、Task Framing、实际 Conversation Summary provider 和 Memory Task 均接收 `0` 个 Skill body；Summary 的 foreground budget projection 可包含同一完整 foreground prompt，但不把 body 发送给 Summary provider。Schedule prompt 不追加 Skill metadata 或 body。
+
+Foreground 的 metadata projection 与最终 chat request 使用同一 Catalog block；这不改变 Conversation Summary provider 的独立 prompt，后者仍接收 `0` 个 Skill metadata 或 body。
 
 ### 8.2 当前 user input 的 Runtime Context
 
@@ -475,7 +485,7 @@ session_id: <session_id>
 
 - Session title：只接收规范化后的首条 user content，不注入 Long-term Memory、tools 或 conversation history。
 - Task Framing：只接收 previous Blackboard、latest assistant content 和 current raw user input 组成的 compact JSON，使用独立 system prompt 且 `tools=()`。
-- Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory、Tool Catalog 或 Skill metadata。
+- Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory、Tool Catalog、Skill metadata 或 Skill body。
 - Memory Task：接收 Summary Cursor 后的 batch 和四分区维护规则，并只暴露 restricted memory tools。
 - Schedule Job：使用共有 chat/schedule system composition，把 Job message 作为 Schedule Session 的普通 user message，不接收 Skill metadata。Session title、Task Framing 和 Memory Task 同样不接收 Skill metadata。
 
@@ -483,7 +493,8 @@ prompt 文本存放在独立、可版本追踪的 package resources；测试断�
 
 ### 8.4 Context budget 与 consolidation
 
-- 可用输入预算为 `context_window - max_output`。
+- 可用输入预算为已解析 chat route 的 `context_window - max_output`。
+- Runtime startup 在读取当前 Long-term Memory 后、构造 provider/router/AgentLoop 或启动任何 task 前执行 always preflight；只有 final Catalog 至少有一个 `always_body` 时才执行。它使用与最终 Foreground chat 完全相同的 `foreground_chat_system_prompt(workspace, long_term_memory, skill_catalog)`，并通过现有 `estimate_input_tokens`（所有 UTF-8 bytes 合计后向上取整 `/ 4`）估算 `RuntimeStatusInput` 的 system prompt projection；`estimated == available` 允许，`estimated > available` 抛出独立 `SkillContextTooLargeError`，稳定 code 为 `skill_context_too_large`，正文不截断。每个 Generation 可用同一 frozen Catalog 和当代 Long-term Memory 重做该 preflight，但不得重扫目录或重读 body；direct `prepare_runtime` 与 `RuntimeHost` 使用同一 seam。
 - 估算对象包含 system prompt、retained session messages、当前 Runtime Context、user input 和结构化 tool definitions。
 - 在每次 chat route model call 前检查预算和 `consolidation_message_threshold`，包括一个 tool loop 中后续的 chat model call。
 - consolidation 只能选择当前 turn 之前的早期消息，不得拆走正在执行的 assistant/tool call chain。
@@ -753,10 +764,12 @@ uptime reset。普通 process shutdown 始终走 awaited `close()`。
 Runtime Lifetime 还拥有一个由 Agent Home Skill root 构建的 immutable Skill Catalog snapshot。
 同一 Runtime Lifetime 的 Runtime Generation replacement（包括 `/resume`）复用该 snapshot，
 不得重新扫描 Skill 目录；只有新的 Runtime Lifetime 才重新发现目录内容。Foreground chat
-只接收该 snapshot 的 metadata 投影，并通过普通 `read_file` 按需读取正文；不启用
-always/manual，不缓存正文，不增加 Skill-specific Tool、invocation 或 EOF 语义。该 Catalog
-不改变 Tool permission、Management Command、slash invocation、Schedule 或 Terminal UI
-契约。
+接收该 snapshot 的 metadata 投影，并在启用且已冻结正文时把 complete always body 作为
+不可伪造的 JSON Lines System block 注入；普通 Skill 正文仍通过 `read_file` 按需读取，
+不缓存按需正文，不增加 Skill-specific Tool、invocation 或 EOF 语义。Generation replacement
+只对同一 snapshot 和当代 Long-term Memory 重做 startup budget preflight，不重扫目录或重读
+always body；新的 Runtime Lifetime 才重新发现目录内容。该 Catalog 不改变 Tool permission、
+Management Command、slash invocation、Schedule 或 Terminal UI 契约。
 
 ## TOOL_SCHEMA：Tool Gateway 契约
 
@@ -965,9 +978,10 @@ ErrorInfo(
 | `tool_failed` | 工具执行失败 | 否 |
 | `memory_task_running` | Memory Task 不重入 | 否 |
 | `schedule_state_error` | Schedule state 损坏或不安全 | 否 |
-| `skill_unavailable` | Skill 正文缺失、不可读、非 UTF-8 或 metadata/path 校验失败 | 否 |
+| `skill_unavailable` | Skill 正文缺失、不可读、非 UTF-8、metadata/path 校验失败或 always opt-in 复核失败 | 否 |
+| `skill_context_too_large` | final always-loaded Skill body 的 exact Foreground System Prompt projection 超出 `context_window - max_output` | 否 |
 
-CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 Terminal Conversation 继续时不退出进程。
+CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 Terminal Conversation 继续时不退出进程。RuntimeHost 构造期间的 `SkillUnavailableError` 与 `SkillContextTooLargeError` 必须在进入 `run_terminal_conversation` 前由 CLI 捕获，只通过 `_print_error_info` 输出稳定 code/message，不输出 traceback、底层异常、Skill 正文或敏感路径。
 
 ## 14. `/status` 契约
 

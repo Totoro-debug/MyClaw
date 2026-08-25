@@ -78,6 +78,13 @@ def foreground_chat_system_prompt(
             for entry in skill_catalog.entries
         )
         sections.append(render_template("skill-catalog.md", entries=entries))
+        always_entries = "\n".join(
+            _skill_always_json(name=entry.metadata.name, body=entry.always_body)
+            for entry in skill_catalog.entries
+            if entry.always_body is not None
+        )
+        if always_entries:
+            sections.append(render_template("skill-always-load.md", entries=always_entries))
     sections.append(render_template("blackboard-guidance.md"))
     return "\n\n".join(sections)
 
@@ -85,6 +92,16 @@ def foreground_chat_system_prompt(
 def _skill_metadata_json(*, name: str, description: str, path: str) -> str:
     serialized = json.dumps(
         {"name": name, "description": description, "path": path},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return serialized.translate(_SKILL_METADATA_TRANSLATION)
+
+
+def _skill_always_json(*, name: str, body: str) -> str:
+    serialized = json.dumps(
+        {"name": name, "body": body},
         ensure_ascii=False,
         separators=(",", ":"),
         allow_nan=False,

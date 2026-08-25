@@ -1,6 +1,8 @@
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -422,7 +424,7 @@ def test_invalid_earlier_duplicate_does_not_block_later_valid_entry(agent_home: 
     assert tuple(entry.metadata.path for entry in catalog.entries) == (valid.resolve(),)
 
 
-def test_phase_one_does_not_interpret_always_load_metadata(agent_home: Path) -> None:
+def test_disabled_always_load_does_not_interpret_always_metadata(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "always-candidate" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(
@@ -432,11 +434,173 @@ def test_phase_one_does_not_interpret_always_load_metadata(agent_home: Path) -> 
     catalog = discover_skills(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
-        enable_always_load=True,
+        enable_always_load=False,
     )
 
     assert len(catalog.entries) == 1
     assert catalog.entries[0].always_body is None
+
+
+def test_enabled_boolean_always_freezes_the_complete_body(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "always" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        b"---\nname: always\ndescription: Always loaded\nalways: true\n---\nComplete body\n"
+    )
+
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=True,
+    )
+
+    assert catalog.entries[0].always_body == "Complete body\n"
+
+
+@pytest.mark.parametrize("always_field", ("always: false\n", ""))
+def test_enabled_non_opted_in_skill_remains_metadata_only(
+    agent_home: Path,
+    always_field: str,
+) -> None:
+    instruction = agent_home / "skills" / "metadata-only" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        (
+            "---\nname: metadata-only\ndescription: Metadata only\n"
+            + always_field
+            + "---\nnot frozen\n"
+        ).encode("utf-8")
+    )
+
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=True,
+    )
+
+    assert catalog.entries[0].always_body is None
+
+
+def test_duplicate_always_candidate_does_not_override_the_first_valid_entry(
+    agent_home: Path,
+) -> None:
+    first = agent_home / "skills" / "a-first" / "SKILL.md"
+    duplicate = agent_home / "skills" / "b-duplicate" / "SKILL.md"
+    first.parent.mkdir(parents=True)
+    duplicate.parent.mkdir(parents=True)
+    first.write_bytes(
+        b"---\nname: duplicate\ndescription: First candidate\nalways: false\n---\nfirst\n"
+    )
+    duplicate.write_bytes(
+        b"---\nname: duplicate\ndescription: Later candidate\nalways: true\n---\nsecond\n"
+    )
+
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=True,
+    )
+
+    assert len(catalog.entries) == 1
+    assert catalog.entries[0].metadata.description == "First candidate"
+    assert catalog.entries[0].always_body is None
+
+
+def test_enabled_always_non_utf8_body_fails_closed(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "binary-always" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        b"---\nname: binary-always\ndescription: Binary body\nalways: true\n---\n\xff"
+    )
+
+    with pytest.raises(SkillUnavailableError) as failure:
+        discover_skills(
+            agent_home=AgentHome(agent_home),
+            reserved_names=(),
+            enable_always_load=True,
+        )
+
+    assert failure.value.error.code == "skill_unavailable"
+
+
+def test_always_body_is_frozen_in_the_final_catalog(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "frozen" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        b"---\nname: frozen\ndescription: Frozen body\nalways: true\n---\nfirst\n"
+    )
+
+    catalog = discover_skills(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=True,
+    )
+    instruction.write_bytes(
+        b"---\nname: frozen\ndescription: Frozen body\nalways: true\n---\nsecond\n"
+    )
+
+    assert catalog.entries[0].always_body == "first\n"
+
+
+def test_always_opt_in_change_during_complete_read_fails_closed(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = agent_home / "skills" / "changing-always" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        b"---\nname: changing-always\ndescription: Changing policy\nalways: true\n---\n"
+        b"body from the opted-in version\n"
+    )
+    original_open = cast(Callable[..., Any], Path.open)
+    open_count = 0
+
+    def replace_after_metadata(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal open_count
+        if path.name == "SKILL.md":
+            open_count += 1
+            if open_count == 2:
+                instruction.write_bytes(
+                    b"---\nname: changing-always\ndescription: Changing policy\nalways: false\n---\n"
+                    b"body from the changed version\n"
+                )
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", replace_after_metadata)
+
+    with pytest.raises(SkillUnavailableError) as failure:
+        discover_skills(
+            agent_home=AgentHome(agent_home),
+            reserved_names=(),
+            enable_always_load=True,
+        )
+
+    assert failure.value.error.code == "skill_unavailable"
+
+
+def test_enabled_non_boolean_always_warns_once_and_stays_metadata_only(
+    agent_home: Path,
+) -> None:
+    instruction = agent_home / "skills" / "invalid-always" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        b'---\nname: invalid-always\ndescription: Invalid policy\nalways: "true"\n---\n'
+        b"SECRET BODY\n"
+    )
+    diagnostics = capture_diagnostics()
+
+    try:
+        catalog = discover_skills(
+            agent_home=AgentHome(agent_home),
+            reserved_names=(),
+            enable_always_load=True,
+        )
+    finally:
+        diagnostics.close()
+
+    assert catalog.entries[0].always_body is None
+    assert diagnostics.event_text.count("Ignoring non-boolean Skill always field") == 1
+    assert "SECRET BODY" not in diagnostics.text
 
 
 def test_read_body_returns_the_complete_current_skill_body(agent_home: Path) -> None:

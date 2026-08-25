@@ -127,10 +127,12 @@ def _host(
     agent_home: Path,
     workspace: Path,
     provider: RuntimeProvider,
+    *,
+    config_text: str = VALID_CONFIG,
 ) -> RuntimeHost:
     home = AgentHome(agent_home)
     home.initialize()
-    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
     clock = FakeClock(NOW)
     return RuntimeHost(
         agent_home=home,
@@ -197,6 +199,67 @@ async def test_runtime_host_reuses_skill_snapshot_across_generation_replacement(
     assert isinstance(fresh_system_prompt, str)
     assert "Changed first" in fresh_system_prompt
     assert "New second" in fresh_system_prompt
+
+
+@pytest.mark.asyncio
+async def test_runtime_host_reuses_frozen_always_body_across_generation_replacement(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    first_skill = agent_home / "skills" / "first" / "SKILL.md"
+    first_skill.parent.mkdir(parents=True)
+    first_skill.write_bytes(
+        b"---\nname: first\ndescription: Original first\nalways: true\n---\nOriginal always body\n"
+    )
+    config_text = VALID_CONFIG.replace(
+        "[runtime]\n",
+        "[runtime]\nenable_skill_always_load = true\n",
+    )
+    provider = RuntimeProvider((_chat_response("First run."), _chat_response("Second run.")))
+    host = _host(agent_home, workspace, provider, config_text=config_text)
+    await host.start()
+    try:
+        await collect_foreground_outbound(host.generation, "Initial request")
+
+        target = Session.create(
+            host.generation.session.workspace_state,
+            now=lambda: NOW,
+            new_uuid=uuid4,
+        )
+        target.add_message("user", "Persisted target")
+        target.close()
+        first_skill.write_bytes(
+            b"---\nname: first\ndescription: Original first\nalways: false\n---\n"
+            b"Changed always body\n"
+        )
+
+        result = await host.management_dispatcher.resume(target.session_id)
+        assert result.resumed_session_id == target.session_id
+        await collect_foreground_outbound(host.generation, "Replacement request")
+    finally:
+        await host.close()
+
+    chat_requests = [request for request in provider.requests if len(request.tools) == 10]
+    assert len(chat_requests) == 2
+    for request in chat_requests:
+        system_prompt = request.messages[0]["content"]
+        assert isinstance(system_prompt, str)
+        assert "Original always body" in system_prompt
+        assert "Changed always body" not in system_prompt
+
+    fresh_provider = RuntimeProvider((_chat_response("Fresh run."),))
+    fresh_host = _host(agent_home, workspace, fresh_provider, config_text=config_text)
+    await fresh_host.start()
+    try:
+        await collect_foreground_outbound(fresh_host.generation, "Fresh request")
+    finally:
+        await fresh_host.close()
+
+    fresh_request = next(request for request in fresh_provider.requests if len(request.tools) == 10)
+    fresh_system_prompt = fresh_request.messages[0]["content"]
+    assert isinstance(fresh_system_prompt, str)
+    assert "Original always body" not in fresh_system_prompt
+    assert "Changed always body" not in fresh_system_prompt
 
 
 @pytest.mark.asyncio

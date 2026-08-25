@@ -16,6 +16,7 @@ from myclaw.errors import ErrorInfo
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _NAME_PATTERN = re.compile(r"[a-z_-][a-z0-9_-]{0,63}")
+_MISSING = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,37 +70,7 @@ class SkillCatalog:
 
     def read_body(self, metadata: SkillMetadata) -> str:
         """Read and revalidate one catalog Skill body without retaining it."""
-        if not isinstance(metadata, SkillMetadata):
-            raise _skill_unavailable()
-        entry = self._by_name.get(metadata.name)
-        if entry is None or entry.metadata != metadata:
-            raise _skill_unavailable()
-
-        try:
-            io_path = HOST_FILESYSTEM.path_for_io(metadata.path)
-            with io_path.open("rb") as stream:
-                path = HOST_FILESYSTEM.require_opened_contained_regular_file(
-                    stream.fileno(),
-                    metadata.path,
-                    within=self._root,
-                )
-                if path != metadata.path:
-                    raise ValueError("Skill path no longer matches the catalog snapshot")
-                raw_content = stream.read()
-            if not path.is_relative_to(self._root):
-                raise ValueError("Skill path is no longer contained by the catalog root")
-        except (OSError, RuntimeError, ValueError) as error:
-            raise _skill_unavailable() from error
-
-        try:
-            content = raw_content.decode("utf-8")
-        except UnicodeError as error:
-            raise _skill_unavailable() from error
-
-        parsed, body = _parse_document(content, path)
-        if parsed is None or parsed != metadata:
-            raise _skill_unavailable()
-        return body
+        return _read_complete_body(self, metadata, require_always=False)
 
 
 def discover_skills(
@@ -108,8 +79,7 @@ def discover_skills(
     reserved_names: Collection[str],
     enable_always_load: bool,
 ) -> SkillCatalog:
-    """Build one metadata-only Skill Catalog snapshot."""
-    del enable_always_load
+    """Build one immutable Skill Catalog snapshot."""
     reserved = {name.removeprefix("/") for name in reserved_names}
     root = agent_home.skills_directory.resolve()
     if not root.is_dir():
@@ -117,6 +87,7 @@ def discover_skills(
         return SkillCatalog(root=root, entries=())
 
     entries: list[SkillEntry] = []
+    always_names: set[str] = set()
     names: set[str] = set()
     try:
         children = tuple(root.iterdir())
@@ -160,10 +131,20 @@ def discover_skills(
         if not path.is_relative_to(root):
             _log_invalid(candidate, "SKILL.md canonical path escapes Skill root")
             continue
-        metadata, reason = _read_metadata(instruction, path)
+        metadata, always_value, reason = _read_metadata(
+            instruction,
+            path,
+            interpret_always=enable_always_load,
+        )
         if metadata is None:
             _log_invalid(candidate, reason)
             continue
+        if enable_always_load:
+            if always_value is not _MISSING and not isinstance(always_value, bool):
+                logger.warning(
+                    "Ignoring non-boolean Skill always field path={} reason=always must be a boolean",
+                    candidate,
+                )
         if metadata.name in reserved:
             _log_invalid(candidate, "name is reserved")
             continue
@@ -171,39 +152,70 @@ def discover_skills(
             _log_invalid(candidate, "name is duplicated")
             continue
         names.add(metadata.name)
+        if enable_always_load and always_value is True:
+            always_names.add(metadata.name)
         entries.append(SkillEntry(metadata=metadata, always_body=None))
     logger.info("Discovered Skills count={}", len(entries))
-    return SkillCatalog(root=root, entries=entries)
+    catalog = SkillCatalog(root=root, entries=entries)
+    if not always_names:
+        return catalog
+
+    frozen_entries = [
+        SkillEntry(
+            metadata=entry.metadata,
+            always_body=(
+                _read_complete_body(catalog, entry.metadata, require_always=True)
+                if entry.metadata.name in always_names
+                else None
+            ),
+        )
+        for entry in catalog.entries
+    ]
+    return SkillCatalog(root=root, entries=frozen_entries)
 
 
-def _read_metadata(instruction: Path, path: Path) -> tuple[SkillMetadata | None, str]:
+def _read_metadata(
+    instruction: Path,
+    path: Path,
+    *,
+    interpret_always: bool,
+) -> tuple[SkillMetadata | None, object, str]:
     try:
         with instruction.open("rb") as stream:
             opening = stream.readline()
             if not _is_delimiter(opening):
-                return None, "frontmatter opening delimiter is missing"
+                return None, _MISSING, "frontmatter opening delimiter is missing"
             frontmatter: list[bytes] = []
             for line in stream:
                 if _is_delimiter(line):
                     break
                 frontmatter.append(line)
             else:
-                return None, "frontmatter closing delimiter is missing"
+                return None, _MISSING, "frontmatter closing delimiter is missing"
     except OSError:
-        return None, "SKILL.md could not be read"
+        return None, _MISSING, "SKILL.md could not be read"
     try:
         document: object = yaml.safe_load(b"".join(frontmatter).decode("utf-8"))
     except UnicodeDecodeError:
-        return None, "frontmatter is not valid UTF-8"
+        return None, _MISSING, "frontmatter is not valid UTF-8"
     except yaml.YAMLError:
-        return None, "frontmatter YAML is invalid"
-    return _validate_metadata(document, path)
+        return None, _MISSING, "frontmatter YAML is invalid"
+    metadata, reason = _validate_metadata(document, path)
+    if metadata is None:
+        return None, _MISSING, reason
+    always_value = _always_value(document) if interpret_always else _MISSING
+    return metadata, always_value, ""
 
 
-def _parse_document(content: str, path: Path) -> tuple[SkillMetadata | None, str]:
+def _parse_document(
+    content: str,
+    path: Path,
+    *,
+    interpret_always: bool,
+) -> tuple[SkillMetadata | None, object, str]:
     lines = content.splitlines(keepends=True)
     if not lines or not _is_text_delimiter(lines[0]):
-        return None, content
+        return None, _MISSING, content
     frontmatter: list[str] = []
     body_start = None
     for index, line in enumerate(lines[1:], start=1):
@@ -212,13 +224,63 @@ def _parse_document(content: str, path: Path) -> tuple[SkillMetadata | None, str
             break
         frontmatter.append(line)
     if body_start is None:
-        return None, content
+        return None, _MISSING, content
     try:
         document: object = yaml.safe_load("".join(frontmatter))
     except yaml.YAMLError:
-        return None, content
+        return None, _MISSING, content
     metadata, _reason = _validate_metadata(document, path)
-    return metadata, "".join(lines[body_start:])
+    always_value = _always_value(document) if interpret_always else _MISSING
+    return metadata, always_value, "".join(lines[body_start:])
+
+
+def _read_complete_body(
+    catalog: SkillCatalog,
+    metadata: SkillMetadata,
+    *,
+    require_always: bool,
+) -> str:
+    if not isinstance(metadata, SkillMetadata):
+        raise _skill_unavailable()
+    entry = catalog._by_name.get(metadata.name)
+    if entry is None or entry.metadata != metadata:
+        raise _skill_unavailable()
+
+    try:
+        io_path = HOST_FILESYSTEM.path_for_io(metadata.path)
+        with io_path.open("rb") as stream:
+            path = HOST_FILESYSTEM.require_opened_contained_regular_file(
+                stream.fileno(),
+                metadata.path,
+                within=catalog.root,
+            )
+            if path != metadata.path:
+                raise ValueError("Skill path no longer matches the catalog snapshot")
+            raw_content = stream.read()
+        if not path.is_relative_to(catalog.root):
+            raise ValueError("Skill path is no longer contained by the catalog root")
+    except (OSError, RuntimeError, ValueError) as error:
+        raise _skill_unavailable() from error
+
+    try:
+        content = raw_content.decode("utf-8")
+    except UnicodeError as error:
+        raise _skill_unavailable() from error
+
+    parsed, always_value, body = _parse_document(
+        content,
+        path,
+        interpret_always=require_always,
+    )
+    if parsed is None or parsed != metadata or (require_always and always_value is not True):
+        raise _skill_unavailable()
+    return body
+
+
+def _always_value(document: object) -> object:
+    if not isinstance(document, Mapping) or "always" not in document:
+        return _MISSING
+    return document["always"]
 
 
 def _validate_metadata(document: object, path: Path) -> tuple[SkillMetadata | None, str]:

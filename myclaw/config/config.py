@@ -77,6 +77,7 @@ _API_KEY_UNSAFE_REMAINDER_PATTERN: Final = re.compile(
 class RuntimeConfiguration:
     max_tool_result_chars: int
     max_iterations: int = 50
+    enable_skill_always_load: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +228,12 @@ def _integer(value: object, field: str, minimum: int, maximum: int | None = None
     return cast(int, value)
 
 
+def _boolean(value: object, field: str) -> bool:
+    if not isinstance(value, bool):
+        _invalid(field, "must be a boolean")
+    return value
+
+
 def _number(value: object, field: str, minimum: float, maximum: float) -> float:
     if (
         isinstance(value, bool)
@@ -320,6 +327,10 @@ def _parse_runtime(document: Mapping[str, object]) -> RuntimeConfiguration:
             table.get("max_iterations", 50),
             "runtime.max_iterations",
             50,
+        ),
+        enable_skill_always_load=_boolean(
+            table.get("enable_skill_always_load", False),
+            "runtime.enable_skill_always_load",
         ),
     )
 
@@ -461,7 +472,11 @@ def _validate_defined_fields(document: Mapping[str, object]) -> None:
     _reject_unknown(document, {"runtime", "memory", "models"}, "")
 
     runtime = _table(document.get("runtime", {}), "runtime")
-    _reject_unknown(runtime, {"max_tool_result_chars", "max_iterations"}, "runtime")
+    _reject_unknown(
+        runtime,
+        {"max_tool_result_chars", "max_iterations", "enable_skill_always_load"},
+        "runtime",
+    )
 
     memory = _table(document.get("memory", {}), "memory")
     _reject_unknown(

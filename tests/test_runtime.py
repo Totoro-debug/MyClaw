@@ -15,14 +15,19 @@ import myclaw.agent.runtime as runtime_module
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import ForegroundContextPreparer
-from myclaw.agent.prompts import conversation_summary_prompt, session_title_prompt
-from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
+from myclaw.agent.prompts import (
+    conversation_summary_prompt,
+    foreground_chat_system_prompt,
+    session_title_prompt,
+)
+from myclaw.agent.runtime import PreparedRuntime, SkillContextTooLargeError, prepare_runtime
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ProviderConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.logging.process import configure_process_logging
+from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -36,7 +41,7 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.session.session import Session
-from myclaw.skills.catalog import SkillCatalog
+from myclaw.skills.catalog import SkillCatalog, discover_skills
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
@@ -47,6 +52,7 @@ from tests.fixtures import (
     StreamScript,
     unexpected_provider_factory,
 )
+from tests.fixtures.diagnostic_capture import capture_diagnostics
 from tests.runtime_bus import collect_foreground_outbound
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -246,6 +252,129 @@ async def test_foreground_skill_catalog_is_included_in_the_exact_budget_guard(
     assert runtime.session.messages == []
 
 
+def _always_skill_budget_fixture(
+    agent_home: Path,
+    workspace: Path,
+) -> tuple[AgentHome, Workspace, WorkspaceState, SkillCatalog, int]:
+    home = AgentHome(agent_home)
+    home.initialize()
+    instruction = agent_home / "skills" / "always" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        b"---\nname: always\ndescription: Always loaded\nalways: true\n---\n"
+        + b"Always-loaded body for the foreground budget projection.\n"
+    )
+    runtime_workspace = Workspace.from_path(workspace)
+    workspace_state = WorkspaceState(runtime_workspace)
+    workspace_state.initialize(agent_home_root=home.path)
+    catalog = discover_skills(
+        agent_home=home,
+        reserved_names=(),
+        enable_always_load=True,
+    )
+    system_prompt = foreground_chat_system_prompt(
+        workspace=runtime_workspace.path,
+        long_term_memory=workspace_state.long_term_memory_path.read_text(encoding="utf-8"),
+        skill_catalog=catalog,
+    )
+    estimated = estimate_input_tokens(
+        RuntimeStatusInput(
+            system_prompt=system_prompt,
+            retained_messages=(),
+            tool_definitions=(),
+            runtime_context="",
+        )
+    )
+    return home, runtime_workspace, workspace_state, catalog, estimated
+
+
+@pytest.mark.asyncio
+async def test_always_skill_budget_allows_exact_foreground_projection(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    home, runtime_workspace, workspace_state, catalog, estimated = _always_skill_budget_fixture(
+        agent_home,
+        workspace,
+    )
+    (agent_home / "config.toml").write_text(
+        VALID_CONFIG.replace(
+            "context_window = 200000",
+            f"context_window = {estimated + 8192}",
+        ),
+        encoding="utf-8",
+    )
+    configuration = ConfigLoader(home).load()
+
+    prepared = prepare_runtime(
+        agent_home=home,
+        workspace=runtime_workspace,
+        workspace_state=workspace_state,
+        configuration=configuration,
+        provider_factory=unexpected_provider_factory,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        skill_catalog=catalog,
+    )
+    await prepared.close()
+
+
+@pytest.mark.asyncio
+async def test_always_skill_budget_overflow_fails_before_provider_or_agent_loop(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, runtime_workspace, workspace_state, catalog, estimated = _always_skill_budget_fixture(
+        agent_home,
+        workspace,
+    )
+    (agent_home / "config.toml").write_text(
+        VALID_CONFIG.replace(
+            "context_window = 200000",
+            f"context_window = {estimated + 8192 - 1}",
+        ),
+        encoding="utf-8",
+    )
+    configuration = ConfigLoader(home).load()
+    provider_factory_calls: list[ProviderConfiguration] = []
+    agent_loop_constructions: list[object] = []
+
+    def provider_factory(provider_configuration: ProviderConfiguration) -> ModelProvider:
+        provider_factory_calls.append(provider_configuration)
+        raise AssertionError("Provider factory was called before budget preflight")
+
+    def unexpected_agent_loop(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        agent_loop_constructions.append(object())
+
+    monkeypatch.setattr(runtime_module, "AgentLoop", unexpected_agent_loop)
+    tasks_before = asyncio.all_tasks()
+    diagnostics = capture_diagnostics()
+
+    try:
+        with pytest.raises(SkillContextTooLargeError) as raised:
+            prepare_runtime(
+                agent_home=home,
+                workspace=runtime_workspace,
+                workspace_state=workspace_state,
+                configuration=configuration,
+                provider_factory=provider_factory,
+                now=lambda: NOW,
+                new_uuid=uuid4,
+                skill_catalog=catalog,
+            )
+    finally:
+        diagnostics.close()
+
+    assert raised.value.error.code == "skill_context_too_large"
+    assert provider_factory_calls == []
+    assert agent_loop_constructions == []
+    assert asyncio.all_tasks() == tasks_before
+    assert "Runtime composition failed" not in diagnostics.event_text
+    assert "Traceback" not in diagnostics.text
+
+
 @pytest.mark.asyncio
 async def test_conversation_summary_provider_keeps_skill_metadata_out_of_its_prompt(
     agent_home: Path,
@@ -255,12 +384,12 @@ async def test_conversation_summary_provider_keeps_skill_metadata_out_of_its_pro
     home.initialize()
     config_text = VALID_CONFIG.replace(
         "consolidation_message_threshold = 50", "consolidation_message_threshold = 4"
-    )
+    ).replace("[runtime]\n", "[runtime]\nenable_skill_always_load = true\n")
     (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
     instruction = agent_home / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_text(
-        "---\nname: planner\ndescription: Private catalog marker\n---\nprivate body\n",
+        "---\nname: planner\ndescription: Private catalog marker\nalways: true\n---\nprivate body\n",
         encoding="utf-8",
     )
     provider = ScriptedFakeProvider(
@@ -322,7 +451,9 @@ async def test_conversation_summary_provider_keeps_skill_metadata_out_of_its_pro
     summary_messages = provider.complete_requests[0].messages
     assert summary_messages[0]["content"] == conversation_summary_prompt()
     assert "Private catalog marker" not in json.dumps(summary_messages)
+    assert "private body" not in json.dumps(summary_messages)
     assert "<skill_catalog>" in cast(str, projected[0]["content"])
+    assert "<skill_always_load>" in cast(str, projected[0]["content"])
 
 
 @pytest.mark.asyncio

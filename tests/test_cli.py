@@ -5,7 +5,13 @@ import sys
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+import myclaw.terminal.cli as cli
+from myclaw.agent.runtime import SkillContextTooLargeError
+from myclaw.config.agent_home import AgentHome
+from myclaw.errors import ErrorInfo
+from myclaw.skills.catalog import SkillUnavailableError
 from tests.configuration.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,
@@ -14,6 +20,62 @@ from tests.configuration.test_config import (
     REDACTION_CONFIG,
     VALID_CONFIG,
 )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code", "secret"),
+    (
+        (
+            SkillUnavailableError(ErrorInfo("skill_unavailable", "Skill body is unavailable.")),
+            "skill_unavailable",
+            "PRIVATE-SKILL-BODY",
+        ),
+        (
+            SkillContextTooLargeError(
+                ErrorInfo(
+                    "skill_context_too_large",
+                    "Always-loaded Skill content exceeds the foreground chat input budget.",
+                )
+            ),
+            "skill_context_too_large",
+            "C:\\sensitive\\skill\\SKILL.md",
+        ),
+    ),
+)
+def test_cli_reports_runtime_skill_startup_failures_without_starting_conversation(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    expected_code: str,
+    secret: str,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    monkeypatch.setattr(AgentHome, "production", lambda: home)
+    monkeypatch.setattr(cli, "is_interactive_terminal", lambda: True)
+    conversation_calls: list[object] = []
+
+    def fail_runtime(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise failure
+
+    def record_conversation(runtime: object) -> None:
+        conversation_calls.append(runtime)
+
+    monkeypatch.setattr(cli, "RuntimeHost", fail_runtime)
+    monkeypatch.setattr(cli, "run_terminal_conversation", record_conversation)
+    monkeypatch.chdir(workspace)
+
+    result = CliRunner().invoke(cli.app, [])
+
+    assert result.exit_code == 1
+    assert result.output.count(f"{expected_code}:") == 1
+    assert result.output.count(str(failure)) == 1
+    assert secret not in result.output
+    assert "Traceback" not in result.output
+    assert conversation_calls == []
 
 
 def run_installed_myclaw(

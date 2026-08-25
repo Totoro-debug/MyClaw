@@ -9,6 +9,7 @@ from myclaw.config.config import ConfigError, ConfigLoader
 EXPECTED_DEFAULT_CONFIG = """[runtime]
 max_tool_result_chars = 4096
 max_iterations = 50
+enable_skill_always_load = false
 
 [memory]
 consolidation_message_threshold = 40
@@ -480,6 +481,26 @@ def test_valid_configuration_loads_as_typed_values(agent_home: Path) -> None:
     ) == (60000, 50, 12, "15 * * * *", ("claude-model",), "medium", 120)
 
 
+def test_explicit_always_load_setting_loads_as_a_boolean(agent_home: Path) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(
+        VALID_CONFIG.replace("[runtime]\n", "[runtime]\nenable_skill_always_load = true\n"),
+        encoding="utf-8",
+    )
+
+    configuration = loader.load()
+
+    assert configuration.runtime.enable_skill_always_load is True
+
+
+def test_generated_configuration_disables_always_load_by_default(agent_home: Path) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+
+    assert loader.ensure_default() is True
+    assert "enable_skill_always_load = false" in loader.path.read_text(encoding="utf-8")
+
+
 def test_omitted_defaulted_configuration_fields_use_accepted_defaults(agent_home: Path) -> None:
     loader = ConfigLoader(AgentHome(agent_home))
     loader.ensure_default()
@@ -493,7 +514,8 @@ def test_omitted_defaulted_configuration_fields_use_accepted_defaults(agent_home
         configuration.memory.batch_size,
         configuration.memory.schedule,
         configuration.models.routes["default"].reasoning_effort,
-    ) == (4096, 40, 10, "0 * * * *", None)
+        configuration.runtime.enable_skill_always_load,
+    ) == (4096, 40, 10, "0 * * * *", None, False)
 
 
 def test_config_view_redacts_nonempty_provider_keys_and_preserves_complete_content(
@@ -763,6 +785,13 @@ def test_config_view_reports_undefined_fields(
         (
             VALID_CONFIG.replace("max_tool_result_chars = 60000", "max_tool_result_chars = 999"),
             "runtime.max_tool_result_chars",
+        ),
+        (
+            VALID_CONFIG.replace(
+                "max_tool_result_chars = 60000",
+                'max_tool_result_chars = 60000\nenable_skill_always_load = "true"',
+            ),
+            "runtime.enable_skill_always_load",
         ),
         (
             VALID_CONFIG.replace(

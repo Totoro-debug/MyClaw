@@ -98,6 +98,7 @@ timeout = 60
 DEFAULT_CONFIG_CONTENT = """[runtime]
 max_tool_result_chars = 4096
 max_iterations = 50
+enable_skill_always_load = false
 
 [memory]
 consolidation_message_threshold = 40

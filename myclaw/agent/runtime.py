@@ -41,6 +41,7 @@ from myclaw.management.service import (
     ResolvedChatStatus,
     RuntimeStatusInput,
     RuntimeStatusService,
+    estimate_input_tokens,
 )
 from myclaw.memory.conversation_summary import (
     ConversationSummaryManager,
@@ -67,6 +68,14 @@ from myclaw.utils.async_tasks import await_task_preserving_cancellation
 from myclaw.utils.scheduler import AsyncioSchedulerClock, SchedulerClock
 
 type SessionReplacement = Callable[[str, bool], Awaitable[None]]
+
+
+class SkillContextTooLargeError(Exception):
+    """The frozen always-loaded Skill snapshot exceeds the chat input budget."""
+
+    def __init__(self, error: ErrorInfo) -> None:
+        self.error = error
+        super().__init__(error.message)
 
 
 class _RuntimeSchedulerOwner:
@@ -395,7 +404,7 @@ class RuntimeHost:
         self._skill_catalog = discover_skills(
             agent_home=agent_home,
             reserved_names=SUPPORTED_MANAGEMENT_COMMANDS,
-            enable_always_load=False,
+            enable_always_load=configuration.runtime.enable_skill_always_load,
         )
         self._terminal_rebind: Callable[[RuntimeBindings], Awaitable[None]] | None = None
         self._replacement_lock = asyncio.Lock()
@@ -629,7 +638,7 @@ def prepare_runtime(
             replace_session=replace_session,
             task_framer=task_framer,
         )
-    except WorkspaceStateError:
+    except (WorkspaceStateError, SkillContextTooLargeError):
         raise
     except Exception as error:
         logger.opt(exception=error).error(
@@ -664,7 +673,7 @@ def _prepare_runtime(
         active_skill_catalog = discover_skills(
             agent_home=agent_home,
             reserved_names=SUPPORTED_MANAGEMENT_COMMANDS,
-            enable_always_load=False,
+            enable_always_load=configuration.runtime.enable_skill_always_load,
         )
     workspace_identity = (
         workspace if isinstance(workspace, Workspace) else Workspace.from_path(workspace)
@@ -683,6 +692,12 @@ def _prepare_runtime(
     )
     schedule_service = ScheduleService(store=schedule_store, clock=schedule_clock)
     long_term_memory = active_workspace_state.long_term_memory_path.read_text(encoding="utf-8")
+    _preflight_skill_context_budget(
+        configuration=configuration,
+        workspace=workspace_identity,
+        long_term_memory=long_term_memory,
+        skill_catalog=active_skill_catalog,
+    )
     runtime_memory = RuntimeMemory(long_term_memory)
     resolved_timezone_name = get_localzone_name() if timezone_name is None else timezone_name
     foreground_context = ContextBuilder(
@@ -938,6 +953,41 @@ def _prepare_runtime(
         _management_service=management_service,
         _skill_catalog=active_skill_catalog,
     )
+
+
+def _preflight_skill_context_budget(
+    *,
+    configuration: UserConfiguration,
+    workspace: Workspace,
+    long_term_memory: str,
+    skill_catalog: SkillCatalog,
+) -> None:
+    """Reject an always-loaded snapshot only when its exact foreground projection overflows."""
+    if not any(entry.always_body is not None for entry in skill_catalog.entries):
+        return
+
+    resolved_chat = configuration.resolve_route("chat").route
+    system_prompt = foreground_chat_system_prompt(
+        workspace=workspace.path,
+        long_term_memory=long_term_memory,
+        skill_catalog=skill_catalog,
+    )
+    estimated = estimate_input_tokens(
+        RuntimeStatusInput(
+            system_prompt=system_prompt,
+            retained_messages=(),
+            tool_definitions=(),
+            runtime_context="",
+        )
+    )
+    available_input = resolved_chat.context_window - resolved_chat.max_output
+    if estimated > available_input:
+        raise SkillContextTooLargeError(
+            ErrorInfo(
+                "skill_context_too_large",
+                "Always-loaded Skill content exceeds the foreground chat input budget.",
+            )
+        )
 
 
 def _project_foreground_messages(

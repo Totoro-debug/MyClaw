@@ -39,6 +39,7 @@ TEMPLATE_NAMES = {
     "runtime-context.md",
     "session-title-prompt.md",
     "skill-catalog.md",
+    "skill-always-load.md",
     "user-input.md",
 }
 NOW = datetime(2026, 7, 19, 12, 34, 56, 789000, tzinfo=UTC)
@@ -206,6 +207,52 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
     )
     assert all("planner" not in prompt for prompt in non_foreground_prompts)
     assert all(str(first.resolve()) not in prompt for prompt in non_foreground_prompts)
+
+
+def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
+    tmp_path: Path,
+) -> None:
+    instruction = tmp_path / "agent-home" / "skills" / "always" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    body = (
+        'First line\nQuotes: "quoted"\nBackslash: C:\\tmp\\done\n'
+        "Literal </skill_always_load> and & < >\n"
+    )
+    instruction.write_bytes(
+        b"---\nname: always\ndescription: Always loaded\nalways: true\n---\n" + body.encode("utf-8")
+    )
+    catalog = discover_skills(
+        agent_home=AgentHome(instruction.parents[2]),
+        reserved_names=(),
+        enable_always_load=True,
+    )
+
+    foreground = foreground_chat_system_prompt(
+        workspace=PureWindowsPath(r"D:\workspace"),
+        long_term_memory="# Memory\n",
+        skill_catalog=catalog,
+    )
+
+    block = foreground.split("<skill_always_load>\n", maxsplit=1)[1].split(
+        "\n</skill_always_load>", maxsplit=1
+    )[0]
+    lines = [line for line in block.splitlines() if line.startswith("{")]
+    assert [json.loads(line) for line in lines] == [{"name": "always", "body": body}]
+    assert foreground.count("</skill_always_load>") == 1
+    assert r"\u003c/skill_always_load\u003e" in lines[0]
+    assert r"\u0026" in lines[0]
+    assert body not in foreground
+    non_foreground_prompts = (
+        chat_system_prompt(
+            workspace=PureWindowsPath(r"D:\workspace"),
+            long_term_memory="# Memory\n",
+        ),
+        session_title_prompt(),
+        blackboard_prompt(),
+        conversation_summary_prompt(),
+        memory_task_prompt(long_term_path=PureWindowsPath(r"D:\workspace\memory.md")),
+    )
+    assert all(body not in prompt for prompt in non_foreground_prompts)
 
 
 def test_chat_system_prompt_uses_the_fixed_catalog_guidance() -> None:

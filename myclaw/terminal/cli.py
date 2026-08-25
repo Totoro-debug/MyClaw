@@ -7,12 +7,13 @@ from uuid import uuid4
 import typer
 from rich.console import Console
 
-from myclaw.agent.runtime import RuntimeHost
+from myclaw.agent.runtime import RuntimeHost, SkillContextTooLargeError
 from myclaw.agent.workspace_state import WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader
 from myclaw.errors import ErrorInfo
 from myclaw.provider.factory import create_provider
+from myclaw.skills.catalog import SkillUnavailableError
 from myclaw.terminal.conversation import is_interactive_terminal, run_terminal_conversation
 
 app = typer.Typer(
@@ -79,6 +80,9 @@ def main(context: typer.Context) -> None:
         )
     except WorkspaceStateError as workspace_state_error:
         _print_error(workspace_state_error.error, workspace_state_error.path)
+        raise typer.Exit(code=1) from None
+    except (SkillUnavailableError, SkillContextTooLargeError) as skill_error:
+        _print_error_info(skill_error.error)
         raise typer.Exit(code=1) from None
     run_terminal_conversation(runtime)
 
