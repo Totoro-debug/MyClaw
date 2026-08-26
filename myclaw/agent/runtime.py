@@ -63,12 +63,7 @@ from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.skills.catalog import (
-    ManualSkillInvocation,
-    RuntimeSkillSnapshot,
-    SkillMetadata,
-    build_runtime_skill_snapshot,
-)
+from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader, SkillMetadata, SkillSnapshot
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.tool_gateway import ToolResult
@@ -176,7 +171,7 @@ class PreparedRuntime:
     _memory_manager: MemoryManager
     _context_builder: ContextBuilder
     _management_service: ManagementViewService
-    _skill_snapshot: RuntimeSkillSnapshot
+    _skill_snapshot: SkillSnapshot
 
     @property
     def session_id(self) -> str:
@@ -201,7 +196,7 @@ class PreparedRuntime:
             control=self.control,
             management_dispatcher=self.management_dispatcher,
             start=self.start,
-            skill_metadata=self._skill_snapshot.catalog.entries,
+            skill_metadata=self._skill_snapshot.metadata,
         )
 
     def validate_unstarted(self) -> None:
@@ -409,11 +404,6 @@ class RuntimeHost:
         )
         self._monotonic_now = monotonic_now
         self._timezone_name = get_localzone_name() if timezone_name is None else timezone_name
-        self._skill_snapshot = build_runtime_skill_snapshot(
-            agent_home=agent_home,
-            reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
-            enable_always_load=configuration.runtime.enable_skill_always_load,
-        )
         self._terminal_rebind: Callable[[RuntimeBindings], Awaitable[None]] | None = None
         self._replacement_lock = asyncio.Lock()
         self._closed = False
@@ -433,7 +423,6 @@ class RuntimeHost:
             schedule_scheduler_clock=self._schedule_scheduler_clock,
             monotonic_now=monotonic_now,
             timezone_name=self._timezone_name,
-            skill_snapshot=self._skill_snapshot,
             replace_session=self._replacement_callback(initial_token),
         )
         try:
@@ -516,7 +505,6 @@ class RuntimeHost:
                 schedule_scheduler_clock=self._schedule_scheduler_clock,
                 monotonic_now=self._monotonic_now,
                 timezone_name=self._timezone_name,
-                skill_snapshot=self._skill_snapshot,
                 session=target_session,
                 replace_session=self._replacement_callback(token),
             )
@@ -575,7 +563,7 @@ class RuntimeHost:
                 )
             old = self._runtime
             if session_id == old.session_id:
-                return
+                await old.session.wait_for_pending_persist()
             target_token = object()
             target = self._prepare_target(session_id, target_token)
             if old.control.has_active_run and not force:
@@ -619,7 +607,7 @@ def prepare_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
-    skill_snapshot: RuntimeSkillSnapshot | None = None,
+    skill_snapshot: SkillSnapshot | None = None,
     session: Session | None = None,
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
@@ -669,7 +657,7 @@ def _prepare_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
-    skill_snapshot: RuntimeSkillSnapshot | None = None,
+    skill_snapshot: SkillSnapshot | None = None,
     session: Session | None = None,
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
@@ -678,11 +666,11 @@ def _prepare_runtime(
     """Prepare one unstarted Runtime Generation."""
     active_skill_snapshot = skill_snapshot
     if active_skill_snapshot is None:
-        active_skill_snapshot = build_runtime_skill_snapshot(
-            agent_home=agent_home,
+        active_skill_snapshot = SkillLoader(
+            root=agent_home.skills_directory,
             reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
             enable_always_load=configuration.runtime.enable_skill_always_load,
-        )
+        ).load()
     workspace_path = normalize_workspace_path(workspace)
     active_workspace_state = (
         WorkspaceState(workspace_path) if workspace_state is None else workspace_state
@@ -881,7 +869,7 @@ def _prepare_runtime(
 
     agent_loop = AgentLoop(
         workspace=workspace_path,
-        skill_catalog=active_skill_snapshot.catalog,
+        skill_snapshot=active_skill_snapshot,
         session=active_session,
         schedule_service=schedule_service,
         model_router=router,
@@ -962,11 +950,11 @@ def _preflight_skill_context_budget(
     context_builder: ContextBuilder,
     long_term_memory: str,
     session_id: str,
-    skill_snapshot: RuntimeSkillSnapshot,
+    skill_snapshot: SkillSnapshot,
     tool_schemas: tuple[OpenAIToolSchema, ...],
 ) -> None:
     """Reject an always-loaded snapshot when the minimum real foreground request overflows."""
-    if not skill_snapshot.always_loaded:
+    if not any(skill.always for skill in skill_snapshot.skills):
         return
 
     resolved_chat = configuration.resolve_route("chat").route

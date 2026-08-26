@@ -352,12 +352,7 @@ def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
 
     runtime_contract = (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8")
     for claim in (
-        "`RuntimeSkillSnapshot`",
-        "`catalog` 只拥有 metadata",
-        "`always_loaded` 单独拥有",
-        "entries: tuple[SkillMetadata, ...]",
         "原始 `name` 不做 trim",
-        "返回包含 frontmatter 与原始换行的完整 document",
         "固定十个结构化 Tool schemas",
         "Tab is not intercepted",
     ):

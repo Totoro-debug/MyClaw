@@ -44,10 +44,9 @@ from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
-    RuntimeSkillSnapshot,
-    SkillCatalog,
+    SkillLoader,
     SkillMetadata,
-    build_runtime_skill_snapshot,
+    SkillSnapshot,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
@@ -196,7 +195,7 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
         runtime_workspace: Path,
         timezone_name: str,
         *,
-        skill_snapshot: RuntimeSkillSnapshot | None = None,
+        skill_snapshot: SkillSnapshot | None = None,
     ) -> ContextBuilder:
         discovered_names.append(timezone_name)
         snapshot_presence.append(skill_snapshot is not None)
@@ -239,10 +238,7 @@ async def test_injected_skill_catalog_root_is_the_only_confirmation_free_skill_r
     agent_home_file = home.skills_directory / "legacy" / "SKILL.md"
     agent_home_file.parent.mkdir(parents=True)
     agent_home_file.write_text("agent home root", encoding="utf-8")
-    snapshot = RuntimeSkillSnapshot(
-        catalog=SkillCatalog(root=catalog_root, entries=()),
-        always_loaded=(),
-    )
+    snapshot = SkillSnapshot(root=catalog_root, skills=())
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -357,7 +353,7 @@ async def test_foreground_skill_catalog_is_included_in_the_exact_budget_guard(
 def _always_skill_budget_fixture(
     agent_home: Path,
     workspace: Path,
-) -> tuple[AgentHome, Path, WorkspaceState, RuntimeSkillSnapshot, int, int]:
+) -> tuple[AgentHome, Path, WorkspaceState, SkillSnapshot, int, int]:
     home = AgentHome(agent_home)
     home.initialize()
     instruction = agent_home / "skills" / "always" / "SKILL.md"
@@ -369,11 +365,11 @@ def _always_skill_budget_fixture(
     runtime_workspace = workspace
     workspace_state = WorkspaceState(runtime_workspace)
     workspace_state.initialize(agent_home_root=home.path)
-    snapshot = build_runtime_skill_snapshot(
-        agent_home=home,
+    snapshot = SkillLoader(
+        root=home.skills_directory,
         reserved_names=(),
         enable_always_load=True,
-    )
+    ).load()
     long_term_memory = workspace_state.long_term_memory_path.read_text(encoding="utf-8")
     context_builder = ContextBuilder(
         runtime_workspace,
@@ -388,7 +384,7 @@ def _always_skill_budget_fixture(
     gateway = ToolGateway(
         workspace=runtime_workspace,
         schedule_service=schedule_service,
-        skill_root=snapshot.catalog.root,
+        skill_root=snapshot.root,
     )
     estimated_without_tools = estimate_input_tokens(
         runtime_module._foreground_runtime_status_input(
@@ -551,11 +547,11 @@ async def test_metadata_only_skill_skips_startup_skill_budget_preflight(
         "---\nname: metadata-only\ndescription: Metadata only\n---\n",
         encoding="utf-8",
     )
-    snapshot = build_runtime_skill_snapshot(
-        agent_home=home,
+    snapshot = SkillLoader(
+        root=home.skills_directory,
         reserved_names=(),
         enable_always_load=False,
-    )
+    ).load()
     (agent_home / "config.toml").write_text(
         VALID_CONFIG.replace("context_window = 200000", "context_window = 8193"),
         encoding="utf-8",

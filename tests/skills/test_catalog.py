@@ -1,128 +1,81 @@
 import os
 import subprocess
 from collections.abc import Callable
-from dataclasses import fields
+from io import StringIO
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Self, cast
 
 import pytest
+from loguru import logger
 
-from myclaw.config.agent_home import AgentHome
 from myclaw.management.commands import MANAGEMENT_COMMANDS
-from myclaw.skills.catalog import (
-    AlwaysLoadedSkill,
-    RuntimeSkillSnapshot,
-    SkillCatalog,
-    SkillMetadata,
-    SkillUnavailableError,
-    build_runtime_skill_snapshot,
-)
-from myclaw.utils.host_filesystem import HOST_FILESYSTEM
-from tests.fixtures.diagnostic_capture import capture_diagnostics
+from myclaw.skills.catalog import SkillLoader, SkillSnapshot
 
 
-def _catalog(
+def _snapshot(
     *,
-    agent_home: AgentHome,
-    reserved_names: tuple[str, ...],
-    enable_always_load: bool,
-) -> SkillCatalog:
-    return build_runtime_skill_snapshot(
-        agent_home=agent_home,
+    agent_home: Path,
+    reserved_names: tuple[str, ...] = (),
+    enable_always_load: bool = False,
+) -> SkillSnapshot:
+    return SkillLoader(
+        root=agent_home / "skills",
         reserved_names=reserved_names,
         enable_always_load=enable_always_load,
-    ).catalog
+    ).load()
 
 
 def test_missing_skills_root_is_empty_without_creating_directory(agent_home: Path) -> None:
-    home = AgentHome(agent_home)
+    snapshot = _snapshot(agent_home=agent_home)
 
-    catalog = _catalog(
-        agent_home=home,
-        reserved_names=(),
-        enable_always_load=False,
-    )
-
-    assert catalog.root == (agent_home / "skills").resolve()
-    assert catalog.entries == ()
-    assert not home.skills_directory.exists()
+    assert snapshot.root == (agent_home / "skills").resolve()
+    assert snapshot.skills == ()
+    assert not (agent_home / "skills").exists()
 
 
 def test_existing_empty_skills_root_is_empty(agent_home: Path) -> None:
     root = agent_home / "skills"
     root.mkdir(parents=True)
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
+    snapshot = _snapshot(agent_home=agent_home)
 
-    assert catalog.root == root.resolve()
-    assert catalog.entries == ()
-    assert root.is_dir()
+    assert snapshot.root == root.resolve()
+    assert snapshot.skills == ()
 
 
-def test_valid_direct_child_retains_exact_name_and_trimmed_description_only(
-    agent_home: Path,
-) -> None:
+def test_valid_candidate_retains_document_and_validated_metadata(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
-    instruction.write_text(
-        '---\nname: "plan"\ndescription: "  Do useful work.  "\n---\nsecret body\n',
-        encoding="utf-8",
-    )
+    document = b'---\nname: "plan"\ndescription: "  Do useful work.  "\n---\nbody\r\n'
+    instruction.write_bytes(document)
 
-    snapshot = build_runtime_skill_snapshot(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-    catalog = snapshot.catalog
+    snapshot = _snapshot(agent_home=agent_home)
 
-    assert len(catalog.entries) == 1
-    entry = catalog.entries[0]
-    assert entry.name == "plan"
-    assert entry.description == "Do useful work."
-    assert entry.path == instruction.resolve()
-    assert snapshot.always_loaded == ()
-    assert catalog.get("plan") == entry
+    assert len(snapshot.skills) == 1
+    skill = snapshot.skills[0]
+    assert skill.metadata.name == "plan"
+    assert skill.metadata.description == "Do useful work."
+    assert skill.metadata.path == instruction.resolve()
+    assert skill.document == document.decode("utf-8")
+    assert skill.always is False
+    assert snapshot.metadata == (skill.metadata,)
 
 
-def test_name_starting_with_a_digit_is_excluded(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "numeric" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_text(
-        "---\nname: 1plan\ndescription: A plan\n---\n",
-        encoding="utf-8",
-    )
-
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-
-    assert catalog.entries == ()
-
-
-def test_reserved_management_command_name_is_excluded(agent_home: Path) -> None:
+def test_reserved_management_command_names_are_excluded(agent_home: Path) -> None:
     for command in MANAGEMENT_COMMANDS:
         name = command.token.removeprefix("/")
         instruction = agent_home / "skills" / f"{name}-skill" / "SKILL.md"
         instruction.parent.mkdir(parents=True)
-        instruction.write_text(
-            f"---\nname: {name}\ndescription: Reserved command guide\n---\n",
-            encoding="utf-8",
+        instruction.write_bytes(
+            f"---\nname: {name}\ndescription: Reserved command guide\n---\n".encode()
         )
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
+    snapshot = _snapshot(
+        agent_home=agent_home,
         reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
-        enable_always_load=False,
     )
 
-    assert catalog.entries == ()
+    assert snapshot.skills == ()
 
 
 def test_first_valid_duplicate_in_canonical_path_order_wins(agent_home: Path) -> None:
@@ -130,67 +83,25 @@ def test_first_valid_duplicate_in_canonical_path_order_wins(agent_home: Path) ->
     earlier = agent_home / "skills" / "a-candidate" / "SKILL.md"
     for instruction in (later, earlier):
         instruction.parent.mkdir(parents=True)
-        instruction.write_text(
-            "---\nname: duplicate\ndescription: Same name\n---\n",
-            encoding="utf-8",
-        )
+        instruction.write_bytes(b"---\nname: duplicate\ndescription: Same name\n---\n")
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
+    snapshot = _snapshot(agent_home=agent_home)
 
-    assert tuple(entry.path for entry in catalog.entries) == (earlier.resolve(),)
+    assert tuple(skill.metadata.path for skill in snapshot.skills) == (earlier.resolve(),)
 
 
-def test_valid_entries_follow_canonical_path_order_regardless_of_creation_order(
-    agent_home: Path,
-) -> None:
+def test_valid_entries_follow_canonical_path_order(agent_home: Path) -> None:
     later = agent_home / "skills" / "z-candidate" / "SKILL.md"
     earlier = agent_home / "skills" / "a-candidate" / "SKILL.md"
     for instruction, name in ((later, "later"), (earlier, "earlier")):
         instruction.parent.mkdir(parents=True)
-        instruction.write_text(
-            f"---\nname: {name}\ndescription: Valid metadata\n---\n",
-            encoding="utf-8",
+        instruction.write_bytes(
+            f"---\nname: {name}\ndescription: Valid metadata\n---\n".encode()
         )
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
+    snapshot = _snapshot(agent_home=agent_home)
 
-    assert tuple(entry.name for entry in catalog.entries) == ("earlier", "later")
-    assert tuple(entry.path for entry in catalog.entries) == (
-        earlier.resolve(),
-        later.resolve(),
-    )
-
-
-def test_invalid_candidate_logs_path_and_reason_without_body(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "invalid" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(
-        b"---\nname: invalid\ndescription: missing closing delimiter\nsecret: body\n"
-        b"SECRET-SKILL-BODY\n"
-    )
-    diagnostics = capture_diagnostics()
-
-    try:
-        catalog = _catalog(
-            agent_home=AgentHome(agent_home),
-            reserved_names=(),
-            enable_always_load=False,
-        )
-    finally:
-        diagnostics.close()
-
-    assert catalog.entries == ()
-    assert "Skipping invalid Skill candidate" in diagnostics.event_text
-    assert str(instruction.parent) in diagnostics.event_text
-    assert "SECRET-SKILL-BODY" not in diagnostics.text
+    assert tuple(skill.metadata.name for skill in snapshot.skills) == ("earlier", "later")
 
 
 def test_only_direct_child_skill_directories_are_scanned(agent_home: Path) -> None:
@@ -198,43 +109,34 @@ def test_only_direct_child_skill_directories_are_scanned(agent_home: Path) -> No
     nested = agent_home / "skills" / "container" / "nested" / "SKILL.md"
     for instruction, name in ((direct, "direct"), (nested, "nested")):
         instruction.parent.mkdir(parents=True)
-        instruction.write_text(
-            f"---\nname: {name}\ndescription: Valid metadata\n---\n",
-            encoding="utf-8",
+        instruction.write_bytes(
+            f"---\nname: {name}\ndescription: Valid metadata\n---\n".encode()
         )
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
+    snapshot = _snapshot(agent_home=agent_home)
 
-    assert tuple(entry.name for entry in catalog.entries) == ("direct",)
+    assert tuple(skill.metadata.name for skill in snapshot.skills) == ("direct",)
 
 
 @pytest.mark.parametrize(
     "document",
     (
-        "name: valid\ndescription: no opening delimiter\n",
-        "---\nname: valid\ndescription: missing closing\n",
-        "---\nname: [broken\ndescription: invalid YAML\n---\n",
-        "---\n- item\n---\n",
-        "---\ndescription: missing name\n---\n",
-        "---\nname: valid\ndescription: [not a string]\n---\n",
+        b"name: valid\ndescription: no opening delimiter\n",
+        b"---\nname: valid\ndescription: missing closing\n",
+        b"---\nname: [broken\ndescription: invalid YAML\n---\n",
+        b"---\n- item\n---\n",
+        b"---\ndescription: missing name\n---\n",
+        b"---\nname: valid\ndescription: [not a string]\n---\n",
     ),
 )
-def test_invalid_frontmatter_shapes_are_excluded(agent_home: Path, document: str) -> None:
+def test_invalid_frontmatter_shapes_are_excluded(agent_home: Path, document: bytes) -> None:
     instruction = agent_home / "skills" / "invalid-frontmatter" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
-    instruction.write_text(document, encoding="utf-8")
+    instruction.write_bytes(document)
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
+    snapshot = _snapshot(agent_home=agent_home)
 
-    assert catalog.entries == ()
+    assert snapshot.skills == ()
 
 
 @pytest.mark.parametrize(
@@ -248,6 +150,8 @@ def test_invalid_frontmatter_shapes_are_excluded(agent_home: Path, document: str
         ("1a", False),
         ("A", False),
         ("a.b", False),
+        (" a", False),
+        ("a ", False),
     ),
 )
 def test_name_character_and_length_contract(
@@ -257,47 +161,13 @@ def test_name_character_and_length_contract(
 ) -> None:
     instruction = agent_home / "skills" / "name-boundary" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
-    instruction.write_text(
-        f'---\nname: "{name}"\ndescription: "Valid description"\n---\n',
-        encoding="utf-8",
+    instruction.write_bytes(
+        f'---\nname: "{name}"\ndescription: "Valid description"\n---\n'.encode()
     )
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
+    snapshot = _snapshot(agent_home=agent_home)
 
-    assert bool(catalog.entries) is accepted
-
-
-@pytest.mark.parametrize(
-    "name_yaml",
-    (
-        '" leading"',
-        '"trailing "',
-        '"alpha\\tbeta"',
-        ">-\n  alpha\n  beta",
-    ),
-)
-def test_name_whitespace_is_rejected_without_normalization(
-    agent_home: Path,
-    name_yaml: str,
-) -> None:
-    instruction = agent_home / "skills" / "whitespace-name" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_text(
-        f"---\nname: {name_yaml}\ndescription: Valid description\n---\n",
-        encoding="utf-8",
-    )
-
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-
-    assert catalog.entries == ()
+    assert bool(snapshot.skills) is accepted
 
 
 @pytest.mark.parametrize(
@@ -317,68 +187,294 @@ def test_description_trimmed_length_contract(
 ) -> None:
     instruction = agent_home / "skills" / "description-boundary" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
-    instruction.write_text(
-        f'---\nname: "description"\ndescription: "{description}"\n---\n',
-        encoding="utf-8",
+    instruction.write_bytes(
+        f'---\nname: "description"\ndescription: "{description}"\n---\n'.encode()
     )
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
+    snapshot = _snapshot(agent_home=agent_home)
 
-    assert bool(catalog.entries) is accepted
+    assert bool(snapshot.skills) is accepted
     if accepted:
-        assert catalog.entries[0].description == description.strip()
+        assert snapshot.skills[0].metadata.description == description.strip()
 
 
-def test_non_utf8_frontmatter_is_excluded(agent_home: Path) -> None:
+def test_non_utf8_document_is_excluded_without_logging_its_body(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "non-utf8" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(b"---\nname: valid\ndescription: \xff\n---\nBODY\n")
-
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
+    instruction.write_bytes(
+        b"---\nname: invalid\ndescription: Invalid UTF-8\n---\nSECRET-BODY\xff\n"
     )
+    diagnostics = StringIO()
+    handler = logger.add(diagnostics, format="{message}", level="WARNING")
+    try:
+        snapshot = _snapshot(agent_home=agent_home)
+    finally:
+        logger.remove(handler)
 
-    assert catalog.entries == ()
+    assert snapshot.skills == ()
+    assert "SECRET-BODY" not in diagnostics.getvalue()
 
 
 def test_non_regular_instruction_path_is_excluded(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "directory-instruction" / "SKILL.md"
     instruction.mkdir(parents=True)
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
+    snapshot = _snapshot(agent_home=agent_home)
+
+    assert snapshot.skills == ()
+
+
+def test_invalid_candidate_diagnostic_contains_path_and_reason_but_not_document(
+    agent_home: Path,
+) -> None:
+    instruction = agent_home / "skills" / "invalid" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        b"---\nname: invalid\ndescription: missing closing delimiter\n"
+        b"SECRET-SKILL-BODY\n"
     )
+    diagnostics = StringIO()
+    handler = logger.add(diagnostics, format="{message}", level="WARNING")
+    try:
+        snapshot = _snapshot(agent_home=agent_home)
+    finally:
+        logger.remove(handler)
 
-    assert catalog.entries == ()
+    assert snapshot.skills == ()
+    assert str(instruction.parent) in diagnostics.getvalue()
+    assert "SECRET-SKILL-BODY" not in diagnostics.getvalue()
 
 
-def test_metadata_discovery_does_not_decode_body_bytes(agent_home: Path) -> None:
+def test_loader_reads_each_candidate_once_as_one_complete_bytes_read(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = agent_home / "skills"
+    documents = {
+        "a-first": b"---\nname: shared\ndescription: First\n---\nfirst\n",
+        "b-duplicate": b"---\nname: shared\ndescription: Duplicate\n---\nsecond\n",
+        "c-invalid": b"---\nname: invalid\ndescription: Missing delimiter\ninvalid body\n",
+        "d-reserved": b"---\nname: config\ndescription: Reserved\n---\nreserved\n",
+    }
+    for name, document in documents.items():
+        instruction = root / name / "SKILL.md"
+        instruction.parent.mkdir(parents=True)
+        instruction.write_bytes(document)
+
+    original_open = cast(Callable[..., Any], Path.open)
+    opens = 0
+    reads: list[tuple[Path, int]] = []
+
+    class RecordingStream:
+        def __init__(self, stream: Any, path: Path) -> None:
+            self._stream = stream
+            self._path = path
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+            del exc_type, exc_value, traceback
+            self._stream.close()
+
+        def fileno(self) -> int:
+            return cast(int, self._stream.fileno())
+
+        def read(self, size: int = -1) -> bytes:
+            reads.append((self._path, size))
+            return cast(bytes, self._stream.read(size))
+
+    def recording_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal opens
+        stream = original_open(path, *args, **kwargs)
+        if path.name != "SKILL.md":
+            return stream
+        opens += 1
+        return RecordingStream(stream, path)
+
+    monkeypatch.setattr(Path, "open", recording_open)
+
+    snapshot = _snapshot(agent_home=agent_home, reserved_names=("/config",))
+
+    assert tuple(skill.metadata.name for skill in snapshot.skills) == ("shared",)
+    assert opens == len(documents)
+    assert [(path.parent.name, size) for path, size in reads] == [
+        (name, -1) for name in documents
+    ]
+
+
+def test_snapshot_is_immutable_and_manual_resolution_does_not_read_disk(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    document = b"---\nname: planner\ndescription: Planner\n---\nfirst\n"
+    instruction.write_bytes(document)
+    snapshot = _snapshot(agent_home=agent_home)
+
+    with pytest.raises(AttributeError):
+        snapshot.skills[0].document = "changed"  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        snapshot.skills.append(snapshot.skills[0])  # type: ignore[attr-defined]
+
+    instruction.unlink()
+
+    def deny_open(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("manual resolution must use the published snapshot")
+
+    monkeypatch.setattr(Path, "open", deny_open)
+    invocation = snapshot.resolve_manual("/planner do it")
+
+    assert invocation is not None
+    assert invocation.metadata == snapshot.skills[0].metadata
+    assert invocation.request == "do it"
+    assert invocation.body == document.decode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "delimiter",
+    (" ", "\t", "\r", "\n", "\u2003"),
+)
+def test_manual_resolution_removes_only_first_unicode_whitespace_delimiter(
+    agent_home: Path,
+    delimiter: str,
+) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: planner\ndescription: Plan work\n---\nbody\n")
+    snapshot = _snapshot(agent_home=agent_home)
+    request = f"{delimiter}  keep\n\tthis"
+
+    invocation = snapshot.resolve_manual(f"/planner{request}")
+
+    assert invocation is not None
+    assert invocation.request == "  keep\n\tthis"
+
+
+@pytest.mark.parametrize(
+    "raw_input",
+    ("planner", " /planner", "/Planner", "/plan", "/unknown", "/config"),
+)
+def test_manual_resolution_returns_none_for_non_matching_input(
+    agent_home: Path,
+    raw_input: str,
+) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: planner\ndescription: Plan work\n---\nbody\n")
+    snapshot = _snapshot(agent_home=agent_home, reserved_names=("/config",))
+
+    assert snapshot.resolve_manual(raw_input) is None
+
+
+def test_manual_resolution_rejects_non_string_input(agent_home: Path) -> None:
+    snapshot = _snapshot(agent_home=agent_home)
+
+    with pytest.raises(TypeError, match="Skill input must be a string"):
+        snapshot.resolve_manual(cast(str, object()))
+
+
+def test_enabled_always_skill_is_fully_loaded_once_and_frozen(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = agent_home / "skills" / "always" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    document = b"---\nname: always\ndescription: Always loaded\nalways: true\n---\nbody\n"
+    instruction.write_bytes(document)
+    original_open = cast(Callable[..., Any], Path.open)
+    opens = 0
+
+    def recording_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal opens
+        if path.name == "SKILL.md":
+            opens += 1
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", recording_open)
+    snapshot = _snapshot(agent_home=agent_home, enable_always_load=True)
+
+    assert len(snapshot.skills) == 1
+    assert snapshot.skills[0].always is True
+    assert snapshot.skills[0].document == document.decode("utf-8")
+    assert opens == 1
+
+
+@pytest.mark.parametrize("always_field", ("always: false\n", ""))
+def test_non_opted_in_skill_is_not_always_loaded(agent_home: Path, always_field: str) -> None:
     instruction = agent_home / "skills" / "metadata-only" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(
-        b"---\nname: metadata-only\ndescription: Metadata is valid\n---\n\xffBODY\n"
+        (
+            "---\nname: metadata-only\ndescription: Metadata only\n"
+            + always_field
+            + "---\nbody\n"
+        ).encode()
     )
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
+    snapshot = _snapshot(agent_home=agent_home, enable_always_load=True)
+
+    assert len(snapshot.skills) == 1
+    assert snapshot.skills[0].always is False
+
+
+def test_disabled_always_field_is_not_interpreted_or_warned(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "always-candidate" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        b'---\nname: always-candidate\ndescription: Metadata only\nalways: "true"\n---\nbody\n'
+    )
+    diagnostics = StringIO()
+    handler = logger.add(diagnostics, format="{message}", level="WARNING")
+    try:
+        snapshot = _snapshot(agent_home=agent_home, enable_always_load=False)
+    finally:
+        logger.remove(handler)
+
+    assert snapshot.skills[0].always is False
+    assert "Ignoring non-boolean Skill always field" not in diagnostics.getvalue()
+
+
+def test_non_boolean_always_warns_once_and_is_not_always_loaded(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "invalid-always" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(
+        b'---\nname: invalid-always\ndescription: Invalid policy\nalways: "true"\n---\n'
+        b"SECRET DOCUMENT\n"
+    )
+    diagnostics = StringIO()
+    handler = logger.add(diagnostics, format="{message}", level="WARNING")
+    try:
+        snapshot = _snapshot(agent_home=agent_home, enable_always_load=True)
+    finally:
+        logger.remove(handler)
+
+    assert snapshot.skills[0].always is False
+    assert diagnostics.getvalue().count("Ignoring non-boolean Skill always field") == 1
+    assert "SECRET DOCUMENT" not in diagnostics.getvalue()
+
+
+def test_duplicate_always_candidate_does_not_override_first_valid_entry(
+    agent_home: Path,
+) -> None:
+    first = agent_home / "skills" / "a-first" / "SKILL.md"
+    duplicate = agent_home / "skills" / "b-duplicate" / "SKILL.md"
+    first.parent.mkdir(parents=True)
+    duplicate.parent.mkdir(parents=True)
+    first.write_bytes(
+        b"---\nname: duplicate\ndescription: First candidate\nalways: false\n---\nfirst\n"
+    )
+    duplicate.write_bytes(
+        b"---\nname: duplicate\ndescription: Later candidate\nalways: true\n---\nsecond\n"
     )
 
-    assert tuple(entry.name for entry in catalog.entries) == ("metadata-only",)
-    assert tuple(field.name for field in fields(catalog.entries[0])) == (
-        "name",
-        "description",
-        "path",
-    )
+    snapshot = _snapshot(agent_home=agent_home, enable_always_load=True)
+
+    assert len(snapshot.skills) == 1
+    assert snapshot.skills[0].metadata.description == "First candidate"
+    assert snapshot.skills[0].always is False
 
 
 def test_instruction_symlink_escape_is_excluded_when_links_are_available(
@@ -386,10 +482,7 @@ def test_instruction_symlink_escape_is_excluded_when_links_are_available(
 ) -> None:
     outside = agent_home.parent / "outside" / "SKILL.md"
     outside.parent.mkdir()
-    outside.write_text(
-        "---\nname: escaped\ndescription: Outside the Skill root\n---\n",
-        encoding="utf-8",
-    )
+    outside.write_bytes(b"---\nname: escaped\ndescription: Outside\n---\nbody\n")
     instruction = agent_home / "skills" / "escaped" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     try:
@@ -397,13 +490,9 @@ def test_instruction_symlink_escape_is_excluded_when_links_are_available(
     except (OSError, NotImplementedError) as error:
         pytest.skip(f"file links unavailable: {error}")
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
+    snapshot = _snapshot(agent_home=agent_home)
 
-    assert catalog.entries == ()
+    assert snapshot.skills == ()
 
 
 def test_skill_directory_reparse_escape_is_excluded_when_links_are_available(
@@ -412,10 +501,7 @@ def test_skill_directory_reparse_escape_is_excluded_when_links_are_available(
     outside = agent_home.parent / "outside-directory"
     instruction = outside / "SKILL.md"
     instruction.parent.mkdir()
-    instruction.write_text(
-        "---\nname: escaped\ndescription: Outside the Skill root\n---\n",
-        encoding="utf-8",
-    )
+    instruction.write_bytes(b"---\nname: escaped\ndescription: Outside\n---\nbody\n")
     linked_directory = agent_home / "skills" / "escaped"
     linked_directory.parent.mkdir(parents=True)
     try:
@@ -431,623 +517,22 @@ def test_skill_directory_reparse_escape_is_excluded_when_links_are_available(
     except (OSError, NotImplementedError, subprocess.CalledProcessError) as error:
         pytest.skip(f"directory links unavailable: {error}")
 
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
+    snapshot = _snapshot(agent_home=agent_home)
 
-    assert catalog.entries == ()
+    assert snapshot.skills == ()
 
 
-def test_catalog_snapshot_exposes_immutable_entries_and_lookup(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "immutable" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_text(
-        "---\nname: immutable\ndescription: Immutable metadata\n---\n",
-        encoding="utf-8",
-    )
-
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-    entry = catalog.get("immutable")
-
-    assert isinstance(catalog.entries, tuple)
-    assert entry is catalog.entries[0]
-    with pytest.raises(AttributeError):
-        catalog.entries.append(entry)  # type: ignore[attr-defined]
-    with pytest.raises(AttributeError):
-        entry.name = "changed"  # type: ignore[misc]
-
-
-def test_runtime_skill_snapshot_requires_an_ordered_unique_catalog_subset(
-    tmp_path: Path,
-) -> None:
-    first = SkillMetadata("first", "First", tmp_path / "first" / "SKILL.md")
-    second = SkillMetadata("second", "Second", tmp_path / "second" / "SKILL.md")
-    outside = SkillMetadata("outside", "Outside", tmp_path / "outside" / "SKILL.md")
-    catalog = SkillCatalog(root=tmp_path, entries=(first, second))
-    first_body = AlwaysLoadedSkill(first, "first body")
-    second_body = AlwaysLoadedSkill(second, "second body")
-
-    snapshot = RuntimeSkillSnapshot(catalog, (first_body, second_body))
-
-    assert snapshot.always_loaded == (first_body, second_body)
-    for invalid in (
-        (second_body, first_body),
-        (first_body, first_body),
-        (AlwaysLoadedSkill(outside, "outside body"),),
-    ):
-        with pytest.raises(ValueError, match="ordered Catalog subset"):
-            RuntimeSkillSnapshot(catalog, invalid)
-
-
-def test_invalid_earlier_duplicate_does_not_block_later_valid_entry(agent_home: Path) -> None:
-    invalid = agent_home / "skills" / "a-invalid" / "SKILL.md"
-    valid = agent_home / "skills" / "b-valid" / "SKILL.md"
-    invalid.parent.mkdir(parents=True)
-    valid.parent.mkdir(parents=True)
-    invalid.write_text(
-        "---\nname: duplicate\ndescription: \n---\n",
-        encoding="utf-8",
-    )
-    valid.write_text(
-        "---\nname: duplicate\ndescription: Later valid metadata\n---\n",
-        encoding="utf-8",
-    )
-
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-
-    assert tuple(entry.path for entry in catalog.entries) == (valid.resolve(),)
-
-
-def test_disabled_always_load_does_not_interpret_always_metadata(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "always-candidate" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(
-        b'---\nname: always-candidate\ndescription: Metadata only\nalways: "true"\n---\n\xffbody\n'
-    )
-    diagnostics = capture_diagnostics()
-
-    try:
-        snapshot = build_runtime_skill_snapshot(
-            agent_home=AgentHome(agent_home),
-            reserved_names=(),
-            enable_always_load=False,
-        )
-    finally:
-        diagnostics.close()
-
-    assert len(snapshot.catalog.entries) == 1
-    assert snapshot.always_loaded == ()
-    assert "Ignoring non-boolean Skill always field" not in diagnostics.event_text
-
-
-def test_enabled_boolean_always_reads_and_freezes_the_complete_body_once(
-    agent_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    instruction = agent_home / "skills" / "always" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    document = "---\nname: always\ndescription: Always loaded\nalways: true\n---\nComplete body\n"
-    instruction.write_bytes(document.encode("utf-8"))
-    original_open = cast(Callable[..., Any], Path.open)
-    instruction_opens = 0
-
-    def recording_open(path: Path, *args: Any, **kwargs: Any) -> Any:
-        nonlocal instruction_opens
-        if path.name == "SKILL.md":
-            instruction_opens += 1
-        return original_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", recording_open)
-
-    snapshot = build_runtime_skill_snapshot(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=True,
-    )
-
-    assert snapshot.catalog.entries == (snapshot.always_loaded[0].metadata,)
-    assert snapshot.always_loaded[0].body == document
-    assert instruction_opens == 2  # one metadata read and one complete-document read
-
-
-@pytest.mark.parametrize("always_field", ("always: false\n", ""))
-def test_enabled_non_opted_in_skill_remains_metadata_only(
-    agent_home: Path,
-    always_field: str,
-) -> None:
-    instruction = agent_home / "skills" / "metadata-only" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(
-        (
-            "---\nname: metadata-only\ndescription: Metadata only\n"
-            + always_field
-            + "---\nnot frozen\n"
-        ).encode("utf-8")
-    )
-
-    snapshot = build_runtime_skill_snapshot(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=True,
-    )
-
-    assert len(snapshot.catalog.entries) == 1
-    assert snapshot.always_loaded == ()
-
-
-def test_duplicate_always_candidate_does_not_override_the_first_valid_entry(
-    agent_home: Path,
-) -> None:
-    first = agent_home / "skills" / "a-first" / "SKILL.md"
-    duplicate = agent_home / "skills" / "b-duplicate" / "SKILL.md"
-    first.parent.mkdir(parents=True)
-    duplicate.parent.mkdir(parents=True)
-    first.write_bytes(
-        b"---\nname: duplicate\ndescription: First candidate\nalways: false\n---\nfirst\n"
-    )
-    duplicate.write_bytes(
-        b"---\nname: duplicate\ndescription: Later candidate\nalways: true\n---\nsecond\n"
-    )
-
-    snapshot = build_runtime_skill_snapshot(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=True,
-    )
-
-    assert len(snapshot.catalog.entries) == 1
-    assert snapshot.catalog.entries[0].description == "First candidate"
-    assert snapshot.always_loaded == ()
-
-
-def test_enabled_always_non_utf8_body_fails_closed(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "binary-always" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(
-        b"---\nname: binary-always\ndescription: Binary body\nalways: true\n---\n\xff"
-    )
-
-    with pytest.raises(SkillUnavailableError) as failure:
-        build_runtime_skill_snapshot(
-            agent_home=AgentHome(agent_home),
-            reserved_names=(),
-            enable_always_load=True,
-        )
-
-    assert failure.value.error.code == "skill_unavailable"
-
-
-def test_always_body_is_frozen_in_the_runtime_snapshot(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "frozen" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(
-        b"---\nname: frozen\ndescription: Frozen body\nalways: true\n---\nfirst\n"
-    )
-
-    snapshot = build_runtime_skill_snapshot(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=True,
-    )
-    instruction.write_bytes(
-        b"---\nname: frozen\ndescription: Frozen body\nalways: true\n---\nsecond\n"
-    )
-
-    assert snapshot.always_loaded[0].body == (
-        "---\nname: frozen\ndescription: Frozen body\nalways: true\n---\nfirst\n"
-    )
-
-
-def test_always_opt_in_change_during_complete_read_fails_closed(
-    agent_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    instruction = agent_home / "skills" / "changing-always" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(
-        b"---\nname: changing-always\ndescription: Changing policy\nalways: true\n---\n"
-        b"body from the opted-in version\n"
-    )
-    original_open = cast(Callable[..., Any], Path.open)
-    open_count = 0
-
-    def replace_after_metadata(path: Path, *args: Any, **kwargs: Any) -> Any:
-        nonlocal open_count
-        if path.name == "SKILL.md":
-            open_count += 1
-            if open_count == 2:
-                instruction.write_bytes(
-                    b"---\nname: changing-always\ndescription: Changing policy\nalways: false\n---\n"
-                    b"body from the changed version\n"
-                )
-        return original_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", replace_after_metadata)
-
-    with pytest.raises(SkillUnavailableError) as failure:
-        build_runtime_skill_snapshot(
-            agent_home=AgentHome(agent_home),
-            reserved_names=(),
-            enable_always_load=True,
-        )
-
-    assert failure.value.error.code == "skill_unavailable"
-
-
-def test_enabled_non_boolean_always_warns_once_and_stays_metadata_only(
-    agent_home: Path,
-) -> None:
-    instruction = agent_home / "skills" / "invalid-always" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(
-        b'---\nname: invalid-always\ndescription: Invalid policy\nalways: "true"\n---\n'
-        b"SECRET BODY\n"
-    )
-    diagnostics = capture_diagnostics()
-
-    try:
-        snapshot = build_runtime_skill_snapshot(
-            agent_home=AgentHome(agent_home),
-            reserved_names=(),
-            enable_always_load=True,
-        )
-    finally:
-        diagnostics.close()
-
-    assert len(snapshot.catalog.entries) == 1
-    assert snapshot.always_loaded == ()
-    assert diagnostics.event_text.count("Ignoring non-boolean Skill always field") == 1
-    assert "SECRET BODY" not in diagnostics.text
-
-
-def test_read_body_returns_the_complete_current_skill_document(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "reader" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(
-        b"---\r\nname: reader\r\ndescription: Read the body\r\n---\r\nfirst line\r\nsecond line\r\n"
-    )
-
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-
-    assert catalog.read_body(catalog.entries[0]) == instruction.read_bytes().decode("utf-8")
-
-
-def test_resolve_manual_returns_the_complete_document_for_an_exact_slash_name(
-    agent_home: Path,
-) -> None:
-    instruction = agent_home / "skills" / "planner" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(b"---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n")
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-
-    invocation = catalog.resolve_manual("/planner")
-
-    assert invocation is not None
-    assert invocation.metadata == catalog.entries[0]
-    assert invocation.request == ""
-    assert invocation.body == instruction.read_text(encoding="utf-8")
-
-
-@pytest.mark.parametrize(
-    "delimiter",
-    (" ", "\t", "\r", "\n", "\u2003"),
-)
-def test_resolve_manual_removes_only_the_first_unicode_whitespace_delimiter(
-    agent_home: Path,
-    delimiter: str,
-) -> None:
-    instruction = agent_home / "skills" / "planner" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_text(
-        "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
-        encoding="utf-8",
-    )
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-    request = f"{delimiter}  keep\n\tthis"
-
-    invocation = catalog.resolve_manual(f"/planner{request}")
-
-    assert invocation is not None
-    assert invocation.request == "  keep\n\tthis"
-
-
-def test_resolve_manual_reads_a_matching_body_once(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "planner" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_text(
-        "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
-        encoding="utf-8",
-    )
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-    reads: list[object] = []
-    original_read_body = catalog.read_body
-
-    def read_body(metadata: object) -> str:
-        reads.append(metadata)
-        return original_read_body(metadata)  # type: ignore[arg-type]
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(catalog, "read_body", read_body)
-    try:
-        invocation = catalog.resolve_manual("/planner do it")
-    finally:
-        monkeypatch.undo()
-
-    assert invocation is not None
-    assert len(reads) == 1
-
-
-@pytest.mark.parametrize(
-    "raw_input",
-    ("planner", " /planner", "/Planner", "/plan", "/unknown", "/config"),
-)
-def test_resolve_manual_does_not_read_non_matching_input(
-    agent_home: Path,
-    raw_input: str,
-) -> None:
-    instruction = agent_home / "skills" / "planner" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_text(
-        "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
-        encoding="utf-8",
-    )
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=("/config",),
-        enable_always_load=False,
-    )
-    reads: list[object] = []
-
-    def read_body(metadata: object) -> str:
-        reads.append(metadata)
-        return "unexpected"
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(catalog, "read_body", read_body)
-    try:
-        assert catalog.resolve_manual(raw_input) is None
-    finally:
-        monkeypatch.undo()
-
-    assert reads == []
-
-
-def test_resolve_manual_rejects_non_string_input(agent_home: Path) -> None:
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-
-    with pytest.raises(TypeError, match="Skill input must be a string"):
-        catalog.resolve_manual(cast(str, object()))
-
-
-def test_read_body_rejects_metadata_changed_after_discovery(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "stale" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(b"---\nname: stale\ndescription: Original\n---\nbody\n")
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-    instruction.write_bytes(b"---\nname: stale\ndescription: Changed\n---\nbody\n")
-
-    with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0])
-
-    assert failure.value.error.code == "skill_unavailable"
-    assert str(failure.value) == failure.value.error.message
-
-
-def test_read_body_maps_missing_target_to_skill_unavailable(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "missing" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(b"---\nname: missing\ndescription: Missing\n---\nbody\n")
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-    instruction.unlink()
-
-    with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0])
-
-    assert failure.value.error.code == "skill_unavailable"
-
-
-def test_read_body_maps_unreadable_target_to_skill_unavailable(
-    agent_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    instruction = agent_home / "skills" / "unreadable" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(b"---\nname: unreadable\ndescription: Unreadable\n---\nbody\n")
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-
-    def deny_open(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise PermissionError("denied by test")
-
-    monkeypatch.setattr(Path, "open", deny_open)
-
-    with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0])
-
-    assert failure.value.error.code == "skill_unavailable"
-
-
-def test_read_body_maps_non_utf8_content_to_skill_unavailable(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "binary" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(b"---\nname: binary\ndescription: Binary\n---\n\xffbody\n")
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-
-    with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0])
-
-    assert failure.value.error.code == "skill_unavailable"
-
-
-def test_read_body_does_not_cache_the_body(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "fresh" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(b"---\nname: fresh\ndescription: Fresh\n---\nfirst\n")
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-    metadata = catalog.entries[0]
-    assert catalog.read_body(metadata) == "---\nname: fresh\ndescription: Fresh\n---\nfirst\n"
-
-    instruction.write_bytes(b"---\nname: fresh\ndescription: Fresh\n---\nsecond\n")
-
-    assert catalog.read_body(metadata) == "---\nname: fresh\ndescription: Fresh\n---\nsecond\n"
-
-
-def test_read_body_keeps_regular_hardlinks_readable(agent_home: Path) -> None:
+def test_regular_hardlink_instruction_remains_readable_when_available(agent_home: Path) -> None:
     outside = agent_home.parent / "shared-skill.md"
-    outside.write_bytes(b"---\nname: linked\ndescription: Linked body\n---\nbody\n")
+    outside.write_bytes(b"---\nname: linked\ndescription: Linked\n---\nbody\n")
     instruction = agent_home / "skills" / "linked" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     try:
         instruction.hardlink_to(outside)
     except (OSError, NotImplementedError) as error:
         pytest.skip(f"hard links unavailable: {error}")
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
 
-    assert catalog.read_body(catalog.entries[0]) == instruction.read_text(encoding="utf-8")
+    snapshot = _snapshot(agent_home=agent_home)
 
-
-def test_read_body_uses_one_opened_descriptor_instead_of_a_second_path_read(
-    agent_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    instruction = agent_home / "skills" / "stable" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(b"---\nname: stable\ndescription: Stable body\n---\noriginal\n")
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-    path_reads: list[Path] = []
-
-    def substitute_path_read(path: Path) -> bytes:
-        path_reads.append(path)
-        return b"---\nname: stable\ndescription: Stable body\n---\noutside\n"
-
-    monkeypatch.setattr(Path, "read_bytes", substitute_path_read)
-
-    assert catalog.read_body(catalog.entries[0]) == (
-        "---\nname: stable\ndescription: Stable body\n---\noriginal\n"
-    )
-    assert path_reads == []
-
-
-def test_read_body_rejects_a_symlink_replacement_after_open(
-    agent_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    instruction = agent_home / "skills" / "stable" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(b"---\nname: stable\ndescription: Stable body\n---\noriginal\n")
-    outside = agent_home.parent / "replacement.md"
-    outside.write_bytes(b"---\nname: stable\ndescription: Stable body\n---\noutside\n")
-    probe = instruction.parent / "link-probe"
-    try:
-        probe.symlink_to(outside)
-        probe.unlink()
-    except (OSError, NotImplementedError) as error:
-        pytest.skip(f"file links unavailable: {error}")
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-    validate_opened = HOST_FILESYSTEM.require_opened_contained_regular_file
-
-    def replace_before_validation(descriptor: int, path: Path, *, within: Path) -> Path:
-        instruction.unlink()
-        instruction.symlink_to(outside)
-        return validate_opened(descriptor, path, within=within)
-
-    monkeypatch.setattr(
-        HOST_FILESYSTEM,
-        "require_opened_contained_regular_file",
-        replace_before_validation,
-    )
-
-    with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0])
-
-    assert failure.value.error.code == "skill_unavailable"
-
-
-@pytest.mark.parametrize(
-    "replacement",
-    (
-        b"---\nname: 1-invalid\ndescription: Stable body\n---\nbody\n",
-        b"---\nname: stable\ndescription: ''\n---\nbody\n",
-        b"---\n- name\n- stable\n---\nbody\n",
-    ),
-)
-def test_read_body_uses_the_same_metadata_rules_as_discovery(
-    agent_home: Path,
-    replacement: bytes,
-) -> None:
-    instruction = agent_home / "skills" / "stable" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(b"---\nname: stable\ndescription: Stable body\n---\nbody\n")
-    catalog = _catalog(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
-    instruction.write_bytes(replacement)
-
-    with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0])
-
-    assert failure.value.error.code == "skill_unavailable"
+    assert len(snapshot.skills) == 1
+    assert snapshot.skills[0].document.endswith("body\n")

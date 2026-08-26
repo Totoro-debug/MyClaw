@@ -1,18 +1,15 @@
-"""Runtime-lifetime discovery of user-authored Skill metadata."""
+"""Generation-scoped loading of user-authored Skill documents."""
 
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 
 import yaml  # type: ignore[import-untyped]
 from loguru import logger
 
-from myclaw.config.agent_home import AgentHome
-from myclaw.errors import ErrorInfo
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _NAME_PATTERN = re.compile(r"[a-z_-][a-z0-9_-]{0,63}")
@@ -29,15 +26,20 @@ class SkillMetadata:
 
 
 @dataclass(frozen=True, slots=True)
-class AlwaysLoadedSkill:
-    """One Runtime Lifetime-owned frozen complete Skill document."""
+class LoadedSkill:
+    """One complete Skill document captured for a Runtime Generation."""
 
     metadata: SkillMetadata
-    body: str
+    document: str
+    always: bool
 
     def __post_init__(self) -> None:
-        if not isinstance(self.metadata, SkillMetadata) or not isinstance(self.body, str):
-            raise TypeError("Always-loaded Skill requires metadata and a body")
+        if not isinstance(self.metadata, SkillMetadata):
+            raise TypeError("Loaded Skill requires Skill metadata")
+        if not isinstance(self.document, str):
+            raise TypeError("Loaded Skill requires a complete document")
+        if not isinstance(self.always, bool):
+            raise TypeError("Loaded Skill always flag must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,48 +51,35 @@ class ManualSkillInvocation:
     body: str
 
 
-class SkillUnavailableError(Exception):
-    """A complete Skill document could not be read from its catalog snapshot."""
+@dataclass(frozen=True, slots=True)
+class SkillSnapshot:
+    """Immutable complete Skill documents for one Runtime Generation."""
 
-    def __init__(self, error: ErrorInfo) -> None:
-        self.error = error
-        super().__init__(error.message)
+    root: Path
+    skills: tuple[LoadedSkill, ...]
 
-
-class SkillCatalog:
-    """Ordered immutable Skill metadata and a name lookup snapshot."""
-
-    def __init__(self, *, root: Path, entries: Iterable[SkillMetadata]) -> None:
-        self._root = Path(root)
-        self._entries = tuple(entries)
-        if not all(isinstance(entry, SkillMetadata) for entry in self._entries):
-            raise TypeError("Skill Catalog entries must be Skill metadata")
-        self._by_name: Mapping[str, SkillMetadata] = MappingProxyType(
-            {entry.name: entry for entry in self._entries}
-        )
-        if len(self._by_name) != len(self._entries):
-            raise ValueError("Skill Catalog metadata names must be unique")
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, Path):
+            raise TypeError("Skill snapshot root must be a Path")
+        if not isinstance(self.skills, tuple) or not all(
+            isinstance(skill, LoadedSkill) for skill in self.skills
+        ):
+            raise TypeError("Skill snapshot skills must be a tuple of Loaded Skill")
+        names = [skill.metadata.name for skill in self.skills]
+        if len(set(names)) != len(names):
+            raise ValueError("Skill snapshot names must be unique")
 
     @property
-    def entries(self) -> tuple[SkillMetadata, ...]:
-        """Return the ordered immutable metadata snapshot."""
-        return self._entries
+    def metadata(self) -> tuple[SkillMetadata, ...]:
+        """Return the ordered metadata projection used by presentation surfaces."""
+        return tuple(skill.metadata for skill in self.skills)
 
-    @property
-    def root(self) -> Path:
-        """Return the canonical Skill root used by this snapshot."""
-        return self._root
-
-    def get(self, name: str) -> SkillMetadata | None:
-        """Return metadata for an exact Skill name, when present."""
-        return self._by_name.get(name)
-
-    def read_body(self, metadata: SkillMetadata) -> str:
-        """Read and revalidate one complete catalog Skill document without retaining it."""
-        return _read_complete_body(self, metadata, require_always=False)
+    def get(self, name: str) -> LoadedSkill | None:
+        """Return one captured Skill by its exact authored name."""
+        return next((skill for skill in self.skills if skill.metadata.name == name), None)
 
     def resolve_manual(self, raw_input: str) -> ManualSkillInvocation | None:
-        """Resolve one exact slash invocation and load its current complete document."""
+        """Resolve one exact slash invocation without filesystem access."""
         if not isinstance(raw_input, str):
             raise TypeError("Skill input must be a string")
         if not raw_input.startswith("/"):
@@ -107,177 +96,156 @@ class SkillCatalog:
         else:
             name = token[:delimiter]
             request = token[delimiter + 1 :]
-        metadata = self.get(name)
-        if metadata is None:
+        skill = self.get(name)
+        if skill is None:
             return None
         return ManualSkillInvocation(
-            metadata=metadata,
+            metadata=skill.metadata,
             request=request,
-            body=self.read_body(metadata),
+            body=skill.document,
         )
 
 
-@dataclass(frozen=True, slots=True)
-class RuntimeSkillSnapshot:
-    """Runtime Lifetime-owned Skill metadata and opted-in frozen bodies."""
+class SkillLoader:
+    """Discover and atomically capture valid complete Skill documents."""
 
-    catalog: SkillCatalog
-    always_loaded: tuple[AlwaysLoadedSkill, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.catalog, SkillCatalog):
-            raise TypeError("Runtime Skill snapshot requires a Skill Catalog")
-        if not isinstance(self.always_loaded, tuple) or not all(
-            isinstance(skill, AlwaysLoadedSkill) for skill in self.always_loaded
-        ):
-            raise TypeError("Runtime Skill snapshot always-loaded entries must be a tuple")
-        positions = {metadata.name: index for index, metadata in enumerate(self.catalog.entries)}
-        previous = -1
-        for skill in self.always_loaded:
-            position = positions.get(skill.metadata.name)
-            if (
-                position is None
-                or self.catalog.entries[position] != skill.metadata
-                or position <= previous
-            ):
-                raise ValueError(
-                    "Runtime Skill snapshot always-loaded entries must be an ordered Catalog subset"
-                )
-            previous = position
-
-
-def build_runtime_skill_snapshot(
-    *,
-    agent_home: AgentHome,
-    reserved_names: Collection[str],
-    enable_always_load: bool,
-) -> RuntimeSkillSnapshot:
-    """Atomically build one Runtime Lifetime Skill snapshot."""
-    reserved = {name.removeprefix("/") for name in reserved_names}
-    root = agent_home.skills_directory.resolve()
-    if not root.is_dir():
-        logger.info("Discovered Skills count=0")
-        return RuntimeSkillSnapshot(
-            catalog=SkillCatalog(root=root, entries=()),
-            always_loaded=(),
+    def __init__(
+        self,
+        *,
+        root: Path,
+        reserved_names: Collection[str],
+        enable_always_load: bool,
+    ) -> None:
+        if not isinstance(root, Path):
+            raise TypeError("Skill Loader root must be a Path")
+        if not isinstance(enable_always_load, bool):
+            raise TypeError("Skill Loader always-load flag must be a boolean")
+        self._root = root.resolve()
+        self._reserved_names = frozenset(
+            name.removeprefix("/") for name in reserved_names
         )
+        self._enable_always_load = enable_always_load
 
-    entries: list[SkillMetadata] = []
-    always_names: set[str] = set()
-    names: set[str] = set()
-    try:
-        children = tuple(root.iterdir())
-    except OSError:
-        logger.warning("Skipping Skill discovery path={} reason=Skill root is unavailable", root)
-        logger.info("Discovered Skills count=0")
-        return RuntimeSkillSnapshot(
-            catalog=SkillCatalog(root=root, entries=()),
-            always_loaded=(),
-        )
+    def load(self) -> SkillSnapshot:
+        """Return one immutable snapshot of the current Skill directory."""
+        root = self._root
+        if not root.is_dir():
+            logger.info("Discovered Skills count=0")
+            return SkillSnapshot(root=root, skills=())
 
-    candidates: list[tuple[Path, Path]] = []
-    for candidate in children:
-        if not candidate.is_dir():
-            continue
         try:
-            canonical_candidate = candidate.resolve(strict=True)
-        except (OSError, RuntimeError):
-            _log_invalid(candidate, "Skill directory canonical path is unavailable")
-            continue
-        candidates.append((canonical_candidate, candidate))
-
-    for canonical_candidate, candidate in sorted(
-        candidates,
-        key=lambda item: (str(item[0]), str(item[1])),
-    ):
-        if not canonical_candidate.is_relative_to(root):
-            _log_invalid(candidate, "Skill directory canonical path escapes Skill root")
-            continue
-        instruction = candidate / "SKILL.md"
-        try:
-            status = instruction.stat()
+            children = tuple(root.iterdir())
         except OSError:
-            _log_invalid(candidate, "SKILL.md is unavailable")
-            continue
-        if not HOST_FILESYSTEM.is_regular_file(status):
-            _log_invalid(candidate, "SKILL.md is not a regular file")
-            continue
+            logger.warning("Skipping Skill discovery path={} reason=Skill root is unavailable", root)
+            logger.info("Discovered Skills count=0")
+            return SkillSnapshot(root=root, skills=())
+
+        candidates: list[tuple[Path, Path]] = []
+        for candidate in children:
+            if not candidate.is_dir():
+                continue
+            try:
+                canonical_candidate = candidate.resolve(strict=True)
+            except (OSError, RuntimeError):
+                _log_invalid(candidate, "Skill directory canonical path is unavailable")
+                continue
+            candidates.append((canonical_candidate, candidate))
+
+        skills: list[LoadedSkill] = []
+        names: set[str] = set()
+        for canonical_candidate, candidate in sorted(
+            candidates,
+            key=lambda item: (str(item[0]), str(item[1])),
+        ):
+            if not canonical_candidate.is_relative_to(root):
+                _log_invalid(candidate, "Skill directory canonical path escapes Skill root")
+                continue
+
+            instruction = candidate / "SKILL.md"
+            try:
+                status = instruction.stat()
+            except OSError:
+                _log_invalid(candidate, "SKILL.md is unavailable")
+                continue
+            if not HOST_FILESYSTEM.is_regular_file(status):
+                _log_invalid(candidate, "SKILL.md is not a regular file")
+                continue
+            try:
+                path = instruction.resolve(strict=True)
+            except (OSError, RuntimeError):
+                _log_invalid(candidate, "SKILL.md canonical path is unavailable")
+                continue
+            if not path.is_relative_to(root):
+                _log_invalid(candidate, "SKILL.md canonical path escapes Skill root")
+                continue
+
+            skill, reason = self._load_candidate(instruction, path, root)
+            if skill is None:
+                _log_invalid(candidate, reason)
+                continue
+            if skill.metadata.name in self._reserved_names:
+                _log_invalid(candidate, "name is reserved")
+                continue
+            if skill.metadata.name in names:
+                _log_invalid(candidate, "name is duplicated")
+                continue
+            names.add(skill.metadata.name)
+            skills.append(skill)
+
+        logger.info("Discovered Skills count={}", len(skills))
+        return SkillSnapshot(root=root, skills=tuple(skills))
+
+    def _load_candidate(
+        self,
+        instruction: Path,
+        path: Path,
+        root: Path,
+    ) -> tuple[LoadedSkill | None, str]:
         try:
-            path = instruction.resolve(strict=True)
-        except (OSError, RuntimeError):
-            _log_invalid(candidate, "SKILL.md canonical path is unavailable")
-            continue
-        if not path.is_relative_to(root):
-            _log_invalid(candidate, "SKILL.md canonical path escapes Skill root")
-            continue
-        metadata, always_value, reason = _read_metadata(
-            instruction,
+            io_path = HOST_FILESYSTEM.path_for_io(instruction)
+            with io_path.open("rb") as stream:
+                opened_path = HOST_FILESYSTEM.require_opened_contained_regular_file(
+                    stream.fileno(),
+                    path,
+                    within=root,
+                )
+                if opened_path != path:
+                    raise ValueError("Skill path does not match its canonical path")
+                raw_content = stream.read()
+            if not opened_path.is_relative_to(root):
+                raise ValueError("Skill path escapes the canonical Skill root")
+        except (OSError, RuntimeError, ValueError):
+            return None, "SKILL.md could not be safely read"
+
+        try:
+            content = raw_content.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "SKILL.md is not valid UTF-8"
+
+        metadata, always_value, reason = _parse_document(
+            content,
             path,
-            interpret_always=enable_always_load,
+            interpret_always=self._enable_always_load,
         )
         if metadata is None:
-            _log_invalid(candidate, reason)
-            continue
-        if enable_always_load:
-            if always_value is not _MISSING and not isinstance(always_value, bool):
-                logger.warning(
-                    "Ignoring non-boolean Skill always field path={} reason=always must be a boolean",
-                    candidate,
-                )
-        if metadata.name in reserved:
-            _log_invalid(candidate, "name is reserved")
-            continue
-        if metadata.name in names:
-            _log_invalid(candidate, "name is duplicated")
-            continue
-        names.add(metadata.name)
-        if enable_always_load and always_value is True:
-            always_names.add(metadata.name)
-        entries.append(metadata)
-    logger.info("Discovered Skills count={}", len(entries))
-    catalog = SkillCatalog(root=root, entries=entries)
-    always_loaded = tuple(
-        AlwaysLoadedSkill(
-            metadata=metadata,
-            body=_read_complete_body(catalog, metadata, require_always=True),
+            return None, reason
+        if (
+            self._enable_always_load
+            and always_value is not _MISSING
+            and not isinstance(always_value, bool)
+        ):
+            logger.warning(
+                "Ignoring non-boolean Skill always field path={} reason=always must be a boolean",
+                instruction.parent,
+            )
+        return (
+            LoadedSkill(
+                metadata=metadata,
+                document=content,
+                always=self._enable_always_load and always_value is True,
+            ),
+            "",
         )
-        for metadata in catalog.entries
-        if metadata.name in always_names
-    )
-    return RuntimeSkillSnapshot(catalog=catalog, always_loaded=always_loaded)
-
-
-def _read_metadata(
-    instruction: Path,
-    path: Path,
-    *,
-    interpret_always: bool,
-) -> tuple[SkillMetadata | None, object, str]:
-    try:
-        with instruction.open("rb") as stream:
-            opening = stream.readline()
-            if not _is_delimiter(opening):
-                return None, _MISSING, "frontmatter opening delimiter is missing"
-            frontmatter: list[bytes] = []
-            for line in stream:
-                if _is_delimiter(line):
-                    break
-                frontmatter.append(line)
-            else:
-                return None, _MISSING, "frontmatter closing delimiter is missing"
-    except OSError:
-        return None, _MISSING, "SKILL.md could not be read"
-    try:
-        document: object = yaml.safe_load(b"".join(frontmatter).decode("utf-8"))
-    except UnicodeDecodeError:
-        return None, _MISSING, "frontmatter is not valid UTF-8"
-    except yaml.YAMLError:
-        return None, _MISSING, "frontmatter YAML is invalid"
-    metadata, reason = _validate_metadata(document, path)
-    if metadata is None:
-        return None, _MISSING, reason
-    always_value = _always_value(document) if interpret_always else _MISSING
-    return metadata, always_value, ""
 
 
 def _parse_document(
@@ -288,7 +256,7 @@ def _parse_document(
 ) -> tuple[SkillMetadata | None, object, str]:
     lines = content.splitlines(keepends=True)
     if not lines or not _is_text_delimiter(lines[0]):
-        return None, _MISSING, content
+        return None, _MISSING, "frontmatter opening delimiter is missing"
     frontmatter: list[str] = []
     closing_delimiter_found = False
     for line in lines[1:]:
@@ -297,57 +265,16 @@ def _parse_document(
             break
         frontmatter.append(line)
     if not closing_delimiter_found:
-        return None, _MISSING, content
+        return None, _MISSING, "frontmatter closing delimiter is missing"
     try:
         document: object = yaml.safe_load("".join(frontmatter))
     except yaml.YAMLError:
-        return None, _MISSING, content
-    metadata, _reason = _validate_metadata(document, path)
+        return None, _MISSING, "frontmatter YAML is invalid"
+    metadata, reason = _validate_metadata(document, path)
+    if metadata is None:
+        return None, _MISSING, reason
     always_value = _always_value(document) if interpret_always else _MISSING
-    return metadata, always_value, content
-
-
-def _read_complete_body(
-    catalog: SkillCatalog,
-    metadata: SkillMetadata,
-    *,
-    require_always: bool,
-) -> str:
-    if not isinstance(metadata, SkillMetadata):
-        raise _skill_unavailable()
-    retained = catalog._by_name.get(metadata.name)
-    if retained is None or retained != metadata:
-        raise _skill_unavailable()
-
-    try:
-        io_path = HOST_FILESYSTEM.path_for_io(metadata.path)
-        with io_path.open("rb") as stream:
-            path = HOST_FILESYSTEM.require_opened_contained_regular_file(
-                stream.fileno(),
-                metadata.path,
-                within=catalog.root,
-            )
-            if path != metadata.path:
-                raise ValueError("Skill path no longer matches the catalog snapshot")
-            raw_content = stream.read()
-        if not path.is_relative_to(catalog.root):
-            raise ValueError("Skill path is no longer contained by the catalog root")
-    except (OSError, RuntimeError, ValueError) as error:
-        raise _skill_unavailable() from error
-
-    try:
-        content = raw_content.decode("utf-8")
-    except UnicodeError as error:
-        raise _skill_unavailable() from error
-
-    parsed, always_value, document = _parse_document(
-        content,
-        path,
-        interpret_always=require_always,
-    )
-    if parsed is None or parsed != metadata or (require_always and always_value is not True):
-        raise _skill_unavailable()
-    return document
+    return metadata, always_value, ""
 
 
 def _always_value(document: object) -> object:
@@ -376,16 +303,8 @@ def _validate_metadata(document: object, path: Path) -> tuple[SkillMetadata | No
     )
 
 
-def _is_delimiter(line: bytes) -> bool:
-    return line.rstrip(b"\r\n") == b"---"
-
-
 def _is_text_delimiter(line: str) -> bool:
     return line.rstrip("\r\n") == "---"
-
-
-def _skill_unavailable() -> SkillUnavailableError:
-    return SkillUnavailableError(ErrorInfo("skill_unavailable", "Skill body is unavailable."))
 
 
 def _log_invalid(candidate: Path, reason: str) -> None:
@@ -393,11 +312,9 @@ def _log_invalid(candidate: Path, reason: str) -> None:
 
 
 __all__ = [
-    "AlwaysLoadedSkill",
+    "LoadedSkill",
     "ManualSkillInvocation",
-    "RuntimeSkillSnapshot",
-    "SkillCatalog",
+    "SkillLoader",
     "SkillMetadata",
-    "SkillUnavailableError",
-    "build_runtime_skill_snapshot",
+    "SkillSnapshot",
 ]

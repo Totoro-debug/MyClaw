@@ -11,7 +11,6 @@ import myclaw.terminal.cli as cli
 from myclaw.agent.runtime import SkillContextTooLargeError
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
-from myclaw.skills.catalog import SkillUnavailableError
 from tests.configuration.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,
@@ -25,11 +24,6 @@ from tests.configuration.test_config import (
 @pytest.mark.parametrize(
     ("failure", "expected_code", "secret"),
     (
-        (
-            SkillUnavailableError(ErrorInfo("skill_unavailable", "Skill body is unavailable.")),
-            "skill_unavailable",
-            "PRIVATE-SKILL-BODY",
-        ),
         (
             SkillContextTooLargeError(
                 ErrorInfo(

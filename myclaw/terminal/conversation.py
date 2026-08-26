@@ -2903,8 +2903,6 @@ class TerminalConversationApp(App[None]):
         input_area: _ConversationInput,
     ) -> None:
         try:
-            if self._control.project_foreground_conversation().session_id == session_id:
-                return
             dispatcher = self._management_dispatcher
             if dispatcher is None:
                 await self._mount_management_rows(

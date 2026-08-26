@@ -4677,7 +4677,8 @@ async def test_runtime_rebind_clears_stale_skill_completion_state(
             "/resume - Resume a Conversation Session",
             "/memory - View Long-term Memory",
             "/dream - Process pending Conversation Summaries",
-            "/first - Original first",
+            "/first - Changed first",
+            "/second - New second",
         ]
         assert completion.highlighted == 0
         assert app.screen.focused is input_area

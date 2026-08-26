@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -24,7 +24,7 @@ from myclaw.provider.models import (
     ReasoningEffort,
 )
 from myclaw.session.session import Session
-from myclaw.skills.catalog import RuntimeSkillSnapshot
+from myclaw.skills.catalog import SkillLoader, SkillSnapshot
 from myclaw.terminal.conversation import TerminalConversationApp
 from myclaw.tools.base import OpenAIToolSchema
 from tests.configuration.test_config import VALID_CONFIG
@@ -147,7 +147,7 @@ def _host(
 
 
 @pytest.mark.asyncio
-async def test_runtime_host_reuses_skill_snapshot_across_generation_replacement(
+async def test_runtime_host_refreshes_skill_snapshot_across_generation_replacement(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -156,26 +156,14 @@ async def test_runtime_host_reuses_skill_snapshot_across_generation_replacement(
     first_skill.parent.mkdir(parents=True)
     first_skill.write_bytes(b"---\nname: first\ndescription: Original first\n---\n")
     snapshot_builds = 0
-    build_snapshot = cast(
-        Callable[..., RuntimeSkillSnapshot],
-        runtime_module.__dict__["build_runtime_skill_snapshot"],
-    )
+    original_load = SkillLoader.load
 
-    def recording_build_snapshot(
-        *,
-        agent_home: AgentHome,
-        reserved_names: Sequence[str],
-        enable_always_load: bool,
-    ) -> RuntimeSkillSnapshot:
+    def recording_load(loader: object) -> SkillSnapshot:
         nonlocal snapshot_builds
         snapshot_builds += 1
-        return build_snapshot(
-            agent_home=agent_home,
-            reserved_names=reserved_names,
-            enable_always_load=enable_always_load,
-        )
+        return original_load(loader)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(runtime_module, "build_runtime_skill_snapshot", recording_build_snapshot)
+    monkeypatch.setattr(SkillLoader, "load", recording_load)
     provider = RuntimeProvider((_chat_response("First run."), _chat_response("Second run.")))
     host = _host(agent_home, workspace, provider)
     initial_metadata = host.bindings.skill_metadata
@@ -199,19 +187,26 @@ async def test_runtime_host_reuses_skill_snapshot_across_generation_replacement(
 
         result = await host.management_dispatcher.resume(target.session_id)
         assert result.resumed_session_id == target.session_id
-        assert host.bindings.skill_metadata == initial_metadata
+        assert tuple(metadata.name for metadata in host.bindings.skill_metadata) == (
+            "first",
+            "second",
+        )
+        assert host.bindings.skill_metadata[0].description == "Changed first"
         await collect_foreground_outbound(host.generation, "Replacement request")
     finally:
         await host.close()
 
     chat_requests = [request for request in provider.requests if len(request.tools) == 10]
     assert len(chat_requests) == 2
-    for request in chat_requests:
-        system_prompt = request.messages[0]["content"]
-        assert isinstance(system_prompt, str)
-        assert "Original first" in system_prompt
-        assert "Changed first" not in system_prompt
-        assert "second" not in system_prompt
+    initial_prompt = chat_requests[0].messages[0]["content"]
+    replacement_prompt = chat_requests[1].messages[0]["content"]
+    assert isinstance(initial_prompt, str)
+    assert isinstance(replacement_prompt, str)
+    assert "Original first" in initial_prompt
+    assert "Changed first" not in initial_prompt
+    assert "second" not in initial_prompt
+    assert "Changed first" in replacement_prompt
+    assert "New second" in replacement_prompt
 
     fresh_provider = RuntimeProvider((_chat_response("Fresh run."),))
     fresh_host = _host(agent_home, workspace, fresh_provider)
@@ -226,11 +221,96 @@ async def test_runtime_host_reuses_skill_snapshot_across_generation_replacement(
     assert isinstance(fresh_system_prompt, str)
     assert "Changed first" in fresh_system_prompt
     assert "New second" in fresh_system_prompt
-    assert snapshot_builds == 2
+    assert snapshot_builds == 3
 
 
 @pytest.mark.asyncio
-async def test_runtime_host_reuses_frozen_always_body_across_generation_replacement(
+async def test_runtime_host_refreshes_skill_snapshot_after_generation_skill_deletion(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    instruction = agent_home / "skills" / "removed" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: removed\ndescription: To be removed\n---\n")
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    assert tuple(metadata.name for metadata in host.bindings.skill_metadata) == ("removed",)
+
+    target = Session.create(
+        host.generation.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    target.add_message("user", "Persisted target")
+    target.close()
+    instruction.unlink()
+
+    try:
+        result = await host.management_dispatcher.resume(target.session_id)
+
+        assert result.resumed_session_id == target.session_id
+        assert host.bindings.skill_metadata == ()
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_host_refreshes_skill_snapshot_when_resuming_current_session(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = agent_home / "skills" / "current" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_bytes(b"---\nname: current\ndescription: Original\n---\noriginal\n")
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    old.session.add_message("user", "Persist the current Session")
+    old.session.persist()
+    pending_persist = old.session._pending_persist
+    assert pending_persist is not None
+    await pending_persist
+
+    original_persist_after = Session._persist_after
+    persist_started = asyncio.Event()
+    release_persist = asyncio.Event()
+
+    async def gated_persist_after(
+        active: Session,
+        previous: asyncio.Task[None] | None,
+        content: bytes,
+    ) -> None:
+        if active is old.session:
+            persist_started.set()
+            await release_persist.wait()
+        await original_persist_after(active, previous, content)
+
+    monkeypatch.setattr(Session, "_persist_after", gated_persist_after)
+    old.session.add_message("user", "Persist before rebuilding this Session")
+    old.session.persist()
+    await persist_started.wait()
+    instruction.write_bytes(b"---\nname: current\ndescription: Refreshed\n---\nrefreshed\n")
+
+    await host.start()
+    try:
+        replacement = asyncio.create_task(host.management_dispatcher.resume(old.session_id))
+        await asyncio.sleep(0)
+        assert not replacement.done()
+        release_persist.set()
+        result = await replacement
+
+        assert result.resumed_session_id == old.session_id
+        assert host.generation is not old
+        assert host.bindings.skill_metadata[0].description == "Refreshed"
+        assert [message["content"] for message in host.generation.session.messages] == [
+            "Persist the current Session",
+            "Persist before rebuilding this Session",
+        ]
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_host_refreshes_frozen_always_body_across_generation_replacement(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -269,11 +349,13 @@ async def test_runtime_host_reuses_frozen_always_body_across_generation_replacem
 
     chat_requests = [request for request in provider.requests if len(request.tools) == 10]
     assert len(chat_requests) == 2
-    for request in chat_requests:
-        system_prompt = request.messages[0]["content"]
-        assert isinstance(system_prompt, str)
-        assert "Original always body" in system_prompt
-        assert "Changed always body" not in system_prompt
+    initial_prompt = chat_requests[0].messages[0]["content"]
+    replacement_prompt = chat_requests[1].messages[0]["content"]
+    assert isinstance(initial_prompt, str)
+    assert isinstance(replacement_prompt, str)
+    assert "Original always body" in initial_prompt
+    assert "Original always body" not in replacement_prompt
+    assert "Changed always body" not in replacement_prompt
 
     fresh_provider = RuntimeProvider((_chat_response("Fresh run."),))
     fresh_host = _host(agent_home, workspace, fresh_provider, config_text=config_text)
@@ -668,7 +750,7 @@ async def test_close_waits_for_an_in_progress_replacement_and_closes_the_committ
 
 
 @pytest.mark.asyncio
-async def test_active_same_session_resume_is_a_no_op_without_confirmation_or_rebuild(
+async def test_active_same_session_resume_requires_confirmation_before_rebuild(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -699,21 +781,18 @@ async def test_active_same_session_resume_is_a_no_op_without_confirmation_or_reb
                     await pilot.pause()
             await pilot.press("enter")
             async with asyncio.timeout(2):
-                while (
-                    app._resume_worker is not None
-                    and not app._resume_worker.is_finished
-                    and app.screen.id != "session-switch-confirmation"
-                ):
+                while app.screen.id != "session-switch-confirmation":
                     await pilot.pause()
 
-            assert app.screen.id != "session-switch-confirmation"
-            assert app._resume_worker is not None and app._resume_worker.is_finished
             assert host.generation is old
             assert app._bus is old.bus
             assert any(
                 "active work" in str(getattr(message, "content", ""))
                 for message in app.query(".user-message")
             )
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.screen.id != "session-switch-confirmation"
         finally:
             provider.release_stream.set()
             provider.release_close.set()

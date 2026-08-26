@@ -18,9 +18,8 @@ from myclaw.agent.prompts import (
     runtime_context,
     session_title_prompt,
 )
-from myclaw.config.agent_home import AgentHome
 from myclaw.memory.records import SummaryEntry
-from myclaw.skills.catalog import build_runtime_skill_snapshot
+from myclaw.skills.catalog import SkillLoader
 from myclaw.templates import load_template, render_template
 
 TEMPLATE_NAMES = {
@@ -162,11 +161,11 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
         "---\nname: reviewer\ndescription: Review the work\n---\nprivate reviewer body\n",
         encoding="utf-8",
     )
-    snapshot = build_runtime_skill_snapshot(
-        agent_home=AgentHome(first.parents[2]),
+    snapshot = SkillLoader(
+        root=first.parents[1],
         reserved_names=(),
         enable_always_load=False,
-    )
+    ).load()
     foreground = foreground_chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),
         long_term_memory="# Memory\n",
@@ -220,11 +219,11 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
     )
     document = "---\nname: always\ndescription: Always loaded\nalways: true\n---\n" + body
     instruction.write_bytes(document.encode("utf-8"))
-    snapshot = build_runtime_skill_snapshot(
-        agent_home=AgentHome(instruction.parents[2]),
+    snapshot = SkillLoader(
+        root=instruction.parents[1],
         reserved_names=(),
         enable_always_load=True,
-    )
+    ).load()
 
     foreground = foreground_chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),

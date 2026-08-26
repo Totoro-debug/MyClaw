@@ -13,11 +13,10 @@ import myclaw.agent.context as context
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
-from myclaw.config.agent_home import AgentHome
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
+    SkillLoader,
     SkillMetadata,
-    build_runtime_skill_snapshot,
 )
 
 FIXED_UTC = datetime(2026, 8, 16, 4, 5, 6, 789000, tzinfo=UTC)
@@ -148,11 +147,11 @@ def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt
     instruction = agent_home / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: planner\ndescription: Plan the work\n---\nprivate body\n")
-    snapshot = build_runtime_skill_snapshot(
-        agent_home=AgentHome(agent_home),
+    snapshot = SkillLoader(
+        root=agent_home / "skills",
         reserved_names=(),
         enable_always_load=False,
-    )
+    ).load()
     builder = ContextBuilder(
         workspace,
         "UTC",

@@ -43,7 +43,7 @@ from myclaw.provider.models import ModelCompleted, ReasoningDelta, TextDelta
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.skills.catalog import ManualSkillInvocation, SkillCatalog, SkillUnavailableError
+from myclaw.skills.catalog import ManualSkillInvocation, SkillSnapshot
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
@@ -181,7 +181,7 @@ class AgentLoop:
         self,
         *,
         workspace: Path,
-        skill_catalog: SkillCatalog | None = None,
+        skill_snapshot: SkillSnapshot | None = None,
         session: Session,
         schedule_service: ScheduleService,
         model_router: AgentRunnerRouter,
@@ -208,11 +208,11 @@ class AgentLoop:
             raise TypeError("Agent Loop requires a clock")
         if schedule_now is not None and not callable(schedule_now):
             raise TypeError("Agent Loop Schedule clock must be callable")
-        if skill_catalog is not None and not isinstance(skill_catalog, SkillCatalog):
-            raise TypeError("Agent Loop requires a Skill Catalog")
+        if skill_snapshot is not None and not isinstance(skill_snapshot, SkillSnapshot):
+            raise TypeError("Agent Loop requires a Skill Snapshot")
 
         self._session = session
-        self._skill_catalog = skill_catalog
+        self._skill_snapshot = skill_snapshot
         self._schedule_service = schedule_service
         self._context_preparer = context_preparer
         self._task_framer = TaskFramer(model_router) if task_framer is None else task_framer
@@ -224,7 +224,7 @@ class AgentLoop:
         self._tool_gateway = ToolGateway(
             workspace=workspace,
             schedule_service=schedule_service,
-            skill_root=None if skill_catalog is None else skill_catalog.root,
+            skill_root=None if skill_snapshot is None else skill_snapshot.root,
         )
         self._model_router = model_router
         self._runner = AgentRunner(model_router)
@@ -591,13 +591,8 @@ class AgentLoop:
     ) -> None:
         active_session = self._session
         manual_invocation = None
-        if self._skill_catalog is not None:
-            try:
-                manual_invocation = self._skill_catalog.resolve_manual(inbound.content)
-            except SkillUnavailableError as failure:
-                await self._publish_preparation_failure(failure.error)
-                execution_ready.set()
-                return
+        if self._skill_snapshot is not None:
+            manual_invocation = self._skill_snapshot.resolve_manual(inbound.content)
         start_title = not active_session.messages
         created_title_work = (
             self._start_title_if_needed(active_session, inbound.content) if start_title else None

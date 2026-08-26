@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from myclaw.agent.blackboard import Blackboard, encode_blackboard
 from myclaw.agent.prompts import current_user_input, foreground_chat_system_prompt
 from myclaw.session.projection import project_session_message
-from myclaw.skills.catalog import ManualSkillInvocation, RuntimeSkillSnapshot
+from myclaw.skills.catalog import ManualSkillInvocation, SkillSnapshot
 
 
 class ContextBuilder:
@@ -24,11 +24,11 @@ class ContextBuilder:
         timezone_name: str,
         *,
         clock: Callable[[], datetime] | None = None,
-        skill_snapshot: RuntimeSkillSnapshot | None = None,
+        skill_snapshot: SkillSnapshot | None = None,
     ) -> None:
         if not isinstance(workspace, Path):
             raise TypeError("Context Builder requires a Path")
-        if skill_snapshot is not None and not isinstance(skill_snapshot, RuntimeSkillSnapshot):
+        if skill_snapshot is not None and not isinstance(skill_snapshot, SkillSnapshot):
             raise TypeError("Context Builder requires a Runtime Skill snapshot")
         self._workspace = workspace
         self._timezone = ZoneInfo(timezone_name)

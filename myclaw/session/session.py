@@ -377,6 +377,16 @@ class Session:
         except Exception:
             return
 
+    async def wait_for_pending_persist(self) -> None:
+        """Wait for every already-scheduled ordered snapshot without starting a new save."""
+        while True:
+            pending = self._pending_persist
+            if pending is None:
+                return
+            await asyncio.shield(pending)
+            if self._pending_persist is pending:
+                return
+
     def close(self) -> None:
         """Synchronously make a bounded best-effort final save and close the Session."""
         if self._closed:
