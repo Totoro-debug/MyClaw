@@ -1,8 +1,9 @@
 """Standalone dispatch for read-only Management Commands."""
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
+from types import MappingProxyType
 from typing import Protocol
 
 from loguru import logger
@@ -20,15 +21,32 @@ from myclaw.memory.memory_task import MemoryTaskResult
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 
-class _ManagementCommand(StrEnum):
-    CONFIG = "/config"
-    STATUS = "/status"
-    RESUME = "/resume"
-    MEMORY = "/memory"
-    DREAM = "/dream"
+@dataclass(frozen=True, slots=True)
+class ManagementCommandDefinition:
+    """Canonical completion and dispatch facts for one Management Command."""
+
+    token: str
+    description: str
 
 
-SUPPORTED_MANAGEMENT_COMMANDS = tuple(command.value for command in _ManagementCommand)
+_CONFIG_COMMAND = ManagementCommandDefinition("/config", "View User Configuration")
+_STATUS_COMMAND = ManagementCommandDefinition("/status", "View Runtime Status")
+_RESUME_COMMAND = ManagementCommandDefinition("/resume", "Resume a Conversation Session")
+_MEMORY_COMMAND = ManagementCommandDefinition("/memory", "View Long-term Memory")
+_DREAM_COMMAND = ManagementCommandDefinition(
+    "/dream",
+    "Process pending Conversation Summaries",
+)
+MANAGEMENT_COMMANDS = (
+    _CONFIG_COMMAND,
+    _STATUS_COMMAND,
+    _RESUME_COMMAND,
+    _MEMORY_COMMAND,
+    _DREAM_COMMAND,
+)
+_MANAGEMENT_COMMAND_BY_TOKEN: Mapping[str, ManagementCommandDefinition] = MappingProxyType(
+    {command.token: command for command in MANAGEMENT_COMMANDS}
+)
 
 
 class ManagementPort(Protocol):
@@ -65,14 +83,16 @@ class ManagementCommandDispatcher:
     async def dispatch(self, command: str) -> ManagementCommandResult:
         """Return rendered output for a recognized Management Command."""
         with without_session_log():
-            try:
-                parsed_command = _ManagementCommand(command)
-            except ValueError:
+            parsed_command = _MANAGEMENT_COMMAND_BY_TOKEN.get(command)
+            if parsed_command is None:
                 return ManagementCommandResult(handled=False, output=None)
             return await self._dispatch(parsed_command)
 
-    async def _dispatch(self, command: _ManagementCommand) -> ManagementCommandResult:
-        if command is _ManagementCommand.RESUME:
+    async def _dispatch(
+        self,
+        command: ManagementCommandDefinition,
+    ) -> ManagementCommandResult:
+        if command is _RESUME_COMMAND:
             try:
                 listing = await self._management.resumable_listing()
             except ManagementError as management_error:
@@ -104,14 +124,14 @@ class ManagementCommandDispatcher:
                 resume_sessions=sessions,
                 resume_skipped_count=listing.skipped_count,
             )
-        if command is _ManagementCommand.STATUS:
+        if command is _STATUS_COMMAND:
             try:
                 status = await self._management.status()
                 output = json.dumps(status.to_dict(), ensure_ascii=False, indent=2)
             except ManagementError as management_error:
                 output = f"{management_error.error.code}: {management_error.error.message}"
             return ManagementCommandResult(handled=True, output=output)
-        if command is _ManagementCommand.MEMORY:
+        if command is _MEMORY_COMMAND:
             try:
                 output = await self._management.memory_view()
             except ManagementError as management_error:
@@ -120,7 +140,7 @@ class ManagementCommandDispatcher:
                 handled=True,
                 output=output,
             )
-        if command is _ManagementCommand.DREAM:
+        if command is _DREAM_COMMAND:
             try:
                 result = await self._management.dream()
             except ManagementError as management_error:
@@ -141,7 +161,7 @@ class ManagementCommandDispatcher:
                         f"cursor: {result.cursor}"
                     )
             return ManagementCommandResult(handled=True, output=output)
-        if command is not _ManagementCommand.CONFIG:
+        if command is not _CONFIG_COMMAND:
             raise RuntimeError(f"Supported Management Command has no handler: {command}")
         try:
             view = await self._management.config_view()

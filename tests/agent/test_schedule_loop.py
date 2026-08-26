@@ -30,7 +30,7 @@ from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.skills.catalog import ManualSkillInvocation
+from myclaw.skills.catalog import ManualSkillInvocation, SkillCatalog
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
@@ -256,7 +256,7 @@ def _loop(
     tmp_path: Path,
     router: _ScheduleRouter,
     *,
-    skill_root: Path | None = None,
+    skill_catalog: SkillCatalog | None = None,
     schedule_context_preparer: Callable[
         [Session, dict[str, Any]],
         Awaitable[list[dict[str, Any]]],
@@ -275,7 +275,7 @@ def _loop(
     )
     loop = AgentLoop(
         workspace=workspace,
-        skill_root=skill_root,
+        skill_catalog=skill_catalog,
         session=foreground,
         schedule_service=service,
         model_router=router,
@@ -605,7 +605,11 @@ async def test_schedule_agent_reads_known_skill_path_via_shared_gateway(tmp_path
         ),
         _ScheduleRouter._response(),
     )
-    loop, state, _ = _loop(tmp_path, router, skill_root=skill_root)
+    loop, state, _ = _loop(
+        tmp_path,
+        router,
+        skill_catalog=SkillCatalog(root=skill_root, entries=()),
+    )
     confirmation_requests: list[object] = []
     loop.bind_confirmation_callback(confirmation_requests.append)
 

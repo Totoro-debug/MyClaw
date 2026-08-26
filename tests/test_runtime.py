@@ -15,7 +15,7 @@ from loguru import logger
 import myclaw.agent.runtime as runtime_module
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.loop import ForegroundContextPreparer
+from myclaw.agent.loop import ConfirmationRequestView, ForegroundContextPreparer
 from myclaw.agent.prompts import (
     conversation_summary_prompt,
     foreground_chat_system_prompt,
@@ -219,6 +219,97 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
 
     assert discovered_names == ["Asia/Shanghai", "Asia/Shanghai"]
     assert catalog_presence == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_injected_skill_catalog_root_is_the_only_confirmation_free_skill_root(
+    agent_home: Path,
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    catalog_root = (tmp_path / "catalog-skills").resolve()
+    catalog_file = catalog_root / "review" / "SKILL.md"
+    catalog_file.parent.mkdir(parents=True)
+    catalog_file.write_text("catalog root", encoding="utf-8")
+    agent_home_file = home.skills_directory / "legacy" / "SKILL.md"
+    agent_home_file.parent.mkdir(parents=True)
+    agent_home_file.write_text("agent home root", encoding="utf-8")
+    catalog = SkillCatalog(root=catalog_root, entries=())
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(
+                                content="",
+                                tool_calls=(
+                                    ModelToolCall(
+                                        id="call_catalog_root",
+                                        name="read_file",
+                                        arguments=json.dumps({"path": str(catalog_file)}),
+                                    ),
+                                    ModelToolCall(
+                                        id="call_agent_home_root",
+                                        name="read_file",
+                                        arguments=json.dumps({"path": str(agent_home_file)}),
+                                    ),
+                                ),
+                            ),
+                            usage=ModelUsage(input_tokens=4, output_tokens=2, total_tokens=6),
+                            finish_reason="tool_calls",
+                        )
+                    ),
+                )
+            ),
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Finished reading."),
+                            usage=ModelUsage(input_tokens=8, output_tokens=3, total_tokens=11),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _: provider,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        skill_catalog=catalog,
+        task_framer=DeterministicTaskFramingEvaluator(),
+    )
+    runtime.session.update_metadata(title="Existing title")
+    requests: list[ConfirmationRequestView] = []
+
+    def approve(request: ConfirmationRequestView) -> None:
+        requests.append(request)
+        runtime.agent_loop.respond_to_confirmation(request.confirmation_id, "approved")
+
+    runtime.agent_loop.bind_confirmation_callback(approve)
+    await runtime.start()
+    try:
+        outbound = await collect_foreground_outbound(runtime, "Read both Skill roots.")
+    finally:
+        await runtime.close()
+
+    assert "Finished reading." in "".join(message.content for message in outbound)
+    assert [request.details["path"] for request in requests] == [str(agent_home_file)]
+    tool_messages = [message for message in runtime.session.messages if message["role"] == "tool"]
+    assert [message["content"] for message in tool_messages] == [
+        "catalog root",
+        "agent home root",
+    ]
+    assert len(runtime.agent_loop.tool_schemas) == 10
 
 
 @pytest.mark.asyncio

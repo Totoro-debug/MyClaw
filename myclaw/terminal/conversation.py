@@ -42,7 +42,7 @@ from textual.worker import Worker, WorkerError
 from myclaw.agent.loop import ConfirmationRequestView, TerminalAgentLoopControl
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runtime import PreparedRuntime, RuntimeBindings, RuntimeHost
-from myclaw.management.commands import SUPPORTED_MANAGEMENT_COMMANDS
+from myclaw.management.commands import MANAGEMENT_COMMANDS
 from myclaw.management.service import SessionListingEntry
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
@@ -62,13 +62,7 @@ _CONVERSATION_NAVIGATION_KEYS = frozenset({"pageup", "pagedown", "ctrl+home", "c
 _FAILURE_REASON_MAX_CHARS = 120
 _TOOL_NAME_MAX_CHARS = 80
 _GENERIC_TOOL_FAILURE_REASON = "The operation did not complete."
-_MANAGEMENT_COMMAND_DESCRIPTIONS: Final[dict[str, str]] = {
-    "/config": "View User Configuration",
-    "/status": "View Runtime Status",
-    "/resume": "Resume a Conversation Session",
-    "/memory": "View Long-term Memory",
-    "/dream": "Process pending Conversation Summaries",
-}
+_RESUME_MANAGEMENT_COMMAND_TOKEN = MANAGEMENT_COMMANDS[2].token
 _UNSAFE_TOOL_DETAIL_PATTERN = re.compile(
     r"(?:^\s*[\[{])|(?:[\"'][^\"']+[\"']\s*:)|"
     r"(?:\b(?:api[_-]?key|authorization|bearer|password|secret|token)\b)|"
@@ -2919,7 +2913,10 @@ class TerminalConversationApp(App[None]):
                 return
             dispatcher = self._management_dispatcher
             if dispatcher is None:
-                await self._mount_management_rows("/resume", "Session resume is unavailable.")
+                await self._mount_management_rows(
+                    _RESUME_MANAGEMENT_COMMAND_TOKEN,
+                    "Session resume is unavailable.",
+                )
                 return
             force = False
             if self._control.has_active_run:
@@ -2929,15 +2926,18 @@ class TerminalConversationApp(App[None]):
             try:
                 result = await dispatcher.resume(session_id, force=force)
             except Exception:
-                await self._mount_management_rows("/resume", "Session resume failed.")
+                await self._mount_management_rows(
+                    _RESUME_MANAGEMENT_COMMAND_TOKEN,
+                    "Session resume failed.",
+                )
                 return
             resumed_session_id = result.resumed_session_id
             if resumed_session_id != session_id:
-                await self._mount_management_rows("/resume", result.output)
+                await self._mount_management_rows(_RESUME_MANAGEMENT_COMMAND_TOKEN, result.output)
                 return
             if self._control.project_foreground_conversation().session_id != resumed_session_id:
                 await self._mount_management_rows(
-                    "/resume",
+                    _RESUME_MANAGEMENT_COMMAND_TOKEN,
                     "Session resume did not select the requested Conversation Session.",
                 )
                 return
@@ -2945,7 +2945,7 @@ class TerminalConversationApp(App[None]):
                 return
             if not await self._replace_display_from_session(resumed_session_id):
                 await self._mount_management_rows(
-                    "/resume",
+                    _RESUME_MANAGEMENT_COMMAND_TOKEN,
                     "Conversation Session authority changed before display replacement.",
                 )
         finally:
@@ -2999,12 +2999,12 @@ def _completion_candidates(
     management = tuple(
         _CompletionCandidate(
             kind=_CompletionCandidateKind.MANAGEMENT,
-            token=command,
-            description=_MANAGEMENT_COMMAND_DESCRIPTIONS[command],
-            insert_text=command,
+            token=command.token,
+            description=command.description,
+            insert_text=command.token,
         )
-        for command in SUPPORTED_MANAGEMENT_COMMANDS
-        if command.startswith(text)
+        for command in MANAGEMENT_COMMANDS
+        if command.token.startswith(text)
     )
     skills = tuple(
         _CompletionCandidate(

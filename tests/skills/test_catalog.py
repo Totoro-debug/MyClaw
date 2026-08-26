@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 
 from myclaw.config.agent_home import AgentHome
+from myclaw.management.commands import MANAGEMENT_COMMANDS
 from myclaw.skills.catalog import SkillUnavailableError, discover_skills
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures.diagnostic_capture import capture_diagnostics
@@ -82,16 +83,18 @@ def test_name_starting_with_a_digit_is_excluded(agent_home: Path) -> None:
 
 
 def test_reserved_management_command_name_is_excluded(agent_home: Path) -> None:
-    instruction = agent_home / "skills" / "config-skill" / "SKILL.md"
-    instruction.parent.mkdir(parents=True)
-    instruction.write_text(
-        "---\nname: config\ndescription: A configuration guide\n---\n",
-        encoding="utf-8",
-    )
+    for command in MANAGEMENT_COMMANDS:
+        name = command.token.removeprefix("/")
+        instruction = agent_home / "skills" / f"{name}-skill" / "SKILL.md"
+        instruction.parent.mkdir(parents=True)
+        instruction.write_text(
+            f"---\nname: {name}\ndescription: Reserved command guide\n---\n",
+            encoding="utf-8",
+        )
 
     catalog = discover_skills(
         agent_home=AgentHome(agent_home),
-        reserved_names=("/config",),
+        reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
         enable_always_load=False,
     )
 

@@ -8,7 +8,7 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
-from myclaw.management.commands import ManagementCommandDispatcher
+from myclaw.management.commands import MANAGEMENT_COMMANDS, ManagementCommandDispatcher
 from myclaw.management.service import (
     ManagementViewService,
     ResolvedChatStatus,
@@ -62,6 +62,18 @@ api_key = "***REDACTED***"
 not_api_key = "diagnostic-content"
 broken = [
 """
+
+
+def test_management_command_catalog_owns_ordered_tokens_and_descriptions() -> None:
+    assert tuple((command.token, command.description) for command in MANAGEMENT_COMMANDS) == (
+        ("/config", "View User Configuration"),
+        ("/status", "View Runtime Status"),
+        ("/resume", "Resume a Conversation Session"),
+        ("/memory", "View Long-term Memory"),
+        ("/dream", "Process pending Conversation Summaries"),
+    )
+    assert all(command.token and command.description for command in MANAGEMENT_COMMANDS)
+
 
 SCHEMA_INVALID_CONFIG_CONTENT = """[models.providers.primary]
 protocol = "anthropic"

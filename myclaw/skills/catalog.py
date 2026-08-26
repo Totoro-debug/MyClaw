@@ -331,17 +331,13 @@ def _validate_metadata(document: object, path: Path) -> tuple[SkillMetadata | No
     if not _NAME_PATTERN.fullmatch(normalized_name) or not 1 <= len(normalized_description) <= 1024:
         return None, "name or description is outside the accepted bounds"
     return (
-        _metadata(
+        SkillMetadata(
             name=normalized_name,
             description=normalized_description,
             path=path,
         ),
         "",
     )
-
-
-def _metadata(*, name: str, description: str, path: Path) -> SkillMetadata:
-    return SkillMetadata(name=name, description=description, path=path)
 
 
 def _is_delimiter(line: bytes) -> bool:

@@ -32,7 +32,7 @@ from myclaw.config.config import ProviderConfiguration, UserConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.commands import (
-    SUPPORTED_MANAGEMENT_COMMANDS,
+    MANAGEMENT_COMMANDS,
     ManagementCommandDispatcher,
 )
 from myclaw.management.service import (
@@ -410,7 +410,7 @@ class RuntimeHost:
         self._timezone_name = get_localzone_name() if timezone_name is None else timezone_name
         self._skill_catalog = discover_skills(
             agent_home=agent_home,
-            reserved_names=SUPPORTED_MANAGEMENT_COMMANDS,
+            reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
             enable_always_load=configuration.runtime.enable_skill_always_load,
         )
         self._terminal_rebind: Callable[[RuntimeBindings], Awaitable[None]] | None = None
@@ -679,7 +679,7 @@ def _prepare_runtime(
     if active_skill_catalog is None:
         active_skill_catalog = discover_skills(
             agent_home=agent_home,
-            reserved_names=SUPPORTED_MANAGEMENT_COMMANDS,
+            reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
             enable_always_load=configuration.runtime.enable_skill_always_load,
         )
     workspace_identity = (
@@ -750,13 +750,6 @@ def _prepare_runtime(
         )
 
     def foreground_system_prompt_for(memory_snapshot: str) -> str:
-        return foreground_chat_system_prompt(
-            workspace=workspace_identity.path,
-            long_term_memory=memory_snapshot,
-            skill_catalog=active_skill_catalog,
-        )
-
-    def summary_system_prompt_for(memory_snapshot: str) -> str:
         return foreground_chat_system_prompt(
             workspace=workspace_identity.path,
             long_term_memory=memory_snapshot,
@@ -889,7 +882,7 @@ def _prepare_runtime(
         manual_invocation: ManualSkillInvocation | None = None,
     ) -> list[dict[str, Any]]:
         memory_snapshot = runtime_memory.snapshot()
-        current_system_prompt = summary_system_prompt_for(memory_snapshot)
+        current_system_prompt = foreground_system_prompt_for(memory_snapshot)
         await prepare_summary(
             active_session,
             "chat",
@@ -919,7 +912,6 @@ def _prepare_runtime(
 
     agent_loop = AgentLoop(
         workspace=workspace_identity,
-        skill_root=agent_home.skills_directory,
         skill_catalog=active_skill_catalog,
         session=active_session,
         schedule_service=schedule_service,
