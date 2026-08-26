@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import PurePath
 
 from myclaw.memory.records import SummaryEntry
-from myclaw.skills.catalog import ManualSkillInvocation, SkillCatalog
+from myclaw.skills.catalog import ManualSkillInvocation, RuntimeSkillSnapshot
 from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
 
@@ -76,24 +76,23 @@ def foreground_chat_system_prompt(
     *,
     workspace: PurePath,
     long_term_memory: str,
-    skill_catalog: SkillCatalog | None = None,
+    skill_snapshot: RuntimeSkillSnapshot | None = None,
 ) -> str:
     """Compose the foreground prompt with optional Skill metadata and Blackboard guidance."""
     sections = [chat_system_prompt(workspace=workspace, long_term_memory=long_term_memory)]
-    if skill_catalog is not None and skill_catalog.entries:
+    if skill_snapshot is not None and skill_snapshot.catalog.entries:
         entries = "\n".join(
             _skill_metadata_json(
-                name=entry.metadata.name,
-                description=entry.metadata.description,
-                path=str(entry.metadata.path),
+                name=metadata.name,
+                description=metadata.description,
+                path=str(metadata.path),
             )
-            for entry in skill_catalog.entries
+            for metadata in skill_snapshot.catalog.entries
         )
         sections.append(render_template("skill-catalog.md", entries=entries))
         always_entries = "\n".join(
-            _skill_always_json(name=entry.metadata.name, body=entry.always_body)
-            for entry in skill_catalog.entries
-            if entry.always_body is not None
+            _skill_always_json(name=skill.metadata.name, body=skill.body)
+            for skill in skill_snapshot.always_loaded
         )
         if always_entries:
             sections.append(render_template("skill-always-load.md", entries=always_entries))

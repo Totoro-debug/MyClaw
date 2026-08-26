@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -24,6 +24,7 @@ from myclaw.provider.models import (
     ReasoningEffort,
 )
 from myclaw.session.session import Session
+from myclaw.skills.catalog import RuntimeSkillSnapshot
 from myclaw.terminal.conversation import TerminalConversationApp
 from myclaw.tools.base import OpenAIToolSchema
 from tests.configuration.test_config import VALID_CONFIG
@@ -149,10 +150,32 @@ def _host(
 async def test_runtime_host_reuses_skill_snapshot_across_generation_replacement(
     agent_home: Path,
     workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first_skill = agent_home / "skills" / "first" / "SKILL.md"
     first_skill.parent.mkdir(parents=True)
     first_skill.write_bytes(b"---\nname: first\ndescription: Original first\n---\n")
+    snapshot_builds = 0
+    build_snapshot = cast(
+        Callable[..., RuntimeSkillSnapshot],
+        runtime_module.__dict__["build_runtime_skill_snapshot"],
+    )
+
+    def recording_build_snapshot(
+        *,
+        agent_home: AgentHome,
+        reserved_names: Sequence[str],
+        enable_always_load: bool,
+    ) -> RuntimeSkillSnapshot:
+        nonlocal snapshot_builds
+        snapshot_builds += 1
+        return build_snapshot(
+            agent_home=agent_home,
+            reserved_names=reserved_names,
+            enable_always_load=enable_always_load,
+        )
+
+    monkeypatch.setattr(runtime_module, "build_runtime_skill_snapshot", recording_build_snapshot)
     provider = RuntimeProvider((_chat_response("First run."), _chat_response("Second run.")))
     host = _host(agent_home, workspace, provider)
     initial_metadata = host.bindings.skill_metadata
@@ -203,6 +226,7 @@ async def test_runtime_host_reuses_skill_snapshot_across_generation_replacement(
     assert isinstance(fresh_system_prompt, str)
     assert "Changed first" in fresh_system_prompt
     assert "New second" in fresh_system_prompt
+    assert snapshot_builds == 2
 
 
 @pytest.mark.asyncio

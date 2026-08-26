@@ -40,7 +40,7 @@ from myclaw.session.session import Session
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
     SkillCatalog,
-    discover_skills,
+    build_runtime_skill_snapshot,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -462,11 +462,11 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
     instruction.write_bytes(
         ("---\nname: planner\ndescription: Plan work\n---\n" + body).encode("utf-8")
     )
-    catalog = discover_skills(
+    catalog = build_runtime_skill_snapshot(
         agent_home=AgentHome(tmp_path / "agent-home"),
         reserved_names=(),
         enable_always_load=False,
-    )
+    ).catalog
     router = _Router((_response("Generated title"), _response("Completed")))
     framer = _FramingFake()
     observed: list[tuple[dict[str, Any], ManualSkillInvocation | None]] = []
@@ -534,11 +534,11 @@ async def test_real_manual_skill_file_failures_short_circuit_then_recover(
         "---\nname: planner\ndescription: Plan work\n---\n" + body,
         encoding="utf-8",
     )
-    catalog = discover_skills(
+    catalog = build_runtime_skill_snapshot(
         agent_home=AgentHome(tmp_path / "agent-home"),
         reserved_names=(),
         enable_always_load=False,
-    )
+    ).catalog
 
     if failure_kind == "missing":
         instruction.unlink()

@@ -38,6 +38,9 @@ _OBSOLETE_SKILL_MARKERS = (
     "adr-0016 proposes",
     "只有内置 slash commands 进入 management port",
     "其它 `/` 开头文本作为普通用户消息发送给模型",
+    "exec、web 和 workspace 外部路径按具体目标执行一次性确认。",
+    "解析到 workspace 外的路径请求一次性确认。",
+    "exec、web 和 workspace 外部路径才使用精确绑定的一次性确认。",
 )
 
 # The tracked corpus uses these simple inline/reference target forms. This is not a
@@ -346,6 +349,16 @@ def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
         definition = _glossary_definition(context, term)
         assert all(claim in definition for claim in claims), term
 
+    runtime_contract = (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8")
+    for claim in (
+        "`RuntimeSkillSnapshot`",
+        "`catalog` 只拥有 metadata",
+        "`always_loaded` 单独拥有",
+        "entries: tuple[SkillMetadata, ...]",
+    ):
+        assert claim in runtime_contract
+    assert "always_body" not in runtime_contract
+
     prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
     management_contract = _markdown_section(prd, "CLI and management").casefold()
     for claim in (
@@ -354,6 +367,25 @@ def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
         "unknown or non-matching slash input remains ordinary input",
     ):
         assert claim in management_contract
+
+    tool_gateway_contract = _markdown_section(
+        prd, "Tool Gateway and fail-closed security"
+    ).casefold()
+    for claim in (
+        "`read_file`",
+        "canonical agent home skill root",
+        "无需 tool confirmation",
+        "resolved escape",
+        "仍请求一次性确认",
+    ):
+        assert claim in tool_gateway_contract
+
+    schedule_contract = _markdown_section(prd, "Schedule").casefold()
+    for claim in (
+        "generic `read_file` path exemption",
+        "不获得 skill discovery 或 invocation interface",
+    ):
+        assert claim in schedule_contract
 
     for path in active_contracts:
         content = path.read_text(encoding="utf-8").casefold()

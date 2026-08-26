@@ -44,9 +44,10 @@ from myclaw.provider.models import (
 from myclaw.session.session import Session
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
+    RuntimeSkillSnapshot,
     SkillCatalog,
     SkillMetadata,
-    discover_skills,
+    build_runtime_skill_snapshot,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -187,21 +188,21 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     discovered_names: list[str] = []
-    catalog_presence: list[bool] = []
+    snapshot_presence: list[bool] = []
     context_builder = ContextBuilder
 
     def recording_context_builder(
         runtime_workspace: Workspace,
         timezone_name: str,
         *,
-        skill_catalog: SkillCatalog | None = None,
+        skill_snapshot: RuntimeSkillSnapshot | None = None,
     ) -> ContextBuilder:
         discovered_names.append(timezone_name)
-        catalog_presence.append(skill_catalog is not None)
+        snapshot_presence.append(skill_snapshot is not None)
         return context_builder(
             runtime_workspace,
             timezone_name,
-            skill_catalog=skill_catalog,
+            skill_snapshot=skill_snapshot,
         )
 
     monkeypatch.setattr(runtime_module, "get_localzone_name", lambda: "Asia/Shanghai")
@@ -217,8 +218,8 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
     )
     await runtime.close()
 
-    assert discovered_names == ["Asia/Shanghai", "Asia/Shanghai"]
-    assert catalog_presence == [True, True]
+    assert discovered_names == ["Asia/Shanghai"]
+    assert snapshot_presence == [True]
 
 
 @pytest.mark.asyncio
@@ -237,7 +238,10 @@ async def test_injected_skill_catalog_root_is_the_only_confirmation_free_skill_r
     agent_home_file = home.skills_directory / "legacy" / "SKILL.md"
     agent_home_file.parent.mkdir(parents=True)
     agent_home_file.write_text("agent home root", encoding="utf-8")
-    catalog = SkillCatalog(root=catalog_root, entries=())
+    snapshot = RuntimeSkillSnapshot(
+        catalog=SkillCatalog(root=catalog_root, entries=()),
+        always_loaded=(),
+    )
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -285,7 +289,7 @@ async def test_injected_skill_catalog_root_is_the_only_confirmation_free_skill_r
         provider_factory=lambda _: provider,
         now=lambda: NOW,
         new_uuid=uuid4,
-        skill_catalog=catalog,
+        skill_snapshot=snapshot,
         task_framer=DeterministicTaskFramingEvaluator(),
     )
     runtime.session.update_metadata(title="Existing title")
@@ -352,7 +356,7 @@ async def test_foreground_skill_catalog_is_included_in_the_exact_budget_guard(
 def _always_skill_budget_fixture(
     agent_home: Path,
     workspace: Path,
-) -> tuple[AgentHome, Workspace, WorkspaceState, SkillCatalog, int]:
+) -> tuple[AgentHome, Workspace, WorkspaceState, RuntimeSkillSnapshot, int]:
     home = AgentHome(agent_home)
     home.initialize()
     instruction = agent_home / "skills" / "always" / "SKILL.md"
@@ -364,7 +368,7 @@ def _always_skill_budget_fixture(
     runtime_workspace = Workspace.from_path(workspace)
     workspace_state = WorkspaceState(runtime_workspace)
     workspace_state.initialize(agent_home_root=home.path)
-    catalog = discover_skills(
+    snapshot = build_runtime_skill_snapshot(
         agent_home=home,
         reserved_names=(),
         enable_always_load=True,
@@ -372,7 +376,7 @@ def _always_skill_budget_fixture(
     system_prompt = foreground_chat_system_prompt(
         workspace=runtime_workspace.path,
         long_term_memory=workspace_state.long_term_memory_path.read_text(encoding="utf-8"),
-        skill_catalog=catalog,
+        skill_snapshot=snapshot,
     )
     estimated = estimate_input_tokens(
         RuntimeStatusInput(
@@ -382,7 +386,7 @@ def _always_skill_budget_fixture(
             runtime_context="",
         )
     )
-    return home, runtime_workspace, workspace_state, catalog, estimated
+    return home, runtime_workspace, workspace_state, snapshot, estimated
 
 
 @pytest.mark.asyncio
@@ -390,7 +394,7 @@ async def test_always_skill_budget_allows_exact_foreground_projection(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    home, runtime_workspace, workspace_state, catalog, estimated = _always_skill_budget_fixture(
+    home, runtime_workspace, workspace_state, snapshot, estimated = _always_skill_budget_fixture(
         agent_home,
         workspace,
     )
@@ -411,7 +415,7 @@ async def test_always_skill_budget_allows_exact_foreground_projection(
         provider_factory=unexpected_provider_factory,
         now=lambda: NOW,
         new_uuid=uuid4,
-        skill_catalog=catalog,
+        skill_snapshot=snapshot,
     )
     await prepared.close()
 
@@ -422,7 +426,7 @@ async def test_always_skill_budget_overflow_fails_before_provider_or_agent_loop(
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    home, runtime_workspace, workspace_state, catalog, estimated = _always_skill_budget_fixture(
+    home, runtime_workspace, workspace_state, snapshot, estimated = _always_skill_budget_fixture(
         agent_home,
         workspace,
     )
@@ -459,7 +463,7 @@ async def test_always_skill_budget_overflow_fails_before_provider_or_agent_loop(
                 provider_factory=provider_factory,
                 now=lambda: NOW,
                 new_uuid=uuid4,
-                skill_catalog=catalog,
+                skill_snapshot=snapshot,
             )
     finally:
         diagnostics.close()

@@ -20,7 +20,7 @@ from myclaw.agent.prompts import (
 )
 from myclaw.config.agent_home import AgentHome
 from myclaw.memory.records import SummaryEntry
-from myclaw.skills.catalog import discover_skills
+from myclaw.skills.catalog import build_runtime_skill_snapshot
 from myclaw.templates import load_template, render_template
 
 TEMPLATE_NAMES = {
@@ -162,7 +162,7 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
         "---\nname: reviewer\ndescription: Review the work\n---\nprivate reviewer body\n",
         encoding="utf-8",
     )
-    catalog = discover_skills(
+    snapshot = build_runtime_skill_snapshot(
         agent_home=AgentHome(first.parents[2]),
         reserved_names=(),
         enable_always_load=False,
@@ -170,7 +170,7 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
     foreground = foreground_chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),
         long_term_memory="# Memory\n",
-        skill_catalog=catalog,
+        skill_snapshot=snapshot,
     )
 
     block = foreground.split("<skill_catalog>\n", maxsplit=1)[1].split(
@@ -221,7 +221,7 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
     instruction.write_bytes(
         b"---\nname: always\ndescription: Always loaded\nalways: true\n---\n" + body.encode("utf-8")
     )
-    catalog = discover_skills(
+    snapshot = build_runtime_skill_snapshot(
         agent_home=AgentHome(instruction.parents[2]),
         reserved_names=(),
         enable_always_load=True,
@@ -230,7 +230,7 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
     foreground = foreground_chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),
         long_term_memory="# Memory\n",
-        skill_catalog=catalog,
+        skill_snapshot=snapshot,
     )
 
     block = foreground.split("<skill_always_load>\n", maxsplit=1)[1].split(

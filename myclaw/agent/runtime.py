@@ -62,9 +62,9 @@ from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
-    SkillCatalog,
+    RuntimeSkillSnapshot,
     SkillMetadata,
-    discover_skills,
+    build_runtime_skill_snapshot,
 )
 from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
@@ -173,7 +173,7 @@ class PreparedRuntime:
     _memory_manager: MemoryManager
     _context_builder: ContextBuilder
     _management_service: ManagementViewService
-    _skill_catalog: SkillCatalog
+    _skill_snapshot: RuntimeSkillSnapshot
 
     @property
     def session_id(self) -> str:
@@ -198,7 +198,7 @@ class PreparedRuntime:
             control=self.control,
             management_dispatcher=self.management_dispatcher,
             start=self.start,
-            skill_metadata=tuple(entry.metadata for entry in self._skill_catalog.entries),
+            skill_metadata=self._skill_snapshot.catalog.entries,
         )
 
     def validate_unstarted(self) -> None:
@@ -408,7 +408,7 @@ class RuntimeHost:
         )
         self._monotonic_now = monotonic_now
         self._timezone_name = get_localzone_name() if timezone_name is None else timezone_name
-        self._skill_catalog = discover_skills(
+        self._skill_snapshot = build_runtime_skill_snapshot(
             agent_home=agent_home,
             reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
             enable_always_load=configuration.runtime.enable_skill_always_load,
@@ -432,7 +432,7 @@ class RuntimeHost:
             schedule_scheduler_clock=self._schedule_scheduler_clock,
             monotonic_now=monotonic_now,
             timezone_name=self._timezone_name,
-            skill_catalog=self._skill_catalog,
+            skill_snapshot=self._skill_snapshot,
             replace_session=self._replacement_callback(initial_token),
         )
         try:
@@ -515,7 +515,7 @@ class RuntimeHost:
                 schedule_scheduler_clock=self._schedule_scheduler_clock,
                 monotonic_now=self._monotonic_now,
                 timezone_name=self._timezone_name,
-                skill_catalog=self._skill_catalog,
+                skill_snapshot=self._skill_snapshot,
                 session=target_session,
                 replace_session=self._replacement_callback(token),
             )
@@ -618,7 +618,7 @@ def prepare_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
-    skill_catalog: SkillCatalog | None = None,
+    skill_snapshot: RuntimeSkillSnapshot | None = None,
     session: Session | None = None,
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
@@ -639,7 +639,7 @@ def prepare_runtime(
             schedule_scheduler_clock=schedule_scheduler_clock,
             monotonic_now=monotonic_now,
             timezone_name=timezone_name,
-            skill_catalog=skill_catalog,
+            skill_snapshot=skill_snapshot,
             session=session,
             workspace_state=workspace_state,
             replace_session=replace_session,
@@ -668,16 +668,16 @@ def _prepare_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
-    skill_catalog: SkillCatalog | None = None,
+    skill_snapshot: RuntimeSkillSnapshot | None = None,
     session: Session | None = None,
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
     task_framer: TaskFramingEvaluator | None = None,
 ) -> PreparedRuntime:
     """Prepare one unstarted Runtime Generation."""
-    active_skill_catalog = skill_catalog
-    if active_skill_catalog is None:
-        active_skill_catalog = discover_skills(
+    active_skill_snapshot = skill_snapshot
+    if active_skill_snapshot is None:
+        active_skill_snapshot = build_runtime_skill_snapshot(
             agent_home=agent_home,
             reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
             enable_always_load=configuration.runtime.enable_skill_always_load,
@@ -703,26 +703,18 @@ def _prepare_runtime(
         configuration=configuration,
         workspace=workspace_identity,
         long_term_memory=long_term_memory,
-        skill_catalog=active_skill_catalog,
+        skill_snapshot=active_skill_snapshot,
     )
     runtime_memory = RuntimeMemory(long_term_memory)
     resolved_timezone_name = get_localzone_name() if timezone_name is None else timezone_name
     foreground_context = ContextBuilder(
         workspace_identity,
         resolved_timezone_name,
-        skill_catalog=active_skill_catalog,
+        skill_snapshot=active_skill_snapshot,
     )
     set_context_clock = getattr(foreground_context, "set_clock", None)
     if callable(set_context_clock):
         set_context_clock(now)
-    summary_context = ContextBuilder(
-        workspace_identity,
-        resolved_timezone_name,
-        skill_catalog=active_skill_catalog,
-    )
-    set_summary_clock = getattr(summary_context, "set_clock", None)
-    if callable(set_summary_clock):
-        set_summary_clock(now)
     memory_store = WorkspaceFileMemoryStore(active_workspace_state)
     active_session = session
     if active_session is None:
@@ -753,7 +745,7 @@ def _prepare_runtime(
         return foreground_chat_system_prompt(
             workspace=workspace_identity.path,
             long_term_memory=memory_snapshot,
-            skill_catalog=active_skill_catalog,
+            skill_snapshot=active_skill_snapshot,
         )
 
     summaries = WorkspaceJsonlSummaryStore(active_workspace_state)
@@ -807,14 +799,14 @@ def _prepare_runtime(
                     )
                 if manual_invocation is None:
                     return _project_foreground_messages(
-                        summary_context,
+                        foreground_context,
                         messages,
                         session_id=active_session.session_id,
                         long_term_memory=runtime_memory.snapshot(),
                         blackboard=blackboard,
                     )
                 return _project_foreground_messages(
-                    summary_context,
+                    foreground_context,
                     messages,
                     session_id=active_session.session_id,
                     long_term_memory=runtime_memory.snapshot(),
@@ -912,7 +904,7 @@ def _prepare_runtime(
 
     agent_loop = AgentLoop(
         workspace=workspace_identity,
-        skill_catalog=active_skill_catalog,
+        skill_catalog=active_skill_snapshot.catalog,
         session=active_session,
         schedule_service=schedule_service,
         model_router=router,
@@ -974,7 +966,7 @@ def _prepare_runtime(
         _memory_manager=memory_manager,
         _context_builder=foreground_context,
         _management_service=management_service,
-        _skill_catalog=active_skill_catalog,
+        _skill_snapshot=active_skill_snapshot,
     )
 
 
@@ -983,17 +975,17 @@ def _preflight_skill_context_budget(
     configuration: UserConfiguration,
     workspace: Workspace,
     long_term_memory: str,
-    skill_catalog: SkillCatalog,
+    skill_snapshot: RuntimeSkillSnapshot,
 ) -> None:
     """Reject an always-loaded snapshot only when its exact foreground projection overflows."""
-    if not any(entry.always_body is not None for entry in skill_catalog.entries):
+    if not skill_snapshot.always_loaded:
         return
 
     resolved_chat = configuration.resolve_route("chat").route
     system_prompt = foreground_chat_system_prompt(
         workspace=workspace.path,
         long_term_memory=long_term_memory,
-        skill_catalog=skill_catalog,
+        skill_snapshot=skill_snapshot,
     )
     estimated = estimate_input_tokens(
         RuntimeStatusInput(

@@ -107,7 +107,7 @@ D01-D17 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Fra
 
 每个候选的 instruction path 必须是可读普通文件并在 canonical Skill root 内；frontmatter bytes 必须是 UTF-8。canonical root 外的 symlink/reparse target、缺失文件、非 UTF-8 metadata 和其他 malformed metadata 均跳过。跳过时只记录安全的 candidate path 与 reason，不记录 instruction body；正文 bytes 留待 `read_body()` 验证。候选按 canonical path 字符串升序评估；reserved Management Command names 和重复 Skill names 不进入 snapshot，同名时保留第一个有效候选。Catalog 只保留 immutable 的 name、trimmed description 和 canonical absolute `SKILL.md` path，不注册 Tool。
 
-`runtime.enable_skill_always_load` 是 boolean，默认 `false`。关闭时 discovery 只解析用于 metadata 的 frontmatter，不解释、告警或读取 `always` 正文。开启时，YAML boolean `always: true` 的候选先进入 metadata snapshot，再在 Catalog module 内读取同一份完整 UTF-8 document bytes；该次读取必须同时重新验证当前 `name`、`description`、canonical `path` 和 `always is True`。读取期间 opt-in 状态、metadata 或路径发生变化时 fail closed 为 `SkillUnavailableError`，不得把版本 A 的 opt-in 决策与版本 B 的正文拼接。YAML non-boolean `always` 只产生一次安全 warning 并保持 metadata-only，不记录正文；`false`、缺失或空值保持 metadata-only。只有完成全部校验后才发布唯一 immutable final Catalog，Generation 不暴露中间 snapshot。
+`runtime.enable_skill_always_load` 是 boolean，默认 `false`。关闭时 discovery 只解析用于 metadata 的 frontmatter，不解释、告警或读取 `always` 正文。开启时，YAML boolean `always: true` 的候选先进入 metadata-only Catalog，再在 Catalog module 内读取同一份完整 UTF-8 document bytes；该次读取必须同时重新验证当前 `name`、`description`、canonical `path` 和 `always is True`。读取期间 opt-in 状态、metadata 或路径发生变化时 fail closed 为 `SkillUnavailableError`，不得把版本 A 的 opt-in 决策与版本 B 的正文拼接。YAML non-boolean `always` 只产生一次安全 warning 并保持 metadata-only，不记录正文；`false`、缺失或空值保持 metadata-only。只有完成全部校验后，`build_runtime_skill_snapshot()` 才原子发布唯一 immutable `RuntimeSkillSnapshot`；其中 `catalog` 只拥有 metadata，`always_loaded` 单独拥有按 Catalog 顺序冻结的 opted-in body，Generation 不暴露中间 snapshot。
 
 Runtime Lifetime 只能通过当前 snapshot 中的完整 `SkillMetadata` 读取正文：
 
@@ -116,7 +116,16 @@ class SkillUnavailableError(Exception):
     error: ErrorInfo
 
 class SkillCatalog:
+    entries: tuple[SkillMetadata, ...]
     def read_body(self, metadata: SkillMetadata) -> str: ...
+
+class AlwaysLoadedSkill:
+    metadata: SkillMetadata
+    body: str
+
+class RuntimeSkillSnapshot:
+    catalog: SkillCatalog
+    always_loaded: tuple[AlwaysLoadedSkill, ...]
 ```
 
 `read_body()` 拒绝不存在或不完全匹配当前 snapshot 的 metadata，不接受任意 path。它先打开文件，再以 host-native descriptor identity 校验 opened/current object 均为普通文件、device/inode 一致且当前 canonical path 仍在 Catalog root 内；普通 hardlink 保持可读，不套用持久化 owned-file 的 single-link 限制。一次调用只从该已验证 descriptor 读取一份 bytes，并从这份 bytes 完成 UTF-8 decode、严格 frontmatter 重解析、canonical path/name/description 重校验和正文提取；普通按需 `read_body()` 正文不缓存。always freeze 复用同一 Catalog module 内的完整-document 读取/重校验实现，但把成功正文保存在 final immutable snapshot 中。缺失、不可读、非 UTF-8、frontmatter/YAML 无效、canonical containment 失效、metadata mismatch 或 always opt-in mismatch 均映射为 `SkillUnavailableError`，其公开 `error` 使用稳定的 `skill_unavailable` code 和非空安全消息，底层异常只作为 cause。
@@ -451,7 +460,7 @@ User Configuration 不得插入或替换 identity/system prompt。缓存的 Open
 
 Foreground chat 在上述共有部分之后按当前 Runtime Lifetime 的 Catalog order 追加一个 `<skill_catalog>` metadata-only block。每个 Skill 是独占一行的 compact JSON object，字段顺序固定为 name、description、path；JSON 文本中的 `&`、`<`、`>` 使用 Unicode escape，确保 metadata 不能产生 literal block delimiter。该 block 只指导模型使用普通 `read_file` 读取已知 canonical absolute path；模型需要更多内容时可按 `offset`/`limit` 继续分页，不需要证明 EOF。
 
-当 final Catalog 至少有一个 `always_body is not None` 时，Foreground chat 随后按相同 Catalog order 追加一个 `<skill_always_load>` intentional System block。每个 opted-in Skill 是一行 compact JSON object，字段顺序固定为 name、body；body 的换行、引号、反斜杠及任意文字（包括类似 closing delimiter 的文字）由 JSON 字符串编码承载，`&`、`<`、`>` 使用 Unicode escape。模板的真实 `</skill_always_load>` closing delimiter 恰好一个；Runtime 不做 raw interpolation，也不截断 body。Foreground consolidation/budget projection 与最终 chat request 使用完全相同的编码后 prompt。该 always body 只进入 Foreground chat：Schedule、Session title、Task Framing、实际 Conversation Summary provider 和 Memory Task 均接收 `0` 个 Skill body；Summary 的 foreground budget projection 可包含同一完整 foreground prompt，但不把 body 发送给 Summary provider。Schedule prompt 不追加 Skill metadata 或 body。
+当 Runtime Skill snapshot 的 `always_loaded` 非空时，Foreground chat 随后按相同 Catalog order 追加一个 `<skill_always_load>` intentional System block。每个 opted-in Skill 是一行 compact JSON object，字段顺序固定为 name、body；body 的换行、引号、反斜杠及任意文字（包括类似 closing delimiter 的文字）由 JSON 字符串编码承载，`&`、`<`、`>` 使用 Unicode escape。模板的真实 `</skill_always_load>` closing delimiter 恰好一个；Runtime 不做 raw interpolation，也不截断 body。Foreground consolidation/budget projection 与最终 chat request 使用完全相同的编码后 prompt。该 always body 只进入 Foreground chat：Schedule、Session title、Task Framing、实际 Conversation Summary provider 和 Memory Task 均接收 `0` 个 Skill body；Summary 的 foreground budget projection 可包含同一完整 foreground prompt，但不把 body 发送给 Summary provider。Schedule prompt 不追加 Skill metadata 或 body。
 
 Foreground 的 metadata projection 与最终 chat request 使用同一 Catalog block；这不改变 Conversation Summary provider 的独立 prompt，后者仍接收 `0` 个 Skill metadata 或 body。
 
@@ -487,7 +496,7 @@ session_id: <session_id>
 string。body、request 的换行、引号、反斜杠及 literal closing delimiter 均由 JSON 编码承载，`&`、`<`、`>`
 使用 Unicode escape；两个真实 closing delimiter 各只有一个。该 ephemeral projection 只存在于本次
 foreground user message，Skill body 不进入 System Prompt；raw slash input 仍是唯一持久化的 Session user
-message。若同一 entry 已有 #184 的 frozen `always_body`，它仍按 always System contract 出现，manual user
+message。若同一 Skill 已在 Runtime Skill snapshot 中拥有 frozen always-loaded body，它仍按 always System contract 出现，manual user
 projection 不会去重、覆盖或额外修改该既有 block。
 
 - session JSONL 只保存 raw user content，不保存上述 wrapper。
@@ -533,7 +542,7 @@ old candidate state while reusing the same Runtime Lifetime Catalog snapshot.
 ### 8.4 Context budget 与 consolidation
 
 - 可用输入预算为已解析 chat route 的 `context_window - max_output`。
-- Runtime startup 在读取当前 Long-term Memory 后、构造 provider/router/AgentLoop 或启动任何 task 前执行 always preflight；只有 final Catalog 至少有一个 `always_body` 时才执行。它使用与最终 Foreground chat 完全相同的 `foreground_chat_system_prompt(workspace, long_term_memory, skill_catalog)`，并通过现有 `estimate_input_tokens`（所有 UTF-8 bytes 合计后向上取整 `/ 4`）估算 `RuntimeStatusInput` 的 system prompt projection；`estimated == available` 允许，`estimated > available` 抛出独立 `SkillContextTooLargeError`，稳定 code 为 `skill_context_too_large`，正文不截断。每个 Generation 可用同一 frozen Catalog 和当代 Long-term Memory 重做该 preflight，但不得重扫目录或重读 body；direct `prepare_runtime` 与 `RuntimeHost` 使用同一 seam。
+- Runtime startup 在读取当前 Long-term Memory 后、构造 provider/router/AgentLoop 或启动任何 task 前执行 always preflight；只有 Runtime Skill snapshot 的 `always_loaded` 非空时才执行。它使用与最终 Foreground chat 完全相同的 `foreground_chat_system_prompt(workspace, long_term_memory, skill_snapshot)`，并通过现有 `estimate_input_tokens`（所有 UTF-8 bytes 合计后向上取整 `/ 4`）估算 `RuntimeStatusInput` 的 system prompt projection；`estimated == available` 允许，`estimated > available` 抛出独立 `SkillContextTooLargeError`，稳定 code 为 `skill_context_too_large`，正文不截断。每个 Generation 可用同一 frozen Runtime Skill snapshot 和当代 Long-term Memory 重做该 preflight，但不得重扫目录或重读 body；direct `prepare_runtime` 与 `RuntimeHost` 使用同一 seam。
 - 估算对象包含 system prompt、retained session messages、当前 Runtime Context、user input 和结构化 tool definitions。
 - foreground manual invocation 的 body/request 通过 transient typed projection 计入 retained-current budget 与 cutoff；实际 Summary provider 仍只接收选中的 raw historical Session records，不接收手动 Skill instructions 或 request。
 - 在每次 chat route model call 前检查预算和 `consolidation_message_threshold`，包括一个 tool loop 中后续的 chat model call。
@@ -801,14 +810,14 @@ detached best effort，只记录 failure；可接受丢失未持久化状态、�
 side-effect/Artifact orphan、Memory cursor skip、Schedule at-least-once side effect 和
 uptime reset。普通 process shutdown 始终走 awaited `close()`。
 
-Runtime Lifetime 还拥有一个由 Agent Home Skill root 构建的 immutable Skill Catalog snapshot。
-同一 Runtime Lifetime 的 Runtime Generation replacement（包括 `/resume`）复用该 snapshot，
+Runtime Lifetime 还拥有一个由 Agent Home Skill root 构建的 immutable `RuntimeSkillSnapshot`；
+其中 metadata-only `SkillCatalog` 与 opted-in `AlwaysLoadedSkill` bodies 是分离字段。同一 Runtime Lifetime 的 Runtime Generation replacement（包括 `/resume`）复用同一对象，
 不得重新扫描 Skill 目录；只有新的 Runtime Lifetime 才重新发现目录内容。Foreground chat
 接收该 snapshot 的 metadata 投影，并在启用且已冻结正文时把 complete always body 作为
 不可伪造的 JSON Lines System block 注入；普通 Skill 正文仍通过 `read_file` 按需读取，
 不缓存按需正文，不增加 Skill-specific Tool、invocation 或 EOF 语义。Generation replacement
 只对同一 snapshot 和当代 Long-term Memory 重做 startup budget preflight，不重扫目录或重读
-always body；新的 Runtime Lifetime 才重新发现目录内容。该 Catalog 不改变 Tool permission、
+always body；新的 Runtime Lifetime 才重新发现目录内容。该 Runtime Skill snapshot 不改变 Tool permission、
 Management Command dispatch、slash invocation、Schedule 或 Message Bus 契约；共享 completion
 的 presentation 与 selection 规则见 8.3a。
 

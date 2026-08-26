@@ -1,6 +1,7 @@
 import os
 import subprocess
 from collections.abc import Callable
+from dataclasses import fields
 from pathlib import Path
 from typing import Any, cast
 
@@ -8,15 +9,35 @@ import pytest
 
 from myclaw.config.agent_home import AgentHome
 from myclaw.management.commands import MANAGEMENT_COMMANDS
-from myclaw.skills.catalog import SkillUnavailableError, discover_skills
+from myclaw.skills.catalog import (
+    AlwaysLoadedSkill,
+    RuntimeSkillSnapshot,
+    SkillCatalog,
+    SkillMetadata,
+    SkillUnavailableError,
+    build_runtime_skill_snapshot,
+)
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures.diagnostic_capture import capture_diagnostics
+
+
+def _catalog(
+    *,
+    agent_home: AgentHome,
+    reserved_names: tuple[str, ...],
+    enable_always_load: bool,
+) -> SkillCatalog:
+    return build_runtime_skill_snapshot(
+        agent_home=agent_home,
+        reserved_names=reserved_names,
+        enable_always_load=enable_always_load,
+    ).catalog
 
 
 def test_missing_skills_root_is_empty_without_creating_directory(agent_home: Path) -> None:
     home = AgentHome(agent_home)
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=home,
         reserved_names=(),
         enable_always_load=False,
@@ -31,7 +52,7 @@ def test_existing_empty_skills_root_is_empty(agent_home: Path) -> None:
     root = agent_home / "skills"
     root.mkdir(parents=True)
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -50,18 +71,19 @@ def test_valid_direct_child_retains_trimmed_metadata_only(agent_home: Path) -> N
         encoding="utf-8",
     )
 
-    catalog = discover_skills(
+    snapshot = build_runtime_skill_snapshot(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
     )
+    catalog = snapshot.catalog
 
     assert len(catalog.entries) == 1
     entry = catalog.entries[0]
-    assert entry.metadata.name == "plan"
-    assert entry.metadata.description == "Do useful work."
-    assert entry.metadata.path == instruction.resolve()
-    assert entry.always_body is None
+    assert entry.name == "plan"
+    assert entry.description == "Do useful work."
+    assert entry.path == instruction.resolve()
+    assert snapshot.always_loaded == ()
     assert catalog.get("plan") == entry
 
 
@@ -73,7 +95,7 @@ def test_name_starting_with_a_digit_is_excluded(agent_home: Path) -> None:
         encoding="utf-8",
     )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -92,7 +114,7 @@ def test_reserved_management_command_name_is_excluded(agent_home: Path) -> None:
             encoding="utf-8",
         )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
         enable_always_load=False,
@@ -111,13 +133,13 @@ def test_first_valid_duplicate_in_canonical_path_order_wins(agent_home: Path) ->
             encoding="utf-8",
         )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
     )
 
-    assert tuple(entry.metadata.path for entry in catalog.entries) == (earlier.resolve(),)
+    assert tuple(entry.path for entry in catalog.entries) == (earlier.resolve(),)
 
 
 def test_valid_entries_follow_canonical_path_order_regardless_of_creation_order(
@@ -132,14 +154,14 @@ def test_valid_entries_follow_canonical_path_order_regardless_of_creation_order(
             encoding="utf-8",
         )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
     )
 
-    assert tuple(entry.metadata.name for entry in catalog.entries) == ("earlier", "later")
-    assert tuple(entry.metadata.path for entry in catalog.entries) == (
+    assert tuple(entry.name for entry in catalog.entries) == ("earlier", "later")
+    assert tuple(entry.path for entry in catalog.entries) == (
         earlier.resolve(),
         later.resolve(),
     )
@@ -155,7 +177,7 @@ def test_invalid_candidate_logs_path_and_reason_without_body(agent_home: Path) -
     diagnostics = capture_diagnostics()
 
     try:
-        catalog = discover_skills(
+        catalog = _catalog(
             agent_home=AgentHome(agent_home),
             reserved_names=(),
             enable_always_load=False,
@@ -179,13 +201,13 @@ def test_only_direct_child_skill_directories_are_scanned(agent_home: Path) -> No
             encoding="utf-8",
         )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
     )
 
-    assert tuple(entry.metadata.name for entry in catalog.entries) == ("direct",)
+    assert tuple(entry.name for entry in catalog.entries) == ("direct",)
 
 
 @pytest.mark.parametrize(
@@ -204,7 +226,7 @@ def test_invalid_frontmatter_shapes_are_excluded(agent_home: Path, document: str
     instruction.parent.mkdir(parents=True)
     instruction.write_text(document, encoding="utf-8")
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -238,7 +260,7 @@ def test_name_character_and_length_contract(
         encoding="utf-8",
     )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -269,7 +291,7 @@ def test_description_trimmed_length_contract(
         encoding="utf-8",
     )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -283,7 +305,7 @@ def test_non_utf8_frontmatter_is_excluded(agent_home: Path) -> None:
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: valid\ndescription: \xff\n---\nBODY\n")
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -296,7 +318,7 @@ def test_non_regular_instruction_path_is_excluded(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "directory-instruction" / "SKILL.md"
     instruction.mkdir(parents=True)
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -312,14 +334,18 @@ def test_metadata_discovery_does_not_decode_body_bytes(agent_home: Path) -> None
         b"---\nname: metadata-only\ndescription: Metadata is valid\n---\n\xffBODY\n"
     )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
     )
 
-    assert tuple(entry.metadata.name for entry in catalog.entries) == ("metadata-only",)
-    assert catalog.entries[0].always_body is None
+    assert tuple(entry.name for entry in catalog.entries) == ("metadata-only",)
+    assert tuple(field.name for field in fields(catalog.entries[0])) == (
+        "name",
+        "description",
+        "path",
+    )
 
 
 def test_instruction_symlink_escape_is_excluded_when_links_are_available(
@@ -338,7 +364,7 @@ def test_instruction_symlink_escape_is_excluded_when_links_are_available(
     except (OSError, NotImplementedError) as error:
         pytest.skip(f"file links unavailable: {error}")
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -372,7 +398,7 @@ def test_skill_directory_reparse_escape_is_excluded_when_links_are_available(
     except (OSError, NotImplementedError, subprocess.CalledProcessError) as error:
         pytest.skip(f"directory links unavailable: {error}")
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -389,7 +415,7 @@ def test_catalog_snapshot_exposes_immutable_entries_and_lookup(agent_home: Path)
         encoding="utf-8",
     )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -401,7 +427,29 @@ def test_catalog_snapshot_exposes_immutable_entries_and_lookup(agent_home: Path)
     with pytest.raises(AttributeError):
         catalog.entries.append(entry)  # type: ignore[attr-defined]
     with pytest.raises(AttributeError):
-        entry.metadata.name = "changed"  # type: ignore[misc]
+        entry.name = "changed"  # type: ignore[misc]
+
+
+def test_runtime_skill_snapshot_requires_an_ordered_unique_catalog_subset(
+    tmp_path: Path,
+) -> None:
+    first = SkillMetadata("first", "First", tmp_path / "first" / "SKILL.md")
+    second = SkillMetadata("second", "Second", tmp_path / "second" / "SKILL.md")
+    outside = SkillMetadata("outside", "Outside", tmp_path / "outside" / "SKILL.md")
+    catalog = SkillCatalog(root=tmp_path, entries=(first, second))
+    first_body = AlwaysLoadedSkill(first, "first body")
+    second_body = AlwaysLoadedSkill(second, "second body")
+
+    snapshot = RuntimeSkillSnapshot(catalog, (first_body, second_body))
+
+    assert snapshot.always_loaded == (first_body, second_body)
+    for invalid in (
+        (second_body, first_body),
+        (first_body, first_body),
+        (AlwaysLoadedSkill(outside, "outside body"),),
+    ):
+        with pytest.raises(ValueError, match="ordered Catalog subset"):
+            RuntimeSkillSnapshot(catalog, invalid)
 
 
 def test_invalid_earlier_duplicate_does_not_block_later_valid_entry(agent_home: Path) -> None:
@@ -418,46 +466,66 @@ def test_invalid_earlier_duplicate_does_not_block_later_valid_entry(agent_home: 
         encoding="utf-8",
     )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
     )
 
-    assert tuple(entry.metadata.path for entry in catalog.entries) == (valid.resolve(),)
+    assert tuple(entry.path for entry in catalog.entries) == (valid.resolve(),)
 
 
 def test_disabled_always_load_does_not_interpret_always_metadata(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "always-candidate" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(
-        b"---\nname: always-candidate\ndescription: Metadata only\nalways: true\n---\n\xffbody\n"
+        b'---\nname: always-candidate\ndescription: Metadata only\nalways: "true"\n---\n\xffbody\n'
     )
+    diagnostics = capture_diagnostics()
 
-    catalog = discover_skills(
-        agent_home=AgentHome(agent_home),
-        reserved_names=(),
-        enable_always_load=False,
-    )
+    try:
+        snapshot = build_runtime_skill_snapshot(
+            agent_home=AgentHome(agent_home),
+            reserved_names=(),
+            enable_always_load=False,
+        )
+    finally:
+        diagnostics.close()
 
-    assert len(catalog.entries) == 1
-    assert catalog.entries[0].always_body is None
+    assert len(snapshot.catalog.entries) == 1
+    assert snapshot.always_loaded == ()
+    assert "Ignoring non-boolean Skill always field" not in diagnostics.event_text
 
 
-def test_enabled_boolean_always_freezes_the_complete_body(agent_home: Path) -> None:
+def test_enabled_boolean_always_reads_and_freezes_the_complete_body_once(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     instruction = agent_home / "skills" / "always" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(
         b"---\nname: always\ndescription: Always loaded\nalways: true\n---\nComplete body\n"
     )
+    original_open = cast(Callable[..., Any], Path.open)
+    instruction_opens = 0
 
-    catalog = discover_skills(
+    def recording_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal instruction_opens
+        if path.name == "SKILL.md":
+            instruction_opens += 1
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", recording_open)
+
+    snapshot = build_runtime_skill_snapshot(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=True,
     )
 
-    assert catalog.entries[0].always_body == "Complete body\n"
+    assert snapshot.catalog.entries == (snapshot.always_loaded[0].metadata,)
+    assert snapshot.always_loaded[0].body == "Complete body\n"
+    assert instruction_opens == 2  # one metadata read and one complete-document read
 
 
 @pytest.mark.parametrize("always_field", ("always: false\n", ""))
@@ -475,13 +543,14 @@ def test_enabled_non_opted_in_skill_remains_metadata_only(
         ).encode("utf-8")
     )
 
-    catalog = discover_skills(
+    snapshot = build_runtime_skill_snapshot(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=True,
     )
 
-    assert catalog.entries[0].always_body is None
+    assert len(snapshot.catalog.entries) == 1
+    assert snapshot.always_loaded == ()
 
 
 def test_duplicate_always_candidate_does_not_override_the_first_valid_entry(
@@ -498,15 +567,15 @@ def test_duplicate_always_candidate_does_not_override_the_first_valid_entry(
         b"---\nname: duplicate\ndescription: Later candidate\nalways: true\n---\nsecond\n"
     )
 
-    catalog = discover_skills(
+    snapshot = build_runtime_skill_snapshot(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=True,
     )
 
-    assert len(catalog.entries) == 1
-    assert catalog.entries[0].metadata.description == "First candidate"
-    assert catalog.entries[0].always_body is None
+    assert len(snapshot.catalog.entries) == 1
+    assert snapshot.catalog.entries[0].description == "First candidate"
+    assert snapshot.always_loaded == ()
 
 
 def test_enabled_always_non_utf8_body_fails_closed(agent_home: Path) -> None:
@@ -517,7 +586,7 @@ def test_enabled_always_non_utf8_body_fails_closed(agent_home: Path) -> None:
     )
 
     with pytest.raises(SkillUnavailableError) as failure:
-        discover_skills(
+        build_runtime_skill_snapshot(
             agent_home=AgentHome(agent_home),
             reserved_names=(),
             enable_always_load=True,
@@ -526,14 +595,14 @@ def test_enabled_always_non_utf8_body_fails_closed(agent_home: Path) -> None:
     assert failure.value.error.code == "skill_unavailable"
 
 
-def test_always_body_is_frozen_in_the_final_catalog(agent_home: Path) -> None:
+def test_always_body_is_frozen_in_the_runtime_snapshot(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "frozen" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(
         b"---\nname: frozen\ndescription: Frozen body\nalways: true\n---\nfirst\n"
     )
 
-    catalog = discover_skills(
+    snapshot = build_runtime_skill_snapshot(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=True,
@@ -542,7 +611,7 @@ def test_always_body_is_frozen_in_the_final_catalog(agent_home: Path) -> None:
         b"---\nname: frozen\ndescription: Frozen body\nalways: true\n---\nsecond\n"
     )
 
-    assert catalog.entries[0].always_body == "first\n"
+    assert snapshot.always_loaded[0].body == "first\n"
 
 
 def test_always_opt_in_change_during_complete_read_fails_closed(
@@ -572,7 +641,7 @@ def test_always_opt_in_change_during_complete_read_fails_closed(
     monkeypatch.setattr(Path, "open", replace_after_metadata)
 
     with pytest.raises(SkillUnavailableError) as failure:
-        discover_skills(
+        build_runtime_skill_snapshot(
             agent_home=AgentHome(agent_home),
             reserved_names=(),
             enable_always_load=True,
@@ -593,7 +662,7 @@ def test_enabled_non_boolean_always_warns_once_and_stays_metadata_only(
     diagnostics = capture_diagnostics()
 
     try:
-        catalog = discover_skills(
+        snapshot = build_runtime_skill_snapshot(
             agent_home=AgentHome(agent_home),
             reserved_names=(),
             enable_always_load=True,
@@ -601,7 +670,8 @@ def test_enabled_non_boolean_always_warns_once_and_stays_metadata_only(
     finally:
         diagnostics.close()
 
-    assert catalog.entries[0].always_body is None
+    assert len(snapshot.catalog.entries) == 1
+    assert snapshot.always_loaded == ()
     assert diagnostics.event_text.count("Ignoring non-boolean Skill always field") == 1
     assert "SECRET BODY" not in diagnostics.text
 
@@ -613,13 +683,13 @@ def test_read_body_returns_the_complete_current_skill_body(agent_home: Path) -> 
         b"---\nname: reader\ndescription: Read the body\n---\nfirst line\nsecond line\n"
     )
 
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
     )
 
-    assert catalog.read_body(catalog.entries[0].metadata) == "first line\nsecond line\n"
+    assert catalog.read_body(catalog.entries[0]) == "first line\nsecond line\n"
 
 
 def test_resolve_manual_returns_the_complete_body_for_an_exact_slash_name(
@@ -628,7 +698,7 @@ def test_resolve_manual_returns_the_complete_body_for_an_exact_slash_name(
     instruction = agent_home / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n")
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -637,7 +707,7 @@ def test_resolve_manual_returns_the_complete_body_for_an_exact_slash_name(
     invocation = catalog.resolve_manual("/planner")
 
     assert invocation is not None
-    assert invocation.metadata == catalog.entries[0].metadata
+    assert invocation.metadata == catalog.entries[0]
     assert invocation.request == ""
     assert invocation.body == "Follow the plan.\n"
 
@@ -656,7 +726,7 @@ def test_resolve_manual_removes_only_the_first_unicode_whitespace_delimiter(
         "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
         encoding="utf-8",
     )
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -676,7 +746,7 @@ def test_resolve_manual_reads_a_matching_body_once(agent_home: Path) -> None:
         "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
         encoding="utf-8",
     )
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -713,7 +783,7 @@ def test_resolve_manual_does_not_read_non_matching_input(
         "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
         encoding="utf-8",
     )
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=("/config",),
         enable_always_load=False,
@@ -735,7 +805,7 @@ def test_resolve_manual_does_not_read_non_matching_input(
 
 
 def test_resolve_manual_rejects_non_string_input(agent_home: Path) -> None:
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -749,7 +819,7 @@ def test_read_body_rejects_metadata_changed_after_discovery(agent_home: Path) ->
     instruction = agent_home / "skills" / "stale" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: stale\ndescription: Original\n---\nbody\n")
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -757,7 +827,7 @@ def test_read_body_rejects_metadata_changed_after_discovery(agent_home: Path) ->
     instruction.write_bytes(b"---\nname: stale\ndescription: Changed\n---\nbody\n")
 
     with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0].metadata)
+        catalog.read_body(catalog.entries[0])
 
     assert failure.value.error.code == "skill_unavailable"
     assert str(failure.value) == failure.value.error.message
@@ -767,7 +837,7 @@ def test_read_body_maps_missing_target_to_skill_unavailable(agent_home: Path) ->
     instruction = agent_home / "skills" / "missing" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: missing\ndescription: Missing\n---\nbody\n")
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -775,7 +845,7 @@ def test_read_body_maps_missing_target_to_skill_unavailable(agent_home: Path) ->
     instruction.unlink()
 
     with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0].metadata)
+        catalog.read_body(catalog.entries[0])
 
     assert failure.value.error.code == "skill_unavailable"
 
@@ -787,7 +857,7 @@ def test_read_body_maps_unreadable_target_to_skill_unavailable(
     instruction = agent_home / "skills" / "unreadable" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: unreadable\ndescription: Unreadable\n---\nbody\n")
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -800,7 +870,7 @@ def test_read_body_maps_unreadable_target_to_skill_unavailable(
     monkeypatch.setattr(Path, "open", deny_open)
 
     with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0].metadata)
+        catalog.read_body(catalog.entries[0])
 
     assert failure.value.error.code == "skill_unavailable"
 
@@ -809,14 +879,14 @@ def test_read_body_maps_non_utf8_content_to_skill_unavailable(agent_home: Path) 
     instruction = agent_home / "skills" / "binary" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: binary\ndescription: Binary\n---\n\xffbody\n")
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
     )
 
     with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0].metadata)
+        catalog.read_body(catalog.entries[0])
 
     assert failure.value.error.code == "skill_unavailable"
 
@@ -825,12 +895,12 @@ def test_read_body_does_not_cache_the_body(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "fresh" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: fresh\ndescription: Fresh\n---\nfirst\n")
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
     )
-    metadata = catalog.entries[0].metadata
+    metadata = catalog.entries[0]
     assert catalog.read_body(metadata) == "first\n"
 
     instruction.write_bytes(b"---\nname: fresh\ndescription: Fresh\n---\nsecond\n")
@@ -847,13 +917,13 @@ def test_read_body_keeps_regular_hardlinks_readable(agent_home: Path) -> None:
         instruction.hardlink_to(outside)
     except (OSError, NotImplementedError) as error:
         pytest.skip(f"hard links unavailable: {error}")
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
     )
 
-    assert catalog.read_body(catalog.entries[0].metadata) == "body\n"
+    assert catalog.read_body(catalog.entries[0]) == "body\n"
 
 
 def test_read_body_uses_one_opened_descriptor_instead_of_a_second_path_read(
@@ -863,7 +933,7 @@ def test_read_body_uses_one_opened_descriptor_instead_of_a_second_path_read(
     instruction = agent_home / "skills" / "stable" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: stable\ndescription: Stable body\n---\noriginal\n")
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -876,7 +946,7 @@ def test_read_body_uses_one_opened_descriptor_instead_of_a_second_path_read(
 
     monkeypatch.setattr(Path, "read_bytes", substitute_path_read)
 
-    assert catalog.read_body(catalog.entries[0].metadata) == "original\n"
+    assert catalog.read_body(catalog.entries[0]) == "original\n"
     assert path_reads == []
 
 
@@ -895,7 +965,7 @@ def test_read_body_rejects_a_symlink_replacement_after_open(
         probe.unlink()
     except (OSError, NotImplementedError) as error:
         pytest.skip(f"file links unavailable: {error}")
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -914,7 +984,7 @@ def test_read_body_rejects_a_symlink_replacement_after_open(
     )
 
     with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0].metadata)
+        catalog.read_body(catalog.entries[0])
 
     assert failure.value.error.code == "skill_unavailable"
 
@@ -934,7 +1004,7 @@ def test_read_body_uses_the_same_metadata_rules_as_discovery(
     instruction = agent_home / "skills" / "stable" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: stable\ndescription: Stable body\n---\nbody\n")
-    catalog = discover_skills(
+    catalog = _catalog(
         agent_home=AgentHome(agent_home),
         reserved_names=(),
         enable_always_load=False,
@@ -942,6 +1012,6 @@ def test_read_body_uses_the_same_metadata_rules_as_discovery(
     instruction.write_bytes(replacement)
 
     with pytest.raises(SkillUnavailableError) as failure:
-        catalog.read_body(catalog.entries[0].metadata)
+        catalog.read_body(catalog.entries[0])
 
     assert failure.value.error.code == "skill_unavailable"

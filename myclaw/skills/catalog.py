@@ -29,11 +29,15 @@ class SkillMetadata:
 
 
 @dataclass(frozen=True, slots=True)
-class SkillEntry:
-    """One immutable Skill Catalog entry."""
+class AlwaysLoadedSkill:
+    """One Runtime Lifetime-owned frozen Skill instruction body."""
 
     metadata: SkillMetadata
-    always_body: str | None
+    body: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.metadata, SkillMetadata) or not isinstance(self.body, str):
+            raise TypeError("Always-loaded Skill requires metadata and a body")
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,16 +60,20 @@ class SkillUnavailableError(Exception):
 class SkillCatalog:
     """Ordered immutable Skill metadata and a name lookup snapshot."""
 
-    def __init__(self, *, root: Path, entries: Iterable[SkillEntry]) -> None:
+    def __init__(self, *, root: Path, entries: Iterable[SkillMetadata]) -> None:
         self._root = Path(root)
         self._entries = tuple(entries)
-        self._by_name: Mapping[str, SkillEntry] = MappingProxyType(
-            {entry.metadata.name: entry for entry in self._entries}
+        if not all(isinstance(entry, SkillMetadata) for entry in self._entries):
+            raise TypeError("Skill Catalog entries must be Skill metadata")
+        self._by_name: Mapping[str, SkillMetadata] = MappingProxyType(
+            {entry.name: entry for entry in self._entries}
         )
+        if len(self._by_name) != len(self._entries):
+            raise ValueError("Skill Catalog metadata names must be unique")
 
     @property
-    def entries(self) -> tuple[SkillEntry, ...]:
-        """Return the ordered immutable entry snapshot."""
+    def entries(self) -> tuple[SkillMetadata, ...]:
+        """Return the ordered immutable metadata snapshot."""
         return self._entries
 
     @property
@@ -73,8 +81,8 @@ class SkillCatalog:
         """Return the canonical Skill root used by this snapshot."""
         return self._root
 
-    def get(self, name: str) -> SkillEntry | None:
-        """Return the entry for an exact Skill name, when present."""
+    def get(self, name: str) -> SkillMetadata | None:
+        """Return metadata for an exact Skill name, when present."""
         return self._by_name.get(name)
 
     def read_body(self, metadata: SkillMetadata) -> str:
@@ -99,30 +107,62 @@ class SkillCatalog:
         else:
             name = token[:delimiter]
             request = token[delimiter + 1 :]
-        entry = self.get(name)
-        if entry is None:
+        metadata = self.get(name)
+        if metadata is None:
             return None
         return ManualSkillInvocation(
-            metadata=entry.metadata,
+            metadata=metadata,
             request=request,
-            body=self.read_body(entry.metadata),
+            body=self.read_body(metadata),
         )
 
 
-def discover_skills(
+@dataclass(frozen=True, slots=True)
+class RuntimeSkillSnapshot:
+    """Runtime Lifetime-owned Skill metadata and opted-in frozen bodies."""
+
+    catalog: SkillCatalog
+    always_loaded: tuple[AlwaysLoadedSkill, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.catalog, SkillCatalog):
+            raise TypeError("Runtime Skill snapshot requires a Skill Catalog")
+        if not isinstance(self.always_loaded, tuple) or not all(
+            isinstance(skill, AlwaysLoadedSkill) for skill in self.always_loaded
+        ):
+            raise TypeError("Runtime Skill snapshot always-loaded entries must be a tuple")
+        positions = {metadata.name: index for index, metadata in enumerate(self.catalog.entries)}
+        previous = -1
+        for skill in self.always_loaded:
+            position = positions.get(skill.metadata.name)
+            if (
+                position is None
+                or self.catalog.entries[position] != skill.metadata
+                or position <= previous
+            ):
+                raise ValueError(
+                    "Runtime Skill snapshot always-loaded entries must be an ordered Catalog subset"
+                )
+            previous = position
+
+
+def build_runtime_skill_snapshot(
     *,
     agent_home: AgentHome,
     reserved_names: Collection[str],
     enable_always_load: bool,
-) -> SkillCatalog:
-    """Build one immutable Skill Catalog snapshot."""
+) -> RuntimeSkillSnapshot:
+    """Atomically build one Runtime Lifetime Skill snapshot."""
     reserved = {name.removeprefix("/") for name in reserved_names}
     root = agent_home.skills_directory.resolve()
     if not root.is_dir():
         logger.info("Discovered Skills count=0")
-        return SkillCatalog(root=root, entries=())
+        return RuntimeSkillSnapshot(
+            catalog=SkillCatalog(root=root, entries=()),
+            always_loaded=(),
+        )
 
-    entries: list[SkillEntry] = []
+    entries: list[SkillMetadata] = []
     always_names: set[str] = set()
     names: set[str] = set()
     try:
@@ -130,7 +170,10 @@ def discover_skills(
     except OSError:
         logger.warning("Skipping Skill discovery path={} reason=Skill root is unavailable", root)
         logger.info("Discovered Skills count=0")
-        return SkillCatalog(root=root, entries=())
+        return RuntimeSkillSnapshot(
+            catalog=SkillCatalog(root=root, entries=()),
+            always_loaded=(),
+        )
 
     candidates: list[tuple[Path, Path]] = []
     for candidate in children:
@@ -190,24 +233,18 @@ def discover_skills(
         names.add(metadata.name)
         if enable_always_load and always_value is True:
             always_names.add(metadata.name)
-        entries.append(SkillEntry(metadata=metadata, always_body=None))
+        entries.append(metadata)
     logger.info("Discovered Skills count={}", len(entries))
     catalog = SkillCatalog(root=root, entries=entries)
-    if not always_names:
-        return catalog
-
-    frozen_entries = [
-        SkillEntry(
-            metadata=entry.metadata,
-            always_body=(
-                _read_complete_body(catalog, entry.metadata, require_always=True)
-                if entry.metadata.name in always_names
-                else None
-            ),
+    always_loaded = tuple(
+        AlwaysLoadedSkill(
+            metadata=metadata,
+            body=_read_complete_body(catalog, metadata, require_always=True),
         )
-        for entry in catalog.entries
-    ]
-    return SkillCatalog(root=root, entries=frozen_entries)
+        for metadata in catalog.entries
+        if metadata.name in always_names
+    )
+    return RuntimeSkillSnapshot(catalog=catalog, always_loaded=always_loaded)
 
 
 def _read_metadata(
@@ -278,8 +315,8 @@ def _read_complete_body(
 ) -> str:
     if not isinstance(metadata, SkillMetadata):
         raise _skill_unavailable()
-    entry = catalog._by_name.get(metadata.name)
-    if entry is None or entry.metadata != metadata:
+    retained = catalog._by_name.get(metadata.name)
+    if retained is None or retained != metadata:
         raise _skill_unavailable()
 
     try:
@@ -357,10 +394,11 @@ def _log_invalid(candidate: Path, reason: str) -> None:
 
 
 __all__ = [
+    "AlwaysLoadedSkill",
     "ManualSkillInvocation",
+    "RuntimeSkillSnapshot",
     "SkillCatalog",
-    "SkillEntry",
     "SkillMetadata",
     "SkillUnavailableError",
-    "discover_skills",
+    "build_runtime_skill_snapshot",
 ]

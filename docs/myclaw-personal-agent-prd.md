@@ -15,7 +15,7 @@
 - Agent Loop 通过 Message Bus、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界编排 Agent Run；RuntimeHost 负责 Runtime Generation 生命周期。
 - 每个非空普通前台输入在 Agent Run 前经过隔离的 Task Framing，用一个隐藏 Blackboard 明确当前任务目标与完成边界。
 - Agent Home 固定为 `~/.myclaw/`，采用 file-first persistence。
-- Terminal Conversation 支持 streaming、前台 Agent Run 期间的 Inbound FIFO 排队、后台 Memory Task、Schedule Jobs、Session resume 和管理 slash commands；Schedule actions 不请求 Tool Confirmation，Exec、Web 和 Workspace 外部路径按具体目标执行一次性确认。
+- Terminal Conversation 支持 streaming、前台 Agent Run 期间的 Inbound FIFO 排队、后台 Memory Task、Schedule Jobs、Session resume 和管理 slash commands；Schedule actions 不请求 Tool Confirmation；Exec、Web、resolved escape 和其他 Workspace 外部路径按具体目标执行一次性确认，只有 `read_file` 对 canonical Agent Home Skill root 无需 Tool Confirmation。
 - 首版非交互管理只支持 `myclaw config`，不支持 one-shot 对话。
 
 ## Current Runtime Contract
@@ -259,13 +259,13 @@
 - 没有独立 `Security` 模块；公共路径、DNS、截断和 Artifact 能力由 BaseTool 或共享 helper 提供，capability-specific 规则保留在具体 Tool。
 - Tool Gateway 不序列化前台和后台工具调用。
 - File read/list/search 默认 allow。
-- Workspace 内新建文件和编辑已有文件直接执行，实际结果服从操作系统权限；解析到 Workspace 外的路径请求一次性确认。
+- Workspace 内新建文件和编辑已有文件直接执行，实际结果服从操作系统权限；`read_file` 对 canonical Agent Home Skill root 无需 Tool Confirmation，resolved escape 和其他解析到 Workspace 外的路径仍请求一次性确认。
 - Exec cwd 默认 Workspace，timeout 范围为 1–600 秒；它执行单次 Bash，没有 allowlist、persistent process 或 OS sandbox。
 - Exec 对已知 destructive 命令形状及 URL DNS/private-target 风险请求确认。
 - WebSearch 无额外首版限制，使用无凭据的内置 adapter，首选 DuckDuckGo；实际后端不进入持久化配置契约。
 - WebFetch 对 DNS 失败、localhost、私有网段和其他非公网地址请求一次性确认；没有确认通道或拒绝时 refused。
 - WebFetch 最多跟随 5 次重定向，并对每个目标重新执行地址检查。
-- Schedule add/list/remove 不请求确认；Scheduled Agent context 拒绝 add，但允许 list/remove。Exec、Web 和 Workspace 外部路径才使用精确绑定的一次性确认。
+- Schedule add/list/remove 不请求确认；Scheduled Agent context 拒绝 add，但允许 list/remove。Schedule 只复用 generic `read_file` path exemption；Exec、Web、resolved escape 和其他 Workspace 外部路径才使用精确绑定的一次性确认。
 
 ### Tool Artifacts
 
@@ -283,6 +283,7 @@
 - Schedule state 是 Workspace-owned 的严格 JSON 数组，字段为 `job_id`、`source`、`message`、`schedule`、`state`、`created_at_ms` 和 `updated_at_ms`。
 - Schedule 支持 `at`、`every` 和 `cron`；Cron Job 固化 IANA timezone，at 使用带 UTC offset 的绝对时间。
 - User Job 通过 `schedule` Tool 的 add、list、remove action 管理；三种 action 都不请求 Tool Confirmation，Scheduled Agent context 拒绝 add。
+- Schedule 只复用 generic `read_file` path exemption，不获得 Skill discovery 或 invocation Interface。
 - 每个 Job 使用由 `schedule_<job_id>` 派生的 Schedule Session，并使用专属 `schedule-sessions/` 分区；该 Session 不出现在 `/resume`。
 - Schedule Service 是唯一的 Job dispatcher，所有触发都通过共享 Agent Run 使用 `schedule` route，结果保留在 Schedule Session。
 - 同一 Job 在单 runtime 内不重入；不同 Job 可并发；不做跨进程协调，因此多个 runtime 可能重复触发。
