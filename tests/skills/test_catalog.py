@@ -63,11 +63,13 @@ def test_existing_empty_skills_root_is_empty(agent_home: Path) -> None:
     assert root.is_dir()
 
 
-def test_valid_direct_child_retains_trimmed_metadata_only(agent_home: Path) -> None:
+def test_valid_direct_child_retains_exact_name_and_trimmed_description_only(
+    agent_home: Path,
+) -> None:
     instruction = agent_home / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_text(
-        '---\nname: "  plan  "\ndescription: "  Do useful work.  "\n---\nsecret body\n',
+        '---\nname: "plan"\ndescription: "  Do useful work.  "\n---\nsecret body\n',
         encoding="utf-8",
     )
 
@@ -270,6 +272,35 @@ def test_name_character_and_length_contract(
 
 
 @pytest.mark.parametrize(
+    "name_yaml",
+    (
+        '" leading"',
+        '"trailing "',
+        '"alpha\\tbeta"',
+        ">-\n  alpha\n  beta",
+    ),
+)
+def test_name_whitespace_is_rejected_without_normalization(
+    agent_home: Path,
+    name_yaml: str,
+) -> None:
+    instruction = agent_home / "skills" / "whitespace-name" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        f"---\nname: {name_yaml}\ndescription: Valid description\n---\n",
+        encoding="utf-8",
+    )
+
+    catalog = _catalog(
+        agent_home=AgentHome(agent_home),
+        reserved_names=(),
+        enable_always_load=False,
+    )
+
+    assert catalog.entries == ()
+
+
+@pytest.mark.parametrize(
     ("description", "accepted"),
     (
         ("", False),
@@ -298,6 +329,8 @@ def test_description_trimmed_length_contract(
     )
 
     assert bool(catalog.entries) is accepted
+    if accepted:
+        assert catalog.entries[0].description == description.strip()
 
 
 def test_non_utf8_frontmatter_is_excluded(agent_home: Path) -> None:
@@ -503,9 +536,8 @@ def test_enabled_boolean_always_reads_and_freezes_the_complete_body_once(
 ) -> None:
     instruction = agent_home / "skills" / "always" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(
-        b"---\nname: always\ndescription: Always loaded\nalways: true\n---\nComplete body\n"
-    )
+    document = "---\nname: always\ndescription: Always loaded\nalways: true\n---\nComplete body\n"
+    instruction.write_bytes(document.encode("utf-8"))
     original_open = cast(Callable[..., Any], Path.open)
     instruction_opens = 0
 
@@ -524,7 +556,7 @@ def test_enabled_boolean_always_reads_and_freezes_the_complete_body_once(
     )
 
     assert snapshot.catalog.entries == (snapshot.always_loaded[0].metadata,)
-    assert snapshot.always_loaded[0].body == "Complete body\n"
+    assert snapshot.always_loaded[0].body == document
     assert instruction_opens == 2  # one metadata read and one complete-document read
 
 
@@ -611,7 +643,9 @@ def test_always_body_is_frozen_in_the_runtime_snapshot(agent_home: Path) -> None
         b"---\nname: frozen\ndescription: Frozen body\nalways: true\n---\nsecond\n"
     )
 
-    assert snapshot.always_loaded[0].body == "first\n"
+    assert snapshot.always_loaded[0].body == (
+        "---\nname: frozen\ndescription: Frozen body\nalways: true\n---\nfirst\n"
+    )
 
 
 def test_always_opt_in_change_during_complete_read_fails_closed(
@@ -676,11 +710,11 @@ def test_enabled_non_boolean_always_warns_once_and_stays_metadata_only(
     assert "SECRET BODY" not in diagnostics.text
 
 
-def test_read_body_returns_the_complete_current_skill_body(agent_home: Path) -> None:
+def test_read_body_returns_the_complete_current_skill_document(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "reader" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(
-        b"---\nname: reader\ndescription: Read the body\n---\nfirst line\nsecond line\n"
+        b"---\r\nname: reader\r\ndescription: Read the body\r\n---\r\nfirst line\r\nsecond line\r\n"
     )
 
     catalog = _catalog(
@@ -689,10 +723,10 @@ def test_read_body_returns_the_complete_current_skill_body(agent_home: Path) -> 
         enable_always_load=False,
     )
 
-    assert catalog.read_body(catalog.entries[0]) == "first line\nsecond line\n"
+    assert catalog.read_body(catalog.entries[0]) == instruction.read_bytes().decode("utf-8")
 
 
-def test_resolve_manual_returns_the_complete_body_for_an_exact_slash_name(
+def test_resolve_manual_returns_the_complete_document_for_an_exact_slash_name(
     agent_home: Path,
 ) -> None:
     instruction = agent_home / "skills" / "planner" / "SKILL.md"
@@ -709,7 +743,7 @@ def test_resolve_manual_returns_the_complete_body_for_an_exact_slash_name(
     assert invocation is not None
     assert invocation.metadata == catalog.entries[0]
     assert invocation.request == ""
-    assert invocation.body == "Follow the plan.\n"
+    assert invocation.body == instruction.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -901,11 +935,11 @@ def test_read_body_does_not_cache_the_body(agent_home: Path) -> None:
         enable_always_load=False,
     )
     metadata = catalog.entries[0]
-    assert catalog.read_body(metadata) == "first\n"
+    assert catalog.read_body(metadata) == "---\nname: fresh\ndescription: Fresh\n---\nfirst\n"
 
     instruction.write_bytes(b"---\nname: fresh\ndescription: Fresh\n---\nsecond\n")
 
-    assert catalog.read_body(metadata) == "second\n"
+    assert catalog.read_body(metadata) == "---\nname: fresh\ndescription: Fresh\n---\nsecond\n"
 
 
 def test_read_body_keeps_regular_hardlinks_readable(agent_home: Path) -> None:
@@ -923,7 +957,7 @@ def test_read_body_keeps_regular_hardlinks_readable(agent_home: Path) -> None:
         enable_always_load=False,
     )
 
-    assert catalog.read_body(catalog.entries[0]) == "body\n"
+    assert catalog.read_body(catalog.entries[0]) == instruction.read_text(encoding="utf-8")
 
 
 def test_read_body_uses_one_opened_descriptor_instead_of_a_second_path_read(
@@ -946,7 +980,9 @@ def test_read_body_uses_one_opened_descriptor_instead_of_a_second_path_read(
 
     monkeypatch.setattr(Path, "read_bytes", substitute_path_read)
 
-    assert catalog.read_body(catalog.entries[0]) == "original\n"
+    assert catalog.read_body(catalog.entries[0]) == (
+        "---\nname: stable\ndescription: Stable body\n---\noriginal\n"
+    )
     assert path_reads == []
 
 

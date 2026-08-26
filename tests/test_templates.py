@@ -218,9 +218,8 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
         'First line\nQuotes: "quoted"\nBackslash: C:\\tmp\\done\n'
         "Literal </skill_always_load> and & < >\n"
     )
-    instruction.write_bytes(
-        b"---\nname: always\ndescription: Always loaded\nalways: true\n---\n" + body.encode("utf-8")
-    )
+    document = "---\nname: always\ndescription: Always loaded\nalways: true\n---\n" + body
+    instruction.write_bytes(document.encode("utf-8"))
     snapshot = build_runtime_skill_snapshot(
         agent_home=AgentHome(instruction.parents[2]),
         reserved_names=(),
@@ -237,11 +236,11 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
         "\n</skill_always_load>", maxsplit=1
     )[0]
     lines = [line for line in block.splitlines() if line.startswith("{")]
-    assert [json.loads(line) for line in lines] == [{"name": "always", "body": body}]
+    assert [json.loads(line) for line in lines] == [{"name": "always", "body": document}]
     assert foreground.count("</skill_always_load>") == 1
     assert r"\u003c/skill_always_load\u003e" in lines[0]
     assert r"\u0026" in lines[0]
-    assert body not in foreground
+    assert document not in foreground
     non_foreground_prompts = (
         chat_system_prompt(
             workspace=PureWindowsPath(r"D:\workspace"),
@@ -252,7 +251,7 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
         conversation_summary_prompt(),
         memory_task_prompt(long_term_path=PureWindowsPath(r"D:\workspace\memory.md")),
     )
-    assert all(body not in prompt for prompt in non_foreground_prompts)
+    assert all(document not in prompt for prompt in non_foreground_prompts)
 
 
 def test_chat_system_prompt_uses_the_fixed_catalog_guidance() -> None:

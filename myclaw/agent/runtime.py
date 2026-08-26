@@ -699,12 +699,6 @@ def _prepare_runtime(
     )
     schedule_service = ScheduleService(store=schedule_store, clock=schedule_clock)
     long_term_memory = active_workspace_state.long_term_memory_path.read_text(encoding="utf-8")
-    _preflight_skill_context_budget(
-        configuration=configuration,
-        workspace=workspace_identity,
-        long_term_memory=long_term_memory,
-        skill_snapshot=active_skill_snapshot,
-    )
     runtime_memory = RuntimeMemory(long_term_memory)
     resolved_timezone_name = get_localzone_name() if timezone_name is None else timezone_name
     foreground_context = ContextBuilder(
@@ -902,6 +896,15 @@ def _prepare_runtime(
         task_framer=task_framer,
     )
 
+    _preflight_skill_context_budget(
+        configuration=configuration,
+        context_builder=foreground_context,
+        long_term_memory=long_term_memory,
+        session_id=active_session.session_id,
+        skill_snapshot=active_skill_snapshot,
+        tool_schemas=agent_loop.tool_schemas,
+    )
+
     schedule_service.on_schedule_job = agent_loop.run_schedule_job
 
     def current_foreground_chat_status() -> ResolvedChatStatus:
@@ -957,26 +960,24 @@ def _prepare_runtime(
 def _preflight_skill_context_budget(
     *,
     configuration: UserConfiguration,
-    workspace: Workspace,
+    context_builder: ContextBuilder,
     long_term_memory: str,
+    session_id: str,
     skill_snapshot: RuntimeSkillSnapshot,
+    tool_schemas: tuple[OpenAIToolSchema, ...],
 ) -> None:
-    """Reject an always-loaded snapshot only when its exact foreground projection overflows."""
+    """Reject an always-loaded snapshot when the minimum real foreground request overflows."""
     if not skill_snapshot.always_loaded:
         return
 
     resolved_chat = configuration.resolve_route("chat").route
-    system_prompt = foreground_chat_system_prompt(
-        workspace=workspace.path,
-        long_term_memory=long_term_memory,
-        skill_snapshot=skill_snapshot,
-    )
     estimated = estimate_input_tokens(
-        RuntimeStatusInput(
-            system_prompt=system_prompt,
-            retained_messages=(),
-            tool_definitions=(),
-            runtime_context="",
+        _foreground_runtime_status_input(
+            context_builder=context_builder,
+            history=(),
+            session_id=session_id,
+            long_term_memory=long_term_memory,
+            tool_schemas=tool_schemas,
         )
     )
     available_input = resolved_chat.context_window - resolved_chat.max_output
@@ -987,6 +988,42 @@ def _preflight_skill_context_budget(
                 "Always-loaded Skill content exceeds the foreground chat input budget.",
             )
         )
+
+
+def _foreground_runtime_status_input(
+    *,
+    context_builder: ContextBuilder,
+    history: Sequence[dict[str, Any]],
+    session_id: str,
+    long_term_memory: str,
+    tool_schemas: tuple[OpenAIToolSchema, ...],
+) -> RuntimeStatusInput:
+    """Project and serialize one real foreground input using the status token seam."""
+    projected = context_builder.build_messages(
+        history=history,
+        current_user={"role": "user", "content": ""},
+        session_id=session_id,
+        long_term_memory=long_term_memory,
+    )
+    projected_system = projected[0].get("content")
+    if not isinstance(projected_system, str):
+        raise TypeError("Context Builder status system message is malformed")
+    return RuntimeStatusInput(
+        system_prompt=projected_system,
+        retained_messages=tuple(
+            json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+            for message in projected[1:]
+        ),
+        tool_definitions=tuple(
+            json.dumps(
+                definition,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            for definition in tool_schemas
+        ),
+        runtime_context="",
+    )
 
 
 def _project_foreground_messages(
@@ -1124,32 +1161,26 @@ def _runtime_status_input(
     tool_schemas: tuple[OpenAIToolSchema, ...],
 ) -> RuntimeStatusInput:
     if context_builder is not None:
-        projected = context_builder.build_messages(
+        return _foreground_runtime_status_input(
+            context_builder=context_builder,
             history=session.messages[session.last_consolidated :],
-            current_user={"role": "user", "content": ""},
             session_id=session_id,
             long_term_memory=long_term_memory,
+            tool_schemas=tool_schemas,
         )
-        projected_system = projected[0].get("content")
-        if not isinstance(projected_system, str):
-            raise TypeError("Context Builder status system message is malformed")
-        system_prompt = projected_system
-        retained = projected[1:]
-        runtime_context_value = ""
-    else:
-        retained = [
-            projected_message
-            for message in session.messages[session.last_consolidated :]
-            if (projected_message := project_session_message(message)) is not None
-        ]
-        runtime_context_value = (
-            ""
-            if current_time is None
-            else runtime_context(
-                current_time=current_time,
-                session_id=session_id,
-            )
+    retained = [
+        projected_message
+        for message in session.messages[session.last_consolidated :]
+        if (projected_message := project_session_message(message)) is not None
+    ]
+    runtime_context_value = (
+        ""
+        if current_time is None
+        else runtime_context(
+            current_time=current_time,
+            session_id=session_id,
         )
+    )
     retained_messages = tuple(
         json.dumps(message, ensure_ascii=False, separators=(",", ":")) for message in retained
     )

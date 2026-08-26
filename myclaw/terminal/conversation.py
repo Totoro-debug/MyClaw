@@ -240,11 +240,6 @@ class _ConversationInput(TextArea):
             event.prevent_default()
             completion.accept_command_completion()
             return
-        if event.key == "tab" and completion.command_completion_visible:
-            event.stop()
-            event.prevent_default()
-            completion.accept_command_completion(submit_exact=False)
-            return
         if event.key == "ctrl+c" and completion.command_completion_visible:
             event.stop()
             event.prevent_default()
@@ -315,7 +310,7 @@ class _CommandCompletionHost(Protocol):
 
     def dismiss_command_completion(self) -> None: ...
 
-    def accept_command_completion(self, *, submit_exact: bool = True) -> None: ...
+    def accept_command_completion(self) -> None: ...
 
 
 class _CompletionCandidateKind(StrEnum):
@@ -2224,7 +2219,7 @@ class TerminalConversationApp(App[None]):
         self._hide_command_completion(remember_text=input_area.text)
         input_area.focus()
 
-    def accept_command_completion(self, *, submit_exact: bool = True) -> None:
+    def accept_command_completion(self) -> None:
         if not self._completion_options:
             return
         completion = self.query_one("#command-completion", _CommandCompletion)
@@ -2233,8 +2228,7 @@ class TerminalConversationApp(App[None]):
         selected = self._completion_options[index]
         input_area = self.query_one("#conversation-input", _ConversationInput)
         should_submit = (
-            submit_exact
-            and selected.kind is _CompletionCandidateKind.MANAGEMENT
+            selected.kind is _CompletionCandidateKind.MANAGEMENT
             and input_area.text == selected.insert_text
         )
         self._select_command_completion(index)

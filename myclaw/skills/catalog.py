@@ -30,7 +30,7 @@ class SkillMetadata:
 
 @dataclass(frozen=True, slots=True)
 class AlwaysLoadedSkill:
-    """One Runtime Lifetime-owned frozen Skill instruction body."""
+    """One Runtime Lifetime-owned frozen complete Skill document."""
 
     metadata: SkillMetadata
     body: str
@@ -50,7 +50,7 @@ class ManualSkillInvocation:
 
 
 class SkillUnavailableError(Exception):
-    """A complete Skill body could not be read from its catalog snapshot."""
+    """A complete Skill document could not be read from its catalog snapshot."""
 
     def __init__(self, error: ErrorInfo) -> None:
         self.error = error
@@ -86,11 +86,11 @@ class SkillCatalog:
         return self._by_name.get(name)
 
     def read_body(self, metadata: SkillMetadata) -> str:
-        """Read and revalidate one catalog Skill body without retaining it."""
+        """Read and revalidate one complete catalog Skill document without retaining it."""
         return _read_complete_body(self, metadata, require_always=False)
 
     def resolve_manual(self, raw_input: str) -> ManualSkillInvocation | None:
-        """Resolve one exact slash invocation and load its current complete body."""
+        """Resolve one exact slash invocation and load its current complete document."""
         if not isinstance(raw_input, str):
             raise TypeError("Skill input must be a string")
         if not raw_input.startswith("/"):
@@ -290,13 +290,13 @@ def _parse_document(
     if not lines or not _is_text_delimiter(lines[0]):
         return None, _MISSING, content
     frontmatter: list[str] = []
-    body_start = None
-    for index, line in enumerate(lines[1:], start=1):
+    closing_delimiter_found = False
+    for line in lines[1:]:
         if _is_text_delimiter(line):
-            body_start = index + 1
+            closing_delimiter_found = True
             break
         frontmatter.append(line)
-    if body_start is None:
+    if not closing_delimiter_found:
         return None, _MISSING, content
     try:
         document: object = yaml.safe_load("".join(frontmatter))
@@ -304,7 +304,7 @@ def _parse_document(
         return None, _MISSING, content
     metadata, _reason = _validate_metadata(document, path)
     always_value = _always_value(document) if interpret_always else _MISSING
-    return metadata, always_value, "".join(lines[body_start:])
+    return metadata, always_value, content
 
 
 def _read_complete_body(
@@ -340,14 +340,14 @@ def _read_complete_body(
     except UnicodeError as error:
         raise _skill_unavailable() from error
 
-    parsed, always_value, body = _parse_document(
+    parsed, always_value, document = _parse_document(
         content,
         path,
         interpret_always=require_always,
     )
     if parsed is None or parsed != metadata or (require_always and always_value is not True):
         raise _skill_unavailable()
-    return body
+    return document
 
 
 def _always_value(document: object) -> object:
@@ -363,13 +363,12 @@ def _validate_metadata(document: object, path: Path) -> tuple[SkillMetadata | No
     description = document.get("description")
     if not isinstance(name, str) or not isinstance(description, str):
         return None, "name and description must be strings"
-    normalized_name = name.strip()
     normalized_description = description.strip()
-    if not _NAME_PATTERN.fullmatch(normalized_name) or not 1 <= len(normalized_description) <= 1024:
+    if not _NAME_PATTERN.fullmatch(name) or not 1 <= len(normalized_description) <= 1024:
         return None, "name or description is outside the accepted bounds"
     return (
         SkillMetadata(
-            name=normalized_name,
+            name=name,
             description=normalized_description,
             path=path,
         ),

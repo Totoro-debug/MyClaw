@@ -322,9 +322,10 @@ def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
         paragraph for paragraph in adr.split("\n\n") if "user slash invocation" in paragraph
     )
     for claim in (
-        "read and revalidate the complete `skill.md`",
-        "instruction body after its frontmatter",
-        "complete raw document are not projected",
+        "read and revalidate the complete utf-8 `skill.md`",
+        "project that complete document",
+        "including its frontmatter delimiters",
+        "runtime context wrapper and fixed tool schemas",
     ):
         assert claim in manual_contract
 
@@ -355,6 +356,10 @@ def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
         "`catalog` 只拥有 metadata",
         "`always_loaded` 单独拥有",
         "entries: tuple[SkillMetadata, ...]",
+        "原始 `name` 不做 trim",
+        "返回包含 frontmatter 与原始换行的完整 document",
+        "固定十个结构化 Tool schemas",
+        "Tab is not intercepted",
     ):
         assert claim in runtime_contract
     assert "always_body" not in runtime_contract

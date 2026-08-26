@@ -132,6 +132,8 @@
 - 首版不要求 `myclaw --help` 作为产品能力。
 - Terminal Conversation 内置 slash commands：`/config`、`/status`、`/resume`、`/memory`、`/dream`。
 - Only Management Commands enter the Management Port. An exact valid Skill slash invocation remains an ordinary foreground Agent Run; unknown or non-matching slash input remains ordinary input.
+- Skill names are validated exactly as authored without trimming; descriptions are trimmed. Manual and opted-in always-load paths revalidate and project the complete UTF-8 `SKILL.md`, including frontmatter and original line endings, while Session persistence retains only the raw slash input.
+- The shared completion surface keeps its existing Management Command Enter/click behavior. Skill Enter/click selection only fills `/<name> ` without submission, and Tab does not accept any completion candidate.
 - `/config` 完整显示配置，但脱敏 plaintext API key。
 - 配置语法错误时，`myclaw config` 显示解析错误、配置路径和原文，并对明显 API key 行做文本级脱敏。
 - `/status` 显示版本、chat model、runtime uptime、估算 token 状态、当前 Session 消息数、`last_consolidated` 和当前 Session 累计 model usage。

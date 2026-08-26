@@ -457,11 +457,10 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
 ) -> None:
     raw_input = "/planner Do the work"
     body = "Follow the plan.\n"
+    document = "---\nname: planner\ndescription: Plan work\n---\n" + body
     instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
-    instruction.write_bytes(
-        ("---\nname: planner\ndescription: Plan work\n---\n" + body).encode("utf-8")
-    )
+    instruction.write_bytes(document.encode("utf-8"))
     catalog = build_runtime_skill_snapshot(
         agent_home=AgentHome(tmp_path / "agent-home"),
         reserved_names=(),
@@ -506,11 +505,11 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
 
     assert len(router.calls) == 2
     assert raw_input in router.calls
-    assert f"<skill>{body}</skill><request>Do the work</request>" in router.calls
+    assert f"<skill>{document}</skill><request>Do the work</request>" in router.calls
     assert framer.calls == [(None, "", raw_input)]
     assert observed[0][0] == {"role": "user", "content": raw_input}
     assert observed[0][1] is not None
-    assert observed[0][1].body == body
+    assert observed[0][1].body == document
     assert observed[0][1].request == "Do the work"
     assert [message["content"] for message in session.messages if message["role"] == "user"] == [
         raw_input

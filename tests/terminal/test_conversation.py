@@ -4541,9 +4541,9 @@ async def test_skill_completion_labels_are_single_line_at_narrow_sizes_and_stop_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("selection", ("enter", "exact-enter", "tab", "mouse"))
+@pytest.mark.parametrize("selection", ("enter", "exact-enter", "mouse"))
 async def test_skill_completion_selection_inserts_only_the_skill_invocation(
-    selection: Literal["enter", "exact-enter", "tab", "mouse"],
+    selection: Literal["enter", "exact-enter", "mouse"],
 ) -> None:
     conversation = ScriptedRunSource()
     fake_runtime = _runtime(conversation)
@@ -4582,6 +4582,43 @@ async def test_skill_completion_selection_inserts_only_the_skill_invocation(
         assert not completion.display
         assert not completion.options
         assert app.screen.focused is input_area
+        assert fake_runtime.inbound_history == []
+        assert conversation.submissions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("down_count", "candidate_text"),
+    ((0, "/config"), (5, "/alpha ")),
+)
+async def test_completion_tab_does_not_accept_or_submit_highlighted_candidate(
+    down_count: int,
+    candidate_text: str,
+) -> None:
+    conversation = ScriptedRunSource()
+    fake_runtime = _runtime(conversation)
+    runtime = cast(PreparedRuntime, fake_runtime)
+    app = TerminalConversationApp(
+        bus=runtime.bus,
+        control=runtime.control,
+        management_dispatcher=runtime.management_dispatcher,
+        start_runtime=runtime.start,
+        close_runtime=runtime.close,
+        skill_metadata=(
+            SkillMetadata(
+                name="alpha",
+                description="First skill",
+                path=Path("C:/agent-home/skills/alpha/SKILL.md"),
+            ),
+        ),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("/", *(("down",) * down_count), "tab")
+        await pilot.pause()
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert input_area.text != candidate_text
         assert fake_runtime.inbound_history == []
         assert conversation.submissions == []
 
