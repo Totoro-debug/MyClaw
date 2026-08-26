@@ -586,6 +586,7 @@ async def test_foreground_context_uses_one_staged_blackboard_for_summary_and_cha
         session_id: str,
         long_term_memory: str,
         blackboard: Blackboard | None = None,
+        manual_invocation: ManualSkillInvocation | None = None,
     ) -> list[dict[str, Any]]:
         observed.append(blackboard)
         return original_projector(
@@ -594,6 +595,7 @@ async def test_foreground_context_uses_one_staged_blackboard_for_summary_and_cha
             session_id=session_id,
             long_term_memory=long_term_memory,
             blackboard=blackboard,
+            manual_invocation=manual_invocation,
         )
 
     monkeypatch.setattr(runtime_module, "_project_foreground_messages", recording_projector)

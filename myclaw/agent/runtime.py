@@ -797,14 +797,6 @@ def _prepare_runtime(
                         messages,
                         system_prompt=current_system_prompt,
                     )
-                if manual_invocation is None:
-                    return _project_foreground_messages(
-                        foreground_context,
-                        messages,
-                        session_id=active_session.session_id,
-                        long_term_memory=runtime_memory.snapshot(),
-                        blackboard=blackboard,
-                    )
                 return _project_foreground_messages(
                     foreground_context,
                     messages,
@@ -885,14 +877,6 @@ def _prepare_runtime(
             manual_invocation=manual_invocation,
         )
         history = active_session.messages[active_session.last_consolidated :]
-        if manual_invocation is None:
-            return _project_foreground_messages(
-                foreground_context,
-                [*history, current_user],
-                session_id=active_session.session_id,
-                long_term_memory=memory_snapshot,
-                blackboard=blackboard,
-            )
         return _project_foreground_messages(
             foreground_context,
             [*history, current_user],
