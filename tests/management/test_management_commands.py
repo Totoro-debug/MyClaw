@@ -8,7 +8,11 @@ import pytest
 from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
-from myclaw.management.commands import MANAGEMENT_COMMANDS, ManagementCommandDispatcher
+from myclaw.management.commands import (
+    MANAGEMENT_COMMANDS,
+    RESUME_MANAGEMENT_COMMAND,
+    ManagementCommandDispatcher,
+)
 from myclaw.management.service import (
     ManagementViewService,
     ResolvedChatStatus,
@@ -73,6 +77,7 @@ def test_management_command_catalog_owns_ordered_tokens_and_descriptions() -> No
         ("/dream", "Process pending Conversation Summaries"),
     )
     assert all(command.token and command.description for command in MANAGEMENT_COMMANDS)
+    assert any(command is RESUME_MANAGEMENT_COMMAND for command in MANAGEMENT_COMMANDS)
 
 
 SCHEMA_INVALID_CONFIG_CONTENT = """[models.providers.primary]

@@ -31,7 +31,7 @@ class ManagementCommandDefinition:
 
 _CONFIG_COMMAND = ManagementCommandDefinition("/config", "View User Configuration")
 _STATUS_COMMAND = ManagementCommandDefinition("/status", "View Runtime Status")
-_RESUME_COMMAND = ManagementCommandDefinition("/resume", "Resume a Conversation Session")
+RESUME_MANAGEMENT_COMMAND = ManagementCommandDefinition("/resume", "Resume a Conversation Session")
 _MEMORY_COMMAND = ManagementCommandDefinition("/memory", "View Long-term Memory")
 _DREAM_COMMAND = ManagementCommandDefinition(
     "/dream",
@@ -40,7 +40,7 @@ _DREAM_COMMAND = ManagementCommandDefinition(
 MANAGEMENT_COMMANDS = (
     _CONFIG_COMMAND,
     _STATUS_COMMAND,
-    _RESUME_COMMAND,
+    RESUME_MANAGEMENT_COMMAND,
     _MEMORY_COMMAND,
     _DREAM_COMMAND,
 )
@@ -92,7 +92,7 @@ class ManagementCommandDispatcher:
         self,
         command: ManagementCommandDefinition,
     ) -> ManagementCommandResult:
-        if command is _RESUME_COMMAND:
+        if command is RESUME_MANAGEMENT_COMMAND:
             try:
                 listing = await self._management.resumable_listing()
             except ManagementError as management_error:

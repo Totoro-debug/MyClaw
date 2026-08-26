@@ -42,7 +42,7 @@ from textual.worker import Worker, WorkerError
 from myclaw.agent.loop import ConfirmationRequestView, TerminalAgentLoopControl
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runtime import PreparedRuntime, RuntimeBindings, RuntimeHost
-from myclaw.management.commands import MANAGEMENT_COMMANDS
+from myclaw.management.commands import MANAGEMENT_COMMANDS, RESUME_MANAGEMENT_COMMAND
 from myclaw.management.service import SessionListingEntry
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
@@ -62,7 +62,7 @@ _CONVERSATION_NAVIGATION_KEYS = frozenset({"pageup", "pagedown", "ctrl+home", "c
 _FAILURE_REASON_MAX_CHARS = 120
 _TOOL_NAME_MAX_CHARS = 80
 _GENERIC_TOOL_FAILURE_REASON = "The operation did not complete."
-_RESUME_MANAGEMENT_COMMAND_TOKEN = MANAGEMENT_COMMANDS[2].token
+_RESUME_MANAGEMENT_COMMAND_TOKEN = RESUME_MANAGEMENT_COMMAND.token
 _UNSAFE_TOOL_DETAIL_PATTERN = re.compile(
     r"(?:^\s*[\[{])|(?:[\"'][^\"']+[\"']\s*:)|"
     r"(?:\b(?:api[_-]?key|authorization|bearer|password|secret|token)\b)|"
