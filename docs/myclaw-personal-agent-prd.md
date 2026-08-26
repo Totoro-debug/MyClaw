@@ -2,7 +2,7 @@
 
 ## Problem Statement
 
-用户需要一个参考 nanobot、但边界更加清晰的通用 Personal Agent。它应当是 local-first、single-user 的本地运行时，以全屏 Terminal Conversation 为主要入口，支持持续前台运行、三层记忆、工具调用、Workspace 级会话隔离、模型路由、用户配置和自然语言定时任务。
+用户需要一个边界清晰、独立设计的通用 Personal Agent。它应当是 local-first、single-user 的本地运行时，以全屏 Terminal Conversation 为主要入口，支持持续前台运行、三层记忆、工具调用、Workspace 级会话隔离、模型路由、用户配置和自然语言定时任务。
 
 首版必须避免演变为多租户 Agent 平台、微服务系统、插件平台或后台 daemon。上层只依赖明确的代码接口边界，不需要了解底层模型 SDK、文件格式或工具实现。
 
@@ -380,7 +380,7 @@
 - Tool Artifact 自动清理。
 - notification adapter 或系统桌面通知。
 - 非交互 status 或 `myclaw --help` 产品能力。
-- nanobot 同等广度的 provider registry。
+- 面向大规模供应商生态的 provider registry。
 
 ## Further Notes
 

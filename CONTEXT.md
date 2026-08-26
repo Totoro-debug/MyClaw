@@ -1,6 +1,6 @@
 # Personal Agent Runtime
 
-This context defines the language for a local-first, single-user Personal Agent runtime inspired by nanobot.
+This context defines the language for an independently designed, local-first, single-user Personal Agent runtime.
 
 ## Language
 
