@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated
 
-from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool, ToolError, ToolParam
 
 
@@ -26,7 +25,7 @@ class ReadFileTool(BaseTool):
         ToolParam(description="Maximum lines to return.", minimum=1, maximum=10000),
     ] = 2000
 
-    def __init__(self, *, workspace: Workspace, skill_root: Path | None = None) -> None:
+    def __init__(self, *, workspace: Path, skill_root: Path | None = None) -> None:
         self._workspace = workspace
         self._skill_root = None if skill_root is None else Path(skill_root).resolve(strict=False)
 

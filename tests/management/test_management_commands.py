@@ -5,7 +5,6 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.management.commands import (
@@ -287,7 +286,7 @@ async def test_memory_command_returns_renderable_complete_disk_text(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     content = "# Long-term Memory\n\n## Lesson\n\u5b8c\u6574\u5185\u5bb9\n" + (
         "memory-line\n" * 8_000
@@ -311,7 +310,7 @@ async def test_memory_command_renders_safe_persistence_failure(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     state.long_term_memory_path.unlink()
     dispatcher = ManagementCommandDispatcher(
@@ -371,7 +370,7 @@ async def test_status_command_renders_actual_runtime_and_session_state(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     session = Session.create(
         state,
@@ -455,7 +454,7 @@ async def test_config_and_memory_commands_bypass_conversation_and_provider(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(CONFIG_CONTENT, encoding="utf-8")
     state.long_term_memory_path.write_text("current memory\n", encoding="utf-8")

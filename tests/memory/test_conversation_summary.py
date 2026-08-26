@@ -10,7 +10,6 @@ import pytest
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.memory.conversation_summary import (
@@ -53,7 +52,7 @@ class _DirectSummaryProvider:
 
 
 def _state(workspace: Path) -> WorkspaceState:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     return state
 
@@ -670,7 +669,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
         },
     }
     if lane == "chat":
-        context = ContextBuilder(Workspace.from_path(workspace), "UTC")
+        context = ContextBuilder(workspace, "UTC")
 
         def project_messages(
             messages: Sequence[dict[str, Any]],
@@ -721,7 +720,7 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
         goal="Keep the current task framed.",
         completion_boundary="The raw input remains the only persisted user message.",
     )
-    context = ContextBuilder(Workspace.from_path(workspace), "UTC", clock=lambda: NOW)
+    context = ContextBuilder(workspace, "UTC", clock=lambda: NOW)
     provider = ScriptedFakeProvider(completions=(_response("Summary without Blackboard."),))
     summaries = WorkspaceJsonlSummaryStore(state)
     projected_calls: list[list[dict[str, Any]]] = []

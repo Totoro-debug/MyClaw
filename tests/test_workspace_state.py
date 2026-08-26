@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 
 EXPECTED_MEMORY = (
@@ -13,7 +12,7 @@ EXPECTED_MEMORY = (
 
 
 def state_for(workspace: Path) -> WorkspaceState:
-    return WorkspaceState(Workspace.from_path(workspace))
+    return WorkspaceState(workspace)
 
 
 def create_directory_alias(alias: Path, target: Path) -> None:

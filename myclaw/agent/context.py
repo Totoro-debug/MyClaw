@@ -5,12 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from myclaw.agent.blackboard import Blackboard, encode_blackboard
 from myclaw.agent.prompts import current_user_input, foreground_chat_system_prompt
-from myclaw.agent.workspace import Workspace
 from myclaw.session.projection import project_session_message
 from myclaw.skills.catalog import ManualSkillInvocation, RuntimeSkillSnapshot
 
@@ -20,14 +20,14 @@ class ContextBuilder:
 
     def __init__(
         self,
-        workspace: Workspace,
+        workspace: Path,
         timezone_name: str,
         *,
         clock: Callable[[], datetime] | None = None,
         skill_snapshot: RuntimeSkillSnapshot | None = None,
     ) -> None:
-        if not isinstance(workspace, Workspace):
-            raise TypeError("Context Builder requires a Workspace")
+        if not isinstance(workspace, Path):
+            raise TypeError("Context Builder requires a Path")
         if skill_snapshot is not None and not isinstance(skill_snapshot, RuntimeSkillSnapshot):
             raise TypeError("Context Builder requires a Runtime Skill snapshot")
         self._workspace = workspace
@@ -59,7 +59,7 @@ class ContextBuilder:
             {
                 "role": "system",
                 "content": foreground_chat_system_prompt(
-                    workspace=self._workspace.path,
+                    workspace=self._workspace,
                     long_term_memory=long_term_memory,
                     skill_snapshot=self._skill_snapshot,
                 ),

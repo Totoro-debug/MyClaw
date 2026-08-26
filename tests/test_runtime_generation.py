@@ -502,8 +502,8 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
     assert old._memory_scheduler._active is not None
     assert replacement._memory_scheduler._active._clock is host._memory_scheduler_clock
     assert old._memory_scheduler._active._clock is host._memory_scheduler_clock
-    assert replacement._context_builder._workspace is host._workspace
-    assert old._context_builder._workspace is host._workspace
+    assert replacement._context_builder._workspace == host._workspace
+    assert old._context_builder._workspace == host._workspace
     assert str(replacement._context_builder._timezone) == host._timezone_name
     assert str(old._context_builder._timezone) == host._timezone_name
     assert host._new_uuid is uuid4

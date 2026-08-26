@@ -12,7 +12,6 @@ import pytest
 import myclaw.utils.scheduler as scheduler_module
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
@@ -60,7 +59,7 @@ SESSION_ID = "20260711-161000-000000_550e8400-e29b-41d4-a716-446655440000"
 def _state(home: AgentHome) -> WorkspaceState:
     workspace = home.path.parent / "workspace-state"
     workspace.mkdir(exist_ok=True)
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     return state
 
@@ -463,7 +462,7 @@ async def test_runtime_starts_the_configured_memory_schedule_with_the_injected_c
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     summaries = WorkspaceJsonlSummaryStore(state)
@@ -643,7 +642,7 @@ async def test_periodic_memory_edit_refreshes_runtime_memory_for_a_later_chat(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     startup_memory = state.long_term_memory_path.read_text(encoding="utf-8")
     legacy_path = agent_home / "memory" / "memory.md"
@@ -734,7 +733,7 @@ async def test_memory_refresh_does_not_change_an_active_chat_snapshot(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     startup_memory = state.long_term_memory_path.read_text(encoding="utf-8")
     updated_memory = startup_memory.replace(
@@ -844,7 +843,7 @@ async def test_periodic_failure_is_isolated_and_all_periodic_results_stay_silent
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     summaries = WorkspaceJsonlSummaryStore(state)

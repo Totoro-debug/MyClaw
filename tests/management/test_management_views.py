@@ -4,7 +4,6 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.management.service import (
@@ -110,7 +109,7 @@ async def test_memory_view_reads_complete_latest_utf8_content_on_every_call(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     memory_path = state.long_term_memory_path
     memory_path.write_text("initial memory\n", encoding="utf-8")
@@ -134,7 +133,7 @@ async def test_memory_view_converts_decode_failure_to_safe_persistence_error(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     state.long_term_memory_path.write_bytes(b"raw-secret\xff")
 
@@ -158,7 +157,7 @@ async def test_memory_view_converts_read_failure_to_safe_persistence_error(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     state.long_term_memory_path.unlink()
 
@@ -180,7 +179,7 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     session = Session.create(
         state,

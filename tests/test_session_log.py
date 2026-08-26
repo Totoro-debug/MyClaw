@@ -10,7 +10,6 @@ from uuid import uuid4
 import pytest
 from loguru import logger
 
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.logging.session import session_log, without_session_log
 
@@ -24,7 +23,7 @@ def _session_id() -> str:
 def _state(tmp_path: Path) -> WorkspaceState:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    return WorkspaceState(Workspace.from_path(workspace))
+    return WorkspaceState(workspace)
 
 
 def _write_boundary_warning(message: str) -> None:

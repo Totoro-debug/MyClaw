@@ -7,7 +7,6 @@ from typing import cast
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
@@ -37,7 +36,7 @@ def _gateway(
     *,
     skill_root: Path | None = None,
 ) -> ToolGateway:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     state = WorkspaceState(identity)
     state.initialize(agent_home_root=agent_home)
     return ToolGateway(

@@ -9,7 +9,6 @@ import pytest
 
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import RuntimeHost, prepare_runtime
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
@@ -337,7 +336,7 @@ async def test_existing_session_turn_does_not_regenerate_its_title(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     session = Session.create(state, now=lambda: NOW, new_uuid=lambda: SESSION_UUID)
     session.update_metadata(title="Existing title")

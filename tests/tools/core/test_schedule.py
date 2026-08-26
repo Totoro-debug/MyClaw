@@ -7,7 +7,6 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleService
@@ -36,7 +35,7 @@ def _store(
     agent_home: Path,
     *persisted_jobs: ScheduleJob,
 ) -> WorkspaceScheduleStore:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     if persisted_jobs:
         write_schedule_state(state, *persisted_jobs)

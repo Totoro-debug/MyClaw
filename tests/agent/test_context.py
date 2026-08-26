@@ -13,7 +13,6 @@ import myclaw.agent.context as context
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
-from myclaw.agent.workspace import Workspace
 from myclaw.config.agent_home import AgentHome
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
@@ -61,14 +60,14 @@ def _builder(
     timezone_name: str,
 ) -> ContextBuilder:
     monkeypatch.setattr(context, "datetime", _FrozenDateTime)
-    return context.ContextBuilder(Workspace.from_path(workspace), timezone_name)
+    return context.ContextBuilder(workspace, timezone_name)
 
 
 def test_context_builder_rejects_an_invalid_iana_timezone_before_building(
     workspace: Path,
 ) -> None:
     with pytest.raises(ZoneInfoNotFoundError):
-        ContextBuilder(Workspace.from_path(workspace), "Mars/Olympus")
+        ContextBuilder(workspace, "Mars/Olympus")
 
 
 @pytest.mark.parametrize(
@@ -113,7 +112,7 @@ def test_context_builder_builds_system_history_and_current_user_in_order(
     assert messages[0]["content"] == (
         "You are the MyClaw Personal Agent.\n"
         "Act within the user's current Workspace.\n"
-        f"Workspace: {Workspace.from_path(workspace).path}\n\n"
+        f"Workspace: {workspace}\n\n"
         "<long_term_memory>\n"
         "# Memory\n"
         "Remember this.</long_term_memory>\n\n"
@@ -155,7 +154,7 @@ def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt
         enable_always_load=False,
     )
     builder = ContextBuilder(
-        Workspace.from_path(workspace),
+        workspace,
         "UTC",
         skill_snapshot=snapshot,
     )
@@ -382,13 +381,13 @@ def test_context_builder_projects_manual_skill_and_request_as_safe_distinct_bloc
 
 def test_context_builder_does_not_accept_tool_gateway_or_schemas(workspace: Path) -> None:
     with pytest.raises(TypeError):
-        ContextBuilder(Workspace.from_path(workspace), "UTC", tool_gateway=object())  # type: ignore[call-arg]
+        ContextBuilder(workspace, "UTC", tool_gateway=object())  # type: ignore[call-arg]
 
 
 def test_runtime_lane_projections_keep_current_turn_continuation_separate(
     workspace: Path,
 ) -> None:
-    builder = ContextBuilder(Workspace.from_path(workspace), "UTC")
+    builder = ContextBuilder(workspace, "UTC")
     messages: list[dict[str, Any]] = [
         {
             "role": "user",

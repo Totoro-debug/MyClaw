@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, NoReturn, Protocol
 from uuid import UUID
 
@@ -34,7 +35,6 @@ from myclaw.agent.runner import (
     AgentRunnerToolCallStarted,
     _build_assistant_repair_message,
 )
-from myclaw.agent.workspace import Workspace
 from myclaw.errors import TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.logging.session import session_log
 from myclaw.provider.errors import ModelCallError
@@ -180,7 +180,7 @@ class AgentLoop:
     def __init__(
         self,
         *,
-        workspace: Workspace,
+        workspace: Path,
         skill_catalog: SkillCatalog | None = None,
         session: Session,
         schedule_service: ScheduleService,
@@ -194,8 +194,8 @@ class AgentLoop:
         title_prompt: str | None = None,
         externalize_result_for: ResultExternalizerFactory | None = None,
     ) -> None:
-        if not isinstance(workspace, Workspace):
-            raise TypeError("Agent Loop requires a Workspace")
+        if not isinstance(workspace, Path):
+            raise TypeError("Agent Loop requires a Path")
         if not isinstance(session, Session):
             raise TypeError("Agent Loop requires a foreground Session")
         if not isinstance(schedule_service, ScheduleService):

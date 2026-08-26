@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated
 
-from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool, ToolError, ToolParam
 from myclaw.tools.core._directory import (
     iter_directory_entries,
@@ -34,7 +34,7 @@ class GlobTool(BaseTool):
         ToolParam(description="Return files, directories, or both.", min_length=1),
     ] = "files"
 
-    def __init__(self, *, workspace: Workspace) -> None:
+    def __init__(self, *, workspace: Path) -> None:
         self._workspace = workspace
 
     def validate_arguments(  # type: ignore[override]

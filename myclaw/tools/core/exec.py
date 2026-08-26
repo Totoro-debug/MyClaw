@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from pathlib import Path
 from typing import Annotated, Final, Protocol
 from urllib.parse import urlsplit
 
-from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool, ToolError, ToolParam, truncate_text
 from myclaw.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
@@ -73,7 +73,7 @@ class ExecTool(BaseTool):
         ToolParam(description="Execution timeout in seconds.", minimum=1, maximum=600),
     ] = 60
 
-    def __init__(self, *, workspace: Workspace, resolver: DNSResolver | None = None) -> None:
+    def __init__(self, *, workspace: Path, resolver: DNSResolver | None = None) -> None:
         self._workspace = workspace
         self._resolver = SocketDNSResolver() if resolver is None else resolver
 

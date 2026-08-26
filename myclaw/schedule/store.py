@@ -56,7 +56,7 @@ class WorkspaceScheduleStore:
         self.workspace_state = workspace_state
         self.path = workspace_state.schedule_path
         self._state_path = workspace_state.path
-        workspace_root = Path(workspace_state.workspace.path).resolve(strict=True)
+        workspace_root = workspace_state.workspace_path.resolve(strict=True)
         try:
             self._state_root = HOST_FILESYSTEM.require_owned_directory(
                 self._state_path,
@@ -241,7 +241,7 @@ class WorkspaceScheduleStore:
         self._condition.notify_all()
 
     def _require_write_location(self) -> None:
-        workspace_root = Path(self.workspace_state.workspace.path).resolve(strict=True)
+        workspace_root = self.workspace_state.workspace_path.resolve(strict=True)
         self._state_root = HOST_FILESYSTEM.require_owned_directory(
             self._state_path,
             within=workspace_root,

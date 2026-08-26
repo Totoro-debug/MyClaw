@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.schedule.model import JobSchedule, ScheduleJob
@@ -31,7 +30,7 @@ class _Clock:
 
 
 def _state(workspace: Path, agent_home: Path) -> WorkspaceState:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     return state
 
@@ -73,7 +72,7 @@ async def test_schedule_tool_guard_is_task_local_and_list_remove_stay_available(
     workspace: Path,
     agent_home: Path,
 ) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     state = WorkspaceState(identity)
     state.initialize(agent_home_root=agent_home)
     service = ScheduleService(store=WorkspaceScheduleStore(state), clock=_Clock())

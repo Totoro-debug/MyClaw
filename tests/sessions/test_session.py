@@ -8,7 +8,6 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
@@ -28,7 +27,7 @@ ZERO_USAGE = {
 
 
 def _state(workspace: Path, agent_home: Path) -> WorkspaceState:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     return state
 
@@ -506,7 +505,7 @@ async def test_ordinary_persist_failure_is_silent_and_a_later_persist_is_indepen
 async def test_empty_session_persist_and_close_remain_unmaterialized(
     workspace: Path,
 ) -> None:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     session = Session.create(state)
 
     session.persist()

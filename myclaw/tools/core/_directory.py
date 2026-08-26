@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Final
 
-from myclaw.agent.workspace import Workspace
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
@@ -80,9 +79,9 @@ def iter_directory_entries(root: Path, *, recursive: bool = True) -> Iterator[Di
                 pending.append(child)
 
 
-def requested_path_has_directory_link(workspace: Workspace, requested: str) -> bool:
+def requested_path_has_directory_link(workspace: Path, requested: str) -> bool:
     """Return whether a requested root crosses a directory link or reparse point."""
-    workspace_root = Path(workspace.path).resolve(strict=True)
+    workspace_root = workspace.resolve(strict=True)
     path = Path(requested)
     if not path.is_absolute():
         path = workspace_root / path
@@ -107,11 +106,11 @@ def requested_path_has_directory_link(workspace: Workspace, requested: str) -> b
 def report_path(
     entry: DirectoryEntry,
     *,
-    workspace: Workspace,
+    workspace: Path,
     search_root: Path,
 ) -> str:
     """Render Workspace-relative or confirmed external absolute POSIX paths."""
-    workspace_root = Path(workspace.path).resolve(strict=True)
+    workspace_root = workspace.resolve(strict=True)
     if search_root.is_relative_to(workspace_root):
         path = entry.path.relative_to(workspace_root)
     else:

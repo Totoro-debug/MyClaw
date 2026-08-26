@@ -13,7 +13,6 @@ from uuid import UUID, uuid4
 
 from loguru import logger
 
-from myclaw.agent.workspace import Workspace
 from myclaw.schedule.service import ScheduleService
 from myclaw.tools.base import (
     ArtifactReference,
@@ -169,12 +168,12 @@ class ToolGateway:
     def __init__(
         self,
         *,
-        workspace: Workspace,
+        workspace: Path,
         schedule_service: ScheduleService,
         skill_root: Path | None = None,
     ) -> None:
-        if not isinstance(workspace, Workspace):
-            raise TypeError("Tool Gateway requires a Workspace")
+        if not isinstance(workspace, Path):
+            raise TypeError("Tool Gateway requires a Path")
         if not isinstance(schedule_service, ScheduleService):
             raise TypeError("Tool Gateway requires a ScheduleService")
 

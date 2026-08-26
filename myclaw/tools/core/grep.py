@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Final
 
-from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool, ToolError, ToolParam
 from myclaw.tools.core._directory import (
     is_ignored_directory_name,
@@ -105,7 +104,7 @@ class GrepTool(BaseTool):
         int, ToolParam(description="Number of matches or files to skip.", minimum=0)
     ] = 0
 
-    def __init__(self, *, workspace: Workspace) -> None:
+    def __init__(self, *, workspace: Path) -> None:
         self._workspace = workspace
 
     def validate_arguments(  # type: ignore[override]
@@ -212,7 +211,7 @@ class GrepTool(BaseTool):
         )
 
     def _candidates(self, *, target: Path, requested: str) -> tuple[list[_Candidate], Path]:
-        workspace_root = Path(self._workspace.path).resolve(strict=True)
+        workspace_root = self._workspace.resolve(strict=True)
         lexical = _lexical_path(self._workspace, requested)
         if target.is_dir():
             if _contains_directory_link(lexical, workspace_root=workspace_root):
@@ -286,10 +285,10 @@ class GrepTool(BaseTool):
             return None
 
 
-def _lexical_path(workspace: Workspace, requested: str) -> Path:
+def _lexical_path(workspace: Path, requested: str) -> Path:
     path = Path(requested)
     if not path.is_absolute():
-        path = Path(workspace.path) / path
+        path = workspace / path
     return path.absolute()
 
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace import normalize_workspace_path
 from myclaw.errors import ErrorInfo
 from myclaw.templates import load_template
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
@@ -37,11 +37,15 @@ class _UnsafeStatePath(PermissionError):
 class WorkspaceState:
     """Canonical persistent-state paths owned by one Workspace."""
 
-    workspace: Workspace
+    workspace_path: Path
+
+    def __post_init__(self) -> None:
+        normalized = normalize_workspace_path(self.workspace_path)
+        object.__setattr__(self, "workspace_path", normalized)
 
     @property
     def path(self) -> Path:
-        return Path(self.workspace.path) / ".myclaw"
+        return self.workspace_path / ".myclaw"
 
     @property
     def memory_directory(self) -> Path:
@@ -109,7 +113,7 @@ class WorkspaceState:
         return HOST_FILESYSTEM.require_owned_directory(sessions_path, within=state_root)
 
     def _owned_workspace_root(self) -> Path:
-        workspace_path = HOST_FILESYSTEM.path_for_io(Path(self.workspace.path))
+        workspace_path = HOST_FILESYSTEM.path_for_io(self.workspace_path)
         return HOST_FILESYSTEM.require_owned_directory(workspace_path, within=workspace_path)
 
     @staticmethod
@@ -129,9 +133,9 @@ class WorkspaceState:
             ) or normalized_agent_home.is_relative_to(normalized_state_root):
                 raise _UnsafeStatePath(self.path)
 
-            workspace_root = Path(self.workspace.path).resolve(strict=True)
+            workspace_root = self.workspace_path.resolve(strict=True)
             if not workspace_root.is_dir():
-                raise _UnsafeStatePath(Path(self.workspace.path))
+                raise _UnsafeStatePath(self.workspace_path)
 
             self.path.mkdir(exist_ok=True)
             state_root = HOST_FILESYSTEM.require_owned_directory(self.path, within=workspace_root)

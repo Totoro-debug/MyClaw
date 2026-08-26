@@ -18,7 +18,6 @@ from myclaw.agent.blackboard import Blackboard, FramingResult, TaskFramingEvalua
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
 from myclaw.agent.message_bus import InboundMessage, OutboundMessage
 from myclaw.agent.runner import AgentRunnerResult, AgentRunnerRouter
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
@@ -323,8 +322,8 @@ def _runtime(
 ) -> tuple[AgentLoop, Session]:
     agent_home = AgentHome(tmp_path / "agent-home")
     agent_home.initialize()
-    workspace = Workspace.from_path(tmp_path / "workspace")
-    workspace.path.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home.path)
     session = Session.create(state, now=_Clock().now)

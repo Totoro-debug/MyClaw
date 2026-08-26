@@ -10,7 +10,6 @@ from uuid import UUID, uuid4
 import pytest
 
 from myclaw.agent.runtime import prepare_runtime
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
@@ -186,7 +185,7 @@ class ConcurrentScheduleAndForegroundProvider:
 
 
 def _state(workspace: Path, agent_home: Path) -> WorkspaceState:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     return state
 

@@ -21,7 +21,6 @@ from myclaw.agent.prompts import (
     session_title_prompt,
 )
 from myclaw.agent.runtime import PreparedRuntime, SkillContextTooLargeError, prepare_runtime
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ProviderConfiguration
@@ -194,7 +193,7 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
     context_builder = ContextBuilder
 
     def recording_context_builder(
-        runtime_workspace: Workspace,
+        runtime_workspace: Path,
         timezone_name: str,
         *,
         skill_snapshot: RuntimeSkillSnapshot | None = None,
@@ -358,7 +357,7 @@ async def test_foreground_skill_catalog_is_included_in_the_exact_budget_guard(
 def _always_skill_budget_fixture(
     agent_home: Path,
     workspace: Path,
-) -> tuple[AgentHome, Workspace, WorkspaceState, RuntimeSkillSnapshot, int, int]:
+) -> tuple[AgentHome, Path, WorkspaceState, RuntimeSkillSnapshot, int, int]:
     home = AgentHome(agent_home)
     home.initialize()
     instruction = agent_home / "skills" / "always" / "SKILL.md"
@@ -367,7 +366,7 @@ def _always_skill_budget_fixture(
         b"---\nname: always\ndescription: Always loaded\nalways: true\n---\n"
         + b"Always-loaded body for the foreground budget projection.\n"
     )
-    runtime_workspace = Workspace.from_path(workspace)
+    runtime_workspace = workspace
     workspace_state = WorkspaceState(runtime_workspace)
     workspace_state.initialize(agent_home_root=home.path)
     snapshot = build_runtime_skill_snapshot(
@@ -1985,7 +1984,7 @@ async def test_prepared_repl_reuses_one_session_and_its_startup_system_context(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     startup_memory = "# Durable Memory\n\nRemember the startup snapshot exactly.\n"
     state.long_term_memory_path.write_text(startup_memory, encoding="utf-8")

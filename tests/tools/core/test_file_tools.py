@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool
 from myclaw.tools.core.edit_file import EditFileTool
 from myclaw.tools.core.read_file import ReadFileTool
@@ -34,7 +33,7 @@ def _gateway(
 
 
 def test_gateway_exports_the_new_path_and_line_contract(workspace: Path) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     gateway = _gateway(ReadFileTool(workspace=identity))
 
     assert tuple(gateway.schemas) == (
@@ -78,7 +77,7 @@ async def test_read_file_uses_one_based_windows_and_preserves_line_endings(
 ) -> None:
     target = workspace / "mixed.txt"
     target.write_bytes(b"one\r\ntwo\nthree\r")
-    gateway = _gateway(ReadFileTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(ReadFileTool(workspace=workspace))
 
     first_window = await gateway.call(_call("read_file", {"path": "mixed.txt", "limit": 2}))
     second_line = await gateway.call(
@@ -97,7 +96,7 @@ async def test_read_file_uses_one_based_windows_and_preserves_line_endings(
 async def test_read_file_requires_strict_utf8_but_allows_empty_and_nul_content(
     workspace: Path,
 ) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     empty = workspace / "empty.txt"
     empty.write_bytes(b"")
     nul = workspace / "nul.txt"
@@ -120,7 +119,7 @@ async def test_read_file_requires_strict_utf8_but_allows_empty_and_nul_content(
 
 @pytest.mark.asyncio
 async def test_write_file_creates_parents_and_writes_exact_utf8_bytes(workspace: Path) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     gateway = _gateway(WriteFileTool(workspace=identity))
     content = "line one\r\n中文\n"
 
@@ -145,7 +144,7 @@ async def test_write_file_creates_parents_and_writes_exact_utf8_bytes(workspace:
 async def test_edit_file_rejects_zero_and_ambiguous_single_replacements_without_writing(
     workspace: Path,
 ) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     target = workspace / "notes.txt"
     target.write_bytes(b"same\r\nsame\n")
     gateway = _gateway(EditFileTool(workspace=identity))
@@ -191,7 +190,7 @@ async def test_edit_file_rejects_zero_and_ambiguous_single_replacements_without_
 async def test_workspace_state_and_absolute_internal_paths_use_host_permissions(
     workspace: Path,
 ) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     state_file = workspace / ".myclaw" / "sessions" / "state.txt"
     state_file.parent.mkdir(parents=True)
     state_file.write_bytes(b"workspace state")
@@ -211,7 +210,7 @@ async def test_read_file_allows_canonical_skill_root_without_confirmation(
     workspace: Path,
     tmp_path: Path,
 ) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     skill_root = tmp_path / "agent-home" / "skills"
     skill_file = skill_root / "review" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
@@ -238,7 +237,7 @@ async def test_read_file_missing_skill_target_skips_confirmation(
     workspace: Path,
     tmp_path: Path,
 ) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     skill_root = tmp_path / "agent-home" / "skills"
     missing = skill_root / "review" / "SKILL.md"
     requests: list[ConfirmationRequest] = []
@@ -265,7 +264,7 @@ async def test_read_file_keeps_other_agent_home_paths_confirmed(
     workspace: Path,
     tmp_path: Path,
 ) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     agent_home = tmp_path / "agent-home"
     config = agent_home / "config.toml"
     config.parent.mkdir(parents=True)
@@ -314,7 +313,7 @@ async def test_read_file_skill_root_escape_requires_confirmation(tmp_path: Path)
         return "approved"
 
     gateway = _gateway(
-        ReadFileTool(workspace=Workspace.from_path(workspace), skill_root=skill_root),
+        ReadFileTool(workspace=workspace, skill_root=skill_root),
         confirmation=approve,
     )
 
@@ -330,7 +329,7 @@ async def test_external_targets_require_confirmation_and_bind_the_exact_call(
     workspace: Path,
     tmp_path: Path,
 ) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     external = tmp_path / "external.txt"
     external.write_bytes(b"outside\n")
     gateway = _gateway(ReadFileTool(workspace=identity))
@@ -369,7 +368,7 @@ async def test_all_file_mutations_support_confirmed_external_paths(tmp_path: Pat
     workspace.mkdir()
     external = tmp_path / "external"
     external.mkdir()
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     read_target = external / "read.txt"
     read_target.write_text("read outside", encoding="utf-8")
     edit_target = external / "edit.txt"
@@ -411,7 +410,7 @@ async def test_expected_filesystem_failures_keep_operation_context_and_original_
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     target = workspace / "read-error.txt"
     target.write_text("content", encoding="utf-8")
     original_read_bytes = Path.read_bytes
@@ -476,7 +475,7 @@ async def test_path_failures_keep_resolution_context_and_original_os_error(
         return original_resolve(path, strict=strict)
 
     monkeypatch.setattr(Path, "resolve", fail_resolve)
-    gateway = _gateway(tool_type(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(tool_type(workspace=workspace))
 
     result = await gateway.call(_call(tool_name, arguments))
 
@@ -503,7 +502,7 @@ async def test_cancellation_while_waiting_for_external_confirmation_propagates(
         return "approved"
 
     gateway = _gateway(
-        WriteFileTool(workspace=Workspace.from_path(workspace)),
+        WriteFileTool(workspace=workspace),
         confirmation=wait_for_decision,
     )
     task = asyncio.create_task(

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated
 
-from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool, ToolError, ToolParam
 
 
@@ -21,7 +21,7 @@ class WriteFileTool(BaseTool):
     ]
     content: Annotated[str, ToolParam(description="Complete UTF-8 text content.")]
 
-    def __init__(self, *, workspace: Workspace) -> None:
+    def __init__(self, *, workspace: Path) -> None:
         self._workspace = workspace
 
     async def check_safety(  # type: ignore[override]

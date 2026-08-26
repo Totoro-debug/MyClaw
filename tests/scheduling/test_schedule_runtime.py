@@ -19,7 +19,6 @@ from myclaw.agent.message_bus import OutboundMessage
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult
 from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
@@ -255,7 +254,7 @@ async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 3.0) ->
 
 
 def _schedule_state(workspace: Path) -> WorkspaceScheduleStore:
-    return WorkspaceScheduleStore(WorkspaceState(Workspace.from_path(workspace)))
+    return WorkspaceScheduleStore(WorkspaceState(workspace))
 
 
 def _tool_json(runtime: PreparedRuntime) -> list[dict[str, object]]:
@@ -332,7 +331,7 @@ async def test_runtime_schedule_uses_its_own_complete_context_projection(
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     await WorkspaceScheduleStore(state).add_user_job(
         ScheduleJob(
@@ -395,7 +394,7 @@ async def test_runtime_schedule_tool_loop_persists_each_message_from_awaitable_r
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     await WorkspaceScheduleStore(state).add_user_job(
         ScheduleJob(
@@ -475,7 +474,7 @@ async def test_runtime_schedule_tool_loop_does_not_prepare_summary_inside_agent_
         "consolidation_message_threshold = 50",
         "consolidation_message_threshold = 5",
     )
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     await WorkspaceScheduleStore(state).add_user_job(
         ScheduleJob(
@@ -566,7 +565,7 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     store = WorkspaceScheduleStore(state)
     created_at_ms = int((NOW - timedelta(seconds=60)).timestamp() * 1000)
@@ -777,7 +776,7 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
         assert len(schedule_session_paths) == 1
         schedule_session_id = schedule_session_paths[0].stem
         schedule_session = Session.load(
-            WorkspaceState(Workspace.from_path(workspace)),
+            WorkspaceState(workspace),
             schedule_session_id,
             partition=SessionStoragePartition.SCHEDULE,
         )
@@ -926,7 +925,7 @@ async def test_runtime_externalizers_keep_foreground_and_schedule_artifacts_sepa
     finally:
         await runtime.close()
 
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     schedule_session = Session.load(
         state,
         f"schedule_{JOB_UUID}",
@@ -979,7 +978,7 @@ async def test_runtime_schedule_session_uses_schedule_clock_for_persisted_timest
         await runtime.close()
 
     schedule_session = Session.load(
-        WorkspaceState(Workspace.from_path(workspace)),
+        WorkspaceState(workspace),
         job.session_id,
         partition=SessionStoragePartition.SCHEDULE,
     )
@@ -994,7 +993,7 @@ async def test_runtime_shutdown_during_schedule_model_persists_user_and_keeps_jo
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     job = _due_job(message="Block in the Schedule model.")
     store = WorkspaceScheduleStore(state)
@@ -1026,7 +1025,7 @@ async def test_runtime_shutdown_during_schedule_preparation_persists_user(
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     job = _due_job(message="Block in Schedule context preparation.")
     store = WorkspaceScheduleStore(state)
@@ -1078,7 +1077,7 @@ async def test_runtime_schedule_failure_logs_one_safe_session_warning(
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     job = _due_job(message="Fail safely during Schedule preparation.")
     store = WorkspaceScheduleStore(state)

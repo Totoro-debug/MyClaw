@@ -3,9 +3,37 @@ from pathlib import Path, PurePath, PureWindowsPath
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace import Workspace, normalize_workspace_path
+from myclaw.agent.workspace_state import WorkspaceState
 
 windows_only = pytest.mark.skipif(os.name != "nt", reason="requires native Windows paths")
+
+
+def test_normalize_workspace_path_preserves_path_and_pure_path_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "Project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    assert normalize_workspace_path(Path("Project") / "discarded" / "..") == project.absolute()
+    assert normalize_workspace_path(tmp_path / "discarded" / "..") == tmp_path
+    assert normalize_workspace_path(PurePath(tmp_path / "discarded" / "..")) == tmp_path
+    with pytest.raises(ValueError, match="Workspace path must be absolute"):
+        normalize_workspace_path(PurePath("Project") / "discarded" / "..")
+
+
+def test_workspace_state_stores_the_normalized_path_without_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "Project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    state = WorkspaceState(Path("Project") / "discarded" / "..")
+
+    assert state.workspace_path == project.absolute()
+    assert not hasattr(state, "workspace")
 
 
 @windows_only

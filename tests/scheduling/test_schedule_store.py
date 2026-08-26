@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.store import (
@@ -19,7 +18,7 @@ SYSTEM_ID = "6fa459ea-ee8a-4ca4-894e-db77e160355e"
 
 
 def _state(path: Path) -> WorkspaceState:
-    state = WorkspaceState(Workspace.from_path(path))
+    state = WorkspaceState(path)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     return state
 

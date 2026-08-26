@@ -14,7 +14,6 @@ import pytest
 from myclaw.agent.blackboard import Blackboard, TaskFramingEvaluator
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import InboundMessage
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
@@ -264,8 +263,8 @@ def _loop(
     externalize_result_for: Callable[[Session], Callable[[ToolResult], ToolResult]] | None = None,
     task_framer: TaskFramingEvaluator | None = None,
 ) -> tuple[AgentLoop, WorkspaceState, ScheduleService]:
-    workspace = Workspace.from_path(tmp_path / "workspace")
-    workspace.path.mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=tmp_path / "agent-home")
     foreground = Session.create(state, now=lambda: NOW)
@@ -641,7 +640,7 @@ async def test_schedule_oversized_result_uses_canonical_schedule_artifact_sessio
                 return result
             output = BaseTool.handle_result(
                 result.content,
-                workspace=session.workspace_state.workspace,
+                workspace=session.workspace_state.workspace_path,
                 session_id=session.session_id,
                 tool_call_id=result.tool_call_id,
                 limit=4,
@@ -663,7 +662,7 @@ async def test_schedule_oversized_result_uses_canonical_schedule_artifact_sessio
         router,
         externalize_result_for=externalizer_for,
     )
-    (state.workspace.path / "large.txt").write_text("x\n" * 4000, encoding="utf-8")
+    (state.workspace_path / "large.txt").write_text("x\n" * 4000, encoding="utf-8")
 
     await loop.run_schedule_job(_job())
 
@@ -677,7 +676,7 @@ async def test_schedule_oversized_result_uses_canonical_schedule_artifact_sessio
     )
     artifact = tool_message["artifact"]
     assert artifact["path"].startswith(f".myclaw/artifacts/schedule_{JOB_ID}/")
-    assert (state.workspace.path / artifact["path"]).exists()
+    assert (state.workspace_path / artifact["path"]).exists()
 
 
 @pytest.mark.asyncio
@@ -715,8 +714,8 @@ async def test_foreground_cancel_does_not_cancel_overlapping_schedule_run(
 async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
     tmp_path: Path,
 ) -> None:
-    workspace = Workspace.from_path(tmp_path / "workspace")
-    workspace.path.mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=tmp_path / "agent-home")
     foreground = Session.create(state, now=lambda: NOW)

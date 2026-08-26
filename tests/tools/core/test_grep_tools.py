@@ -8,7 +8,6 @@ from typing import cast
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool
 from myclaw.tools.core.grep import GrepTool
 from myclaw.tools.tool_gateway import (
@@ -37,7 +36,7 @@ async def test_grep_supports_regex_fixed_strings_case_insensitivity_and_invalid_
 ) -> None:
     target = workspace / "notes.txt"
     target.write_text("needle alpha\nNEEDLE beta\nneedle needle\nplain\n", encoding="utf-8")
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
 
     regex = await gateway.call(_call("grep", {"pattern": r"needle \w+", "path": "notes.txt"}))
     fixed = await gateway.call(
@@ -78,7 +77,7 @@ async def test_grep_fixed_string_case_insensitivity_uses_python_regex_semantics(
 ) -> None:
     target = workspace / "unicode.txt"
     target.write_text("SS\n\u0131\n", encoding="utf-8")
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
 
     sharp_s = await gateway.call(
         _call(
@@ -117,7 +116,7 @@ async def test_grep_context_merges_windows_and_uses_context_delimiters(
         "one\nhit two\nthree\nhit four\nfive\nsix\nhit seven\neight\n",
         encoding="utf-8",
     )
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
 
     merged = await gateway.call(
         _call("grep", {"pattern": "hit", "path": "context.txt", "context": 1})
@@ -158,7 +157,7 @@ async def test_grep_context_merges_windows_and_uses_context_delimiters(
 async def test_grep_separates_disjoint_content_groups_across_files(workspace: Path) -> None:
     (workspace / "a.py").write_text("hit\n", encoding="utf-8")
     (workspace / "b.py").write_text("hit\n", encoding="utf-8")
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
 
     result = await gateway.call(_call("grep", {"pattern": "hit", "head_limit": 0}))
 
@@ -171,7 +170,7 @@ async def test_grep_paginates_files_and_counts_matching_lines_not_occurrences(
 ) -> None:
     (workspace / "a.py").write_text("hit hit\nplain\n", encoding="utf-8")
     (workspace / "b.py").write_text("hit\n", encoding="utf-8")
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
 
     files = await gateway.call(
         _call(
@@ -207,7 +206,7 @@ async def test_grep_omitted_head_limit_returns_all_matches(workspace: Path) -> N
         "".join(f"hit {index}\n" for index in range(201)),
         encoding="utf-8",
     )
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
     function = cast(dict[str, object], gateway.schemas[0]["function"])
     parameters = cast(dict[str, object], function["parameters"])
     properties = cast(dict[str, object], parameters["properties"])
@@ -230,7 +229,7 @@ async def test_grep_intersects_glob_and_type_filters_and_supports_aliases(
     (workspace / "script.js").write_text("needle\n", encoding="utf-8")
     (workspace / "document.md").write_text("needle\n", encoding="utf-8")
     (workspace / "custom.foo").write_text("needle\n", encoding="utf-8")
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
 
     python = await gateway.call(
         _call("grep", {"pattern": "needle", "type": "PYTHON", "head_limit": 0})
@@ -297,7 +296,7 @@ async def test_grep_builtin_type_aliases_filter_by_their_suffix(
 ) -> None:
     target = workspace / f"source{suffix}"
     target.write_text("needle\n", encoding="utf-8")
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
 
     result = await gateway.call(
         _call("grep", {"pattern": "needle", "type": type_name, "head_limit": 0})
@@ -315,7 +314,7 @@ async def test_grep_reuses_glob_absolute_pattern_rejection(
     workspace: Path,
     glob: str,
 ) -> None:
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
 
     result = await gateway.call(_call("grep", {"pattern": "needle", "glob": glob}))
 
@@ -344,7 +343,7 @@ async def test_grep_skips_ignored_and_inaccessible_descendants(
 
     monkeypatch.setattr(Path, "iterdir", fail_inaccessible)
 
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
     result = await gateway.call(_call("grep", {"pattern": "needle", "head_limit": 0}))
     ignored_root = await gateway.call(
         _call("grep", {"pattern": "needle", "path": "build"}, call_id="call_ignored_root")
@@ -365,7 +364,7 @@ async def test_grep_preserves_file_link_paths(workspace: Path) -> None:
             pytest.skip(f"file links unavailable: {error}")
         pytest.skip(f"file links unavailable: {error}")
 
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
     result = await gateway.call(_call("grep", {"pattern": "needle", "head_limit": 0}))
 
     assert result.content == "alias.py:1:needle\n--\nvisible.py:1:needle"
@@ -383,7 +382,7 @@ async def test_grep_does_not_traverse_an_explicit_directory_link(workspace: Path
     except (OSError, NotImplementedError) as error:
         pytest.skip(f"directory links unavailable: {error}")
 
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
     root_result = await gateway.call(_call("grep", {"pattern": "needle", "path": "linked"}))
     nested_result = await gateway.call(
         _call(
@@ -420,7 +419,7 @@ async def test_grep_skips_file_links_outside_the_approved_root(
     except (OSError, NotImplementedError) as error:
         pytest.skip(f"file links unavailable: {error}")
 
-    gateway = _gateway(GrepTool(workspace=Workspace.from_path(workspace)))
+    gateway = _gateway(GrepTool(workspace=workspace))
     result = await gateway.call(_call("grep", {"pattern": "needle"}))
 
     assert result.content == ""
@@ -451,7 +450,7 @@ async def test_grep_reports_explicit_file_links_by_their_visible_paths(tmp_path:
         return "approved"
 
     gateway = _gateway(
-        GrepTool(workspace=Workspace.from_path(workspace)),
+        GrepTool(workspace=workspace),
         confirmation=approve,
     )
     internal_result = await gateway.call(
@@ -482,7 +481,7 @@ async def test_grep_external_root_requires_confirmation_and_reports_absolute_pat
     workspace.mkdir()
     external.mkdir()
     (external / "outside.py").write_text("needle\n", encoding="utf-8")
-    identity = Workspace.from_path(workspace)
+    identity = workspace
     requests: list[ConfirmationRequest] = []
 
     async def approve(request: ConfirmationRequest) -> ConfirmationDecision:

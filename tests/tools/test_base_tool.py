@@ -7,7 +7,6 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.workspace import Workspace
 from myclaw.tools.base import BaseTool, PreparedToolCall, ToolError, ToolParam
 
 
@@ -214,7 +213,7 @@ def test_base_tool_result_handler_writes_a_bounded_workspace_artifact(
 ) -> None:
     workspace_path = tmp_path / "workspace"
     workspace_path.mkdir()
-    workspace = Workspace.from_path(workspace_path)
+    workspace = workspace_path
     content = "0123456789" * 80
     limit = 160
 
@@ -246,7 +245,7 @@ def test_base_tool_result_handler_keeps_exact_limit_inline_and_overwrites_target
 ) -> None:
     workspace_path = tmp_path / "workspace"
     workspace_path.mkdir()
-    workspace = Workspace.from_path(workspace_path)
+    workspace = workspace_path
     target = workspace_path / ".myclaw" / "artifacts" / "session-1" / "call-1.txt"
     target.parent.mkdir(parents=True)
     target.write_text("old", encoding="utf-8")
@@ -277,7 +276,7 @@ def test_base_tool_result_handler_uses_uuid_for_an_illegal_tool_call_id(
 ) -> None:
     workspace_path = tmp_path / "workspace"
     workspace_path.mkdir()
-    workspace = Workspace.from_path(workspace_path)
+    workspace = workspace_path
 
     output = _RepresentativeTool().handle_result(
         "oversized",
@@ -298,7 +297,7 @@ def test_base_tool_result_handler_retains_success_when_artifact_write_fails(
 ) -> None:
     workspace_path = tmp_path / "workspace"
     workspace_path.mkdir()
-    workspace = Workspace.from_path(workspace_path)
+    workspace = workspace_path
     failed_target = workspace_path / ".myclaw" / "artifacts" / "session-1" / "failed.txt"
     failed_target.mkdir(parents=True)
 

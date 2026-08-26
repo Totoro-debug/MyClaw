@@ -25,7 +25,7 @@ from myclaw.agent.prompts import (
     session_title_prompt,
 )
 from myclaw.agent.runner import AgentRunnerRoute
-from myclaw.agent.workspace import Workspace
+from myclaw.agent.workspace import Workspace, normalize_workspace_path
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
@@ -386,8 +386,8 @@ class RuntimeHost:
         timezone_name: str | None = None,
     ) -> None:
         self._agent_home = agent_home
-        self._workspace = (
-            workspace if isinstance(workspace, Workspace) else Workspace.from_path(workspace)
+        self._workspace = normalize_workspace_path(
+            workspace.path if isinstance(workspace, Workspace) else workspace
         )
         self._workspace_state = WorkspaceState(self._workspace)
         self._configuration = configuration
@@ -682,13 +682,13 @@ def _prepare_runtime(
             reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
             enable_always_load=configuration.runtime.enable_skill_always_load,
         )
-    workspace_identity = (
-        workspace if isinstance(workspace, Workspace) else Workspace.from_path(workspace)
+    workspace_path = normalize_workspace_path(
+        workspace.path if isinstance(workspace, Workspace) else workspace
     )
     active_workspace_state = (
-        WorkspaceState(workspace_identity) if workspace_state is None else workspace_state
+        WorkspaceState(workspace_path) if workspace_state is None else workspace_state
     )
-    if active_workspace_state.workspace is not workspace_identity:
+    if active_workspace_state.workspace_path != workspace_path:
         raise ValueError("Runtime Workspace State must belong to the Runtime Workspace")
     active_workspace_state.initialize(agent_home_root=agent_home.path)
     schedule_store = WorkspaceScheduleStore(active_workspace_state)
@@ -702,7 +702,7 @@ def _prepare_runtime(
     runtime_memory = RuntimeMemory(long_term_memory)
     resolved_timezone_name = get_localzone_name() if timezone_name is None else timezone_name
     foreground_context = ContextBuilder(
-        workspace_identity,
+        workspace_path,
         resolved_timezone_name,
         skill_snapshot=active_skill_snapshot,
     )
@@ -731,13 +731,13 @@ def _prepare_runtime(
 
     def system_prompt_for(memory_snapshot: str) -> str:
         return chat_system_prompt(
-            workspace=workspace_identity.path,
+            workspace=workspace_path,
             long_term_memory=memory_snapshot,
         )
 
     def foreground_system_prompt_for(memory_snapshot: str) -> str:
         return foreground_chat_system_prompt(
-            workspace=workspace_identity.path,
+            workspace=workspace_path,
             long_term_memory=memory_snapshot,
             skill_snapshot=active_skill_snapshot,
         )
@@ -881,7 +881,7 @@ def _prepare_runtime(
         )
 
     agent_loop = AgentLoop(
-        workspace=workspace_identity,
+        workspace=workspace_path,
         skill_catalog=active_skill_snapshot.catalog,
         session=active_session,
         schedule_service=schedule_service,
@@ -1131,7 +1131,7 @@ def _build_tool_result_externalizer(
             return result
         output = BaseTool.handle_result(
             result.content,
-            workspace=session.workspace_state.workspace,
+            workspace=session.workspace_state.workspace_path,
             session_id=session.session_id,
             tool_call_id=result.tool_call_id,
             limit=max_tool_result_chars,

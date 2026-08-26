@@ -10,7 +10,6 @@ import pytest
 from myclaw.agent.message_bus import InboundMessage
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runtime import prepare_runtime
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
@@ -255,7 +254,7 @@ async def test_start_preflight_failure_requires_no_async_cleanup(
     )
     baseline = asyncio.all_tasks()
     log_capture = capture_diagnostics()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     ambient_session_id = _session_id()
 
     try:

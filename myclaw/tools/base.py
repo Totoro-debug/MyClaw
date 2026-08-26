@@ -29,7 +29,6 @@ from uuid import uuid4
 
 from loguru import logger
 
-from myclaw.agent.workspace import Workspace
 from myclaw.tools.schema import Schema, ToolParam
 from myclaw.utils.json_types import JsonObject, JsonValue
 from myclaw.utils.validation import require_nonnegative_int
@@ -70,15 +69,14 @@ class ToolError(Exception):
         super().__init__(message)
 
 
-def resolve_tool_path(workspace: Workspace | Path, requested: str | Path) -> Path:
+def resolve_tool_path(workspace: Path, requested: str | Path) -> Path:
     """Resolve a model-provided path using the current host's path semantics."""
     if not isinstance(requested, (str, Path)):
         raise TypeError("requested Tool path must be a string or Path")
-    if not isinstance(workspace, (Workspace, Path)):
-        raise TypeError("Tool workspace must be a Workspace or Path")
+    if not isinstance(workspace, Path):
+        raise TypeError("Tool workspace must be a Path")
     try:
-        workspace_path = workspace.path if isinstance(workspace, Workspace) else workspace
-        root = Path(workspace_path).resolve(strict=True)
+        root = workspace.resolve(strict=True)
         candidate = Path(requested)
         if not candidate.is_absolute():
             candidate = root / candidate
@@ -90,12 +88,11 @@ def resolve_tool_path(workspace: Workspace | Path, requested: str | Path) -> Pat
     return resolved
 
 
-def is_workspace_path(workspace: Workspace | Path, resolved: Path) -> bool:
+def is_workspace_path(workspace: Path, resolved: Path) -> bool:
     """Return whether a previously resolved path remains inside the Workspace."""
-    if not isinstance(workspace, (Workspace, Path)):
-        raise TypeError("Tool workspace must be a Workspace or Path")
-    workspace_path = workspace.path if isinstance(workspace, Workspace) else workspace
-    root = Path(workspace_path).resolve(strict=True)
+    if not isinstance(workspace, Path):
+        raise TypeError("Tool workspace must be a Path")
+    root = workspace.resolve(strict=True)
     return resolved.is_relative_to(root)
 
 
@@ -238,7 +235,7 @@ class BaseTool(ABC):
     def resolve_path_argument(
         self,
         *,
-        workspace: Workspace | Path,
+        workspace: Path,
         requested: str | Path,
     ) -> Path:
         """Resolve one Tool path and map expected failures to the public result contract."""
@@ -251,7 +248,7 @@ class BaseTool(ABC):
     def workspace_path_safety_reason(
         self,
         *,
-        workspace: Workspace | Path,
+        workspace: Path,
         requested: str | Path,
         additional_roots: Collection[Path] = (),
     ) -> str | None:
@@ -277,7 +274,7 @@ class BaseTool(ABC):
     def handle_result(
         content: str,
         *,
-        workspace: Workspace,
+        workspace: Path,
         session_id: str,
         tool_call_id: str,
         limit: int,
@@ -286,14 +283,14 @@ class BaseTool(ABC):
         """Externalize oversized successful content beneath Workspace State."""
         if len(content) <= limit:
             return ToolResultContent(content=content)
-        if not isinstance(workspace, Workspace):
-            raise TypeError("Tool Artifact workspace must be a Workspace")
+        if not isinstance(workspace, Path):
+            raise TypeError("Tool Artifact workspace must be a Path")
         if not isinstance(session_id, str) or not _ARTIFACT_SESSION_PATTERN.fullmatch(session_id):
             raise ValueError("Tool Artifact session ID must be a single path component")
 
         filename = tool_call_id if _ARTIFACT_ID_PATTERN.fullmatch(tool_call_id) else str(uuid4())
         relative_path = f".myclaw/artifacts/{session_id}/{filename}.txt"
-        artifact_path = Path(workspace.path) / Path(*relative_path.split("/"))
+        artifact_path = workspace / Path(*relative_path.split("/"))
         marker = f"\n\n...[truncated; full result stored at {relative_path}]"
         preview = truncate_text(content, limit=limit, marker=marker)
         preview_chars = max(0, len(preview) - len(marker))

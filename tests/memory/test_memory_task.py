@@ -9,7 +9,6 @@ from uuid import uuid4
 import pytest
 
 from myclaw.agent.runtime import prepare_runtime
-from myclaw.agent.workspace import Workspace
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
@@ -51,7 +50,7 @@ SESSION_ID = "20260711-160000-000000_550e8400-e29b-41d4-a716-446655440000"
 def _state(home: AgentHome) -> WorkspaceState:
     workspace = home.path.parent / "workspace-state"
     workspace.mkdir(exist_ok=True)
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     return state
 
@@ -1072,7 +1071,7 @@ async def test_runtime_dream_uses_memory_route_with_static_default_fallback(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    state = WorkspaceState(Workspace.from_path(workspace))
+    state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     configuration = ConfigLoader(home).load()
