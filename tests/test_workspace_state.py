@@ -1,18 +1,83 @@
+import importlib.util
+import os
 import shutil
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 
 import pytest
 
-from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
+from myclaw.agent.workspace_state import (
+    WorkspaceState,
+    WorkspaceStateError,
+    normalize_workspace_path,
+)
 
 EXPECTED_MEMORY = (
     "# Long-term Memory\n\n## User Info\n\n## User Preference\n\n## Project Fact\n\n## Lesson\n"
 )
+windows_only = pytest.mark.skipif(os.name != "nt", reason="requires native Windows paths")
 
 
 def state_for(workspace: Path) -> WorkspaceState:
     return WorkspaceState(workspace)
+
+
+def test_normalize_workspace_path_preserves_lexical_path_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "Project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    assert normalize_workspace_path(Path("Project") / "discarded" / "..") == project.absolute()
+    assert normalize_workspace_path(tmp_path / "discarded" / "..") == tmp_path
+    assert normalize_workspace_path(PurePath(tmp_path / "discarded" / "..")) == tmp_path
+    with pytest.raises(ValueError, match="Workspace path must be absolute"):
+        normalize_workspace_path(PurePath("Project") / "discarded" / "..")
+
+    assert normalize_workspace_path.__module__ == "myclaw.agent.workspace_state"
+
+
+def test_workspace_wrapper_module_is_removed() -> None:
+    assert importlib.util.find_spec("myclaw.agent.workspace") is None
+
+
+def test_normalized_workspace_path_uses_the_current_hosts_native_path_type(
+    tmp_path: Path,
+) -> None:
+    normalized = normalize_workspace_path(tmp_path)
+
+    assert normalized == tmp_path.absolute()
+    assert type(normalized) is type(Path())
+
+
+@windows_only
+def test_windows_drive_workspace_path_has_the_accepted_identity() -> None:
+    normalized = normalize_workspace_path(PureWindowsPath(r"D:\desktop\project\Demo-one"))
+
+    assert normalized == Path(r"D:\desktop\project\Demo-one")
+
+
+@windows_only
+def test_unc_workspace_path_has_the_accepted_identity() -> None:
+    normalized = normalize_workspace_path(PureWindowsPath(r"\\server\share\Demo-one"))
+
+    assert normalized == Path(r"\\server\share\Demo-one")
+
+
+@windows_only
+def test_windows_workspace_path_is_lexically_normalized() -> None:
+    normalized = normalize_workspace_path(
+        PureWindowsPath(r"D:\desktop\project\discarded\..\current")
+    )
+
+    assert normalized == Path(r"D:\desktop\project\current")
+
+
+@windows_only
+def test_relative_pure_windows_workspace_path_is_rejected() -> None:
+    with pytest.raises(ValueError, match="absolute"):
+        normalize_workspace_path(PureWindowsPath(r"project\subdirectory"))
 
 
 def create_directory_alias(alias: Path, target: Path) -> None:

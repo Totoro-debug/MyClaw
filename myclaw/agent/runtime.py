@@ -25,8 +25,11 @@ from myclaw.agent.prompts import (
     session_title_prompt,
 )
 from myclaw.agent.runner import AgentRunnerRoute
-from myclaw.agent.workspace import Workspace, normalize_workspace_path
-from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
+from myclaw.agent.workspace_state import (
+    WorkspaceState,
+    WorkspaceStateError,
+    normalize_workspace_path,
+)
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ProviderConfiguration, UserConfiguration
 from myclaw.errors import ErrorInfo
@@ -373,7 +376,7 @@ class RuntimeHost:
         self,
         *,
         agent_home: AgentHome,
-        workspace: Path | Workspace,
+        workspace: Path,
         configuration: UserConfiguration,
         provider_factory: Callable[[ProviderConfiguration], ModelProvider],
         now: Callable[[], datetime],
@@ -386,9 +389,7 @@ class RuntimeHost:
         timezone_name: str | None = None,
     ) -> None:
         self._agent_home = agent_home
-        self._workspace = normalize_workspace_path(
-            workspace.path if isinstance(workspace, Workspace) else workspace
-        )
+        self._workspace = normalize_workspace_path(workspace)
         self._workspace_state = WorkspaceState(self._workspace)
         self._configuration = configuration
         self._provider_factory = provider_factory
@@ -607,7 +608,7 @@ class RuntimeHost:
 def prepare_runtime(
     *,
     agent_home: AgentHome,
-    workspace: Path | Workspace,
+    workspace: Path,
     configuration: UserConfiguration,
     provider_factory: Callable[[ProviderConfiguration], ModelProvider],
     now: Callable[[], datetime],
@@ -657,7 +658,7 @@ def prepare_runtime(
 def _prepare_runtime(
     *,
     agent_home: AgentHome,
-    workspace: Path | Workspace,
+    workspace: Path,
     configuration: UserConfiguration,
     provider_factory: Callable[[ProviderConfiguration], ModelProvider],
     now: Callable[[], datetime],
@@ -682,9 +683,7 @@ def _prepare_runtime(
             reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
             enable_always_load=configuration.runtime.enable_skill_always_load,
         )
-    workspace_path = normalize_workspace_path(
-        workspace.path if isinstance(workspace, Workspace) else workspace
-    )
+    workspace_path = normalize_workspace_path(workspace)
     active_workspace_state = (
         WorkspaceState(workspace_path) if workspace_state is None else workspace_state
     )

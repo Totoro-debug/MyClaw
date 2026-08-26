@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Final
 
-from myclaw.agent.workspace import normalize_workspace_path
 from myclaw.errors import ErrorInfo
 from myclaw.templates import load_template
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _GITIGNORE_CONTENT: Final = "*\n"
 _LONG_TERM_MEMORY_TEMPLATE: Final = load_template("long-term-memory.md")
+
+
+def normalize_workspace_path(path: Path | PurePath) -> Path:
+    """Return the normalized absolute Workspace path without resolving aliases."""
+    if isinstance(path, Path):
+        normalized = Path(os.path.abspath(path))
+    else:
+        normalized = Path(os.path.normpath(path))
+
+    if not normalized.is_absolute():
+        raise ValueError("Workspace path must be absolute")
+
+    return normalized
 
 
 class WorkspaceStateError(Exception):
