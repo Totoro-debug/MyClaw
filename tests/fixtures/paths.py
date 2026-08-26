@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from myclaw.agent.workspace_state import normalize_workspace_path
+
 
 @pytest.fixture
 def agent_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -17,7 +19,12 @@ def agent_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
-    """Return an existing normalized Workspace beneath the test directory."""
-    path = (tmp_path / "workspace").resolve()
+    """Return an existing normalized Workspace Path beneath the test directory."""
+    return create_workspace(tmp_path)
+
+
+def create_workspace(parent: Path) -> Path:
+    """Create an existing normalized Workspace Path beneath the given directory."""
+    path = normalize_workspace_path(parent / "workspace")
     path.mkdir()
     return path
