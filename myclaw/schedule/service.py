@@ -84,8 +84,10 @@ class ScheduleService:
         self._loop_task: asyncio.Task[None] | None = None
         self._run_tasks: set[asyncio.Task[None]] = set()
         self._terminal_commit_tasks: set[asyncio.Task[ScheduleJob | None]] = set()
+        self._reservation_gate = asyncio.Lock()
         self._active_job_ids: set[str] = set()
         self._consumed_at_jobs: set[str] = set()
+        self._retry_at_jobs_after_resume: set[str] = set()
         self._every_deadlines: dict[str, _EveryDeadline] = {}
         self._cron_cursors: dict[str, _CronCursor] = {}
         self._last_wall_timestamp: float | None = None
@@ -103,6 +105,8 @@ class ScheduleService:
 
     def start(self) -> None:
         """Start the single dispatcher; repeated starts are idempotent."""
+        if self._pause_task is not None and not self._pause_task.done():
+            raise RuntimeError("Schedule Service pause is still draining")
         if self._paused:
             self.resume()
             return
@@ -149,7 +153,6 @@ class ScheduleService:
         if self._close_task is not None:
             await await_task_preserving_cancellation(self._close_task)
             return
-        self._paused = True
         task = self._pause_task
         if task is None:
             task = asyncio.create_task(self._pause_owned_tasks())
@@ -160,10 +163,10 @@ class ScheduleService:
         """Resume dispatch after a completed pause barrier."""
         if self._aborted or self._close_task is not None:
             raise RuntimeError("Schedule Service is closed")
-        if not self._paused:
-            return
         if self._pause_task is not None and not self._pause_task.done():
             raise RuntimeError("Schedule Service pause is still draining")
+        if not self._paused:
+            return
         self._paused = False
         self._pause_task = None
         self._prepare_start()
@@ -242,13 +245,19 @@ class ScheduleService:
         return self._store._register_system_job_sync(job)
 
     async def _pause_owned_tasks(self) -> None:
+        async with self._reservation_gate:
+            self._paused = True
         loop_task = self._loop_task
         if loop_task is not None and not loop_task.done():
             loop_task.cancel()
         if loop_task is not None:
             await asyncio.gather(loop_task, return_exceptions=True)
         self._loop_task = None
-        await self._cancel_and_drain_job_tasks()
+        retry_at_jobs = self._consumed_at_jobs.intersection(self._active_job_ids)
+        await self._cancel_and_drain_job_tasks(cancel_terminal=False)
+        retry_at_jobs.update(self._retry_at_jobs_after_resume)
+        self._consumed_at_jobs.difference_update(retry_at_jobs)
+        self._retry_at_jobs_after_resume.clear()
         self._active_job_ids.clear()
 
     async def _drain_cancelled_tasks(self) -> None:
@@ -261,14 +270,18 @@ class ScheduleService:
         self._every_deadlines.clear()
         self._cron_cursors.clear()
 
-    async def _cancel_and_drain_job_tasks(self) -> None:
+    async def _cancel_and_drain_job_tasks(self, *, cancel_terminal: bool = True) -> None:
         while self._run_tasks or self._terminal_commit_tasks:
             run_tasks = tuple(self._run_tasks)
             terminal_tasks = tuple(self._terminal_commit_tasks)
             tasks = run_tasks + terminal_tasks
-            for task in tasks:
+            for task in run_tasks:
                 if not task.done():
                     task.cancel()
+            if cancel_terminal:
+                for terminal_task in terminal_tasks:
+                    if not terminal_task.done():
+                        terminal_task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._run_tasks.difference_update(run_tasks)
             self._terminal_commit_tasks.difference_update(terminal_tasks)
@@ -296,6 +309,7 @@ class ScheduleService:
             self._terminal_commit_tasks.difference_update(
                 task for task in self._terminal_commit_tasks if task.done()
             )
+        await self._cancel_and_drain_job_tasks(cancel_terminal=False)
         self._active_job_ids.clear()
         self._every_deadlines.clear()
         self._cron_cursors.clear()
@@ -318,6 +332,8 @@ class ScheduleService:
                     self._latch_fault()
                     return
                 jobs = await self._store.snapshot()
+                if self._closing.is_set() or self._paused:
+                    return
                 current = self._clock.now()
                 current_monotonic = self._clock.monotonic()
                 forward_jump = self._record_clock_sample(current, current_monotonic)
@@ -341,9 +357,14 @@ class ScheduleService:
                     key=lambda job: job.job_id,
                 )
                 if due:
-                    reserved = await self._store.reserve_due(tuple(due))
-                    for job in reserved:
-                        self._reserve(job, current_monotonic=current_monotonic)
+                    if self._closing.is_set() or self._paused:
+                        return
+                    async with self._reservation_gate:
+                        if self._closing.is_set() or self._paused:
+                            return
+                        reserved = await self._store.reserve_due(tuple(due))
+                        for job in reserved:
+                            self._reserve(job, current_monotonic=current_monotonic)
                     revision = self._store.revision
                     await asyncio.sleep(0)
                     continue
@@ -369,8 +390,13 @@ class ScheduleService:
                     type(error).__name__,
                 )
 
-    def _reserve(self, job: ScheduleJob, *, current_monotonic: float) -> None:
-        if self._faulted or self._paused:
+    def _reserve(
+        self,
+        job: ScheduleJob,
+        *,
+        current_monotonic: float,
+    ) -> None:
+        if self._faulted or self._closing.is_set() or self._paused:
             return
         lane = self._execution_lane(job)
         if job.job_id in self._active_job_ids:
@@ -553,6 +579,7 @@ class ScheduleService:
         terminal: Literal["ok", "error"] | None = None
         terminal_error: str | None = None
         terminal_ready = False
+        terminal_persisted = False
         try:
             if lane == "dream":
                 result = await self._execute_dream()
@@ -588,7 +615,10 @@ class ScheduleService:
             try:
                 if terminal is not None and terminal_ready:
                     await self._commit_terminal(job, terminal, terminal_error)
+                    terminal_persisted = True
             finally:
+                if job.schedule.kind == "at" and not terminal_persisted:
+                    self._retry_at_jobs_after_resume.add(job.job_id)
                 self._active_job_ids.discard(job.job_id)
 
     async def _commit_terminal(

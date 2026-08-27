@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -59,6 +60,53 @@ class _AdvancingClock:
             if deadline <= self.elapsed and not future.done():
                 future.set_result(None)
                 self._waiters.remove((deadline, future))
+
+
+class _BlockingReservation:
+    def __init__(self, store: WorkspaceScheduleStore) -> None:
+        self._reserve_due = store.reserve_due
+        self.completed = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def reserve_due(
+        self,
+        candidates: tuple[ScheduleJob, ...],
+    ) -> tuple[ScheduleJob, ...]:
+        self.calls += 1
+        if self.calls == 1:
+            reserved = await self._reserve_due(candidates)
+            self.completed.set()
+            await self.release.wait()
+            return reserved
+        return await self._reserve_due(candidates)
+
+
+class _BlockingOperation:
+    def __init__(self, operation: Callable[..., Awaitable[object]]) -> None:
+        self._operation = operation
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def run(self, *args: object, **kwargs: object) -> object:
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        return await self._operation(*args, **kwargs)
+
+
+class _DrainObserver:
+    def __init__(self, drain: Callable[..., Awaitable[None]]) -> None:
+        self._drain = drain
+        self.started = asyncio.Event()
+
+    async def drain(self, *args: object, **kwargs: object) -> None:
+        self.started.set()
+        await self._drain(*args, **kwargs)
 
 
 def _state(workspace: Path, agent_home: Path) -> WorkspaceState:
@@ -629,6 +677,869 @@ async def test_pause_and_drain_cancels_user_and_dream_then_resume_keeps_progress
         for job in await WorkspaceScheduleStore(state).snapshot()
     )
     await service.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_and_drain_waits_for_a_completed_user_terminal_commit(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run a user occurrence.",
+        schedule=JobSchedule.at("2026-08-07T11:59:00.000+00:00"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    store = WorkspaceScheduleStore(state)
+    await store.add_user_job(job)
+    commit = _BlockingOperation(store._remove_terminal_job)
+    monkeypatch.setattr(store, "_remove_terminal_job", commit.run)
+
+    callbacks = 0
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        nonlocal callbacks
+        assert active_job == job
+        callbacks += 1
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    service._store = store
+    drain = _DrainObserver(service._cancel_and_drain_job_tasks)
+    monkeypatch.setattr(service, "_cancel_and_drain_job_tasks", drain.drain)
+
+    service.start()
+    await commit.started.wait()
+
+    paused = asyncio.create_task(service.pause_and_drain())
+    await drain.started.wait()
+    assert not paused.done()
+    assert not commit.cancelled.is_set()
+    assert service.status_snapshot().active_job_count == 1
+
+    paused.cancel()
+    commit.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await paused
+    await service.pause_and_drain()
+
+    assert callbacks == 1
+    assert await store.snapshot() == ()
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+    assert service.status_snapshot().active_job_count == 0
+
+    clock.wait_started = asyncio.Event()
+    service.resume()
+    await clock.wait_started.wait()
+    assert callbacks == 1
+    assert await store.snapshot() == ()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_and_drain_waits_for_a_completed_recurring_terminal_commit(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run a recurring user occurrence.",
+        schedule=JobSchedule.every(60),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    callback_count = 0
+    next_occurrence_started = asyncio.Event()
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        nonlocal callback_count
+        assert active_job.job_id == job.job_id
+        assert active_job.schedule == job.schedule
+        callback_count += 1
+        if callback_count == 2:
+            next_occurrence_started.set()
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    store = service._store
+    service_identity = id(service)
+    store_identity = id(store)
+    await service.add_user_job(job)
+    commit = _BlockingOperation(store.commit_terminal)
+    monkeypatch.setattr(store, "commit_terminal", commit.run)
+    drain = _DrainObserver(service._cancel_and_drain_job_tasks)
+    monkeypatch.setattr(service, "_cancel_and_drain_job_tasks", drain.drain)
+
+    service.start()
+    await commit.started.wait()
+
+    paused = asyncio.create_task(service.pause_and_drain())
+    await drain.started.wait()
+    assert not paused.done()
+    assert not commit.cancelled.is_set()
+
+    commit.release.set()
+    await paused
+
+    persisted = (await store.snapshot())[0]
+    assert persisted.state.last_status == "ok"
+    assert callback_count == 1
+    assert service.status_snapshot().active_job_count == 0
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+
+    try:
+        clock.wait_started = asyncio.Event()
+        service.resume()
+        assert id(service) == service_identity
+        assert id(service._store) == store_identity
+        await clock.wait_started.wait()
+        assert callback_count == 1
+
+        clock.advance(59)
+        assert callback_count == 1
+
+        clock.advance(1)
+        await next_occurrence_started.wait()
+        assert callback_count == 2
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_one_shot_terminal_commit_stays_pending_and_retries_once(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Retry a cancelled terminal commit.",
+        schedule=JobSchedule.at("2026-08-07T11:59:00.000+00:00"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    callback_count = 0
+    second_run_finished = asyncio.Event()
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        nonlocal callback_count
+        assert active_job.job_id == job.job_id
+        callback_count += 1
+        if callback_count == 2:
+            run_task = asyncio.current_task()
+            assert run_task is not None
+            run_task.add_done_callback(lambda _task: second_run_finished.set())
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+    store = service._store
+    original_commit = store._remove_terminal_job
+    commit_started = asyncio.Event()
+    cancel_commit = asyncio.Event()
+    second_commit_finished = asyncio.Event()
+    commit_attempts = 0
+
+    async def cancelled_then_successful_commit(*args: object, **kwargs: object) -> bool:
+        nonlocal commit_attempts
+        commit_attempts += 1
+        if commit_attempts == 1:
+            commit_started.set()
+            await cancel_commit.wait()
+            raise asyncio.CancelledError
+        committed = await original_commit(*args, **kwargs)  # type: ignore[arg-type]
+        second_commit_finished.set()
+        return committed
+
+    monkeypatch.setattr(store, "_remove_terminal_job", cancelled_then_successful_commit)
+    drain = _DrainObserver(service._cancel_and_drain_job_tasks)
+    monkeypatch.setattr(service, "_cancel_and_drain_job_tasks", drain.drain)
+
+    service.start()
+    await commit_started.wait()
+    paused = asyncio.create_task(service.pause_and_drain())
+    await drain.started.wait()
+
+    assert not paused.done()
+    assert service.status_snapshot().active_job_count == 1
+    cancel_commit.set()
+    await paused
+
+    assert callback_count == 1
+    assert commit_attempts == 1
+    assert await store.snapshot() == (job,)
+    assert job.job_id not in service._consumed_at_jobs
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+    assert service.status_snapshot().active_job_count == 0
+
+    try:
+        clock.wait_started = asyncio.Event()
+        service.resume()
+        await second_commit_finished.wait()
+        await second_run_finished.wait()
+        await clock.wait_started.wait()
+
+        assert callback_count == 2
+        assert commit_attempts == 2
+        assert await store.snapshot() == ()
+        assert service._run_tasks == set()
+        assert service._terminal_commit_tasks == set()
+        assert service.status_snapshot().active_job_count == 0
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_linearizes_after_an_inflight_reservation_and_preserves_its_occurrence(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    timestamp = 1
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run a user occurrence.",
+        schedule=JobSchedule.every(10),
+        created_at_ms=timestamp,
+        updated_at_ms=timestamp,
+    )
+    store = WorkspaceScheduleStore(state)
+    await store.add_user_job(job)
+    reservation = _BlockingReservation(store)
+    pause_started = asyncio.Event()
+    callback_count = 0
+    callback_started = asyncio.Event()
+
+    monkeypatch.setattr(store, "reserve_due", reservation.reserve_due)
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        nonlocal callback_count
+        assert active_job.job_id == job.job_id
+        assert active_job.schedule == job.schedule
+        callback_count += 1
+        callback_started.set()
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    service._store = store
+    original_pause = service._pause_owned_tasks
+
+    async def observed_pause() -> None:
+        pause_started.set()
+        await original_pause()
+
+    monkeypatch.setattr(service, "_pause_owned_tasks", observed_pause)
+
+    service.start()
+    await reservation.completed.wait()
+    paused = asyncio.create_task(service.pause_and_drain())
+    await pause_started.wait()
+    assert service._paused is False
+    assert not paused.done()
+    reservation.release.set()
+    await paused
+
+    try:
+        callbacks_before_resume = callback_count
+        assert reservation.calls == 1
+        assert service._paused is True
+        assert service._run_tasks == set()
+        assert service.status_snapshot().active_job_count == 0
+
+        clock.wait_started = asyncio.Event()
+        callback_started.clear()
+        service.resume()
+        await clock.wait_started.wait()
+
+        assert reservation.calls == 1
+        assert callback_count == callbacks_before_resume
+
+        clock.wait_started = asyncio.Event()
+        clock.advance(10)
+        await callback_started.wait()
+        await clock.wait_started.wait()
+        assert callback_count == callbacks_before_resume + 1
+        assert reservation.calls == 2
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_and_resume_retries_an_unfinished_user_one_shot(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run a one-shot occurrence.",
+        schedule=JobSchedule.at("2026-08-07T11:59:00.000+00:00"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    second_started = asyncio.Event()
+    calls = 0
+    blocker = asyncio.Event()
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        nonlocal calls
+        assert active_job.job_id == job.job_id
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            try:
+                await blocker.wait()
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                raise
+        else:
+            second_started.set()
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+
+    service.start()
+    await first_started.wait()
+    await service.pause_and_drain()
+    assert first_cancelled.is_set()
+    assert calls == 1
+    assert await service._store.snapshot() == (job,)
+
+    try:
+        clock.wait_started = asyncio.Event()
+        service.resume()
+        await second_started.wait()
+        await clock.wait_started.wait()
+        assert calls == 2
+        assert await service._store.snapshot() == ()
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_paused_reserve_gate_rejects_a_one_shot_without_consuming_it(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run a one-shot occurrence.",
+        schedule=JobSchedule.at("2026-08-07T11:59:00.000+00:00"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    callback_started = asyncio.Event()
+    callback_count = 0
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        nonlocal callback_count
+        assert active_job.job_id == job.job_id
+        callback_count += 1
+        callback_started.set()
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+    await service.pause_and_drain()
+
+    service._reserve(job, current_monotonic=clock.monotonic())
+
+    assert not callback_started.is_set()
+    assert callback_count == 0
+    assert service._run_tasks == set()
+    assert service._active_job_ids == set()
+    assert service._consumed_at_jobs == set()
+    assert await service._store.snapshot() == (job,)
+
+    try:
+        clock.wait_started = asyncio.Event()
+        service.resume()
+        await callback_started.wait()
+        await clock.wait_started.wait()
+        assert callback_count == 1
+        assert await service._store.snapshot() == ()
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_after_snapshot_await_does_not_start_a_new_reservation(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run a one-shot occurrence.",
+        schedule=JobSchedule.at("2026-08-07T11:59:00.000+00:00"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    store = WorkspaceScheduleStore(state)
+    await store.add_user_job(job)
+    original_snapshot = store.snapshot
+    original_reserve_due = store.reserve_due
+    snapshot_started = asyncio.Event()
+    snapshot_cancelled = asyncio.Event()
+    callback_started = asyncio.Event()
+    snapshot_calls = 0
+    reserve_calls = 0
+
+    async def cancelled_snapshot() -> tuple[ScheduleJob, ...]:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls > 1:
+            return await original_snapshot()
+        snapshot_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            snapshot_cancelled.set()
+            return await original_snapshot()
+        raise AssertionError("snapshot barrier was released without cancellation")
+
+    async def record_reservation(
+        candidates: tuple[ScheduleJob, ...],
+    ) -> tuple[ScheduleJob, ...]:
+        nonlocal reserve_calls
+        reserve_calls += 1
+        return await original_reserve_due(candidates)
+
+    monkeypatch.setattr(store, "snapshot", cancelled_snapshot)
+    monkeypatch.setattr(store, "reserve_due", record_reservation)
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        assert active_job.job_id == job.job_id
+        callback_started.set()
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    service._store = store
+    service.start()
+    await snapshot_started.wait()
+
+    paused = asyncio.create_task(service.pause_and_drain())
+    await snapshot_cancelled.wait()
+    await paused
+
+    assert reserve_calls == 0
+    assert not callback_started.is_set()
+    assert await original_snapshot() == (job,)
+
+    try:
+        clock.wait_started = asyncio.Event()
+        service.resume()
+        await callback_started.wait()
+        await clock.wait_started.wait()
+        assert reserve_calls == 1
+        assert await original_snapshot() == ()
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_preserves_a_completed_dream_reservation_before_resume(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    store = WorkspaceScheduleStore(state)
+    job = ScheduleJob(
+        job_id="dream",
+        source="system",
+        message="Internal Dream schedule.",
+        schedule=JobSchedule.every(10),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    await store._register_system_job(job)
+    reservation = _BlockingReservation(store)
+    pause_started = asyncio.Event()
+    dream_calls = 0
+    dream_started = asyncio.Event()
+
+    monkeypatch.setattr(store, "reserve_due", reservation.reserve_due)
+
+    async def execute_dream() -> DreamResult:
+        nonlocal dream_calls
+        dream_calls += 1
+        dream_started.set()
+        return DreamResult(
+            status="No pending summaries",
+            processed_count=0,
+            memory_updated=False,
+            cursor=0,
+        )
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=lambda active_job: _unexpected_user_job(active_job),
+        execute_dream=execute_dream,
+    )
+    service._store = store
+    original_pause = service._pause_owned_tasks
+
+    async def observed_pause() -> None:
+        pause_started.set()
+        await original_pause()
+
+    monkeypatch.setattr(service, "_pause_owned_tasks", observed_pause)
+    service.start()
+    await reservation.completed.wait()
+
+    paused = asyncio.create_task(service.pause_and_drain())
+    await pause_started.wait()
+    assert service._paused is False
+    assert not paused.done()
+    reservation.release.set()
+    await paused
+
+    try:
+        dreams_before_resume = dream_calls
+        assert reservation.calls == 1
+        clock.wait_started = asyncio.Event()
+        dream_started.clear()
+        service.resume()
+        await clock.wait_started.wait()
+        assert reservation.calls == 1
+        assert dream_calls == dreams_before_resume
+
+        clock.wait_started = asyncio.Event()
+        clock.advance(10)
+        await dream_started.wait()
+        await clock.wait_started.wait()
+        assert dream_calls == dreams_before_resume + 1
+        assert reservation.calls == 2
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_pause_waiters_share_a_cancellable_drain_barrier(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run a user occurrence.",
+        schedule=JobSchedule.every(60),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        assert active_job.job_id == job.job_id
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await cleanup_release.wait()
+            raise
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+    service.start()
+    await started.wait()
+
+    first = asyncio.create_task(service.pause_and_drain())
+    second = asyncio.create_task(service.pause_and_drain())
+    await cancelled.wait()
+    with pytest.raises(RuntimeError, match="pause is still draining"):
+        service.resume()
+    first.cancel()
+    assert not second.done()
+
+    cleanup_release.set()
+    await second
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    assert service._paused is True
+    assert service._loop_task is None
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+    service.resume()
+    service.resume()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_before_start_then_resume_does_not_duplicate_dispatcher(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=lambda active_job: _unexpected_user_job(active_job),
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    store = service._store
+
+    await service.pause_and_drain()
+    assert service._paused is True
+    assert service._loop_task is None
+
+    service.resume()
+    service.resume()
+    service.start()
+    assert service._store is store
+    await service.close()
+
+    assert service._loop_task is None
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_pause_and_abort_interleave_with_deterministic_owned_task_cleanup(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run a user occurrence.",
+        schedule=JobSchedule.every(60),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        assert active_job.job_id == job.job_id
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await cleanup_release.wait()
+            raise
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+    service.start()
+    await started.wait()
+
+    paused = asyncio.create_task(service.pause_and_drain())
+    await cancelled.wait()
+    service.abort()
+    aborted = asyncio.create_task(service.abort_and_wait())
+    cleanup_release.set()
+    await asyncio.gather(paused, aborted)
+
+    assert service._aborted is True
+    assert service._paused is True
+    assert service._loop_task is None
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+    with pytest.raises(RuntimeError, match="closed"):
+        service.resume()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_and_close_interleave_with_deterministic_owned_task_cleanup(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run a user occurrence.",
+        schedule=JobSchedule.every(60),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        assert active_job.job_id == job.job_id
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await cleanup_release.wait()
+            raise
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+    service.start()
+    await started.wait()
+
+    paused = asyncio.create_task(service.pause_and_drain())
+    await cancelled.wait()
+    closing = asyncio.create_task(service.close())
+    await service._closing.wait()
+    assert not closing.done()
+
+    cleanup_release.set()
+    await asyncio.gather(paused, closing)
+
+    assert service._paused is True
+    assert service._loop_task is None
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+    with pytest.raises(RuntimeError, match="closed"):
+        service.resume()
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_a_run_registered_after_its_initial_task_snapshot(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run a user occurrence.",
+        schedule=JobSchedule.every(60),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    store = WorkspaceScheduleStore(state)
+    await store.add_user_job(job)
+    original_reserve_due = store.reserve_due
+    reserve_started = asyncio.Event()
+    reservation_completed = asyncio.Event()
+    run_started = asyncio.Event()
+
+    async def completed_after_cancellation(
+        candidates: tuple[ScheduleJob, ...],
+    ) -> tuple[ScheduleJob, ...]:
+        reserve_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            reserved = await original_reserve_due(candidates)
+            reservation_completed.set()
+            return reserved
+        raise AssertionError("reservation barrier was released without cancellation")
+
+    monkeypatch.setattr(store, "reserve_due", completed_after_cancellation)
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        assert active_job.job_id == job.job_id
+        run_started.set()
+        await asyncio.Event().wait()
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    service._store = store
+    service.start()
+    await reserve_started.wait()
+
+    closing = asyncio.create_task(service.close())
+    await reservation_completed.wait()
+    await closing
+
+    try:
+        assert service._loop_task is None
+        assert not run_started.is_set()
+        assert await store.snapshot() == (job,)
+        assert service._run_tasks == set()
+        assert service._terminal_commit_tasks == set()
+    finally:
+        if service._run_tasks:
+            service.abort()
+            await service.abort_and_wait()
+
+
+async def _unexpected_user_job(job: ScheduleJob) -> None:
+    raise AssertionError(f"unexpected User Job: {job.job_id}")
+
+
+async def _unexpected_dream() -> object:
+    raise AssertionError("unexpected Dream execution")
 
 
 @pytest.mark.asyncio
