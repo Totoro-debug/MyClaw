@@ -12,15 +12,19 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ConfigView
 from myclaw.errors import ErrorInfo
-from myclaw.memory.memory_task import MemoryStore, MemoryTaskResult
+from myclaw.memory.dream import DreamResult
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_nonnegative_int, require_nonnegative_number
 
 
-class _ManualMemoryManager(Protocol):
-    async def run_manual(self) -> MemoryTaskResult: ...
+class _MemoryReader(Protocol):
+    async def read_long_term(self) -> str: ...
+
+
+class _DreamRunner(Protocol):
+    async def run(self) -> DreamResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,16 +241,16 @@ class ManagementViewService:
         workspace_state: WorkspaceState | None = None,
         replace_session: Callable[[str, bool], Awaitable[None]] | None = None,
         now: Callable[[], datetime] | None = None,
-        memory_manager: _ManualMemoryManager | None = None,
-        memory_store: MemoryStore | None = None,
+        memory_manager: _MemoryReader | None = None,
+        dream: _DreamRunner | None = None,
     ) -> None:
         self._config = ConfigLoader(agent_home)
         self._status_service = status_service
         self._workspace_state = workspace_state
         self._replace_session = replace_session
         self._now = now
-        self._memory_manager = memory_manager
-        self._memory_store = memory_store
+        self._memory_reader = memory_manager
+        self._dream = dream
         self._aborted = False
 
     def deactivate(self) -> None:
@@ -276,23 +280,25 @@ class ManagementViewService:
     async def memory_view(self) -> str:
         """Return the complete current Long-term Memory file."""
         self._ensure_active()
-        if self._memory_store is None:
+        memory_reader = self._memory_reader
+        if memory_reader is None:
             raise ManagementError(
                 ErrorInfo("route_unavailable", "Long-term Memory is unavailable.")
             )
         try:
-            return await self._memory_store.read_long_term()
+            return await memory_reader.read_long_term()
         except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Long-term Memory could not be read.")
             ) from error
 
-    async def dream(self) -> MemoryTaskResult:
+    async def dream(self) -> DreamResult:
         """Run one foreground Memory Task and return its safe summary."""
         self._ensure_active()
-        if self._memory_manager is None:
+        dream = self._dream
+        if dream is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Memory Task is unavailable."))
-        return await self._memory_manager.run_manual()
+        return await dream.run()
 
     async def status(self) -> RuntimeStatus:
         """Return the injected Runtime status snapshot."""

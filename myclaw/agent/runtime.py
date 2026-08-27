@@ -48,15 +48,11 @@ from myclaw.management.service import (
 )
 from myclaw.memory.conversation_summary import (
     ConversationSummaryManager,
-    WorkspaceJsonlSummaryStore,
     _last_user_index,
 )
+from myclaw.memory.dream import Dream
+from myclaw.memory.manager import MemoryManager
 from myclaw.memory.memory_scheduler import MemoryTaskScheduler
-from myclaw.memory.memory_task import (
-    MemoryManager,
-    RuntimeMemory,
-    WorkspaceFileMemoryStore,
-)
 from myclaw.provider.model_router import Jitter, ModelRouter, RetryClock
 from myclaw.provider.models import ModelProvider
 from myclaw.schedule.service import ScheduleClock, ScheduleService
@@ -86,10 +82,10 @@ class _RuntimeSchedulerOwner:
 
     def __init__(
         self,
-        factory: Callable[[], MemoryTaskScheduler | ScheduleService],
+        factory: Callable[[], MemoryTaskScheduler],
     ) -> None:
         self._factory = factory
-        self._active: MemoryTaskScheduler | ScheduleService | None = None
+        self._active: MemoryTaskScheduler | None = None
         self._aborted = False
 
     def prepare(self) -> None:
@@ -128,6 +124,13 @@ class _RuntimeSchedulerOwner:
         if scheduler is not None:
             scheduler.abort()
 
+    async def abort_and_wait(self) -> None:
+        """Cancel and drain the active scheduler without final persistence."""
+        self.abort()
+        scheduler = self._active
+        if scheduler is not None:
+            await scheduler.abort_and_wait()
+
 
 @dataclass(slots=True)
 class _RuntimeLifetime:
@@ -135,6 +138,7 @@ class _RuntimeLifetime:
     aborted: bool = False
     validated: bool = False
     close_task: asyncio.Task[None] | None = None
+    abort_task: asyncio.Task[None] | None = None
     shutdown_requested: asyncio.Event = field(default_factory=asyncio.Event)
     run_task: asyncio.Task[object] | None = None
     run_done: asyncio.Event | None = None
@@ -167,8 +171,8 @@ class PreparedRuntime:
     _router: ModelRouter
     _lifetime: _RuntimeLifetime
     _schedule_store: WorkspaceScheduleStore
-    _runtime_memory: RuntimeMemory
     _memory_manager: MemoryManager
+    _dream: Dream
     _context_builder: ContextBuilder
     _management_service: ManagementViewService
     _skill_snapshot: SkillSnapshot
@@ -221,8 +225,17 @@ class PreparedRuntime:
         self._lifetime.begin()
         await self._start_schedulers()
 
-    def abort(self) -> None:
-        """Synchronously abandon this generation without final persistence."""
+    async def abort(self) -> None:
+        """Abandon this generation and drain its Memory-owned tasks."""
+        self._request_abort()
+        task = self._lifetime.abort_task
+        if task is None:
+            task = asyncio.create_task(self._drain_aborted_memory())
+            self._lifetime.abort_task = task
+        await await_task_preserving_cancellation(task)
+
+    def _request_abort(self) -> None:
+        """Synchronously request abandonment for unstarted or async-drained runtimes."""
         if self._lifetime.aborted:
             return
         self._lifetime.aborted = True
@@ -231,7 +244,7 @@ class PreparedRuntime:
         self._management_service.deactivate()
         self.agent_loop.abort()
         self.schedule_service.abort()
-        self._memory_manager.abort()
+        self._dream.abort()
         self._memory_scheduler.abort()
         self._router.abort()
         closing = self._lifetime.close_task
@@ -244,6 +257,12 @@ class PreparedRuntime:
             current = None
         if running is not None and running is not current and not running.done():
             running.cancel()
+
+    async def _drain_aborted_memory(self) -> None:
+        await asyncio.gather(
+            self._dream.abort_and_wait(),
+            self._memory_scheduler.abort_and_wait(),
+        )
 
     async def _start_schedulers(self) -> None:
         if not self._lifetime.validated:
@@ -341,7 +360,7 @@ class PreparedRuntime:
             failures.extend(result for result in results if isinstance(result, BaseException))
 
             try:
-                await self._memory_manager.wait_until_idle()
+                await self._dream.close()
             except BaseException as error:
                 failures.append(error)
 
@@ -428,7 +447,7 @@ class RuntimeHost:
         try:
             self._runtime.validate_unstarted()
         except BaseException:
-            self._runtime.abort()
+            self._runtime._request_abort()
             raise
 
     @property
@@ -512,13 +531,13 @@ class RuntimeHost:
             return target_runtime
         except ManagementError:
             if target_runtime is not None:
-                target_runtime.abort()
+                target_runtime._request_abort()
             if target_session is not None:
                 target_session.abandon()
             raise
         except (OSError, UnicodeError, ValueError, WorkspaceStateError) as error:
             if target_runtime is not None:
-                target_runtime.abort()
+                target_runtime._request_abort()
             if target_session is not None:
                 target_session.abandon()
             raise ManagementError(
@@ -529,7 +548,7 @@ class RuntimeHost:
             ) from error
         except Exception as error:
             if target_runtime is not None:
-                target_runtime.abort()
+                target_runtime._request_abort()
             if target_session is not None:
                 target_session.abandon()
             raise ManagementError(
@@ -540,7 +559,7 @@ class RuntimeHost:
             ) from error
         except BaseException:
             if target_runtime is not None:
-                target_runtime.abort()
+                target_runtime._request_abort()
             if target_session is not None:
                 target_session.abandon()
             raise
@@ -567,7 +586,7 @@ class RuntimeHost:
             target_token = object()
             target = self._prepare_target(session_id, target_token)
             if old.control.has_active_run and not force:
-                target.abort()
+                await target.abort()
                 raise ManagementError(
                     ErrorInfo(
                         "model_invalid_request",
@@ -575,22 +594,30 @@ class RuntimeHost:
                     )
                 )
 
-            old.abort()
+            replacement = asyncio.create_task(
+                self._commit_replacement(old, target, target_token)
+            )
+            await await_task_preserving_cancellation(replacement)
+
+    async def _commit_replacement(
+        self,
+        old: PreparedRuntime,
+        target: PreparedRuntime,
+        target_token: object,
+    ) -> None:
+        """Drain and publish a replacement as one cancellation-safe operation."""
+        try:
+            await old.abort()
             self._runtime = target
             self._runtime_token = target_token
             rebind = self._terminal_rebind
             if rebind is None:
-                try:
-                    await target.start()
-                except BaseException:
-                    target.abort()
-                    raise
+                await target.start()
                 return
-            try:
-                await rebind(target.bindings)
-            except BaseException:
-                target.abort()
-                raise
+            await rebind(target.bindings)
+        except BaseException:
+            await target.abort()
+            raise
 
 
 def prepare_runtime(
@@ -679,14 +706,14 @@ def _prepare_runtime(
         raise ValueError("Runtime Workspace State must belong to the Runtime Workspace")
     active_workspace_state.initialize(agent_home_root=agent_home.path)
     schedule_store = WorkspaceScheduleStore(active_workspace_state)
+    memory_manager = MemoryManager(active_workspace_state)
+    long_term_memory = memory_manager.memory_snapshot()
     schedule_clock = (
         schedule_scheduler_clock
         if schedule_scheduler_clock is not None
         else AsyncioSchedulerClock(now=now)
     )
     schedule_service = ScheduleService(store=schedule_store, clock=schedule_clock)
-    long_term_memory = active_workspace_state.long_term_memory_path.read_text(encoding="utf-8")
-    runtime_memory = RuntimeMemory(long_term_memory)
     resolved_timezone_name = get_localzone_name() if timezone_name is None else timezone_name
     foreground_context = ContextBuilder(
         workspace_path,
@@ -696,7 +723,6 @@ def _prepare_runtime(
     set_context_clock = getattr(foreground_context, "set_clock", None)
     if callable(set_context_clock):
         set_context_clock(now)
-    memory_store = WorkspaceFileMemoryStore(active_workspace_state)
     active_session = session
     if active_session is None:
         active_session = Session.create(
@@ -729,27 +755,39 @@ def _prepare_runtime(
             skill_snapshot=active_skill_snapshot,
         )
 
-    summaries = WorkspaceJsonlSummaryStore(active_workspace_state)
-    memory_manager = MemoryManager(
-        router=router,
-        summaries=summaries,
-        memory=memory_store,
-        long_term_path=active_workspace_state.long_term_memory_path,
-        batch_size=configuration.memory.batch_size,
-        runtime_memory=runtime_memory,
-    )
+    try:
+        dream = Dream(
+            memory_manager=memory_manager,
+            model_router=router,
+            batch_size=configuration.memory.batch_size,
+            max_iterations=configuration.runtime.max_iterations,
+        )
+    except BaseException:
+        schedule_service.abort()
+        router.abort()
+        raise
+
+    def abort_memory_composition() -> None:
+        dream.abort()
+        schedule_service.abort()
+        router.abort()
+
     scheduler_clock = (
         memory_scheduler_clock
         if memory_scheduler_clock is not None
         else AsyncioSchedulerClock(now=now)
     )
-    memory_scheduler = _RuntimeSchedulerOwner(
-        lambda: MemoryTaskScheduler(
-            manager=memory_manager,
-            schedule=configuration.memory.schedule,
-            clock=scheduler_clock,
+    try:
+        memory_scheduler = _RuntimeSchedulerOwner(
+            lambda: MemoryTaskScheduler(
+                dream=dream,
+                schedule=configuration.memory.schedule,
+                clock=scheduler_clock,
+            )
         )
-    )
+    except BaseException:
+        abort_memory_composition()
+        raise
 
     def externalize_result_for(active_session: Session) -> Callable[[ToolResult], ToolResult]:
         return _build_tool_result_externalizer(
@@ -782,7 +820,7 @@ def _prepare_runtime(
                     foreground_context,
                     messages,
                     session_id=active_session.session_id,
-                    long_term_memory=runtime_memory.snapshot(),
+                    long_term_memory=memory_manager.memory_snapshot(),
                     blackboard=blackboard,
                     manual_invocation=manual_invocation,
                 )
@@ -805,7 +843,7 @@ def _prepare_runtime(
 
         manager = ConversationSummaryManager(
             provider=router,
-            summaries=summaries,
+            summaries=memory_manager,
             route_context_window=effective_route.context_window,
             route_max_output=effective_route.max_output,
             consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
@@ -822,7 +860,7 @@ def _prepare_runtime(
         active_session: Session,
         current_user: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        memory_snapshot = runtime_memory.snapshot()
+        memory_snapshot = memory_manager.memory_snapshot()
         current_system_prompt = system_prompt_for(memory_snapshot)
         await prepare_summary(
             active_session,
@@ -846,7 +884,7 @@ def _prepare_runtime(
         *,
         manual_invocation: ManualSkillInvocation | None = None,
     ) -> list[dict[str, Any]]:
-        memory_snapshot = runtime_memory.snapshot()
+        memory_snapshot = memory_manager.memory_snapshot()
         current_system_prompt = foreground_system_prompt_for(memory_snapshot)
         await prepare_summary(
             active_session,
@@ -867,30 +905,39 @@ def _prepare_runtime(
             manual_invocation=manual_invocation,
         )
 
-    agent_loop = AgentLoop(
-        workspace=workspace_path,
-        skill_snapshot=active_skill_snapshot,
-        session=active_session,
-        schedule_service=schedule_service,
-        model_router=router,
-        context_preparer=prepare_foreground_context,
-        now=now,
-        max_iterations=configuration.runtime.max_iterations,
-        schedule_context_preparer=prepare_schedule_context,
-        schedule_now=schedule_clock.now,
-        title_prompt=session_title_prompt(),
-        externalize_result_for=externalize_result_for,
-        task_framer=task_framer,
-    )
+    try:
+        agent_loop = AgentLoop(
+            workspace=workspace_path,
+            skill_snapshot=active_skill_snapshot,
+            session=active_session,
+            schedule_service=schedule_service,
+            model_router=router,
+            context_preparer=prepare_foreground_context,
+            now=now,
+            max_iterations=configuration.runtime.max_iterations,
+            schedule_context_preparer=prepare_schedule_context,
+            schedule_now=schedule_clock.now,
+            title_prompt=session_title_prompt(),
+            externalize_result_for=externalize_result_for,
+            task_framer=task_framer,
+        )
+    except BaseException:
+        abort_memory_composition()
+        raise
 
-    _preflight_skill_context_budget(
-        configuration=configuration,
-        context_builder=foreground_context,
-        long_term_memory=long_term_memory,
-        session_id=active_session.session_id,
-        skill_snapshot=active_skill_snapshot,
-        tool_schemas=agent_loop.tool_schemas,
-    )
+    try:
+        _preflight_skill_context_budget(
+            configuration=configuration,
+            context_builder=foreground_context,
+            long_term_memory=long_term_memory,
+            session_id=active_session.session_id,
+            skill_snapshot=active_skill_snapshot,
+            tool_schemas=agent_loop.tool_schemas,
+        )
+    except BaseException:
+        agent_loop.abort()
+        abort_memory_composition()
+        raise
 
     schedule_service.on_schedule_job = agent_loop.run_schedule_job
 
@@ -904,30 +951,35 @@ def _prepare_runtime(
             )
         return _resolved_chat_status(router)
 
-    status_service = RuntimeStatusService(
-        session=agent_loop.session,
-        resolved_chat=current_foreground_chat_status,
-        next_input=lambda active_session: _runtime_status_input(
-            active_session,
-            context_builder=foreground_context,
-            long_term_memory=runtime_memory.snapshot(),
-            session_id=active_session.session_id,
-            tool_schemas=agent_loop.tool_schemas,
-        ),
-        monotonic=monotonic_now,
-        schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
-    )
+    try:
+        status_service = RuntimeStatusService(
+            session=agent_loop.session,
+            resolved_chat=current_foreground_chat_status,
+            next_input=lambda active_session: _runtime_status_input(
+                active_session,
+                context_builder=foreground_context,
+                long_term_memory=memory_manager.memory_snapshot(),
+                session_id=active_session.session_id,
+                tool_schemas=agent_loop.tool_schemas,
+            ),
+            monotonic=monotonic_now,
+            schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
+        )
 
-    management_service = ManagementViewService(
-        agent_home,
-        status_service=status_service,
-        workspace_state=active_workspace_state,
-        replace_session=replace_session,
-        now=now,
-        memory_manager=memory_manager,
-        memory_store=memory_store,
-    )
-    management_dispatcher = ManagementCommandDispatcher(management_service)
+        management_service = ManagementViewService(
+            agent_home,
+            status_service=status_service,
+            workspace_state=active_workspace_state,
+            replace_session=replace_session,
+            now=now,
+            memory_manager=memory_manager,
+            dream=dream,
+        )
+        management_dispatcher = ManagementCommandDispatcher(management_service)
+    except BaseException:
+        agent_loop.abort()
+        abort_memory_composition()
+        raise
     return PreparedRuntime(
         agent_loop=agent_loop,
         management_dispatcher=management_dispatcher,
@@ -936,8 +988,8 @@ def _prepare_runtime(
         _router=router,
         _lifetime=_RuntimeLifetime(),
         _schedule_store=schedule_store,
-        _runtime_memory=runtime_memory,
         _memory_manager=memory_manager,
+        _dream=dream,
         _context_builder=foreground_context,
         _management_service=management_service,
         _skill_snapshot=active_skill_snapshot,

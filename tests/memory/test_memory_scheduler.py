@@ -18,9 +18,10 @@ from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
 from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
+from myclaw.memory.dream import Dream
+from myclaw.memory.manager import MemoryManager
 from myclaw.memory.memory_scheduler import MemoryTaskScheduler
 from myclaw.memory.memory_task import (
-    MemoryManager,
     MemoryTaskModelRouter,
     MemoryTaskResult,
     WorkspaceFileMemoryStore,
@@ -140,18 +141,20 @@ def _response(
     )
 
 
-def _manager(
+def _dream(
     *,
     home: AgentHome,
     router: MemoryTaskModelRouter,
     summaries: WorkspaceJsonlSummaryStore,
-) -> MemoryManager:
-    return MemoryManager(
-        router=router,
-        summaries=summaries,
-        memory=WorkspaceFileMemoryStore(_state(home)),
-        long_term_path=home.path / "memory" / "memory.md",
+) -> Dream:
+    state = _state(home)
+    manager = MemoryManager(state)
+    manager._summary_store = summaries
+    return Dream(
+        memory_manager=manager,
+        model_router=router,
         batch_size=10,
+        max_iterations=50,
     )
 
 
@@ -192,7 +195,7 @@ async def test_periodic_memory_task_runs_when_the_manager_is_idle(agent_home: Pa
     summaries = WorkspaceJsonlSummaryStore(_state(home))
     await summaries.append("A pending summary.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
-    manager = _manager(home=home, router=_router(provider), summaries=summaries)
+    manager = _dream(home=home, router=_router(provider), summaries=summaries)
 
     result = await manager.run_periodic()
 
@@ -226,7 +229,7 @@ async def test_periodic_memory_task_does_not_borrow_a_foreground_session_log(
         clock=FakeClock(NOW),
     )
     with configured_process_logging(), session_log(state, SESSION_ID):
-        result = await _manager(
+        result = await _dream(
             home=home,
             router=router,
             summaries=summaries,
@@ -287,7 +290,7 @@ async def test_memory_scheduler_trigger_does_not_borrow_a_foreground_session_log
 
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=_manager(
+        dream=_dream(
             home=home,
             router=_router(UnexpectedFailureProvider()),
             summaries=summaries,
@@ -318,7 +321,7 @@ async def test_hourly_memory_schedule_triggers_only_at_next_local_cron_boundary(
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=_manager(home=home, router=_router(provider), summaries=summaries),
+        dream=_dream(home=home, router=_router(provider), summaries=summaries),
         schedule="0 * * * *",
         clock=clock,
     )
@@ -378,7 +381,7 @@ async def test_periodic_trigger_is_skipped_while_the_previous_run_is_still_activ
     provider = BlockingProvider()
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=_manager(home=home, router=_router(provider), summaries=summaries),
+        dream=_dream(home=home, router=_router(provider), summaries=summaries),
         schedule="0 * * * *",
         clock=clock,
     )
@@ -437,13 +440,13 @@ async def test_manual_memory_task_reports_running_while_a_periodic_run_is_active
             return _response("No update needed.")
 
     provider = BlockingProvider()
-    manager = _manager(home=home, router=_router(provider), summaries=summaries)
+    manager = _dream(home=home, router=_router(provider), summaries=summaries)
     periodic = asyncio.create_task(manager.run_periodic())
     await started.wait()
     (_state(home).memory_directory / ".cursor").write_bytes(b"corrupt\n")
 
     try:
-        manual = await manager.run_manual()
+        manual = await manager.run()
     finally:
         release.set()
         await periodic
@@ -545,7 +548,7 @@ async def test_custom_schedule_keeps_the_runtime_startup_local_timezone(
     provider = ScriptedFakeProvider(completions=(_response("No update needed."),))
     clock = ControlledClock(datetime(2026, 7, 11, 8, 50, tzinfo=LOCAL))
     scheduler = MemoryTaskScheduler(
-        manager=_manager(home=home, router=_router(provider), summaries=summaries),
+        dream=_dream(home=home, router=_router(provider), summaries=summaries),
         schedule="0 9 * * *",
         clock=clock,
     )
@@ -568,7 +571,7 @@ async def test_local_schedule_wait_uses_elapsed_time_across_daylight_saving_chan
     home.initialize()
     clock = ControlledClock(datetime(2026, 3, 8, 1, 50, tzinfo=SpringForwardTimezone()))
     scheduler = MemoryTaskScheduler(
-        manager=_manager(
+        dream=_dream(
             home=home,
             router=_router(ScriptedFakeProvider()),
             summaries=WorkspaceJsonlSummaryStore(_state(home)),
@@ -947,10 +950,10 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
             return _response("No update needed.")
 
     provider = CancellationAwareProvider()
-    manager = _manager(home=home, router=_router(provider), summaries=summaries)
+    manager = _dream(home=home, router=_router(provider), summaries=summaries)
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=manager,
+        dream=manager,
         schedule="0 * * * *",
         clock=clock,
     )
@@ -971,7 +974,7 @@ async def test_scheduler_close_cancels_and_awaits_an_active_memory_task(
     assert not (agent_home / "logs").exists()
     with pytest.raises(RuntimeError, match="scheduler is closed"):
         scheduler.start()
-    recovered = await manager.run_manual()
+    recovered = await manager.run()
     assert recovered == MemoryTaskResult(
         status="No pending summaries",
         processed_count=0,
@@ -1025,10 +1028,10 @@ async def test_scheduler_and_manager_abort_cancel_active_memory_work_without_awa
             raise AssertionError("blocking Provider completed without cancellation")
 
     provider = CancellationAwareProvider()
-    manager = _manager(home=home, router=_router(provider), summaries=summaries)
+    manager = _dream(home=home, router=_router(provider), summaries=summaries)
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=manager,
+        dream=manager,
         schedule="0 * * * *",
         clock=clock,
     )
@@ -1050,7 +1053,7 @@ async def test_scheduler_and_manager_abort_cancel_active_memory_work_without_awa
     assert scheduler._aborted
     assert not scheduler._run_tasks
     with pytest.raises(RuntimeError, match="no longer active"):
-        await manager.run_manual()
+        await manager.run()
 
 
 @pytest.mark.asyncio
@@ -1097,14 +1100,14 @@ async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
             raise AssertionError("cleanup test wait returned unexpectedly")
 
     provider = CleanupFailingProvider()
-    manager = _manager(
+    manager = _dream(
         home=home,
         router=_router(provider),
         summaries=summaries,
     )
     clock = ControlledClock(NOW)
     scheduler = MemoryTaskScheduler(
-        manager=manager,
+        dream=manager,
         schedule="0 * * * *",
         clock=clock,
     )
@@ -1118,7 +1121,7 @@ async def test_memory_scheduler_reports_cleanup_failure_without_a_session_log(
     assert capsys.readouterr().err == "Memory Task scheduler cleanup failed\n"
     assert not state.logs_directory.exists()
     assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
-    recovered = await manager.run_manual()
+    recovered = await manager.run()
     assert recovered == MemoryTaskResult(
         status="No pending summaries",
         processed_count=0,

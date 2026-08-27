@@ -17,12 +17,12 @@ from myclaw.logging.session import session_log
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import ManagementViewService
 from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
+from myclaw.memory.dream import Dream, DreamModelRouter
+from myclaw.memory.manager import MemoryManager
 from myclaw.memory.memory_task import (
     MemoryEditFileTool,
-    MemoryManager,
     MemoryReadFileTool,
     MemoryTaskResult,
-    RuntimeMemory,
     WorkspaceFileMemoryStore,
 )
 from myclaw.memory.records import SummaryEntry
@@ -92,6 +92,59 @@ def _provider_call(
 
 def _router(provider: ScriptedFakeProvider) -> ScriptedFakeRouter:
     return ScriptedFakeRouter(provider)
+
+
+class _CursorStoreAdapter:
+    def __init__(self, store: object) -> None:
+        self._store = cast(Any, store)
+
+    async def read(self) -> int:
+        return cast(int, await self._store.read_summary_cursor())
+
+    async def write(self, index: int) -> None:
+        await self._store.write_summary_cursor(index)
+
+
+class _LongTermStoreAdapter:
+    def __init__(self, store: object, path: Path) -> None:
+        self._store = cast(Any, store)
+        self.path = path
+
+    async def read(self) -> str:
+        return cast(str, await self._store.read_long_term())
+
+    async def replace(self, content: str) -> None:
+        await self._store.replace_long_term(content)
+
+
+def _dream(
+    *,
+    router: DreamModelRouter,
+    summaries: object,
+    memory: object,
+    long_term_path: Path,
+    batch_size: int,
+) -> Dream:
+    state = (
+        memory.workspace_state
+        if isinstance(memory, WorkspaceFileMemoryStore)
+        else cast(Any, summaries).workspace_state
+    )
+    manager = MemoryManager(cast(WorkspaceState, state))
+    injected = cast(Any, manager)
+    injected._summary_store = summaries
+    if isinstance(memory, WorkspaceFileMemoryStore):
+        injected._cursor_store = memory._cursor
+        injected._long_term_store = memory._long_term
+    else:
+        injected._cursor_store = _CursorStoreAdapter(memory)
+        injected._long_term_store = _LongTermStoreAdapter(memory, long_term_path)
+    return Dream(
+        memory_manager=manager,
+        model_router=router,
+        batch_size=batch_size,
+        max_iterations=50,
+    )
 
 
 class _RecordingMemoryTaskRouter:
@@ -170,23 +223,12 @@ async def test_memory_store_atomically_replaces_exact_long_term_memory(
     assert (_state(home).long_term_memory_path).read_bytes() == replacement.encode("utf-8")
 
 
-def test_runtime_memory_keeps_snapshots_immutable_and_replaces_without_failure() -> None:
-    memory = RuntimeMemory("before")
-
-    first_snapshot = memory.snapshot()
-    memory.replace("after")
-
-    assert first_snapshot == "before"
-    assert memory.snapshot() == "after"
-
-
 def test_memory_tools_export_common_schemas_with_zero_retries(agent_home: Path) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    memory = WorkspaceFileMemoryStore(_state(home))
-    path = _state(home).long_term_memory_path
-    read_tool = MemoryReadFileTool(memory=memory, long_term_path=path)
-    edit_tool = MemoryEditFileTool(memory=memory, long_term_path=path)
+    manager = MemoryManager(_state(home))
+    read_tool = MemoryReadFileTool(memory_manager=manager)
+    edit_tool = MemoryEditFileTool(memory_manager=manager)
 
     assert read_tool.to_schema() == {
         "type": "function",
@@ -260,7 +302,7 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
     home = AgentHome(agent_home)
     home.initialize()
     provider = ScriptedFakeProvider()
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=WorkspaceJsonlSummaryStore(_state(home)),
         memory=WorkspaceFileMemoryStore(_state(home)),
@@ -269,7 +311,7 @@ async def test_manual_memory_task_returns_exact_zero_work_result_without_a_model
     )
     capture = capture_diagnostics()
 
-    result = await manager.run_manual()
+    result = await manager.run()
     capture.close()
 
     assert result == MemoryTaskResult(
@@ -287,7 +329,7 @@ async def test_wait_until_idle_returns_for_idle_and_current_memory_tasks(
     agent_home: Path,
 ) -> None:
     class SelfWaitingSummaries:
-        manager: MemoryManager | None = None
+        manager: Dream | None = None
 
         async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]:
             del cursor, limit
@@ -299,7 +341,7 @@ async def test_wait_until_idle_returns_for_idle_and_current_memory_tasks(
     home.initialize()
     state = _state(home)
     summaries = SelfWaitingSummaries()
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(ScriptedFakeProvider()),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
@@ -309,7 +351,7 @@ async def test_wait_until_idle_returns_for_idle_and_current_memory_tasks(
     summaries.manager = manager
 
     await manager.wait_until_idle()
-    result = await manager.run_manual()
+    result = await manager.run()
 
     assert result.status == "No pending summaries"
 
@@ -324,7 +366,7 @@ async def test_memory_task_uses_the_direct_memory_route_and_dictionary_messages(
     summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("The user prefers concise status reports.", NOW)
     router = _RecordingMemoryTaskRouter(_response("No stable update is needed."))
-    manager = MemoryManager(
+    manager = _dream(
         router=router,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
@@ -332,7 +374,7 @@ async def test_memory_task_uses_the_direct_memory_route_and_dictionary_messages(
         batch_size=10,
     )
 
-    result = await manager.run_manual()
+    result = await manager.run()
 
     assert result.status == "Processed 1 summary; Long-term Memory unchanged."
     assert len(router.calls) == 1
@@ -371,7 +413,7 @@ async def test_memory_task_direct_router_receives_tool_results_as_follow_up_dict
         first_response,
         _response("No stable update is needed."),
     )
-    manager = MemoryManager(
+    manager = _dream(
         router=router,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
@@ -379,7 +421,7 @@ async def test_memory_task_direct_router_receives_tool_results_as_follow_up_dict
         batch_size=10,
     )
 
-    result = await manager.run_manual()
+    result = await manager.run()
 
     assert result.status == "Processed 1 summary; Long-term Memory unchanged."
     assert len(router.calls) == 2
@@ -391,7 +433,11 @@ async def test_memory_task_direct_router_receives_tool_results_as_follow_up_dict
         "assistant",
         "tool",
     ]
-    assert follow_up_messages[2] == first_response.message.to_dict()
+    assert follow_up_messages[2] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [call.to_dict() for call in first_response.message.tool_calls],
+    }
     assert follow_up_messages[3] == {
         "role": "tool",
         "tool_call_id": "read-memory",
@@ -425,7 +471,7 @@ async def test_manual_memory_task_does_not_borrow_a_foreground_session_log(
         provider_factory=lambda _configuration: provider,
         clock=FakeClock(NOW),
     )
-    manager = MemoryManager(
+    manager = _dream(
         router=router,
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
@@ -433,7 +479,7 @@ async def test_manual_memory_task_does_not_borrow_a_foreground_session_log(
         batch_size=10,
     )
     with configured_process_logging(), session_log(state, SESSION_ID):
-        result = await manager.run_manual()
+        result = await manager.run()
 
     assert result.error == ErrorInfo(
         code="model_failed",
@@ -458,7 +504,7 @@ async def test_memory_task_without_an_edit_advances_the_summary_cursor(
     provider = ScriptedFakeProvider(
         completions=(_response("No stable Long-term Memory update is needed."),)
     )
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=memory,
@@ -466,7 +512,7 @@ async def test_memory_task_without_an_edit_advances_the_summary_cursor(
         batch_size=10,
     )
 
-    result = await manager.run_manual()
+    result = await manager.run()
 
     assert result == MemoryTaskResult(
         status="Processed 1 summary; Long-term Memory unchanged.",
@@ -522,7 +568,7 @@ async def test_memory_task_advances_the_summary_cursor_before_model_work(
             )
 
     provider = CursorObservingProvider(completions=(_response("No update needed."),))
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=memory,
@@ -530,7 +576,7 @@ async def test_memory_task_advances_the_summary_cursor_before_model_work(
         batch_size=10,
     )
 
-    result = await manager.run_manual()
+    result = await manager.run()
 
     assert result.cursor == 1
     assert await memory.read_summary_cursor() == 1
@@ -581,7 +627,7 @@ async def test_memory_task_preadvances_summary_cursor_before_exact_edit(
             _response("Long-term Memory updated."),
         )
     )
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
@@ -589,7 +635,7 @@ async def test_memory_task_preadvances_summary_cursor_before_exact_edit(
         batch_size=10,
     )
 
-    result = await manager.run_manual()
+    result = await manager.run()
 
     assert result == MemoryTaskResult(
         status="Processed 1 summary; Long-term Memory updated.",
@@ -634,7 +680,7 @@ async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
             ),
         )
     )
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
@@ -642,7 +688,7 @@ async def test_memory_task_catalog_denies_every_non_long_term_memory_path(
         batch_size=10,
     )
 
-    result = await manager.run_manual()
+    result = await manager.run()
 
     assert result == MemoryTaskResult(
         status="Memory Task failed.",
@@ -678,7 +724,6 @@ async def test_required_memory_edit_failure_keeps_the_advanced_summary_cursor(
         HOST_FILESYSTEM.atomic_replace_text(_target, _content)
 
     memory = WorkspaceFileMemoryStore(state, replace_text=fail_replace)
-    runtime_memory = RuntimeMemory("cached memory")
     provider = ScriptedFakeProvider(
         completions=(
             _response(
@@ -701,17 +746,16 @@ async def test_required_memory_edit_failure_keeps_the_advanced_summary_cursor(
             ),
         )
     )
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=memory,
         long_term_path=memory_path,
         batch_size=10,
-        runtime_memory=runtime_memory,
     )
     capture = capture_diagnostics()
 
-    result = await manager.run_manual()
+    result = await manager.run()
     capture.close()
 
     assert result == MemoryTaskResult(
@@ -725,7 +769,7 @@ async def test_required_memory_edit_failure_keeps_the_advanced_summary_cursor(
         ),
     )
     assert memory_path.read_bytes() == original_memory
-    assert runtime_memory.snapshot() == "cached memory"
+    assert manager._memory_manager.memory_snapshot() == original_memory.decode("utf-8")
     assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
     content = capture.text
     event_text = capture.event_text
@@ -787,7 +831,7 @@ async def test_unexpected_memory_tool_failure_is_logged_once_at_the_task_boundar
             ),
         )
     )
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=FailingMemoryStore(),
@@ -796,7 +840,7 @@ async def test_unexpected_memory_tool_failure_is_logged_once_at_the_task_boundar
     )
     capture = capture_diagnostics()
 
-    result = await manager.run_manual()
+    result = await manager.run()
     capture.close()
 
     assert result.error == ErrorInfo(
@@ -817,7 +861,7 @@ async def test_conversation_summary_read_failure_is_logged_only_at_memory_task_b
     home.initialize()
     summaries = WorkspaceJsonlSummaryStore(_state(home))
     summaries.path.write_text("PRIVATE INVALID SUMMARY STREAM", encoding="utf-8")
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(ScriptedFakeProvider()),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
@@ -826,7 +870,7 @@ async def test_conversation_summary_read_failure_is_logged_only_at_memory_task_b
     )
     capture = capture_diagnostics()
 
-    result = await manager.run_manual()
+    result = await manager.run()
     capture.close()
 
     assert result.error is not None
@@ -852,8 +896,6 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
     outside = agent_home.parent / "outside-memory.md"
     secret = "OUTSIDE SECRET MUST NOT REACH THE MODEL"
     outside.write_text(secret, encoding="utf-8")
-    memory_path.unlink()
-    memory_path.hardlink_to(outside)
     provider = ScriptedFakeProvider(
         completions=(
             _response(
@@ -869,15 +911,17 @@ async def test_restricted_memory_catalog_never_reads_through_an_external_hard_li
             _response("No update needed."),
         )
     )
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(state),
         long_term_path=memory_path,
         batch_size=10,
     )
+    memory_path.unlink()
+    memory_path.hardlink_to(outside)
 
-    result = await manager.run_manual()
+    result = await manager.run()
 
     assert result == MemoryTaskResult(
         status="Memory Task failed.",
@@ -941,7 +985,7 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
             return _response("No update needed.")
 
     provider = BlockingFirstProvider()
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
@@ -950,9 +994,9 @@ async def test_overlapping_manual_memory_task_is_rejected_without_a_second_model
     )
     capture = capture_diagnostics()
 
-    first_task = asyncio.create_task(manager.run_manual())
+    first_task = asyncio.create_task(manager.run())
     await first_started.wait()
-    overlapping = await manager.run_manual()
+    overlapping = await manager.run()
     release_first.set()
     first = await first_task
     capture.close()
@@ -1013,19 +1057,19 @@ async def test_overlapping_manual_memory_task_ignores_a_corrupt_cursor(
             return _response("No update needed.")
 
     provider = BlockingProvider()
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
         long_term_path=_state(home).long_term_memory_path,
         batch_size=10,
     )
-    first_task = asyncio.create_task(manager.run_manual())
+    first_task = asyncio.create_task(manager.run())
     await first_started.wait()
     (_state(home).memory_directory / ".cursor").write_bytes(b"corrupt\n")
 
     try:
-        overlapping = await manager.run_manual()
+        overlapping = await manager.run()
     finally:
         release_first.set()
         first = await first_task
@@ -1046,7 +1090,7 @@ async def test_dream_command_returns_exact_no_pending_output_without_a_model_cal
     home = AgentHome(agent_home)
     home.initialize()
     provider = ScriptedFakeProvider()
-    memory_manager = MemoryManager(
+    dream = _dream(
         router=_router(provider),
         summaries=WorkspaceJsonlSummaryStore(_state(home)),
         memory=WorkspaceFileMemoryStore(_state(home)),
@@ -1054,7 +1098,11 @@ async def test_dream_command_returns_exact_no_pending_output_without_a_model_cal
         batch_size=10,
     )
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_manager=memory_manager)
+        ManagementViewService(
+            home,
+            memory_manager=dream._memory_manager,
+            dream=dream,
+        )
     )
 
     result = await dispatcher.dispatch("/dream")
@@ -1115,7 +1163,7 @@ async def test_dream_command_renders_model_failure_after_advancing_cursor(
             ModelCallError(ErrorInfo(code="model_failed", message="Memory model failed.")),
         )
     )
-    memory_manager = MemoryManager(
+    dream = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=memory,
@@ -1123,7 +1171,11 @@ async def test_dream_command_renders_model_failure_after_advancing_cursor(
         batch_size=10,
     )
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_manager=memory_manager)
+        ManagementViewService(
+            home,
+            memory_manager=dream._memory_manager,
+            dream=dream,
+        )
     )
 
     result = await dispatcher.dispatch("/dream")
@@ -1134,7 +1186,7 @@ async def test_dream_command_renders_model_failure_after_advancing_cursor(
     )
     assert await memory.read_summary_cursor() == 1
 
-    retry = await memory_manager.run_manual()
+    retry = await dream.run()
 
     assert retry.status == "No pending summaries"
     assert retry.cursor == 1
@@ -1157,7 +1209,7 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
 
     memory = WorkspaceFileMemoryStore(_state(home), replace_text=fail_cursor)
     provider = ScriptedFakeProvider(completions=(_response("No durable update is needed."),))
-    memory_manager = MemoryManager(
+    dream = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=memory,
@@ -1165,7 +1217,11 @@ async def test_dream_reports_cursor_publication_failure_as_unprocessed(
         batch_size=10,
     )
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_manager=memory_manager)
+        ManagementViewService(
+            home,
+            memory_manager=dream._memory_manager,
+            dream=dream,
+        )
     )
     capture = capture_diagnostics()
 
@@ -1198,7 +1254,7 @@ async def test_dream_reports_corrupt_cursor_without_calling_the_model(
     home.initialize()
     (_state(home).memory_directory / ".cursor").write_bytes(cursor_bytes)
     provider = ScriptedFakeProvider()
-    memory_manager = MemoryManager(
+    dream = _dream(
         router=_router(provider),
         summaries=WorkspaceJsonlSummaryStore(_state(home)),
         memory=WorkspaceFileMemoryStore(_state(home)),
@@ -1206,7 +1262,11 @@ async def test_dream_reports_corrupt_cursor_without_calling_the_model(
         batch_size=10,
     )
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_manager=memory_manager)
+        ManagementViewService(
+            home,
+            memory_manager=dream._memory_manager,
+            dream=dream,
+        )
     )
 
     result = await dispatcher.dispatch("/dream")
@@ -1234,7 +1294,7 @@ async def test_memory_task_rejects_an_external_hard_linked_cursor(
     cursor_path = _state(home).memory_directory / ".cursor"
     cursor_path.hardlink_to(outside_cursor)
     provider = ScriptedFakeProvider()
-    manager = MemoryManager(
+    manager = _dream(
         router=_router(provider),
         summaries=summaries,
         memory=WorkspaceFileMemoryStore(_state(home)),
@@ -1242,7 +1302,7 @@ async def test_memory_task_rejects_an_external_hard_linked_cursor(
         batch_size=10,
     )
 
-    result = await manager.run_manual()
+    result = await manager.run()
 
     assert result == MemoryTaskResult(
         status="Memory Task failed.",

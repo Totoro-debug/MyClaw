@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal, Protocol
+from typing import Any, ClassVar, Literal, Protocol, cast
 
 from loguru import logger
 
@@ -31,6 +32,7 @@ from myclaw.tools.tool_gateway import (
 from myclaw.utils.validation import token_usage_validation_issue
 
 type AgentRunnerRoute = Literal["chat", "schedule"]
+type AgentRunnerModelRoute = Literal["chat", "schedule", "memory"]
 type AgentRunnerSegment = Literal["reasoning", "response"]
 type AgentRunnerFinishReason = Literal["completed", "failed", "cancelled", "max_iterations"]
 type AgentRunnerOutput = (
@@ -78,6 +80,20 @@ class AgentRunnerRouter(Protocol):
     async def complete(
         self,
         route: AgentRunnerRoute,
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None = None,
+    ) -> ModelResponse: ...
+
+
+class AgentRunnerMemoryRouter(ABC):
+    """Nominal non-streaming Router seam reserved for Memory Agent Runs."""
+
+    @abstractmethod
+    async def complete(
+        self,
+        route: Literal["memory"],
         *,
         messages: Sequence[dict[str, Any]],
         tools: Sequence[OpenAIToolSchema],
@@ -138,23 +154,29 @@ class _CallbackFailure(Exception):
 class AgentRunner:
     """Run bounded ReAct execution while owning only a Model Router reference."""
 
-    def __init__(self, model_router: AgentRunnerRouter) -> None:
+    def __init__(
+        self,
+        model_router: AgentRunnerRouter | AgentRunnerMemoryRouter,
+    ) -> None:
         self._model_router = model_router
 
     async def run(
         self,
         initial_messages: Sequence[dict[str, Any]],
         *,
-        model: AgentRunnerRoute,
+        model: AgentRunnerModelRoute,
         tool_gateway: ToolGateway | None,
         on_output: AgentRunnerOutputCallback,
         confirmation: ConfirmationRequester | None,
         externalize_result: Callable[[ToolResult], ToolResult] | None,
         cancel_requested: Callable[[], bool] | None,
         max_iterations: int,
+        stop_on_tool_error: bool = False,
+        propagate_unexpected_errors: bool = False,
+        tool_calls_as_tasks: bool = True,
     ) -> AgentRunnerResult:
-        if model not in {"chat", "schedule"}:
-            raise ValueError("Agent Runner model route must be chat or schedule")
+        if model not in {"chat", "schedule", "memory"}:
+            raise ValueError("Agent Runner model route must be chat, schedule, or memory")
         _validate_max_iterations(max_iterations)
 
         runtime_messages = deepcopy(list(initial_messages))
@@ -217,7 +239,8 @@ class AgentRunner:
                 usage["model_calls"] += 1
                 response: ModelResponse | None = None
                 if model == "chat":
-                    events = self._model_router.stream(
+                    router = cast(AgentRunnerRouter, self._model_router)
+                    events = router.stream(
                         model,
                         messages=deepcopy(runtime_messages),
                         tools=() if tool_gateway is None else tuple(tool_gateway.schemas),
@@ -256,8 +279,18 @@ class AgentRunner:
                     finally:
                         await _close_iterator(events)
                         events = None
-                else:
+                elif model == "memory":
+                    if not isinstance(self._model_router, AgentRunnerMemoryRouter):
+                        raise ValueError("Memory Agent Runs require a Memory Router")
                     response = await self._model_router.complete(
+                        model,
+                        messages=deepcopy(runtime_messages),
+                        tools=() if tool_gateway is None else tuple(tool_gateway.schemas),
+                        continuation=continuation,
+                    )
+                else:
+                    router = cast(AgentRunnerRouter, self._model_router)
+                    response = await router.complete(
                         model,
                         messages=deepcopy(runtime_messages),
                         tools=() if tool_gateway is None else tuple(tool_gateway.schemas),
@@ -303,6 +336,7 @@ class AgentRunner:
                                 tool_call,
                                 confirmation,
                                 state,
+                                as_task=tool_calls_as_tasks,
                             )
                         except BaseException as failure:
                             if not isinstance(failure, Exception) and state.result is not None:
@@ -334,6 +368,14 @@ class AgentRunner:
                     result = _externalize_tool_result(result, externalize)
                     _append_run_message(runtime_messages, increment, _tool_run_message(result))
                     pending_tool_calls.pop(0)
+                    if stop_on_tool_error and result.status != "success":
+                        return AgentRunnerResult(
+                            messages=increment,
+                            final_content="",
+                            usage=usage,
+                            finish_reason="failed",
+                            error=ErrorInfo("tool_failed", result.content),
+                        )
                     if is_cancel_requested():
                         return finish_cancelled(final_content="")
 
@@ -398,6 +440,8 @@ class AgentRunner:
                 pass
             raise
         except Exception:
+            if propagate_unexpected_errors:
+                raise
             await close_segment_for_error()
             if is_cancel_requested():
                 cancelled_content = "".join(partial_content)
@@ -437,7 +481,13 @@ async def _await_tool_call(
     tool_call: ModelToolCall,
     confirmation: ConfirmationRequester | None,
     state: _ToolCallState,
+    *,
+    as_task: bool,
 ) -> ToolResult:
+    if not as_task:
+        result = await gateway.call(tool_call, confirmation=confirmation)
+        state.result = result
+        return result
     operation = asyncio.create_task(gateway.call(tool_call, confirmation=confirmation))
     try:
         result = await operation
@@ -643,6 +693,7 @@ async def _close_iterator(iterator: AsyncIterator[object] | None) -> None:
 __all__ = [
     "AgentRunner",
     "AgentRunnerFinishReason",
+    "AgentRunnerMemoryRouter",
     "AgentRunnerOutput",
     "AgentRunnerOutputCallback",
     "AgentRunnerResponseSegmentEnd",

@@ -18,7 +18,8 @@ from myclaw.management.service import (
     RuntimeStatusInput,
     RuntimeStatusService,
 )
-from myclaw.memory.memory_task import WorkspaceFileMemoryStore
+from myclaw.memory.manager import MemoryManager
+from myclaw.memory.store import WorkspaceFileMemoryStore
 from myclaw.session.session import Session
 from tests.fixtures.diagnostic_capture import configured_process_logging
 
@@ -293,7 +294,7 @@ async def test_memory_command_returns_renderable_complete_disk_text(
     )
     state.long_term_memory_path.write_text(content, encoding="utf-8")
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
+        ManagementViewService(home, memory_manager=WorkspaceFileMemoryStore(state))
     )
 
     result = await dispatcher.dispatch("/memory")
@@ -314,7 +315,7 @@ async def test_memory_command_renders_safe_persistence_failure(
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     state.long_term_memory_path.unlink()
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
+        ManagementViewService(home, memory_manager=WorkspaceFileMemoryStore(state))
     )
     with configured_process_logging():
         result = await dispatcher.dispatch("/memory")
@@ -459,7 +460,7 @@ async def test_config_and_memory_commands_bypass_conversation_and_provider(
     (agent_home / "config.toml").write_text(CONFIG_CONTENT, encoding="utf-8")
     state.long_term_memory_path.write_text("current memory\n", encoding="utf-8")
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
+        ManagementViewService(home, memory_manager=MemoryManager(state))
     )
     conversation = ConversationProviderSpy()
 

@@ -17,7 +17,7 @@ from myclaw.management.service import (
     SessionListingEntry,
     SessionListingReport,
 )
-from myclaw.memory.memory_task import MemoryTaskResult
+from myclaw.memory.dream import DreamResult
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 
@@ -56,7 +56,7 @@ class ManagementPort(Protocol):
 
     async def memory_view(self) -> str: ...
 
-    async def dream(self) -> MemoryTaskResult: ...
+    async def dream(self) -> DreamResult: ...
 
     async def resumable_listing(self) -> SessionListingReport: ...
 

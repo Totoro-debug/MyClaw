@@ -7,21 +7,21 @@ from croniter import croniter  # type: ignore[import-untyped]
 from loguru import logger
 
 from myclaw.logging.session import without_session_log
-from myclaw.memory.memory_task import MemoryManager
+from myclaw.memory.dream import Dream
 from myclaw.utils.scheduler import SchedulerClock
 
 
 class MemoryTaskScheduler:
-    """Run one Memory Manager on configured local-time cron boundaries."""
+    """Run one Dream on configured local-time cron boundaries."""
 
     def __init__(
         self,
         *,
-        manager: MemoryManager,
+        dream: Dream,
         schedule: str,
         clock: SchedulerClock,
     ) -> None:
-        self._manager = manager
+        self._dream = dream
         self._schedule = schedule
         self._clock = clock
         self._loop_task: asyncio.Task[None] | None = None
@@ -84,6 +84,17 @@ class MemoryTaskScheduler:
             if not run_task.done():
                 run_task.cancel()
 
+    async def abort_and_wait(self) -> None:
+        """Cancel and drain every task owned by an abandoned scheduler."""
+        self.abort()
+        loop_task = self._loop_task
+        running = tuple(self._run_tasks)
+        owned = (() if loop_task is None else (loop_task,)) + running
+        if owned:
+            await asyncio.gather(*owned, return_exceptions=True)
+        self._loop_task = None
+        self._run_tasks.clear()
+
     async def _run(self) -> None:
         timezone = self._timezone
         if timezone is None:
@@ -98,7 +109,7 @@ class MemoryTaskScheduler:
 
     async def _trigger(self) -> None:
         try:
-            await self._manager.run_periodic()
+            await self._dream.run_periodic()
         except Exception as error:
             current = asyncio.current_task()
             if current is not None and current.cancelling():

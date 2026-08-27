@@ -15,6 +15,8 @@ from myclaw.config.config import ConfigLoader
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import SessionListingEntry
 from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
+from myclaw.memory.dream import Dream
+from myclaw.memory.memory_scheduler import MemoryTaskScheduler
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelContinuation,
@@ -463,7 +465,7 @@ async def test_abort_interrupts_an_in_progress_normal_close_before_final_session
     closing = asyncio.create_task(runtime.close())
     await close_started.wait()
 
-    runtime.abort()
+    await runtime.abort()
     assert runtime._lifetime.close_task is not None
     assert runtime._lifetime.close_task.cancelling()
     release_close.set()
@@ -511,6 +513,135 @@ async def test_normal_close_waits_for_an_in_progress_dream_before_closing_the_ro
 
 
 @pytest.mark.asyncio
+async def test_generation_replacement_aborts_old_dream_and_scheduler(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = GatedMemoryProvider()
+    host = _host(agent_home, workspace, provider)
+    await host.start()
+    old = host.generation
+    summaries = WorkspaceJsonlSummaryStore(old.session.workspace_state)
+    await summaries.append("Pending summary for replacement.", NOW)
+    dream_task = asyncio.create_task(host.management_dispatcher.dispatch("/dream"))
+
+    await asyncio.wait_for(provider.memory_started.wait(), timeout=2)
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Replacement target")
+    target.close()
+
+    result = await host.management_dispatcher.resume(target.session_id, force=True)
+
+    assert result.resumed_session_id == target.session_id
+    assert dream_task.done()
+    assert old._dream._task is None
+    assert old._dream._closed is True
+    assert old._memory_scheduler._active is not None
+    scheduler = old._memory_scheduler._active
+    assert scheduler._loop_task is None
+    assert not scheduler._run_tasks
+    with pytest.raises(asyncio.CancelledError):
+        await dream_task
+
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_abort_drains_active_dream_and_memory_scheduler(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = GatedMemoryProvider()
+    host = _host(agent_home, workspace, provider)
+    await host.start()
+    runtime = host.generation
+    summaries = WorkspaceJsonlSummaryStore(runtime.session.workspace_state)
+    await summaries.append("Pending summary for direct abort.", NOW)
+    dream_task = asyncio.create_task(runtime.management_dispatcher.dispatch("/dream"))
+    await asyncio.wait_for(provider.memory_started.wait(), timeout=2)
+
+    await runtime.abort()
+
+    assert dream_task.done()
+    assert runtime._dream._task is None
+    scheduler = runtime._memory_scheduler._active
+    assert scheduler is not None
+    assert scheduler._loop_task is None
+    assert not scheduler._run_tasks
+    with pytest.raises(asyncio.CancelledError):
+        await dream_task
+
+
+@pytest.mark.asyncio
+async def test_generation_replacement_finishes_atomically_when_waiter_is_cancelled(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Replacement committed after caller cancellation")
+    target.close()
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+    original_drain = runtime_module.PreparedRuntime._drain_aborted_memory
+
+    async def gated_drain(active: runtime_module.PreparedRuntime) -> None:
+        await original_drain(active)
+        if active is old:
+            drain_started.set()
+            await release_drain.wait()
+
+    monkeypatch.setattr(runtime_module.PreparedRuntime, "_drain_aborted_memory", gated_drain)
+    replacement = asyncio.create_task(
+        host.management_dispatcher.resume(target.session_id, force=True)
+    )
+    await asyncio.wait_for(drain_started.wait(), timeout=2)
+
+    replacement.cancel()
+    await asyncio.sleep(0)
+    assert not replacement.done()
+    release_drain.set()
+    with pytest.raises(asyncio.CancelledError):
+        await replacement
+
+    assert host.generation is not old
+    assert host.generation.session_id == target.session_id
+    assert not host.generation._lifetime.aborted
+    await host.close()
+
+
+def test_runtime_composition_failure_closes_a_constructed_dream(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[object] = []
+    original_dream = Dream
+
+    def recording_dream(*args: object, **kwargs: object) -> Dream:
+        dream = original_dream(*args, **kwargs)  # type: ignore[arg-type]
+        created.append(dream)
+        return dream
+
+    def fail_wiring(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("post-Dream wiring failed")
+
+    monkeypatch.setitem(runtime_module.__dict__, "Dream", recording_dream)
+    monkeypatch.setattr(runtime_module, "_preflight_skill_context_budget", fail_wiring)
+
+    with pytest.raises(RuntimeError, match="post-Dream wiring failed"):
+        _host(agent_home, workspace, RuntimeProvider(()))
+
+    assert len(created) == 1
+    dream = cast(Dream, created[0])
+    assert dream._closed is True
+    assert dream._task is None
+
+
+@pytest.mark.asyncio
 async def test_pending_only_resume_replaces_every_generation_owned_component(
     agent_home: Path,
     workspace: Path,
@@ -523,7 +654,6 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
         old.schedule_service,
         old._schedule_store,
         old._router,
-        old._runtime_memory,
         old._memory_manager,
         old._memory_scheduler,
         old.agent_loop._tool_gateway,
@@ -553,7 +683,6 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
         replacement.schedule_service,
         replacement._schedule_store,
         replacement._router,
-        replacement._runtime_memory,
         replacement._memory_manager,
         replacement._memory_scheduler,
         replacement.agent_loop._tool_gateway,
@@ -567,6 +696,11 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
         new is not previous
         for new, previous in zip(replacement_components, old_components, strict=True)
     )
+    assert old._dream._task is None
+    assert old._dream._closed is True
+    assert old._memory_scheduler._active is not None
+    assert isinstance(old._memory_scheduler._active, MemoryTaskScheduler)
+    assert old._memory_scheduler._active._closed is True
     assert all(
         new_tool is not old_tool
         for new_tool, old_tool in zip(replacement_components[-1], old_components[-1], strict=True)

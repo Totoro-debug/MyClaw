@@ -2,31 +2,34 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Callable, Sequence
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Protocol
 
 from myclaw.agent.prompts import conversation_summary_input, conversation_summary_prompt
-from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.records import SummaryEntry
+from myclaw.memory.store import SummaryStore, WorkspaceJsonlSummaryStore
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
 from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session
 from myclaw.tools.base import OpenAIToolSchema
-from myclaw.utils.host_filesystem import HOST_FILESYSTEM
-from myclaw.utils.time import format_rfc3339_milliseconds
 
-type AtomicReplaceBytes = Callable[[Path, bytes], None]
 type SummaryProjection = Callable[
     [Sequence[dict[str, Any]]],
     list[dict[str, Any]],
+]
+
+__all__ = [
+    "ConversationSummaryManager",
+    "SummaryAppender",
+    "SummaryModelRouter",
+    "SummaryStore",
+    "WorkspaceJsonlSummaryStore",
 ]
 
 
@@ -42,97 +45,10 @@ class SummaryModelRouter(Protocol):
     ) -> ModelResponse: ...
 
 
-class SummaryStore(Protocol):
-    """Append and read the ordered Conversation Summary stream."""
+class SummaryAppender(Protocol):
+    """Append summaries through the owning Memory Manager or store adapter."""
 
-    async def append(self, content: str, timestamp: datetime) -> SummaryEntry: ...
-
-    async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]: ...
-
-
-class WorkspaceJsonlSummaryStore:
-    """Persist Conversation Summary entries in one Workspace State."""
-
-    def __init__(
-        self,
-        workspace_state: WorkspaceState,
-        *,
-        replace_bytes: AtomicReplaceBytes = HOST_FILESYSTEM.atomic_replace_bytes,
-    ) -> None:
-        self.workspace_state = workspace_state
-        self._state_root = workspace_state.path.resolve(strict=True)
-        self._memory_directory = workspace_state.memory_directory
-        self.path = workspace_state.memory_directory / "summary.jsonl"
-        self._replace_bytes = replace_bytes
-        self._lock = asyncio.Lock()
-
-    async def append(self, content: str, timestamp: datetime) -> SummaryEntry:
-        async with self._lock:
-            next_index = len(self._entries()) + 1
-            entry = SummaryEntry(index=next_index, timestamp=timestamp, content=content)
-            self._append_exact(entry)
-            return entry
-
-    async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]:
-        async with self._lock:
-            return self._entries()[cursor : cursor + limit]
-
-    def _append_exact(self, entry: SummaryEntry) -> None:
-        entries = self._entries()
-        if entry.index <= len(entries):
-            if entries[entry.index - 1].to_dict() != entry.to_dict():
-                raise ValueError("summary index already contains a different record")
-            return
-        if entry.index != len(entries) + 1:
-            raise ValueError("summary index must be contiguous")
-        existing = self.path.read_bytes() if self.path.exists() else b""
-        self._replace_bytes(self.path, existing + entry.to_json_line().encode("utf-8"))
-        HOST_FILESYSTEM.require_owned_regular_file(self.path, within=self._state_root)
-
-    def _entries(self) -> tuple[SummaryEntry, ...]:
-        self._require_memory_directory()
-        if not self.path.exists() and not self.path.is_symlink():
-            return ()
-        HOST_FILESYSTEM.require_owned_regular_file(self.path, within=self._state_root)
-        content = self.path.read_bytes()
-        if content and not content.endswith(b"\n"):
-            raise ValueError("summary stream must contain complete JSONL records")
-        entries: list[SummaryEntry] = []
-        for expected_index, line in enumerate(content.decode("utf-8").splitlines(), start=1):
-            loaded: object = json.loads(line)
-            if not isinstance(loaded, dict) or set(loaded) != {
-                "index",
-                "timestamp",
-                "content",
-            }:
-                raise ValueError("summary record has an invalid schema")
-            index = loaded["index"]
-            timestamp = loaded["timestamp"]
-            summary_content = loaded["content"]
-            if isinstance(index, bool) or not isinstance(index, int):
-                raise ValueError("summary index must be an integer")
-            if index != expected_index:
-                raise ValueError("summary indexes must be contiguous from 1")
-            if not isinstance(timestamp, str):
-                raise ValueError("summary timestamp must be a string")
-            if not isinstance(summary_content, str):
-                raise ValueError("summary content must be a string")
-            parsed_timestamp = datetime.fromisoformat(timestamp)
-            if format_rfc3339_milliseconds(parsed_timestamp) != timestamp:
-                raise ValueError("summary timestamp must use canonical RFC 3339 milliseconds")
-            entries.append(
-                SummaryEntry(
-                    index=index,
-                    timestamp=parsed_timestamp,
-                    content=summary_content,
-                )
-            )
-        return tuple(entries)
-
-    def _require_memory_directory(self) -> Path:
-        return HOST_FILESYSTEM.require_owned_directory(
-            self._memory_directory, within=self._state_root
-        )
+    async def append_summary(self, content: str, timestamp: datetime) -> SummaryEntry: ...
 
 
 class ConversationSummaryManager:
@@ -142,7 +58,7 @@ class ConversationSummaryManager:
         self,
         *,
         provider: SummaryModelRouter,
-        summaries: SummaryStore,
+        summaries: SummaryAppender,
         route_context_window: int,
         route_max_output: int,
         consolidation_message_threshold: int,
@@ -244,7 +160,7 @@ class ConversationSummaryManager:
         session.update_metadata(usage_delta={"model_calls": 1, **response.usage.to_dict()})
         try:
             new_last_consolidated = session.last_consolidated + cutoff
-            await self._summaries.append(
+            await self._summaries.append_summary(
                 content=response.message.content,
                 timestamp=self._persisted_now(),
             )

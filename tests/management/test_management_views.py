@@ -14,7 +14,8 @@ from myclaw.management.service import (
     RuntimeStatusInput,
     RuntimeStatusService,
 )
-from myclaw.memory.memory_task import WorkspaceFileMemoryStore
+from myclaw.memory.manager import MemoryManager
+from myclaw.memory.store import WorkspaceFileMemoryStore
 from myclaw.session.session import Session
 
 CONFIG_WITH_PLAINTEXT_KEYS = """# User Configuration remains source-preserved.
@@ -113,7 +114,7 @@ async def test_memory_view_reads_complete_latest_utf8_content_on_every_call(
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     memory_path = state.long_term_memory_path
     memory_path.write_text("initial memory\n", encoding="utf-8")
-    service = ManagementViewService(home, memory_store=WorkspaceFileMemoryStore(state))
+    service = ManagementViewService(home, memory_manager=MemoryManager(state))
 
     initial = await service.memory_view()
     updated_content = "# Long-term Memory\n\n\u7528\u6237\u504f\u597d\n" + (
@@ -139,7 +140,7 @@ async def test_memory_view_converts_decode_failure_to_safe_persistence_error(
 
     with pytest.raises(ManagementError) as raised:
         await ManagementViewService(
-            home, memory_store=WorkspaceFileMemoryStore(state)
+            home, memory_manager=WorkspaceFileMemoryStore(state)
         ).memory_view()
 
     assert (raised.value.error.code, raised.value.error.message) == (
@@ -163,7 +164,7 @@ async def test_memory_view_converts_read_failure_to_safe_persistence_error(
 
     with pytest.raises(ManagementError) as raised:
         await ManagementViewService(
-            home, memory_store=WorkspaceFileMemoryStore(state)
+            home, memory_manager=WorkspaceFileMemoryStore(state)
         ).memory_view()
 
     assert (raised.value.error.code, raised.value.error.message) == (
