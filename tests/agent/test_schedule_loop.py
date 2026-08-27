@@ -27,7 +27,6 @@ from myclaw.provider.models import (
 )
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
-from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import ManualSkillInvocation, SkillSnapshot
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
@@ -268,7 +267,18 @@ def _loop(
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=tmp_path / "agent-home")
     foreground = Session.create(state, now=lambda: NOW)
-    service = ScheduleService(store=WorkspaceScheduleStore(state), clock=_Clock())
+    async def execute_user_job(job: ScheduleJob) -> None:
+        del job
+
+    async def execute_dream() -> object:
+        return None
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=_Clock(),
+        execute_user_job=execute_user_job,
+        execute_dream=execute_dream,
+    )
     selected_task_framer = (
         DeterministicTaskFramingEvaluator() if task_framer is None else task_framer
     )
@@ -719,7 +729,18 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=tmp_path / "agent-home")
     foreground = Session.create(state, now=lambda: NOW)
-    service = ScheduleService(store=WorkspaceScheduleStore(state), clock=_Clock())
+    async def execute_user_job(job: ScheduleJob) -> None:
+        del job
+
+    async def execute_dream() -> object:
+        return None
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=_Clock(),
+        execute_user_job=execute_user_job,
+        execute_dream=execute_dream,
+    )
     router = _ScheduleToolOverlapRouter(service)
     loop = AgentLoop(
         workspace=workspace,

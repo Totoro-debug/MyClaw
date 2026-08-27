@@ -10,7 +10,12 @@ import pytest
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.schedule.model import JobSchedule, ScheduleJob
-from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
+from myclaw.schedule.service import (
+    DreamExecutor,
+    ScheduleJobExecutionError,
+    ScheduleJobExecutor,
+    ScheduleService,
+)
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResult
@@ -35,6 +40,28 @@ def _state(workspace: Path, agent_home: Path) -> WorkspaceState:
     return state
 
 
+async def _noop_user_job(job: ScheduleJob) -> None:
+    del job
+
+
+async def _noop_dream() -> object:
+    return None
+
+
+def _service(
+    state: WorkspaceState,
+    *,
+    execute_user_job: ScheduleJobExecutor = _noop_user_job,
+    execute_dream: DreamExecutor = _noop_dream,
+) -> ScheduleService:
+    return ScheduleService(
+        workspace_state=state,
+        clock=_Clock(),
+        execute_user_job=execute_user_job,
+        execute_dream=execute_dream,
+    )
+
+
 async def _wait_until(predicate: object) -> None:
     if not callable(predicate):
         raise TypeError("predicate must be callable")
@@ -51,8 +78,7 @@ async def test_schedule_service_facade_preserves_user_job_management(
     agent_home: Path,
 ) -> None:
     state = _state(workspace, agent_home)
-    store = WorkspaceScheduleStore(state)
-    service = ScheduleService(store=store, clock=_Clock())
+    service = _service(state)
     job = ScheduleJob(
         job_id="550e8400-e29b-41d4-a716-446655440000",
         message="Review the project.",
@@ -75,7 +101,7 @@ async def test_schedule_tool_guard_is_task_local_and_list_remove_stay_available(
     identity = workspace
     state = WorkspaceState(identity)
     state.initialize(agent_home_root=agent_home)
-    service = ScheduleService(store=WorkspaceScheduleStore(state), clock=_Clock())
+    service = _service(state)
     foreground = ToolGateway(workspace=identity, schedule_service=service)
     scheduled = ToolGateway(workspace=identity, schedule_service=service)
     barrier = asyncio.Event()
@@ -166,12 +192,12 @@ async def test_schedule_service_start_rejects_unbound_callback_before_reservatio
         updated_at_ms=1,
     )
     await store.add_user_job(job)
-    service = ScheduleService(store=store, clock=_Clock())
+    service = _service(state)
+    service.start()
+    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
+    await service.close()
 
-    with pytest.raises(RuntimeError, match="on_schedule_job"):
-        service.start()
-
-    assert await store.snapshot() == (job,)
+    assert await service._store.snapshot() == (job,)
     assert service.status_snapshot().active_job_count == 0
 
 
@@ -199,13 +225,13 @@ async def test_schedule_service_maps_structured_callback_failure_without_leaking
             ErrorInfo(code="model_failed", message="safe model failure")
         )
 
-    service = ScheduleService(store=store, clock=_Clock(), on_schedule_job=callback)
+    service = _service(state, execute_user_job=callback)
     service.start()
     await started.wait()
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
     await service.close()
 
-    saved = (await store.snapshot())[0]
+    saved = (await service._store.snapshot())[0]
     assert saved.state.last_status == "error"
     assert saved.state.last_error == "safe model failure"
 
@@ -232,7 +258,7 @@ async def test_schedule_service_callback_cancellation_leaves_job_pending(
         started.set()
         raise asyncio.CancelledError()
 
-    service = ScheduleService(store=store, clock=_Clock(), on_schedule_job=callback)
+    service = _service(state, execute_user_job=callback)
     service.start()
     await started.wait()
     await _wait_until(lambda: service.status_snapshot().active_job_count == 0)

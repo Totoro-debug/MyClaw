@@ -39,8 +39,8 @@ from myclaw.provider.models import (
     ReasoningEffort,
     TextDelta,
 )
+from myclaw.schedule.model import JobSchedule
 from myclaw.schedule.service import ScheduleService
-from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
@@ -223,6 +223,40 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
 
 
 @pytest.mark.asyncio
+async def test_runtime_persists_the_configured_dream_schedule_with_startup_timezone(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    monkeypatch.setattr(runtime_module, "get_localzone_name", lambda: "Asia/Shanghai")
+
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=unexpected_provider_factory,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    try:
+        jobs = await runtime.schedule_service._store.snapshot()
+        callback = runtime.schedule_service._execute_dream
+
+        assert len(jobs) == 1
+        assert jobs[0].job_id == "dream"
+        assert jobs[0].source == "system"
+        assert jobs[0].schedule == JobSchedule.cron("15 * * * *", "Asia/Shanghai")
+        assert await runtime.schedule_service.public_snapshot() == ()
+        assert getattr(callback, "__self__", None) is runtime._dream
+        assert getattr(callback, "__func__", None) is runtime._dream.run.__func__
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_injected_skill_catalog_root_is_the_only_confirmation_free_skill_root(
     agent_home: Path,
     workspace: Path,
@@ -377,9 +411,18 @@ def _always_skill_budget_fixture(
         skill_snapshot=snapshot,
     )
     context_builder.set_clock(lambda: NOW)
+
+    async def execute_user_job(_job: object) -> None:
+        return None
+
+    async def execute_dream() -> object:
+        return None
+
     schedule_service = ScheduleService(
-        store=WorkspaceScheduleStore(workspace_state),
+        workspace_state=workspace_state,
         clock=AsyncioSchedulerClock(now=lambda: NOW),
+        execute_user_job=execute_user_job,
+        execute_dream=execute_dream,
     )
     gateway = ToolGateway(
         workspace=runtime_workspace,

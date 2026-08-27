@@ -18,6 +18,8 @@ ScheduleKind = Literal["at", "every", "cron"]
 JobSource = Literal["user", "system"]
 JobStatus = Literal["ok", "error"]
 
+DREAM_JOB_ID = "dream"
+
 _JOB_FIELDS = frozenset(
     {
         "job_id",
@@ -181,9 +183,12 @@ class ScheduleJob:
     def __post_init__(self) -> None:
         if not isinstance(self.job_id, str):
             raise ValueError("job_id must be a string")
-        require_uuid4_string(self.job_id, field="job_id")
         if not isinstance(self.source, str) or self.source not in {"user", "system"}:
             raise ValueError("source must be user or system")
+        if self.source == "user":
+            require_uuid4_string(self.job_id, field="job_id")
+        elif self.job_id != DREAM_JOB_ID:
+            raise ValueError("system job_id must be the reserved dream identity")
         if not isinstance(self.message, str):
             raise ValueError("message must be a string")
         if not self.message or self.message != self.message.strip():
@@ -192,6 +197,8 @@ class ScheduleJob:
             raise ValueError("message must not exceed 20000 characters")
         if not isinstance(self.schedule, JobSchedule):
             raise ValueError("schedule must be a JobSchedule")
+        if self.source == "system" and self.schedule.kind == "at":
+            raise ValueError("system Schedule Jobs must be recurring")
         if not isinstance(self.state, ScheduleJobState):
             raise ValueError("state must be a ScheduleJobState")
         require_nonnegative_int(self.created_at_ms, field="created_at_ms")
@@ -341,6 +348,7 @@ def _parse_canonical_rfc3339_milliseconds(value: str, *, field: str) -> datetime
 
 
 __all__ = [
+    "DREAM_JOB_ID",
     "JobSchedule",
     "JobSource",
     "JobStatus",

@@ -74,10 +74,10 @@ class BlockingSchedulerClock:
 
 class FailingSchedulerClock:
     def now(self) -> datetime:
-        raise RuntimeError("Schedule Service clock failed to start")
+        return NOW
 
     def monotonic(self) -> float:
-        return 0.0
+        raise RuntimeError("Schedule Service clock failed to start")
 
     async def sleep(self, seconds: float) -> None:
         del seconds
@@ -209,7 +209,6 @@ async def test_scheduler_preflight_failure_starts_no_runtime_tasks(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    memory_clock = BlockingSchedulerClock()
     runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
@@ -217,7 +216,6 @@ async def test_scheduler_preflight_failure_starts_no_runtime_tasks(
         provider_factory=lambda _configuration: ScriptedFakeProvider(),
         now=lambda: NOW,
         new_uuid=uuid4,
-        memory_scheduler_clock=memory_clock,
         schedule_scheduler_clock=FailingSchedulerClock(),
     )
     baseline = asyncio.all_tasks()
@@ -227,7 +225,6 @@ async def test_scheduler_preflight_failure_starts_no_runtime_tasks(
             await runtime.run(input_reader=UnusedInput(), writer=SilentWriter())
         await asyncio.sleep(0)
 
-        assert not memory_clock.sleep_started.is_set()
         assert asyncio.all_tasks() == baseline
     finally:
         await runtime.close()
@@ -241,7 +238,6 @@ async def test_start_preflight_failure_requires_no_async_cleanup(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    memory_clock = BlockingSchedulerClock()
     runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
@@ -249,7 +245,6 @@ async def test_start_preflight_failure_requires_no_async_cleanup(
         provider_factory=lambda _configuration: ScriptedFakeProvider(),
         now=lambda: NOW,
         new_uuid=uuid4,
-        memory_scheduler_clock=memory_clock,
         schedule_scheduler_clock=FailingSchedulerClock(),
     )
     baseline = asyncio.all_tasks()
@@ -261,19 +256,53 @@ async def test_start_preflight_failure_requires_no_async_cleanup(
         with session_log(state, ambient_session_id):
             with pytest.raises(RuntimeError, match="Schedule Service clock failed to start"):
                 await runtime.start()
-        assert not memory_clock.sleep_started.is_set()
-        assert not memory_clock.sleep_stopped.is_set()
     finally:
         await runtime.close()
         log_capture.close()
 
-    assert not memory_clock.sleep_stopped.is_set()
     assert asyncio.all_tasks() == baseline
     assert not (state.logs_directory / f"{ambient_session_id}.log").exists()
     content = log_capture.text
     assert content.count(" ERROR ") == 1
     marker = "Runtime validation failed type=RuntimeError"
     assert content.count(marker) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_activation_failure_aborts_all_owned_tasks(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: ScriptedFakeProvider(),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    baseline = asyncio.all_tasks()
+
+    def fail_schedule_activation() -> None:
+        raise RuntimeError("Schedule Service activation failed")
+
+    monkeypatch.setattr(runtime.schedule_service, "_activate_prepared", fail_schedule_activation)
+
+    with pytest.raises(RuntimeError, match="Schedule Service activation failed"):
+        await runtime.start()
+    await asyncio.sleep(0)
+
+    assert runtime.agent_loop._consumer_task is None
+    assert runtime.schedule_service._loop_task is None
+    assert runtime.schedule_service._run_tasks == set()
+    assert runtime.schedule_service._terminal_commit_tasks == set()
+    assert runtime._dream._aborted is True
+    assert runtime._router._aborted is True
+    assert asyncio.all_tasks() == baseline
 
 
 @pytest.mark.asyncio
@@ -577,7 +606,6 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     provider = InterruptibleProvider()
-    memory_clock = BlockingSchedulerClock()
     scheduled_clock = BlockingSchedulerClock()
     runtime = prepare_runtime(
         agent_home=home,
@@ -586,7 +614,6 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
         provider_factory=lambda _configuration: provider,
         now=lambda: NOW,
         new_uuid=uuid4,
-        memory_scheduler_clock=memory_clock,
         schedule_scheduler_clock=scheduled_clock,
         task_framer=DeterministicTaskFramingEvaluator(),
     )
@@ -594,12 +621,10 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
     log_capture = capture_diagnostics()
     running = asyncio.create_task(runtime.run(input_reader=input_reader, writer=SilentWriter()))
     await provider.started[0].wait()
-    await memory_clock.sleep_started.wait()
     await scheduled_clock.sleep_started.wait()
     try:
         await runtime.control.cancel_active_run()
         await input_reader.idle.wait()
-        assert not memory_clock.sleep_stopped.is_set()
         assert not scheduled_clock.sleep_stopped.is_set()
 
         await runtime.control.cancel_active_run()
@@ -611,7 +636,6 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
         await runtime.control.cancel_active_run()
         await input_reader.waiting_for_exit.wait()
         assert running.cancelling() == 0
-        assert not memory_clock.sleep_stopped.is_set()
         assert not scheduled_clock.sleep_stopped.is_set()
 
         input_reader.release_exit.set()
@@ -624,7 +648,6 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
 
     assert provider.stopped[0].is_set()
     assert provider.stopped[1].is_set()
-    assert memory_clock.sleep_stopped.is_set()
     assert scheduled_clock.sleep_stopped.is_set()
     assert provider.closed
     content = log_capture.text

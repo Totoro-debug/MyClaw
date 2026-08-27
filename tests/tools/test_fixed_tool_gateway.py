@@ -9,7 +9,6 @@ import pytest
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.service import ScheduleService
-from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
@@ -42,11 +41,17 @@ def _gateway(
     return ToolGateway(
         workspace=identity,
         schedule_service=ScheduleService(
-            store=WorkspaceScheduleStore(state),
+            workspace_state=state,
             clock=_Clock(),
+            execute_user_job=_noop,
+            execute_dream=_noop,
         ),
         skill_root=skill_root,
     )
+
+
+async def _noop(*args: object) -> None:
+    del args
 
 
 def _names(gateway: ToolGateway) -> list[str]:

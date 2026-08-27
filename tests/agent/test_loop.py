@@ -33,8 +33,8 @@ from myclaw.provider.models import (
     ReasoningDelta,
     TextDelta,
 )
+from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleService
-from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
@@ -327,7 +327,18 @@ def _runtime(
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home.path)
     session = Session.create(state, now=_Clock().now)
-    schedule = ScheduleService(store=WorkspaceScheduleStore(state), clock=_Clock())
+    async def execute_user_job(job: ScheduleJob) -> None:
+        del job
+
+    async def execute_dream() -> object:
+        return None
+
+    schedule = ScheduleService(
+        workspace_state=state,
+        clock=_Clock(),
+        execute_user_job=execute_user_job,
+        execute_dream=execute_dream,
+    )
     selected_context_preparer = _context if context_preparer is None else context_preparer
     selected_context_preparer_with_blackboard = context_preparer_with_blackboard
     selected_context_preparer_with_invocation = context_preparer_with_invocation

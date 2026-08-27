@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,15 +9,16 @@ from uuid import uuid4
 import pytest
 
 import myclaw.agent.runtime as runtime_module
+from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import InboundMessage, OutboundMessage
 from myclaw.agent.runtime import RuntimeHost
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import SessionListingEntry
 from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
 from myclaw.memory.dream import Dream
-from myclaw.memory.memory_scheduler import MemoryTaskScheduler
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelContinuation,
@@ -25,12 +27,14 @@ from myclaw.provider.models import (
     ModelUsage,
     ReasoningEffort,
 )
+from myclaw.schedule.service import ScheduleService
+from myclaw.schedule.store import ScheduleStateError
 from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillLoader, SkillSnapshot
 from myclaw.terminal.conversation import TerminalConversationApp
 from myclaw.tools.base import OpenAIToolSchema
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import FakeClock
+from tests.fixtures import FakeClock, ScriptedFakeProvider
 from tests.runtime_bus import collect_foreground_outbound
 from tests.test_runtime_active_session import RuntimeProvider
 
@@ -227,6 +231,83 @@ async def test_runtime_host_refreshes_skill_snapshot_across_generation_replaceme
 
 
 @pytest.mark.asyncio
+async def test_runtime_rejects_conflicting_dream_state_before_agent_loop_construction(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=home.path)
+    state.schedule_path.write_text(
+        json.dumps(
+            [
+                {
+                    "job_id": "dream",
+                    "source": "user",
+                    "message": "Internal Dream schedule.",
+                    "schedule": {
+                        "kind": "every",
+                        "at_time": None,
+                        "every_seconds": 60,
+                        "cron_expr": None,
+                        "timezone": None,
+                    },
+                    "state": {
+                        "last_finished_at_ms": None,
+                        "last_status": None,
+                        "last_error": None,
+                    },
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1,
+                }
+            ],
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    created_dreams: list[Dream] = []
+    real_dream = Dream
+
+    def recording_dream(**kwargs: object) -> Dream:
+        dream = real_dream(**kwargs)  # type: ignore[arg-type]
+        created_dreams.append(dream)
+        return dream
+
+    agent_loop_constructions = 0
+    real_agent_loop = AgentLoop
+
+    def recording_agent_loop(*args: object, **kwargs: object) -> object:
+        nonlocal agent_loop_constructions
+        agent_loop_constructions += 1
+        return real_agent_loop(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runtime_module, "Dream", recording_dream)
+    monkeypatch.setattr(runtime_module, "AgentLoop", recording_agent_loop)
+    baseline = asyncio.all_tasks()
+
+    with pytest.raises(ScheduleStateError):
+        runtime_module.prepare_runtime(
+            agent_home=home,
+            workspace=workspace,
+            configuration=ConfigLoader(home).load(),
+            provider_factory=lambda _configuration: ScriptedFakeProvider(),
+            now=lambda: NOW,
+            new_uuid=uuid4,
+            workspace_state=state,
+        )
+
+    assert agent_loop_constructions == 0
+    assert len(created_dreams) == 1
+    assert created_dreams[0]._aborted is True
+    assert created_dreams[0]._closed is True
+    assert created_dreams[0]._task is None
+    assert asyncio.all_tasks() == baseline
+
+
+@pytest.mark.asyncio
 async def test_runtime_host_refreshes_skill_snapshot_after_generation_skill_deletion(
     agent_home: Path,
     workspace: Path,
@@ -410,7 +491,7 @@ async def test_target_generation_preparation_failure_preserves_old_generation(
 
 
 @pytest.mark.asyncio
-async def test_target_scheduler_preflight_failure_preserves_the_started_old_generation(
+async def test_target_schedule_service_preflight_failure_preserves_the_started_old_generation(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -424,11 +505,18 @@ async def test_target_scheduler_preflight_failure_preserves_the_started_old_gene
     target.add_message("user", "Target whose scheduler cannot be prepared")
     target.close()
 
-    def fail_scheduler_construction(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise RuntimeError("target scheduler validation failed")
+    original_prepare_start = ScheduleService._prepare_start
 
-    monkeypatch.setattr(runtime_module, "MemoryTaskScheduler", fail_scheduler_construction)
+    def fail_target_schedule_preflight(service: ScheduleService) -> None:
+        if service is not old.schedule_service:
+            raise RuntimeError("target scheduler validation failed")
+        original_prepare_start(service)
+
+    monkeypatch.setattr(
+        ScheduleService,
+        "_prepare_start",
+        fail_target_schedule_preflight,
+    )
 
     result = await host.management_dispatcher.resume(target.session_id)
 
@@ -513,7 +601,7 @@ async def test_normal_close_waits_for_an_in_progress_dream_before_closing_the_ro
 
 
 @pytest.mark.asyncio
-async def test_generation_replacement_aborts_old_dream_and_scheduler(
+async def test_generation_replacement_aborts_old_dream_and_schedule_service(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -536,10 +624,9 @@ async def test_generation_replacement_aborts_old_dream_and_scheduler(
     assert dream_task.done()
     assert old._dream._task is None
     assert old._dream._closed is True
-    assert old._memory_scheduler._active is not None
-    scheduler = old._memory_scheduler._active
-    assert scheduler._loop_task is None
-    assert not scheduler._run_tasks
+    assert old.schedule_service._loop_task is None
+    assert not old.schedule_service._run_tasks
+    assert not old.schedule_service._terminal_commit_tasks
     with pytest.raises(asyncio.CancelledError):
         await dream_task
 
@@ -547,7 +634,7 @@ async def test_generation_replacement_aborts_old_dream_and_scheduler(
 
 
 @pytest.mark.asyncio
-async def test_runtime_abort_drains_active_dream_and_memory_scheduler(
+async def test_runtime_abort_drains_active_dream_and_schedule_service(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -564,10 +651,9 @@ async def test_runtime_abort_drains_active_dream_and_memory_scheduler(
 
     assert dream_task.done()
     assert runtime._dream._task is None
-    scheduler = runtime._memory_scheduler._active
-    assert scheduler is not None
-    assert scheduler._loop_task is None
-    assert not scheduler._run_tasks
+    assert runtime.schedule_service._loop_task is None
+    assert not runtime.schedule_service._run_tasks
+    assert not runtime.schedule_service._terminal_commit_tasks
     with pytest.raises(asyncio.CancelledError):
         await dream_task
 
@@ -652,10 +738,8 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
     old_components = (
         old.agent_loop,
         old.schedule_service,
-        old._schedule_store,
         old._router,
         old._memory_manager,
-        old._memory_scheduler,
         old.agent_loop._tool_gateway,
         old.agent_loop._runner,
         old._management_service,
@@ -681,10 +765,8 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
     replacement_components = (
         replacement.agent_loop,
         replacement.schedule_service,
-        replacement._schedule_store,
         replacement._router,
         replacement._memory_manager,
-        replacement._memory_scheduler,
         replacement.agent_loop._tool_gateway,
         replacement.agent_loop._runner,
         replacement._management_service,
@@ -698,9 +780,10 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
     )
     assert old._dream._task is None
     assert old._dream._closed is True
-    assert old._memory_scheduler._active is not None
-    assert isinstance(old._memory_scheduler._active, MemoryTaskScheduler)
-    assert old._memory_scheduler._active._closed is True
+    assert old.schedule_service._aborted is True
+    assert old.schedule_service._loop_task is None
+    assert not old.schedule_service._run_tasks
+    assert not old.schedule_service._terminal_commit_tasks
     assert all(
         new_tool is not old_tool
         for new_tool, old_tool in zip(replacement_components[-1], old_components[-1], strict=True)
@@ -714,10 +797,6 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
     assert replacement._router._clock is old._router._clock is host._retry_clock
     assert replacement.schedule_service._clock is host._schedule_scheduler_clock
     assert old.schedule_service._clock is host._schedule_scheduler_clock
-    assert replacement._memory_scheduler._active is not None
-    assert old._memory_scheduler._active is not None
-    assert replacement._memory_scheduler._active._clock is host._memory_scheduler_clock
-    assert old._memory_scheduler._active._clock is host._memory_scheduler_clock
     assert replacement._context_builder._workspace == host._workspace
     assert old._context_builder._workspace == host._workspace
     assert str(replacement._context_builder._timezone) == host._timezone_name

@@ -861,7 +861,6 @@ def _generation_host(
         provider_factory=lambda _configuration: provider,
         now=lambda: NOW,
         new_uuid=uuid4,
-        memory_scheduler_clock=_BlockingClock(),
         schedule_scheduler_clock=_BlockingClock(),
     )
 

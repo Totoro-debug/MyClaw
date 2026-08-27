@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -27,12 +28,13 @@ from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
+from myclaw.utils import scheduler as scheduler_module
+from myclaw.utils.scheduler import AsyncioSchedulerClock
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
     DeterministicTaskFramingEvaluator,
     ProviderCall,
     ScriptedFakeProvider,
-    write_schedule_state,
 )
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 from tests.runtime_bus import collect_foreground_outbound
@@ -40,6 +42,57 @@ from tests.runtime_bus import collect_foreground_outbound
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 OTHER_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
 START = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+
+
+def test_production_schedule_clock_captures_a_rule_bearing_local_zone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zone = ZoneInfo("America/New_York")
+    monkeypatch.setattr(scheduler_module, "get_localzone", lambda: zone)
+    instants = (
+        datetime(2026, 3, 8, 6, 50, tzinfo=UTC),
+        datetime(2026, 3, 8, 7, 30, tzinfo=UTC),
+    )
+    pending = iter(instants)
+    clock = AsyncioSchedulerClock(now=lambda: next(pending))
+
+    before_transition = clock.now()
+    after_transition = clock.now()
+
+    assert before_transition.tzinfo == zone
+    assert before_transition.astimezone(UTC) == instants[0]
+    assert (before_transition.hour, before_transition.minute, before_transition.utcoffset()) == (
+        1,
+        50,
+        timedelta(hours=-5),
+    )
+    assert after_transition.tzinfo == zone
+    assert after_transition.astimezone(UTC) == instants[1]
+    assert (after_transition.hour, after_transition.minute, after_transition.utcoffset()) == (
+        3,
+        30,
+        timedelta(hours=-4),
+    )
+
+
+def test_production_schedule_clock_supports_a_non_dst_local_zone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zone = ZoneInfo("Asia/Shanghai")
+    monkeypatch.setattr(scheduler_module, "get_localzone", lambda: zone)
+    instant = datetime(2026, 7, 11, 8, 10, tzinfo=UTC)
+    clock = AsyncioSchedulerClock(now=lambda: instant)
+
+    local = clock.now()
+
+    assert local.tzinfo == zone
+    assert local.astimezone(UTC) == instant
+    assert (local.hour, local.minute, local.utcoffset()) == (
+        16,
+        10,
+        timedelta(hours=8),
+    )
+    assert local.dst() == timedelta(0)
 
 
 class ControlledClock:
@@ -229,8 +282,18 @@ async def _wait_until(predicate: object) -> None:
 
 def _service(**kwargs: Any) -> ScheduleService:
     callback = kwargs.pop("callback")
-    service = ScheduleService(**kwargs)
-    service.on_schedule_job = callback
+    store = kwargs.pop("store")
+
+    async def execute_dream() -> object:
+        return None
+
+    service = ScheduleService(
+        workspace_state=store.workspace_state,
+        execute_user_job=callback,
+        execute_dream=execute_dream,
+        **kwargs,
+    )
+    service._store = store
     return service
 
 
@@ -991,38 +1054,6 @@ async def test_terminal_at_removal_does_not_delete_a_replacement_job(
 
 
 @pytest.mark.asyncio
-async def test_system_at_job_is_deleted_after_terminal_completion(
-    workspace: Path,
-    agent_home: Path,
-) -> None:
-    state = _state(workspace, agent_home)
-    job = ScheduleJob(
-        job_id=str(JOB_UUID),
-        message="Run this.",
-        schedule=JobSchedule.at("2026-08-07T11:59:00.000+00:00"),
-        created_at_ms=1,
-        updated_at_ms=1,
-        source="system",
-    )
-    write_schedule_state(state, job)
-    store = WorkspaceScheduleStore(state)
-    callback = RecordingScheduleCallback()
-    service = _service(
-        store=store,
-        callback=callback,
-        clock=ControlledClock(START),
-    )
-
-    service.start()
-    await callback.started.wait()
-    await _wait_until(lambda: service.status_snapshot().active_job_count == 0)
-    await service.close()
-
-    assert await store.snapshot() == ()
-    assert service.status_snapshot().status == "available"
-
-
-@pytest.mark.asyncio
 async def test_store_fault_stops_dispatch_and_is_visible_in_status(
     workspace: Path,
     agent_home: Path,
@@ -1352,7 +1383,7 @@ async def test_prepared_runtime_executes_at_job_with_schedule_route_and_partitio
 
     request = provider.complete_requests[0]
     assert len(request.tools) == 10
-    assert await WorkspaceScheduleStore(state).snapshot() == ()
+    assert await runtime.schedule_service.public_snapshot() == ()
     session = Session.load(
         state,
         f"schedule_{JOB_UUID}",

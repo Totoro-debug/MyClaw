@@ -254,26 +254,6 @@ class Dream:
                 if self._task is task:
                     self._task = None
 
-    async def run_periodic(self) -> DreamResult | None:
-        with without_session_log():
-            if self._closed or self._aborted:
-                raise RuntimeError("Dream is no longer active")
-            if self._running:
-                return None
-            self._running = True
-            self._running_cursor = 0
-            self._failure_diagnostic = None
-            task = asyncio.current_task()
-            self._task = task
-            try:
-                result = await self._run_once()
-                self._log_failure(result)
-                return result
-            finally:
-                self._running = False
-                if self._task is task:
-                    self._task = None
-
     async def close(self) -> None:
         if self._closed:
             return

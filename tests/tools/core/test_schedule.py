@@ -47,7 +47,20 @@ def _gateway(tool: ScheduleTool) -> SingleToolGateway:
 
 
 def _service(store: WorkspaceScheduleStore) -> ScheduleService:
-    return ScheduleService(store=store, clock=_ToolClock())
+    async def execute_user_job(job: ScheduleJob) -> None:
+        del job
+
+    async def execute_dream() -> object:
+        return None
+
+    service = ScheduleService(
+        workspace_state=store.workspace_state,
+        clock=_ToolClock(),
+        execute_user_job=execute_user_job,
+        execute_dream=execute_dream,
+    )
+    service._store = store
+    return service
 
 
 def test_schema_exposes_the_three_actions_and_optional_schedule_branches(
@@ -281,10 +294,10 @@ async def test_list_returns_only_public_jobs_in_creation_then_id_order(
         updated_at_ms=10,
     )
     hidden = ScheduleJob(
-        job_id="8ba7b810-9dad-41d1-80b4-00c04fd430c8",
+        job_id="dream",
         source="system",
         message="Hidden",
-        schedule=JobSchedule.at("2026-08-07T15:00:00.000+00:00"),
+        schedule=JobSchedule.every(60),
         created_at_ms=1,
         updated_at_ms=1,
     )
@@ -333,10 +346,10 @@ async def test_remove_requires_canonical_uuid_and_hides_unknown_or_system_jobs(
         updated_at_ms=1,
     )
     hidden = ScheduleJob(
-        job_id="9ba7b810-9dad-41d1-80b4-00c04fd430c8",
+        job_id="dream",
         source="system",
         message="Internal",
-        schedule=JobSchedule.at("2026-08-07T14:00:00.000+00:00"),
+        schedule=JobSchedule.every(60),
         created_at_ms=2,
         updated_at_ms=2,
     )

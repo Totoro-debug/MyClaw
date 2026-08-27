@@ -65,6 +65,33 @@ def test_schedule_job_derives_its_schedule_session_id() -> None:
     assert job.session_id == f"schedule_{JOB_ID}"
 
 
+def test_schedule_job_accepts_the_reserved_dream_system_identity() -> None:
+    job = ScheduleJob(
+        job_id="dream",
+        source="system",
+        message="Internal Dream schedule.",
+        schedule=JobSchedule(kind="cron", cron_expr="0 * * * *", timezone="UTC"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+
+    assert job.source == "system"
+    assert job.job_id == "dream"
+
+
+@pytest.mark.parametrize(
+    ("job_id", "source"),
+    [
+        ("dream", "user"),
+        (JOB_ID, "system"),
+        ("unknown", "system"),
+    ],
+)
+def test_schedule_job_rejects_invalid_system_identity(job_id: str, source: str) -> None:
+    with pytest.raises(ValueError, match="job_id"):
+        _valid_job(job_id=job_id, source=source)
+
+
 @pytest.mark.parametrize(
     "schedule",
     [

@@ -14,7 +14,8 @@ from myclaw.schedule.store import (
 from tests.fixtures import write_schedule_state
 
 JOB_ID = "550e8400-e29b-41d4-a716-446655440000"
-SYSTEM_ID = "6fa459ea-ee8a-4ca4-894e-db77e160355e"
+OTHER_ID = "6fa459ea-ee8a-4ca4-894e-db77e160355e"
+SYSTEM_ID = "dream"
 
 
 def _state(path: Path) -> WorkspaceState:
@@ -153,7 +154,7 @@ async def test_write_failure_keeps_old_snapshot_and_latches_fault(
     assert store.revision == revision
     assert store.health == "faulted"
     with pytest.raises(ScheduleStoreFaultedError):
-        await store.add_user_job(_job(SYSTEM_ID))
+        await store.add_user_job(_job(OTHER_ID))
 
 
 @pytest.mark.asyncio
@@ -192,7 +193,7 @@ async def test_public_removal_treats_a_system_job_as_missing(workspace: Path) ->
     store = WorkspaceScheduleStore(state)
     revision = store.revision
 
-    assert await store.remove_user_job(SYSTEM_ID) is False
+    assert await store.remove_user_job(OTHER_ID) is False
     assert await store.snapshot() == (system_job,)
     assert await store.public_snapshot() == ()
     assert store.revision == revision

@@ -52,11 +52,10 @@ from myclaw.memory.conversation_summary import (
 )
 from myclaw.memory.dream import Dream
 from myclaw.memory.manager import MemoryManager
-from myclaw.memory.memory_scheduler import MemoryTaskScheduler
 from myclaw.provider.model_router import Jitter, ModelRouter, RetryClock
 from myclaw.provider.models import ModelProvider
+from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleClock, ScheduleService
-from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader, SkillMetadata, SkillSnapshot
@@ -64,7 +63,7 @@ from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplIn
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.tool_gateway import ToolResult
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
-from myclaw.utils.scheduler import AsyncioSchedulerClock, SchedulerClock
+from myclaw.utils.scheduler import AsyncioSchedulerClock
 
 type SessionReplacement = Callable[[str, bool], Awaitable[None]]
 
@@ -75,61 +74,6 @@ class SkillContextTooLargeError(Exception):
     def __init__(self, error: ErrorInfo) -> None:
         self.error = error
         super().__init__(error.message)
-
-
-class _RuntimeSchedulerOwner:
-    """Own one terminal scheduler instance per Runtime run."""
-
-    def __init__(
-        self,
-        factory: Callable[[], MemoryTaskScheduler],
-    ) -> None:
-        self._factory = factory
-        self._active: MemoryTaskScheduler | None = None
-        self._aborted = False
-
-    def prepare(self) -> None:
-        """Construct and validate the scheduler without starting owned tasks."""
-        if self._aborted:
-            raise RuntimeError("Runtime scheduler is closed")
-        scheduler = self._active
-        if scheduler is None:
-            scheduler = self._factory()
-            self._active = scheduler
-        scheduler._prepare_start()
-
-    def activate_prepared(self) -> None:
-        """Activate the already validated scheduler."""
-        scheduler = self._active
-        if scheduler is None:
-            raise RuntimeError("Runtime scheduler was not prepared")
-        scheduler._activate_prepared()
-
-    async def close(self) -> None:
-        if self._aborted:
-            return
-        scheduler = self._active
-        if scheduler is None:
-            return
-        await scheduler.close()
-        if self._active is scheduler:
-            self._active = None
-
-    def abort(self) -> None:
-        """Synchronously cancel the active scheduler, if it was started."""
-        if self._aborted:
-            return
-        self._aborted = True
-        scheduler = self._active
-        if scheduler is not None:
-            scheduler.abort()
-
-    async def abort_and_wait(self) -> None:
-        """Cancel and drain the active scheduler without final persistence."""
-        self.abort()
-        scheduler = self._active
-        if scheduler is not None:
-            await scheduler.abort_and_wait()
 
 
 @dataclass(slots=True)
@@ -167,10 +111,8 @@ class PreparedRuntime:
     agent_loop: AgentLoop
     management_dispatcher: ManagementDispatcher
     schedule_service: ScheduleService
-    _memory_scheduler: _RuntimeSchedulerOwner
     _router: ModelRouter
     _lifetime: _RuntimeLifetime
-    _schedule_store: WorkspaceScheduleStore
     _memory_manager: MemoryManager
     _dream: Dream
     _context_builder: ContextBuilder
@@ -210,7 +152,6 @@ class PreparedRuntime:
                 if self._lifetime.started or self._lifetime.aborted:
                     raise RuntimeError("Runtime Generation is no longer preparable")
                 self.agent_loop._prepare_start()
-                self._memory_scheduler.prepare()
                 self.schedule_service._prepare_start()
                 self._lifetime.validated = True
             except BaseException as error:
@@ -245,7 +186,6 @@ class PreparedRuntime:
         self.agent_loop.abort()
         self.schedule_service.abort()
         self._dream.abort()
-        self._memory_scheduler.abort()
         self._router.abort()
         closing = self._lifetime.close_task
         if closing is not None and not closing.done():
@@ -261,7 +201,7 @@ class PreparedRuntime:
     async def _drain_aborted_memory(self) -> None:
         await asyncio.gather(
             self._dream.abort_and_wait(),
-            self._memory_scheduler.abort_and_wait(),
+            self.schedule_service.abort_and_wait(),
         )
 
     async def _start_schedulers(self) -> None:
@@ -270,12 +210,17 @@ class PreparedRuntime:
         with without_session_log():
             try:
                 self.agent_loop._activate_prepared()
-                self._memory_scheduler.activate_prepared()
                 self.schedule_service._activate_prepared()
             except BaseException as error:
                 logger.opt(exception=error).error(
                     "Runtime startup failed type={}", type(error).__name__
                 )
+                self._request_abort()
+                try:
+                    await self._drain_aborted_memory()
+                    await asyncio.sleep(0)
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
                 raise
 
     async def run(
@@ -351,7 +296,6 @@ class PreparedRuntime:
                 failures.append(error)
 
             shutdowns: list[Awaitable[object]] = [
-                self._memory_scheduler.close(),
                 self.agent_loop.close(),
             ]
             if run_done is not None:
@@ -397,7 +341,6 @@ class RuntimeHost:
         new_uuid: Callable[[], UUID],
         retry_clock: RetryClock | None = None,
         retry_jitter: Jitter | None = None,
-        memory_scheduler_clock: SchedulerClock | None = None,
         schedule_scheduler_clock: ScheduleClock | None = None,
         monotonic_now: Callable[[], float] = monotonic,
         timezone_name: str | None = None,
@@ -411,11 +354,6 @@ class RuntimeHost:
         self._new_uuid = new_uuid
         self._retry_clock = retry_clock
         self._retry_jitter = retry_jitter
-        self._memory_scheduler_clock = (
-            memory_scheduler_clock
-            if memory_scheduler_clock is not None
-            else AsyncioSchedulerClock(now=now)
-        )
         self._schedule_scheduler_clock = (
             schedule_scheduler_clock
             if schedule_scheduler_clock is not None
@@ -438,7 +376,6 @@ class RuntimeHost:
             new_uuid=new_uuid,
             retry_clock=retry_clock,
             retry_jitter=retry_jitter,
-            memory_scheduler_clock=self._memory_scheduler_clock,
             schedule_scheduler_clock=self._schedule_scheduler_clock,
             monotonic_now=monotonic_now,
             timezone_name=self._timezone_name,
@@ -520,7 +457,6 @@ class RuntimeHost:
                 new_uuid=self._new_uuid,
                 retry_clock=self._retry_clock,
                 retry_jitter=self._retry_jitter,
-                memory_scheduler_clock=self._memory_scheduler_clock,
                 schedule_scheduler_clock=self._schedule_scheduler_clock,
                 monotonic_now=self._monotonic_now,
                 timezone_name=self._timezone_name,
@@ -630,7 +566,6 @@ def prepare_runtime(
     new_uuid: Callable[[], UUID],
     retry_clock: RetryClock | None = None,
     retry_jitter: Jitter | None = None,
-    memory_scheduler_clock: SchedulerClock | None = None,
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
@@ -651,7 +586,6 @@ def prepare_runtime(
             new_uuid=new_uuid,
             retry_clock=retry_clock,
             retry_jitter=retry_jitter,
-            memory_scheduler_clock=memory_scheduler_clock,
             schedule_scheduler_clock=schedule_scheduler_clock,
             monotonic_now=monotonic_now,
             timezone_name=timezone_name,
@@ -680,7 +614,6 @@ def _prepare_runtime(
     new_uuid: Callable[[], UUID],
     retry_clock: RetryClock | None = None,
     retry_jitter: Jitter | None = None,
-    memory_scheduler_clock: SchedulerClock | None = None,
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
@@ -705,7 +638,6 @@ def _prepare_runtime(
     if active_workspace_state.workspace_path != workspace_path:
         raise ValueError("Runtime Workspace State must belong to the Runtime Workspace")
     active_workspace_state.initialize(agent_home_root=agent_home.path)
-    schedule_store = WorkspaceScheduleStore(active_workspace_state)
     memory_manager = MemoryManager(active_workspace_state)
     long_term_memory = memory_manager.memory_snapshot()
     schedule_clock = (
@@ -713,7 +645,6 @@ def _prepare_runtime(
         if schedule_scheduler_clock is not None
         else AsyncioSchedulerClock(now=now)
     )
-    schedule_service = ScheduleService(store=schedule_store, clock=schedule_clock)
     resolved_timezone_name = get_localzone_name() if timezone_name is None else timezone_name
     foreground_context = ContextBuilder(
         workspace_path,
@@ -763,31 +694,44 @@ def _prepare_runtime(
             max_iterations=configuration.runtime.max_iterations,
         )
     except BaseException:
-        schedule_service.abort()
         router.abort()
         raise
+
+    agent_loop: AgentLoop | None = None
+
+    async def execute_user_job(job: ScheduleJob) -> None:
+        active_loop = agent_loop
+        if active_loop is None:
+            raise RuntimeError("Schedule Service user executor is not bound")
+        await active_loop.run_schedule_job(job)
+
+    schedule_service: ScheduleService | None = None
+    try:
+        schedule_service = ScheduleService(
+            workspace_state=active_workspace_state,
+            clock=schedule_clock,
+            execute_user_job=execute_user_job,
+            execute_dream=dream.run,
+        )
+        schedule_service._register_dream_job_sync(
+            schedule=JobSchedule.from_cron_input(
+                configuration.memory.schedule,
+                resolved_timezone_name,
+            )
+        )
+    except BaseException:
+        if schedule_service is not None:
+            schedule_service.abort()
+        dream.abort()
+        router.abort()
+        raise
+
+    assert schedule_service is not None
 
     def abort_memory_composition() -> None:
         dream.abort()
         schedule_service.abort()
         router.abort()
-
-    scheduler_clock = (
-        memory_scheduler_clock
-        if memory_scheduler_clock is not None
-        else AsyncioSchedulerClock(now=now)
-    )
-    try:
-        memory_scheduler = _RuntimeSchedulerOwner(
-            lambda: MemoryTaskScheduler(
-                dream=dream,
-                schedule=configuration.memory.schedule,
-                clock=scheduler_clock,
-            )
-        )
-    except BaseException:
-        abort_memory_composition()
-        raise
 
     def externalize_result_for(active_session: Session) -> Callable[[ToolResult], ToolResult]:
         return _build_tool_result_externalizer(
@@ -860,13 +804,16 @@ def _prepare_runtime(
         active_session: Session,
         current_user: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        active_loop = agent_loop
+        if active_loop is None:
+            raise RuntimeError("Schedule context requested before Agent Loop construction")
         memory_snapshot = memory_manager.memory_snapshot()
         current_system_prompt = system_prompt_for(memory_snapshot)
         await prepare_summary(
             active_session,
             "schedule",
             current_system_prompt,
-            tuple(agent_loop.tool_schemas),
+            tuple(active_loop.tool_schemas),
             current_user,
         )
         history = active_session.messages[active_session.last_consolidated :]
@@ -884,13 +831,16 @@ def _prepare_runtime(
         *,
         manual_invocation: ManualSkillInvocation | None = None,
     ) -> list[dict[str, Any]]:
+        active_loop = agent_loop
+        if active_loop is None:
+            raise RuntimeError("Foreground context requested before Agent Loop construction")
         memory_snapshot = memory_manager.memory_snapshot()
         current_system_prompt = foreground_system_prompt_for(memory_snapshot)
         await prepare_summary(
             active_session,
             "chat",
             current_system_prompt,
-            tuple(agent_loop.tool_schemas),
+            tuple(active_loop.tool_schemas),
             current_user,
             blackboard=blackboard,
             manual_invocation=manual_invocation,
@@ -939,8 +889,6 @@ def _prepare_runtime(
         abort_memory_composition()
         raise
 
-    schedule_service.on_schedule_job = agent_loop.run_schedule_job
-
     def current_foreground_chat_status() -> ResolvedChatStatus:
         foreground_status = agent_loop.last_foreground_route_status
         if foreground_status is not None:
@@ -984,10 +932,8 @@ def _prepare_runtime(
         agent_loop=agent_loop,
         management_dispatcher=management_dispatcher,
         schedule_service=schedule_service,
-        _memory_scheduler=memory_scheduler,
         _router=router,
         _lifetime=_RuntimeLifetime(),
-        _schedule_store=schedule_store,
         _memory_manager=memory_manager,
         _dream=dream,
         _context_builder=foreground_context,

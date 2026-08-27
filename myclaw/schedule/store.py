@@ -12,7 +12,7 @@ from typing import Literal, NoReturn
 
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.errors import ErrorInfo
-from myclaw.schedule.model import JobStatus, ScheduleJob, ScheduleJobState
+from myclaw.schedule.model import DREAM_JOB_ID, JobStatus, ScheduleJob, ScheduleJobState
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.validation import require_nonnegative_int, require_uuid4_string
 
@@ -114,6 +114,46 @@ class WorkspaceScheduleStore:
             raise ValueError("public Schedule mutations can add only user Jobs")
         return await self._add_job(job)
 
+    async def _register_system_job(self, job: ScheduleJob) -> ScheduleJob:
+        _require_system_job(job)
+        async with self._condition:
+            self._ensure_available()
+            current = next((item for item in self._jobs if item.job_id == job.job_id), None)
+            if current is not None and current.source != "system":
+                raise ScheduleStateError(self.path)
+            reconciled = _reconcile_system_job(current, job)
+            if reconciled is None:
+                assert current is not None
+                return copy.deepcopy(current)
+            candidate = (
+                (*self._jobs, reconciled)
+                if current is None
+                else tuple(
+                    reconciled if item.job_id == job.job_id else item for item in self._jobs
+                )
+            )
+            self._publish_locked(candidate)
+            return copy.deepcopy(reconciled)
+
+    def _register_system_job_sync(self, job: ScheduleJob) -> ScheduleJob:
+        """Reconcile a system Job before the dispatcher has any waiters."""
+        _require_system_job(job)
+        self._ensure_available()
+        current = next((item for item in self._jobs if item.job_id == job.job_id), None)
+        if current is not None and current.source != "system":
+            raise ScheduleStateError(self.path)
+        reconciled = _reconcile_system_job(current, job)
+        if reconciled is None:
+            assert current is not None
+            return copy.deepcopy(current)
+        candidate = (
+            (*self._jobs, reconciled)
+            if current is None
+            else tuple(reconciled if item.job_id == job.job_id else item for item in self._jobs)
+        )
+        self._publish_unlocked(candidate)
+        return copy.deepcopy(reconciled)
+
     async def _add_job(self, job: ScheduleJob) -> ScheduleJob:
         if not isinstance(job, ScheduleJob):
             raise TypeError("job must be a ScheduleJob")
@@ -143,6 +183,15 @@ class WorkspaceScheduleStore:
         *,
         expected: ScheduleJob | None = None,
     ) -> bool:
+        return await self._remove(job_id, expected=expected, user_only=True)
+
+    async def _remove_terminal_job(
+        self,
+        job_id: str,
+        *,
+        expected: ScheduleJob,
+    ) -> bool:
+        require_uuid4_string(job_id, field="job_id")
         return await self._remove(job_id, expected=expected, user_only=False)
 
     async def commit_terminal(
@@ -156,6 +205,49 @@ class WorkspaceScheduleStore:
         now_ms: int | None = None,
     ) -> ScheduleJob | None:
         require_uuid4_string(job_id, field="job_id")
+        return await self._commit_terminal(
+            job_id,
+            expected=expected,
+            finished_at_ms=finished_at_ms,
+            status=status,
+            error=error,
+            now_ms=now_ms,
+            source="user",
+        )
+
+    async def _commit_system_terminal(
+        self,
+        job_id: str,
+        *,
+        expected: ScheduleJob | None = None,
+        finished_at_ms: int,
+        status: JobStatus,
+        error: str | None = None,
+        now_ms: int | None = None,
+    ) -> ScheduleJob | None:
+        if job_id != DREAM_JOB_ID:
+            raise ValueError("only the reserved Dream system Job may use internal mutation")
+        return await self._commit_terminal(
+            job_id,
+            expected=expected,
+            finished_at_ms=finished_at_ms,
+            status=status,
+            error=error,
+            now_ms=now_ms,
+            source="system",
+        )
+
+    async def _commit_terminal(
+        self,
+        job_id: str,
+        *,
+        expected: ScheduleJob | None,
+        finished_at_ms: int,
+        status: JobStatus,
+        error: str | None,
+        now_ms: int | None,
+        source: Literal["user", "system"],
+    ) -> ScheduleJob | None:
         require_nonnegative_int(finished_at_ms, field="finished_at_ms")
         commit_now = finished_at_ms if now_ms is None else now_ms
         require_nonnegative_int(commit_now, field="now_ms")
@@ -167,7 +259,11 @@ class WorkspaceScheduleStore:
         async with self._condition:
             self._ensure_available()
             current = next((job for job in self._jobs if job.job_id == job_id), None)
-            if current is None or (expected is not None and current != expected):
+            if current is None or current.source != source:
+                if current is not None and current.source != source:
+                    raise ScheduleStateError(self.path)
+                return None
+            if expected is not None and current != expected:
                 return None
             updated = replace(
                 current,
@@ -203,7 +299,10 @@ class WorkspaceScheduleStore:
         expected: ScheduleJob | None,
         user_only: bool,
     ) -> bool:
-        require_uuid4_string(job_id, field="job_id")
+        if user_only:
+            require_uuid4_string(job_id, field="job_id")
+        else:
+            _require_internal_job_id(job_id)
         async with self._condition:
             self._ensure_available()
             current = next((job for job in self._jobs if job.job_id == job_id), None)
@@ -226,6 +325,12 @@ class WorkspaceScheduleStore:
             raise ScheduleStoreFaultedError("Schedule Store is faulted")
 
     def _publish_locked(self, candidate: tuple[ScheduleJob, ...]) -> None:
+        self._publish(candidate, notify=True)
+
+    def _publish_unlocked(self, candidate: tuple[ScheduleJob, ...]) -> None:
+        self._publish(candidate, notify=False)
+
+    def _publish(self, candidate: tuple[ScheduleJob, ...], *, notify: bool) -> None:
         try:
             encoded = _serialize_document(candidate)
             if _parse_document(encoded) != candidate:
@@ -234,11 +339,13 @@ class WorkspaceScheduleStore:
             self._replace_text(self.path, encoded)
         except Exception:
             self._faulted = True
-            self._condition.notify_all()
+            if notify:
+                self._condition.notify_all()
             raise
         self._jobs = copy.deepcopy(candidate)
         self._revision += 1
-        self._condition.notify_all()
+        if notify:
+            self._condition.notify_all()
 
     def _require_write_location(self) -> None:
         workspace_root = self.workspace_state.workspace_path.resolve(strict=True)
@@ -302,6 +409,35 @@ def _reject_json_constant(value: str) -> NoReturn:
 
 def _public_job_key(job: ScheduleJob) -> tuple[object, ...]:
     return (job.job_id, job.message, tuple(job.schedule.to_dict().items()))
+
+
+def _require_system_job(job: ScheduleJob) -> None:
+    if not isinstance(job, ScheduleJob):
+        raise TypeError("system Job must be a ScheduleJob")
+    if job.source != "system" or job.job_id != DREAM_JOB_ID:
+        raise ValueError("only the reserved Dream system Job may use internal mutation")
+
+
+def _require_internal_job_id(job_id: str) -> None:
+    if job_id == DREAM_JOB_ID:
+        return
+    require_uuid4_string(job_id, field="job_id")
+
+
+def _reconcile_system_job(
+    current: ScheduleJob | None,
+    requested: ScheduleJob,
+) -> ScheduleJob | None:
+    if current is None:
+        return requested
+    if current.schedule == requested.schedule:
+        return None
+    updated_at_ms = (
+        max(current.updated_at_ms, requested.updated_at_ms)
+        if current.state.last_status is not None
+        else current.created_at_ms
+    )
+    return replace(current, schedule=requested.schedule, updated_at_ms=updated_at_ms)
 
 
 __all__ = [

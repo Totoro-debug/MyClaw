@@ -232,7 +232,6 @@ def _runtime(
         provider_factory=lambda _configuration: provider,
         now=lambda: NOW,
         new_uuid=lambda: JOB_UUID,
-        memory_scheduler_clock=_BlockingClock(NOW),
         schedule_scheduler_clock=schedule_clock,
         task_framer=DeterministicTaskFramingEvaluator(),
     )
@@ -296,7 +295,7 @@ async def test_runtime_conversation_manages_schedule_jobs_without_confirmation(
     try:
         await _submit_turn(runtime, "Schedule the report.")
 
-        jobs = await _schedule_state(workspace).snapshot()
+        jobs = await _schedule_state(workspace).public_snapshot()
         assert len(jobs) == 1
         job_id = jobs[0].job_id
         assert jobs[0].message == "ship report"
@@ -319,7 +318,7 @@ async def test_runtime_conversation_manages_schedule_jobs_without_confirmation(
         }
 
         await _submit_turn(runtime, "Remove that Schedule Job.")
-        assert await _schedule_state(workspace).snapshot() == ()
+        assert await _schedule_state(workspace).public_snapshot() == ()
         assert _tool_json(runtime)[-1]["action"] == "remove"
     finally:
         await runtime.close()
@@ -769,7 +768,7 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
             "web_fetch",
             "schedule",
         ]
-        assert await _schedule_state(workspace).snapshot() == ()
+        assert await _schedule_state(workspace).public_snapshot() == ()
         schedule_session_paths = tuple(
             (workspace / ".myclaw" / "schedule-sessions").glob("schedule_*.jsonl")
         )
@@ -802,17 +801,19 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
         await runtime.close()
 
 
-def test_runtime_binds_schedule_callback_to_agent_loop(
+def test_runtime_wires_schedule_service_user_executor_to_agent_loop(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     provider = _RuntimeProvider()
     runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
 
-    callback = runtime.schedule_service.on_schedule_job
-    assert callback is not None
-    assert getattr(callback, "__self__", None) is runtime.agent_loop
-    assert getattr(callback, "__func__", None) is runtime.agent_loop.run_schedule_job.__func__
+    callback = runtime.schedule_service._execute_user_job
+    closure_values = tuple(
+        cell.cell_contents
+        for cell in (callback.__closure__ or ())
+    )
+    assert runtime.agent_loop in closure_values
 
 
 @pytest.mark.asyncio
@@ -846,15 +847,11 @@ async def test_runtime_foreground_and_schedule_share_runner_and_gateway_identity
         return await original_run(runner, initial_messages, **kwargs)
 
     monkeypatch.setattr(AgentRunner, "run", record_run)
-    callback = runtime.schedule_service.on_schedule_job
-    assert callback is not None
+    callback = runtime.agent_loop.run_schedule_job
     await runtime.start()
     try:
         assert (await _submit_turn(runtime, "Run foreground."))[-1].metadata == {"_streamed": True}
-        callback_result = await cast(Callable[..., Any], callback)(
-            _due_job(message="Run Schedule.")
-        )
-        assert callback_result is None
+        await callback(_due_job(message="Run Schedule."))
     finally:
         await runtime.close()
 
@@ -909,15 +906,11 @@ async def test_runtime_externalizers_keep_foreground_and_schedule_artifacts_sepa
         schedule_clock=_BlockingClock(NOW),
         config_text=config_text,
     )
-    callback = runtime.schedule_service.on_schedule_job
-    assert callback is not None
+    callback = runtime.agent_loop.run_schedule_job
     await runtime.start()
     try:
         await _submit_turn(runtime, "Read the large file in foreground.")
-        callback_result = await cast(Callable[..., Any], callback)(
-            _due_job(message="Read the large file in Schedule.")
-        )
-        assert callback_result is None
+        await callback(_due_job(message="Read the large file in Schedule."))
         foreground_session_id = runtime.session.session_id
         foreground_tool = next(
             message for message in runtime.session.messages if message["role"] == "tool"
@@ -969,11 +962,9 @@ async def test_runtime_schedule_session_uses_schedule_clock_for_persisted_timest
         updated_at_ms=1,
     )
 
-    callback = runtime.schedule_service.on_schedule_job
-    assert callback is not None
+    callback = runtime.agent_loop.run_schedule_job
     try:
-        callback_result = await cast(Callable[..., Any], callback)(job)
-        assert callback_result is None
+        await callback(job)
     finally:
         await runtime.close()
 
@@ -1114,7 +1105,7 @@ async def test_runtime_schedule_failure_logs_one_safe_session_warning(
         await runtime.close()
         capture.close()
 
-    assert await _schedule_state(workspace).snapshot() == ()
+    assert await _schedule_state(workspace).public_snapshot() == ()
     assert capture.event_text.count("Schedule Job failed") == 1
     assert "code=model_failed" in capture.event_text
     assert "PRIVATE_SCHEDULE_PREPARATION_BODY" not in capture.text

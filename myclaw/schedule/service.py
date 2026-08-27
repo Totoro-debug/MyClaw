@@ -12,11 +12,13 @@ from zoneinfo import ZoneInfo
 from croniter import croniter  # type: ignore[import-untyped]
 from loguru import logger
 
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
-from myclaw.schedule.model import ScheduleJob
+from myclaw.schedule.model import DREAM_JOB_ID, JobSchedule, ScheduleJob
 from myclaw.schedule.store import (
     ScheduleStaleRemovalError,
+    ScheduleStateError,
     ScheduleStoreFaultedError,
     WorkspaceScheduleStore,
 )
@@ -36,6 +38,8 @@ class ScheduleClock(Protocol):
 
 
 type ScheduleJobExecutor = Callable[[ScheduleJob], Awaitable[None]]
+type DreamExecutor = Callable[[], Awaitable[object]]
+type _ExecutionLane = Literal["user", "dream"]
 
 
 class ScheduleJobExecutionError(Exception):
@@ -68,13 +72,15 @@ class ScheduleService:
     def __init__(
         self,
         *,
-        store: WorkspaceScheduleStore,
+        workspace_state: WorkspaceState,
         clock: ScheduleClock,
-        on_schedule_job: ScheduleJobExecutor | None = None,
+        execute_user_job: ScheduleJobExecutor,
+        execute_dream: DreamExecutor,
     ) -> None:
-        self._store = store
+        self._store = WorkspaceScheduleStore(workspace_state)
         self._clock = clock
-        self.on_schedule_job = on_schedule_job
+        self._execute_user_job = execute_user_job
+        self._execute_dream = execute_dream
         self._loop_task: asyncio.Task[None] | None = None
         self._run_tasks: set[asyncio.Task[None]] = set()
         self._terminal_commit_tasks: set[asyncio.Task[ScheduleJob | None]] = set()
@@ -87,13 +93,19 @@ class ScheduleService:
         self._closing = asyncio.Event()
         self._faulted_event = asyncio.Event()
         self._close_task: asyncio.Task[None] | None = None
+        self._pause_task: asyncio.Task[None] | None = None
+        self._abort_task: asyncio.Task[None] | None = None
         self._faulted = False
         self._aborted = False
+        self._paused = False
         self._dispatcher_error_logged = False
         self._terminal_store_error_logged = False
 
     def start(self) -> None:
         """Start the single dispatcher; repeated starts are idempotent."""
+        if self._paused:
+            self.resume()
+            return
         self._prepare_start()
         self._activate_prepared()
 
@@ -103,8 +115,6 @@ class ScheduleService:
             raise RuntimeError("Schedule Service is closed")
         if self._loop_task is not None:
             return
-        if self.on_schedule_job is None:
-            raise RuntimeError("Schedule Service requires on_schedule_job before start")
         if self._faulted or self._store.health == "faulted":
             self._faulted = True
             self._faulted_event.set()
@@ -123,12 +133,41 @@ class ScheduleService:
     async def close(self) -> None:
         """Cancel and await the dispatcher and every reserved Job run."""
         if self._aborted:
+            await self.abort_and_wait()
             return
         task = self._close_task
         if task is None:
             task = asyncio.create_task(self._close_owned_tasks())
             self._close_task = task
         await await_task_preserving_cancellation(task)
+
+    async def pause_and_drain(self) -> None:
+        """Stop new occurrences and await every in-flight dispatcher operation."""
+        if self._aborted:
+            await self.abort_and_wait()
+            return
+        if self._close_task is not None:
+            await await_task_preserving_cancellation(self._close_task)
+            return
+        self._paused = True
+        task = self._pause_task
+        if task is None:
+            task = asyncio.create_task(self._pause_owned_tasks())
+            self._pause_task = task
+        await await_task_preserving_cancellation(task)
+
+    def resume(self) -> None:
+        """Resume dispatch after a completed pause barrier."""
+        if self._aborted or self._close_task is not None:
+            raise RuntimeError("Schedule Service is closed")
+        if not self._paused:
+            return
+        if self._pause_task is not None and not self._pause_task.done():
+            raise RuntimeError("Schedule Service pause is still draining")
+        self._paused = False
+        self._pause_task = None
+        self._prepare_start()
+        self._activate_prepared()
 
     def status_snapshot(self) -> ScheduleServiceStatus:
         """Return health and active reservations without exposing Job details."""
@@ -147,7 +186,7 @@ class ScheduleService:
             return
         self._aborted = True
         self._closing.set()
-        self.on_schedule_job = None
+        self._paused = True
         loop_task = self._loop_task
         if loop_task is not None and not loop_task.done():
             loop_task.cancel()
@@ -157,9 +196,15 @@ class ScheduleService:
         for commit_task in tuple(self._terminal_commit_tasks):
             if not commit_task.done():
                 commit_task.cancel()
-        self._active_job_ids.clear()
-        self._every_deadlines.clear()
-        self._cron_cursors.clear()
+
+    async def abort_and_wait(self) -> None:
+        """Cancel and drain all dispatcher, Job, and terminal persistence tasks."""
+        self.abort()
+        task = self._abort_task
+        if task is None:
+            task = asyncio.create_task(self._drain_cancelled_tasks())
+            self._abort_task = task
+        await await_task_preserving_cancellation(task)
 
     async def add_user_job(self, job: ScheduleJob) -> ScheduleJob:
         """Add one user-owned Job through the Schedule persistence boundary."""
@@ -184,8 +229,53 @@ class ScheduleService:
             raise RuntimeError("Schedule Service is no longer active")
         return await self._store.remove_user_job(job_id, expected=expected)
 
+    async def register_dream_job(self, *, schedule: JobSchedule) -> ScheduleJob:
+        if self._aborted:
+            raise RuntimeError("Schedule Service is no longer active")
+        job = _new_dream_job(schedule, now_ms=_epoch_milliseconds(self._clock.now()))
+        return await self._store._register_system_job(job)
+
+    def _register_dream_job_sync(self, *, schedule: JobSchedule) -> ScheduleJob:
+        if self._aborted:
+            raise RuntimeError("Schedule Service is no longer active")
+        job = _new_dream_job(schedule, now_ms=_epoch_milliseconds(self._clock.now()))
+        return self._store._register_system_job_sync(job)
+
+    async def _pause_owned_tasks(self) -> None:
+        loop_task = self._loop_task
+        if loop_task is not None and not loop_task.done():
+            loop_task.cancel()
+        if loop_task is not None:
+            await asyncio.gather(loop_task, return_exceptions=True)
+        self._loop_task = None
+        await self._cancel_and_drain_job_tasks()
+        self._active_job_ids.clear()
+
+    async def _drain_cancelled_tasks(self) -> None:
+        loop_task = self._loop_task
+        if loop_task is not None and loop_task is not asyncio.current_task():
+            await asyncio.gather(loop_task, return_exceptions=True)
+        await self._cancel_and_drain_job_tasks()
+        self._loop_task = None
+        self._active_job_ids.clear()
+        self._every_deadlines.clear()
+        self._cron_cursors.clear()
+
+    async def _cancel_and_drain_job_tasks(self) -> None:
+        while self._run_tasks or self._terminal_commit_tasks:
+            run_tasks = tuple(self._run_tasks)
+            terminal_tasks = tuple(self._terminal_commit_tasks)
+            tasks = run_tasks + terminal_tasks
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._run_tasks.difference_update(run_tasks)
+            self._terminal_commit_tasks.difference_update(terminal_tasks)
+
     async def _close_owned_tasks(self) -> None:
         self._closing.set()
+        self._paused = True
         loop_task = self._loop_task
         if loop_task is not None:
             loop_task.cancel()
@@ -194,6 +284,18 @@ class ScheduleService:
             task.cancel()
         owned = (() if loop_task is None else (loop_task,)) + running
         results = await asyncio.gather(*owned, return_exceptions=True)
+        self._loop_task = None
+        self._run_tasks.difference_update(running)
+        done_terminal_tasks = tuple(
+            task for task in tuple(self._terminal_commit_tasks) if task.done()
+        )
+        self._terminal_commit_tasks.difference_update(done_terminal_tasks)
+        while self._terminal_commit_tasks:
+            terminal_tasks = tuple(self._terminal_commit_tasks)
+            await asyncio.gather(*terminal_tasks, return_exceptions=True)
+            self._terminal_commit_tasks.difference_update(
+                task for task in self._terminal_commit_tasks if task.done()
+            )
         self._active_job_ids.clear()
         self._every_deadlines.clear()
         self._cron_cursors.clear()
@@ -211,7 +313,7 @@ class ScheduleService:
     async def _dispatch(self) -> None:
         revision = self._store.revision
         try:
-            while not self._closing.is_set():
+            while not self._closing.is_set() and not self._paused:
                 if self._faulted or self._store.health == "faulted":
                     self._latch_fault()
                     return
@@ -241,7 +343,7 @@ class ScheduleService:
                 if due:
                     reserved = await self._store.reserve_due(tuple(due))
                     for job in reserved:
-                        self._reserve(job)
+                        self._reserve(job, current_monotonic=current_monotonic)
                     revision = self._store.revision
                     await asyncio.sleep(0)
                     continue
@@ -267,11 +369,12 @@ class ScheduleService:
                     type(error).__name__,
                 )
 
-    def _reserve(self, job: ScheduleJob) -> None:
-        if self._faulted:
+    def _reserve(self, job: ScheduleJob, *, current_monotonic: float) -> None:
+        if self._faulted or self._paused:
             return
+        lane = self._execution_lane(job)
         if job.job_id in self._active_job_ids:
-            if self._consume_recurring_occurrence(job):
+            if self._consume_recurring_occurrence(job, current_monotonic=current_monotonic):
                 with logger.contextualize(session_id=job.session_id):
                     logger.warning(
                         "Schedule Job occurrence skipped while active job_id={} kind={}",
@@ -281,13 +384,20 @@ class ScheduleService:
             return
         if job.job_id in self._consumed_at_jobs:
             return
-        self._consume_recurring_occurrence(job)
+        self._consume_recurring_occurrence(job, current_monotonic=current_monotonic)
         if job.schedule.kind == "at":
             self._consumed_at_jobs.add(job.job_id)
-        task = asyncio.create_task(self._run_job(job))
+        task = asyncio.create_task(self._run_job(job, lane=lane))
         self._active_job_ids.add(job.job_id)
         self._run_tasks.add(task)
         task.add_done_callback(self._run_finished)
+
+    def _execution_lane(self, job: ScheduleJob) -> _ExecutionLane:
+        if job.source == "user":
+            return "user"
+        if job.source == "system" and job.job_id == DREAM_JOB_ID:
+            return "dream"
+        raise ScheduleStateError(self._store.path)
 
     def _sync_every_deadlines(
         self,
@@ -301,9 +411,12 @@ class ScheduleService:
                 continue
             active_ids.add(job.job_id)
             anchor_ms = _every_anchor_ms(job)
+            every_seconds = job.schedule.every_seconds
+            if every_seconds is None:
+                raise ValueError("every Schedule Job must define every_seconds")
             existing = self._every_deadlines.get(job.job_id)
             if existing is not None:
-                if existing.anchor_ms == anchor_ms:
+                if existing.anchor_ms == anchor_ms and existing.every_seconds == every_seconds:
                     continue
                 # A finishing run fixes its monotonic deadline before the Store publishes
                 # the matching wall-clock anchor. Keep that mapping while the run is active.
@@ -314,24 +427,34 @@ class ScheduleService:
             self._every_deadlines[job.job_id] = _EveryDeadline(
                 anchor_ms=anchor_ms,
                 deadline=current_monotonic + delay,
+                every_seconds=every_seconds,
             )
         for job_id in tuple(self._every_deadlines):
             if job_id not in active_ids:
                 del self._every_deadlines[job_id]
 
-    def _consume_every_occurrence(self, job: ScheduleJob) -> None:
+    def _consume_every_occurrence(self, job: ScheduleJob, *, current_monotonic: float) -> None:
         deadline = self._every_deadlines.get(job.job_id)
         every_seconds = job.schedule.every_seconds
         if deadline is None or every_seconds is None:
             return
+        next_deadline = deadline.deadline + every_seconds
+        if next_deadline <= current_monotonic:
+            next_deadline = current_monotonic + every_seconds
         self._every_deadlines[job.job_id] = _EveryDeadline(
             anchor_ms=deadline.anchor_ms,
-            deadline=deadline.deadline + every_seconds,
+            deadline=next_deadline,
+            every_seconds=every_seconds,
         )
 
-    def _consume_recurring_occurrence(self, job: ScheduleJob) -> bool:
+    def _consume_recurring_occurrence(
+        self,
+        job: ScheduleJob,
+        *,
+        current_monotonic: float,
+    ) -> bool:
         if job.schedule.kind == "every":
-            self._consume_every_occurrence(job)
+            self._consume_every_occurrence(job, current_monotonic=current_monotonic)
             return True
         if job.schedule.kind == "cron":
             self._consume_cron_occurrence(job)
@@ -426,17 +549,26 @@ class ScheduleService:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run_job(self, job: ScheduleJob) -> None:
+    async def _run_job(self, job: ScheduleJob, *, lane: _ExecutionLane) -> None:
         terminal: Literal["ok", "error"] | None = None
         terminal_error: str | None = None
         terminal_ready = False
         try:
-            callback = self.on_schedule_job
-            if callback is None:
-                raise RuntimeError("Schedule Service requires on_schedule_job before start")
-            await callback(job)
-            terminal = "ok"
-            terminal_ready = True
+            if lane == "dream":
+                result = await self._execute_dream()
+                if _is_memory_task_running(result):
+                    return
+                result_error = getattr(result, "error", None)
+                if isinstance(result_error, ErrorInfo):
+                    terminal = "error"
+                    terminal_error = result_error.message
+                else:
+                    terminal = "ok"
+                terminal_ready = True
+            else:
+                await self._execute_user_job(job)
+                terminal = "ok"
+                terminal_ready = True
         except asyncio.CancelledError:
             raise
         except ScheduleJobExecutionError as failure:
@@ -473,11 +605,16 @@ class ScheduleService:
             self._every_deadlines[job.job_id] = _EveryDeadline(
                 anchor_ms=finished_at_ms,
                 deadline=self._clock.monotonic() + every_seconds,
+                every_seconds=every_seconds,
             )
         operation = asyncio.create_task(
             self._remove_at_job(job)
             if job.schedule.kind == "at"
-            else self._store.commit_terminal(
+            else (
+                self._store._commit_system_terminal
+                if job.source == "system"
+                else self._store.commit_terminal
+            )(
                 job.job_id,
                 expected=job,
                 finished_at_ms=finished_at_ms,
@@ -510,7 +647,16 @@ class ScheduleService:
             self._latch_fault()
             if not self._terminal_store_error_logged:
                 self._terminal_store_error_logged = True
-                with session_log(self._store.workspace_state, job.session_id):
+                if job.source == "user":
+                    with session_log(self._store.workspace_state, job.session_id):
+                        logger.error(
+                            "Schedule terminal update failed job_id={} kind={} outcome={} type={}",
+                            job.job_id,
+                            job.schedule.kind,
+                            terminal,
+                            type(failure).__name__,
+                        )
+                else:
                     logger.error(
                         "Schedule terminal update failed job_id={} kind={} outcome={} type={}",
                         job.job_id,
@@ -522,7 +668,7 @@ class ScheduleService:
             raise cancellation
 
     async def _remove_at_job(self, job: ScheduleJob) -> None:
-        await self._store.remove_job(job.job_id, expected=job)
+        await self._store._remove_terminal_job(job.job_id, expected=job)
 
     def _run_finished(self, task: asyncio.Task[None]) -> None:
         self._run_tasks.discard(task)
@@ -546,6 +692,7 @@ class ScheduleService:
 class _EveryDeadline:
     anchor_ms: int
     deadline: float
+    every_seconds: int
 
 
 def _is_due(
@@ -669,6 +816,24 @@ def _instant_timestamp(value: datetime) -> float:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("Schedule Service clock must be timezone-aware")
     return value.timestamp()
+
+
+def _new_dream_job(schedule: JobSchedule, *, now_ms: int) -> ScheduleJob:
+    if schedule.kind == "at":
+        raise ValueError("Dream Schedule Job must be recurring")
+    return ScheduleJob(
+        job_id=DREAM_JOB_ID,
+        source="system",
+        message="Internal Dream schedule.",
+        schedule=schedule,
+        created_at_ms=now_ms,
+        updated_at_ms=now_ms,
+    )
+
+
+def _is_memory_task_running(result: object) -> bool:
+    error = getattr(result, "error", None)
+    return isinstance(error, ErrorInfo) and error.code == "memory_task_running"
 
 
 def _local_time_exists(value: datetime, zone: ZoneInfo) -> bool:
