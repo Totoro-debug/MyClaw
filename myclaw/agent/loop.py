@@ -322,6 +322,8 @@ class AgentLoop:
         self._generation_started_at: float | None = None
         self._consumer_task: asyncio.Task[None] | None = None
         self._execution_task: asyncio.Task[None] | None = None
+        self._foreground_commit_gate = asyncio.Lock()
+        self._replacement_barrier_held = False
         self._schedule_tasks: set[asyncio.Task[None]] = set()
         self._aborted_tasks: set[asyncio.Task[Any]] = set()
         self._abort_task: asyncio.Task[None] | None = None
@@ -412,6 +414,31 @@ class AgentLoop:
             return
         self.preflight()
         self._activate_prepared()
+
+    async def _pause_for_replacement(self) -> None:
+        """Freeze new foreground admission and the final Session commit point."""
+        if self._replacement_barrier_held:
+            raise RuntimeError("Agent Loop replacement barrier is already held")
+        await self._bus.pause_inbound_delivery()
+        try:
+            await self._foreground_commit_gate.acquire()
+        except BaseException as error:
+            resume = asyncio.create_task(self._bus.resume_inbound_delivery())
+            try:
+                await await_task_preserving_cancellation(resume)
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+        self._replacement_barrier_held = True
+
+    async def _release_replacement_barrier(self, *, resume_inbound: bool) -> None:
+        """Release a barrier after rejection or after the target is published."""
+        if self._replacement_barrier_held:
+            self._replacement_barrier_held = False
+            self._foreground_commit_gate.release()
+        if resume_inbound:
+            resume = asyncio.create_task(self._bus.resume_inbound_delivery())
+            await await_task_preserving_cancellation(resume)
 
     def preflight(self) -> None:
         """Validate this generation synchronously without external side effects."""
@@ -1011,28 +1038,29 @@ class AgentLoop:
             metadata_updates = {"blackboard": encoded_blackboard}
             metadata_removals = ()
 
-        try:
-            if self._aborted:
+        async with self._foreground_commit_gate:
+            try:
+                if self._aborted:
+                    return False
+                active_session.append_messages(
+                    [deepcopy(current_user), *deepcopy(result.messages)],
+                    metadata_updates=metadata_updates,
+                    metadata_removals=metadata_removals,
+                    usage_delta=framing_result.usage_delta,
+                )
+            except Exception as failure:
+                _runtime_logger().opt(exception=failure).error(
+                    "Agent Run Session increment failed code=persistence_error type={}",
+                    type(failure).__name__,
+                )
+                await self._publish_commit_failure()
                 return False
-            active_session.append_messages(
-                [deepcopy(current_user), *deepcopy(result.messages)],
-                metadata_updates=metadata_updates,
-                metadata_removals=metadata_removals,
-                usage_delta=framing_result.usage_delta,
-            )
-        except Exception as failure:
-            _runtime_logger().opt(exception=failure).error(
-                "Agent Run Session increment failed code=persistence_error type={}",
-                type(failure).__name__,
-            )
-            await self._publish_commit_failure()
-            return False
-        try:
-            if self._aborted:
-                return False
-            active_session.persist()
-        except Exception:
-            pass
+            try:
+                if self._aborted:
+                    return False
+                active_session.persist()
+            except Exception:
+                pass
         await self._publish_terminal(result)
         return True
 

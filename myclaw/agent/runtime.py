@@ -572,22 +572,36 @@ class RuntimeHost:
             if self._closed:
                 raise ManagementError(ErrorInfo("route_unavailable", "Runtime Host is closed."))
             old = self._current_runtime()
-            if session_id == old.session_id:
-                await old.session.wait_for_pending_persist()
-            target = self._prepare_target(session_id)
-            if old.control.has_active_run and not force:
-                await target.abort(clear_inbound=False)
-                raise ManagementError(
-                    ErrorInfo(
-                        "model_invalid_request",
-                        "An active foreground run must be confirmed before switching Sessions.",
+            replacement_barrier_held = False
+            try:
+                await old.agent_loop._pause_for_replacement()
+                replacement_barrier_held = True
+                if session_id == old.session_id:
+                    await old.session.wait_for_pending_persist()
+                target = self._prepare_target(session_id)
+                if old.control.has_active_run and not force:
+                    try:
+                        await target.abort(clear_inbound=False)
+                    finally:
+                        await old.agent_loop._release_replacement_barrier(
+                            resume_inbound=True
+                        )
+                        replacement_barrier_held = False
+                    raise ManagementError(
+                        ErrorInfo(
+                            "model_invalid_request",
+                            "An active foreground run must be confirmed before switching Sessions.",
+                        )
                     )
-                )
 
-            replacement = asyncio.create_task(
-                self._commit_replacement(old, target)
-            )
-            await await_task_preserving_cancellation(replacement)
+                replacement = asyncio.create_task(self._commit_replacement(old, target))
+                replacement_barrier_held = False
+                await await_task_preserving_cancellation(replacement)
+            finally:
+                if replacement_barrier_held:
+                    await old.agent_loop._release_replacement_barrier(
+                        resume_inbound=True
+                    )
 
     async def _commit_replacement(
         self,
@@ -599,6 +613,7 @@ class RuntimeHost:
         quiesce: Callable[[], Awaitable[None]] | None = None
         bus_reset = False
         old_detached = False
+        replacement_succeeded = False
         try:
             old_detached = True
             self._management_available = False
@@ -606,17 +621,22 @@ class RuntimeHost:
             if quiesce is not None:
                 await quiesce()
             await old.schedule_service.pause_and_drain()
-            await old.abort()
+            await old.abort(clear_inbound=False)
             await self._bus.reset()
             bus_reset = True
-            self._runtime = target
             if rebind is None:
                 await target.start()
+                self._runtime = target
                 self._management_available = True
+                replacement_succeeded = True
+                await old.agent_loop._release_replacement_barrier(resume_inbound=True)
                 return
             await rebind(target.presentation)
             await target.start()
+            self._runtime = target
             self._management_available = True
+            replacement_succeeded = True
+            await old.agent_loop._release_replacement_barrier(resume_inbound=True)
         except BaseException as error:
             if old_detached:
                 self._management_available = False
@@ -647,6 +667,9 @@ class RuntimeHost:
             if old_cleanup_error is not None:
                 raise error from old_cleanup_error
             raise
+        finally:
+            if not replacement_succeeded:
+                await old.agent_loop._release_replacement_barrier(resume_inbound=False)
 
 
 def prepare_runtime(

@@ -552,6 +552,34 @@ async def test_blocked_inbound_get_resumes_when_a_message_arrives() -> None:
 
 
 @pytest.mark.asyncio
+async def test_paused_inbound_delivery_keeps_queued_work_unclaimed_until_resume() -> None:
+    bus = MessageBus()
+    message = InboundMessage(content="held for replacement")
+    await bus.pause_inbound_delivery()
+    getter_started = asyncio.Event()
+
+    async def get_inbound() -> InboundMessage:
+        getter_started.set()
+        return await bus.get_inbound()
+
+    getter = asyncio.create_task(get_inbound())
+
+    try:
+        await getter_started.wait()
+        await bus.put_inbound(message)
+
+        assert not getter.done()
+        assert await bus.inbound_snapshot() == (message,)
+
+        await bus.resume_inbound_delivery()
+        assert await getter is message
+    finally:
+        if not getter.done():
+            getter.cancel()
+            await asyncio.gather(getter, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_concurrent_inbound_puts_are_consumed_in_their_actual_admission_order() -> None:
     bus = MessageBus()
     snapshots: list[tuple[InboundMessage, ...]] = []

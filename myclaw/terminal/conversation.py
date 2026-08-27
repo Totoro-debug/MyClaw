@@ -46,7 +46,7 @@ from myclaw.agent.loop import (
 )
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.management.commands import MANAGEMENT_COMMANDS, RESUME_MANAGEMENT_COMMAND
-from myclaw.management.service import SessionListingEntry
+from myclaw.management.service import FatalManagementError, SessionListingEntry
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
 from myclaw.terminal.repl import ManagementDispatcher
@@ -1829,11 +1829,16 @@ class TerminalConversationApp(App[None]):
         self._confirmation_callback: Callable[[ConfirmationRequestView], None] | None = None
         self._confirmation_control: TerminalAgentLoopControl | None = None
         self._application_error: Exception | None = None
+        self._fatal_management_error: FatalManagementError | None = None
 
     def _handle_exception(self, error: Exception) -> None:
         if self._application_error is None:
             self._application_error = error
         super()._handle_exception(error)
+
+    @property
+    def fatal_management_error(self) -> FatalManagementError | None:
+        return self._fatal_management_error
 
     def _build_driver(
         self,
@@ -3012,6 +3017,10 @@ class TerminalConversationApp(App[None]):
                 force = True
             try:
                 result = await dispatcher.resume(session_id, force=force)
+            except FatalManagementError as fatal_error:
+                self._fatal_management_error = fatal_error
+                self.exit(return_code=1)
+                return
             except Exception:
                 await self._mount_management_rows(
                     _RESUME_MANAGEMENT_COMMAND_TOKEN,

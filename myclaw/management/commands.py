@@ -12,6 +12,7 @@ from myclaw.config.config import ConfigView
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.service import (
+    FatalManagementError,
     ManagementError,
     ResumeResult,
     RuntimeStatus,
@@ -195,6 +196,8 @@ class ManagementCommandDispatcher:
                 return self._unavailable_result()
             try:
                 result = await management.resume(session_id, force=force)
+            except FatalManagementError:
+                raise
             except ManagementError as management_error:
                 return ManagementCommandResult(
                     handled=True,

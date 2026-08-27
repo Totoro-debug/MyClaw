@@ -39,6 +39,7 @@ class MessageBus:
     def __init__(self) -> None:
         self._inbound: deque[InboundMessage] = deque()
         self._condition = asyncio.Condition()
+        self._inbound_delivery_paused = False
         self._inbound_changed_callback: Callable[[tuple[InboundMessage, ...]], None] | None = None
         self._outbound: deque[OutboundMessage] = deque()
 
@@ -56,13 +57,24 @@ class MessageBus:
 
     async def get_inbound(self) -> InboundMessage:
         async with self._condition:
-            while not self._inbound:
+            while not self._inbound or self._inbound_delivery_paused:
                 await self._condition.wait()
             message = self._inbound.popleft()
             snapshot = tuple(self._inbound)
             callback = self._inbound_changed_callback
         self._invoke_inbound_changed_callback(callback, snapshot)
         return message
+
+    async def pause_inbound_delivery(self) -> None:
+        """Linearize a replacement before another consumer can claim Inbound work."""
+        async with self._condition:
+            self._inbound_delivery_paused = True
+
+    async def resume_inbound_delivery(self) -> None:
+        """Allow the active generation to claim queued Inbound work again."""
+        async with self._condition:
+            self._inbound_delivery_paused = False
+            self._condition.notify_all()
 
     async def drain_inbound(self) -> tuple[InboundMessage, ...]:
         async with self._condition:

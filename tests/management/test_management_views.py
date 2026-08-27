@@ -13,6 +13,7 @@ from myclaw.management.service import (
     RuntimeStatus,
     RuntimeStatusInput,
     RuntimeStatusService,
+    SessionListingEntry,
 )
 from myclaw.memory.dream import DreamResult
 from myclaw.memory.manager import MemoryManager
@@ -517,6 +518,69 @@ async def test_generation_sensitive_views_snapshot_each_current_provider_once(
     assert raised.value.error.code == "model_invalid_request"
     assert current_loop_calls == 4
     assert replacements == [(target.session_id, True)]
+
+
+@pytest.mark.asyncio
+async def test_resume_prepares_before_loading_resumable_sessions(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=agent_home)
+    target = Session.create(
+        state,
+        now=lambda: CREATED_AT,
+        new_uuid=iter((SESSION_UUID,)).__next__,
+    )
+    target.add_message("user", "Resume target")
+    target.close()
+    loop = _StatusProjectionLoop(
+        RuntimeStatusInput(
+            system_prompt="current",
+            retained_messages=(),
+            tool_definitions=(),
+            runtime_context="",
+        )
+    )
+    events: list[str] = []
+
+    async def prepare_session_resume(session_id: str) -> None:
+        assert session_id == target.session_id
+        events.append("prepare")
+
+    async def load_resumable_sessions() -> tuple[SessionListingEntry, ...]:
+        events.append("session_load")
+        return (
+            SessionListingEntry(
+                id=target.session_id,
+                title="Resume target",
+                created_at=target.created_at,
+                updated_at=target.updated_at,
+                message_count=len(target.messages),
+            ),
+        )
+
+    async def replace_agent_loop(session_id: str, force: bool) -> None:
+        assert session_id == target.session_id
+        assert force is False
+        events.append("replace")
+
+    service = ManagementViewService(
+        home,
+        current_agent_loop=lambda: loop,
+        workspace_state=state,
+        replace_agent_loop=replace_agent_loop,
+        prepare_session_resume=prepare_session_resume,
+    )
+    monkeypatch.setattr(service, "resumable_sessions", load_resumable_sessions)
+
+    result = await service.resume(target.session_id)
+
+    assert result.session_id == target.session_id
+    assert events == ["prepare", "session_load", "replace"]
 
 
 @pytest.mark.asyncio

@@ -40,7 +40,9 @@ from myclaw.agent.runtime import (
 )
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
+from myclaw.errors import ErrorInfo
 from myclaw.management.commands import ManagementCommandResult
+from myclaw.management.service import FatalManagementError
 from myclaw.provider.models import (
     ModelCompleted,
     ModelContinuation,
@@ -5995,6 +5997,51 @@ async def test_unexpected_resume_exception_preserves_session_display_and_interac
         assert "Must remain hidden after an exception." not in visible_text
         assert "Session resume failed." in failure_text
         assert "private failure detail" not in failure_text
+
+
+@pytest.mark.asyncio
+async def test_fatal_resume_failure_exits_terminal_without_rendering_raw_error(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _RuntimeProvider(())
+    runtime = _generation_host(agent_home, workspace, provider)
+    target = Session.create(
+        runtime.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    target.update_metadata(title="Fatal target")
+    target.add_message("user", "Must not be rendered after fatal replacement failure.")
+    target.close()
+    fatal = FatalManagementError(
+        ErrorInfo("persistence_error", "Runtime Session replacement could not be completed.")
+    )
+
+    async def failing_resume(
+        session_id: str,
+        *,
+        force: bool = False,
+    ) -> ManagementCommandResult:
+        del session_id, force
+        raise fatal
+
+    monkeypatch.setattr(runtime.management_dispatcher, "resume", failing_resume)
+    app = _terminal_app(runtime)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while app.is_running:
+                await pilot.pause()
+
+        assert not app.is_running
+        assert app.fatal_management_error is fatal
+        assert "Must not be rendered after fatal replacement failure." not in _visible_screen_text(app)
 
 
 @pytest.mark.asyncio

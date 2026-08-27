@@ -213,6 +213,10 @@ class ManagementError(Exception):
         super().__init__(error.message)
 
 
+class FatalManagementError(ManagementError):
+    """A safe Management error that must terminate the owning application."""
+
+
 class ManagementViewService:
     """Read global configuration and dynamically selected runtime-owned views."""
 
@@ -225,6 +229,7 @@ class ManagementViewService:
         workspace_state: WorkspaceState | None = None,
         replace_agent_loop: Callable[[str, bool], Awaitable[None]] | None = None,
         replace_session: Callable[[str, bool], Awaitable[None]] | None = None,
+        prepare_session_resume: Callable[[str], Awaitable[None]] | None = None,
         now: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = monotonic,
         memory_manager: _MemoryReader | None = None,
@@ -252,6 +257,7 @@ class ManagementViewService:
         self._replace_agent_loop = (
             replace_agent_loop if replace_agent_loop is not None else replace_session
         )
+        self._prepare_session_resume = prepare_session_resume
         self._now = now
         if memory_manager is not None and current_memory_manager is not None:
             raise TypeError("Specify either memory_manager or current_memory_manager")
@@ -406,6 +412,9 @@ class ManagementViewService:
         replace_agent_loop = self._replace_agent_loop
         if workspace_state is None or replace_agent_loop is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
+        prepare_session_resume = self._prepare_session_resume
+        if prepare_session_resume is not None:
+            await prepare_session_resume(session_id)
         sessions = await self.resumable_sessions()
         if session_id not in {summary.id for summary in sessions}:
             raise ManagementError(

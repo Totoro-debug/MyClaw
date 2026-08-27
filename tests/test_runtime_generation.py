@@ -980,8 +980,12 @@ async def test_generation_replacement_finishes_atomically_when_waiter_is_cancell
     original_drain = runtime_module.PreparedRuntime._drain_aborted_memory
     original_start = runtime_module.PreparedRuntime.start
 
-    async def gated_drain(active: runtime_module.PreparedRuntime) -> None:
-        await original_drain(active)
+    async def gated_drain(
+        active: runtime_module.PreparedRuntime,
+        *,
+        clear_inbound: bool = True,
+    ) -> None:
+        await original_drain(active, clear_inbound=clear_inbound)
         if active is old:
             drain_started.set()
             await release_drain.wait()
@@ -996,7 +1000,9 @@ async def test_generation_replacement_finishes_atomically_when_waiter_is_cancell
 
     async def rebind(presentation: RuntimeGenerationPresentation) -> None:
         events.append("rebind")
-        assert presentation.control is host.control
+        assert presentation.control is not host.control
+        status = await host.management_dispatcher.dispatch("/status")
+        assert status.output == "route_unavailable: Runtime Generation is unavailable."
         rebind_started.set()
         await release_rebind.wait()
 
@@ -1218,8 +1224,10 @@ async def test_runtime_handoff_preserves_lifetime_seams_and_starts_target_after_
         assert isinstance(presentation, runtime_module.RuntimeGenerationPresentation)
         assert host.bus is shared_bus
         assert host.management_dispatcher is shared_dispatcher
-        assert presentation.control is host.control
+        assert presentation.control is not host.control
         assert presentation.control is not old_control
+        status = await host.management_dispatcher.dispatch("/status")
+        assert status.output == "route_unavailable: Runtime Generation is unavailable."
         assert presentation.session_projection.session_id == target.session_id
         assert tuple(shared_bus._outbound) == ()
 

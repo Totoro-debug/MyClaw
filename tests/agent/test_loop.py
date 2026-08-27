@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Literal, cast
 from uuid import uuid4
 
@@ -559,6 +560,58 @@ async def test_agent_loop_failed_activation_does_not_publish_or_duplicate_consum
     await loop.start()
     assert loop._consumer_task is consumer
     assert monotonic_calls == 2
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_replacement_barrier_blocks_a_late_foreground_commit_until_released(
+    tmp_path: Path,
+) -> None:
+    class ObservableCommitLock(asyncio.Lock):
+        def __init__(self) -> None:
+            super().__init__()
+            self.acquire_attempted = asyncio.Event()
+            self.commit_completed = asyncio.Event()
+
+        async def acquire(self) -> Literal[True]:
+            self.acquire_attempted.set()
+            return await super().acquire()
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> None:
+            del exc_type, exc, tb
+            self.release()
+            self.commit_completed.set()
+
+    router = _ConcurrentTitleRouter()
+    loop, session = _runtime(tmp_path, router)
+    commit_gate = ObservableCommitLock()
+    loop._foreground_commit_gate = commit_gate
+    session.add_message("user", "Existing turn suppresses title work.")
+    initial_messages = tuple(session.messages)
+    await loop.start()
+    await loop._bus.put_inbound(InboundMessage(content="late foreground"))
+    await asyncio.wait_for(router.chat_started.wait(), timeout=1)
+
+    await loop._pause_for_replacement()
+    commit_gate.acquire_attempted.clear()
+    router.release_chat.set()
+    await asyncio.wait_for(commit_gate.acquire_attempted.wait(), timeout=1)
+
+    assert tuple(session.messages) == initial_messages
+    assert loop.control.has_active_run
+
+    await loop._release_replacement_barrier(resume_inbound=True)
+    await asyncio.wait_for(commit_gate.commit_completed.wait(), timeout=1)
+
+    assert [message["content"] for message in session.messages if message["role"] == "user"] == [
+        "Existing turn suppresses title work.",
+        "late foreground",
+    ]
     await loop.close()
 
 
