@@ -38,26 +38,26 @@ class OutboundMessage:
 class MessageBus:
     def __init__(self) -> None:
         self._inbound: deque[InboundMessage] = deque()
-        self._inbound_condition = asyncio.Condition()
+        self._condition = asyncio.Condition()
         self._inbound_changed_callback: Callable[[tuple[InboundMessage, ...]], None] | None = None
-        self._outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+        self._outbound: deque[OutboundMessage] = deque()
 
     async def inbound_snapshot(self) -> tuple[InboundMessage, ...]:
-        async with self._inbound_condition:
+        async with self._condition:
             return tuple(self._inbound)
 
     async def put_inbound(self, message: InboundMessage) -> None:
-        async with self._inbound_condition:
+        async with self._condition:
             self._inbound.append(message)
             snapshot = tuple(self._inbound)
             callback = self._inbound_changed_callback
-            self._inbound_condition.notify()
+            self._condition.notify_all()
         self._invoke_inbound_changed_callback(callback, snapshot)
 
     async def get_inbound(self) -> InboundMessage:
-        async with self._inbound_condition:
+        async with self._condition:
             while not self._inbound:
-                await self._inbound_condition.wait()
+                await self._condition.wait()
             message = self._inbound.popleft()
             snapshot = tuple(self._inbound)
             callback = self._inbound_changed_callback
@@ -65,7 +65,7 @@ class MessageBus:
         return message
 
     async def drain_inbound(self) -> tuple[InboundMessage, ...]:
-        async with self._inbound_condition:
+        async with self._condition:
             messages = tuple(self._inbound)
             self._inbound.clear()
             snapshot = tuple(self._inbound)
@@ -74,21 +74,30 @@ class MessageBus:
         return messages
 
     async def put_outbound(self, message: OutboundMessage) -> None:
-        await self._outbound.put(message)
+        async with self._condition:
+            self._outbound.append(message)
+            self._condition.notify_all()
 
     async def get_outbound(self) -> OutboundMessage:
-        return await self._outbound.get()
+        async with self._condition:
+            while not self._outbound:
+                await self._condition.wait()
+            return self._outbound.popleft()
+
+    async def reset(self) -> None:
+        """Atomically discard pending Inbound and Outbound messages."""
+        async with self._condition:
+            self._inbound.clear()
+            self._outbound.clear()
+            callback = self._inbound_changed_callback
+            self._condition.notify_all()
+        self._invoke_inbound_changed_callback(callback, ())
 
     def set_inbound_changed_callback(
         self,
         callback: Callable[[tuple[InboundMessage, ...]], None] | None,
     ) -> None:
         self._inbound_changed_callback = callback
-
-    def _detach_inbound(self) -> None:
-        """Discard owner-held input without adding a Message Bus lifecycle state."""
-        self._inbound.clear()
-        self._inbound_changed_callback = None
 
     @staticmethod
     def _invoke_inbound_changed_callback(

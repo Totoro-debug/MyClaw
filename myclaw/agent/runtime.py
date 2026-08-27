@@ -200,6 +200,7 @@ class PreparedRuntime:
 
     async def _drain_aborted_memory(self) -> None:
         await asyncio.gather(
+            self.agent_loop._bus.drain_inbound(),
             self._dream.abort_and_wait(),
             self.schedule_service.abort_and_wait(),
         )

@@ -347,7 +347,7 @@ class AgentLoop:
         self._closing = True
         self._cancel_pending_confirmation()
         self._confirmation_callback = None
-        self._bus._detach_inbound()
+        self._bus.set_inbound_changed_callback(None)
 
         for task in (self._consumer_task, self._execution_task):
             self._retain_aborted_task(task)

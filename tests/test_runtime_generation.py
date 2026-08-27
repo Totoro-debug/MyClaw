@@ -659,6 +659,34 @@ async def test_runtime_abort_drains_active_dream_and_schedule_service(
 
 
 @pytest.mark.asyncio
+async def test_runtime_abort_drains_only_inbound_after_unbinding_its_callback(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    runtime = host.generation
+    bus = runtime.bus
+    observed: list[tuple[InboundMessage, ...]] = []
+    bus.set_inbound_changed_callback(observed.append)
+    pending_inbound = InboundMessage(content="discard pending input")
+    completed_outbound = OutboundMessage(
+        type="model_response",
+        content="preserve completed response",
+        metadata={"_streamed": True},
+    )
+    await bus.put_inbound(pending_inbound)
+    await bus.put_outbound(completed_outbound)
+    observed.clear()
+
+    await runtime.abort()
+
+    assert await bus.inbound_snapshot() == ()
+    assert observed == []
+    assert await bus.get_outbound() is completed_outbound
+    await host.close()
+
+
+@pytest.mark.asyncio
 async def test_generation_replacement_finishes_atomically_when_waiter_is_cancelled(
     agent_home: Path,
     workspace: Path,
