@@ -193,6 +193,7 @@ class AgentLoop:
         schedule_now: Callable[[], datetime] | None = None,
         title_prompt: str | None = None,
         externalize_result_for: ResultExternalizerFactory | None = None,
+        bus: MessageBus | None = None,
     ) -> None:
         if not isinstance(workspace, Path):
             raise TypeError("Agent Loop requires a Path")
@@ -229,7 +230,9 @@ class AgentLoop:
         self._model_router = model_router
         self._runner = AgentRunner(model_router)
         self._max_iterations = max_iterations
-        self._bus = MessageBus()
+        if bus is not None and not isinstance(bus, MessageBus):
+            raise TypeError("Agent Loop requires a Message Bus")
+        self._bus = MessageBus() if bus is None else bus
         self._consumer_task: asyncio.Task[None] | None = None
         self._execution_task: asyncio.Task[None] | None = None
         self._aborted_tasks: set[asyncio.Task[Any]] = set()
@@ -298,6 +301,11 @@ class AgentLoop:
             raise TypeError("confirmation callback must be callable")
         self._confirmation_callback = callback
 
+    def unbind_confirmation_callback(self, callback: ConfirmationCallback) -> None:
+        """Clear a callback only when it is still bound to this control surface."""
+        if self._confirmation_callback is callback:
+            self._confirmation_callback = None
+
     async def start(self) -> None:
         self._prepare_start()
         self._activate_prepared()
@@ -347,7 +355,6 @@ class AgentLoop:
         self._closing = True
         self._cancel_pending_confirmation()
         self._confirmation_callback = None
-        self._bus.set_inbound_changed_callback(None)
 
         for task in (self._consumer_task, self._execution_task):
             self._retain_aborted_task(task)
@@ -382,6 +389,12 @@ class AgentLoop:
                 "Aborted Agent Loop task failed type={}",
                 type(error).__name__,
             )
+
+    async def _wait_for_abort(self) -> None:
+        """Wait until every detached generation task has reached a terminal state."""
+        tasks = tuple(self._aborted_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _close_sessions(self) -> None:
         """Close the foreground Session during normal awaited Runtime shutdown."""

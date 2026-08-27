@@ -1,13 +1,16 @@
+import asyncio
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
 
 import myclaw.terminal.cli as cli
+from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runtime import SkillContextTooLargeError
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
@@ -19,6 +22,327 @@ from tests.configuration.test_config import (
     REDACTION_CONFIG,
     VALID_CONFIG,
 )
+
+
+@pytest.mark.asyncio
+async def test_composition_driver_owns_runtime_lifecycle_outside_terminal_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeApp:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            events.append("app_init")
+
+        async def quiesce_for_rebind(self) -> None:
+            events.append("quiesce")
+
+        async def rebind_agent_loop(self, **kwargs: object) -> None:
+            del kwargs
+            events.append("rebind")
+
+        async def run_async(self) -> None:
+            events.append("app_run")
+
+    class FakeRuntime:
+        bus = object()
+        control = object()
+        management_dispatcher = object()
+        presentation = SimpleNamespace(control=control, skill_metadata=())
+
+        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
+            del rebind, quiesce
+            events.append("bind")
+
+        def unbind_terminal(self, rebind: object) -> None:
+            del rebind
+            events.append("unbind")
+
+        async def start(self) -> None:
+            events.append("start")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
+
+    await cli._run_runtime_conversation(FakeRuntime())  # type: ignore[arg-type]
+
+    assert events == ["app_init", "bind", "start", "app_run", "unbind", "close"]
+
+
+@pytest.mark.asyncio
+async def test_composition_driver_closes_runtime_when_initial_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeApp:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            events.append("app_init")
+
+        async def quiesce_for_rebind(self) -> None:
+            events.append("quiesce")
+
+        async def rebind_agent_loop(self, **kwargs: object) -> None:
+            del kwargs
+            events.append("rebind")
+
+        async def run_async(self) -> None:
+            events.append("app_run")
+
+    class FakeRuntime:
+        bus = object()
+        control = object()
+        management_dispatcher = object()
+        presentation = SimpleNamespace(control=control, skill_metadata=())
+
+        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
+            del rebind, quiesce
+            events.append("bind")
+
+        def unbind_terminal(self, rebind: object) -> None:
+            del rebind
+            events.append("unbind")
+
+        async def start(self) -> None:
+            events.append("start")
+            raise RuntimeError("initial runtime startup failed")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
+
+    with pytest.raises(RuntimeError, match="initial runtime startup failed"):
+        await cli._run_runtime_conversation(FakeRuntime())  # type: ignore[arg-type]
+
+    assert events == ["app_init", "bind", "start", "unbind", "close"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ("app_init", "bind"))
+async def test_composition_driver_closes_runtime_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    events: list[str] = []
+
+    class FakeApp:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            events.append("app_init")
+            if failure_point == "app_init":
+                raise RuntimeError("application setup failed")
+
+        async def quiesce_for_rebind(self) -> None:
+            raise AssertionError("quiesce must not run")
+
+        async def rebind_agent_loop(self, **kwargs: object) -> None:
+            del kwargs
+            raise AssertionError("rebind must not run")
+
+        async def run_async(self) -> None:
+            raise AssertionError("application must not run")
+
+    class FakeRuntime:
+        bus = object()
+        control = object()
+        management_dispatcher = object()
+        presentation = SimpleNamespace(control=control, skill_metadata=())
+
+        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
+            del rebind, quiesce
+            events.append("bind")
+            raise RuntimeError("terminal binding failed")
+
+        def unbind_terminal(self, rebind: object) -> None:
+            del rebind
+            events.append("unbind")
+
+        async def start(self) -> None:
+            events.append("start")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
+
+    expected = "application setup failed" if failure_point == "app_init" else "terminal binding failed"
+    with pytest.raises(RuntimeError, match=expected):
+        await cli._run_runtime_conversation(FakeRuntime())  # type: ignore[arg-type]
+
+    prefix = ["app_init"] if failure_point == "app_init" else ["app_init", "bind"]
+    assert events == [*prefix, "close"]
+
+
+@pytest.mark.asyncio
+async def test_composition_driver_closes_once_when_application_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeApp:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            events.append("app_init")
+
+        async def quiesce_for_rebind(self) -> None:
+            events.append("quiesce")
+
+        async def rebind_agent_loop(self, **kwargs: object) -> None:
+            del kwargs
+
+        async def run_async(self) -> None:
+            events.append("app_run")
+            raise asyncio.CancelledError()
+
+    class FakeRuntime:
+        bus = object()
+        control = object()
+        management_dispatcher = object()
+        presentation = SimpleNamespace(control=control, skill_metadata=())
+
+        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
+            del rebind, quiesce
+            events.append("bind")
+
+        def unbind_terminal(self, rebind: object) -> None:
+            del rebind
+            events.append("unbind")
+
+        async def start(self) -> None:
+            events.append("start")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
+
+    with pytest.raises(asyncio.CancelledError):
+        await cli._run_runtime_conversation(FakeRuntime())  # type: ignore[arg-type]
+
+    assert events == ["app_init", "bind", "start", "app_run", "unbind", "close"]
+    assert events.count("close") == 1
+
+
+@pytest.mark.asyncio
+async def test_composition_driver_preserves_messages_queued_before_app_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    bus = MessageBus()
+    inbound = InboundMessage(content="queued before mount")
+    outbound = OutboundMessage(type="model_response", content="queued before mount")
+    mounted_snapshot: tuple[InboundMessage, ...] | None = None
+    mounted_outbound: OutboundMessage | None = None
+
+    class FakeApp:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs["bus"] is bus
+
+        async def quiesce_for_rebind(self) -> None:
+            return
+
+        async def rebind_agent_loop(self, **kwargs: object) -> None:
+            del kwargs
+
+        async def run_async(self) -> None:
+            nonlocal mounted_snapshot, mounted_outbound
+            events.append("mount")
+            mounted_snapshot = await bus.inbound_snapshot()
+            mounted_outbound = await bus.get_outbound()
+
+    class FakeRuntime:
+        control = object()
+        management_dispatcher = object()
+        presentation = SimpleNamespace(control=control, skill_metadata=())
+
+        @property
+        def bus(self) -> MessageBus:
+            return bus
+
+        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
+            del rebind, quiesce
+
+        def unbind_terminal(self, rebind: object) -> None:
+            del rebind
+
+        async def start(self) -> None:
+            events.append("start")
+            await bus.put_inbound(inbound)
+            await bus.put_outbound(outbound)
+
+        async def close(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
+
+    await cli._run_runtime_conversation(FakeRuntime())  # type: ignore[arg-type]
+
+    assert events == ["start", "mount", "close"]
+    assert mounted_snapshot == (inbound,)
+    assert mounted_outbound is outbound
+
+
+@pytest.mark.asyncio
+async def test_composition_driver_retrieves_close_task_that_emits_after_app_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bus = MessageBus()
+    close_calls = 0
+
+    class FakeApp:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        async def quiesce_for_rebind(self) -> None:
+            return
+
+        async def rebind_agent_loop(self, **kwargs: object) -> None:
+            del kwargs
+
+        async def run_async(self) -> None:
+            return
+
+    class FakeRuntime:
+        control = object()
+        management_dispatcher = object()
+        presentation = SimpleNamespace(control=control, skill_metadata=())
+
+        @property
+        def bus(self) -> MessageBus:
+            return bus
+
+        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
+            del rebind, quiesce
+
+        def unbind_terminal(self, rebind: object) -> None:
+            del rebind
+
+        async def start(self) -> None:
+            return
+
+        async def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+            async def emit() -> None:
+                await bus.put_outbound(
+                    OutboundMessage(type="system_control", content="closed")
+                )
+
+            await asyncio.create_task(emit(), name="close-outbound")
+
+    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
+
+    await cli._run_runtime_conversation(FakeRuntime())  # type: ignore[arg-type]
+
+    assert close_calls == 1
+    assert (await bus.get_outbound()).content == "closed"
+    assert all(task.get_name() != "close-outbound" for task in asyncio.all_tasks())
 
 
 @pytest.mark.parametrize(
@@ -55,11 +379,11 @@ def test_cli_reports_runtime_skill_startup_failures_without_starting_conversatio
         del args, kwargs
         raise failure
 
-    def record_conversation(runtime: object) -> None:
+    async def record_conversation(runtime: object) -> None:
         conversation_calls.append(runtime)
 
     monkeypatch.setattr(cli, "RuntimeHost", fail_runtime)
-    monkeypatch.setattr(cli, "run_terminal_conversation", record_conversation)
+    monkeypatch.setattr(cli, "_run_runtime_conversation", record_conversation)
     monkeypatch.chdir(workspace)
 
     result = CliRunner().invoke(cli.app, [])

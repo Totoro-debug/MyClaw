@@ -99,6 +99,14 @@ class MessageBus:
     ) -> None:
         self._inbound_changed_callback = callback
 
+    def unbind_inbound_changed_callback(
+        self,
+        callback: Callable[[tuple[InboundMessage, ...]], None],
+    ) -> None:
+        """Clear only the callback still owned by the caller."""
+        if self._inbound_changed_callback is callback:
+            self._inbound_changed_callback = None
+
     @staticmethod
     def _invoke_inbound_changed_callback(
         callback: Callable[[tuple[InboundMessage, ...]], None] | None,

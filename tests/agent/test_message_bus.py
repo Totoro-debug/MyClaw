@@ -498,6 +498,26 @@ async def test_inbound_callback_can_be_replaced_or_cleared() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inbound_callback_unbind_is_identity_safe() -> None:
+    bus = MessageBus()
+    first_observed: list[tuple[InboundMessage, ...]] = []
+    second_observed: list[tuple[InboundMessage, ...]] = []
+    first_callback = first_observed.append
+    second_callback = second_observed.append
+    message = InboundMessage(content="still bound")
+
+    bus.set_inbound_changed_callback(first_callback)
+    bus.set_inbound_changed_callback(second_callback)
+    bus.unbind_inbound_changed_callback(first_callback)
+    await bus.put_inbound(message)
+    bus.unbind_inbound_changed_callback(second_callback)
+    await bus.drain_inbound()
+
+    assert first_observed == []
+    assert second_observed == [(message,)]
+
+
+@pytest.mark.asyncio
 async def test_callback_failure_is_logged_and_does_not_roll_back_queue_state() -> None:
     bus = MessageBus()
 

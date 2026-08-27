@@ -140,6 +140,49 @@ def test_terminal_depends_on_ports_instead_of_tool_implementations() -> None:
     assert violations == []
 
 
+def test_agent_modules_do_not_depend_on_terminal_presentation() -> None:
+    violations = [
+        f"{path.relative_to(PROJECT_ROOT)}:{line} imports {module}"
+        for path in _python_files(PACKAGE_ROOT / "agent")
+        for module, line in _imports(path)
+        if module == "myclaw.terminal" or module.startswith("myclaw.terminal.")
+    ]
+
+    assert violations == []
+
+
+def test_terminal_conversation_lifecycle_has_no_business_lifecycle_calls() -> None:
+    path = PACKAGE_ROOT / "terminal" / "conversation.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    app = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "TerminalConversationApp"
+    )
+    lifecycle_methods = {"__init__", "on_mount", "on_unmount", "rebind_agent_loop"}
+    business_calls = {
+        "abort",
+        "abort_and_wait",
+        "close",
+        "drain_inbound",
+        "drain_outbound",
+        "reset",
+        "start",
+    }
+    violations = [
+        f"{path.relative_to(PROJECT_ROOT)}:{call.lineno} calls {call.func.attr}"
+        for method in app.body
+        if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and method.name in lifecycle_methods
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in business_calls
+    ]
+
+    assert violations == []
+
+
 def test_package_initializers_do_not_create_aggregate_import_entries() -> None:
     violations: list[str] = []
     for path in _python_files(PACKAGE_ROOT):

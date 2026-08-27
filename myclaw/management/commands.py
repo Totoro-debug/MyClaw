@@ -9,6 +9,7 @@ from typing import Protocol
 from loguru import logger
 
 from myclaw.config.config import ConfigView
+from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.service import (
     ManagementError,
@@ -78,7 +79,16 @@ class ManagementCommandDispatcher:
     """Dispatch exact built-in commands without entering conversation flow."""
 
     def __init__(self, management: ManagementPort) -> None:
+        self._management: ManagementPort | None = management
+
+    def _rebind_management(self, management: ManagementPort) -> None:
+        """Switch the lifetime dispatcher to the prepared generation port."""
         self._management = management
+
+    def _unbind_management(self, management: ManagementPort) -> None:
+        """Enter a safe empty state only if this generation is still selected."""
+        if self._management is management:
+            self._management = None
 
     async def dispatch(self, command: str) -> ManagementCommandResult:
         """Return rendered output for a recognized Management Command."""
@@ -86,15 +96,19 @@ class ManagementCommandDispatcher:
             parsed_command = _MANAGEMENT_COMMAND_BY_TOKEN.get(command)
             if parsed_command is None:
                 return ManagementCommandResult(handled=False, output=None)
-            return await self._dispatch(parsed_command)
+            management = self._management
+            if management is None:
+                return self._unavailable_result()
+            return await self._dispatch(parsed_command, management)
 
     async def _dispatch(
         self,
         command: ManagementCommandDefinition,
+        management: ManagementPort,
     ) -> ManagementCommandResult:
         if command is RESUME_MANAGEMENT_COMMAND:
             try:
-                listing = await self._management.resumable_listing()
+                listing = await management.resumable_listing()
             except ManagementError as management_error:
                 return ManagementCommandResult(
                     handled=True,
@@ -126,14 +140,14 @@ class ManagementCommandDispatcher:
             )
         if command is _STATUS_COMMAND:
             try:
-                status = await self._management.status()
+                status = await management.status()
                 output = json.dumps(status.to_dict(), ensure_ascii=False, indent=2)
             except ManagementError as management_error:
                 output = f"{management_error.error.code}: {management_error.error.message}"
             return ManagementCommandResult(handled=True, output=output)
         if command is _MEMORY_COMMAND:
             try:
-                output = await self._management.memory_view()
+                output = await management.memory_view()
             except ManagementError as management_error:
                 output = f"{management_error.error.code}: {management_error.error.message}"
             return ManagementCommandResult(
@@ -142,7 +156,7 @@ class ManagementCommandDispatcher:
             )
         if command is _DREAM_COMMAND:
             try:
-                result = await self._management.dream()
+                result = await management.dream()
             except ManagementError as management_error:
                 output = f"{management_error.error.code}: {management_error.error.message}"
             else:
@@ -164,7 +178,7 @@ class ManagementCommandDispatcher:
         if command is not _CONFIG_COMMAND:
             raise RuntimeError(f"Supported Management Command has no handler: {command}")
         try:
-            view = await self._management.config_view()
+            view = await management.config_view()
         except ManagementError as management_error:
             return ManagementCommandResult(
                 handled=True,
@@ -180,8 +194,11 @@ class ManagementCommandDispatcher:
 
     async def resume(self, session_id: str, *, force: bool = False) -> ManagementCommandResult:
         with without_session_log():
+            management = self._management
+            if management is None:
+                return self._unavailable_result()
             try:
-                result = await self._management.resume(session_id, force=force)
+                result = await management.resume(session_id, force=force)
             except ManagementError as management_error:
                 return ManagementCommandResult(
                     handled=True,
@@ -199,3 +216,11 @@ class ManagementCommandDispatcher:
                     output=output,
                     resumed_session_id=result.session_id,
                 )
+
+    @staticmethod
+    def _unavailable_result() -> ManagementCommandResult:
+        error = ErrorInfo("route_unavailable", "Runtime Generation is unavailable.")
+        return ManagementCommandResult(
+            handled=True,
+            output=f"{error.code}: {error.message}",
+        )

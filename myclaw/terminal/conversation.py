@@ -7,7 +7,7 @@ import re
 import sys
 from asyncio import CancelledError, Event, Task, create_task, sleep
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -39,9 +39,12 @@ from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 from textual.worker import Worker, WorkerError
 
-from myclaw.agent.loop import ConfirmationRequestView, TerminalAgentLoopControl
+from myclaw.agent.loop import (
+    ConfirmationRequestView,
+    ForegroundConversationProjection,
+    TerminalAgentLoopControl,
+)
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
-from myclaw.agent.runtime import PreparedRuntime, RuntimeBindings, RuntimeHost
 from myclaw.management.commands import MANAGEMENT_COMMANDS, RESUME_MANAGEMENT_COMMAND
 from myclaw.management.service import SessionListingEntry
 from myclaw.skills.catalog import SkillMetadata
@@ -1484,7 +1487,7 @@ class _MessageBusRunProjection:
         await self._reconcile_terminal()
 
     async def _reconcile_terminal(self) -> None:
-        if self._app._closing:
+        if self._app._closing or self._app._presentation_quiesced:
             return
         if self._outcome == "completed":
             if self._terminal_content:
@@ -1602,6 +1605,21 @@ class TerminalConversationApp(App[None]):
             self.request = request
             self.bound_control = control
             self.bound_bus = bus
+
+    class InboundSnapshotChanged(Message):
+        def __init__(
+            self,
+            bus: MessageBus,
+            snapshot: tuple[InboundMessage, ...],
+            *,
+            promote_removed: bool,
+            callback: Callable[[tuple[InboundMessage, ...]], None],
+        ) -> None:
+            super().__init__()
+            self.bus = bus
+            self.snapshot = snapshot
+            self.promote_removed = promote_removed
+            self.callback = callback
 
     CSS = """
     Screen {
@@ -1775,23 +1793,15 @@ class TerminalConversationApp(App[None]):
         bus: MessageBus,
         control: TerminalAgentLoopControl,
         management_dispatcher: ManagementDispatcher | None,
-        start_runtime: Callable[[], Awaitable[None]],
-        close_runtime: Callable[[], Awaitable[None]],
         monotonic: Callable[[], float] = monotonic_now,
-        runtime_host: RuntimeHost | None = None,
         skill_metadata: tuple[SkillMetadata, ...] = (),
     ) -> None:
         super().__init__()
-        self._runtime_host = runtime_host
-        self._runtime_rebind_callback = self._rebind_runtime
         self._skill_metadata = tuple(skill_metadata)
         self._bus = bus
         self._control = control
         self._management_dispatcher = management_dispatcher
-        self._start_runtime = start_runtime
-        self._close_runtime = close_runtime
         self._monotonic = monotonic
-        self._runtime_started = False
         self._size_insufficient = False
         self._driver_mode_started = False
         self._driver_mode_stopped = True
@@ -1813,6 +1823,11 @@ class TerminalConversationApp(App[None]):
         self._completion_options: tuple[_CompletionCandidate, ...] = ()
         self._completion_dismissed_text: str | None = None
         self._closing = False
+        self._presentation_quiesced = False
+        self._bus_callback: Callable[[tuple[InboundMessage, ...]], None] | None = None
+        self._bus_callback_bus: MessageBus | None = None
+        self._confirmation_callback: Callable[[ConfirmationRequestView], None] | None = None
+        self._confirmation_control: TerminalAgentLoopControl | None = None
         self._application_error: Exception | None = None
 
     def _handle_exception(self, error: Exception) -> None:
@@ -1940,13 +1955,9 @@ class TerminalConversationApp(App[None]):
         )
 
     async def on_mount(self) -> None:
-        self._runtime_started = True
-        if self._runtime_host is not None:
-            self._runtime_host.bind_terminal(self._runtime_rebind_callback)
         self._bind_bus_callback(self._bus)
         self._bus_snapshot = await self._bus.inbound_snapshot()
         self._bind_confirmation_callback(self._control, self._bus)
-        await self._start_runtime()
         self._outbound_worker = self.run_worker(
             self._consume_outbound(),
             name="conversation-outbound",
@@ -1966,9 +1977,8 @@ class TerminalConversationApp(App[None]):
         session_switch_result = self._session_switch_result
         if session_switch_result is not None and not session_switch_result.done():
             session_switch_result.cancel()
-        if self._runtime_host is not None:
-            self._runtime_host.unbind_terminal(self._runtime_rebind_callback)
-        self._bus.set_inbound_changed_callback(None)
+        self._unbind_confirmation_callback(self._control)
+        self._unbind_bus_callback(self._bus)
         projection = self._active_run_projection
         self._active_run_projection = None
         if projection is not None:
@@ -1985,13 +1995,22 @@ class TerminalConversationApp(App[None]):
                     await self._resume_worker.wait()
         except BaseException as worker_error:
             cleanup_errors.append(worker_error)
-        finally:
-            if self._runtime_started:
-                self._runtime_started = False
-                try:
-                    await self._close_runtime()
-                except BaseException as runtime_error:
-                    cleanup_errors.append(runtime_error)
+
+        for run in self._consumed_runs:
+            run.projection.stop()
+        self._consumed_runs.clear()
+        self._pending_inputs.clear()
+        self._bus_snapshot = ()
+        self._run_ready = Event()
+        self._cancel_requested_turn = None
+        self._active_confirmation_id = None
+        self._confirmation_result = None
+        self._session_switch_result = None
+        self._completion_options = ()
+        self._completion_dismissed_text = None
+        self._outbound_worker = None
+        self._resume_worker = None
+        self._presentation_quiesced = True
 
         primary_error = self._application_error
         if primary_error is not None and cleanup_errors:
@@ -2019,9 +2038,28 @@ class TerminalConversationApp(App[None]):
 
     def _bind_bus_callback(self, bus: MessageBus) -> None:
         def on_snapshot(snapshot: tuple[InboundMessage, ...]) -> None:
-            self._on_inbound_snapshot_for(bus, snapshot)
+            if self._closing or self._presentation_quiesced:
+                return
+            self.post_message(
+                self.InboundSnapshotChanged(
+                    bus,
+                    snapshot,
+                    promote_removed=not self._draining_inputs,
+                    callback=on_snapshot,
+                )
+            )
 
+        self._bus_callback = on_snapshot
+        self._bus_callback_bus = bus
         bus.set_inbound_changed_callback(on_snapshot)
+
+    def _unbind_bus_callback(self, bus: MessageBus) -> None:
+        callback = self._bus_callback
+        if callback is None or self._bus_callback_bus is not bus:
+            return
+        bus.unbind_inbound_changed_callback(callback)
+        self._bus_callback = None
+        self._bus_callback_bus = None
 
     def _bind_confirmation_callback(
         self,
@@ -2037,7 +2075,19 @@ class TerminalConversationApp(App[None]):
                 )
             )
 
+        self._confirmation_callback = on_confirmation
+        self._confirmation_control = control
         control.bind_confirmation_callback(on_confirmation)
+
+    def _unbind_confirmation_callback(self, control: TerminalAgentLoopControl) -> None:
+        callback = self._confirmation_callback
+        if callback is None or self._confirmation_control is not control:
+            return
+        unbind = getattr(control, "unbind_confirmation_callback", None)
+        if callable(unbind):
+            unbind(callback)
+        self._confirmation_callback = None
+        self._confirmation_control = None
 
     async def _stop_outbound_worker(self) -> None:
         worker = self._outbound_worker
@@ -2047,6 +2097,22 @@ class TerminalConversationApp(App[None]):
         worker.cancel()
         with suppress(WorkerError, CancelledError):
             await worker.wait()
+
+    async def quiesce_for_rebind(self) -> None:
+        """Stop presentation work before the owning composition driver switches generations."""
+        if self._presentation_quiesced:
+            return
+        self._presentation_quiesced = True
+        confirmation_result = self._confirmation_result
+        if confirmation_result is not None and not confirmation_result.done():
+            confirmation_result.cancel()
+        session_switch_result = self._session_switch_result
+        if session_switch_result is not None and not session_switch_result.done():
+            session_switch_result.cancel()
+        self._unbind_confirmation_callback(self._control)
+        self._unbind_bus_callback(self._bus)
+        await self._stop_outbound_worker()
+        await self._clear_generation_projection()
 
     async def _clear_generation_projection(self) -> None:
         self._pending_inputs.clear()
@@ -2061,6 +2127,7 @@ class TerminalConversationApp(App[None]):
         self._cancel_requested_turn = None
         self._active_run_projection = None
         self._active_confirmation_id = None
+        self._completion_dismissed_text = None
         confirmation_result = self._confirmation_result
         self._confirmation_result = None
         if confirmation_result is not None and not confirmation_result.done():
@@ -2078,27 +2145,30 @@ class TerminalConversationApp(App[None]):
         display = self.query_one("#conversation-display", _ConversationDisplay)
         await display.remove_children()
 
-    async def _rebind_runtime(self, bindings: RuntimeBindings) -> None:
-        """Replace all Terminal-owned generation seams before target display rebuild."""
-        if self._closing:
+    async def rebind_agent_loop(
+        self,
+        *,
+        control: TerminalAgentLoopControl,
+        skill_metadata: tuple[SkillMetadata, ...],
+        session_projection: ForegroundConversationProjection,
+    ) -> None:
+        """Replace generation presentation state without owning business lifecycle."""
+        if self._closing and not self._presentation_quiesced:
             raise RuntimeError("Terminal Conversation is closing")
-        self._closing = True
-        old_bus = self._bus
-        old_bus.set_inbound_changed_callback(None)
-        await self._stop_outbound_worker()
-        await self._clear_generation_projection()
+        if not isinstance(session_projection, ForegroundConversationProjection):
+            raise TypeError("Terminal Conversation requires a session projection")
+        if not self._presentation_quiesced:
+            await self.quiesce_for_rebind()
 
-        self._bus = bindings.bus
-        self._control = bindings.control
-        self._management_dispatcher = bindings.management_dispatcher
-        self._start_runtime = bindings.start
-        self._skill_metadata = tuple(bindings.skill_metadata)
-        self._closing = False
+        target_skill_metadata = tuple(skill_metadata)
         try:
+            await self._replace_display_from_projection(session_projection)
+            self._control = control
+            self._skill_metadata = target_skill_metadata
+            self._bind_confirmation_callback(self._control, self._bus)
             self._bind_bus_callback(self._bus)
             self._bus_snapshot = await self._bus.inbound_snapshot()
-            self._bind_confirmation_callback(self._control, self._bus)
-            await self._start_runtime()
+            self._closing = False
             self._outbound_worker = self.run_worker(
                 self._consume_outbound(),
                 name="conversation-outbound",
@@ -2106,13 +2176,15 @@ class TerminalConversationApp(App[None]):
                 exclusive=True,
                 exit_on_error=False,
             )
-            target_session_id = self._control.project_foreground_conversation().session_id
-            if not await self._replace_display_from_session(target_session_id):
-                raise RuntimeError(
-                    "Conversation Session authority changed during Runtime replacement"
-                )
+            self._presentation_quiesced = False
         except BaseException:
             self._closing = True
+            self._presentation_quiesced = True
+            self._unbind_confirmation_callback(control)
+            self._unbind_bus_callback(self._bus)
+            await self._stop_outbound_worker()
+            with suppress(Exception):
+                await self._clear_generation_projection()
             raise
 
     @property
@@ -2184,7 +2256,7 @@ class TerminalConversationApp(App[None]):
         self._size_screen = None
         if active_size_screen is not None and active_size_screen is self.screen:
             active_size_screen.dismiss()
-        if not too_small and not self._closing:
+        if not too_small and not self._closing and not self._presentation_quiesced:
             self.refresh(layout=True)
             display.resume_from_size()
             display.restore_resize_anchor()
@@ -2193,7 +2265,7 @@ class TerminalConversationApp(App[None]):
             self.call_after_refresh(self._restore_input_focus_after_size)
 
     def _restore_input_focus_after_size(self) -> None:
-        if self._size_insufficient or self._closing:
+        if self._size_insufficient or self._closing or self._presentation_quiesced:
             return
         self.screen.refresh(layout=True)
         if isinstance(self.screen, _ToolConfirmationScreen):
@@ -2373,15 +2445,27 @@ class TerminalConversationApp(App[None]):
         self,
         bus: MessageBus,
         snapshot: tuple[InboundMessage, ...],
+        *,
+        promote_removed: bool,
     ) -> None:
-        if bus is not self._bus or self._closing:
+        if bus is not self._bus or self._closing or self._presentation_quiesced:
             return
         previous = self._bus_snapshot
         self._bus_snapshot = snapshot
         removed = max(0, len(previous) - len(snapshot))
-        if removed and not self._draining_inputs:
+        if removed and promote_removed:
             self._promote_consumed_inputs(removed)
         self._refresh_pending_queue()
+
+    @on(InboundSnapshotChanged)
+    def _inbound_snapshot_changed(self, message: InboundSnapshotChanged) -> None:
+        if message.callback is not self._bus_callback:
+            return
+        self._on_inbound_snapshot_for(
+            message.bus,
+            message.snapshot,
+            promote_removed=message.promote_removed,
+        )
 
     def _promote_consumed_inputs(self, count: int) -> None:
         promoted = False
@@ -2410,10 +2494,10 @@ class TerminalConversationApp(App[None]):
     async def _consume_outbound(self) -> None:
         try:
             buffered: OutboundMessage | None = None
-            while not self._closing:
+            while not self._closing and not self._presentation_quiesced:
                 if not self._consumed_runs:
                     buffered = await self._wait_for_consumed_run_or_discard_orphan()
-                if self._closing:
+                if self._closing or self._presentation_quiesced:
                     return
                 if not self._consumed_runs:
                     continue
@@ -2430,7 +2514,7 @@ class TerminalConversationApp(App[None]):
                     self._consumed_runs.popleft()
                     self._finish_consumed_run(run)
         except CancelledError:
-            if not self._closing:
+            if not self._closing and not self._presentation_quiesced:
                 raise
         except Exception as error:
             self._handle_exception(error)
@@ -2438,7 +2522,7 @@ class TerminalConversationApp(App[None]):
     async def _wait_for_consumed_run_or_discard_orphan(
         self,
     ) -> OutboundMessage | None:
-        while not self._closing and not self._consumed_runs:
+        while not self._closing and not self._presentation_quiesced and not self._consumed_runs:
             self._run_ready.clear()
             if self._consumed_runs:
                 break
@@ -2486,7 +2570,7 @@ class TerminalConversationApp(App[None]):
             self._cancel_requested_turn = None
         self._set_working(False)
         self._refresh_pending_queue()
-        if not self._closing:
+        if not self._closing and not self._presentation_quiesced:
             with suppress(Exception):
                 input_area.focus()
 
@@ -2510,7 +2594,12 @@ class TerminalConversationApp(App[None]):
         control: TerminalAgentLoopControl,
         bus: MessageBus,
     ) -> None:
-        if self._closing or control is not self._control or bus is not self._bus:
+        if (
+            self._closing
+            or self._presentation_quiesced
+            or control is not self._control
+            or bus is not self._bus
+        ):
             return
         if self._active_confirmation_id is not None:
             self._respond_to_confirmation_if_pending(
@@ -2541,7 +2630,7 @@ class TerminalConversationApp(App[None]):
             if decision not in {"approved", "declined"}:
                 decision = "declined"
         except BaseException:
-            if not self._closing:
+            if not self._closing and not self._presentation_quiesced:
                 with suppress(Exception):
                     self._respond_to_confirmation_if_pending(
                         request.confirmation_id,
@@ -2744,10 +2833,13 @@ class TerminalConversationApp(App[None]):
         conversation_projection = self._control.project_foreground_conversation()
         if conversation_projection.session_id != expected_session_id:
             return False
-        projected_messages = conversation_projection.messages
-        if self._control.project_foreground_conversation().session_id != expected_session_id:
-            return False
+        return await self._replace_display_from_projection(conversation_projection)
 
+    async def _replace_display_from_projection(
+        self,
+        conversation_projection: ForegroundConversationProjection,
+    ) -> bool:
+        projected_messages = conversation_projection.messages
         run_projection = self._active_run_projection
         self._active_run_projection = None
         if run_projection is not None:
@@ -2787,7 +2879,7 @@ class TerminalConversationApp(App[None]):
                     Static(historical.terminal_status, markup=False, classes="turn-status")
                 )
         display.reset_to_latest()
-        return self._control.project_foreground_conversation().session_id == expected_session_id
+        return True
 
     async def _mount_persisted_message(
         self,
@@ -2910,6 +3002,7 @@ class TerminalConversationApp(App[None]):
                     "Session resume is unavailable.",
                 )
                 return
+            previous_control = self._control
             force = False
             if self._control.has_active_run:
                 if not await self._confirm_active_session_switch():
@@ -2933,7 +3026,7 @@ class TerminalConversationApp(App[None]):
                     "Session resume did not select the requested Conversation Session.",
                 )
                 return
-            if self._runtime_host is not None:
+            if self._control is not previous_control:
                 return
             if not await self._replace_display_from_session(resumed_session_id):
                 await self._mount_management_rows(
@@ -2942,7 +3035,7 @@ class TerminalConversationApp(App[None]):
                 )
         finally:
             input_area.read_only = False
-            if not self._closing:
+            if not self._closing and not self._presentation_quiesced:
                 with suppress(Exception):
                     input_area.focus()
 
@@ -3397,30 +3490,21 @@ def is_interactive_terminal() -> bool:
     )
 
 
-def run_terminal_conversation(runtime: PreparedRuntime | RuntimeHost) -> None:
-    """Run a Terminal Conversation application around a prepared Runtime."""
+def run_terminal_conversation(
+    *,
+    bus: MessageBus,
+    control: TerminalAgentLoopControl,
+    management_dispatcher: ManagementDispatcher | None,
+    skill_metadata: tuple[SkillMetadata, ...] = (),
+) -> None:
+    """Run a Terminal Conversation around already-composed presentation seams."""
     if not is_interactive_terminal():
         raise TerminalConversationError(
             "Terminal Conversation requires interactive stdin, stdout, and stderr TTYs."
         )
-    if isinstance(runtime, RuntimeHost):
-        bindings = runtime.bindings
-        TerminalConversationApp(
-            bus=bindings.bus,
-            control=bindings.control,
-            management_dispatcher=bindings.management_dispatcher,
-            start_runtime=runtime.start,
-            close_runtime=runtime.close,
-            runtime_host=runtime,
-            skill_metadata=bindings.skill_metadata,
-        ).run()
-        return
-    bindings = runtime.bindings
     TerminalConversationApp(
-        bus=runtime.bus,
-        control=runtime.control,
-        management_dispatcher=runtime.management_dispatcher,
-        start_runtime=runtime.start,
-        close_runtime=runtime.close,
-        skill_metadata=bindings.skill_metadata,
+        bus=bus,
+        control=control,
+        management_dispatcher=management_dispatcher,
+        skill_metadata=skill_metadata,
     ).run()

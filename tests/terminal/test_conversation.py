@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sys
-from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 from uuid import UUID, uuid4
 from xml.etree import ElementTree
 
@@ -32,7 +33,11 @@ from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 from myclaw.agent.loop import ConfirmationRequestView, ForegroundConversationProjection
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import PreparedRuntime, RuntimeHost
+from myclaw.agent.runtime import (
+    PreparedRuntime,
+    RuntimeGenerationPresentation,
+    RuntimeHost,
+)
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.management.commands import ManagementCommandResult
@@ -720,6 +725,86 @@ class FakePreparedRuntime:
         return ()
 
 
+class _TestCompositionDriver:
+    """Keep test runtime ownership outside the Textual application lifecycle."""
+
+    def __init__(
+        self,
+        app: TerminalConversationApp,
+        runtime: PreparedRuntime | RuntimeHost,
+    ) -> None:
+        self._app = app
+        self._runtime = runtime
+        self._rebind: Callable[[RuntimeGenerationPresentation], Awaitable[None]] | None = None
+        if isinstance(runtime, RuntimeHost):
+
+            async def rebind(presentation: RuntimeGenerationPresentation) -> None:
+                await app.rebind_agent_loop(
+                    control=presentation.control,
+                    skill_metadata=presentation.skill_metadata,
+                    session_projection=presentation.session_projection,
+                )
+
+            runtime.bind_terminal(rebind, quiesce=app.quiesce_for_rebind)
+            self._rebind = rebind
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._app, name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {"_app", "_runtime", "_rebind"}:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._app, name, value)
+
+    async def _close_runtime(self) -> None:
+        if self._rebind is not None:
+            cast(RuntimeHost, self._runtime).unbind_terminal(self._rebind)
+        await self._runtime.close()
+
+    @asynccontextmanager
+    async def run_test(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        primary_error: BaseException | None = None
+        try:
+            await self._runtime.start()
+            async with self._app.run_test(*args, **kwargs) as pilot:
+                yield pilot
+        except BaseException as error:
+            primary_error = error
+        finally:
+            try:
+                await self._close_runtime()
+            except BaseException as cleanup_error:
+                if primary_error is not None:
+                    cause = primary_error.__cause__
+                    if cause is None:
+                        raise primary_error from cleanup_error
+                    raise primary_error from BaseExceptionGroup(
+                        "Terminal Conversation cleanup failed",
+                        (cause, cleanup_error),
+                    )
+                raise
+        if primary_error is not None:
+            raise primary_error
+
+    async def run_async(self, *args: Any, **kwargs: Any) -> None:
+        primary_error: BaseException | None = None
+        try:
+            await self._runtime.start()
+            await self._app.run_async(*args, **kwargs)
+        except BaseException as error:
+            primary_error = error
+        finally:
+            try:
+                await self._close_runtime()
+            except BaseException as cleanup_error:
+                if primary_error is not None:
+                    raise primary_error from cleanup_error
+                raise
+        if primary_error is not None:
+            raise primary_error
+
+
 class _DirectControl:
     """Minimal public AgentLoop control seam for direct MessageBus UI tests."""
 
@@ -800,7 +885,7 @@ class FailingStartRuntime(FakePreparedRuntime):
 
 class FailingCloseRuntime(FakePreparedRuntime):
     async def close(self) -> None:
-        self.close_calls += 1
+        await super().close()
         raise RuntimeError("runtime cleanup failed")
 
 
@@ -818,26 +903,18 @@ def _terminal_app(
     *,
     app_type: type[TerminalConversationApp] = TerminalConversationApp,
     monotonic: Callable[[], float] | None = None,
+    skill_metadata: tuple[SkillMetadata, ...] = (),
 ) -> TerminalConversationApp:
-    runtime_host = runtime if isinstance(runtime, RuntimeHost) else None
-    if monotonic is None:
-        return app_type(
-            bus=runtime.bus,
-            control=runtime.control,
-            management_dispatcher=runtime.management_dispatcher,
-            start_runtime=runtime.start,
-            close_runtime=runtime.close,
-            runtime_host=runtime_host,
-        )
-    return app_type(
-        bus=runtime.bus,
-        control=runtime.control,
-        management_dispatcher=runtime.management_dispatcher,
-        start_runtime=runtime.start,
-        close_runtime=runtime.close,
-        monotonic=monotonic,
-        runtime_host=runtime_host,
-    )
+    kwargs: dict[str, object] = {
+        "bus": runtime.bus,
+        "control": runtime.control,
+        "management_dispatcher": runtime.management_dispatcher,
+        "skill_metadata": skill_metadata,
+    }
+    if monotonic is not None:
+        kwargs["monotonic"] = monotonic
+    app = app_type(**kwargs)  # type: ignore[arg-type]
+    return cast(TerminalConversationApp, _TestCompositionDriver(app, runtime))
 
 
 class _GenerationHost(RuntimeHost):
@@ -995,6 +1072,118 @@ async def _wait_for_turn(app: TerminalConversationApp) -> None:
         await refreshed.wait()
 
 
+def test_terminal_constructor_does_not_expose_runtime_lifecycle_parameters() -> None:
+    parameter_names = set(inspect.signature(TerminalConversationApp).parameters)
+
+    assert parameter_names.isdisjoint({"start_runtime", "close_runtime", "runtime_host"})
+
+
+@pytest.mark.asyncio
+async def test_rebind_agent_loop_only_replaces_generation_presentation() -> None:
+    bus = MessageBus()
+    initial_control = _DirectControl()
+    target_control = _DirectControl()
+    initial_metadata = (
+        SkillMetadata(
+            name="initial",
+            description="Initial skill",
+            path=Path("C:/agent-home/skills/initial/SKILL.md"),
+        ),
+    )
+    target_metadata = (
+        SkillMetadata(
+            name="target",
+            description="Target skill",
+            path=Path("C:/agent-home/skills/target/SKILL.md"),
+        ),
+    )
+    app = TerminalConversationApp(
+        bus=bus,
+        control=initial_control,
+        management_dispatcher=None,
+        skill_metadata=initial_metadata,
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.rebind_agent_loop(
+            control=target_control,
+            skill_metadata=target_metadata,
+            session_projection=ForegroundConversationProjection(
+                session_id="target-session",
+                messages=({"role": "user", "content": "Target projection"},),
+            ),
+        )
+        await pilot.pause()
+
+        assert app._bus is bus
+        assert app._management_dispatcher is None
+        assert app._control is target_control
+        assert app._skill_metadata == target_metadata
+        assert "Target projection" in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_rebind_discards_a_stale_inbound_snapshot_callback() -> None:
+    bus = MessageBus()
+    initial_control = _DirectControl()
+    target_control = _DirectControl()
+    app = TerminalConversationApp(
+        bus=bus,
+        control=initial_control,
+        management_dispatcher=None,
+    )
+
+    async with app.run_test(size=(80, 24)):
+        old_callback = app._bus_callback
+        assert old_callback is not None
+        await app.rebind_agent_loop(
+            control=target_control,
+            skill_metadata=(),
+            session_projection=ForegroundConversationProjection(
+                session_id="target-session",
+                messages=(),
+            ),
+        )
+        app._inbound_snapshot_changed(
+            app.InboundSnapshotChanged(
+                bus,
+                (InboundMessage(content="stale old input"),),
+                promote_removed=True,
+                callback=old_callback,
+            )
+        )
+
+        assert app._bus_snapshot == ()
+        assert not app.has_pending_input
+
+
+@pytest.mark.asyncio
+async def test_terminal_unmount_clears_ui_owned_generation_state() -> None:
+    app = TerminalConversationApp(
+        bus=MessageBus(),
+        control=_DirectControl(),
+        management_dispatcher=None,
+    )
+
+    async with app.run_test(size=(80, 24)):
+        app._pending_inputs.append("stale input")
+        app._bus_snapshot = (InboundMessage(content="stale inbound"),)
+        app._cancel_requested_turn = object()
+        app._active_confirmation_id = uuid4()
+        app._completion_dismissed_text = "stale completion"
+        app._run_ready.clear()
+        app.exit()
+
+    assert not app._pending_inputs
+    assert not app._bus_snapshot
+    assert app._cancel_requested_turn is None
+    assert app._active_confirmation_id is None
+    assert app._completion_dismissed_text is None
+    assert app._run_ready.is_set() is False
+    assert app._outbound_worker is None
+    assert app._resume_worker is None
+
+
 def _constant_datetime(value: datetime) -> Callable[[], datetime]:
     return lambda: value
 
@@ -1060,15 +1249,10 @@ async def test_up_drain_keeps_an_inbound_consumed_during_the_atomic_drain() -> N
     bus = CoordinatedDrainBus()
     control = _DirectControl()
 
-    async def no_op() -> None:
-        return None
-
     app = TerminalConversationApp(
         bus=bus,
         control=control,
         management_dispatcher=None,
-        start_runtime=no_op,
-        close_runtime=no_op,
     )
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("first"), "enter")
@@ -1104,15 +1288,10 @@ async def test_sparse_protocol_errors_and_duplicate_terminal_do_not_poison_next_
     bus = MessageBus()
     control = _DirectControl()
 
-    async def no_op() -> None:
-        return None
-
     app = TerminalConversationApp(
         bus=bus,
         control=control,
         management_dispatcher=None,
-        start_runtime=no_op,
-        close_runtime=no_op,
     )
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("malformed"), "enter")
@@ -3984,7 +4163,7 @@ async def test_resize_back_from_undersized_terminal_restores_bottom_follow() -> 
 
 
 @pytest.mark.asyncio
-async def test_runtime_start_failure_restores_terminal_before_owner_cleanup() -> None:
+async def test_runtime_start_failure_closes_after_external_driver_start() -> None:
     terminal_state = {"restored": False}
 
     class RecordingDriver(KeyboardLifecycleDriver):
@@ -4013,7 +4192,7 @@ async def test_runtime_start_failure_restores_terminal_before_owner_cleanup() ->
         async with app.run_test(headless=False, size=(80, 24)):
             pass
 
-    assert runtime.close_saw_terminal_restored
+    assert not runtime.close_saw_terminal_restored
     assert runtime.close_calls == 1
 
 
@@ -4123,21 +4302,20 @@ async def test_terminal_stop_failure_still_restores_enhanced_keyboard_mode(
 
 
 @pytest.mark.asyncio
-async def test_terminal_stop_failure_does_not_mask_an_application_body_failure() -> None:
+async def test_terminal_stop_failure_does_not_mask_an_application_body_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FailingStopDriver(KeyboardLifecycleDriver):
         def stop_application_mode(self) -> None:
             raise RuntimeError("terminal cleanup failed")
 
-    class FailingBodyApp(TerminalConversationApp):
-        async def on_mount(self) -> None:
-            await super().on_mount()
-            raise RuntimeError("application body failed")
+    def failing_compose(_app: TerminalConversationApp) -> object:
+        raise RuntimeError("application body failed")
+
+    monkeypatch.setattr(TerminalConversationApp, "compose", failing_compose)
 
     runtime = _runtime(ScriptedRunSource())
-    app = _terminal_app(
-        cast(PreparedRuntime, runtime),
-        app_type=FailingBodyApp,
-    )
+    app = _terminal_app(cast(PreparedRuntime, runtime))
     app.driver_class = FailingStopDriver
 
     with pytest.raises(RuntimeError, match="application body failed") as raised:
@@ -4281,7 +4459,11 @@ def test_non_tty_terminal_streams_are_rejected_before_textual_starts(
     monkeypatch.setattr(TerminalConversationApp, "run", app_must_not_start)
 
     with pytest.raises(TerminalConversationError, match="interactive stdin, stdout, and stderr"):
-        run_terminal_conversation(cast(PreparedRuntime, object()))
+        run_terminal_conversation(
+            bus=MessageBus(),
+            control=_DirectControl(),
+            management_dispatcher=None,
+        )
 
 
 @pytest.mark.asyncio
@@ -4456,14 +4638,7 @@ async def test_skill_completion_merges_after_management_commands_with_safe_label
             path=Path("C:/agent-home/skills/bravo/SKILL.md"),
         ),
     )
-    app = TerminalConversationApp(
-        bus=runtime.bus,
-        control=runtime.control,
-        management_dispatcher=runtime.management_dispatcher,
-        start_runtime=runtime.start,
-        close_runtime=runtime.close,
-        skill_metadata=skills,
-    )
+    app = _terminal_app(runtime, skill_metadata=skills)
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("/")
@@ -4493,12 +4668,8 @@ async def test_skill_completion_labels_are_single_line_at_narrow_sizes_and_stop_
     long_description = (description_chunk * ((1024 // len(description_chunk)) + 1))[:1024]
     assert len(long_description) == 1024
     runtime = cast(PreparedRuntime, _runtime(ScriptedRunSource()))
-    app = TerminalConversationApp(
-        bus=runtime.bus,
-        control=runtime.control,
-        management_dispatcher=runtime.management_dispatcher,
-        start_runtime=runtime.start,
-        close_runtime=runtime.close,
+    app = _terminal_app(
+        runtime,
         skill_metadata=(
             SkillMetadata(
                 name=long_name,
@@ -4547,12 +4718,8 @@ async def test_skill_completion_selection_inserts_only_the_skill_invocation(
     conversation = ScriptedRunSource()
     fake_runtime = _runtime(conversation)
     runtime = cast(PreparedRuntime, fake_runtime)
-    app = TerminalConversationApp(
-        bus=runtime.bus,
-        control=runtime.control,
-        management_dispatcher=runtime.management_dispatcher,
-        start_runtime=runtime.start,
-        close_runtime=runtime.close,
+    app = _terminal_app(
+        runtime,
         skill_metadata=(
             SkillMetadata(
                 name="alpha",
@@ -4597,12 +4764,8 @@ async def test_completion_tab_does_not_accept_or_submit_highlighted_candidate(
     conversation = ScriptedRunSource()
     fake_runtime = _runtime(conversation)
     runtime = cast(PreparedRuntime, fake_runtime)
-    app = TerminalConversationApp(
-        bus=runtime.bus,
-        control=runtime.control,
-        management_dispatcher=runtime.management_dispatcher,
-        start_runtime=runtime.start,
-        close_runtime=runtime.close,
+    app = _terminal_app(
+        runtime,
         skill_metadata=(
             SkillMetadata(
                 name="alpha",
@@ -4632,15 +4795,7 @@ async def test_runtime_rebind_clears_stale_skill_completion_state(
     first_skill.write_bytes(b"---\nname: first\ndescription: Original first\n---\n")
     runtime = _generation_host(agent_home, workspace, _RuntimeProvider(()))
     bindings = runtime.bindings
-    app = TerminalConversationApp(
-        bus=bindings.bus,
-        control=bindings.control,
-        management_dispatcher=bindings.management_dispatcher,
-        start_runtime=runtime.start,
-        close_runtime=runtime.close,
-        runtime_host=runtime,
-        skill_metadata=bindings.skill_metadata,
-    )
+    app = _terminal_app(runtime, skill_metadata=bindings.skill_metadata)
     target = Session.create(
         runtime.session.workspace_state,
         now=lambda: NOW,

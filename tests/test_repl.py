@@ -6,9 +6,19 @@ from dataclasses import dataclass
 
 import pytest
 
+import myclaw.agent.repl as agent_repl
+import myclaw.terminal.repl as terminal_repl
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.management.service import SessionListingEntry
 from myclaw.terminal.repl import run_repl
+
+
+def test_terminal_repl_is_a_thin_compatibility_export() -> None:
+    assert terminal_repl.run_repl is agent_repl.run_repl
+    assert terminal_repl.ManagementDispatcher is agent_repl.ManagementDispatcher
+    assert terminal_repl.ManagementDispatchResult is agent_repl.ManagementDispatchResult
+    assert terminal_repl.ProgressiveWriter is agent_repl.ProgressiveWriter
+    assert terminal_repl.ReplInput is agent_repl.ReplInput
 
 
 class _Input:

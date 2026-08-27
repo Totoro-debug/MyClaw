@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +16,11 @@ from tzlocal import get_localzone_name
 
 from myclaw.agent.blackboard import Blackboard, TaskFramingEvaluator
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.loop import AgentLoop, TerminalAgentLoopControl
+from myclaw.agent.loop import (
+    AgentLoop,
+    ForegroundConversationProjection,
+    TerminalAgentLoopControl,
+)
 from myclaw.agent.message_bus import MessageBus
 from myclaw.agent.prompts import (
     chat_system_prompt,
@@ -24,6 +29,7 @@ from myclaw.agent.prompts import (
     runtime_context,
     session_title_prompt,
 )
+from myclaw.agent.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.agent.runner import AgentRunnerRoute
 from myclaw.agent.workspace_state import (
     WorkspaceState,
@@ -59,7 +65,6 @@ from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader, SkillMetadata, SkillSnapshot
-from myclaw.terminal.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.tool_gateway import ToolResult
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
@@ -105,6 +110,15 @@ class RuntimeBindings:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeGenerationPresentation:
+    """Immutable presentation data handed to an external Terminal adapter."""
+
+    control: TerminalAgentLoopControl
+    skill_metadata: tuple[SkillMetadata, ...]
+    session_projection: ForegroundConversationProjection
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedRuntime:
     """An in-memory Runtime exposing the MessageBus foreground seams."""
 
@@ -145,6 +159,24 @@ class PreparedRuntime:
             skill_metadata=self._skill_snapshot.metadata,
         )
 
+    @property
+    def presentation(self) -> RuntimeGenerationPresentation:
+        return RuntimeGenerationPresentation(
+            control=self.control,
+            skill_metadata=self._skill_snapshot.metadata,
+            session_projection=self.control.project_foreground_conversation(),
+        )
+
+    def _activate_management(self) -> None:
+        cast(ManagementCommandDispatcher, self.management_dispatcher)._rebind_management(
+            self._management_service
+        )
+
+    def _deactivate_management(self) -> None:
+        cast(ManagementCommandDispatcher, self.management_dispatcher)._unbind_management(
+            self._management_service
+        )
+
     def validate_unstarted(self) -> None:
         """Validate injected scheduler seams without creating consumer tasks."""
         with without_session_log():
@@ -166,12 +198,17 @@ class PreparedRuntime:
         self._lifetime.begin()
         await self._start_schedulers()
 
-    async def abort(self) -> None:
+    async def abort(self, *, clear_inbound: bool = True) -> None:
         """Abandon this generation and drain its Memory-owned tasks."""
         self._request_abort()
         task = self._lifetime.abort_task
         if task is None:
-            task = asyncio.create_task(self._drain_aborted_memory())
+            drain = (
+                self._drain_aborted_memory()
+                if clear_inbound
+                else self._drain_aborted_memory(clear_inbound=False)
+            )
+            task = asyncio.create_task(drain)
             self._lifetime.abort_task = task
         await await_task_preserving_cancellation(task)
 
@@ -198,12 +235,15 @@ class PreparedRuntime:
         if running is not None and running is not current and not running.done():
             running.cancel()
 
-    async def _drain_aborted_memory(self) -> None:
-        await asyncio.gather(
-            self.agent_loop._bus.drain_inbound(),
+    async def _drain_aborted_memory(self, *, clear_inbound: bool = True) -> None:
+        drains: list[Awaitable[object]] = [
+            self.agent_loop._wait_for_abort(),
             self._dream.abort_and_wait(),
             self.schedule_service.abort_and_wait(),
-        )
+        ]
+        if clear_inbound:
+            drains.insert(0, self.agent_loop._bus.drain_inbound())
+        await asyncio.gather(*drains)
 
     async def _start_schedulers(self) -> None:
         if not self._lifetime.validated:
@@ -362,12 +402,14 @@ class RuntimeHost:
         )
         self._monotonic_now = monotonic_now
         self._timezone_name = get_localzone_name() if timezone_name is None else timezone_name
-        self._terminal_rebind: Callable[[RuntimeBindings], Awaitable[None]] | None = None
+        self._bus = MessageBus()
+        self._terminal_rebind: Callable[[RuntimeGenerationPresentation], Awaitable[None]] | None = None
+        self._terminal_quiesce: Callable[[], Awaitable[None]] | None = None
         self._replacement_lock = asyncio.Lock()
         self._closed = False
         initial_token = object()
         self._runtime_token = initial_token
-        self._runtime = prepare_runtime(
+        self._runtime: PreparedRuntime | None = prepare_runtime(
             agent_home=agent_home,
             workspace=self._workspace,
             workspace_state=self._workspace_state,
@@ -381,56 +423,82 @@ class RuntimeHost:
             monotonic_now=monotonic_now,
             timezone_name=self._timezone_name,
             replace_session=self._replacement_callback(initial_token),
+            bus=self._bus,
+        )
+        initial_runtime = self._runtime
+        self._management_dispatcher = cast(
+            ManagementCommandDispatcher,
+            initial_runtime.management_dispatcher,
         )
         try:
-            self._runtime.validate_unstarted()
+            initial_runtime.validate_unstarted()
         except BaseException:
-            self._runtime._request_abort()
+            initial_runtime._request_abort()
             raise
+
+    def _current_runtime(self) -> PreparedRuntime:
+        runtime = self._runtime
+        if runtime is None:
+            raise RuntimeError("Runtime Host has no active Runtime Generation")
+        return runtime
 
     @property
     def generation(self) -> PreparedRuntime:
-        return self._runtime
+        return self._current_runtime()
 
     @property
     def bindings(self) -> RuntimeBindings:
-        return self._runtime.bindings
+        return self._current_runtime().bindings
 
     @property
     def bus(self) -> MessageBus:
-        return self._runtime.bus
+        return self._bus
 
     @property
     def control(self) -> TerminalAgentLoopControl:
-        return self._runtime.control
+        return self._current_runtime().control
+
+    @property
+    def presentation(self) -> RuntimeGenerationPresentation:
+        return self._current_runtime().presentation
 
     @property
     def management_dispatcher(self) -> ManagementCommandDispatcher:
-        return cast(ManagementCommandDispatcher, self._runtime.management_dispatcher)
+        return self._management_dispatcher
 
     async def start(self) -> None:
         if self._closed:
             raise RuntimeError("Runtime Host is closed")
-        await self._runtime.start()
+        await self._current_runtime().start()
 
     async def close(self) -> None:
         async with self._replacement_lock:
             if self._closed:
                 return
             self._closed = True
-            await self._runtime.close()
+            await self._current_runtime().close()
 
-    def bind_terminal(self, rebind: Callable[[RuntimeBindings], Awaitable[None]]) -> None:
+    def bind_terminal(
+        self,
+        rebind: Callable[[RuntimeGenerationPresentation], Awaitable[None]],
+        *,
+        quiesce: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """Register the sole Terminal binding callback for generation replacement."""
         if self._terminal_rebind is not None:
             raise RuntimeError("Runtime Host Terminal binding is already registered")
         if not callable(rebind):
             raise TypeError("Runtime Host Terminal binding must be callable")
         self._terminal_rebind = rebind
+        self._terminal_quiesce = quiesce
 
-    def unbind_terminal(self, rebind: Callable[[RuntimeBindings], Awaitable[None]]) -> None:
+    def unbind_terminal(
+        self,
+        rebind: Callable[[RuntimeGenerationPresentation], Awaitable[None]],
+    ) -> None:
         if self._terminal_rebind is rebind:
             self._terminal_rebind = None
+            self._terminal_quiesce = None
 
     def _replacement_callback(self, token: object) -> SessionReplacement:
         async def replace_session(session_id: str, force: bool) -> None:
@@ -463,6 +531,8 @@ class RuntimeHost:
                 timezone_name=self._timezone_name,
                 session=target_session,
                 replace_session=self._replacement_callback(token),
+                bus=self._bus,
+                management_dispatcher=self.management_dispatcher,
             )
             target_runtime.validate_unstarted()
             return target_runtime
@@ -517,13 +587,13 @@ class RuntimeHost:
                         "Runtime Generation is no longer active.",
                     )
                 )
-            old = self._runtime
+            old = self._current_runtime()
             if session_id == old.session_id:
                 await old.session.wait_for_pending_persist()
             target_token = object()
             target = self._prepare_target(session_id, target_token)
             if old.control.has_active_run and not force:
-                await target.abort()
+                await target.abort(clear_inbound=False)
                 raise ManagementError(
                     ErrorInfo(
                         "model_invalid_request",
@@ -543,17 +613,42 @@ class RuntimeHost:
         target_token: object,
     ) -> None:
         """Drain and publish a replacement as one cancellation-safe operation."""
+        rebind = self._terminal_rebind
+        quiesce: Callable[[], Awaitable[None]] | None = None
+        bus_reset = False
+        old_detached = False
         try:
+            quiesce = self._terminal_quiesce
+            if quiesce is not None:
+                await quiesce()
+            old_detached = True
             await old.abort()
+            await self._bus.reset()
+            bus_reset = True
+            target._activate_management()
             self._runtime = target
             self._runtime_token = target_token
-            rebind = self._terminal_rebind
             if rebind is None:
                 await target.start()
                 return
-            await rebind(target.bindings)
-        except BaseException:
-            await target.abort()
+            await rebind(target.presentation)
+            await target.start()
+        except BaseException as error:
+            if old_detached:
+                old._deactivate_management()
+                target._deactivate_management()
+                self._runtime = None
+                self._runtime_token = object()
+                self._closed = True
+            if quiesce is not None:
+                with suppress(BaseException):
+                    await quiesce()
+            if rebind is not None:
+                self.unbind_terminal(rebind)
+            try:
+                await target.abort(clear_inbound=bus_reset)
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
             raise
 
 
@@ -575,6 +670,8 @@ def prepare_runtime(
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
     task_framer: TaskFramingEvaluator | None = None,
+    bus: MessageBus | None = None,
+    management_dispatcher: ManagementCommandDispatcher | None = None,
 ) -> PreparedRuntime:
     """Prepare one Runtime and record terminal composition failures once."""
     try:
@@ -595,6 +692,8 @@ def prepare_runtime(
             workspace_state=workspace_state,
             replace_session=replace_session,
             task_framer=task_framer,
+            bus=bus,
+            management_dispatcher=management_dispatcher,
         )
     except (WorkspaceStateError, SkillContextTooLargeError):
         raise
@@ -623,6 +722,8 @@ def _prepare_runtime(
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
     task_framer: TaskFramingEvaluator | None = None,
+    bus: MessageBus | None = None,
+    management_dispatcher: ManagementCommandDispatcher | None = None,
 ) -> PreparedRuntime:
     """Prepare one unstarted Runtime Generation."""
     active_skill_snapshot = skill_snapshot
@@ -871,6 +972,7 @@ def _prepare_runtime(
             title_prompt=session_title_prompt(),
             externalize_result_for=externalize_result_for,
             task_framer=task_framer,
+            bus=bus,
         )
     except BaseException:
         abort_memory_composition()
@@ -924,7 +1026,8 @@ def _prepare_runtime(
             memory_manager=memory_manager,
             dream=dream,
         )
-        management_dispatcher = ManagementCommandDispatcher(management_service)
+        if management_dispatcher is None:
+            management_dispatcher = ManagementCommandDispatcher(management_service)
     except BaseException:
         agent_loop.abort()
         abort_memory_composition()

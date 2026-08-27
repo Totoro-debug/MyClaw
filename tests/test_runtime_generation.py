@@ -1,9 +1,10 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -11,7 +12,7 @@ import pytest
 import myclaw.agent.runtime as runtime_module
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import InboundMessage, OutboundMessage
-from myclaw.agent.runtime import RuntimeHost
+from myclaw.agent.runtime import RuntimeGenerationPresentation, RuntimeHost
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
@@ -150,6 +151,51 @@ def _host(
         new_uuid=uuid4,
         retry_clock=clock,
     )
+
+
+class _RuntimeAppDriver:
+    """Test composition root for a Textual app and one RuntimeHost."""
+
+    def __init__(self, host: RuntimeHost) -> None:
+        presentation = host.presentation
+        self._app = TerminalConversationApp(
+            bus=host.bus,
+            control=presentation.control,
+            management_dispatcher=host.management_dispatcher,
+            skill_metadata=presentation.skill_metadata,
+        )
+
+        async def rebind(presentation: RuntimeGenerationPresentation) -> None:
+            self.rebind_sessions.append(presentation.session_projection.session_id)
+            await self._app.rebind_agent_loop(
+                control=presentation.control,
+                skill_metadata=presentation.skill_metadata,
+                session_projection=presentation.session_projection,
+            )
+
+        self._rebind = rebind
+        self._host = host
+        self.rebind_sessions: list[str] = []
+        host.bind_terminal(self._rebind, quiesce=self._app.quiesce_for_rebind)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._app, name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {"_app", "_rebind", "_host", "rebind_sessions"}:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._app, name, value)
+
+    @asynccontextmanager
+    async def run_test(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        await self._host.start()
+        try:
+            async with self._app.run_test(*args, **kwargs) as pilot:
+                yield pilot
+        finally:
+            self._host.unbind_terminal(self._rebind)
+            await self._host.close()
 
 
 @pytest.mark.asyncio
@@ -668,6 +714,7 @@ async def test_runtime_abort_drains_only_inbound_after_unbinding_its_callback(
     bus = runtime.bus
     observed: list[tuple[InboundMessage, ...]] = []
     bus.set_inbound_changed_callback(observed.append)
+    bus.set_inbound_changed_callback(None)
     pending_inbound = InboundMessage(content="discard pending input")
     completed_outbound = OutboundMessage(
         type="model_response",
@@ -699,7 +746,11 @@ async def test_generation_replacement_finishes_atomically_when_waiter_is_cancell
     target.close()
     drain_started = asyncio.Event()
     release_drain = asyncio.Event()
+    rebind_started = asyncio.Event()
+    release_rebind = asyncio.Event()
+    events: list[str] = []
     original_drain = runtime_module.PreparedRuntime._drain_aborted_memory
+    original_start = runtime_module.PreparedRuntime.start
 
     async def gated_drain(active: runtime_module.PreparedRuntime) -> None:
         await original_drain(active)
@@ -707,19 +758,37 @@ async def test_generation_replacement_finishes_atomically_when_waiter_is_cancell
             drain_started.set()
             await release_drain.wait()
 
+    async def record_start(active: runtime_module.PreparedRuntime) -> None:
+        if active is not old:
+            events.append("target_start")
+        await original_start(active)
+
+    async def quiesce() -> None:
+        events.append("quiesce")
+
+    async def rebind(presentation: RuntimeGenerationPresentation) -> None:
+        events.append("rebind")
+        assert presentation.control is host.control
+        rebind_started.set()
+        await release_rebind.wait()
+
     monkeypatch.setattr(runtime_module.PreparedRuntime, "_drain_aborted_memory", gated_drain)
+    monkeypatch.setattr(runtime_module.PreparedRuntime, "start", record_start)
+    host.bind_terminal(rebind, quiesce=quiesce)
     replacement = asyncio.create_task(
         host.management_dispatcher.resume(target.session_id, force=True)
     )
     await asyncio.wait_for(drain_started.wait(), timeout=2)
 
     replacement.cancel()
-    await asyncio.sleep(0)
     assert not replacement.done()
     release_drain.set()
+    await asyncio.wait_for(rebind_started.wait(), timeout=2)
+    release_rebind.set()
     with pytest.raises(asyncio.CancelledError):
         await replacement
 
+    assert events == ["quiesce", "rebind", "target_start"]
     assert host.generation is not old
     assert host.generation.session_id == target.session_id
     assert not host.generation._lifetime.aborted
@@ -771,7 +840,6 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
         old.agent_loop._tool_gateway,
         old.agent_loop._runner,
         old._management_service,
-        old.management_dispatcher,
         tuple(old.agent_loop._tool_gateway._tools.values()),
     )
     await old_bus.put_inbound(InboundMessage(content="discard this pending input"))
@@ -798,10 +866,10 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
         replacement.agent_loop._tool_gateway,
         replacement.agent_loop._runner,
         replacement._management_service,
-        replacement.management_dispatcher,
         tuple(replacement.agent_loop._tool_gateway._tools.values()),
     )
-    assert replacement.bus is not old_bus
+    assert replacement.bus is old_bus is host.bus
+    assert replacement.management_dispatcher is old.management_dispatcher is host.management_dispatcher
     assert all(
         new is not previous
         for new, previous in zip(replacement_components, old_components, strict=True)
@@ -845,9 +913,9 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
     with pytest.raises(RuntimeError, match="no longer active"):
         _ = old.control.has_active_run
     old_management = await old.management_dispatcher.dispatch("/status")
-    assert old_management.output == "route_unavailable: Runtime Generation is no longer active."
-    await old_bus.put_inbound(InboundMessage(content="late old input"))
-    assert await old_bus.inbound_snapshot() == (InboundMessage(content="late old input"),)
+    assert old_management.output is not None
+    assert "route_unavailable" not in old_management.output
+    assert await old_bus.inbound_snapshot() == ()
     with pytest.raises(RuntimeError, match="abandoned"):
         old.session.add_message("user", "old generation is detached")
 
@@ -870,22 +938,7 @@ async def test_terminal_rebinds_once_and_rebuilds_the_target_session(
     target.add_message("user", "Target display")
     target.close()
 
-    app = TerminalConversationApp(
-        bus=host.bus,
-        control=host.control,
-        management_dispatcher=host.management_dispatcher,
-        start_runtime=host.start,
-        close_runtime=host.close,
-        runtime_host=host,
-    )
-    rebuilds: list[str] = []
-    original_rebuild = app._replace_display_from_session
-
-    async def record_rebuild(session_id: str) -> bool:
-        rebuilds.append(session_id)
-        return await original_rebuild(session_id)
-
-    app._replace_display_from_session = record_rebuild  # type: ignore[assignment]
+    app = _RuntimeAppDriver(host)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("/resume"), "enter")
         async with asyncio.timeout(2):
@@ -893,7 +946,7 @@ async def test_terminal_rebinds_once_and_rebuilds_the_target_session(
                 await pilot.pause()
         await pilot.press("enter")
         async with asyncio.timeout(2):
-            while host.generation.session_id != target.session_id or app._bus is old_bus:
+            while host.generation.session_id != target.session_id:
                 await pilot.pause()
 
         assert app._bus is host.bus
@@ -901,9 +954,286 @@ async def test_terminal_rebinds_once_and_rebuilds_the_target_session(
         messages = app.query_one("#conversation-display").query(".user-message")
         assert messages
         assert any("Target display" in str(getattr(message, "content", "")) for message in messages)
-        assert rebuilds == [target.session_id]
+        assert app.rebind_sessions == [target.session_id]
 
-    assert old_bus is not host.bus
+    assert old_bus is host.bus
+
+
+@pytest.mark.asyncio
+async def test_runtime_handoff_preserves_lifetime_seams_and_starts_target_after_rebind(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old_control = host.control
+    shared_bus = host.bus
+    shared_dispatcher = host.management_dispatcher
+    pending = InboundMessage(content="discard during handoff")
+    stale_outbound = OutboundMessage(type="model_response", content="stale")
+    await shared_bus.put_inbound(pending)
+    await shared_bus.put_outbound(stale_outbound)
+
+    target = Session.create(host.generation.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Target presentation")
+    target.close()
+    events: list[str] = []
+
+    async def quiesce() -> None:
+        events.append("quiesce")
+        assert await shared_bus.inbound_snapshot() == (pending,)
+
+    async def rebind(presentation: object) -> None:
+        events.append("rebind")
+        assert isinstance(presentation, runtime_module.RuntimeGenerationPresentation)
+        assert host.bus is shared_bus
+        assert host.management_dispatcher is shared_dispatcher
+        assert presentation.control is host.control
+        assert presentation.control is not old_control
+        assert presentation.session_projection.session_id == target.session_id
+        assert tuple(shared_bus._outbound) == ()
+
+    host.bind_terminal(rebind, quiesce=quiesce)
+    result = await host.management_dispatcher.resume(target.session_id)
+
+    assert result.resumed_session_id == target.session_id
+    assert events == ["quiesce", "rebind"]
+    assert host.bus is shared_bus
+    assert host.management_dispatcher is shared_dispatcher
+    assert host.control is not old_control
+    assert host.generation.agent_loop._consumer_task is not None
+    assert await shared_bus.inbound_snapshot() == ()
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_handoff_waits_for_old_tasks_before_reset_rebind_and_target_output(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    shared_bus = host.bus
+    target_session = Session.create(
+        old.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    target_session.add_message("user", "Target after drain barrier")
+    target_session.close()
+    old_cancelled = asyncio.Event()
+    release_old = asyncio.Event()
+    old_finished = asyncio.Event()
+    rebind_started = asyncio.Event()
+    events: list[str] = []
+    consumed: asyncio.Task[OutboundMessage] | None = None
+    original_start = runtime_module.PreparedRuntime.start
+
+    async def old_owned_task() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            old_cancelled.set()
+            await release_old.wait()
+            await shared_bus.put_outbound(
+                OutboundMessage(type="model_response", content="late old output")
+            )
+            events.append("old_finished")
+            old_finished.set()
+
+    async def rebind(presentation: RuntimeGenerationPresentation) -> None:
+        nonlocal consumed
+        assert old_finished.is_set()
+        assert tuple(shared_bus._outbound) == ()
+        events.append("rebind")
+        rebind_started.set()
+        consumed = asyncio.create_task(shared_bus.get_outbound())
+        assert presentation.session_projection.session_id == target_session.session_id
+
+    async def start_with_target_output(active: runtime_module.PreparedRuntime) -> None:
+        await original_start(active)
+        if active is not old:
+            assert rebind_started.is_set()
+            events.append("target_start")
+            await shared_bus.put_outbound(
+                OutboundMessage(type="model_response", content="target output")
+            )
+
+    old.agent_loop._consumer_task = asyncio.create_task(old_owned_task())
+    monkeypatch.setattr(runtime_module.PreparedRuntime, "start", start_with_target_output)
+    host.bind_terminal(rebind)
+    replacement = asyncio.create_task(
+        host.management_dispatcher.resume(target_session.session_id)
+    )
+
+    await old_cancelled.wait()
+    await asyncio.sleep(0)
+    assert not replacement.done()
+    assert not rebind_started.is_set()
+    release_old.set()
+    result = await replacement
+
+    assert result.resumed_session_id == target_session.session_id
+    assert consumed is not None
+    assert (await consumed).content == "target output"
+    assert events == ["old_finished", "rebind", "target_start"]
+    assert tuple(shared_bus._outbound) == ()
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_target_preflight_failure_preserves_current_generation_and_bus(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    shared_bus = host.bus
+    shared_dispatcher = host.management_dispatcher
+    snapshots: list[tuple[InboundMessage, ...]] = []
+    shared_bus.set_inbound_changed_callback(snapshots.append)
+    pending = InboundMessage(content="keep current pending input")
+    await shared_bus.put_inbound(pending)
+    snapshots.clear()
+
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Target never committed")
+    target.close()
+    original_validate = runtime_module.PreparedRuntime.validate_unstarted
+
+    def fail_target_preflight(runtime: runtime_module.PreparedRuntime) -> None:
+        if runtime is not old:
+            raise RuntimeError("target preflight failed")
+        original_validate(runtime)
+
+    monkeypatch.setattr(
+        runtime_module.PreparedRuntime,
+        "validate_unstarted",
+        fail_target_preflight,
+    )
+
+    result = await shared_dispatcher.resume(target.session_id)
+
+    assert result.output is not None
+    assert result.output.startswith("persistence_error:")
+    assert host.generation is old
+    assert host.control is old.control
+    assert host.bus is shared_bus
+    assert host.management_dispatcher is shared_dispatcher
+    assert shared_dispatcher._management is old._management_service
+    assert await shared_bus.inbound_snapshot() == (pending,)
+    assert snapshots == []
+    assert shared_bus._inbound_changed_callback is not None
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_rebind_failure_leaves_a_quiesced_target_without_mixed_generation_state(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    shared_bus = host.bus
+    shared_dispatcher = host.management_dispatcher
+    pending = InboundMessage(content="old pending")
+    stale = OutboundMessage(type="model_response", content="old stale")
+    await shared_bus.put_inbound(pending)
+    await shared_bus.put_outbound(stale)
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Target presentation")
+    target.close()
+    events: list[str] = []
+    presentations: list[RuntimeGenerationPresentation] = []
+    target_starts: list[runtime_module.PreparedRuntime] = []
+    original_start = runtime_module.PreparedRuntime.start
+
+    async def record_target_start(runtime: runtime_module.PreparedRuntime) -> None:
+        target_starts.append(runtime)
+        await original_start(runtime)
+
+    async def quiesce() -> None:
+        events.append("quiesce")
+
+    async def fail_rebind(presentation: RuntimeGenerationPresentation) -> None:
+        events.append("rebind")
+        presentations.append(presentation)
+        assert presentation.session_projection.session_id == target.session_id
+        raise RuntimeError("presentation rebind failed")
+
+    monkeypatch.setattr(runtime_module.PreparedRuntime, "start", record_target_start)
+    host.bind_terminal(fail_rebind, quiesce=quiesce)
+
+    with pytest.raises(RuntimeError, match="presentation rebind failed"):
+        await shared_dispatcher.resume(target.session_id)
+
+    assert events == ["quiesce", "rebind", "quiesce"]
+    assert target_starts == []
+    assert old._lifetime.aborted
+    assert len(presentations) == 1
+    assert cast(AgentLoop, presentations[0].control)._aborted
+    assert host.bus is shared_bus
+    assert host.management_dispatcher is shared_dispatcher
+    with pytest.raises(RuntimeError, match="no active Runtime Generation"):
+        _ = host.generation
+    assert shared_dispatcher._management is None
+    unavailable = await shared_dispatcher.resume(target.session_id)
+    assert unavailable.output == "route_unavailable: Runtime Generation is unavailable."
+    assert await shared_bus.inbound_snapshot() == ()
+    assert tuple(shared_bus._outbound) == ()
+    assert host._terminal_rebind is None
+    assert host._terminal_quiesce is None
+    await host.close()
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_target_start_failure_enters_the_same_fail_closed_state(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    shared_bus = host.bus
+    shared_dispatcher = host.management_dispatcher
+    target_session = Session.create(
+        old.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    target_session.add_message("user", "Target start fails")
+    target_session.close()
+    target_control: AgentLoop | None = None
+    original_start = runtime_module.PreparedRuntime.start
+
+    async def rebind(presentation: RuntimeGenerationPresentation) -> None:
+        nonlocal target_control
+        target_control = cast(AgentLoop, presentation.control)
+
+    async def fail_target_start(active: runtime_module.PreparedRuntime) -> None:
+        if active is old:
+            await original_start(active)
+            return
+        raise RuntimeError("target start failed")
+
+    monkeypatch.setattr(runtime_module.PreparedRuntime, "start", fail_target_start)
+    host.bind_terminal(rebind)
+
+    with pytest.raises(RuntimeError, match="target start failed"):
+        await shared_dispatcher.resume(target_session.session_id)
+
+    assert target_control is not None
+    assert target_control._aborted
+    assert old._lifetime.aborted
+    assert host.bus is shared_bus
+    assert host.management_dispatcher is shared_dispatcher
+    assert shared_dispatcher._management is None
+    with pytest.raises(RuntimeError, match="no active Runtime Generation"):
+        _ = host.generation
+    await host.close()
 
 
 @pytest.mark.asyncio
@@ -956,6 +1286,41 @@ async def test_concurrent_old_generation_resume_requests_cannot_replace_the_new_
 
 
 @pytest.mark.asyncio
+async def test_management_command_uses_one_generation_port_across_concurrent_rebind(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    dispatcher = host.management_dispatcher
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Concurrent management target")
+    target.close()
+    old_command_started = asyncio.Event()
+    release_old_command = asyncio.Event()
+
+    async def gated_old_memory_view() -> str:
+        old_command_started.set()
+        await release_old_command.wait()
+        return "old generation memory"
+
+    monkeypatch.setattr(old._management_service, "memory_view", gated_old_memory_view)
+    old_command = asyncio.create_task(dispatcher.dispatch("/memory"))
+    await old_command_started.wait()
+
+    replacement = await dispatcher.resume(target.session_id)
+    assert replacement.resumed_session_id == target.session_id
+    assert dispatcher._management is host.generation._management_service
+    release_old_command.set()
+    result = await old_command
+
+    assert result.output == "old generation memory"
+    assert dispatcher._management is host.generation._management_service
+    await host.close()
+
+
+@pytest.mark.asyncio
 async def test_close_waits_for_an_in_progress_replacement_and_closes_the_committed_target(
     agent_home: Path,
     workspace: Path,
@@ -968,10 +1333,10 @@ async def test_close_waits_for_an_in_progress_replacement_and_closes_the_committ
     rebind_started = asyncio.Event()
     release_rebind = asyncio.Event()
 
-    async def gated_rebind(bindings: runtime_module.RuntimeBindings) -> None:
+    async def gated_rebind(presentation: RuntimeGenerationPresentation) -> None:
+        del presentation
         rebind_started.set()
         await release_rebind.wait()
-        await bindings.start()
 
     host.bind_terminal(gated_rebind)
     replacement = asyncio.create_task(host.management_dispatcher.resume(target.session_id))
@@ -1004,14 +1369,7 @@ async def test_active_same_session_resume_requires_confirmation_before_rebuild(
     assert pending_persist is not None
     await pending_persist
 
-    app = TerminalConversationApp(
-        bus=host.bus,
-        control=host.control,
-        management_dispatcher=host.management_dispatcher,
-        start_runtime=host.start,
-        close_runtime=host.close,
-        runtime_host=host,
-    )
+    app = _RuntimeAppDriver(host)
     async with app.run_test(size=(80, 24)) as pilot:
         try:
             await pilot.press(*list("active work"), "enter")
@@ -1051,14 +1409,7 @@ async def test_active_resume_decline_keeps_the_old_generation_untouched(
     target.add_message("user", "Decline target")
     target.close()
 
-    app = TerminalConversationApp(
-        bus=host.bus,
-        control=host.control,
-        management_dispatcher=host.management_dispatcher,
-        start_runtime=host.start,
-        close_runtime=host.close,
-        runtime_host=host,
-    )
+    app = _RuntimeAppDriver(host)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("active work"), "enter")
         await asyncio.wait_for(provider.stream_started.wait(), timeout=2)
@@ -1096,14 +1447,7 @@ async def test_active_resume_approval_detaches_without_waiting_for_provider_clos
     target.add_message("user", "Approve target")
     target.close()
 
-    app = TerminalConversationApp(
-        bus=host.bus,
-        control=host.control,
-        management_dispatcher=host.management_dispatcher,
-        start_runtime=host.start,
-        close_runtime=host.close,
-        runtime_host=host,
-    )
+    app = _RuntimeAppDriver(host)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("active work"), "enter")
         await asyncio.wait_for(provider.stream_started.wait(), timeout=2)
@@ -1124,7 +1468,7 @@ async def test_active_resume_approval_detaches_without_waiting_for_provider_clos
         await asyncio.wait_for(provider.close_started.wait(), timeout=2)
         assert not provider.close_finished.is_set()
         assert app._bus is host.bus
-        assert app._bus is not old_bus
+        assert app._bus is old_bus is host.bus
         await old_bus.put_outbound(
             OutboundMessage(
                 type="model_response",
