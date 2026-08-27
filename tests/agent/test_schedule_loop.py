@@ -13,9 +13,12 @@ import pytest
 
 from myclaw.agent.blackboard import Blackboard, TaskFramingEvaluator
 from myclaw.agent.loop import AgentLoop
-from myclaw.agent.message_bus import InboundMessage
+from myclaw.agent.message_bus import InboundMessage, MessageBus
 from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
+from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -25,13 +28,14 @@ from myclaw.provider.models import (
     ModelStreamEvent,
     ModelUsage,
 )
-from myclaw.schedule.model import JobSchedule, ScheduleJob
+from myclaw.schedule.model import DREAM_JOB_ID, JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import ManualSkillInvocation, SkillSnapshot
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
+from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import DeterministicTaskFramingEvaluator
 
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
@@ -264,9 +268,12 @@ def _loop(
 ) -> tuple[AgentLoop, WorkspaceState, ScheduleService]:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
+    agent_home = AgentHome(tmp_path / "agent-home")
+    agent_home.initialize()
+    (agent_home.path / "config.toml").write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(agent_home).load()
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=tmp_path / "agent-home")
-    foreground = Session.create(state, now=lambda: NOW)
     async def execute_user_job(job: ScheduleJob) -> None:
         del job
 
@@ -279,22 +286,29 @@ def _loop(
         execute_user_job=execute_user_job,
         execute_dream=execute_dream,
     )
-    selected_task_framer = (
-        DeterministicTaskFramingEvaluator() if task_framer is None else task_framer
-    )
     loop = AgentLoop(
-        workspace=workspace,
-        skill_snapshot=skill_snapshot,
-        session=foreground,
+        workspace_path=workspace,
+        workspace_state=state,
+        agent_home=agent_home,
+        configuration=configuration,
+        bus=MessageBus(),
         schedule_service=service,
         model_router=router,
-        context_preparer=_foreground_context,
-        task_framer=selected_task_framer,
-        schedule_context_preparer=schedule_context_preparer,
+        memory_manager=MemoryManager(state),
+        session_id=None,
         now=lambda: NOW,
-        max_iterations=50,
-        externalize_result_for=externalize_result_for,
+        new_uuid=lambda: JOB_ID,
+        monotonic_now=lambda: 0.0,
     )
+    if task_framer is not None:
+        object.__setattr__(loop, "_task_framer", task_framer)
+    if skill_snapshot is not None:
+        loop._skill_snapshot = skill_snapshot
+        loop._context_builder._skill_snapshot = skill_snapshot
+    if externalize_result_for is not None:
+        object.__setattr__(loop, "_result_externalizer_for", externalize_result_for)
+    object.__setattr__(loop, "_prepare_foreground_context", _foreground_context)
+    object.__setattr__(loop, "_prepare_schedule_context", schedule_context_preparer)
     return loop, state, service
 
 
@@ -360,6 +374,65 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
     assert router.routes == ["schedule"]
     assert router.requests[0][1] == 10
     assert framer.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_schedule_run_rejects_system_job_before_session_creation(tmp_path: Path) -> None:
+    loop, state, _service = _loop(tmp_path, _ScheduleRouter())
+    system_job = ScheduleJob(
+        job_id=DREAM_JOB_ID,
+        source="system",
+        message="internal dream placeholder",
+        schedule=JobSchedule.every(3600),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+
+    with pytest.raises(ScheduleJobExecutionError) as captured:
+        await loop.run_schedule_job(system_job)
+
+    assert captured.value.error.code == "schedule_state_error"
+    assert not state.schedule_sessions_directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_schedule_run_drains_session_persist_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop, _state, _service = _loop(tmp_path, _ScheduleRouter())
+    persist_started = asyncio.Event()
+    release_persist = asyncio.Event()
+    captured: list[Session] = []
+    original_persist_after = Session._persist_after
+
+    async def blocked_persist_after(
+        session: Session,
+        previous: asyncio.Task[None] | None,
+        content: bytes,
+    ) -> None:
+        persist_started.set()
+        await release_persist.wait()
+        await original_persist_after(session, previous, content)
+
+    async def persist_only(session: Session, job: ScheduleJob) -> None:
+        del job
+        captured.append(session)
+        session.add_message("user", "queued persistence")
+        session.persist()
+
+    monkeypatch.setattr(Session, "_persist_after", blocked_persist_after)
+    object.__setattr__(loop, "_run_schedule_agent", persist_only)
+    running = asyncio.create_task(loop.run_schedule_job(_job()))
+
+    await persist_started.wait()
+    await asyncio.sleep(0)
+    assert not running.done()
+
+    release_persist.set()
+    await running
+    assert captured
+    assert captured[0]._persist_tasks == set()
 
 
 @pytest.mark.asyncio
@@ -728,7 +801,10 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
     workspace.mkdir(parents=True)
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=tmp_path / "agent-home")
-    foreground = Session.create(state, now=lambda: NOW)
+    agent_home = AgentHome(tmp_path / "agent-home")
+    agent_home.initialize()
+    (agent_home.path / "config.toml").write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(agent_home).load()
     async def execute_user_job(job: ScheduleJob) -> None:
         del job
 
@@ -743,16 +819,22 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
     )
     router = _ScheduleToolOverlapRouter(service)
     loop = AgentLoop(
-        workspace=workspace,
-        session=foreground,
+        workspace_path=workspace,
+        workspace_state=state,
+        agent_home=agent_home,
+        configuration=configuration,
+        bus=MessageBus(),
         schedule_service=service,
         model_router=router,
-        context_preparer=_foreground_context,
-        task_framer=DeterministicTaskFramingEvaluator(),
-        schedule_context_preparer=_schedule_context,
+        memory_manager=MemoryManager(state),
+        session_id=None,
         now=lambda: NOW,
-        max_iterations=50,
+        new_uuid=lambda: JOB_ID,
+        monotonic_now=lambda: 0.0,
     )
+    object.__setattr__(loop, "_task_framer", DeterministicTaskFramingEvaluator())
+    object.__setattr__(loop, "_prepare_foreground_context", _foreground_context)
+    object.__setattr__(loop, "_prepare_schedule_context", _schedule_context)
     await loop.start()
     schedule_task = asyncio.create_task(loop.run_schedule_job(_job()))
     try:

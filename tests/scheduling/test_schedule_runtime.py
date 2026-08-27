@@ -225,7 +225,7 @@ def _runtime(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
-    return prepare_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -233,8 +233,9 @@ def _runtime(
         now=lambda: NOW,
         new_uuid=lambda: JOB_UUID,
         schedule_scheduler_clock=schedule_clock,
-        task_framer=DeterministicTaskFramingEvaluator(),
     )
+    runtime.agent_loop._task_framer = DeterministicTaskFramingEvaluator()
+    return runtime
 
 
 async def _submit_turn(
@@ -347,8 +348,8 @@ async def test_runtime_schedule_uses_its_own_complete_context_projection(
         del args, kwargs
         raise AssertionError("Schedule must not use ContextBuilder")
 
-    monkeypatch.setattr(ContextBuilder, "build_messages", fail_foreground_context)
     runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    monkeypatch.setattr(ContextBuilder, "build_messages", fail_foreground_context)
     await runtime.start()
     try:
         await _wait_until(lambda: runtime.schedule_service.status_snapshot().active_job_count == 0)
@@ -1032,6 +1033,10 @@ async def test_runtime_shutdown_during_schedule_preparation_persists_user(
         *,
         current_user: dict[str, Any] | None = None,
         continuation: Sequence[dict[str, Any]] = (),
+        project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+        route_context_window: int | None = None,
+        route_max_output: int | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
     ) -> Session:
         if session.storage_partition is SessionStoragePartition.SCHEDULE:
             context_started.set()
@@ -1041,6 +1046,10 @@ async def test_runtime_shutdown_during_schedule_preparation_persists_user(
             session,
             current_user=current_user,
             continuation=continuation,
+            project_messages=project_messages,
+            route_context_window=route_context_window,
+            route_max_output=route_max_output,
+            tools=tools,
         )
 
     monkeypatch.setattr(ConversationSummaryManager, "prepare", block_schedule_preparation)
@@ -1083,6 +1092,10 @@ async def test_runtime_schedule_failure_logs_one_safe_session_warning(
         *,
         current_user: dict[str, Any] | None = None,
         continuation: Sequence[dict[str, Any]] = (),
+        project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+        route_context_window: int | None = None,
+        route_max_output: int | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
     ) -> Session:
         if session.storage_partition is SessionStoragePartition.SCHEDULE:
             failure_started.set()
@@ -1092,6 +1105,10 @@ async def test_runtime_schedule_failure_logs_one_safe_session_warning(
             session,
             current_user=current_user,
             continuation=continuation,
+            project_messages=project_messages,
+            route_context_window=route_context_window,
+            route_max_output=route_max_output,
+            tools=tools,
         )
 
     monkeypatch.setattr(ConversationSummaryManager, "prepare", fail_schedule_preparation)

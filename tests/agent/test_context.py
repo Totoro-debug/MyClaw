@@ -12,7 +12,7 @@ import pytest
 import myclaw.agent.context as context
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
+from myclaw.agent.loop import _project_foreground_messages, _project_schedule_messages
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
     SkillLoader,

@@ -81,12 +81,20 @@ class ConversationSummaryManager:
         *,
         current_user: dict[str, Any] | None = None,
         continuation: Sequence[dict[str, Any]] = (),
+        project_messages: SummaryProjection | None = None,
+        route_context_window: int | None = None,
+        route_max_output: int | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
     ) -> Session:
         with without_session_log():
             return await self._prepare(
                 session,
                 current_user=current_user,
                 continuation=continuation,
+                project_messages=project_messages,
+                route_context_window=route_context_window,
+                route_max_output=route_max_output,
+                tools=tools,
             )
 
     async def _prepare(
@@ -95,15 +103,25 @@ class ConversationSummaryManager:
         *,
         current_user: dict[str, Any] | None,
         continuation: Sequence[dict[str, Any]],
+        project_messages: SummaryProjection | None,
+        route_context_window: int | None,
+        route_max_output: int | None,
+        tools: Sequence[OpenAIToolSchema] | None,
     ) -> Session:
+        project = self._project_messages if project_messages is None else project_messages
+        input_window = (
+            self._route_context_window if route_context_window is None else route_context_window
+        )
+        output_limit = self._route_max_output if route_max_output is None else route_max_output
+        effective_tools = self._tools if tools is None else tuple(tools)
         short_term = _short_term_messages(
             session,
             current_user=current_user,
             continuation=continuation,
         )
         current_user_index = _last_user_index(short_term)
-        complete_messages = self._project_messages(short_term)
-        available_input = self._route_context_window - self._route_max_output
+        complete_messages = project(short_term)
+        available_input = input_window - output_limit
         system_tokens = _estimate_messages(complete_messages[:1])
         if system_tokens > available_input:
             raise ModelCallError(
@@ -113,7 +131,7 @@ class ConversationSummaryManager:
                 )
             )
         if current_user_index < len(short_term):
-            non_summarizable_messages = self._project_messages(short_term[current_user_index:])
+            non_summarizable_messages = project(short_term[current_user_index:])
             if _estimate_messages(non_summarizable_messages) >= available_input:
                 raise ModelCallError(
                     ErrorInfo(
@@ -122,7 +140,7 @@ class ConversationSummaryManager:
                     )
                 )
         token_triggered = (
-            _estimate_messages(complete_messages, tools=self._tools) >= available_input
+            _estimate_messages(complete_messages, tools=effective_tools) >= available_input
         )
         message_triggered = len(short_term) >= self._message_threshold
         if not token_triggered and not message_triggered:
@@ -133,7 +151,7 @@ class ConversationSummaryManager:
                 short_term,
                 current_user_index,
                 available_input,
-                self._project_messages,
+                project,
             )
         if message_triggered:
             initial_cutoff = max(

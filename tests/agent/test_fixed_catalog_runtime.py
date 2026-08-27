@@ -138,7 +138,7 @@ def _runtime(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
-    return prepare_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -146,8 +146,9 @@ def _runtime(
         now=lambda: NOW,
         new_uuid=uuid4,
         schedule_scheduler_clock=_BlockingClock(),
-        task_framer=DeterministicTaskFramingEvaluator(),
     )
+    runtime.agent_loop._task_framer = DeterministicTaskFramingEvaluator()
+    return runtime
 
 
 @pytest.mark.asyncio

@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+import json
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NoReturn, Protocol
+from typing import Any, NoReturn, Protocol, cast
 from uuid import UUID
 
 from loguru import logger
+from tzlocal import get_localzone_name
 
 from myclaw.agent.blackboard import (
     Blackboard,
@@ -21,11 +23,18 @@ from myclaw.agent.blackboard import (
     decode_blackboard,
     encode_blackboard,
 )
+from myclaw.agent.context import ContextBuilder
 from myclaw.agent.message_bus import (
     InboundMessage,
     MessageBus,
     OutboundMessage,
     OutboundMessageType,
+)
+from myclaw.agent.prompts import (
+    chat_system_prompt,
+    current_user_input,
+    foreground_chat_system_prompt,
+    session_title_prompt,
 )
 from myclaw.agent.runner import (
     AgentRunner,
@@ -35,16 +44,28 @@ from myclaw.agent.runner import (
     AgentRunnerToolCallStarted,
     _build_assistant_repair_message,
 )
+from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import UserConfiguration
 from myclaw.errors import TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.logging.session import session_log
+from myclaw.management.commands import MANAGEMENT_COMMANDS
+from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
+from myclaw.memory.conversation_summary import (
+    ConversationSummaryManager,
+    SummaryModelRouter,
+    _last_user_index,
+)
+from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouteStatus
 from myclaw.provider.models import ModelCompleted, ReasoningDelta, TextDelta
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
+from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.skills.catalog import ManualSkillInvocation, SkillSnapshot
-from myclaw.tools.base import OpenAIToolSchema
+from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader, SkillMetadata
+from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
@@ -52,6 +73,7 @@ from myclaw.tools.tool_gateway import (
     ToolGateway,
     ToolResult,
 )
+from myclaw.utils.async_tasks import await_task_preserving_cancellation
 
 
 class ForegroundContextPreparer(Protocol):
@@ -73,6 +95,14 @@ type ScheduleContextPreparer = Callable[
     Awaitable[list[dict[str, Any]]],
 ]
 type ResultExternalizerFactory = Callable[[Session], Callable[[ToolResult], ToolResult]]
+
+
+class SkillContextTooLargeError(Exception):
+    """The frozen always-loaded Skill snapshot exceeds the chat input budget."""
+
+    def __init__(self, error: ErrorInfo) -> None:
+        self.error = error
+        super().__init__(error.message)
 
 
 class ConfirmationRequestView(Protocol):
@@ -180,62 +210,117 @@ class AgentLoop:
     def __init__(
         self,
         *,
-        workspace: Path,
-        skill_snapshot: SkillSnapshot | None = None,
-        session: Session,
+        workspace_path: Path,
+        workspace_state: WorkspaceState,
+        agent_home: AgentHome,
+        configuration: UserConfiguration,
+        bus: MessageBus,
         schedule_service: ScheduleService,
         model_router: AgentRunnerRouter,
-        context_preparer: ForegroundContextPreparer,
-        task_framer: TaskFramingEvaluator | None = None,
+        memory_manager: MemoryManager,
+        session_id: str | None,
         now: Callable[[], datetime],
-        max_iterations: int,
-        schedule_context_preparer: ScheduleContextPreparer | None = None,
-        schedule_now: Callable[[], datetime] | None = None,
-        title_prompt: str | None = None,
-        externalize_result_for: ResultExternalizerFactory | None = None,
-        bus: MessageBus | None = None,
+        new_uuid: Callable[[], UUID],
+        monotonic_now: Callable[[], float],
     ) -> None:
-        if not isinstance(workspace, Path):
-            raise TypeError("Agent Loop requires a Path")
-        if not isinstance(session, Session):
-            raise TypeError("Agent Loop requires a foreground Session")
+        if not isinstance(workspace_path, Path):
+            raise TypeError("Agent Loop requires a Workspace Path")
+        if not isinstance(workspace_state, WorkspaceState):
+            raise TypeError("Agent Loop requires a Workspace State")
+        if workspace_state.workspace_path != workspace_path:
+            raise ValueError("Agent Loop Workspace State must belong to the Workspace")
+        if not isinstance(agent_home, AgentHome):
+            raise TypeError("Agent Loop requires an Agent Home")
+        if not isinstance(configuration, UserConfiguration):
+            raise TypeError("Agent Loop requires User Configuration")
+        if not isinstance(bus, MessageBus):
+            raise TypeError("Agent Loop requires a Message Bus")
         if not isinstance(schedule_service, ScheduleService):
-            raise TypeError("Agent Loop requires a Schedule Service for the foreground catalog")
-        if not callable(context_preparer):
-            raise TypeError("Agent Loop requires a context preparer")
-        if task_framer is not None and not callable(getattr(task_framer, "frame", None)):
-            raise TypeError("Agent Loop requires a task framing evaluator")
+            raise TypeError("Agent Loop requires a Schedule Service")
+        if not isinstance(memory_manager, MemoryManager):
+            raise TypeError("Agent Loop requires a Memory Manager")
+        if memory_manager.workspace_state is not workspace_state:
+            raise ValueError("Agent Loop Memory Manager must belong to the Workspace State")
         if not callable(now):
             raise TypeError("Agent Loop requires a clock")
-        if schedule_now is not None and not callable(schedule_now):
-            raise TypeError("Agent Loop Schedule clock must be callable")
-        if skill_snapshot is not None and not isinstance(skill_snapshot, SkillSnapshot):
-            raise TypeError("Agent Loop requires a Skill Snapshot")
+        if not callable(new_uuid):
+            raise TypeError("Agent Loop requires a UUID allocator")
+        if not callable(monotonic_now):
+            raise TypeError("Agent Loop requires a monotonic clock")
+        if session_id is not None and not isinstance(session_id, str):
+            raise TypeError("Agent Loop Session ID must be a string or None")
 
-        self._session = session
+        # Build every generation-local collaborator before publishing any Loop field.
+        chat_route = configuration.resolve_route("chat").route
+        skill_loader = SkillLoader(
+            root=agent_home.skills_directory,
+            reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
+            enable_always_load=configuration.runtime.enable_skill_always_load,
+        )
+        skill_snapshot = skill_loader.load()
+        context_builder = ContextBuilder(
+            workspace_path,
+            schedule_service.context_timezone_name() or get_localzone_name(),
+            clock=now,
+            skill_snapshot=skill_snapshot,
+        )
+        task_framer: TaskFramingEvaluator = TaskFramer(model_router)
+        tool_gateway = ToolGateway(
+            workspace=workspace_path,
+            schedule_service=schedule_service,
+            skill_root=skill_snapshot.root,
+        )
+        runner = AgentRunner(model_router)
+        summary_manager = ConversationSummaryManager(
+            provider=cast(SummaryModelRouter, model_router),
+            summaries=memory_manager,
+            route_context_window=chat_route.context_window,
+            route_max_output=chat_route.max_output,
+            consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
+            tools=tuple(tool_gateway.schemas),
+            now=now,
+            project_messages=self._project_foreground_summary_messages,
+        )
+        title_prompt: str | None = session_title_prompt()
+        generation_started_at = monotonic_now()
+        active_session = (
+            Session.create(workspace_state, now=now, new_uuid=new_uuid)
+            if session_id is None
+            else Session.load(
+                workspace_state,
+                session_id,
+                partition=SessionStoragePartition.FOREGROUND,
+                now=now,
+            )
+        )
+
+        self._workspace_path = workspace_path
+        self._workspace_state = workspace_state
+        self._agent_home = agent_home
+        self._configuration = configuration
+        self._session = active_session
+        self._skill_loader = skill_loader
         self._skill_snapshot = skill_snapshot
         self._schedule_service = schedule_service
-        self._context_preparer = context_preparer
-        self._task_framer = TaskFramer(model_router) if task_framer is None else task_framer
-        self._schedule_context_preparer = schedule_context_preparer
+        self._context_builder = context_builder
+        self._summary_manager = summary_manager
+        self._task_framer = task_framer
         self._now = now
-        self._schedule_now = now if schedule_now is None else schedule_now
+        self._schedule_now = schedule_service.current_time
         self._title_prompt = title_prompt
-        self._externalize_result_for = externalize_result_for
-        self._tool_gateway = ToolGateway(
-            workspace=workspace,
-            schedule_service=schedule_service,
-            skill_root=None if skill_snapshot is None else skill_snapshot.root,
-        )
+        self._tool_gateway = tool_gateway
         self._model_router = model_router
-        self._runner = AgentRunner(model_router)
-        self._max_iterations = max_iterations
-        if bus is not None and not isinstance(bus, MessageBus):
-            raise TypeError("Agent Loop requires a Message Bus")
-        self._bus = MessageBus() if bus is None else bus
+        self._memory_manager = memory_manager
+        self._runner = runner
+        self._max_iterations = configuration.runtime.max_iterations
+        self._bus = bus
+        self._generation_started_at = generation_started_at
         self._consumer_task: asyncio.Task[None] | None = None
         self._execution_task: asyncio.Task[None] | None = None
+        self._schedule_tasks: set[asyncio.Task[None]] = set()
         self._aborted_tasks: set[asyncio.Task[Any]] = set()
+        self._abort_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._execution_ready: asyncio.Event | None = None
         self._title_work: dict[str, _TitleWork] = {}
         self._pending_confirmation: _PendingConfirmation | None = None
@@ -244,6 +329,11 @@ class AgentLoop:
         self._closing = False
         self._closed = False
         self._aborted = False
+        self._started = False
+        self._preflighted = False
+        self._preflight_error: Exception | None = None
+        self._session_closed = False
+        self._session_abandoned = False
         self._last_foreground_route_status: ModelRouteStatus | None = None
 
     @property
@@ -263,6 +353,10 @@ class AgentLoop:
     @property
     def session(self) -> Session:
         return self._session
+
+    @property
+    def skill_metadata(self) -> tuple[SkillMetadata, ...]:
+        return self._skill_snapshot.metadata
 
     @property
     def tool_schemas(self) -> tuple[OpenAIToolSchema, ...]:
@@ -307,68 +401,203 @@ class AgentLoop:
             self._confirmation_callback = None
 
     async def start(self) -> None:
-        self._prepare_start()
+        if self._closed or self._aborted or self._closing or self._close_task is not None:
+            raise RuntimeError("Agent Loop is closed")
+        if self._started:
+            return
+        self.preflight()
         self._activate_prepared()
 
-    def _prepare_start(self) -> None:
-        """Validate activation without creating the foreground consumer task."""
-        if self._closed or self._aborted:
+    def preflight(self) -> None:
+        """Validate this generation synchronously without external side effects."""
+        if self._closed or self._aborted or self._closing or self._close_task is not None:
             raise RuntimeError("Agent Loop is closed")
+        if self._started:
+            return
+        if self._preflighted:
+            return
+        if self._preflight_error is not None:
+            raise self._preflight_error
+        try:
+            chat_route = self._configuration.resolve_route("chat").route
+            status_input = _foreground_runtime_status_input(
+                context_builder=self._context_builder,
+                history=(),
+                session_id=self._session.session_id,
+                long_term_memory=self._memory_manager.memory_snapshot(),
+                tool_schemas=self.tool_schemas,
+            )
+            available_input = chat_route.context_window - chat_route.max_output
+            if any(skill.always for skill in self._skill_snapshot.skills):
+                estimated = estimate_input_tokens(status_input)
+                if estimated > available_input:
+                    raise SkillContextTooLargeError(
+                        ErrorInfo(
+                            "skill_context_too_large",
+                            "Always-loaded Skill content exceeds the foreground chat input budget.",
+                        )
+                    )
+        except Exception as error:
+            self._preflight_error = error
+            raise
+        self._preflighted = True
 
     def _activate_prepared(self) -> None:
         """Activate a preflighted Loop using only infallible task creation."""
-        if self._consumer_task is not None:
+        if self._closed or self._aborted or self._closing or self._close_task is not None:
+            raise RuntimeError("Agent Loop is closed")
+        if self._started:
             return
+        if not self._preflighted:
+            raise RuntimeError("Agent Loop was not preflighted")
         self._consumer_task = asyncio.create_task(self._consume_foreground())
+        self._started = True
 
     async def close(self) -> None:
         if self._aborted:
+            if self._abort_task is not None:
+                await await_task_preserving_cancellation(self._abort_task)
             return
-        if self._closed:
+        task = self._close_task
+        if task is None:
+            task = asyncio.create_task(self._finish_close())
+            self._close_task = task
+        try:
+            try:
+                await await_task_preserving_cancellation(task)
+            except asyncio.CancelledError:
+                if not self._aborted:
+                    raise
+                abort_task = self._abort_task
+                if abort_task is None:
+                    abort_task = asyncio.create_task(self._finish_abort())
+                    self._abort_task = abort_task
+                await await_task_preserving_cancellation(abort_task)
+        finally:
+            if not self._aborted:
+                self._close_session()
+                await self._session.wait_for_pending_persist()
+
+    async def abort(self) -> None:
+        """Cancel and await every Session-scoped task before abandoning the Session."""
+        if self._aborted:
+            task = self._abort_task
+            if task is None:
+                task = asyncio.create_task(self._finish_abort())
+                self._abort_task = task
+            await await_task_preserving_cancellation(task)
             return
-        self._closing = True
-        self._cancel_pending_confirmation()
-        active = self._execution_task
-        if active is not None and not active.done():
-            await self.cancel_active_run()
+        self._request_abort()
+        task = self._abort_task
+        if task is None:
+            task = asyncio.create_task(self._finish_abort())
+            self._abort_task = task
+        await await_task_preserving_cancellation(task)
 
-        consumer = self._consumer_task
-        if consumer is not None and not consumer.done():
-            consumer.cancel()
-            await asyncio.gather(consumer, return_exceptions=True)
-        self._consumer_task = None
-
-        title_work = tuple(self._title_work.values())
-        for work in title_work:
-            if not work.task.done():
-                work.task.cancel()
-        if title_work:
-            await asyncio.gather(*(work.task for work in title_work), return_exceptions=True)
-        self._title_work.clear()
-        self._closed = True
-
-    def abort(self) -> None:
-        """Synchronously detach this generation without persistence or repair."""
+    def _request_abort(self) -> None:
+        """Synchronously stop new work before the awaited abort barrier runs."""
         if self._aborted:
             return
         self._aborted = True
         self._closing = True
         self._cancel_pending_confirmation()
         self._confirmation_callback = None
-
-        for task in (self._consumer_task, self._execution_task):
+        if not self._started:
+            self._abandon_session()
+            self._closed = True
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        closing = self._close_task
+        if closing is not None and closing is not current and not closing.done():
+            closing.cancel()
+        for task in self._owned_tasks():
+            if task is current or task.done():
+                continue
             self._retain_aborted_task(task)
-        for work in tuple(self._title_work.values()):
-            self._retain_aborted_task(work.task)
+
+    async def _finish_abort(self) -> None:
+        try:
+            await self._drain_owned_tasks()
+            self._abandon_session()
+            await self._session.wait_for_pending_persist()
+        finally:
+            self._clear_owned_task_references()
+            self._closed = True
+
+    async def _finish_close(self) -> None:
+        if self._aborted:
+            return
+        self._closing = True
+        self._cancel_pending_confirmation()
+        if self._execution_task is not None and not self._execution_task.done():
+            await self.cancel_active_run()
+        current = asyncio.current_task()
+        for task in self._owned_tasks():
+            if task is not current and not task.done():
+                task.cancel()
+        await self._drain_owned_tasks()
+        self._clear_owned_task_references()
+        self._closed = True
+
+    def _owned_tasks(self) -> tuple[asyncio.Task[Any], ...]:
+        tasks: list[asyncio.Task[Any]] = []
+        for task in (self._consumer_task, self._execution_task):
+            if task is not None:
+                tasks.append(task)
+        tasks.extend(work.task for work in self._title_work.values())
+        tasks.extend(self._schedule_tasks)
+        return tuple(dict.fromkeys(tasks))
+
+    async def _drain_owned_tasks(self) -> None:
+        tasks = self._owned_tasks()
+        current = asyncio.current_task()
+        awaitable_tasks = tuple(task for task in tasks if task is not current)
+        if awaitable_tasks:
+            await asyncio.gather(*awaitable_tasks, return_exceptions=True)
+        for task in awaitable_tasks:
+            self._aborted_tasks.discard(task)
+            if task.done() and not task.cancelled():
+                try:
+                    task.result()
+                except BaseException as error:
+                    logger.warning(
+                        "Drained Agent Loop task failed type={}",
+                        type(error).__name__,
+                    )
+
+    def _clear_owned_task_references(self) -> None:
         self._consumer_task = None
         self._execution_task = None
         self._execution_ready = None
         self._title_work.clear()
+        self._schedule_tasks.clear()
+        self._aborted_tasks.clear()
 
+    def _close_session(self) -> None:
+        if self._session_closed or self._session_abandoned:
+            return
         try:
-            self._session.abandon()
-        except BaseException:
-            pass
+            self._session.close()
+        except BaseException as error:
+            logger.warning("Agent Loop Session close failed type={}", type(error).__name__)
+        finally:
+            self._session_closed = True
+
+    def _abandon_session(self) -> None:
+        if self._session_abandoned or self._session_closed:
+            return
+        self._session.abandon()
+        self._session_abandoned = True
+
+    def _abandon_unstarted(self) -> None:
+        """Release a synchronously constructed but never activated generation."""
+        if self._started or self._closed:
+            return
+        self._request_abort()
+        self._abandon_session()
+        self._clear_owned_task_references()
         self._closed = True
 
     def _retain_aborted_task(self, task: asyncio.Task[Any] | None) -> None:
@@ -391,17 +620,18 @@ class AgentLoop:
             )
 
     async def _wait_for_abort(self) -> None:
-        """Wait until every detached generation task has reached a terminal state."""
-        tasks = tuple(self._aborted_tasks)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        """Compatibility barrier for Runtime's coordinated abort path."""
+        if not self._aborted:
+            return
+        task = self._abort_task
+        if task is None:
+            task = asyncio.create_task(self._finish_abort())
+            self._abort_task = task
+        await await_task_preserving_cancellation(task)
 
     def _close_sessions(self) -> None:
         """Close the foreground Session during normal awaited Runtime shutdown."""
-        try:
-            self._session.close()
-        except BaseException:
-            pass
+        self._close_session()
 
     async def cancel_active_run(self) -> None:
         if self._aborted:
@@ -422,13 +652,25 @@ class AgentLoop:
 
     async def run_schedule_job(self, job: ScheduleJob) -> None:
         """Execute one Schedule Job without using foreground state or output."""
-        if self._aborted:
+        if self._aborted or self._closing or self._closed:
             raise RuntimeError("Agent Loop is no longer active")
+        if job.source != "user":
+            raise ScheduleJobExecutionError(
+                ErrorInfo(
+                    "schedule_state_error",
+                    "Only User Schedule Jobs may run through Agent Loop.",
+                )
+            )
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._schedule_tasks.add(current_task)
         token = ScheduleTool._in_schedule_job.set(True)
         try:
             await self._execute_schedule_job(job)
         finally:
             ScheduleTool._in_schedule_job.reset(token)
+            if current_task is not None:
+                self._schedule_tasks.discard(current_task)
 
     async def _execute_schedule_job(self, job: ScheduleJob) -> None:
         schedule_session: Session | None = None
@@ -465,6 +707,10 @@ class AgentLoop:
                             schedule_session.abandon()
                         else:
                             schedule_session.close()
+                        persist_drain = asyncio.create_task(
+                            schedule_session.wait_for_pending_persist()
+                        )
+                        await await_task_preserving_cancellation(persist_drain)
                     except Exception as error:
                         logger.error(
                             "Schedule Session close failed job_id={} type={}",
@@ -474,22 +720,22 @@ class AgentLoop:
 
     async def _run_schedule_agent(self, session: Session, job: ScheduleJob) -> None:
         current_user = {"role": "user", "content": job.message}
-        context_preparer = self._schedule_context_preparer
-        if context_preparer is None:
-            self._persist_schedule_failure(
-                session,
-                current_user,
-                ErrorInfo("model_failed", "The model request failed."),
-            )
         try:
-            initial_messages = await context_preparer(session, deepcopy(current_user))
+            initial_messages = await self._prepare_schedule_context(
+                session,
+                deepcopy(current_user),
+            )
         except asyncio.CancelledError:
             if not self._aborted:
                 self._persist_schedule_cancelled_user(session, current_user, job)
             raise
         except ModelCallError as failure:
+            if self._aborted:
+                raise asyncio.CancelledError() from None
             self._persist_schedule_failure(session, current_user, failure.error)
         except Exception:
+            if self._aborted:
+                raise asyncio.CancelledError() from None
             self._persist_schedule_failure(
                 session,
                 current_user,
@@ -506,6 +752,8 @@ class AgentLoop:
             cancel_requested=self._schedule_service.cancellation_requested,
             max_iterations=self._max_iterations,
         )
+        if self._aborted:
+            raise asyncio.CancelledError()
         session.append_messages([deepcopy(current_user), *deepcopy(result.messages)])
         session.persist()
 
@@ -694,20 +942,12 @@ class AgentLoop:
             )
         staged_blackboard = framing_result.blackboard
         try:
-            context_user = deepcopy(current_user)
-            if manual_invocation is None:
-                initial_messages = await self._context_preparer(
-                    active_session,
-                    context_user,
-                    blackboard=staged_blackboard,
-                )
-            else:
-                initial_messages = await self._context_preparer(
-                    active_session,
-                    context_user,
-                    blackboard=staged_blackboard,
-                    manual_invocation=manual_invocation,
-                )
+            initial_messages = await self._prepare_foreground_context(
+                active_session,
+                deepcopy(current_user),
+                blackboard=staged_blackboard,
+                manual_invocation=manual_invocation,
+            )
         except asyncio.CancelledError:
             if not self._cancel_requested:
                 raise
@@ -746,6 +986,9 @@ class AgentLoop:
             )
             return False
 
+        if self._aborted:
+            return False
+
         if staged_blackboard is None:
             metadata_updates = None
             metadata_removals: tuple[str, ...] = ("blackboard",)
@@ -756,6 +999,8 @@ class AgentLoop:
             metadata_removals = ()
 
         try:
+            if self._aborted:
+                return False
             active_session.append_messages(
                 [deepcopy(current_user), *deepcopy(result.messages)],
                 metadata_updates=metadata_updates,
@@ -770,11 +1015,133 @@ class AgentLoop:
             await self._publish_commit_failure()
             return False
         try:
+            if self._aborted:
+                return False
             active_session.persist()
         except Exception:
             pass
         await self._publish_terminal(result)
         return True
+
+    async def _prepare_foreground_context(
+        self,
+        active_session: Session,
+        current_user: dict[str, Any],
+        blackboard: Blackboard | None = None,
+        *,
+        manual_invocation: ManualSkillInvocation | None = None,
+    ) -> list[dict[str, Any]]:
+        memory_snapshot = self._memory_manager.memory_snapshot()
+        current_system_prompt = foreground_chat_system_prompt(
+            workspace=self._workspace_path,
+            long_term_memory=memory_snapshot,
+            skill_snapshot=self._skill_snapshot,
+        )
+        route = self._configuration.resolve_route("chat").route
+
+        def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+            if _last_user_index(messages) == len(messages):
+                return _project_without_current_user(
+                    messages,
+                    system_prompt=current_system_prompt,
+                )
+            return _project_foreground_messages(
+                self._context_builder,
+                messages,
+                session_id=active_session.session_id,
+                long_term_memory=self._memory_manager.memory_snapshot(),
+                blackboard=blackboard,
+                manual_invocation=manual_invocation,
+            )
+
+        await self._summary_manager.prepare(
+            active_session,
+            current_user=current_user,
+            project_messages=project_messages,
+            route_context_window=route.context_window,
+            route_max_output=route.max_output,
+            tools=self.tool_schemas,
+        )
+        history = active_session.messages[active_session.last_consolidated :]
+        return _project_foreground_messages(
+            self._context_builder,
+            [*history, current_user],
+            session_id=active_session.session_id,
+            long_term_memory=memory_snapshot,
+            blackboard=blackboard,
+            manual_invocation=manual_invocation,
+        )
+
+    async def _prepare_schedule_context(
+        self,
+        active_session: Session,
+        current_user: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        memory_snapshot = self._memory_manager.memory_snapshot()
+        current_system_prompt = chat_system_prompt(
+            workspace=self._workspace_path,
+            long_term_memory=memory_snapshot,
+        )
+        route = self._configuration.resolve_route("schedule").route
+
+        def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+            if _last_user_index(messages) == len(messages):
+                return _project_without_current_user(
+                    messages,
+                    system_prompt=current_system_prompt,
+                )
+            return _project_schedule_messages(
+                messages,
+                system_prompt=current_system_prompt,
+                session_id=active_session.session_id,
+                current_time=self._schedule_now(),
+            )
+
+        await self._summary_manager.prepare(
+            active_session,
+            current_user=current_user,
+            project_messages=project_messages,
+            route_context_window=route.context_window,
+            route_max_output=route.max_output,
+            tools=self.tool_schemas,
+        )
+        history = active_session.messages[active_session.last_consolidated :]
+        return _project_schedule_messages(
+            [*history, current_user],
+            system_prompt=current_system_prompt,
+            session_id=active_session.session_id,
+            current_time=self._schedule_now(),
+        )
+
+    def _project_foreground_summary_messages(
+        self,
+        messages: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        memory_snapshot = self._memory_manager.memory_snapshot()
+        system_prompt = foreground_chat_system_prompt(
+            workspace=self._workspace_path,
+            long_term_memory=memory_snapshot,
+            skill_snapshot=self._skill_snapshot,
+        )
+        if _last_user_index(messages) == len(messages):
+            return _project_without_current_user(messages, system_prompt=system_prompt)
+        return _project_foreground_messages(
+            self._context_builder,
+            messages,
+            session_id=self._session.session_id,
+            long_term_memory=memory_snapshot,
+        )
+
+    def runtime_status_input(self, active_session: Session | None = None) -> RuntimeStatusInput:
+        """Return the status token input projected by this generation's Context Builder."""
+        session = self._session if active_session is None else active_session
+        return _foreground_runtime_status_input(
+            context_builder=self._context_builder,
+            history=session.messages[session.last_consolidated :],
+            session_id=session.session_id,
+            long_term_memory=self._memory_manager.memory_snapshot(),
+            tool_schemas=self.tool_schemas,
+        )
 
     def _remember_foreground_route_status(self) -> None:
         current_call_status = getattr(self._model_router, "current_call_status", None)
@@ -793,11 +1160,25 @@ class AgentLoop:
         self,
         active_session: Session,
     ) -> Callable[[ToolResult], ToolResult] | None:
-        if self._externalize_result_for is None:
-            return None
-        return self._externalize_result_for(active_session)
+        max_tool_result_chars = self._configuration.runtime.max_tool_result_chars
+
+        def externalize(result: ToolResult) -> ToolResult:
+            if result.status != "success" or len(result.content) <= max_tool_result_chars:
+                return result
+            output = BaseTool.handle_result(
+                result.content,
+                workspace=active_session.workspace_state.workspace_path,
+                session_id=active_session.session_id,
+                tool_call_id=result.tool_call_id,
+                limit=max_tool_result_chars,
+            )
+            return replace(result, content=output.content, artifact=output.artifact)
+
+        return externalize
 
     async def _publish_runner_output(self, event: object) -> None:
+        if self._aborted:
+            return
         if isinstance(event, ReasoningDelta):
             await self._bus.put_outbound(
                 OutboundMessage(
@@ -837,6 +1218,8 @@ class AgentLoop:
         raise TypeError(f"Unsupported Agent Runner output: {type(event).__name__}")
 
     async def _publish_terminal(self, result: AgentRunnerResult) -> None:
+        if self._aborted:
+            return
         if result.finish_reason == "completed":
             await self._bus.put_outbound(OutboundMessage("model_response", "", {"_streamed": True}))
             return
@@ -856,6 +1239,8 @@ class AgentLoop:
         )
 
     async def _publish_preparation_failure(self, error: ErrorInfo) -> None:
+        if self._aborted:
+            return
         if error.code != "turn_cancelled":
             _log_agent_failure(error)
         finish_reason = "cancelled" if error.code == "turn_cancelled" else "failed"
@@ -872,6 +1257,8 @@ class AgentLoop:
         )
 
     async def _publish_commit_failure(self) -> None:
+        if self._aborted:
+            return
         error = ErrorInfo(
             "persistence_error",
             "The Conversation Session could not be updated.",
@@ -892,7 +1279,7 @@ class AgentLoop:
         self,
         request: ConfirmationRequest,
     ) -> ConfirmationDecision:
-        if self._aborted:
+        if self._aborted or self._closing:
             raise asyncio.CancelledError()
         if self._pending_confirmation is not None:
             raise RuntimeError("A foreground confirmation request is already pending")
@@ -920,7 +1307,9 @@ class AgentLoop:
         content: str,
     ) -> _TitleWork | None:
         if (
-            self._title_prompt is None
+            self._closing
+            or self._aborted
+            or self._title_prompt is None
             or not content.strip()
             or session.metadata.get("title") != "Untitled session"
             or session.session_id in self._title_work
@@ -1041,6 +1430,7 @@ __all__ = [
     "ConfirmationRequestView",
     "ForegroundContextPreparer",
     "ScheduleContextPreparer",
+    "SkillContextTooLargeError",
 ]
 
 
@@ -1072,3 +1462,129 @@ def _latest_assistant_content(session: Session) -> str:
         if isinstance(content, str):
             return content
     return ""
+
+
+def _foreground_runtime_status_input(
+    *,
+    context_builder: ContextBuilder,
+    history: Sequence[dict[str, Any]],
+    session_id: str,
+    long_term_memory: str,
+    tool_schemas: tuple[OpenAIToolSchema, ...],
+) -> RuntimeStatusInput:
+    """Project and serialize a minimum foreground request for status and preflight."""
+    projected = context_builder.build_messages(
+        history=history,
+        current_user={"role": "user", "content": ""},
+        session_id=session_id,
+        long_term_memory=long_term_memory,
+    )
+    projected_system = projected[0].get("content")
+    if not isinstance(projected_system, str):
+        raise TypeError("Context Builder status system message is malformed")
+    return RuntimeStatusInput(
+        system_prompt=projected_system,
+        retained_messages=tuple(
+            json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+            for message in projected[1:]
+        ),
+        tool_definitions=tuple(
+            json.dumps(schema, ensure_ascii=False, separators=(",", ":")) for schema in tool_schemas
+        ),
+        runtime_context="",
+    )
+
+
+def _project_foreground_messages(
+    context: ContextBuilder,
+    messages: Sequence[dict[str, Any]],
+    *,
+    session_id: str,
+    long_term_memory: str,
+    blackboard: Blackboard | None = None,
+    manual_invocation: ManualSkillInvocation | None = None,
+) -> list[dict[str, Any]]:
+    history, current_user, current_user_index = _current_turn(messages, lane="Foreground")
+    projected = context.build_messages(
+        history=history,
+        current_user=current_user,
+        session_id=session_id,
+        long_term_memory=long_term_memory,
+        blackboard=blackboard,
+        manual_invocation=manual_invocation,
+    )
+    projected.extend(_project_continuation(messages, current_user_index))
+    return projected
+
+
+def _project_schedule_messages(
+    messages: Sequence[dict[str, Any]],
+    *,
+    system_prompt: str,
+    session_id: str,
+    current_time: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Project Schedule context without exposing foreground Skill content."""
+    history, current_user, current_user_index = _current_turn(messages, lane="Schedule")
+    projected = _project_without_current_user(history, system_prompt=system_prompt)
+    content = current_user.get("content")
+    timestamp = current_user.get("timestamp")
+    if not isinstance(content, str):
+        raise TypeError("Session user message is malformed")
+    if isinstance(timestamp, str):
+        effective_current_time = datetime.fromisoformat(timestamp)
+    elif current_time is not None:
+        effective_current_time = current_time
+    else:
+        raise TypeError("Schedule user message is missing a timestamp")
+    projected.append(
+        {
+            "role": "user",
+            "content": current_user_input(
+                content=content,
+                current_time=effective_current_time,
+                session_id=session_id,
+            ),
+        }
+    )
+    projected.extend(_project_continuation(messages, current_user_index))
+    return projected
+
+
+def _project_continuation(
+    messages: Sequence[dict[str, Any]],
+    current_user_index: int,
+) -> list[dict[str, Any]]:
+    return _project_history_messages(messages[current_user_index + 1 :])
+
+
+def _project_without_current_user(
+    messages: Sequence[dict[str, Any]],
+    *,
+    system_prompt: str,
+) -> list[dict[str, Any]]:
+    return [
+        {"role": "system", "content": system_prompt},
+        *_project_history_messages(messages),
+    ]
+
+
+def _project_history_messages(
+    messages: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        projected
+        for message in messages
+        if (projected := project_session_message(message)) is not None
+    ]
+
+
+def _current_turn(
+    messages: Sequence[dict[str, Any]],
+    *,
+    lane: str,
+) -> tuple[Sequence[dict[str, Any]], dict[str, Any], int]:
+    current_user_index = _last_user_index(messages)
+    if current_user_index == len(messages):
+        raise ValueError(f"{lane} context requires a current user message")
+    return messages[:current_user_index], messages[current_user_index], current_user_index

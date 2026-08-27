@@ -2162,9 +2162,11 @@ class TerminalConversationApp(App[None]):
 
         target_skill_metadata = tuple(skill_metadata)
         try:
-            await self._replace_display_from_projection(session_projection)
+            # Switch generation-bound control before the first DOM await so observers
+            # cannot see the new Runtime generation paired with the old control.
             self._control = control
             self._skill_metadata = target_skill_metadata
+            await self._replace_display_from_projection(session_projection)
             self._bind_confirmation_callback(self._control, self._bus)
             self._bind_bus_callback(self._bus)
             self._bus_snapshot = await self._bus.inbound_snapshot()

@@ -76,11 +76,13 @@ class ScheduleService:
         clock: ScheduleClock,
         execute_user_job: ScheduleJobExecutor,
         execute_dream: DreamExecutor,
+        timezone_name: str | None = None,
     ) -> None:
         self._store = WorkspaceScheduleStore(workspace_state)
         self._clock = clock
         self._execute_user_job = execute_user_job
         self._execute_dream = execute_dream
+        self._timezone_name = timezone_name
         self._loop_task: asyncio.Task[None] | None = None
         self._run_tasks: set[asyncio.Task[None]] = set()
         self._terminal_commit_tasks: set[asyncio.Task[ScheduleJob | None]] = set()
@@ -182,6 +184,14 @@ class ScheduleService:
     def cancellation_requested(self) -> bool:
         """Return whether Runtime shutdown has requested Schedule execution cancellation."""
         return self._closing.is_set()
+
+    def current_time(self) -> datetime:
+        """Return the wall-clock value used for Schedule Session projections."""
+        return self._clock.now()
+
+    def context_timezone_name(self) -> str | None:
+        """Return the configured timezone for generation-local context projection."""
+        return self._timezone_name
 
     def abort(self) -> None:
         """Synchronously detach Schedule work for an abandoned generation."""

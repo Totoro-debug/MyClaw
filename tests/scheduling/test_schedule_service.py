@@ -1379,6 +1379,7 @@ async def test_prepared_runtime_executes_at_job_with_schedule_route_and_partitio
 
     runtime.schedule_service.start()
     await _wait_until(lambda: len(provider.complete_requests) == 1)
+    await _wait_until(lambda: runtime.schedule_service.status_snapshot().active_job_count == 0)
     await runtime.close()
 
     request = provider.complete_requests[0]
@@ -1417,8 +1418,8 @@ async def test_prepared_runtime_runs_foreground_while_every_job_is_active(
         now=lambda: START,
         new_uuid=uuid4,
         schedule_scheduler_clock=ControlledClock(START),
-        task_framer=DeterministicTaskFramingEvaluator(),
     )
+    runtime.agent_loop._task_framer = DeterministicTaskFramingEvaluator()
 
     await runtime.start()
     try:

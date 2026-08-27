@@ -160,8 +160,8 @@ async def test_runtime_shutdown_cancels_blocked_framing_and_reclaims_title_work(
         provider_factory=lambda _configuration: provider,
         now=lambda: NOW,
         new_uuid=uuid4,
-        task_framer=framer,
     )
+    runtime.agent_loop._task_framer = framer
 
     await runtime.start()
     await runtime.bus.put_inbound(InboundMessage("Blocked framing during shutdown"))
@@ -615,8 +615,8 @@ async def test_repeated_and_idle_cancellations_cancel_only_foreground_until_exit
         now=lambda: NOW,
         new_uuid=uuid4,
         schedule_scheduler_clock=scheduled_clock,
-        task_framer=DeterministicTaskFramingEvaluator(),
     )
+    runtime.agent_loop._task_framer = DeterministicTaskFramingEvaluator()
     input_reader = ControlledInput()
     log_capture = capture_diagnostics()
     running = asyncio.create_task(runtime.run(input_reader=input_reader, writer=SilentWriter()))

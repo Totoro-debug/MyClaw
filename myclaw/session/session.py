@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.tools.base import ArtifactReference
+from myclaw.utils.async_tasks import await_task_preserving_cancellation
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import (
@@ -373,19 +374,36 @@ class Session:
             pending = loop.create_task(self._persist_after(previous, content))
             self._pending_persist = pending
             self._persist_tasks.add(pending)
-            pending.add_done_callback(self._persist_tasks.discard)
+            pending.add_done_callback(self._persist_task_finished)
         except Exception:
             return
 
     async def wait_for_pending_persist(self) -> None:
         """Wait for every already-scheduled ordered snapshot without starting a new save."""
+        drain = asyncio.create_task(self._drain_pending_persist())
+        await await_task_preserving_cancellation(drain)
+
+    async def _drain_pending_persist(self) -> None:
         while True:
-            pending = self._pending_persist
-            if pending is None:
+            done_tasks = tuple(task for task in self._persist_tasks if task.done())
+            for task in done_tasks:
+                self._consume_persist_task(task)
+            pending_tasks = tuple(self._persist_tasks)
+            if not pending_tasks:
                 return
-            await asyncio.shield(pending)
-            if self._pending_persist is pending:
-                return
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    def _persist_task_finished(self, task: asyncio.Task[None]) -> None:
+        self._consume_persist_task(task)
+
+    def _consume_persist_task(self, task: asyncio.Task[None]) -> None:
+        self._persist_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except BaseException:
+            return
 
     def close(self) -> None:
         """Synchronously make a bounded best-effort final save and close the Session."""

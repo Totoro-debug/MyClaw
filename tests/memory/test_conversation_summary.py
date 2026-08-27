@@ -9,7 +9,7 @@ import pytest
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.runtime import _project_foreground_messages, _project_schedule_messages
+from myclaw.agent.loop import _project_foreground_messages, _project_schedule_messages
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.memory.conversation_summary import (

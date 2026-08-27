@@ -302,6 +302,154 @@ async def test_persist_retries_each_snapshot_before_starting_the_next_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_pending_persist_waiter_cancellation_does_not_cancel_snapshots(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "Keep this snapshot")
+    first_write_failed = asyncio.Event()
+    release_backoff = asyncio.Event()
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+    yield_once = asyncio.sleep
+    attempts = 0
+
+    def fail_once_then_replace(target: Path, content: bytes) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            first_write_failed.set()
+            raise OSError("transient snapshot failure")
+        replace(target, content)
+
+    async def blocked_backoff(_delay: float) -> None:
+        await release_backoff.wait()
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_once_then_replace)
+    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", blocked_backoff)
+
+    session.persist()
+    await first_write_failed.wait()
+    waiter = asyncio.create_task(session.wait_for_pending_persist())
+    await yield_once(0)
+    waiter.cancel()
+    await yield_once(0)
+
+    assert not waiter.done()
+    release_backoff.set()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert Session.load(state, session.session_id).messages == session.messages
+
+
+@pytest.mark.asyncio
+async def test_pending_persist_wait_retrieves_already_completed_task_failure(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+
+    class TrackingTask(asyncio.Task[None]):
+        result_calls = 0
+
+        def result(self) -> None:
+            self.result_calls += 1
+            return super().result()
+
+    async def fail() -> None:
+        raise RuntimeError("private persistence detail")
+
+    task = TrackingTask(fail())
+    session._persist_tasks.add(task)
+    await asyncio.sleep(0)
+
+    await session.wait_for_pending_persist()
+
+    assert task.result_calls == 1
+    assert session._persist_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_pending_persist_wait_drains_snapshot_queued_while_waiting(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "First snapshot")
+    first_write_failed = asyncio.Event()
+    release_backoff = asyncio.Event()
+    replace = HOST_FILESYSTEM.atomic_replace_bytes
+    yield_once = asyncio.sleep
+    attempts = 0
+
+    def fail_once_then_replace(target: Path, content: bytes) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            first_write_failed.set()
+            raise OSError("transient snapshot failure")
+        replace(target, content)
+
+    async def blocked_backoff(_delay: float) -> None:
+        await release_backoff.wait()
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_once_then_replace)
+    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", blocked_backoff)
+
+    session.persist()
+    await first_write_failed.wait()
+    waiter = asyncio.create_task(session.wait_for_pending_persist())
+    await yield_once(0)
+    session.add_message("user", "Second snapshot")
+    session.persist()
+    release_backoff.set()
+
+    await waiter
+
+    assert Session.load(state, session.session_id).messages == session.messages
+    assert session._persist_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_pending_persist_wait_converges_with_concurrent_abandon(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    session.add_message("user", "Abandoned snapshot")
+    backoff_started = asyncio.Event()
+    yield_once = asyncio.sleep
+
+    def fail_write(_target: Path, _content: bytes) -> None:
+        raise OSError("transient snapshot failure")
+
+    async def blocked_backoff(_delay: float) -> None:
+        backoff_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_write)
+    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", blocked_backoff)
+
+    session.persist()
+    await backoff_started.wait()
+    waiter = asyncio.create_task(session.wait_for_pending_persist())
+    await yield_once(0)
+    session.abandon()
+
+    await waiter
+
+    assert session._persist_tasks == set()
+    assert not (state.sessions_directory / f"{session.session_id}.jsonl").exists()
+
+
+@pytest.mark.asyncio
 async def test_abandon_cancels_every_pending_snapshot_when_latest_has_not_started(
     agent_home: Path,
     workspace: Path,

@@ -130,7 +130,7 @@ def _runtime(
     home.initialize()
     (agent_home / "config.toml").write_text(config, encoding="utf-8")
     clock = FakeClock(NOW)
-    return prepare_runtime(
+    runtime = prepare_runtime(
         agent_home=home,
         workspace=workspace,
         configuration=ConfigLoader(home).load(),
@@ -138,8 +138,9 @@ def _runtime(
         now=clock.now,
         new_uuid=uuid4,
         retry_clock=clock,
-        task_framer=DeterministicTaskFramingEvaluator(),
     )
+    runtime.agent_loop._task_framer = DeterministicTaskFramingEvaluator()
+    return runtime
 
 
 @pytest.mark.asyncio
@@ -433,7 +434,7 @@ async def test_runtime_shutdown_keeps_an_empty_session_memory_only(
 
 
 @pytest.mark.asyncio
-async def test_runtime_shutdown_swallows_final_session_close_fault_after_router_close(
+async def test_runtime_shutdown_swallows_final_session_close_fault_before_router_close(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -467,7 +468,7 @@ async def test_runtime_shutdown_swallows_final_session_close_fault_after_router_
     await runtime.close()
 
     assert provider.closed
-    assert close_order == ["provider", "session"]
+    assert close_order == ["session", "provider"]
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
@@ -14,14 +15,17 @@ from uuid import uuid4
 import pytest
 from loguru import logger
 
+import myclaw.agent.loop as loop_module
 from myclaw.agent.blackboard import Blackboard, FramingResult, TaskFramingEvaluator
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
-from myclaw.agent.message_bus import InboundMessage, OutboundMessage
+from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runner import AgentRunnerResult, AgentRunnerRouter
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
+from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log as real_session_log
+from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -43,6 +47,7 @@ from myclaw.skills.catalog import (
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
+from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import BlockingTaskFramingEvaluator, DeterministicTaskFramingEvaluator
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
@@ -278,6 +283,103 @@ class _EventRouter(_Router):
         return replay()
 
 
+def test_agent_loop_constructor_is_the_generation_composition_boundary() -> None:
+    assert tuple(inspect.signature(AgentLoop).parameters) == (
+        "workspace_path",
+        "workspace_state",
+        "agent_home",
+        "configuration",
+        "bus",
+        "schedule_service",
+        "model_router",
+        "memory_manager",
+        "session_id",
+        "now",
+        "new_uuid",
+        "monotonic_now",
+    )
+    assert tuple(inspect.signature(AgentLoop.close).parameters) == ("self",)
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_constructs_each_generation_collaborator_once_without_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counts = {
+        "session": 0,
+        "skill_loader": 0,
+        "skill_snapshot": 0,
+        "context_builder": 0,
+        "summary_manager": 0,
+        "task_framer": 0,
+        "tool_gateway": 0,
+        "runner": 0,
+        "persist": 0,
+    }
+
+    original_create = Session.create
+    original_persist = Session.persist
+
+    def recording_create(*args: Any, **kwargs: Any) -> Session:
+        counts["session"] += 1
+        return original_create(*args, **kwargs)
+
+    def recording_persist(session: Session) -> None:
+        counts["persist"] += 1
+        original_persist(session)
+
+    class RecordingSkillLoader(SkillLoader):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            counts["skill_loader"] += 1
+            super().__init__(*args, **kwargs)
+
+        def load(self) -> SkillSnapshot:
+            counts["skill_snapshot"] += 1
+            return super().load()
+
+    def record_factory(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
+        def recording(*args: Any, **kwargs: Any) -> Any:
+            counts[name] += 1
+            return original(*args, **kwargs)
+
+        return recording
+
+    monkeypatch.setattr(Session, "create", staticmethod(recording_create))
+    monkeypatch.setattr(Session, "persist", recording_persist)
+    monkeypatch.setattr(loop_module, "SkillLoader", RecordingSkillLoader)
+    for name, attribute in (
+        ("context_builder", "ContextBuilder"),
+        ("summary_manager", "ConversationSummaryManager"),
+        ("task_framer", "TaskFramer"),
+        ("tool_gateway", "ToolGateway"),
+        ("runner", "AgentRunner"),
+    ):
+        original = getattr(loop_module, attribute)
+        monkeypatch.setattr(loop_module, attribute, record_factory(name, original))
+
+    router = _Router(())
+    tasks_before = asyncio.all_tasks()
+    loop, session = _runtime(tmp_path, router)
+
+    assert counts == {
+        "session": 1,
+        "skill_loader": 1,
+        "skill_snapshot": 1,
+        "context_builder": 1,
+        "summary_manager": 1,
+        "task_framer": 1,
+        "tool_gateway": 1,
+        "runner": 1,
+        "persist": 0,
+    }
+    assert asyncio.all_tasks() == tasks_before
+    assert router.calls == []
+    assert not (session.workspace_state.sessions_directory / f"{session.session_id}.jsonl").exists()
+
+    await loop.abort()
+
+
 def _response(
     content: str,
     *,
@@ -326,7 +428,8 @@ def _runtime(
     workspace.mkdir()
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home.path)
-    session = Session.create(state, now=_Clock().now)
+    (agent_home.path / "config.toml").write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
+    configuration = ConfigLoader(agent_home).load()
     async def execute_user_job(job: ScheduleJob) -> None:
         del job
 
@@ -365,18 +468,27 @@ def _runtime(
         return await selected_context_preparer(active_session, current_user)
 
     loop = AgentLoop(
-        workspace=workspace,
-        skill_snapshot=skill_snapshot,
-        session=session,
+        workspace_path=workspace,
+        workspace_state=state,
+        agent_home=agent_home,
+        configuration=configuration,
+        bus=MessageBus(),
         schedule_service=schedule,
         model_router=router,
-        context_preparer=prepare,
+        memory_manager=MemoryManager(state),
+        session_id=None,
         now=_Clock().now,
-        max_iterations=50,
-        task_framer=(None if use_default_task_framer else task_framer or _FramingFake()),
-        title_prompt=title_prompt,
+        new_uuid=uuid4,
+        monotonic_now=lambda: 0.0,
     )
-    return loop, session
+    if not use_default_task_framer:
+        object.__setattr__(loop, "_task_framer", task_framer or _FramingFake())
+    object.__setattr__(loop, "_title_prompt", title_prompt)
+    if skill_snapshot is not None:
+        loop._skill_snapshot = skill_snapshot
+        loop._context_builder._skill_snapshot = skill_snapshot
+    object.__setattr__(loop, "_prepare_foreground_context", prepare)
+    return loop, loop.session
 
 
 async def _context(
@@ -1293,7 +1405,8 @@ async def test_loop_abort_retains_cancelled_owned_tasks_until_cleanup_finishes(
     loop._execution_task = task
     await started.wait()
 
-    loop.abort()
+    abort_task = asyncio.create_task(loop.abort())
+    await asyncio.sleep(0)
 
     assert task in loop._aborted_tasks
     release_cleanup.set()
@@ -1301,7 +1414,78 @@ async def test_loop_abort_retains_cancelled_owned_tasks_until_cleanup_finishes(
     tasks_drained = asyncio.Event()
     task.add_done_callback(lambda _task: tasks_drained.set())
     await tasks_drained.wait()
+    await abort_task
     assert loop._aborted_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_terminal_loop_states_reject_restart(tmp_path: Path) -> None:
+    closed_loop, _closed_session = _runtime(tmp_path / "closed", _Router(()))
+    await closed_loop.start()
+    await closed_loop.close()
+
+    with pytest.raises(RuntimeError, match="Agent Loop is closed"):
+        await closed_loop.start()
+
+    aborted_loop, _aborted_session = _runtime(tmp_path / "aborted", _Router(()))
+    await aborted_loop.start()
+    await aborted_loop.abort()
+
+    with pytest.raises(RuntimeError, match="Agent Loop is closed"):
+        await aborted_loop.start()
+
+
+@pytest.mark.asyncio
+async def test_close_transition_blocks_concurrent_preflight_and_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop, _session = _runtime(tmp_path, _Router(()))
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def blocked_finish_close() -> None:
+        close_started.set()
+        await release_close.wait()
+
+    monkeypatch.setattr(loop, "_finish_close", blocked_finish_close)
+    closing = asyncio.create_task(loop.close())
+    await close_started.wait()
+
+    try:
+        with pytest.raises(RuntimeError, match="Agent Loop is closed"):
+            loop.preflight()
+        with pytest.raises(RuntimeError, match="Agent Loop is closed"):
+            await loop.start()
+    finally:
+        release_close.set()
+        await closing
+
+
+@pytest.mark.asyncio
+async def test_abort_wins_before_normal_close_finalizes_the_session(
+    tmp_path: Path,
+) -> None:
+    loop, session = _runtime(tmp_path, _Router(()))
+    session.add_message("user", "preserve this turn")
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def blocked_finish_close() -> None:
+        close_started.set()
+        await release_close.wait()
+
+    object.__setattr__(loop, "_finish_close", blocked_finish_close)
+    closing = asyncio.create_task(loop.close())
+    await close_started.wait()
+
+    aborting = asyncio.create_task(loop.abort())
+    await asyncio.sleep(0)
+    release_close.set()
+
+    await asyncio.gather(closing, aborting)
+    assert loop._session_abandoned
+    assert not loop._session_closed
 
 
 @pytest.mark.asyncio

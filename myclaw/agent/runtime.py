@@ -1,36 +1,26 @@
 """Composition for one prepared command-line Conversation Session."""
 
 import asyncio
-import json
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any, cast
+from typing import cast
 from uuid import UUID
 
 from loguru import logger
 from tzlocal import get_localzone_name
 
-from myclaw.agent.blackboard import Blackboard, TaskFramingEvaluator
-from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import (
     AgentLoop,
     ForegroundConversationProjection,
     TerminalAgentLoopControl,
 )
+from myclaw.agent.loop import SkillContextTooLargeError as SkillContextTooLargeError
 from myclaw.agent.message_bus import MessageBus
-from myclaw.agent.prompts import (
-    chat_system_prompt,
-    current_user_input,
-    foreground_chat_system_prompt,
-    runtime_context,
-    session_title_prompt,
-)
 from myclaw.agent.repl import ManagementDispatcher, ProgressiveWriter, ReplInput, run_repl
-from myclaw.agent.runner import AgentRunnerRoute
 from myclaw.agent.workspace_state import (
     WorkspaceState,
     WorkspaceStateError,
@@ -41,20 +31,13 @@ from myclaw.config.config import ProviderConfiguration, UserConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.commands import (
-    MANAGEMENT_COMMANDS,
     ManagementCommandDispatcher,
 )
 from myclaw.management.service import (
     ManagementError,
     ManagementViewService,
     ResolvedChatStatus,
-    RuntimeStatusInput,
     RuntimeStatusService,
-    estimate_input_tokens,
-)
-from myclaw.memory.conversation_summary import (
-    ConversationSummaryManager,
-    _last_user_index,
 )
 from myclaw.memory.dream import Dream
 from myclaw.memory.manager import MemoryManager
@@ -62,23 +45,12 @@ from myclaw.provider.model_router import Jitter, ModelRouter, RetryClock
 from myclaw.provider.models import ModelProvider
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleClock, ScheduleService
-from myclaw.session.projection import project_session_message
-from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader, SkillMetadata, SkillSnapshot
-from myclaw.tools.base import BaseTool, OpenAIToolSchema
-from myclaw.tools.tool_gateway import ToolResult
+from myclaw.session.session import Session
+from myclaw.skills.catalog import SkillMetadata
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
 from myclaw.utils.scheduler import AsyncioSchedulerClock
 
 type SessionReplacement = Callable[[str, bool], Awaitable[None]]
-
-
-class SkillContextTooLargeError(Exception):
-    """The frozen always-loaded Skill snapshot exceeds the chat input budget."""
-
-    def __init__(self, error: ErrorInfo) -> None:
-        self.error = error
-        super().__init__(error.message)
 
 
 @dataclass(slots=True)
@@ -129,9 +101,7 @@ class PreparedRuntime:
     _lifetime: _RuntimeLifetime
     _memory_manager: MemoryManager
     _dream: Dream
-    _context_builder: ContextBuilder
     _management_service: ManagementViewService
-    _skill_snapshot: SkillSnapshot
 
     @property
     def session_id(self) -> str:
@@ -156,14 +126,14 @@ class PreparedRuntime:
             control=self.control,
             management_dispatcher=self.management_dispatcher,
             start=self.start,
-            skill_metadata=self._skill_snapshot.metadata,
+            skill_metadata=self.agent_loop.skill_metadata,
         )
 
     @property
     def presentation(self) -> RuntimeGenerationPresentation:
         return RuntimeGenerationPresentation(
             control=self.control,
-            skill_metadata=self._skill_snapshot.metadata,
+            skill_metadata=self.agent_loop.skill_metadata,
             session_projection=self.control.project_foreground_conversation(),
         )
 
@@ -183,7 +153,7 @@ class PreparedRuntime:
             try:
                 if self._lifetime.started or self._lifetime.aborted:
                     raise RuntimeError("Runtime Generation is no longer preparable")
-                self.agent_loop._prepare_start()
+                self.agent_loop.preflight()
                 self.schedule_service._prepare_start()
                 self._lifetime.validated = True
             except BaseException as error:
@@ -220,8 +190,8 @@ class PreparedRuntime:
         self._lifetime.started = True
         self._lifetime.shutdown_requested.set()
         self._management_service.deactivate()
-        self.agent_loop.abort()
         self.schedule_service.abort()
+        self.agent_loop._request_abort()
         self._dream.abort()
         self._router.abort()
         closing = self._lifetime.close_task
@@ -237,7 +207,7 @@ class PreparedRuntime:
 
     async def _drain_aborted_memory(self, *, clear_inbound: bool = True) -> None:
         drains: list[Awaitable[object]] = [
-            self.agent_loop._wait_for_abort(),
+            self.agent_loop.abort(),
             self._dream.abort_and_wait(),
             self.schedule_service.abort_and_wait(),
         ]
@@ -250,7 +220,7 @@ class PreparedRuntime:
             raise RuntimeError("Runtime Generation was not validated")
         with without_session_log():
             try:
-                self.agent_loop._activate_prepared()
+                await self.agent_loop.start()
                 self.schedule_service._activate_prepared()
             except BaseException as error:
                 logger.opt(exception=error).error(
@@ -332,13 +302,14 @@ class PreparedRuntime:
         with without_session_log():
             failures: list[BaseException] = []
             try:
+                # Let a dispatcher that has already handed work to its run task
+                # reach the callback before the lifetime owner closes the service.
+                await asyncio.sleep(0)
                 await self.schedule_service.close()
             except BaseException as error:
                 failures.append(error)
 
-            shutdowns: list[Awaitable[object]] = [
-                self.agent_loop.close(),
-            ]
+            shutdowns: list[Awaitable[object]] = [self.agent_loop.close()]
             if run_done is not None:
                 shutdowns.append(run_done.wait())
             results = await asyncio.gather(*shutdowns, return_exceptions=True)
@@ -354,7 +325,6 @@ class PreparedRuntime:
             except BaseException as error:
                 failures.append(error)
 
-            self.agent_loop._close_sessions()
             if not failures:
                 return
             failure = (
@@ -507,15 +477,8 @@ class RuntimeHost:
         return replace_session
 
     def _prepare_target(self, session_id: str, token: object) -> PreparedRuntime:
-        target_session: Session | None = None
         target_runtime: PreparedRuntime | None = None
         try:
-            target_session = Session.load(
-                self._workspace_state,
-                session_id,
-                partition=SessionStoragePartition.FOREGROUND,
-                now=self._now,
-            )
             target_runtime = prepare_runtime(
                 agent_home=self._agent_home,
                 workspace=self._workspace,
@@ -529,7 +492,7 @@ class RuntimeHost:
                 schedule_scheduler_clock=self._schedule_scheduler_clock,
                 monotonic_now=self._monotonic_now,
                 timezone_name=self._timezone_name,
-                session=target_session,
+                session_id=session_id,
                 replace_session=self._replacement_callback(token),
                 bus=self._bus,
                 management_dispatcher=self.management_dispatcher,
@@ -539,14 +502,10 @@ class RuntimeHost:
         except ManagementError:
             if target_runtime is not None:
                 target_runtime._request_abort()
-            if target_session is not None:
-                target_session.abandon()
             raise
         except (OSError, UnicodeError, ValueError, WorkspaceStateError) as error:
             if target_runtime is not None:
                 target_runtime._request_abort()
-            if target_session is not None:
-                target_session.abandon()
             raise ManagementError(
                 ErrorInfo(
                     "persistence_error",
@@ -556,8 +515,6 @@ class RuntimeHost:
         except Exception as error:
             if target_runtime is not None:
                 target_runtime._request_abort()
-            if target_session is not None:
-                target_session.abandon()
             raise ManagementError(
                 ErrorInfo(
                     "persistence_error",
@@ -567,8 +524,6 @@ class RuntimeHost:
         except BaseException:
             if target_runtime is not None:
                 target_runtime._request_abort()
-            if target_session is not None:
-                target_session.abandon()
             raise
 
     async def _replace_session(
@@ -618,10 +573,11 @@ class RuntimeHost:
         bus_reset = False
         old_detached = False
         try:
+            old_detached = True
             quiesce = self._terminal_quiesce
             if quiesce is not None:
                 await quiesce()
-            old_detached = True
+            await old.schedule_service.pause_and_drain()
             await old.abort()
             await self._bus.reset()
             bus_reset = True
@@ -645,10 +601,23 @@ class RuntimeHost:
                     await quiesce()
             if rebind is not None:
                 self.unbind_terminal(rebind)
+            old_cleanup_error: BaseException | None = None
+            try:
+                if not old._lifetime.aborted:
+                    await old.abort()
+            except BaseException as caught:
+                old_cleanup_error = caught
             try:
                 await target.abort(clear_inbound=bus_reset)
             except BaseException as cleanup_error:
+                if old_cleanup_error is not None:
+                    raise error from BaseExceptionGroup(
+                        "Runtime replacement cleanup failed",
+                        [old_cleanup_error, cleanup_error],
+                    )
                 raise error from cleanup_error
+            if old_cleanup_error is not None:
+                raise error from old_cleanup_error
             raise
 
 
@@ -665,11 +634,9 @@ def prepare_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
-    skill_snapshot: SkillSnapshot | None = None,
-    session: Session | None = None,
+    session_id: str | None = None,
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
-    task_framer: TaskFramingEvaluator | None = None,
     bus: MessageBus | None = None,
     management_dispatcher: ManagementCommandDispatcher | None = None,
 ) -> PreparedRuntime:
@@ -687,11 +654,9 @@ def prepare_runtime(
             schedule_scheduler_clock=schedule_scheduler_clock,
             monotonic_now=monotonic_now,
             timezone_name=timezone_name,
-            skill_snapshot=skill_snapshot,
-            session=session,
+            session_id=session_id,
             workspace_state=workspace_state,
             replace_session=replace_session,
-            task_framer=task_framer,
             bus=bus,
             management_dispatcher=management_dispatcher,
         )
@@ -717,22 +682,13 @@ def _prepare_runtime(
     schedule_scheduler_clock: ScheduleClock | None = None,
     monotonic_now: Callable[[], float] = monotonic,
     timezone_name: str | None = None,
-    skill_snapshot: SkillSnapshot | None = None,
-    session: Session | None = None,
+    session_id: str | None = None,
     workspace_state: WorkspaceState | None = None,
     replace_session: SessionReplacement | None = None,
-    task_framer: TaskFramingEvaluator | None = None,
     bus: MessageBus | None = None,
     management_dispatcher: ManagementCommandDispatcher | None = None,
 ) -> PreparedRuntime:
     """Prepare one unstarted Runtime Generation."""
-    active_skill_snapshot = skill_snapshot
-    if active_skill_snapshot is None:
-        active_skill_snapshot = SkillLoader(
-            root=agent_home.skills_directory,
-            reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
-            enable_always_load=configuration.runtime.enable_skill_always_load,
-        ).load()
     workspace_path = normalize_workspace_path(workspace)
     active_workspace_state = (
         WorkspaceState(workspace_path) if workspace_state is None else workspace_state
@@ -741,52 +697,18 @@ def _prepare_runtime(
         raise ValueError("Runtime Workspace State must belong to the Runtime Workspace")
     active_workspace_state.initialize(agent_home_root=agent_home.path)
     memory_manager = MemoryManager(active_workspace_state)
-    long_term_memory = memory_manager.memory_snapshot()
     schedule_clock = (
         schedule_scheduler_clock
         if schedule_scheduler_clock is not None
         else AsyncioSchedulerClock(now=now)
     )
     resolved_timezone_name = get_localzone_name() if timezone_name is None else timezone_name
-    foreground_context = ContextBuilder(
-        workspace_path,
-        resolved_timezone_name,
-        skill_snapshot=active_skill_snapshot,
-    )
-    set_context_clock = getattr(foreground_context, "set_clock", None)
-    if callable(set_context_clock):
-        set_context_clock(now)
-    active_session = session
-    if active_session is None:
-        active_session = Session.create(
-            active_workspace_state,
-            now=now,
-            new_uuid=new_uuid,
-        )
-    elif (
-        active_session.workspace_state is not active_workspace_state
-        or active_session.storage_partition is not SessionStoragePartition.FOREGROUND
-    ):
-        raise ValueError("Runtime Session must belong to the foreground Runtime Workspace State")
     router = ModelRouter(
         configuration=configuration,
         provider_factory=provider_factory,
         clock=retry_clock,
         jitter=retry_jitter,
     )
-
-    def system_prompt_for(memory_snapshot: str) -> str:
-        return chat_system_prompt(
-            workspace=workspace_path,
-            long_term_memory=memory_snapshot,
-        )
-
-    def foreground_system_prompt_for(memory_snapshot: str) -> str:
-        return foreground_chat_system_prompt(
-            workspace=workspace_path,
-            long_term_memory=memory_snapshot,
-            skill_snapshot=active_skill_snapshot,
-        )
 
     try:
         dream = Dream(
@@ -814,6 +736,7 @@ def _prepare_runtime(
             clock=schedule_clock,
             execute_user_job=execute_user_job,
             execute_dream=dream.run,
+            timezone_name=resolved_timezone_name,
         )
         schedule_service._register_dream_job_sync(
             schedule=JobSchedule.from_cron_input(
@@ -835,160 +758,29 @@ def _prepare_runtime(
         schedule_service.abort()
         router.abort()
 
-    def externalize_result_for(active_session: Session) -> Callable[[ToolResult], ToolResult]:
-        return _build_tool_result_externalizer(
-            session=active_session,
-            max_tool_result_chars=configuration.runtime.max_tool_result_chars,
-        )
-
-    async def prepare_summary(
-        active_session: Session,
-        route: AgentRunnerRoute,
-        current_system_prompt: str,
-        tools: tuple[OpenAIToolSchema, ...],
-        current_user: dict[str, Any] | None = None,
-        blackboard: Blackboard | None = None,
-        *,
-        manual_invocation: ManualSkillInvocation | None = None,
-    ) -> Session:
-        effective_route = configuration.resolve_route(route).route
-        if route == "chat":
-
-            def project_messages(
-                messages: Sequence[dict[str, Any]],
-            ) -> list[dict[str, Any]]:
-                if _last_user_index(messages) == len(messages):
-                    return _project_without_current_user(
-                        messages,
-                        system_prompt=current_system_prompt,
-                    )
-                return _project_foreground_messages(
-                    foreground_context,
-                    messages,
-                    session_id=active_session.session_id,
-                    long_term_memory=memory_manager.memory_snapshot(),
-                    blackboard=blackboard,
-                    manual_invocation=manual_invocation,
-                )
-        else:
-
-            def project_messages(
-                messages: Sequence[dict[str, Any]],
-            ) -> list[dict[str, Any]]:
-                if _last_user_index(messages) == len(messages):
-                    return _project_without_current_user(
-                        messages,
-                        system_prompt=current_system_prompt,
-                    )
-                return _project_schedule_messages(
-                    messages,
-                    system_prompt=current_system_prompt,
-                    session_id=active_session.session_id,
-                    current_time=now(),
-                )
-
-        manager = ConversationSummaryManager(
-            provider=router,
-            summaries=memory_manager,
-            route_context_window=effective_route.context_window,
-            route_max_output=effective_route.max_output,
-            consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
-            tools=tools,
-            now=now,
-            project_messages=project_messages,
-        )
-        return await manager.prepare(
-            active_session,
-            current_user=current_user,
-        )
-
-    async def prepare_schedule_context(
-        active_session: Session,
-        current_user: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        active_loop = agent_loop
-        if active_loop is None:
-            raise RuntimeError("Schedule context requested before Agent Loop construction")
-        memory_snapshot = memory_manager.memory_snapshot()
-        current_system_prompt = system_prompt_for(memory_snapshot)
-        await prepare_summary(
-            active_session,
-            "schedule",
-            current_system_prompt,
-            tuple(active_loop.tool_schemas),
-            current_user,
-        )
-        history = active_session.messages[active_session.last_consolidated :]
-        return _project_schedule_messages(
-            [*history, current_user],
-            system_prompt=current_system_prompt,
-            session_id=active_session.session_id,
-            current_time=now(),
-        )
-
-    async def prepare_foreground_context(
-        active_session: Session,
-        current_user: dict[str, Any],
-        blackboard: Blackboard | None = None,
-        *,
-        manual_invocation: ManualSkillInvocation | None = None,
-    ) -> list[dict[str, Any]]:
-        active_loop = agent_loop
-        if active_loop is None:
-            raise RuntimeError("Foreground context requested before Agent Loop construction")
-        memory_snapshot = memory_manager.memory_snapshot()
-        current_system_prompt = foreground_system_prompt_for(memory_snapshot)
-        await prepare_summary(
-            active_session,
-            "chat",
-            current_system_prompt,
-            tuple(active_loop.tool_schemas),
-            current_user,
-            blackboard=blackboard,
-            manual_invocation=manual_invocation,
-        )
-        history = active_session.messages[active_session.last_consolidated :]
-        return _project_foreground_messages(
-            foreground_context,
-            [*history, current_user],
-            session_id=active_session.session_id,
-            long_term_memory=memory_snapshot,
-            blackboard=blackboard,
-            manual_invocation=manual_invocation,
-        )
-
     try:
         agent_loop = AgentLoop(
-            workspace=workspace_path,
-            skill_snapshot=active_skill_snapshot,
-            session=active_session,
+            workspace_path=workspace_path,
+            workspace_state=active_workspace_state,
+            agent_home=agent_home,
+            configuration=configuration,
+            bus=MessageBus() if bus is None else bus,
             schedule_service=schedule_service,
             model_router=router,
-            context_preparer=prepare_foreground_context,
+            memory_manager=memory_manager,
+            session_id=session_id,
             now=now,
-            max_iterations=configuration.runtime.max_iterations,
-            schedule_context_preparer=prepare_schedule_context,
-            schedule_now=schedule_clock.now,
-            title_prompt=session_title_prompt(),
-            externalize_result_for=externalize_result_for,
-            task_framer=task_framer,
-            bus=bus,
+            new_uuid=new_uuid,
+            monotonic_now=monotonic_now,
         )
     except BaseException:
         abort_memory_composition()
         raise
 
     try:
-        _preflight_skill_context_budget(
-            configuration=configuration,
-            context_builder=foreground_context,
-            long_term_memory=long_term_memory,
-            session_id=active_session.session_id,
-            skill_snapshot=active_skill_snapshot,
-            tool_schemas=agent_loop.tool_schemas,
-        )
+        agent_loop.preflight()
     except BaseException:
-        agent_loop.abort()
+        agent_loop._abandon_unstarted()
         abort_memory_composition()
         raise
 
@@ -1006,13 +798,7 @@ def _prepare_runtime(
         status_service = RuntimeStatusService(
             session=agent_loop.session,
             resolved_chat=current_foreground_chat_status,
-            next_input=lambda active_session: _runtime_status_input(
-                active_session,
-                context_builder=foreground_context,
-                long_term_memory=memory_manager.memory_snapshot(),
-                session_id=active_session.session_id,
-                tool_schemas=agent_loop.tool_schemas,
-            ),
+            next_input=agent_loop.runtime_status_input,
             monotonic=monotonic_now,
             schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
         )
@@ -1029,7 +815,7 @@ def _prepare_runtime(
         if management_dispatcher is None:
             management_dispatcher = ManagementCommandDispatcher(management_service)
     except BaseException:
-        agent_loop.abort()
+        agent_loop._abandon_unstarted()
         abort_memory_composition()
         raise
     return PreparedRuntime(
@@ -1040,194 +826,8 @@ def _prepare_runtime(
         _lifetime=_RuntimeLifetime(),
         _memory_manager=memory_manager,
         _dream=dream,
-        _context_builder=foreground_context,
         _management_service=management_service,
-        _skill_snapshot=active_skill_snapshot,
     )
-
-
-def _preflight_skill_context_budget(
-    *,
-    configuration: UserConfiguration,
-    context_builder: ContextBuilder,
-    long_term_memory: str,
-    session_id: str,
-    skill_snapshot: SkillSnapshot,
-    tool_schemas: tuple[OpenAIToolSchema, ...],
-) -> None:
-    """Reject an always-loaded snapshot when the minimum real foreground request overflows."""
-    if not any(skill.always for skill in skill_snapshot.skills):
-        return
-
-    resolved_chat = configuration.resolve_route("chat").route
-    estimated = estimate_input_tokens(
-        _foreground_runtime_status_input(
-            context_builder=context_builder,
-            history=(),
-            session_id=session_id,
-            long_term_memory=long_term_memory,
-            tool_schemas=tool_schemas,
-        )
-    )
-    available_input = resolved_chat.context_window - resolved_chat.max_output
-    if estimated > available_input:
-        raise SkillContextTooLargeError(
-            ErrorInfo(
-                "skill_context_too_large",
-                "Always-loaded Skill content exceeds the foreground chat input budget.",
-            )
-        )
-
-
-def _foreground_runtime_status_input(
-    *,
-    context_builder: ContextBuilder,
-    history: Sequence[dict[str, Any]],
-    session_id: str,
-    long_term_memory: str,
-    tool_schemas: tuple[OpenAIToolSchema, ...],
-) -> RuntimeStatusInput:
-    """Project and serialize one real foreground input using the status token seam."""
-    projected = context_builder.build_messages(
-        history=history,
-        current_user={"role": "user", "content": ""},
-        session_id=session_id,
-        long_term_memory=long_term_memory,
-    )
-    projected_system = projected[0].get("content")
-    if not isinstance(projected_system, str):
-        raise TypeError("Context Builder status system message is malformed")
-    return RuntimeStatusInput(
-        system_prompt=projected_system,
-        retained_messages=tuple(
-            json.dumps(message, ensure_ascii=False, separators=(",", ":"))
-            for message in projected[1:]
-        ),
-        tool_definitions=tuple(
-            json.dumps(
-                definition,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            for definition in tool_schemas
-        ),
-        runtime_context="",
-    )
-
-
-def _project_foreground_messages(
-    context: ContextBuilder,
-    messages: Sequence[dict[str, Any]],
-    *,
-    session_id: str,
-    long_term_memory: str,
-    blackboard: Blackboard | None = None,
-    manual_invocation: ManualSkillInvocation | None = None,
-) -> list[dict[str, Any]]:
-    history, current_user, current_user_index = _current_turn(messages, lane="Foreground")
-    projected = context.build_messages(
-        history=history,
-        current_user=current_user,
-        session_id=session_id,
-        long_term_memory=long_term_memory,
-        blackboard=blackboard,
-        manual_invocation=manual_invocation,
-    )
-    projected.extend(_project_continuation(messages, current_user_index))
-    return projected
-
-
-def _project_schedule_messages(
-    messages: Sequence[dict[str, Any]],
-    *,
-    system_prompt: str,
-    session_id: str,
-    current_time: datetime | None = None,
-) -> list[dict[str, Any]]:
-    """Project Schedule context without using the foreground ContextBuilder."""
-    history, current_user, current_user_index = _current_turn(messages, lane="Schedule")
-    projected = _project_without_current_user(history, system_prompt=system_prompt)
-    content = current_user.get("content")
-    timestamp = current_user.get("timestamp")
-    if not isinstance(content, str):
-        raise TypeError("Session user message is malformed")
-    if isinstance(timestamp, str):
-        effective_current_time = datetime.fromisoformat(timestamp)
-    elif current_time is not None:
-        effective_current_time = current_time
-    else:
-        raise TypeError("Schedule user message is missing a timestamp")
-    projected.append(
-        {
-            "role": "user",
-            "content": current_user_input(
-                content=content,
-                current_time=effective_current_time,
-                session_id=session_id,
-            ),
-        }
-    )
-    projected.extend(_project_continuation(messages, current_user_index))
-    return projected
-
-
-def _project_continuation(
-    messages: Sequence[dict[str, Any]],
-    current_user_index: int,
-) -> list[dict[str, Any]]:
-    return _project_history_messages(messages[current_user_index + 1 :])
-
-
-def _project_without_current_user(
-    messages: Sequence[dict[str, Any]],
-    *,
-    system_prompt: str,
-) -> list[dict[str, Any]]:
-    return [
-        {"role": "system", "content": system_prompt},
-        *_project_history_messages(messages),
-    ]
-
-
-def _project_history_messages(
-    messages: Sequence[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    return [
-        projected
-        for message in messages
-        if (projected := project_session_message(message)) is not None
-    ]
-
-
-def _current_turn(
-    messages: Sequence[dict[str, Any]],
-    *,
-    lane: str,
-) -> tuple[Sequence[dict[str, Any]], dict[str, Any], int]:
-    current_user_index = _last_user_index(messages)
-    if current_user_index == len(messages):
-        raise ValueError(f"{lane} context requires a current user message")
-    return messages[:current_user_index], messages[current_user_index], current_user_index
-
-
-def _build_tool_result_externalizer(
-    *,
-    session: Session,
-    max_tool_result_chars: int,
-) -> Callable[[ToolResult], ToolResult]:
-    def externalize(result: ToolResult) -> ToolResult:
-        if result.status != "success" or len(result.content) <= max_tool_result_chars:
-            return result
-        output = BaseTool.handle_result(
-            result.content,
-            workspace=session.workspace_state.workspace_path,
-            session_id=session.session_id,
-            tool_call_id=result.tool_call_id,
-            limit=max_tool_result_chars,
-        )
-        return replace(result, content=output.content, artifact=output.artifact)
-
-    return externalize
 
 
 def _resolved_chat_status(router: ModelRouter) -> ResolvedChatStatus:
@@ -1236,53 +836,4 @@ def _resolved_chat_status(router: ModelRouter) -> ResolvedChatStatus:
         provider_id=status.provider_id,
         model=status.model,
         context_window=status.context_window,
-    )
-
-
-def _runtime_status_input(
-    session: Session,
-    *,
-    context_builder: ContextBuilder | None = None,
-    long_term_memory: str = "",
-    system_prompt: str = "",
-    current_time: datetime | None = None,
-    session_id: str,
-    tool_schemas: tuple[OpenAIToolSchema, ...],
-) -> RuntimeStatusInput:
-    if context_builder is not None:
-        return _foreground_runtime_status_input(
-            context_builder=context_builder,
-            history=session.messages[session.last_consolidated :],
-            session_id=session_id,
-            long_term_memory=long_term_memory,
-            tool_schemas=tool_schemas,
-        )
-    retained = [
-        projected_message
-        for message in session.messages[session.last_consolidated :]
-        if (projected_message := project_session_message(message)) is not None
-    ]
-    runtime_context_value = (
-        ""
-        if current_time is None
-        else runtime_context(
-            current_time=current_time,
-            session_id=session_id,
-        )
-    )
-    retained_messages = tuple(
-        json.dumps(message, ensure_ascii=False, separators=(",", ":")) for message in retained
-    )
-    return RuntimeStatusInput(
-        system_prompt=system_prompt,
-        retained_messages=retained_messages,
-        tool_definitions=tuple(
-            json.dumps(
-                definition,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            for definition in tool_schemas
-        ),
-        runtime_context=runtime_context_value,
     )

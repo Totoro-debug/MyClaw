@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 
+import myclaw.agent.loop as loop_module
 import myclaw.agent.runtime as runtime_module
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import InboundMessage, OutboundMessage
@@ -523,7 +524,7 @@ async def test_target_generation_preparation_failure_preserves_old_generation(
         del args, kwargs
         raise RuntimeError("target validation failed")
 
-    monkeypatch.setattr(runtime_module, "ContextBuilder", fail_target_context)
+    monkeypatch.setattr(loop_module, "ContextBuilder", fail_target_context)
 
     result = await host.management_dispatcher.resume(target.session_id)
 
@@ -813,7 +814,7 @@ def test_runtime_composition_failure_closes_a_constructed_dream(
         raise RuntimeError("post-Dream wiring failed")
 
     monkeypatch.setitem(runtime_module.__dict__, "Dream", recording_dream)
-    monkeypatch.setattr(runtime_module, "_preflight_skill_context_budget", fail_wiring)
+    monkeypatch.setattr(AgentLoop, "preflight", fail_wiring)
 
     with pytest.raises(RuntimeError, match="post-Dream wiring failed"):
         _host(agent_home, workspace, RuntimeProvider(()))
@@ -893,15 +894,15 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
     assert replacement._router._clock is old._router._clock is host._retry_clock
     assert replacement.schedule_service._clock is host._schedule_scheduler_clock
     assert old.schedule_service._clock is host._schedule_scheduler_clock
-    assert replacement._context_builder._workspace == host._workspace
-    assert old._context_builder._workspace == host._workspace
-    assert str(replacement._context_builder._timezone) == host._timezone_name
-    assert str(old._context_builder._timezone) == host._timezone_name
+    assert replacement.agent_loop._context_builder._workspace == host._workspace
+    assert old.agent_loop._context_builder._workspace == host._workspace
+    assert str(replacement.agent_loop._context_builder._timezone) == host._timezone_name
+    assert str(old.agent_loop._context_builder._timezone) == host._timezone_name
     assert host._new_uuid is uuid4
     for generation in (old, replacement):
         assert generation.session._now is host._now
         assert generation.agent_loop._now is host._now
-        assert generation._context_builder._clock is host._now
+        assert generation.agent_loop._context_builder._clock is host._now
         assert generation._management_service._now is host._now
         assert generation._management_service._config.agent_home is host._agent_home
         status_service = generation._management_service._status_service

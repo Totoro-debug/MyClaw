@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 from collections import deque
 from collections.abc import AsyncIterator, Iterable, Sequence
@@ -7,11 +8,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
-from zoneinfo import ZoneInfoNotFoundError
 
 import pytest
 from loguru import logger
 
+import myclaw.agent.loop as loop_module
 import myclaw.agent.runtime as runtime_module
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
@@ -178,8 +179,41 @@ class BlockingSessionLogProvider:
         return None
 
 
+def test_runtime_prepare_does_not_accept_generation_collaborators() -> None:
+    parameters = inspect.signature(prepare_runtime).parameters
+    assert "task_framer" not in parameters
+    assert "session" not in parameters
+    assert "skill_snapshot" not in parameters
+
+
 @pytest.mark.asyncio
-async def test_runtime_composition_passes_discovered_iana_name_to_context_builder(
+async def test_runtime_preserves_explicit_foreground_timezone(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "get_localzone_name", lambda: "UTC")
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+
+    runtime = prepare_runtime(
+        agent_home=home,
+        workspace=workspace,
+        configuration=ConfigLoader(home).load(),
+        provider_factory=lambda _configuration: ScriptedFakeProvider(),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        timezone_name="Asia/Tokyo",
+    )
+    try:
+        assert str(runtime.agent_loop._context_builder._timezone) == "Asia/Tokyo"
+    finally:
+        await runtime.abort()
+
+
+@pytest.mark.asyncio
+async def test_runtime_composes_context_builder_only_inside_agent_loop(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -195,6 +229,7 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
         runtime_workspace: Path,
         timezone_name: str,
         *,
+        clock: Any = None,
         skill_snapshot: SkillSnapshot | None = None,
     ) -> ContextBuilder:
         discovered_names.append(timezone_name)
@@ -202,11 +237,12 @@ async def test_runtime_composition_passes_discovered_iana_name_to_context_builde
         return context_builder(
             runtime_workspace,
             timezone_name,
+            clock=clock,
             skill_snapshot=skill_snapshot,
         )
 
-    monkeypatch.setattr(runtime_module, "get_localzone_name", lambda: "Asia/Shanghai")
-    monkeypatch.setattr(runtime_module, "ContextBuilder", recording_context_builder)
+    monkeypatch.setattr(loop_module, "get_localzone_name", lambda: "Asia/Shanghai")
+    monkeypatch.setattr(loop_module, "ContextBuilder", recording_context_builder)
 
     runtime = prepare_runtime(
         agent_home=home,
@@ -272,7 +308,6 @@ async def test_injected_skill_catalog_root_is_the_only_confirmation_free_skill_r
     agent_home_file = home.skills_directory / "legacy" / "SKILL.md"
     agent_home_file.parent.mkdir(parents=True)
     agent_home_file.write_text("agent home root", encoding="utf-8")
-    snapshot = SkillSnapshot(root=catalog_root, skills=())
     provider = ScriptedFakeProvider(
         streams=(
             StreamScript(
@@ -320,9 +355,8 @@ async def test_injected_skill_catalog_root_is_the_only_confirmation_free_skill_r
         provider_factory=lambda _: provider,
         now=lambda: NOW,
         new_uuid=uuid4,
-        skill_snapshot=snapshot,
-        task_framer=DeterministicTaskFramingEvaluator(),
     )
+    runtime.agent_loop._task_framer = DeterministicTaskFramingEvaluator()
     runtime.session.update_metadata(title="Existing title")
     requests: list[ConfirmationRequestView] = []
 
@@ -338,7 +372,7 @@ async def test_injected_skill_catalog_root_is_the_only_confirmation_free_skill_r
         await runtime.close()
 
     assert "Finished reading." in "".join(message.content for message in outbound)
-    assert [request.details["path"] for request in requests] == [str(agent_home_file)]
+    assert [request.details["path"] for request in requests] == [str(catalog_file)]
     tool_messages = [message for message in runtime.session.messages if message["role"] == "tool"]
     assert [message["content"] for message in tool_messages] == [
         "catalog root",
@@ -372,7 +406,7 @@ async def test_foreground_skill_catalog_is_included_in_the_exact_budget_guard(
         now=lambda: NOW,
         new_uuid=uuid4,
     )
-    preparer: ForegroundContextPreparer = runtime.agent_loop._context_preparer
+    preparer: ForegroundContextPreparer = runtime.agent_loop._prepare_foreground_context
 
     try:
         with pytest.raises(ModelCallError) as raised:
@@ -430,7 +464,7 @@ def _always_skill_budget_fixture(
         skill_root=snapshot.root,
     )
     estimated_without_tools = estimate_input_tokens(
-        runtime_module._foreground_runtime_status_input(
+        loop_module._foreground_runtime_status_input(
             context_builder=context_builder,
             history=(),
             session_id=f"{NOW:%Y%m%d-%H%M%S-%f}_{SESSION_UUID}",
@@ -439,7 +473,7 @@ def _always_skill_budget_fixture(
         )
     )
     estimated = estimate_input_tokens(
-        runtime_module._foreground_runtime_status_input(
+        loop_module._foreground_runtime_status_input(
             context_builder=context_builder,
             history=(),
             session_id=f"{NOW:%Y%m%d-%H%M%S-%f}_{SESSION_UUID}",
@@ -455,11 +489,11 @@ async def test_always_skill_budget_allows_exact_foreground_projection(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    home, runtime_workspace, workspace_state, snapshot, _, estimated = _always_skill_budget_fixture(
-        agent_home, workspace
+    home, runtime_workspace, workspace_state, _snapshot, _, estimated = (
+        _always_skill_budget_fixture(agent_home, workspace)
     )
     (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
+        VALID_CONFIG.replace("[runtime]\n", "[runtime]\nenable_skill_always_load = true\n").replace(
             "context_window = 200000",
             f"context_window = {estimated + 8192}",
         ),
@@ -476,7 +510,6 @@ async def test_always_skill_budget_allows_exact_foreground_projection(
         now=lambda: NOW,
         new_uuid=iter((SESSION_UUID,)).__next__,
         timezone_name="Asia/Shanghai",
-        skill_snapshot=snapshot,
     )
     await prepared.close()
 
@@ -487,12 +520,12 @@ async def test_always_skill_budget_overflow_fails_before_provider_or_background_
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    home, runtime_workspace, workspace_state, snapshot, estimated_without_tools, estimated = (
+    home, runtime_workspace, workspace_state, _snapshot, estimated_without_tools, estimated = (
         _always_skill_budget_fixture(agent_home, workspace)
     )
     assert estimated_without_tools <= estimated - 1
     (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
+        VALID_CONFIG.replace("[runtime]\n", "[runtime]\nenable_skill_always_load = true\n").replace(
             "context_window = 200000",
             f"context_window = {estimated + 8192 - 1}",
         ),
@@ -527,7 +560,6 @@ async def test_always_skill_budget_overflow_fails_before_provider_or_background_
                 now=lambda: NOW,
                 new_uuid=iter((SESSION_UUID,)).__next__,
                 timezone_name="Asia/Shanghai",
-                skill_snapshot=snapshot,
             )
     finally:
         diagnostics.close()
@@ -545,11 +577,11 @@ async def test_always_skill_budget_ignores_retained_session_history(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    home, runtime_workspace, workspace_state, snapshot, _, estimated = _always_skill_budget_fixture(
-        agent_home, workspace
+    home, runtime_workspace, workspace_state, _snapshot, _, estimated = (
+        _always_skill_budget_fixture(agent_home, workspace)
     )
     (agent_home / "config.toml").write_text(
-        VALID_CONFIG.replace(
+        VALID_CONFIG.replace("[runtime]\n", "[runtime]\nenable_skill_always_load = true\n").replace(
             "context_window = 200000",
             f"context_window = {estimated + 8192}",
         ),
@@ -562,6 +594,7 @@ async def test_always_skill_budget_ignores_retained_session_history(
     )
     active_session.add_message("user", "history-" + ("x" * 100_000))
 
+    active_session.close()
     prepared = prepare_runtime(
         agent_home=home,
         workspace=runtime_workspace,
@@ -571,8 +604,7 @@ async def test_always_skill_budget_ignores_retained_session_history(
         now=lambda: NOW,
         new_uuid=uuid4,
         timezone_name="Asia/Shanghai",
-        skill_snapshot=snapshot,
-        session=active_session,
+        session_id=active_session.session_id,
     )
     await prepared.close()
 
@@ -590,11 +622,6 @@ async def test_metadata_only_skill_skips_startup_skill_budget_preflight(
         "---\nname: metadata-only\ndescription: Metadata only\n---\n",
         encoding="utf-8",
     )
-    snapshot = SkillLoader(
-        root=home.skills_directory,
-        reserved_names=(),
-        enable_always_load=False,
-    ).load()
     (agent_home / "config.toml").write_text(
         VALID_CONFIG.replace("context_window = 200000", "context_window = 8193"),
         encoding="utf-8",
@@ -608,7 +635,6 @@ async def test_metadata_only_skill_skips_startup_skill_budget_preflight(
         now=lambda: NOW,
         new_uuid=iter((SESSION_UUID,)).__next__,
         timezone_name="Asia/Shanghai",
-        skill_snapshot=snapshot,
     )
     await prepared.close()
 
@@ -675,7 +701,7 @@ async def test_conversation_summary_provider_keeps_skill_metadata_out_of_its_pro
             "total_tokens": 2,
         },
     )
-    preparer: ForegroundContextPreparer = runtime.agent_loop._context_preparer
+    preparer: ForegroundContextPreparer = runtime.agent_loop._prepare_foreground_context
 
     try:
         projected = await preparer(
@@ -714,7 +740,7 @@ async def test_foreground_context_uses_one_staged_blackboard_for_summary_and_cha
     )
     blackboard = Blackboard(goal="Current task", completion_boundary="Current boundary")
     observed: list[Blackboard | None] = []
-    original_projector = runtime_module._project_foreground_messages
+    original_projector = loop_module._project_foreground_messages
 
     def recording_projector(
         context: ContextBuilder,
@@ -735,8 +761,8 @@ async def test_foreground_context_uses_one_staged_blackboard_for_summary_and_cha
             manual_invocation=manual_invocation,
         )
 
-    monkeypatch.setattr(runtime_module, "_project_foreground_messages", recording_projector)
-    preparer: ForegroundContextPreparer = runtime.agent_loop._context_preparer
+    monkeypatch.setattr(loop_module, "_project_foreground_messages", recording_projector)
+    preparer: ForegroundContextPreparer = runtime.agent_loop._prepare_foreground_context
 
     projected_without_blackboard = await preparer(
         runtime.session,
@@ -821,7 +847,7 @@ async def test_manual_body_counts_in_foreground_token_budget_but_not_summary_pro
         request="REQUEST-MARKER",
         body="MANUAL-BODY-MARKER" + ("b" * 9_000),
     )
-    preparer: ForegroundContextPreparer = runtime.agent_loop._context_preparer
+    preparer: ForegroundContextPreparer = runtime.agent_loop._prepare_foreground_context
 
     try:
         projected = await preparer(
@@ -880,8 +906,8 @@ async def test_oversized_manual_body_returns_context_overflow_without_provider_o
         provider_factory=lambda _configuration: provider,
         now=lambda: NOW,
         new_uuid=uuid4,
-        task_framer=framer,
     )
+    runtime.agent_loop._task_framer = framer
     runtime.session.add_message("user", "Earlier question")
     runtime.session.add_message(
         "assistant",
@@ -928,8 +954,8 @@ async def test_management_command_performs_zero_task_framing_attempts(
         provider_factory=unexpected_provider_factory,
         now=lambda: NOW,
         new_uuid=uuid4,
-        task_framer=framer,
     )
+    runtime.agent_loop._task_framer = framer
 
     result = await runtime.management_dispatcher.dispatch("/status")
     await runtime.close()
@@ -954,7 +980,7 @@ def test_runtime_composition_rejects_invalid_discovered_iana_before_provider_cal
 
     monkeypatch.setattr(runtime_module, "get_localzone_name", lambda: "Invalid/MyClaw-Zone")
 
-    with pytest.raises(ZoneInfoNotFoundError):
+    with pytest.raises(ValueError):
         prepare_runtime(
             agent_home=home,
             workspace=workspace,
@@ -1088,8 +1114,8 @@ async def test_prepared_runtime_correlates_foreground_and_title_work_with_its_se
         now=clock.now,
         new_uuid=iter((SESSION_UUID, TURN_UUID)).__next__,
         retry_clock=clock,
-        task_framer=DeterministicTaskFramingEvaluator(),
     )
+    runtime.agent_loop._task_framer = DeterministicTaskFramingEvaluator()
 
     private_input = " ".join(("private", "foreground", "input"))
     await runtime.start()
@@ -1126,15 +1152,16 @@ async def test_concurrent_foreground_sessions_write_only_to_their_own_session_lo
     second_provider = BlockingSessionLogProvider(marker="SECOND_SESSION", release=release)
 
     def runtime_for(provider: BlockingSessionLogProvider) -> PreparedRuntime:
-        return prepare_runtime(
+        runtime = prepare_runtime(
             agent_home=home,
             workspace=workspace,
             configuration=configuration,
             provider_factory=lambda _: provider,
             now=FakeClock(NOW).now,
             new_uuid=uuid4,
-            task_framer=DeterministicTaskFramingEvaluator(),
         )
+        runtime.agent_loop._task_framer = DeterministicTaskFramingEvaluator()
+        return runtime
 
     first_runtime = runtime_for(first_provider)
     second_runtime = runtime_for(second_provider)
