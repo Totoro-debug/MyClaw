@@ -81,10 +81,6 @@ class ManagementCommandDispatcher:
     def __init__(self, management: ManagementPort) -> None:
         self._management: ManagementPort | None = management
 
-    def _rebind_management(self, management: ManagementPort) -> None:
-        """Switch the lifetime dispatcher to the prepared generation port."""
-        self._management = management
-
     def _unbind_management(self, management: ManagementPort) -> None:
         """Enter a safe empty state only if this generation is still selected."""
         if self._management is management:

@@ -251,7 +251,10 @@ class AgentLoop:
             raise TypeError("Agent Loop Session ID must be a string or None")
 
         # Build every generation-local collaborator before publishing any Loop field.
-        chat_route = configuration.resolve_route("chat").route
+        resolved_chat_route = configuration.resolve_route("chat")
+        chat_route = resolved_chat_route.route
+        configured_chat_model = f"{resolved_chat_route.provider.provider_id}/{chat_route.model}"
+        configured_chat_context_window = chat_route.context_window
         skill_loader = SkillLoader(
             root=agent_home.skills_directory,
             reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
@@ -282,7 +285,6 @@ class AgentLoop:
             project_messages=self._project_foreground_summary_messages,
         )
         title_prompt: str | None = session_title_prompt()
-        generation_started_at = monotonic_now()
         active_session = (
             Session.create(workspace_state, now=now, new_uuid=new_uuid)
             if session_id is None
@@ -298,6 +300,8 @@ class AgentLoop:
         self._workspace_state = workspace_state
         self._agent_home = agent_home
         self._configuration = configuration
+        self._configured_chat_model = configured_chat_model
+        self._configured_chat_context_window = configured_chat_context_window
         self._session = active_session
         self._skill_loader = skill_loader
         self._skill_snapshot = skill_snapshot
@@ -306,6 +310,7 @@ class AgentLoop:
         self._summary_manager = summary_manager
         self._task_framer = task_framer
         self._now = now
+        self._monotonic_now = monotonic_now
         self._schedule_now = schedule_service.current_time
         self._title_prompt = title_prompt
         self._tool_gateway = tool_gateway
@@ -314,7 +319,7 @@ class AgentLoop:
         self._runner = runner
         self._max_iterations = configuration.runtime.max_iterations
         self._bus = bus
-        self._generation_started_at = generation_started_at
+        self._generation_started_at: float | None = None
         self._consumer_task: asyncio.Task[None] | None = None
         self._execution_task: asyncio.Task[None] | None = None
         self._schedule_tasks: set[asyncio.Task[None]] = set()
@@ -443,14 +448,22 @@ class AgentLoop:
         self._preflighted = True
 
     def _activate_prepared(self) -> None:
-        """Activate a preflighted Loop using only infallible task creation."""
+        """Sample uptime and atomically publish the preflighted Loop activation."""
         if self._closed or self._aborted or self._closing or self._close_task is not None:
             raise RuntimeError("Agent Loop is closed")
         if self._started:
             return
         if not self._preflighted:
             raise RuntimeError("Agent Loop was not preflighted")
-        self._consumer_task = asyncio.create_task(self._consume_foreground())
+        started_at = self._monotonic_now()
+        consumer = self._consume_foreground()
+        try:
+            consumer_task = asyncio.create_task(consumer)
+        except BaseException:
+            consumer.close()
+            raise
+        self._consumer_task = consumer_task
+        self._generation_started_at = started_at
         self._started = True
 
     async def close(self) -> None:
@@ -1132,15 +1145,45 @@ class AgentLoop:
             long_term_memory=memory_snapshot,
         )
 
-    def runtime_status_input(self, active_session: Session | None = None) -> RuntimeStatusInput:
+    def runtime_status_input(self) -> RuntimeStatusInput:
         """Return the status token input projected by this generation's Context Builder."""
-        session = self._session if active_session is None else active_session
+        session = self._session
+        route_status = self._last_foreground_route_status
+        session_id = session.session_id
+        messages = session.messages
+        metadata = session.metadata
+        last_consolidated = session.last_consolidated
+        title = metadata.get("title")
+        if not isinstance(title, str):
+            raise ValueError("Active Session title is malformed")
+        usage_value = metadata.get("token_usage")
+        if not isinstance(usage_value, dict):
+            raise ValueError("Active Session token usage is malformed")
+        usage_fields = ("model_calls", "input_tokens", "output_tokens", "total_tokens")
+        usage = tuple((field, usage_value.get(field)) for field in usage_fields)
+        if any(isinstance(value, bool) or not isinstance(value, int) for _, value in usage):
+            raise ValueError("Active Session token usage is malformed")
         return _foreground_runtime_status_input(
             context_builder=self._context_builder,
-            history=session.messages[session.last_consolidated :],
-            session_id=session.session_id,
+            history=messages[last_consolidated:],
+            session_id=session_id,
             long_term_memory=self._memory_manager.memory_snapshot(),
             tool_schemas=self.tool_schemas,
+            session_title=title,
+            session_message_count=len(messages),
+            last_consolidated=last_consolidated,
+            cumulative_usage=tuple((field, cast(int, value)) for field, value in usage),
+            chat_model=(
+                self._configured_chat_model
+                if route_status is None
+                else f"{route_status.provider_id}/{route_status.model}"
+            ),
+            context_window=(
+                self._configured_chat_context_window
+                if route_status is None
+                else route_status.context_window
+            ),
+            generation_started_at=self._generation_started_at,
         )
 
     def _remember_foreground_route_status(self) -> None:
@@ -1471,6 +1514,13 @@ def _foreground_runtime_status_input(
     session_id: str,
     long_term_memory: str,
     tool_schemas: tuple[OpenAIToolSchema, ...],
+    session_title: str = "",
+    session_message_count: int = 0,
+    last_consolidated: int = 0,
+    cumulative_usage: tuple[tuple[str, int], ...] = (),
+    chat_model: str = "",
+    context_window: int = 0,
+    generation_started_at: float | None = None,
 ) -> RuntimeStatusInput:
     """Project and serialize a minimum foreground request for status and preflight."""
     projected = context_builder.build_messages(
@@ -1492,6 +1542,14 @@ def _foreground_runtime_status_input(
             json.dumps(schema, ensure_ascii=False, separators=(",", ":")) for schema in tool_schemas
         ),
         runtime_context="",
+        session_id=session_id,
+        session_title=session_title,
+        session_message_count=session_message_count,
+        last_consolidated=last_consolidated,
+        cumulative_usage=cumulative_usage,
+        chat_model=chat_model,
+        context_window=context_window,
+        generation_started_at=generation_started_at,
     )
 
 

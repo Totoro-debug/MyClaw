@@ -11,16 +11,17 @@ import pytest
 
 import myclaw.agent.loop as loop_module
 import myclaw.agent.runtime as runtime_module
+import myclaw.management.service as management_service_module
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import InboundMessage, OutboundMessage
 from myclaw.agent.runtime import RuntimeGenerationPresentation, RuntimeHost
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.management.commands import ManagementCommandDispatcher
-from myclaw.management.service import SessionListingEntry
+from myclaw.management.commands import ManagementCommandDispatcher, ManagementCommandResult
+from myclaw.management.service import ManagementViewService, SessionListingEntry
 from myclaw.memory.conversation_summary import WorkspaceJsonlSummaryStore
-from myclaw.memory.dream import Dream
+from myclaw.memory.dream import Dream, DreamResult
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelContinuation,
@@ -29,7 +30,7 @@ from myclaw.provider.models import (
     ModelUsage,
     ReasoningEffort,
 )
-from myclaw.schedule.service import ScheduleService
+from myclaw.schedule.service import ScheduleService, ScheduleServiceStatus
 from myclaw.schedule.store import ScheduleStateError
 from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillLoader, SkillSnapshot
@@ -197,6 +198,232 @@ class _RuntimeAppDriver:
         finally:
             self._host.unbind_terminal(self._rebind)
             await self._host.close()
+
+
+@pytest.mark.asyncio
+async def test_management_port_identity_survives_runtime_generation_replacement(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    management_services: list[object] = []
+    status_services: list[object] = []
+    dispatchers: list[object] = []
+    original_management_service = ManagementViewService
+    original_status_service = management_service_module.RuntimeStatusService
+    original_dispatcher = ManagementCommandDispatcher
+
+    def recording_management_service(*args: Any, **kwargs: Any) -> ManagementViewService:
+        service = original_management_service(*args, **kwargs)
+        management_services.append(service)
+        return service
+
+    def recording_status_service(*args: Any, **kwargs: Any) -> object:
+        service = original_status_service(*args, **kwargs)
+        status_services.append(service)
+        return service
+
+    def recording_dispatcher(*args: Any, **kwargs: Any) -> ManagementCommandDispatcher:
+        dispatcher = original_dispatcher(*args, **kwargs)
+        dispatchers.append(dispatcher)
+        return dispatcher
+
+    monkeypatch.setattr(runtime_module, "ManagementViewService", recording_management_service)
+    monkeypatch.setattr(management_service_module, "RuntimeStatusService", recording_status_service)
+    monkeypatch.setattr(runtime_module, "ManagementCommandDispatcher", recording_dispatcher)
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Lifetime management target")
+    target.close()
+    dispatcher = host.management_dispatcher
+    management_port = dispatcher._management
+    status_service = host._management_service._status_service
+    current_providers = (
+        host._management_service._current_agent_loop,
+        host._management_service._memory_reader,
+        host._management_service._dream,
+        None if status_service is None else status_service._schedule_status,
+        host._management_service._replace_agent_loop,
+    )
+
+    try:
+        assert management_services == [management_port]
+        assert status_services == [status_service]
+        assert dispatchers == [dispatcher]
+        assert not hasattr(ManagementCommandDispatcher, "_rebind_management")
+        assert not hasattr(host._management_service, "_replacement_lock")
+        for provider in current_providers:
+            assert provider is not None
+            assert getattr(provider, "__self__", None) is None
+            assert getattr(provider, "__defaults__", None) in (None, ())
+            closure_values = tuple(
+                cell.cell_contents for cell in (getattr(provider, "__closure__", None) or ())
+            )
+            assert old not in closure_values
+            assert old.agent_loop not in closure_values
+            assert old.session not in closure_values
+        result = await dispatcher.resume(target.session_id)
+
+        assert result.resumed_session_id == target.session_id
+        assert dispatcher._management is management_port
+
+        second_target = Session.create(
+            host.generation.session.workspace_state,
+            now=lambda: NOW,
+            new_uuid=uuid4,
+        )
+        second_target.add_message("user", "Second lifetime management target")
+        second_target.close()
+        second_result = await dispatcher.resume(second_target.session_id)
+
+        assert second_result.resumed_session_id == second_target.session_id
+        assert dispatcher._management is management_port
+        assert host.generation._management_service is old._management_service
+        assert host._management_service._status_service is status_service
+        assert management_services == [management_port]
+        assert status_services == [status_service]
+        assert dispatchers == [dispatcher]
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_management_uses_target_generation_resources_after_replacement(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Current resource target")
+    target.close()
+
+    try:
+        result = await host.management_dispatcher.resume(target.session_id)
+        assert result.resumed_session_id == target.session_id
+        replacement = host.generation
+        target_memory_calls = 0
+        target_dream_calls = 0
+        target_schedule_calls = 0
+
+        async def old_memory() -> str:
+            return "old memory"
+
+        async def target_memory() -> str:
+            nonlocal target_memory_calls
+            target_memory_calls += 1
+            return "target memory"
+
+        async def old_dream() -> DreamResult:
+            return DreamResult(
+                status="Old Dream",
+                processed_count=0,
+                memory_updated=False,
+                cursor=0,
+            )
+
+        async def target_dream() -> DreamResult:
+            nonlocal target_dream_calls
+            target_dream_calls += 1
+            return DreamResult(
+                status="Target Dream",
+                processed_count=0,
+                memory_updated=False,
+                cursor=0,
+            )
+
+        monkeypatch.setattr(old._memory_manager, "read_long_term", old_memory)
+        monkeypatch.setattr(replacement._memory_manager, "read_long_term", target_memory)
+        monkeypatch.setattr(old._dream, "run", old_dream)
+        monkeypatch.setattr(replacement._dream, "run", target_dream)
+        monkeypatch.setattr(
+            old.schedule_service,
+            "status_snapshot",
+            lambda: ScheduleServiceStatus(status="available", active_job_count=1),
+        )
+        def target_schedule_status() -> ScheduleServiceStatus:
+            nonlocal target_schedule_calls
+            target_schedule_calls += 1
+            return ScheduleServiceStatus(status="available", active_job_count=2)
+
+        monkeypatch.setattr(replacement.schedule_service, "status_snapshot", target_schedule_status)
+
+        memory = await host.management_dispatcher.dispatch("/memory")
+        dream = await host.management_dispatcher.dispatch("/dream")
+        status = await host.management_dispatcher.dispatch("/status")
+
+        assert memory.output == "target memory"
+        assert dream.output is not None and dream.output.startswith("Target Dream\n")
+        assert status.output is not None
+        assert json.loads(status.output)["schedule"] == {
+            "status": "available",
+            "active_job_count": 2,
+        }
+        assert target_memory_calls == 1
+        assert target_dream_calls == 1
+        assert target_schedule_calls == 1
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("status", "memory", "dream", "resume"))
+async def test_management_is_unavailable_between_generation_detach_and_start(
+    agent_home: Path,
+    workspace: Path,
+    operation: str,
+) -> None:
+    host = _host(agent_home, workspace, RuntimeProvider(()))
+    old = host.generation
+    target = Session.create(old.session.workspace_state, now=lambda: NOW, new_uuid=uuid4)
+    target.add_message("user", "Barrier target")
+    target.close()
+    nested_target = Session.create(
+        old.session.workspace_state,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    nested_target.add_message("user", "Nested barrier target")
+    nested_target.close()
+    during_commit: list[ManagementCommandResult] = []
+    during_ready = asyncio.Event()
+    release_rebind = asyncio.Event()
+
+    async def gated_rebind(presentation: RuntimeGenerationPresentation) -> None:
+        del presentation
+        result = (
+            await host.management_dispatcher.resume(nested_target.session_id)
+            if operation == "resume"
+            else await host.management_dispatcher.dispatch(f"/{operation}")
+        )
+        during_commit.append(result)
+        during_ready.set()
+        await release_rebind.wait()
+
+    host.bind_terminal(gated_rebind)
+    try:
+        await host.start()
+        before = await host.management_dispatcher.dispatch("/status")
+        assert before.output is not None
+        assert "route_unavailable" not in before.output
+
+        replacement = asyncio.create_task(host.management_dispatcher.resume(target.session_id))
+        await asyncio.wait_for(during_ready.wait(), timeout=2)
+        during = during_commit[0]
+        assert during.output == "route_unavailable: Runtime Generation is unavailable."
+
+        release_rebind.set()
+        result = await replacement
+        assert result.resumed_session_id == target.session_id
+        after = await host.management_dispatcher.dispatch("/status")
+        assert after.output is not None
+        assert "route_unavailable" not in after.output
+        assert json.loads(after.output)["session_message_count"] == 1
+    finally:
+        release_rebind.set()
+        await host.close()
 
 
 @pytest.mark.asyncio
@@ -873,8 +1100,11 @@ async def test_pending_only_resume_replaces_every_generation_owned_component(
     assert replacement.management_dispatcher is old.management_dispatcher is host.management_dispatcher
     assert all(
         new is not previous
-        for new, previous in zip(replacement_components, old_components, strict=True)
+        for new, previous in zip(
+            replacement_components[:6], old_components[:6], strict=True
+        )
     )
+    assert replacement_components[6] is old_components[6] is host._management_service
     assert old._dream._task is None
     assert old._dream._closed is True
     assert old.schedule_service._aborted is True
@@ -1276,12 +1506,8 @@ async def test_concurrent_old_generation_resume_requests_cannot_replace_the_new_
     results = await asyncio.gather(*requests)
 
     successes = [result for result in results if result.resumed_session_id is not None]
-    assert len(successes) == 1
-    assert host.generation.session_id == successes[0].resumed_session_id
-    assert any(
-        result.output == "route_unavailable: Runtime Generation is no longer active."
-        for result in results
-    )
+    assert len(successes) == 2
+    assert host.generation.session_id == successes[-1].resumed_session_id
 
     await host.close()
 
@@ -1300,13 +1526,24 @@ async def test_management_command_uses_one_generation_port_across_concurrent_reb
     target.close()
     old_command_started = asyncio.Event()
     release_old_command = asyncio.Event()
+    memory_provider_calls = 0
+    memory_read_calls = 0
+    original_current_memory = host._current_management_memory_manager
 
-    async def gated_old_memory_view() -> str:
+    def current_memory() -> object:
+        nonlocal memory_provider_calls
+        memory_provider_calls += 1
+        return original_current_memory()
+
+    async def gated_old_memory_read() -> str:
+        nonlocal memory_read_calls
+        memory_read_calls += 1
         old_command_started.set()
         await release_old_command.wait()
         return "old generation memory"
 
-    monkeypatch.setattr(old._management_service, "memory_view", gated_old_memory_view)
+    monkeypatch.setattr(host, "_current_management_memory_manager", current_memory)
+    monkeypatch.setattr(old._memory_manager, "read_long_term", gated_old_memory_read)
     old_command = asyncio.create_task(dispatcher.dispatch("/memory"))
     await old_command_started.wait()
 
@@ -1317,6 +1554,8 @@ async def test_management_command_uses_one_generation_port_across_concurrent_reb
     result = await old_command
 
     assert result.output == "old generation memory"
+    assert memory_provider_calls == 1
+    assert memory_read_calls == 1
     assert dispatcher._management is host.generation._management_service
     await host.close()
 

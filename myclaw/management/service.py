@@ -3,7 +3,8 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, cast
+from time import monotonic
+from typing import Protocol
 
 from loguru import logger
 
@@ -25,6 +26,10 @@ class _MemoryReader(Protocol):
 
 class _DreamRunner(Protocol):
     async def run(self) -> DreamResult: ...
+
+
+class _StatusProjectionLoop(Protocol):
+    def runtime_status_input(self) -> "RuntimeStatusInput": ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,34 +79,21 @@ class SessionListingReport:
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvedChatStatus:
-    """The actual provider/model identity and context window used for chat."""
-
-    provider_id: str
-    model: str
-    context_window: int
-
-    def __post_init__(self) -> None:
-        if not self.provider_id or not self.model:
-            msg = "provider_id and model must not be empty"
-            raise ValueError(msg)
-        if self.context_window <= 0:
-            msg = "context_window must be positive"
-            raise ValueError(msg)
-
-    @property
-    def chat_model(self) -> str:
-        return f"{self.provider_id}/{self.model}"
-
-
-@dataclass(frozen=True, slots=True)
 class RuntimeStatusInput:
-    """Exact next-request text fragments included in the token estimate."""
+    """Immutable status projection and exact next-request text fragments."""
 
     system_prompt: str
     retained_messages: tuple[str, ...]
     tool_definitions: tuple[str, ...]
     runtime_context: str
+    session_id: str = ""
+    session_title: str = ""
+    session_message_count: int = 0
+    last_consolidated: int = 0
+    cumulative_usage: tuple[tuple[str, int], ...] = ()
+    chat_model: str = ""
+    context_window: int = 0
+    generation_started_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,59 +159,50 @@ def estimate_input_tokens(status_input: RuntimeStatusInput) -> int:
 
 
 class RuntimeStatusService:
-    """Build one Management Port status snapshot from injectable runtime state."""
+    """Build one Management Port status snapshot from a current-loop projection."""
 
     def __init__(
         self,
         *,
-        session: Session | Callable[[], Session],
-        resolved_chat: Callable[[], ResolvedChatStatus],
-        next_input: Callable[[Session], RuntimeStatusInput],
+        current_agent_loop: Callable[[], _StatusProjectionLoop],
         monotonic: Callable[[], float],
         schedule_status: Callable[[], dict[str, object]] | None = None,
         version: str = __version__,
     ) -> None:
-        self._session: Callable[[], Session]
-        if isinstance(session, Session):
-            self._session = lambda: session
-        else:
-            self._session = session
-        self._resolved_chat = resolved_chat
-        self._next_input = next_input
+        self._current_agent_loop = current_agent_loop
         self._monotonic = monotonic
         self._schedule_status = schedule_status
-        self._started_at = monotonic()
         self._version = version
 
     async def status(self) -> RuntimeStatus:
         """Return all required runtime and current-session status fields."""
-        session = self._session()
-        resolved = self._resolved_chat()
-        estimated = estimate_input_tokens(self._next_input(session))
-        uptime = max(0, int(self._monotonic() - self._started_at))
+        current_agent_loop = self._current_agent_loop()
+        projection = current_agent_loop.runtime_status_input()
+        estimated = estimate_input_tokens(projection)
+        if projection.context_window <= 0:
+            raise ValueError("Runtime status context window must be positive")
+        started_at = projection.generation_started_at
+        uptime = (
+            0
+            if started_at is None
+            else max(0, int(self._monotonic() - started_at))
+        )
         return RuntimeStatus(
             version=self._version,
-            chat_model=resolved.chat_model,
+            chat_model=projection.chat_model,
             uptime_seconds=uptime,
             estimated_input_tokens=estimated,
-            context_window=resolved.context_window,
-            context_used_percent=estimated / resolved.context_window * 100,
-            session_message_count=len(session.messages),
-            last_consolidated=session.last_consolidated,
-            cumulative_usage=_active_session_usage(session),
-            schedule=(None if self._schedule_status is None else dict(self._schedule_status())),
+            context_window=projection.context_window,
+            context_used_percent=estimated / projection.context_window * 100,
+            session_message_count=projection.session_message_count,
+            last_consolidated=projection.last_consolidated,
+            cumulative_usage=dict(projection.cumulative_usage),
+            schedule=(
+                None
+                if self._schedule_status is None
+                else dict(self._schedule_status())
+            ),
         )
-
-
-def _active_session_usage(session: Session) -> dict[str, int]:
-    value = session.metadata.get("token_usage")
-    if not isinstance(value, dict):
-        raise ValueError("Active Session token usage is malformed")
-    fields = ("model_calls", "input_tokens", "output_tokens", "total_tokens")
-    usage = {field: value.get(field) for field in fields}
-    if any(isinstance(item, bool) or not isinstance(item, int) for item in usage.values()):
-        raise ValueError("Active Session token usage is malformed")
-    return {field: cast(int, usage[field]) for field in fields}
 
 
 class ManagementError(Exception):
@@ -231,26 +214,57 @@ class ManagementError(Exception):
 
 
 class ManagementViewService:
-    """Read global configuration and injected runtime-owned views."""
+    """Read global configuration and dynamically selected runtime-owned views."""
 
     def __init__(
         self,
         agent_home: AgentHome,
         *,
         status_service: RuntimeStatusService | None = None,
+        current_agent_loop: Callable[[], _StatusProjectionLoop] | None = None,
         workspace_state: WorkspaceState | None = None,
+        replace_agent_loop: Callable[[str, bool], Awaitable[None]] | None = None,
         replace_session: Callable[[str, bool], Awaitable[None]] | None = None,
         now: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] = monotonic,
         memory_manager: _MemoryReader | None = None,
+        current_memory_manager: Callable[[], _MemoryReader] | None = None,
         dream: _DreamRunner | None = None,
+        current_dream: Callable[[], _DreamRunner] | None = None,
+        schedule_status: Callable[[], dict[str, object]] | None = None,
     ) -> None:
         self._config = ConfigLoader(agent_home)
-        self._status_service = status_service
+        self._status_service = (
+            status_service
+            if status_service is not None
+            else (
+                None
+                if current_agent_loop is None
+                else RuntimeStatusService(
+                    current_agent_loop=current_agent_loop,
+                    monotonic=monotonic,
+                    schedule_status=schedule_status,
+                )
+            )
+        )
+        self._current_agent_loop = current_agent_loop
         self._workspace_state = workspace_state
-        self._replace_session = replace_session
+        self._replace_agent_loop = (
+            replace_agent_loop if replace_agent_loop is not None else replace_session
+        )
         self._now = now
-        self._memory_reader = memory_manager
-        self._dream = dream
+        if memory_manager is not None and current_memory_manager is not None:
+            raise TypeError("Specify either memory_manager or current_memory_manager")
+        self._memory_reader = (
+            current_memory_manager
+            if current_memory_manager is not None
+            else (None if memory_manager is None else lambda: memory_manager)
+        )
+        if dream is not None and current_dream is not None:
+            raise TypeError("Specify either dream or current_dream")
+        self._dream = (
+            current_dream if current_dream is not None else (None if dream is None else lambda: dream)
+        )
         self._aborted = False
 
     def deactivate(self) -> None:
@@ -262,6 +276,11 @@ class ManagementViewService:
             raise ManagementError(
                 ErrorInfo("route_unavailable", "Runtime Generation is no longer active.")
             )
+
+    def _ensure_current_generation(self) -> None:
+        current_agent_loop = self._current_agent_loop
+        if current_agent_loop is not None:
+            current_agent_loop()
 
     async def config_view(self) -> ConfigView:
         """Return complete redacted User Configuration content."""
@@ -280,13 +299,16 @@ class ManagementViewService:
     async def memory_view(self) -> str:
         """Return the complete current Long-term Memory file."""
         self._ensure_active()
+        self._ensure_current_generation()
         memory_reader = self._memory_reader
         if memory_reader is None:
             raise ManagementError(
                 ErrorInfo("route_unavailable", "Long-term Memory is unavailable.")
             )
         try:
-            return await memory_reader.read_long_term()
+            return await memory_reader().read_long_term()
+        except ManagementError:
+            raise
         except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Long-term Memory could not be read.")
@@ -295,10 +317,11 @@ class ManagementViewService:
     async def dream(self) -> DreamResult:
         """Run one foreground Memory Task and return its safe summary."""
         self._ensure_active()
+        self._ensure_current_generation()
         dream = self._dream
         if dream is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Memory Task is unavailable."))
-        return await dream.run()
+        return await dream().run()
 
     async def status(self) -> RuntimeStatus:
         """Return the injected Runtime status snapshot."""
@@ -307,6 +330,8 @@ class ManagementViewService:
             raise ManagementError(ErrorInfo("route_unavailable", "Runtime status is unavailable."))
         try:
             return await self._status_service.status()
+        except ManagementError:
+            raise
         except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Runtime status could not be read.")
@@ -376,9 +401,10 @@ class ManagementViewService:
     async def resume(self, session_id: str, *, force: bool = False) -> ResumeResult:
         """Revalidate and select one Session from the current Workspace."""
         self._ensure_active()
+        self._ensure_current_generation()
         workspace_state = self._workspace_state
-        replace_session = self._replace_session
-        if workspace_state is None or replace_session is None:
+        replace_agent_loop = self._replace_agent_loop
+        if workspace_state is None or replace_agent_loop is None:
             raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
         sessions = await self.resumable_sessions()
         if session_id not in {summary.id for summary in sessions}:
@@ -388,7 +414,7 @@ class ManagementViewService:
                     "The selected Conversation Session is not resumable.",
                 )
             )
-        await replace_session(session_id, force)
+        await replace_agent_loop(session_id, force)
         return ResumeResult(session_id=session_id)
 
 

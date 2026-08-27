@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import cast
 from uuid import UUID
 
 from loguru import logger
@@ -36,7 +35,6 @@ from myclaw.management.commands import (
 from myclaw.management.service import (
     ManagementError,
     ManagementViewService,
-    ResolvedChatStatus,
     RuntimeStatusService,
 )
 from myclaw.memory.dream import Dream
@@ -102,6 +100,7 @@ class PreparedRuntime:
     _memory_manager: MemoryManager
     _dream: Dream
     _management_service: ManagementViewService
+    _management_service_owned: bool
 
     @property
     def session_id(self) -> str:
@@ -135,16 +134,6 @@ class PreparedRuntime:
             control=self.control,
             skill_metadata=self.agent_loop.skill_metadata,
             session_projection=self.control.project_foreground_conversation(),
-        )
-
-    def _activate_management(self) -> None:
-        cast(ManagementCommandDispatcher, self.management_dispatcher)._rebind_management(
-            self._management_service
-        )
-
-    def _deactivate_management(self) -> None:
-        cast(ManagementCommandDispatcher, self.management_dispatcher)._unbind_management(
-            self._management_service
         )
 
     def validate_unstarted(self) -> None:
@@ -189,7 +178,8 @@ class PreparedRuntime:
         self._lifetime.aborted = True
         self._lifetime.started = True
         self._lifetime.shutdown_requested.set()
-        self._management_service.deactivate()
+        if self._management_service_owned:
+            self._management_service.deactivate()
         self.schedule_service.abort()
         self.agent_loop._request_abort()
         self._dream.abort()
@@ -282,7 +272,8 @@ class PreparedRuntime:
             return
         task = self._lifetime.close_task
         if task is None:
-            self._management_service.deactivate()
+            if self._management_service_owned:
+                self._management_service.deactivate()
             self._lifetime.started = True
             self._lifetime.shutdown_requested.set()
             running = self._lifetime.run_task
@@ -377,33 +368,47 @@ class RuntimeHost:
         self._terminal_quiesce: Callable[[], Awaitable[None]] | None = None
         self._replacement_lock = asyncio.Lock()
         self._closed = False
-        initial_token = object()
-        self._runtime_token = initial_token
-        self._runtime: PreparedRuntime | None = prepare_runtime(
-            agent_home=agent_home,
-            workspace=self._workspace,
+        self._runtime: PreparedRuntime | None = None
+        self._management_available = False
+        self._management_service = ManagementViewService(
+            agent_home,
+            current_agent_loop=lambda: self._current_management_agent_loop(),
             workspace_state=self._workspace_state,
-            configuration=configuration,
-            provider_factory=provider_factory,
+            replace_agent_loop=self._replacement_callback(),
             now=now,
-            new_uuid=new_uuid,
-            retry_clock=retry_clock,
-            retry_jitter=retry_jitter,
-            schedule_scheduler_clock=self._schedule_scheduler_clock,
-            monotonic_now=monotonic_now,
-            timezone_name=self._timezone_name,
-            replace_session=self._replacement_callback(initial_token),
-            bus=self._bus,
+            monotonic=monotonic_now,
+            current_memory_manager=lambda: self._current_management_memory_manager(),
+            current_dream=lambda: self._current_management_dream(),
+            schedule_status=lambda: self._current_management_schedule_status(),
         )
-        initial_runtime = self._runtime
-        self._management_dispatcher = cast(
-            ManagementCommandDispatcher,
-            initial_runtime.management_dispatcher,
-        )
+        self._management_dispatcher = ManagementCommandDispatcher(self._management_service)
+        initial_runtime: PreparedRuntime | None = None
         try:
+            initial_runtime = prepare_runtime(
+                agent_home=agent_home,
+                workspace=self._workspace,
+                workspace_state=self._workspace_state,
+                configuration=configuration,
+                provider_factory=provider_factory,
+                now=now,
+                new_uuid=new_uuid,
+                retry_clock=retry_clock,
+                retry_jitter=retry_jitter,
+                schedule_scheduler_clock=self._schedule_scheduler_clock,
+                monotonic_now=monotonic_now,
+                timezone_name=self._timezone_name,
+                bus=self._bus,
+                management_dispatcher=self._management_dispatcher,
+                management_service=self._management_service,
+            )
             initial_runtime.validate_unstarted()
+            self._runtime = initial_runtime
+            self._management_available = True
         except BaseException:
-            initial_runtime._request_abort()
+            self._management_available = False
+            self._management_service.deactivate()
+            if initial_runtime is not None:
+                initial_runtime._request_abort()
             raise
 
     def _current_runtime(self) -> PreparedRuntime:
@@ -411,6 +416,26 @@ class RuntimeHost:
         if runtime is None:
             raise RuntimeError("Runtime Host has no active Runtime Generation")
         return runtime
+
+    def _current_management_runtime(self) -> PreparedRuntime:
+        runtime = self._runtime
+        if not self._management_available or runtime is None:
+            raise ManagementError(
+                ErrorInfo("route_unavailable", "Runtime Generation is unavailable.")
+            )
+        return runtime
+
+    def _current_management_agent_loop(self) -> AgentLoop:
+        return self._current_management_runtime().agent_loop
+
+    def _current_management_memory_manager(self) -> MemoryManager:
+        return self._current_management_runtime()._memory_manager
+
+    def _current_management_dream(self) -> Dream:
+        return self._current_management_runtime()._dream
+
+    def _current_management_schedule_status(self) -> dict[str, object]:
+        return self._current_management_runtime().schedule_service.status_snapshot().to_dict()
 
     @property
     def generation(self) -> PreparedRuntime:
@@ -439,14 +464,26 @@ class RuntimeHost:
     async def start(self) -> None:
         if self._closed:
             raise RuntimeError("Runtime Host is closed")
-        await self._current_runtime().start()
+        try:
+            await self._current_runtime().start()
+        except BaseException:
+            self._management_available = False
+            self._management_service.deactivate()
+            self._runtime = None
+            self._closed = True
+            raise
+        self._management_available = True
 
     async def close(self) -> None:
         async with self._replacement_lock:
             if self._closed:
                 return
             self._closed = True
-            await self._current_runtime().close()
+            self._management_available = False
+            self._management_service.deactivate()
+            runtime = self._runtime
+            if runtime is not None:
+                await runtime.close()
 
     def bind_terminal(
         self,
@@ -470,13 +507,13 @@ class RuntimeHost:
             self._terminal_rebind = None
             self._terminal_quiesce = None
 
-    def _replacement_callback(self, token: object) -> SessionReplacement:
+    def _replacement_callback(self) -> SessionReplacement:
         async def replace_session(session_id: str, force: bool) -> None:
-            await self._replace_session(token, session_id, force)
+            await self._replace_session(session_id, force)
 
         return replace_session
 
-    def _prepare_target(self, session_id: str, token: object) -> PreparedRuntime:
+    def _prepare_target(self, session_id: str) -> PreparedRuntime:
         target_runtime: PreparedRuntime | None = None
         try:
             target_runtime = prepare_runtime(
@@ -493,9 +530,9 @@ class RuntimeHost:
                 monotonic_now=self._monotonic_now,
                 timezone_name=self._timezone_name,
                 session_id=session_id,
-                replace_session=self._replacement_callback(token),
                 bus=self._bus,
                 management_dispatcher=self.management_dispatcher,
+                management_service=self._management_service,
             )
             target_runtime.validate_unstarted()
             return target_runtime
@@ -528,25 +565,16 @@ class RuntimeHost:
 
     async def _replace_session(
         self,
-        source_token: object,
         session_id: str,
         force: bool,
     ) -> None:
         async with self._replacement_lock:
             if self._closed:
                 raise ManagementError(ErrorInfo("route_unavailable", "Runtime Host is closed."))
-            if source_token is not self._runtime_token:
-                raise ManagementError(
-                    ErrorInfo(
-                        "route_unavailable",
-                        "Runtime Generation is no longer active.",
-                    )
-                )
             old = self._current_runtime()
             if session_id == old.session_id:
                 await old.session.wait_for_pending_persist()
-            target_token = object()
-            target = self._prepare_target(session_id, target_token)
+            target = self._prepare_target(session_id)
             if old.control.has_active_run and not force:
                 await target.abort(clear_inbound=False)
                 raise ManagementError(
@@ -557,7 +585,7 @@ class RuntimeHost:
                 )
 
             replacement = asyncio.create_task(
-                self._commit_replacement(old, target, target_token)
+                self._commit_replacement(old, target)
             )
             await await_task_preserving_cancellation(replacement)
 
@@ -565,7 +593,6 @@ class RuntimeHost:
         self,
         old: PreparedRuntime,
         target: PreparedRuntime,
-        target_token: object,
     ) -> None:
         """Drain and publish a replacement as one cancellation-safe operation."""
         rebind = self._terminal_rebind
@@ -574,6 +601,7 @@ class RuntimeHost:
         old_detached = False
         try:
             old_detached = True
+            self._management_available = False
             quiesce = self._terminal_quiesce
             if quiesce is not None:
                 await quiesce()
@@ -581,21 +609,21 @@ class RuntimeHost:
             await old.abort()
             await self._bus.reset()
             bus_reset = True
-            target._activate_management()
             self._runtime = target
-            self._runtime_token = target_token
             if rebind is None:
                 await target.start()
+                self._management_available = True
                 return
             await rebind(target.presentation)
             await target.start()
+            self._management_available = True
         except BaseException as error:
             if old_detached:
-                old._deactivate_management()
-                target._deactivate_management()
+                self._management_available = False
                 self._runtime = None
-                self._runtime_token = object()
                 self._closed = True
+                self._management_service.deactivate()
+                self._management_dispatcher._unbind_management(self._management_service)
             if quiesce is not None:
                 with suppress(BaseException):
                     await quiesce()
@@ -639,6 +667,7 @@ def prepare_runtime(
     replace_session: SessionReplacement | None = None,
     bus: MessageBus | None = None,
     management_dispatcher: ManagementCommandDispatcher | None = None,
+    management_service: ManagementViewService | None = None,
 ) -> PreparedRuntime:
     """Prepare one Runtime and record terminal composition failures once."""
     try:
@@ -659,6 +688,7 @@ def prepare_runtime(
             replace_session=replace_session,
             bus=bus,
             management_dispatcher=management_dispatcher,
+            management_service=management_service,
         )
     except (WorkspaceStateError, SkillContextTooLargeError):
         raise
@@ -687,6 +717,7 @@ def _prepare_runtime(
     replace_session: SessionReplacement | None = None,
     bus: MessageBus | None = None,
     management_dispatcher: ManagementCommandDispatcher | None = None,
+    management_service: ManagementViewService | None = None,
 ) -> PreparedRuntime:
     """Prepare one unstarted Runtime Generation."""
     workspace_path = normalize_workspace_path(workspace)
@@ -784,34 +815,24 @@ def _prepare_runtime(
         abort_memory_composition()
         raise
 
-    def current_foreground_chat_status() -> ResolvedChatStatus:
-        foreground_status = agent_loop.last_foreground_route_status
-        if foreground_status is not None:
-            return ResolvedChatStatus(
-                provider_id=foreground_status.provider_id,
-                model=foreground_status.model,
-                context_window=foreground_status.context_window,
-            )
-        return _resolved_chat_status(router)
-
+    management_service_owned = management_service is None
     try:
-        status_service = RuntimeStatusService(
-            session=agent_loop.session,
-            resolved_chat=current_foreground_chat_status,
-            next_input=agent_loop.runtime_status_input,
-            monotonic=monotonic_now,
-            schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
-        )
-
-        management_service = ManagementViewService(
-            agent_home,
-            status_service=status_service,
-            workspace_state=active_workspace_state,
-            replace_session=replace_session,
-            now=now,
-            memory_manager=memory_manager,
-            dream=dream,
-        )
+        assert agent_loop is not None
+        if management_service is None:
+            status_service = RuntimeStatusService(
+                current_agent_loop=lambda: agent_loop,
+                monotonic=monotonic_now,
+                schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
+            )
+            management_service = ManagementViewService(
+                agent_home,
+                status_service=status_service,
+                workspace_state=active_workspace_state,
+                replace_agent_loop=replace_session,
+                now=now,
+                memory_manager=memory_manager,
+                dream=dream,
+            )
         if management_dispatcher is None:
             management_dispatcher = ManagementCommandDispatcher(management_service)
     except BaseException:
@@ -827,13 +848,5 @@ def _prepare_runtime(
         _memory_manager=memory_manager,
         _dream=dream,
         _management_service=management_service,
-    )
-
-
-def _resolved_chat_status(router: ModelRouter) -> ResolvedChatStatus:
-    status = router.route_status("chat")
-    return ResolvedChatStatus(
-        provider_id=status.provider_id,
-        model=status.model,
-        context_window=status.context_window,
+        _management_service_owned=management_service_owned,
     )

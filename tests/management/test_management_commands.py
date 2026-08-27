@@ -14,7 +14,6 @@ from myclaw.management.commands import (
 )
 from myclaw.management.service import (
     ManagementViewService,
-    ResolvedChatStatus,
     RuntimeStatusInput,
     RuntimeStatusService,
 )
@@ -111,6 +110,14 @@ max_output = 512
 temperature = 0
 timeout = 60
 """
+
+
+class _StatusProjectionLoop:
+    def __init__(self, projection: RuntimeStatusInput) -> None:
+        self._projection = projection
+
+    def runtime_status_input(self) -> RuntimeStatusInput:
+        return self._projection
 
 DEFAULT_CONFIG_CONTENT = """[runtime]
 max_tool_result_chars = 4096
@@ -333,24 +340,17 @@ async def test_status_command_renders_safe_persistence_failure(
     agent_home: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    def failing_session() -> Session:
-        raise OSError("PRIVATE_STATUS_PERSISTENCE_BODY_52")
+    class FailingStatusProjection:
+        def runtime_status_input(self) -> RuntimeStatusInput:
+            raise OSError("PRIVATE_STATUS_PERSISTENCE_BODY_52")
+
+    def failing_loop() -> FailingStatusProjection:
+        return FailingStatusProjection()
 
     home = AgentHome(agent_home)
     home.initialize()
     status_service = RuntimeStatusService(
-        session=failing_session,
-        resolved_chat=lambda: ResolvedChatStatus(
-            provider_id="provider",
-            model="model",
-            context_window=8,
-        ),
-        next_input=lambda _session: RuntimeStatusInput(
-            system_prompt="",
-            retained_messages=(),
-            tool_definitions=(),
-            runtime_context="",
-        ),
+        current_agent_loop=failing_loop,
         monotonic=lambda: 0.0,
     )
     dispatcher = ManagementCommandDispatcher(
@@ -394,19 +394,28 @@ async def test_status_command_renders_actual_runtime_and_session_state(
     )
     session.last_consolidated = 1
     status_service = RuntimeStatusService(
-        session=session,
-        resolved_chat=lambda: ResolvedChatStatus(
-            provider_id="fallback",
-            model="chat-model",
-            context_window=8,
+        current_agent_loop=lambda: _StatusProjectionLoop(
+            RuntimeStatusInput(
+                system_prompt="abcd",
+                retained_messages=(),
+                tool_definitions=(),
+                runtime_context="",
+                session_id=session.session_id,
+                session_title="New Conversation",
+                session_message_count=len(session.messages),
+                last_consolidated=session.last_consolidated,
+                cumulative_usage=(
+                    ("model_calls", 1),
+                    ("input_tokens", 10),
+                    ("output_tokens", 3),
+                    ("total_tokens", 13),
+                ),
+                chat_model="fallback/chat-model",
+                context_window=8,
+                generation_started_at=10.0,
+            )
         ),
-        next_input=lambda _session: RuntimeStatusInput(
-            system_prompt="abcd",
-            retained_messages=(),
-            tool_definitions=(),
-            runtime_context="",
-        ),
-        monotonic=iter((10.0, 75.8)).__next__,
+        monotonic=lambda: 75.8,
     )
     dispatcher = ManagementCommandDispatcher(
         ManagementViewService(home, status_service=status_service)

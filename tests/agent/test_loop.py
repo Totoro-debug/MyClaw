@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -421,6 +422,7 @@ def _runtime(
     use_default_task_framer: bool = False,
     title_prompt: str | None = None,
     skill_snapshot: SkillSnapshot | None = None,
+    monotonic_now: Callable[[], float] | None = None,
 ) -> tuple[AgentLoop, Session]:
     agent_home = AgentHome(tmp_path / "agent-home")
     agent_home.initialize()
@@ -479,7 +481,7 @@ def _runtime(
         session_id=None,
         now=_Clock().now,
         new_uuid=uuid4,
-        monotonic_now=lambda: 0.0,
+        monotonic_now=(lambda: 0.0) if monotonic_now is None else monotonic_now,
     )
     if not use_default_task_framer:
         object.__setattr__(loop, "_task_framer", task_framer or _FramingFake())
@@ -489,6 +491,143 @@ def _runtime(
         loop._context_builder._skill_snapshot = skill_snapshot
     object.__setattr__(loop, "_prepare_foreground_context", prepare)
     return loop, loop.session
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_status_projection_starts_uptime_only_after_activation(
+    tmp_path: Path,
+) -> None:
+    monotonic_calls = 0
+
+    def monotonic_now() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        return 42.5
+
+    loop, _session = _runtime(
+        tmp_path,
+        _Router(()),
+        monotonic_now=monotonic_now,
+    )
+
+    assert monotonic_calls == 0
+    loop.preflight()
+    assert monotonic_calls == 0
+
+    await asyncio.gather(loop.start(), loop.start())
+
+    assert monotonic_calls == 1
+    assert loop.runtime_status_input().generation_started_at == 42.5
+    await loop.start()
+    assert monotonic_calls == 1
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_failed_activation_does_not_publish_or_duplicate_consumer(
+    tmp_path: Path,
+) -> None:
+    monotonic_calls = 0
+
+    def monotonic_now() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        if monotonic_calls == 1:
+            raise RuntimeError("monotonic clock failed")
+        return 84.5
+
+    loop, _session = _runtime(
+        tmp_path,
+        _Router(()),
+        monotonic_now=monotonic_now,
+    )
+    loop.preflight()
+
+    with pytest.raises(RuntimeError, match="monotonic clock failed"):
+        await loop.start()
+
+    assert loop._consumer_task is None
+    assert loop._generation_started_at is None
+    assert loop._started is False
+
+    await asyncio.gather(loop.start(), loop.start())
+
+    consumer = loop._consumer_task
+    assert consumer is not None
+    assert loop._generation_started_at == 84.5
+    assert monotonic_calls == 2
+    await loop.start()
+    assert loop._consumer_task is consumer
+    assert monotonic_calls == 2
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effect_free(
+    tmp_path: Path,
+) -> None:
+    router = _Router(())
+    loop, session = _runtime(tmp_path, router)
+    session.add_message("user", "Status snapshot input")
+    session.last_consolidated = 0
+
+    class SessionAccessSpy:
+        def __init__(self) -> None:
+            self.calls = {
+                "session_id": 0,
+                "messages": 0,
+                "metadata": 0,
+                "last_consolidated": 0,
+            }
+
+        @property
+        def session_id(self) -> str:
+            self.calls["session_id"] += 1
+            return session.session_id
+
+        @property
+        def messages(self) -> list[dict[str, Any]]:
+            self.calls["messages"] += 1
+            return session.messages
+
+        @property
+        def metadata(self) -> dict[str, Any]:
+            self.calls["metadata"] += 1
+            return session.metadata
+
+        @property
+        def last_consolidated(self) -> int:
+            self.calls["last_consolidated"] += 1
+            return session.last_consolidated
+
+    spy = SessionAccessSpy()
+    messages_before = deepcopy(session.messages)
+    metadata_before = deepcopy(session.metadata)
+    tasks_before = set(asyncio.all_tasks())
+    object.__setattr__(loop, "_session", spy)
+    try:
+        projection = loop.runtime_status_input()
+    finally:
+        object.__setattr__(loop, "_session", session)
+
+    assert spy.calls == {
+        "session_id": 1,
+        "messages": 1,
+        "metadata": 1,
+        "last_consolidated": 1,
+    }
+    assert session.messages == messages_before
+    assert session.metadata == metadata_before
+    assert session._pending_persist is None
+    assert set(asyncio.all_tasks()) == tasks_before
+    assert router.calls == []
+    assert loop._consumer_task is None
+    assert isinstance(projection.retained_messages, tuple)
+    assert isinstance(projection.cumulative_usage, tuple)
+    assert all(isinstance(value, str) for value in projection.retained_messages)
+    with pytest.raises(FrozenInstanceError):
+        projection.session_message_count = 99  # type: ignore[misc]
+    await loop.close()
 
 
 async def _context(
