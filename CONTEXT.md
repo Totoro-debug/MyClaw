@@ -21,7 +21,7 @@ Persistent Personal Agent state owned by exactly one Workspace rather than by th
 _Avoid_: Agent Home, project source, global state, cache
 
 **Message Bus**:
-The transient pair of Inbound and Outbound queues owned by one Agent Loop for foreground conversation flow.
+The transient pair of Inbound and Outbound queues shared by one Command-line Conversation and its current Agent Loop for foreground conversation flow. Its public async operations are snapshot, put/get, pause/resume delivery, drain, and reset; its only synchronous operations bind and unbind the Inbound-changed callback. Its contents are cleared whenever the conversation resumes a Conversation Session, including its current one.
 _Avoid_: persistent event log, broadcast bus, Schedule queue
 
 **Inbound Message**:
@@ -61,7 +61,7 @@ Workspace-owned technical diagnostics associated with one Conversation Session r
 _Avoid_: Runtime Log, Conversation log, chat transcript, audit log, activity feed
 
 **Agent Loop**:
-The product orchestrator that owns foreground state, consumes Inbound Messages serially, invokes Agent Runs, and publishes Outbound Messages.
+The Session-scoped product orchestrator that owns foreground state, consumes Inbound Messages serially, invokes Agent Runs, and publishes Outbound Messages through the Command-line Conversation's Message Bus.
 _Avoid_: Agent Runner, Runtime Lifetime, model loop, Schedule Service
 
 **Agent Runner**:
@@ -96,6 +96,10 @@ _Avoid_: Tool, Plugin, Management Command, capability extension
 The ordered set of valid Skill metadata available for discovery without loading the corresponding Skill instructions.
 _Avoid_: Tool Catalog, command list, loaded Skill content
 
+**Skill Snapshot**:
+The immutable set of validated Skill metadata and complete instructions captured for one Runtime Generation.
+_Avoid_: live Skill directory, Tool Catalog, Runtime Lifetime cache
+
 **Skill Invocation**:
 The selection and application of one Skill's instructions to a foreground Agent Run, initiated explicitly by the user or autonomously by the model.
 _Avoid_: Management Command, Tool capability, Skill discovery
@@ -124,12 +128,12 @@ _Avoid_: Long-term Memory, raw history, manual note, Session memory
 A Workspace-level durable memory of stable information intended to influence later Agent behavior across Conversation Sessions.
 _Avoid_: Raw history, Session archive, manual notes, vector database, Conversation Summary
 
-**Memory Task**:
-A background or manually triggered task that considers new Conversation Summary entries for incorporation into Long-term Memory.
-_Avoid_: Chat turn, Session compression, full Agent Run
+**Dream**:
+A background or manually triggered memory process that turns new Conversation Summary entries into Long-term Memory.
+_Avoid_: Memory Task, Chat turn, Session compression, full Agent Run
 
 **Summary Cursor**:
-The Workspace-owned position through which Memory Tasks have consumed the Conversation Summary stream.
+The Workspace-owned position through which Dream has consumed the Conversation Summary stream.
 _Avoid_: Session position, checkpoint
 
 **Lesson**:
@@ -157,11 +161,19 @@ The domain encompassing persistent scheduled tasks and the service that manages 
 _Avoid_: Scheduled Work, a single scheduled task, the scheduling service
 
 **Schedule Job**:
-One Workspace-owned persistent task in the Schedule domain with its own execution timing and Conversation Session.
+One Workspace-owned persistent task in the Schedule domain with its own execution timing. A user-created Schedule Job has its own Conversation Session; a System Schedule Job may use a dedicated internal executor.
 _Avoid_: Schedule, Scheduled Work, shell cron job, reminder
 
+**System Schedule Job**:
+A Schedule Job created and maintained by the Personal Agent for internal Runtime work rather than by the user. It is hidden from user Schedule listing and mutation.
+_Avoid_: User Schedule Job, public Schedule, shell cron job
+
+**Dream Schedule Job**:
+The unique System Schedule Job that invokes Dream through its dedicated execution path without creating a Schedule Session or entering an Agent Loop.
+_Avoid_: User Schedule Job, Memory Task scheduler, scheduled Agent Run
+
 **Schedule Service**:
-The sole management and execution boundary for Schedule Jobs within one Runtime Generation.
+The sole management and execution boundary for Schedule Jobs within one Runtime Lifetime.
 _Avoid_: Schedule, Schedule Job, detached background process
 
 **Permission Policy**:

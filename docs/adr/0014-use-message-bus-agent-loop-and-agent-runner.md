@@ -4,6 +4,8 @@ status: accepted
 
 # Use Message Bus, Agent Loop, and Agent Runner
 
+> Ownership and Runtime Generation replacement in this ADR are superseded by [ADR-0017](0017-use-cli-composition-root-and-session-scoped-agent-loop.md). The Message Bus protocol, Agent Loop orchestration role, and Agent Runner boundary remain accepted. This historical decision and its consequences are immutable; the superseded scope is not an active ownership contract.
+
 One `AgentLoop` owns one transient `MessageBus`, one active foreground `Session`, the fixed Tool Gateway, and the serial foreground execution path. Inbound is an editable FIFO of ordinary user messages; Outbound has one Terminal Conversation consumer and carries only sparse reasoning, response, Tool-call, and system-control presentation messages. Tool results, Schedule output, and Memory Task output never enter Outbound.
 
 `AgentRunner` is a reusable Session-independent ReAct engine whose constructor owns only `ModelRouter`. Each invocation receives initial messages, a `chat` or `schedule` route, the Tool Gateway, output and confirmation callbacks, a result externalizer, cancellation state, and an iteration limit; it returns only the invocation's Provider-valid assistant/Tool increment, final content, four-field usage, finish reason, and optional `ErrorInfo`.

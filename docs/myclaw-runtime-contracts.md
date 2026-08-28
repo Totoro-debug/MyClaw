@@ -35,14 +35,14 @@
 
 - 所有持久化时间使用 RFC 3339，精确到毫秒，并带系统本地 UTC offset，例如 `2026-07-11T15:30:12.123+08:00`。
 - runtime 内部使用 timezone-aware `datetime`。
-- Schedule Tool 的 cron 默认使用 UTC，显式 timezone 必须是规范 IANA 时区；Memory Task 的独立 cron 仍使用 runtime 启动时的系统本地时区。夏令时行为交给选定 cron library，并通过 fake clock 固化测试。
+- Schedule Tool 的 cron 默认使用 UTC，显式 timezone 必须是规范 IANA 时区；Dream System Schedule Job 使用 Runtime 启动时的系统本地 IANA 时区。夏令时行为交给选定 cron library，并通过 fake clock 固化测试。
 - elapsed time、timeout 和 retry backoff 使用 monotonic clock，不使用 wall clock 差值。
 
 ### 1.4 ID
 
 - UUID 均使用小写、带连字符的 UUID4。
 - Session ID 使用 `<local_timestamp>_<uuid4>`：`YYYYMMDD-HHMMSS-ffffff_550e8400-e29b-41d4-a716-446655440000`。
-- Schedule Job ID 和 turn ID 使用 UUID4；Conversation Session message dictionaries 没有通用 message ID。
+- User Schedule Job ID 和 turn ID 使用 UUID4；内置 System Schedule Job 可以使用保留 symbolic ID，当前唯一保留值为 `dream`。Conversation Session message dictionaries 没有通用 message ID。
 - provider 返回的 tool call ID 原样保存在 message 中，不在业务层重新命名。
 - Tool Artifact 文件名直接使用只含 ASCII 字母、数字、下划线和连字符的 tool call ID；其他 ID 使用 UUID4。Artifact 路径固定为 Workspace State 下 `.myclaw/artifacts/<session_id>/<id>.txt`。
 
@@ -67,8 +67,9 @@
 | D15 | 配置、持久化、模型与服务错误使用稳定 code；Tool Error/Result 使用安全扁平 message | 上层逻辑不依赖易变终端文案 |
 | D16 | Exec 不提供 OS 级文件系统、网络或进程隔离 | cwd 和字符串检查不能制造虚假 sandbox 保证 |
 | D17 | 每个非空普通前台输入在 Agent Run 前做 Task Framing，Blackboard 与 usage 只随已接受 increment 提交 | 在跨输入保留一个明确任务边界，不引入计划或执行控制产品 |
+| D18 | CLI 是唯一 Runtime composition root；一个 Session-scoped Agent Loop 承担一个 Runtime Generation | 让创建位置、生命周期与真实 ownership 一致，不保留代理所有组件的 Runtime 聚合层 |
 
-D01-D17 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Framing 边界由本文后续章节与对应 ADR 定义。
+D01-D18 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Framing 边界由本文后续章节与对应 ADR 定义。
 
 ## 3. Agent Home 与 Workspace
 
@@ -99,36 +100,33 @@ D01-D17 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Fra
     <session_id>.log
 ```
 
-已确定：Agent Home 拥有 User Configuration 和可选的 user-authored Skill root；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 Terminal Conversation 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/` 和缺失的 `memory/memory.md`；`summary.jsonl`、`.cursor`、`schedule.json`、Session、`.myclaw/artifacts/`、`schedule-sessions/` 和 `logs/` 按需创建。legacy scheduled-work state 原样保留且不读取、不检测、不迁移、不重命名或删除。`myclaw config` 不初始化 Workspace State。`AgentHome.initialize()` 只创建 Agent Home root，不创建缺失的 `skills/`。
+已确定：Agent Home 拥有 User Configuration 和可选的 user-authored Skill root；其中既有的 `logs/run.log.0`、`run.log.1`、`run.log.cursor` 与 `run.log.lock` 仅作为 legacy Runtime Log 文件逐字节保留，MyClaw 不再读取、移动、删除、截断或更新它们。有效 Terminal Conversation 启动初始化 Workspace State root、`.gitignore`、`memory/`、`sessions/`、缺失的 `memory/memory.md`，并在注册内置 Dream System Job 时创建或校正 `schedule.json`；`summary.jsonl`、`.cursor`、Session、`.myclaw/artifacts/`、`schedule-sessions/` 和 `logs/` 按需创建。legacy scheduled-work state 原样保留且不读取、不检测、不迁移、不重命名或删除。`myclaw config` 不初始化 Workspace State。`AgentHome.initialize()` 只创建 Agent Home root，不创建缺失的 `skills/`。
 
 #### 3.1.1 Skill Catalog discovery
 
 `~/.myclaw/skills/` 缺失或为空时，Skill Catalog 是空 snapshot。Catalog 只扫描其一级子目录中名为 `SKILL.md` 的 instruction file；不会把嵌套目录作为独立候选。frontmatter 必须从文件首行的独占 `---` 开始，并以之后的独占 `---` 结束；其内容使用安全 YAML mapping 解析，`name` 和 `description` 必须是字符串。原始 `name` 不做 trim，必须直接匹配 `[a-z_-][a-z0-9_-]{0,63}`；`description` trim 后必须为 1 到 1024 个 Unicode code points。
 
-每个候选的 instruction path 必须是可读普通文件并在 canonical Skill root 内；frontmatter bytes 必须是 UTF-8。canonical root 外的 symlink/reparse target、缺失文件、非 UTF-8 metadata 和其他 malformed metadata 均跳过。跳过时只记录安全的 candidate path 与 reason，不记录 instruction document；完整 document bytes 留待 `read_body()` 验证。候选按 canonical path 字符串升序评估；reserved Management Command names 和重复 Skill names 不进入 snapshot，同名时保留第一个有效候选。Catalog 只保留 immutable 的 name、trimmed description 和 canonical absolute `SKILL.md` path，不注册 Tool。
+每个候选的 instruction path 必须是可读普通文件并在 canonical Skill root 内；每个候选都捕获一个 complete `SKILL.md` document，其 bytes 必须是 UTF-8。canonical root 外的 symlink/reparse target、缺失文件、非 UTF-8 document 和其他 malformed metadata/body 均跳过。跳过时只记录安全的 candidate path 与 reason，不记录 instruction document。候选按 canonical path 字符串升序评估；reserved Management Command names 和重复 Skill names 不进入 snapshot，同名时保留第一个有效候选。Catalog metadata 不注册 Tool。
 
-`runtime.enable_skill_always_load` 是 boolean，默认 `false`。关闭时 discovery 只解析用于 metadata 的 frontmatter，不解释、告警或读取 `always` 正文。开启时，YAML boolean `always: true` 的候选先进入 metadata-only Catalog，再在 Catalog module 内读取同一份完整 UTF-8 document bytes；该次读取必须同时重新验证当前 `name`、`description`、canonical `path` 和 `always is True`。读取期间 opt-in 状态、metadata 或路径发生变化时 fail closed 为 `SkillUnavailableError`，不得把版本 A 的 opt-in 决策与版本 B 的正文拼接。YAML non-boolean `always` 只产生一次安全 warning 并保持 metadata-only，不记录正文；`false`、缺失或空值保持 metadata-only。只有完成全部校验后，`build_runtime_skill_snapshot()` 才原子发布唯一 immutable `RuntimeSkillSnapshot`；其中 `catalog` 只拥有 metadata，`always_loaded` 单独拥有按 Catalog 顺序冻结的 opted-in body，Generation 不暴露中间 snapshot。
+`runtime.enable_skill_always_load` 是 boolean，默认 `false`。每个 Agent Loop 构造自己的 `SkillLoader`；Loader 对每个候选只读取一次完整 UTF-8 document，以同一份 bytes 完成 frontmatter、metadata、document、canonical path 和可选 `always` 校验，然后原子保存一个 Runtime Generation-scoped immutable `SkillSnapshot`。YAML non-boolean `always` 只产生一次安全 warning 并按非 always Skill 保留；`false`、缺失或关闭配置时不进入 always-loaded subset。Generation 不暴露中间 snapshot。
 
-Runtime Lifetime 只能通过当前 snapshot 中的完整 `SkillMetadata` 读取 instruction document：
+当前 Agent Loop 的 manual Skill invocation 只能使用 SkillLoader 保存的完整 snapshot document，不再次读取磁盘：
 
 ```python
-class SkillUnavailableError(Exception):
-    error: ErrorInfo
-
-class SkillCatalog:
-    entries: tuple[SkillMetadata, ...]
-    def read_body(self, metadata: SkillMetadata) -> str: ...
-
-class AlwaysLoadedSkill:
+class LoadedSkill:
     metadata: SkillMetadata
-    body: str
+    document: str
+    always: bool
 
-class RuntimeSkillSnapshot:
-    catalog: SkillCatalog
-    always_loaded: tuple[AlwaysLoadedSkill, ...]
+class SkillSnapshot:
+    root: Path
+    skills: tuple[LoadedSkill, ...]
+
+class SkillLoader:
+    def load(self) -> SkillSnapshot: ...
 ```
 
-`read_body()` 拒绝不存在或不完全匹配当前 snapshot 的 metadata，不接受任意 path。它先打开文件，再以 host-native descriptor identity 校验 opened/current object 均为普通文件、device/inode 一致且当前 canonical path 仍在 Catalog root 内；普通 hardlink 保持可读，不套用持久化 owned-file 的 single-link 限制。一次调用只从该已验证 descriptor 读取一份 bytes，并从这份 bytes 完成 UTF-8 decode、严格 frontmatter 重解析、canonical path/name/description 重校验；成功后返回逐字符一致的完整 document，不剥离 opening delimiter、frontmatter、closing delimiter、正文或原始换行。普通按需 `read_body()` document 不缓存，always freeze 复用同一 Catalog module 内的完整-document 读取/重校验实现并把成功 document 保存在 final immutable snapshot 中。缺失、不可读、非 UTF-8、frontmatter/YAML 无效、canonical containment 失效、metadata mismatch 或 always opt-in mismatch 均映射为 `SkillUnavailableError`，其公开 `error` 使用稳定的 `skill_unavailable` code 和非空安全消息，底层异常只作为 cause。
+`LoadedSkill.document` 逐字符保留完整 document，不剥离 opening delimiter、frontmatter、closing delimiter、正文或原始换行。`SkillSnapshot` 保存 immutable `tuple[LoadedSkill, ...]`，`SkillLoader` 只通过 `load()` 发布 snapshot；不存在可变的 `snapshot` 字段。当前 Agent Loop 内 manual invocation 和 always-loaded projection 使用 frozen document；启动或任何 `/resume` 构造新的 Agent Loop 时重新扫描。模型自主调用普通 `read_file` 仍遵守 Tool path 和实时文件读取契约。缺失、不可读、非 UTF-8、frontmatter/YAML 无效或 canonical containment 失效的单个候选被跳过并记录安全 warning；已发布 snapshot 的全局预算 preflight failure 使用稳定 `skill_context_too_large` 并终止 Terminal Conversation。
 
 `memory.md` 初始内容固定为：
 
@@ -282,7 +280,7 @@ timeout = 120
 规则：
 
 - `last_consolidated` 是从 `0` 开始的 message boundary，表示前多少条 Session messages 已被 Conversation Summary 覆盖；Short-term Memory 是 `messages[last_consolidated:]`。Conversation Summary 直接赋值，不调用 cursor-specific method，也不通过 journal 与 Session snapshot 协调。
-- `metadata` 必须拥有 `title` 与 `token_usage`，并可选拥有当前 `blackboard`。`token_usage` 包含主 chat、Tool loop、Task Framing、title、Conversation Summary 和与当前 Session 直接相关的辅助调用。Memory Task 不接收 Conversation Session；Schedule Job 的模型调用计入其 Schedule Session，不计入当前前台 Session。
+- `metadata` 必须拥有 `title` 与 `token_usage`，并可选拥有当前 `blackboard`。`token_usage` 包含主 chat、Tool loop、Task Framing、title、Conversation Summary 和与当前 Session 直接相关的辅助调用。Dream 不接收 Conversation Session；User Schedule Job 的模型调用计入其 Schedule Session，不计入当前前台 Session。
 - `blackboard` 恰好包含 `goal` 与 `completion_boundary` 两个经过 trim 后的非空 string，不设字符数上限。Session load 将 malformed optional Blackboard 当作缺失并从内存 metadata 移除；`update_metadata()` 和 Agent Loop commit 必须拒绝非法形状。
 - `total_tokens` 必须等于 `input_tokens + output_tokens`。provider 未返回某项时该项为 `0`，不得用估算值混入实际 usage。
 - 每次成功持久化都是完整 compact UTF-8 JSONL atomic replacement，header 与所有 message lines 一起提交；不存在逐消息写入或 metadata-only rewrite。
@@ -381,14 +379,14 @@ timeout = 120
 
 - `memory/.cursor` 内容是一个非负 ASCII decimal integer 和尾随 `\n`，例如 `12\n`。
 - 文件缺失等价于 `0`。
-- cursor 表示 Memory Task 已成功处理的最大 summary index。
-- no update 或 edit success 后原子写入 batch 的最后 index；required edit failure 不写。
+- cursor 表示已由 Dream 领取的最大 summary index。
+- Dream 在模型工作前通过 Memory Manager 原子写入 batch 的最后 index；no update、edit success、model failure 和 Tool/edit failure 均保留已推进的 cursor，不自动重试该 batch。
 
 ### 6.3 Summary and `last_consolidated` consistency
 
-Conversation Summary generation appends its one summary entry under the
-single-runtime Summary lock, then directly assigns the active Session's
-`last_consolidated`. There is no pending journal, startup recovery path, or
+Conversation Summary Manager generates one summary, asks Memory Manager to append it under the
+single-runtime Summary lock, then directly assigns the active Session's `last_consolidated` only
+after the append succeeds. There is no pending journal, startup recovery path, or
 cross-file transaction between `summary.jsonl` and Session JSONL. A crash or
 failed Session snapshot may leave the summary entry and `last_consolidated`
 divergent; subsequent work may therefore repeat or omit a summary range. This
@@ -396,10 +394,10 @@ is accepted by ADR-0009 and does not provide cross-process coordination.
 
 ### 6.4 Long-term Memory cache
 
-- runtime startup 原子创建缺失模板并读取一次，保存 immutable string snapshot。
-- chat 和 schedule 的 System Prompt 使用该 snapshot。
-- `/memory` 和 Memory Task 每次读取磁盘最新文件。
-- Memory Task 成功编辑后刷新 runtime snapshot；正在运行的 Agent Run 保持启动时快照。
+- Workspace State startup 原子创建缺失模板；Memory Manager 读取并保存当前 string snapshot。
+- chat 和 user Schedule Job 的 System Prompt 使用该 snapshot。
+- `/memory` 和 Dream 每次通过 Memory Manager 读取磁盘最新文件。
+- Dream 成功编辑后由 Memory Manager 刷新 snapshot；正在运行的 Agent Run 保持启动时快照。
 - system-level prompt 超过 route context budget 时返回 `memory_context_too_large`，不得裁剪 Long-term Memory。
 
 ## 7. Schedule 契约
@@ -436,15 +434,17 @@ is accepted by ADR-0009 and does not provide cross-process coordination.
 
 规则：
 
-- `source` 只能是 `user` 或 `system`；System Job 不进入公开 list/remove。
+- `source` 只能是 `user` 或 `system`；User Job ID 必须是 UUID4，内置 System Job 可以使用保留 symbolic ID。当前唯一支持的 System Job 是 `job_id="dream", source="system"`；System Job 不进入公开 list/remove。
 - `schedule.kind` 只能是 `at`、`every` 或 `cron`；未选择的 schedule 字段必须显式为 `null`。
 - `at` 使用带 UTC offset 的 RFC 3339 毫秒时间；`every` 使用正整数秒；`cron` 使用规范五字段表达式和规范 IANA timezone。
 - `state` 只记录 `never-run`、`latest-ok` 或 `latest-error` 允许的字段组合；running、next run 和 history 不持久化。
 - 解析拒绝重复 object key、非 canonical 值、非法 schedule/state、重复 Job ID 和非精确 field set；任何损坏都阻止 Runtime 启动并输出 `schedule_state_error` 与路径。
 - Store 在 Runtime-local lock 内构造 immutable candidate，严格序列化后通过同目录 atomic replacement 发布；写失败保留旧 authority 并 fault Store。
 - User Job 的 add/list/remove 由 `schedule` Tool 管理且不请求确认；Schedule Agent context 拒绝 add，list/remove 仍可用，公开定义按创建时间和 Job ID 稳定排序。
-- 每次触发通过共享 Agent Run 的 `schedule` route 运行；Schedule Session ID 派生为 `schedule_<job_id>`，Session 首次产生消息时才落盘到 `schedule-sessions/`。
-- Schedule Service 在一个 dispatcher 中处理动态变更、at/every/cron、重叠跳过、不同 Job 并发和 Runtime shutdown；不发送前台 `OutboundMessage` 或通知。
+- Schedule Service 初始化后、启动 dispatcher 前，CLI 注册 Dream System Job。Store 中不存在该 ID/source 时创建；ID/source 和配置 cron/本地 IANA 时区一致时跳过；cron 或时区变化时更新 schedule 并保留 ID/state；同 ID 不同 source 时以 `schedule_state_error` 阻止启动。Dream identity、注册和 dispatch 忽略 `message`。
+- User Job 通过当前 Agent Loop 的共享 Agent Runner/Gateway 使用 `schedule` route；Schedule Session ID 派生为 `schedule_<job_id>`，Session 首次产生消息时才落盘到 `schedule-sessions/`。Dream System Job 不创建 Schedule Session、不进入 Agent Loop，直接调用 `Dream.run()`。
+- Dream 无 pending summary 或成功处理记为 `ok`，安全失败记为 `error`；Dream 已运行时按重叠 occurrence 跳过且不修改 Job state。下一 cron 正常运行，不自动重试失败 batch。
+- Schedule Service 在一个 dispatcher 中处理动态变更、at/every/cron、重叠跳过、不同 Job 并发、Session replacement pause/resume 和 Runtime shutdown；不发送前台 `OutboundMessage` 或通知。
 
 ## 8. Prompt、Runtime Context 与预算
 
@@ -458,19 +458,18 @@ chat 和 schedule 的共有 system-level context 按以下固定顺序组装：
 
 User Configuration 不得插入或替换 identity/system prompt。缓存的 OpenAI-format Tool schema snapshots 通过 provider 的结构化 tools 字段发送，不把 JSON schema 重复拼入自然语言 guidance。
 
-Foreground chat 在上述共有部分之后按当前 Runtime Lifetime 的 Catalog order 追加一个 `<skill_catalog>` metadata-only block。每个 Skill 是独占一行的 compact JSON object，字段顺序固定为 name、description、path；JSON 文本中的 `&`、`<`、`>` 使用 Unicode escape，确保 metadata 不能产生 literal block delimiter。该 block 只指导模型使用普通 `read_file` 读取已知 canonical absolute path；模型需要更多内容时可按 `offset`/`limit` 继续分页，不需要证明 EOF。
+Foreground chat 在上述共有部分之后按当前 Runtime Generation Skill Snapshot order 追加一个 `<skill_catalog>` metadata-only block。每个 Skill 是独占一行的 compact JSON object，字段顺序固定为 name、description、path；JSON 文本中的 `&`、`<`、`>` 使用 Unicode escape，确保 metadata 不能产生 literal block delimiter。该 block 只指导模型使用普通 `read_file` 读取已知 canonical absolute path；模型需要更多内容时可按 `offset`/`limit` 继续分页，不需要证明 EOF。
 
-当 Runtime Skill snapshot 的 `always_loaded` 非空时，Foreground chat 随后按相同 Catalog order 追加一个 `<skill_always_load>` intentional System block。每个 opted-in Skill 是一行 compact JSON object，字段顺序固定为 name、body；body 字段承载逐字符一致的完整 `SKILL.md` document。document 的 frontmatter、换行、引号、反斜杠及任意文字（包括类似 closing delimiter 的文字）由 JSON 字符串编码承载，`&`、`<`、`>` 使用 Unicode escape。模板的真实 `</skill_always_load>` closing delimiter 恰好一个；Runtime 不做 raw interpolation，也不截断 document。Foreground consolidation/budget projection 与最终 chat request 使用完全相同的编码后 prompt。该 always document 只进入 Foreground chat：Schedule、Session title、Task Framing、实际 Conversation Summary provider 和 Memory Task 均接收 `0` 个 Skill document；Summary 的 foreground budget projection 可包含同一完整 foreground prompt，但不把 document 发送给 Summary provider。Schedule prompt 不追加 Skill metadata 或 document。
+当 Skill Snapshot 的 always-loaded subset 非空时，Foreground chat 随后按相同 Snapshot order 追加一个 `<skill_always_load>` intentional System block。每个 opted-in Skill 是一行 compact JSON object，字段顺序固定为 name、body；body 字段承载逐字符一致的完整 `SKILL.md` document。document 的 frontmatter、换行、引号、反斜杠及任意文字（包括类似 closing delimiter 的文字）由 JSON 字符串编码承载，`&`、`<`、`>` 使用 Unicode escape。模板的真实 `</skill_always_load>` closing delimiter 恰好一个；Runtime 不做 raw interpolation，也不截断 document。Foreground consolidation/budget projection 与最终 chat request 使用完全相同的编码后 prompt。该 always document 只进入 Foreground chat：Schedule、Session title、Task Framing、实际 Conversation Summary provider 和 Dream 均接收 `0` 个 Skill document；Summary 的 foreground budget projection 可包含同一完整 foreground prompt，但不把 document 发送给 Summary provider。Schedule prompt 不追加 Skill metadata 或 document。
 
 Foreground 的 metadata projection 与最终 chat request 使用同一 Catalog block；这不改变 Conversation Summary provider 的独立 prompt，后者仍接收 `0` 个 Skill metadata 或 body。
 
-手动 Skill invocation 是独立的 foreground loading path：只有 raw input 在字符 `0` 以 `/` 开始、且第一个
+手动 Skill invocation 是独立的 foreground projection path：只有 raw input 在字符 `0` 以 `/` 开始、且第一个
 Unicode whitespace 之前的 token 与 Catalog 中的 Skill name 完全一致（区分大小写）时才匹配。无 delimiter
 时 request 为空；匹配 delimiter 只移除一个，其后的空格、换行和其它字符逐字保留。匹配后 Agent Loop
-在创建 Session title work 之前调用同一个 `SkillCatalog.read_body()` complete-read seam；该读取从当前
-bytes 完成 UTF-8、frontmatter、canonical path 和 metadata revalidation，并返回包含 frontmatter 与原始换行的完整 document。missing、unreadable、non-UTF-8
-或 metadata mismatch 以 `skill_unavailable` 结束当前 turn，不启动 title、Task Framing 或 foreground
-provider，也不增加 Session message。
+直接读取当前 Runtime Generation 的 immutable Skill Snapshot 中已经验证并冻结的完整 document，不再次访问文件系统。
+磁盘上的 Skill 在当前 Session 中发生删除、修改或失效不会改变本次 projection；首次启动或任意 `/resume`
+构造新 Agent Loop 时才由新的 Skill Loader 重新发现、完整读取并校验候选。
 
 ### 8.2 当前 user input 的 Runtime Context
 
@@ -496,7 +495,7 @@ session_id: <session_id>
 string。body 字段承载逐字符一致的完整 `SKILL.md` document；document、request 的换行、引号、反斜杠及 literal closing delimiter 均由 JSON 编码承载，`&`、`<`、`>`
 使用 Unicode escape；两个真实 closing delimiter 各只有一个。该 ephemeral projection 只存在于本次
 foreground user message，Skill body 不进入 System Prompt；raw slash input 仍是唯一持久化的 Session user
-message。若同一 Skill 已在 Runtime Skill snapshot 中拥有 frozen always-loaded body，它仍按 always System contract 出现，manual user
+message。若同一 Skill 已在当前 Runtime Generation Skill Snapshot 中属于 always-loaded subset，它仍按 always System contract 出现，manual user
 projection 不会去重、覆盖或额外修改该既有 block。
 
 - session JSONL 只保存 raw user content，不保存上述 wrapper。
@@ -504,7 +503,7 @@ projection 不会去重、覆盖或额外修改该既有 block。
 - Workspace 已在 identity prompt 中，不在每轮 wrapper 重复。
 - `<blackboard>` 只在 staged Blackboard 存在时追加，且必须是当前 user message 最后一个 Runtime-owned block。User raw content 中的相同 markup 不作为 Blackboard。
 - Foreground system prompt 明确 Blackboard 只是目标/完成边界解释，不能授权文件、网络、Exec 或任何 Tool 操作。
-- Schedule Job 不额外注入旧任务 ID 字段；Memory Task 使用专门 prompt，不伪装成 chat user input。
+- User Schedule Job 不额外注入旧任务 ID 字段；Dream 使用专门 prompt，不伪装成 chat user input。
 
 ### 8.3 专用 prompts
 
@@ -512,8 +511,8 @@ projection 不会去重、覆盖或额外修改该既有 block。
 - Task Framing：只接收 previous Blackboard、latest assistant content 和 current raw user input 组成的 compact JSON，使用独立 system prompt 且 `tools=()`。
 - Manual Skill invocation：Title 与 Task Framing 继续接收 current raw slash input；只有最终 foreground context 接收 typed invocation。手动 body 与 extracted request 在同一个 current `user` message 的不同 JSON-delimited blocks 中各出现一次，不能写入 Session、Blackboard 或 System Prompt；unknown/non-matching slash input 继续 ordinary foreground input。
 - Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory、Tool Catalog、Skill metadata 或 Skill body。
-- Memory Task：接收 Summary Cursor 后的 batch 和四分区维护规则，并只暴露 restricted memory tools。
-- Schedule Job：使用共有 chat/schedule system composition，把 Job message 作为 Schedule Session 的普通 user message，不接收 Skill metadata。Session title、Task Framing 和 Memory Task 同样不接收 Skill metadata。
+- Dream：接收 Summary Cursor 后的 batch 和四分区维护规则，并只暴露 restricted memory tools。
+- User Schedule Job：使用共有 chat/schedule system composition，把 Job message 作为 Schedule Session 的普通 user message，不接收 Skill metadata。Dream System Job 只触发 Dream，不生成该 prompt。Session title、Task Framing 和 Dream 同样不接收 Skill metadata。
 
 prompt 文本存放在独立、可版本追踪的 package resources；测试断言组成部分和是否注入，不锁死整段自然语言文案。
 
@@ -525,7 +524,7 @@ zero and contains no character for which `str.isspace()` is true. The five Manag
 remain first in their fixed order, with these stable labels and descriptions: `/config - View User
 Configuration`, `/status - View Runtime Status`, `/resume - Resume a Conversation Session`,
 `/memory - View Long-term Memory`, and `/dream - Process pending Conversation Summaries`. Valid
-Skills follow in the immutable Runtime Lifetime Catalog order and use `/name - description`.
+Skills follow in the current Runtime Generation Skill Snapshot order and use `/name - description`.
 
 The display label is independent from the insertion value. Skill descriptions are user-controlled:
 their whitespace runs are folded to one ASCII space for a markup-disabled, single-line OptionList
@@ -536,14 +535,15 @@ the existing dispatcher. A Skill selection through mouse or Enter inserts exactl
 closes the popup, restores input focus, and creates zero Message Bus inbound messages; it never
 submits or dispatches the Skill. Tab is not intercepted by the completion surface and does not
 accept, replace, or submit any highlighted candidate. A Management prefix selection only
-completes the composer. RuntimeBindings exposes only an ordered
-`tuple[SkillMetadata, ...]` projection, and generation rebind replaces the UI projection and clears
-old candidate state while reusing the same Runtime Lifetime Catalog snapshot.
+completes the composer. The current Agent Loop supplies only an ordered
+`tuple[SkillMetadata, ...]` presentation projection; generation rebind replaces that UI projection
+and clears old candidate state after the replacement Agent Loop has built and preflighted a new
+Skill Snapshot.
 
 ### 8.4 Context budget 与 consolidation
 
 - 可用输入预算为已解析 chat route 的 `context_window - max_output`。
-- Runtime startup 在读取当前 Long-term Memory、构造 `ContextBuilder` 与 `AgentLoop` 之后，但在绑定 Schedule callback、创建 Provider 或启动任何 task 前执行 always preflight；只有 Runtime Skill snapshot 的 `always_loaded` 非空时才执行。它以空 history 和空 current user content 调用与最终 Foreground chat 相同的 `ContextBuilder.build_messages()`，并与 `/status` 共享 compact JSON 序列化 seam，将真实 System Prompt、当前 user Runtime Context wrapper 和 `AgentLoop` 的固定十个结构化 Tool schemas 投影为 `RuntimeStatusInput`，再调用现有 `estimate_input_tokens`（所有 UTF-8 bytes 合计后向上取整 `/ 4`）。`estimated == available` 允许，`estimated > available` 抛出独立 `SkillContextTooLargeError`，稳定 code 为 `skill_context_too_large`，document 不截断。每个 Generation 可用同一 frozen Runtime Skill snapshot 和当代 Long-term Memory 重做该 preflight，但不得重扫目录或重读 document；direct `prepare_runtime` 与 `RuntimeHost` 使用同一 seam，Session retained history 不参与该 startup configuration check。
+- Agent Loop 同步构造在读取当前 Long-term Memory、构造 Skill Loader/Snapshot、`ContextBuilder`、固定 Tool schemas 和其他会话内组件之后，但在启动任何 task 前执行 Skill budget preflight。它以空 history 和空 current user content 调用与最终 Foreground chat 相同的 `ContextBuilder.build_messages()`，并与 `/status` 共享 compact JSON 序列化 seam，将真实 System Prompt、当前 user Runtime Context wrapper 和固定十个结构化 Tool schemas 投影为 `RuntimeStatusInput`，再调用现有 `estimate_input_tokens`（所有 UTF-8 bytes 合计后向上取整 `/ 4`）。`estimated == available` 允许，`estimated > available` 抛出独立 `SkillContextTooLargeError`，稳定 code 为 `skill_context_too_large`，document 不截断。每次启动或 `/resume` 都重扫完整 Skill documents 并对新 Snapshot 做 preflight；Session retained history 不参与该 startup configuration check。
 - 估算对象包含 system prompt、retained session messages、当前 Runtime Context、user input 和结构化 tool definitions。
 - foreground manual invocation 的 body/request 通过 transient typed projection 计入 retained-current budget 与 cutoff；实际 Summary provider 仍只接收选中的 raw historical Session records，不接收手动 Skill instructions 或 request。
 - 在每次 chat route model call 前检查预算和 `consolidation_message_threshold`，包括一个 tool loop 中后续的 chat model call。
@@ -563,7 +563,7 @@ logical purpose -> requested route -> usable route config -> provider adapter
 ```
 
 - route purpose 是 `default | chat | memory | schedule`。
-- chat 用于主对话、Task Framing 和 title；memory 用于 summary 和 Memory Task；schedule 用于 Schedule Jobs。
+- chat 用于主对话、Task Framing 和 title；memory 用于 Conversation Summary 和 Dream；schedule 用于 User Schedule Jobs。
 - chat request 必须调用 streaming provider contract；memory/schedule 可调用 complete contract。
 - requested route 与 default 指向同一配置时只尝试一次。
 - default 不可用时 runtime startup 失败。
@@ -647,24 +647,30 @@ adapter 内部负责聚合 provider-specific tool call deltas。Agent Loop 不�
 
 ### 10.1 Public foreground boundary
 
-`AgentLoop` owns one foreground `MessageBus`. Terminal Conversation and the
+The CLI composition root owns one foreground `MessageBus` for the whole Runtime Lifetime; the
+current `AgentLoop` only uses it. Terminal Conversation and the
 internal headless `run_repl` test seam submit `InboundMessage` values and consume
 `OutboundMessage` values; they do not reach into Session, provider or Tool
 objects. The independent `AgentLoop.control` surface owns cancellation,
 confirmation callbacks and the current foreground projection. Management Port
 and its dispatcher remain a separate management boundary.
 
-Message Bus 的六个 async operations 恰好是 `inbound_snapshot()`、`put_inbound()`、
-`get_inbound()`、`drain_inbound()`、`put_outbound()` 和 `get_outbound()`。Inbound 使用
-`deque` 与一个 `asyncio.Condition` 保持 FIFO；put/get/drain 在 coordination 内捕获操作后的
-immutable tuple，释放 coordination 后同步调用一个可绑定或清除的 callback。Snapshot read
-不调用 callback；callback failure 只记录并忽略，不回滚 mutation。Outbound 是一个无界、
-single-consumer FIFO。Message Bus 不拥有独立 close、abort、replay、broadcast、version 或
+Message Bus 的九个 async operations 恰好是 `inbound_snapshot()`、`put_inbound()`、
+`get_inbound()`、`pause_inbound_delivery()`、`resume_inbound_delivery()`、
+`drain_inbound()`、`put_outbound()`、`get_outbound()` 和 `reset()`；两个同步 public
+operations 是 `set_inbound_changed_callback()` 与 `unbind_inbound_changed_callback()`。Inbound 与
+Outbound 共享同一个异步 coordination boundary 并分别保持 FIFO。Inbound put/get/drain 在 coordination
+内捕获操作后的 immutable tuple，释放 coordination 后同步调用一个可绑定或清除的 callback；Outbound
+put/get 不调用该 callback。Snapshot read 不调用 callback；callback failure 只记录并忽略，不回滚 mutation。
+`reset()` 在同一个临界区内清空
+Inbound 和 Outbound，随后用空 Inbound snapshot 通知 callback；因此任意 `/resume`（包括当前 Session）
+可以复用同一 Bus identity 而不会保留旧 generation 消息。Outbound 是无界 single-consumer FIFO。
+Message Bus 不拥有独立 close、abort、replay、broadcast、version 或
 backpressure lifecycle；Tool result 永不进入 Outbound。
 
 ### 10.2 Task Framing and Blackboard
 
-`AgentLoop` 在每个非空普通 foreground `InboundMessage` 的主 Agent Run 准备前调用一次 `TaskFramingEvaluator`。Management Command、Schedule execution、Conversation Summary 模型调用和 Memory Task 不自行做 Task Framing；Conversation Summary/context preparation 使用该轮已 staged 的同一 Blackboard。
+`AgentLoop` 在每个非空普通 foreground `InboundMessage` 的主 Agent Run 准备前调用一次 `TaskFramingEvaluator`。Management Command、User Schedule execution、Conversation Summary 模型调用和 Dream 不自行做 Task Framing；Conversation Summary/context preparation 使用该轮已 staged 的同一 Blackboard。
 
 最小值与接口形状：
 
@@ -706,8 +712,9 @@ Agent Loop 只通过一次 `Session.append_messages()` 把主 Runner increment�
 
 ### 10.3 AgentRunner
 
-`AgentRunner` is the bounded, Session-independent model/Tool execution shared
-by the foreground loop and Schedule. It receives the selected route and Tool
+`AgentRunner` is the bounded, Session-independent model/Tool execution created by one
+Agent Loop and shared by its foreground work and User Schedule Jobs. Dream owns a separate
+Runner and restricted Gateway. Each Runner invocation receives the selected route and Tool
 Gateway dependencies and returns an `AgentRunnerResult`. Agent Run remains the
 domain term for one complete execution from input acceptance through Summary/context,
 one Runner invocation, Session increment and persistence request. Repair construction,
@@ -731,7 +738,7 @@ confirmation replies are not foreground bus payloads. A Tool confirmation is
 delivered through the `AgentLoop.control` callback and resolved by its direct
 Future-bound response; wrong, late and duplicate decisions do not authorize a
 different call. Schedule uses the same Runner/Gateway execution through
-`AgentLoop.run_schedule_job` and does not publish foreground messages.
+the current `AgentLoop.run_schedule_job` callback and does not publish foreground messages.
 
 Streaming metadata is sparse and mutually exclusive on each message:
 `{"_stream_delta": True}` marks one reasoning/response fragment,
@@ -750,7 +757,7 @@ class ManagementPort(Protocol):
     async def resumable_listing(self) -> SessionListingReport: ...
     async def resume(self, session_id: str, *, force: bool = False) -> ResumeResult: ...
     async def memory_view(self) -> str: ...
-    async def dream(self) -> MemoryTaskResult: ...
+    async def dream(self) -> DreamResult: ...
 ```
 
 - `resumable_listing` 的 `sessions` 仅包含当前 Workspace 的 id、title、created_at、
@@ -786,13 +793,13 @@ messages、Outbound 或持久化。
 
 ### 10.7 Schedule and Lifecycle Boundary
 
-`ScheduleService` 是唯一的 Schedule Store/management owner。它必须在 Agent Loop 之前
-创建；Agent Loop 创建 Schedule Tool、固定 Catalog、共享 Tool Gateway 和 Agent Runner，
-再绑定 `on_schedule_job(job) -> None` callback，最后才启动 Service。Foreground 与 Schedule
-execution 使用同一 Gateway identity 和同一 Runner identity，但每次 Schedule execution
-拥有独立的 Schedule Session、context、cancellation 和 externalizer Session ID。Schedule
-没有 confirmation channel 或 foreground Message Bus projection，传入 `confirmation=None`，
-任何 Schedule output 都不进入 foreground Outbound。
+`ScheduleService` 在 CLI composition root 中创建并拥有 Schedule Store。CLI 给它两个稳定 executor：
+User Job executor 每次调用时解引用当前 Agent Loop；Dream executor 直接调用 CLI-owned `Dream.run()`。
+CLI 在 Service 初始化后、dispatcher 启动前注册或校正内置 Dream System Job。Foreground 与 User
+Schedule execution 使用当前 Agent Loop 的同一 Gateway identity 和同一 Runner identity，但每次
+User Schedule execution 拥有独立的 Schedule Session、context、cancellation 和 externalizer Session ID。
+Dream 使用自己的 Runner/Gateway，不创建 Schedule Session。所有 Schedule execution 都没有 confirmation
+channel 或 foreground Message Bus projection，任何 Schedule output 都不进入 foreground Outbound。
 
 Schedule execution 通过 ContextVar token 设置 `ScheduleTool._in_schedule_job`，并在
 `finally` 中 reset；只有递归 `add` 被拒绝，foreground `add` 以及 Schedule `list`/`remove`
@@ -800,27 +807,26 @@ Schedule execution 通过 ContextVar token 设置 `ScheduleTool._in_schedule_job
 `.myclaw/artifacts/schedule_<job_id>/<tool_call_id>.txt`，reference shape 保持
 `path`、`total_chars`、`preview_chars` 三个字段。
 
-一个 Runtime Generation 包含 Store/Service、MessageBus、Router、Runtime Memory、Memory
-Task scheduler、Agent Loop、fixed Tools、shared Gateway/Runner 和 Management services。
-`PreparedRuntime.start()` 和 `close()` 是正常 awaited lifecycle；`PreparedRuntime.abort()`
-是 synchronous forced lifecycle。`RuntimeHost` 先构造并 validate unstarted target，再 abort
-old generation，解绑旧 bus/control、清理旧 Terminal projection、绑定并启动 target。
-Target preparation failure 不改变 old generation；abort 调用 `Session.abandon()`，不等待
-active Runner、persistence、Schedule、Memory 或 Provider shutdown。Provider cleanup 是
-detached best effort，只记录 failure；可接受丢失未持久化状态、未修复 active work、Tool
-side-effect/Artifact orphan、Memory cursor skip、Schedule at-least-once side effect 和
-uptime reset。普通 process shutdown 始终走 awaited `close()`。
+CLI 的 private async root 是唯一 composition root，拥有规范化绝对 Workspace `Path`、`WorkspaceState`、
+一个稳定 Message Bus、Model Router、Memory Manager、Dream、Schedule Service、Management
+Service/Dispatcher、Terminal application 和可替换的 current Agent Loop reference。同步 Typer entry
+只完成参数/配置边界并进入该 async root；Terminal application 不启动或关闭业务组件。代码中不得存在
+`RuntimeHost`、`PreparedRuntime`、`RuntimeBindings`、`prepare_runtime` 或承担相同聚合职责的改名容器。
 
-Runtime Lifetime 还拥有一个由 Agent Home Skill root 构建的 immutable `RuntimeSkillSnapshot`；
-其中 metadata-only `SkillCatalog` 与 opted-in `AlwaysLoadedSkill` bodies 是分离字段。同一 Runtime Lifetime 的 Runtime Generation replacement（包括 `/resume`）复用同一对象，
-不得重新扫描 Skill 目录；只有新的 Runtime Lifetime 才重新发现目录内容。Foreground chat
-接收该 snapshot 的 metadata 投影，并在启用且已冻结正文时把 complete always body 作为
-不可伪造的 JSON Lines System block 注入；普通 Skill 正文仍通过 `read_file` 按需读取，
-不缓存按需正文，不增加 Skill-specific Tool、invocation 或 EOF 语义。Generation replacement
-只对同一 snapshot 和当代 Long-term Memory 重做 startup budget preflight，不重扫目录或重读
-always body；新的 Runtime Lifetime 才重新发现目录内容。该 Runtime Skill snapshot 不改变 Tool permission、
-Management Command dispatch、slash invocation、Schedule 或 Message Bus 契约；共享 completion
-的 presentation 与 selection 规则见 8.3a。
+一个 Runtime Generation 恰好是一个 Agent Loop。Agent Loop 同步构造 Session、Skill Loader、immutable
+full Skill Snapshot、Context Builder、Conversation Summary Manager、Task Framer、Tool Gateway、Agent Runner
+及其他 Session 内 task；它只接收并使用 CLI-owned outer objects/ports。构造完成后处于 prepared/unstarted
+状态，并在启动 task 前完成同步 preflight。Skill Loader 在每个 generation 重新发现目录、完整读取/校验正文，
+丢弃并安全记录无效候选，再保存包含 metadata 和全部正文的 immutable Snapshot；同一 generation 的 manual
+和 always projection 都只使用 frozen document。普通模型主动调用 `read_file` 仍保持实时 Tool 语义。
+
+The final linearization refinement formed during later implementation review is recorded here; it is not a restatement of the original parent issue wording. In this contract, target preparation is a precondition and includes target construction plus synchronous `preflight()` before destructive cutover. For a successful target, the exact source-backed sequence is:
+
+`quiesce_for_rebind -> pause_and_drain -> current unavailable -> old abort/drain -> bus.reset() -> rebind_agent_loop -> target.start() -> publish current -> schedule_service.resume()`
+
+`current unavailable` means the CLI clears its current reference before old-loop abort/drain. The target is successfully started and activated before that reference is published; Schedule resumes only after publication. Any target construction or preflight failure is fatal, terminates Terminal Conversation, and is handled by the CLI `finally` path. Selection of the current Session also performs the full flow. Schedule Service, Dream, Memory Manager, Model Router and Message Bus are not closed or rebuilt during replacement.
+
+After Terminal `run_async()` returns, the actual CLI shutdown call chain is `Management deactivate -> Schedule pause_and_drain + close -> pending/active Agent Loop abort or close -> Dream close -> Model Router close`. Terminal exit/unmount cleanup has already run at the first boundary; the CLI does not call a separate Terminal business-component close. Accepted Tool/Artifact/Memory/Schedule side effects are not rolled back.
 
 ## TOOL_SCHEMA：Tool Gateway 契约
 
@@ -848,11 +854,11 @@ ToolResult(
 
 ### 11.2 Catalog 与依赖所有权
 
-- Agent Loop 在初始化时以 Workspace、Schedule Service 和 canonical Agent Home Skill root 构造一个共享 `ToolGateway`；Gateway 自己一次性构造固定十工具 Catalog，不暴露注册入口。Schedule Service 只持有 Store/Job management ownership，Gateway 不接受第二套 Schedule Gateway。
+- Agent Loop 在初始化时以规范化绝对 Workspace `Path`、Schedule Service 和 canonical Agent Home Skill root 构造一个共享 `ToolGateway`；不存在 `Workspace` wrapper class。Gateway 自己一次性构造固定十工具 Catalog，不暴露注册入口。Schedule Service 自己创建并持有 Store/Job management ownership，Gateway 不接受第二套 Schedule Gateway。
 - Tool 调用不接收 session ID、Agent Home、lane、approval flag 或通用 execution context。
 - 没有独立 `Security` 模块；公共路径、DNS、截断和 Artifact 边界由 BaseTool 或共享小 helper 提供，具体 Tool 保留 capability-specific 规则。
-- Memory Task 使用合法且独立的专用 Tool Gateway，只注册 Long-term Memory read/edit Tool；
-  它不复用 foreground/Schedule 的共享 Gateway，也不形成第三条 Agent Runner execution path。
+- Dream 使用合法且独立的专用 Tool Gateway，只注册 Long-term Memory read/edit Tool；
+  它不复用 foreground/User Schedule 的共享 Gateway，并拥有独立 Agent Runner execution path。
 - Tool Gateway 不在前台/后台之间加全局执行锁。
 - Tool Gateway 不设置统一 timeout、持久化 Tool Result 或持有 Workspace；Artifact 写入由 BaseTool 的结果处理能力完成。
 
@@ -971,7 +977,7 @@ BaseTool 在 `status == "success"` 且结果长度严格超过 `runtime.max_tool
 
 ## 12. Fail-closed capability 矩阵
 
-| Capability | Foreground | Schedule Job | Memory Task |
+| Capability | Foreground | User Schedule Job | Dream |
 | --- | --- | --- | --- |
 | Workspace read/list/search | allow | allow | 不在 catalog |
 | Workspace write/edit | allow, subject to OS permissions | allow, subject to OS permissions | 不在 catalog |
@@ -1027,12 +1033,11 @@ ErrorInfo(
 | `tool_denied` | 内置 policy 禁止 | 否 |
 | `tool_refused` | service-level Tool refusal projection | 否 |
 | `tool_failed` | 工具执行失败 | 否 |
-| `memory_task_running` | Memory Task 不重入 | 否 |
+| `memory_task_running` | Dream 不重入（保留既有稳定 code） | 否 |
 | `schedule_state_error` | Schedule state 损坏或不安全 | 否 |
-| `skill_unavailable` | Skill document 缺失、不可读、非 UTF-8、metadata/path 校验失败或 always opt-in 复核失败 | 否 |
 | `skill_context_too_large` | always-loaded Skill document 的最小真实 Foreground request projection 超出 `context_window - max_output` | 否 |
 
-CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 Terminal Conversation 继续时不退出进程。RuntimeHost 构造期间的 `SkillUnavailableError` 与 `SkillContextTooLargeError` 必须在进入 `run_terminal_conversation` 前由 CLI 捕获，只通过 `_print_error_info` 输出稳定 code/message，不输出 traceback、底层异常、Skill 正文或敏感路径。
+CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 Terminal Conversation 继续时不退出进程。首次启动或任意 `/resume` 的 Agent Loop 构造/同步 preflight failure 必须由 CLI composition root 捕获，终止 Terminal Conversation，并只通过 `_print_error_info` 输出稳定 code/message，不输出 traceback、底层异常、Skill 正文或敏感路径。
 
 ## 14. `/status` 契约
 
@@ -1058,9 +1063,10 @@ CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`
 ```
 
 - `chat_model` 显示解析后的实际 route；chat fallback default 时显示 default 对应 provider/model。
+- `uptime_seconds` 是当前 Agent Loop/Conversation Session 的 generation uptime；任意 `/resume`（包括当前 Session）后重置，不表示 CLI process uptime。
 - token estimate 对下一次 chat request 的 system prompt、retained messages、tool definitions 和 Runtime Context 的 UTF-8 bytes 求和后除以 4 向上取整。
 - 没有已持久化 message 的准备中 Session：message count/`last_consolidated`/usage 都为 0。
-- scheduler 初始化失败可附加非持久化 warning，但不得取代 required fields。
+- Schedule Service health 可附加非持久化 warning，但不得取代当前 Session required fields。
 
 ## 15. 最小 Session/Provider/Tool 接口
 
@@ -1144,11 +1150,13 @@ Schema casting、参数校验、安全检查和结果截断/Artifact 写入属�
 - MessageBus sparse outbound schema、terminal marker 以及 AgentLoop control/Future 语义。
 - Blackboard/FramingResult strict shape、Task Framing decision table、current-input-only projection、usage/metadata atomic commit 和非前台路径排除。
 - Model Provider scripted transcript：text deltas、tool call deltas、usage、retry-after、timeout、cancellation。
-- 固定 Catalog、Runtime Lifetime Skill snapshot/read_body、foreground-only metadata projection、BaseTool preparation order、file path boundary、Exec/Web confirmation 和 WebFetch redirect/IP cases。
+- 固定 Catalog、generation-scoped full Skill Snapshot/manual frozen projection、foreground-only metadata projection、BaseTool preparation order、file path boundary、Exec/Web confirmation 和 WebFetch redirect/IP cases。
+- CLI composition ownership、Agent Loop session ownership、initial/resume preflight failure、same-Session replacement、stable Message Bus identity 和 atomic inbound/outbound reset。
+- Dream System Job registration/reconciliation、direct Dream dispatch、User Job current-loop dispatch、replacement pause/cancel/await/rebind/resume 顺序和 no-Schedule-Session invariant。
 - complete atomic JSONL replacement、缺少 trailing newline、middle corruption、旧 schema rejection，以及 Summary/`last_consolidated` crash divergence。
 
 契约测试断言稳定 code、结构和文件内容；终端文案除脱敏与必需信息外不做全文 snapshot，以免实现被展示细节锁死。
 
 ## 17. 确认记录
 
-D01-D17、Session snapshot、固定 Tool Catalog、Message Bus/Agent Loop/Agent Runner 以及 Session Blackboard Task Framing 均为当前已接受契约。本文 `TOOL_SCHEMA` 与各持久化 schema 是 Python 类型、实现和 contract fixtures 的直接输入。
+D01-D18、Session snapshot、固定 Tool Catalog、CLI composition root、Message Bus/Agent Loop/Agent Runner、Dream System Job 以及 Session Blackboard Task Framing 均为当前已接受契约。本文 `TOOL_SCHEMA` 与各持久化 schema 是 Python 类型、实现和 contract fixtures 的直接输入。

@@ -12,23 +12,24 @@
 
 - 用户运行 `myclaw` 进入长驻前台 Terminal Conversation；非-TTY 启动以 `interactive_terminal_required` 拒绝，不回退到 headless prompt。
 - 每个有效 Terminal Conversation 启动准备一个新的 Workspace-scoped Conversation Session；未发送用户消息就退出时不持久化空 session。
-- Agent Loop 通过 Message Bus、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界编排 Agent Run；RuntimeHost 负责 Runtime Generation 生命周期。
+- CLI 是 Runtime Lifetime 的唯一 composition root；Agent Loop 通过 Message Bus、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界承担当前 Session 的 Runtime Generation。
 - 每个非空普通前台输入在 Agent Run 前经过隔离的 Task Framing，用一个隐藏 Blackboard 明确当前任务目标与完成边界。
 - Agent Home 固定为 `~/.myclaw/`，采用 file-first persistence。
-- Terminal Conversation 支持 streaming、前台 Agent Run 期间的 Inbound FIFO 排队、后台 Memory Task、Schedule Jobs、Session resume 和管理 slash commands；Schedule actions 不请求 Tool Confirmation；Exec、Web、resolved escape 和其他 Workspace 外部路径按具体目标执行一次性确认，只有 `read_file` 对 canonical Agent Home Skill root 无需 Tool Confirmation。
+- Terminal Conversation 支持 streaming、前台 Agent Run 期间的 Inbound FIFO 排队、后台 Dream、Schedule Jobs、Session resume 和管理 slash commands；Schedule actions 不请求 Tool Confirmation；Exec、Web、resolved escape 和其他 Workspace 外部路径按具体目标执行一次性确认，只有 `read_file` 对 canonical Agent Home Skill root 无需 Tool Confirmation。
 - 首版非交互管理只支持 `myclaw config`，不支持 one-shot 对话。
 
 ## Current Runtime Contract
 
 以下是当前实现与发布验收使用的边界：
 
-- 一个 Agent Loop 拥有一个无界 FIFO Message Bus。公开的六个 async 操作是
+- 一个 Runtime Lifetime 拥有一个无界 FIFO Message Bus，当前 Agent Loop 只使用它。公开操作包括
   `inbound_snapshot()`、`put_inbound()`、`get_inbound()`、`drain_inbound()`、
-  `put_outbound()`、`get_outbound()`；Inbound mutation 在释放 queue coordination 后把
+  `pause_inbound_delivery()`、`resume_inbound_delivery()`、`put_outbound()`、`get_outbound()` 和原子清空 Inbound/Outbound 的 `reset()`；同步 public callback operations 是
+  `set_inbound_changed_callback()` 与 `unbind_inbound_changed_callback()`。Inbound mutation 在释放 queue coordination 后把
   immutable snapshot 同步交给一个 callback。Outbound 只有 `model_reasoning`、
   `model_response`、`tool_call`、`system_control` 四种 type，使用互斥的 `_stream_delta`、
   `_stream_end`、`_streamed` 三种 sparse marker；它只有一个 Terminal consumer，Tool
-  result、Schedule output、Memory Task output 永不进入 Outbound。Message Bus 没有独立
+  result、Schedule output、Dream output 永不进入 Outbound。Message Bus 没有独立
   close、abort、replay、broadcast、version 或 backpressure lifecycle。
 - 每个非空普通 foreground input 使用 `chat` Model Route 做一次无 Tools、无 continuation
   的 Task Framing completion。输入只包含上一个 Blackboard、最新 assistant content
@@ -44,18 +45,24 @@
   `MyClaw 已取消本轮对话。` 均由 runtime contracts 定义。Provider-visible
   reasoning 只保留 Provider 返回内容；opaque continuation 只在同一 Tool loop 内传递，
   不进入 Session 或 Outbound。
-- Schedule Service 是唯一 Store/management owner；它在 Agent Loop 前创建，随后绑定
-  `on_schedule_job(job) -> None` callback。Foreground 与 Schedule 共享同一 Gateway/Runner
-  identity，但拥有独立 Session、context、cancel 和 externalizer state；Schedule 没有
-  confirmation channel 或 foreground Message Bus projection，使用 `confirmation=None`，并用
-  ContextVar token/finally 阻止递归 add。Schedule Artifact root 与 reference shape 保持不变。
+- Schedule Service 创建并独占 Store；CLI 向它提供 User Job 和 Dream 两条稳定 executor。
+  User executor 每次解引用当前 Agent Loop，并与 foreground 共享该 generation 的 Gateway/Runner
+  identity，但使用独立 Schedule Session、context、cancel 和 externalizer state；Dream executor
+  直接调用 CLI-owned `Dream.run()`，不经过 Agent Loop 或 Schedule Session。两条路径都没有
+  confirmation channel 或 foreground Message Bus projection。User Schedule path 使用 ContextVar
+  token/finally 阻止递归 add；Schedule Artifact root 与 reference shape 保持不变。
 - 普通 Session snapshot 按顺序最多三次异步写入（失败后 `100 ms`、`200 ms` backoff）；
-  normal awaited close 仍做最多三次 final save；`Session.abandon()` 同步取消 pending
-  snapshots、禁止后续修改且不做 final save。`PreparedRuntime.abort()` 是 forced replacement
-  的同步生命周期，`RuntimeHost` 先 validate unstarted target 再 abort/rebind/start；旧
-  generation 的 detached Provider cleanup 是 best effort，已接受其不修复 active work、
-  可能丢失未持久化状态、Tool/Artifact orphan、Memory cursor skip、Schedule at-least-once
-  side effect 和 uptime reset 后果。
+  normal awaited close 仍做最多三次 final save；`Session.abandon()` 取消 pending snapshots、
+  禁止后续修改且不做 final save。The final linearization refinement formed during later
+  implementation review is not a claim about the original parent issue wording. In this
+  contract, target preparation is a precondition: the target Agent Loop is constructed and synchronously
+  preflighted before destructive cutover. The successful cutover is
+  `quiesce_for_rebind -> pause_and_drain -> current unavailable -> old abort/drain -> bus.reset() -> rebind_agent_loop -> target.start() -> publish current -> schedule_service.resume()`.
+  Target activation precedes publishing the CLI current reference; target construction or
+  preflight failure is fatal and the CLI safely shuts down through its `finally` path. After
+  Terminal exit, the shutdown chain is `Management deactivate -> Schedule pause_and_drain + close -> Loop close/abort -> Dream close -> Model Router close`.
+  已接受 forced replacement 可能丢失未持久化状态、产生 Tool/Artifact orphan、Memory cursor
+  skip、Schedule at-least-once side effect 和 current-Session uptime reset。
 
 ## User Stories
 
@@ -91,9 +98,9 @@
 30. 作为个人用户，我想大型工具结果存为 Tool Artifact，所以 session 和上下文不会被大结果撑爆。
 31. 作为个人用户，我想 Tool Artifact 随 session 保留，所以恢复旧 session 时仍能读取完整结果。
 32. 作为个人用户，我想通过自然语言创建 at、every 或 cron Schedule Job，所以无需手写状态文件。
-33. 作为个人用户，我想 Schedule Job 使用专属 Session，所以定时任务不污染当前会话。
-34. 作为个人用户，我想 Schedule Job 运行结果留在其 Session 中，所以后台结果不会打断前台 streaming。
-35. 作为个人用户，我想 Schedule Job 与前台使用同一个 Agent Run，所以模型、Tool、Summary 和 Artifact 语义一致。
+33. 作为个人用户，我想 User Schedule Job 使用专属 Session，所以定时任务不污染当前会话。
+34. 作为个人用户，我想 User Schedule Job 运行结果留在其 Session 中，所以后台结果不会打断前台 streaming。
+35. 作为个人用户，我想 User Schedule Job 与前台共享当前 Runtime Generation 的 Agent Runner 和 Tool Gateway，所以模型、Tool、Summary 和 Artifact 语义一致。
 36. 作为个人用户，我想分别配置 default、chat、memory、schedule 模型，所以不同任务可使用不同模型。
 37. 作为个人用户，我想具体 route 不可用时 fallback 到 default，所以系统有统一兜底。
 38. 作为个人用户，我想支持 Anthropic 和 OpenAI-compatible provider，所以可以使用不同模型服务。
@@ -119,12 +126,12 @@
 - 首版没有 one-shot 对话命令、detached daemon、HTTP server 或 IPC server。
 - 每个 Terminal Conversation invocation 创建一个独立 Runtime Lifetime；它在任一时刻拥有
   一个 active Runtime Generation，并可在成功切换 Conversation Session 时替换该 generation。
-- 用户消息进入前台队列并串行执行；Memory Task 和 Schedule Jobs 在同一 runtime 内异步运行。
-- 每个非空普通前台输入在 Agent Run 前做 Task Framing；Management Command、Schedule 和 Memory 路径不做任务框定。
+- 用户消息进入前台队列并串行执行；Dream 和 Schedule Jobs 在同一 runtime 内异步运行。
+- 每个非空普通前台输入在 Agent Run 前做 Task Framing；Management Command、Schedule 和 Dream 路径不做任务框定。
 - Blackboard 只解释当前任务，不分解子任务、不控制 Agent Runner、不授权 Tool，且没有命令、Tool、event 或 UI 表面。
 - Ctrl+C 只取消当前前台 turn。
 - 输入 `exit` 或 `quit`（忽略前后空白、大小写不敏感）退出 Terminal Conversation 并立即取消后台任务。
-- 多个 Terminal Conversation 可在同一 Workspace 运行，但首版不做跨进程协调；每个 Runtime Generation 独立启动后台调度器。
+- 多个 Terminal Conversation 可在同一 Workspace 运行，但首版不做跨进程协调；每个 Runtime Lifetime 只启动一个 Schedule Service。
 
 ### CLI and management
 
@@ -132,15 +139,15 @@
 - 首版不要求 `myclaw --help` 作为产品能力。
 - Terminal Conversation 内置 slash commands：`/config`、`/status`、`/resume`、`/memory`、`/dream`。
 - Only Management Commands enter the Management Port. An exact valid Skill slash invocation remains an ordinary foreground Agent Run; unknown or non-matching slash input remains ordinary input.
-- Skill names are validated exactly as authored without trimming; descriptions are trimmed. Manual and opted-in always-load paths revalidate and project the complete UTF-8 `SKILL.md`, including frontmatter and original line endings, while Session persistence retains only the raw slash input.
+- Skill names are validated exactly as authored without trimming; descriptions are trimmed. Each Agent Loop constructs a Skill Loader that reads every retained complete UTF-8 `SKILL.md` into one immutable Runtime Generation Skill Snapshot; manual and opted-in always-load invocation use that frozen document, while Session persistence retains only the raw slash input. Invalid candidates are skipped with safe diagnostics, and a later Agent Loop construction rescans the directory.
 - The shared completion surface keeps its existing Management Command Enter/click behavior. Skill Enter/click selection only fills `/<name> ` without submission, and Tab does not accept any completion candidate.
 - `/config` 完整显示配置，但脱敏 plaintext API key。
 - 配置语法错误时，`myclaw config` 显示解析错误、配置路径和原文，并对明显 API key 行做文本级脱敏。
-- `/status` 显示版本、chat model、runtime uptime、估算 token 状态、当前 Session 消息数、`last_consolidated` 和当前 Session 累计 model usage。
+- `/status` 显示版本、chat model、当前 Agent Loop/Session uptime、估算 token 状态、当前 Session 消息数、`last_consolidated`、当前 Session 累计 model usage 和 Schedule 健康状态。
 - `/status` 的 provider-neutral token estimate 使用 `ceil(UTF-8 byte length / 4)`，展示估算输入 token、context window 和占比；实际 cumulative usage 不混入估算值。
-- `/resume` 只展示当前 Workspace 的 sessions；选择后直接切换。原 session 有消息则保留，无消息可丢弃。
+- `/resume` 只展示当前 Workspace 的 sessions；选择任一 Session（包括当前 Session）都重建 Agent Loop、刷新 Skill Snapshot 并原子清空 Message Bus。原 Session 使用 `abandon()`，不做 final save；active run 仍需 force confirmation。
 - `/memory` 不分页，完整读取并显示磁盘最新 `memory.md`。
-- `/dream` 前台阻塞执行 Memory Task，并显示处理条数、是否更新及 cursor 状态等摘要，不显示完整 diff。
+- `/dream` 前台阻塞执行 `Dream.run()`，并显示处理条数、是否更新及 cursor 状态等摘要，不显示完整 diff。
 - `/dream` 没有 pending summary 时返回 `No pending summaries`，不调用模型。
 
 ### Agent Home and persistence
@@ -155,7 +162,7 @@
 - Summary Cursor 是纯文本文件 `<workspace>/.myclaw/memory/.cursor`。
 - Schedule state 保存在 Workspace State 根目录的 `schedule.json` 严格 JSON 数组文件中；Schedule Session 使用独立的 `schedule-sessions/` 分区。
 - Long-term Memory 缺失时，runtime 启动会创建包含 User Info、User Preference、Project Fact、Lesson 四个空分区的模板。
-- Conversation Summary、Summary Cursor、Schedule state 和 Schedule Session 文件按需创建；legacy scheduled-work state 原样保留且不读取、不迁移、不删除。
+- 内置 Dream System Job 在有效 Terminal Conversation 启动时注册，因此 `schedule.json` 会在启动时创建或校正；Conversation Summary、Summary Cursor 和 Schedule Session 文件仍按需创建。legacy scheduled-work state 原样保留且不读取、不迁移、不删除。
 
 ### Workspace and sessions
 
@@ -182,7 +189,7 @@
 
 ### Task Framing and Blackboard
 
-- 每个非空普通 foreground user input 在 Conversation Summary 与主 Agent Runner 之前做一次隔离 Task Framing；Management Command、Schedule Job 和 Memory Task 不进入该路径。
+- 每个非空普通 foreground user input 在 Conversation Summary 与主 Agent Runner 之前做一次隔离 Task Framing；Management Command、Schedule Job 和 Dream 不进入该路径。
 - Task Framing 只读取上一个 Blackboard、Session 中最新 assistant message 的完整 content 和当前 raw input，不接收全部历史、Long-term Memory 或 Tools。
 - strict decision 只能 keep、replace 或 clear；Blackboard 恰好包含经过 trim 的非空 `goal` 与 `completion_boundary`，不设字符数上限。
 - staged Blackboard 只附加在当前 model-visible user message 最后一个 Runtime-owned `<blackboard>` block 中；persisted user message 始终是 raw input。
@@ -196,7 +203,7 @@
 - Short-term Memory 是 active Session 中 `last_consolidated` 之后的消息后缀。
 - Conversation Summary 是全局 JSONL 流，每条只包含自增 index、timestamp、content，不保存 source session 或 message range。
 - Conversation Summary index 从 1 开始；缺失的 Summary Cursor 文件等价于 0。
-- Conversation Summary 不直接进入 chat 上下文，也不会在新增后立即触发 Memory Task。
+- Conversation Summary 不直接进入 chat 上下文，也不会在新增后立即触发 Dream。
 - 达到 chat route context budget 或配置的总消息数阈值时，在下一次 chat 调用前同步压缩。
 - 总消息数阈值默认 40。
 - Token 触发时初始选择约半个预算的早期消息；消息数触发时选择约半个阈值的早期消息。
@@ -204,25 +211,24 @@
 - 摘要生成使用 memory route，具体 route 不可用时 fallback default；fallback 也失败则当前 chat 请求失败。
 - 生成 Conversation Summary 时不注入 Long-term Memory。
 - Long-term Memory 是单个 Markdown 文件，完整注入 chat 和 Schedule Job 系统提示词，不做相关性筛选，也不设首版大小上限。
-- Long-term Memory 在 runtime 启动时加载并缓存；Memory Task 修改后，新的 Agent Run 使用刷新后的快照，正在运行的 Agent Run 保留启动时快照。
+- Long-term Memory 由 Memory Manager 加载并缓存；Dream 修改后，新的 Agent Run 使用刷新后的快照，正在运行的 Agent Run 保留启动时快照。
 - `/memory` 读取磁盘最新内容，不读取 runtime 缓存。
-- Memory Task 使用系统本地时区 cron，默认每小时一次。
-- Memory Task 的 `batch_size` 是全局配置，默认 10。
-- Memory Manager 读取 Summary Cursor 和 summary batch，然后构造 memory prompt。
+- Dream Schedule Job 使用系统本地 IANA 时区 cron，默认每小时一次。
+- Dream 的 `batch_size` 是全局配置，默认 10。
+- Memory Manager 持有 Conversation Summary、Summary Cursor、Long-term Memory persistence 和当前内存快照；Dream 领取 summary batch 后构造 memory prompt。
 - memory 模型通过标准 Tool Gateway 和专用 read/edit Tool 读取 Long-term Memory，并且只能编辑 `<workspace>/.myclaw/memory/memory.md`；它不使用 Conversation Session 或 Tool Artifact。
-- Memory Task 没有调用 `edit_file` 时视为 no update 并推进 Summary Cursor。
-- 需要编辑且成功时推进 cursor；编辑失败时不推进。
-- Memory Task 在单 runtime 内不重入：周期触发遇到运行中任务则跳过，`/dream` 遇到运行中任务则拒绝并提示。
-- 周期 Memory Task 成功或失败都不通知 Terminal Conversation；手动 `/dream` 输出摘要状态。
-- 主 Agent 的固定 file Tools 可访问 Workspace 内全部路径，包括 Workspace State；实际文件结果服从操作系统权限。Memory Task 仍只使用它的专用 Long-term Memory Tool。
+- Dream 在模型执行前通过 Memory Manager 推进 Summary Cursor；no update、edit success、model failure 和 Tool/edit failure 均保留已推进的 cursor，不自动重试该 batch。
+- Dream 在单 runtime 内不重入：周期触发遇到运行中 Dream 则跳过，`/dream` 遇到运行中 Dream 则拒绝并提示。
+- Dream Schedule Job 成功或失败都不通知 Terminal Conversation；手动 `/dream` 输出摘要状态。
+- 主 Agent 的固定 file Tools 可访问 Workspace 内全部路径，包括 Workspace State；实际文件结果服从操作系统权限。Dream 仍只使用它的专用 Long-term Memory Tool。
 - Conversation Summary 在 global summary lock 内完成自己的 summary stream operation 后直接更新 active Session 的 `last_consolidated`；没有 pending journal 或启动恢复协议。crash 后 Summary 与 Session snapshot 可 divergence，且不提供跨进程协调。
 
 ### Model routing and providers
 
 - Route 名称严格固定为 `default`、`chat`、`memory`、`schedule`；其它 route table 按未定义字段投影掉。
 - `chat` 用于主对话、Task Framing 和 Session title。
-- `memory` 用于 Conversation Summary 和 Memory Task。
-- `schedule` 用于 Schedule Jobs。
+- `memory` 用于 Conversation Summary 和 Dream。
+- `schedule` 用于 User Schedule Jobs；Dream 使用 `memory` route。
 - 具体 route 缺失或不可用时总是 fallback 到 `default`。
 - `default` 不可用时，Terminal Conversation 启动失败。
 - 每个 route 配置 provider_id、model、context_window、max_output、temperature、reasoning_effort、timeout。
@@ -286,8 +292,8 @@
 - Schedule 支持 `at`、`every` 和 `cron`；Cron Job 固化 IANA timezone，at 使用带 UTC offset 的绝对时间。
 - User Job 通过 `schedule` Tool 的 add、list、remove action 管理；三种 action 都不请求 Tool Confirmation，Scheduled Agent context 拒绝 add。
 - Schedule 只复用 generic `read_file` path exemption，不获得 Skill discovery 或 invocation Interface。
-- 每个 Job 使用由 `schedule_<job_id>` 派生的 Schedule Session，并使用专属 `schedule-sessions/` 分区；该 Session 不出现在 `/resume`。
-- Schedule Service 是唯一的 Job dispatcher，所有触发都通过共享 Agent Run 使用 `schedule` route，结果保留在 Schedule Session。
+- User Job 使用由 `schedule_<job_id>` 派生的 Schedule Session，并使用专属 `schedule-sessions/` 分区；该 Session 不出现在 `/resume`。Dream System Job 不创建 Schedule Session。
+- Schedule Service 是唯一的 Job dispatcher。User Job 通过 CLI callable 使用当前 Agent Loop 的共享 Agent Runner/Gateway；`job_id="dream", source="system"` 直接调用 `Dream.run()`。
 - 同一 Job 在单 runtime 内不重入；不同 Job 可并发；不做跨进程协调，因此多个 runtime 可能重复触发。
 - Schedule 只在 runtime 存活时运行，不发送前台 OutboundMessage、完成提示或通知。
 - legacy scheduled-work state 原样保留且永不读取、检测、迁移、重命名或删除。
@@ -296,7 +302,7 @@
 ## Testing Decisions
 
 - 测试只验证外部可观察行为，不绑定内部实现细节。
-- 优先测试最高 seam：Message Bus/Agent Loop、Task Framing、Management Port、PreparedRuntime、Memory Manager、Tool Gateway、active Session、Model Router/Provider Adapter。
+- 优先测试最高 seam：CLI composition root、Message Bus/Agent Loop、Task Framing、Management Port、Memory Manager、Dream、Schedule Service、Tool Gateway、active Session、Model Router/Provider Adapter。
 - 测试使用 fake provider、fake tool、临时 Agent Home 和临时 Workspace，不调用真实模型 API。
 
 ### Required Task Framing tests
@@ -307,7 +313,7 @@
 - framing retry、default fallback、model failure、invalid response、cancellation 和 Runtime replacement。
 - staged Blackboard 在 Summary/context 重建中保持同一值，只投影到当前 model input，不改变 persisted raw user message。
 - accepted Runner result 的 Blackboard/usage atomic commit，以及 preparation failure/cancellation 的旧状态保留。
-- Management、Schedule 和 Memory 路径零 Task Framing call，Blackboard 不影响 Tool Confirmation 或授权。
+- Management、Schedule 和 Dream 路径零 Task Framing call，Blackboard 不影响 Tool Confirmation 或授权。
 
 ### Required memory tests
 
@@ -315,18 +321,18 @@
 - Token 和总消息数两种摘要触发条件。
 - Cutoff 对齐 user message 的主路径和 fallback 路径。
 - Summary JSONL schema 只有 index、timestamp、content。
-- Summary 生成不注入 Long-term Memory，且不会立即触发 Memory Task。
+- Summary 生成不注入 Long-term Memory，且不会立即触发 Dream。
 - memory route/default fallback 全部失败时 chat 请求失败。
 - `/dream` 无 pending summaries 时不调用模型。
 - Summary Cursor 在 no update、edit success、edit failure 下的推进规则。
-- Memory Task batch size、cron、不重入和受限 edit_file 路径。
+- Dream batch size、不重入、受限 edit_file 路径和 Schedule Service system Job 调度。
 - Long-term Memory runtime cache 与 `/memory` 磁盘最新视图的差异。
 
 ### Required session tests
 
 - Session ID、Workspace-owned 文件路径、strict header 第一行和 JSON-native OpenAI-style messages。
 - 空 Terminal Conversation 不持久化 session。
-- `/resume` 只列当前 Workspace sessions，并正确切换。
+- `/resume` 只列当前 Workspace sessions；选择目标或当前 Session 都重建 Agent Loop、清空共享 Message Bus 并刷新 Skill Snapshot。
 - 每轮一次完整 JSONL replacement、snapshot freeze 和同 runtime ordered persistence。
 - empty Session lazy materialization、silent ordinary failure、bounded close retry 与 host filesystem fault seam。
 - title 异步生成、fallback、usage 计入、late title 和后续 snapshot/close 落盘。
@@ -361,7 +367,7 @@
 - channel-first bot 平台。
 - one-shot 对话命令或 one-shot runtime。
 - detached daemon、系统服务、HTTP 或 IPC server。
-- 多 Terminal Conversation、同 session、Memory Task、Schedule Job 的跨进程协调或锁。
+- 多 Terminal Conversation、同 session、Dream、Schedule Job 的跨进程协调或锁。
 - 微服务拆分。
 - MCP 工具扩展。
 - subagent/spawn 或多 Agent 编排。
@@ -387,7 +393,7 @@
 - ADR 0001 记录 file-first local persistence。
 - ADR 0002 记录固定 Agent Home `~/.myclaw/`。
 - ADR-0010 记录 Exec 的 Workspace cwd、destructive/DNS 确认边界及首版不提供 OS 级 sandbox；Exec 没有 allowlist，已知风险形状请求一次性确认。
-- ADR-0014 记录 Message Bus、Agent Loop、Agent Runner 和 Runtime Generation 边界。
+- ADR-0014 记录仍有效的 Message Bus、Agent Loop 和 Agent Runner 边界；ADR-0017 取代其 Runtime Generation ownership/replacement 决定，并取代 ADR-0016 的 Runtime-Lifetime Skill loading scope。
 - ADR-0015 记录 Session Blackboard 与 foreground Task Framing 边界。
 - `docs/myclaw-runtime-contracts.md` 是已接受的首版 schema、Port、事件和错误契约。
 - `CONTEXT.md` 是最终 canonical language；本 PRD 的实现术语应与其保持一致。
