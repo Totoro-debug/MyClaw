@@ -36,8 +36,11 @@
   和当前 raw user input；结果 keep、replace 或 clear 由 `goal` 与
   `completion_boundary` 组成的唯一 Blackboard。暂存结果只投影到当前
   model-visible user message 末尾，persisted user message 保持 raw input。
-- Agent Runner 的 constructor 只拥有 Model Router；它返回本次调用的 assistant/Tool
-  increment、final content、四字段 usage、finish reason 和 optional `ErrorInfo`。一次
+- Agent Runner 的 constructor 只拥有 Model Router；`AgentRunner.run()` 是所有需要有限
+  model/Tool ReAct 的请求的唯一执行入口，当前由 foreground `chat`、User Schedule Job
+  `schedule` 和 Dream `memory` 三条 lane 调用。只需一次 completion 且不进入 ReAct 的
+  模型请求继续直接使用 Model Router。Runner 返回本次调用的 assistant/Tool increment、
+  final content、四字段 usage、finish reason 和 optional `ErrorInfo`。一次
   iteration 是一次 model call 加该响应的全部顺序 Tool calls，Provider retry 不计数；
   default/minimum `runtime.max_iterations` 为 50。第 50 次完成全部 Tools；若此时没有请求
   normal cancellation，则返回 `agent_iteration_limit` 且不发起第 51 次 model call，取消
@@ -393,7 +396,7 @@
 - ADR 0001 记录 file-first local persistence。
 - ADR 0002 记录固定 Agent Home `~/.myclaw/`。
 - ADR-0010 记录 Exec 的 Workspace cwd、destructive/DNS 确认边界及首版不提供 OS 级 sandbox；Exec 没有 allowlist，已知风险形状请求一次性确认。
-- ADR-0014 记录仍有效的 Message Bus、Agent Loop 和 Agent Runner 边界；ADR-0017 取代其 Runtime Generation ownership/replacement 决定，并取代 ADR-0016 的 Runtime-Lifetime Skill loading scope。
+- ADR-0014 记录仍有效的 Message Bus、Agent Loop 和可复用 bounded Agent Runner 边界；ADR-0017 取代其 Runtime Generation ownership/replacement 决定及封闭的 `chat`/`schedule` route 枚举，并取代 ADR-0016 的 Runtime-Lifetime Skill loading scope。
 - ADR-0015 记录 Session Blackboard 与 foreground Task Framing 边界。
 - `docs/myclaw-runtime-contracts.md` 是已接受的首版 schema、Port、事件和错误契约。
 - `CONTEXT.md` 是最终 canonical language；本 PRD 的实现术语应与其保持一致。

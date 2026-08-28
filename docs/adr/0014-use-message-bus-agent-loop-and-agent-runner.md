@@ -4,7 +4,7 @@ status: accepted
 
 # Use Message Bus, Agent Loop, and Agent Runner
 
-> Ownership and Runtime Generation replacement in this ADR are superseded by [ADR-0017](0017-use-cli-composition-root-and-session-scoped-agent-loop.md). The Message Bus protocol, Agent Loop orchestration role, and Agent Runner boundary remain accepted. This historical decision and its consequences are immutable; the superseded scope is not an active ownership contract.
+> Ownership and Runtime Generation replacement in this ADR are superseded by [ADR-0017](0017-use-cli-composition-root-and-session-scoped-agent-loop.md). The Message Bus protocol, Agent Loop orchestration role, and reusable bounded Agent Runner contract remain accepted. ADR-0017 additionally supersedes the `chat` or `schedule` route enumeration below. This historical decision and its consequences are immutable; the superseded scope is not an active contract.
 
 One `AgentLoop` owns one transient `MessageBus`, one active foreground `Session`, the fixed Tool Gateway, and the serial foreground execution path. Inbound is an editable FIFO of ordinary user messages; Outbound has one Terminal Conversation consumer and carries only sparse reasoning, response, Tool-call, and system-control presentation messages. Tool results, Schedule output, and Memory Task output never enter Outbound.
 

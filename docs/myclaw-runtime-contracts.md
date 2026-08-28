@@ -712,14 +712,21 @@ Agent Loop 只通过一次 `Session.append_messages()` 把主 Runner increment�
 
 ### 10.3 AgentRunner
 
-`AgentRunner` is the bounded, Session-independent model/Tool execution created by one
-Agent Loop and shared by its foreground work and User Schedule Jobs. Dream owns a separate
-Runner and restricted Gateway. Each Runner invocation receives the selected route and Tool
-Gateway dependencies and returns an `AgentRunnerResult`. Agent Run remains the
-domain term for one complete execution from input acceptance through Summary/context,
-one Runner invocation, Session increment and persistence request. Repair construction,
-Tool Result externalization and iterator cleanup are private implementation helpers and
-are not package interfaces.
+`AgentRunner.run()` is the sole bounded, Session-independent model/Tool ReAct execution
+boundary. Every request that requires repeated model-and-Tool iteration invokes it using
+that invocation's route, messages, Tool Gateway, output and confirmation callbacks, result
+externalizer, cancellation policy, iteration limit, and failure policy. The current lanes are
+foreground Agent Runs through `chat`, User Schedule Jobs through `schedule`, and Dream through
+`memory`. Each Agent Loop owns one Runner shared by its foreground and User Schedule work;
+Dream owns a separate Runner instance and restricted Gateway while reusing the same bounded
+ReAct implementation. Model requests that require only one completion and no ReAct loop use
+the Model Router directly.
+
+Each Runner invocation returns an `AgentRunnerResult`. Agent Run is not a synonym for Runner
+invocation: it remains the domain term for one complete execution from input acceptance through
+Summary/context, one Runner invocation, Session increment and persistence request. Repair
+construction, Tool Result externalization and iterator cleanup are private implementation
+helpers and are not package interfaces.
 
 ### 10.4 Sparse outbound protocol
 
@@ -798,8 +805,9 @@ User Job executor 每次调用时解引用当前 Agent Loop；Dream executor 直
 CLI 在 Service 初始化后、dispatcher 启动前注册或校正内置 Dream System Job。Foreground 与 User
 Schedule execution 使用当前 Agent Loop 的同一 Gateway identity 和同一 Runner identity，但每次
 User Schedule execution 拥有独立的 Schedule Session、context、cancellation 和 externalizer Session ID。
-Dream 使用自己的 Runner/Gateway，不创建 Schedule Session。所有 Schedule execution 都没有 confirmation
-channel 或 foreground Message Bus projection，任何 Schedule output 都不进入 foreground Outbound。
+Dream 使用自己的 Runner/Gateway，通过 `memory` lane 调用同一个 `AgentRunner.run()` 实现，且不创建
+Schedule Session。所有 Schedule execution 都没有 confirmation channel 或 foreground Message Bus
+projection，任何 Schedule output 都不进入 foreground Outbound。
 
 Schedule execution 通过 ContextVar token 设置 `ScheduleTool._in_schedule_job`，并在
 `finally` 中 reset；只有递归 `add` 被拒绝，foreground `add` 以及 Schedule `list`/`remove`
@@ -858,7 +866,8 @@ ToolResult(
 - Tool 调用不接收 session ID、Agent Home、lane、approval flag 或通用 execution context。
 - 没有独立 `Security` 模块；公共路径、DNS、截断和 Artifact 边界由 BaseTool 或共享小 helper 提供，具体 Tool 保留 capability-specific 规则。
 - Dream 使用合法且独立的专用 Tool Gateway，只注册 Long-term Memory read/edit Tool；
-  它不复用 foreground/User Schedule 的共享 Gateway，并拥有独立 Agent Runner execution path。
+  它不复用 foreground/User Schedule 的共享 Gateway，并拥有独立 Agent Runner instance 与
+  `memory` lane，但复用统一的 `AgentRunner.run()` bounded ReAct implementation。
 - Tool Gateway 不在前台/后台之间加全局执行锁。
 - Tool Gateway 不设置统一 timeout、持久化 Tool Result 或持有 Workspace；Artifact 写入由 BaseTool 的结果处理能力完成。
 

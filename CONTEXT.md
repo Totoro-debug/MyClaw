@@ -65,8 +65,8 @@ The Session-scoped product orchestrator that owns foreground state, consumes Inb
 _Avoid_: Agent Runner, Runtime Lifetime, model loop, Schedule Service
 
 **Agent Runner**:
-A reusable, Session-independent engine that performs one bounded model-and-Tool loop for an Agent Run.
-_Avoid_: Agent Loop, Conversation Session, Runtime Lifetime, Provider retry loop
+A reusable, Session-independent engine that performs one bounded model-and-Tool ReAct loop for any request that requires ReAct.
+_Avoid_: Agent Loop, Conversation Session, Runtime Lifetime, Provider retry loop, single model call
 
 **Agent Run**:
 One complete Agent execution for one input against one Conversation Session, from input acceptance through its final outcome and persistence request.
