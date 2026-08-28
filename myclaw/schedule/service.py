@@ -248,12 +248,6 @@ class ScheduleService:
         job = _new_dream_job(schedule, now_ms=_epoch_milliseconds(self._clock.now()))
         return await self._store._register_system_job(job)
 
-    def _register_dream_job_sync(self, *, schedule: JobSchedule) -> ScheduleJob:
-        if self._aborted:
-            raise RuntimeError("Schedule Service is no longer active")
-        job = _new_dream_job(schedule, now_ms=_epoch_milliseconds(self._clock.now()))
-        return self._store._register_system_job_sync(job)
-
     async def _pause_owned_tasks(self) -> None:
         async with self._reservation_gate:
             self._paused = True

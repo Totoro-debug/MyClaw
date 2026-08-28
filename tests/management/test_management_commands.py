@@ -7,20 +7,18 @@ import pytest
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
+from myclaw.errors import ErrorInfo
 from myclaw.management.commands import (
     MANAGEMENT_COMMANDS,
     RESUME_MANAGEMENT_COMMAND,
     ManagementCommandDispatcher,
 )
-from myclaw.management.service import (
-    ManagementViewService,
-    RuntimeStatusInput,
-    RuntimeStatusService,
-)
+from myclaw.management.service import RuntimeStatusInput
+from myclaw.memory.dream import DreamResult
 from myclaw.memory.manager import MemoryManager
-from myclaw.memory.store import WorkspaceFileMemoryStore
 from myclaw.session.session import Session
 from tests.fixtures.diagnostic_capture import configured_process_logging
+from tests.management.factories import management_service
 
 CONFIG_CONTENT = """[models.providers.primary]
 protocol = "anthropic"
@@ -36,6 +34,17 @@ max_output = 512
 temperature = 0
 timeout = 60
 """
+
+
+class _ResultDream:
+    def __init__(self, result: DreamResult) -> None:
+        self.result = result
+        self.calls = 0
+
+    async def run(self) -> DreamResult:
+        self.calls += 1
+        return self.result
+
 
 REDACTED_CONFIG_CONTENT = """[models.providers.primary]
 protocol = "anthropic"
@@ -79,6 +88,72 @@ def test_management_command_catalog_owns_ordered_tokens_and_descriptions() -> No
     assert any(command is RESUME_MANAGEMENT_COMMAND for command in MANAGEMENT_COMMANDS)
 
 
+@pytest.mark.parametrize(
+    ("dream_result", "expected"),
+    (
+        (
+            DreamResult(
+                status="No pending summaries",
+                processed_count=0,
+                memory_updated=False,
+                cursor=0,
+            ),
+            "No pending summaries",
+        ),
+        (
+            DreamResult(
+                status="Memory Task failed.",
+                processed_count=0,
+                memory_updated=False,
+                cursor=1,
+                error=ErrorInfo("model_failed", "Memory model failed."),
+            ),
+            (
+                "model_failed: Memory model failed.\n"
+                "processed_count: 0\n"
+                "memory_updated: false\n"
+                "cursor: 1"
+            ),
+        ),
+        (
+            DreamResult(
+                status="Memory Task failed.",
+                processed_count=0,
+                memory_updated=False,
+                cursor=0,
+                error=ErrorInfo(
+                    "persistence_error",
+                    "Summary Cursor could not be updated.",
+                ),
+            ),
+            (
+                "persistence_error: Summary Cursor could not be updated.\n"
+                "processed_count: 0\n"
+                "memory_updated: false\n"
+                "cursor: 0"
+            ),
+        ),
+    ),
+    ids=("no-pending", "model-failure", "cursor-publication-failure"),
+)
+@pytest.mark.asyncio
+async def test_dream_command_projects_the_complete_final_result(
+    agent_home: Path,
+    dream_result: DreamResult,
+    expected: str,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    dream = _ResultDream(dream_result)
+    dispatcher = ManagementCommandDispatcher(management_service(home, dream=dream))
+
+    result = await dispatcher.dispatch("/dream")
+
+    assert result.handled is True
+    assert result.output == expected
+    assert dream.calls == 1
+
+
 SCHEMA_INVALID_CONFIG_CONTENT = """[models.providers.primary]
 protocol = "anthropic"
 base_url = "https://api.anthropic.com"
@@ -118,6 +193,7 @@ class _StatusProjectionLoop:
 
     def runtime_status_input(self) -> RuntimeStatusInput:
         return self._projection
+
 
 DEFAULT_CONFIG_CONTENT = """[runtime]
 max_tool_result_chars = 4096
@@ -197,7 +273,7 @@ async def test_config_command_returns_renderable_complete_redacted_text(
     home.initialize()
     config_path = agent_home / "config.toml"
     config_path.write_text(CONFIG_CONTENT, encoding="utf-8")
-    dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    dispatcher = ManagementCommandDispatcher(management_service(home))
 
     result = await dispatcher.dispatch("/config")
 
@@ -215,7 +291,7 @@ async def test_config_command_renders_safe_parse_error_and_redacted_source(
     home.initialize()
     config_path = agent_home / "config.toml"
     config_path.write_text(MALFORMED_CONFIG_CONTENT, encoding="utf-8")
-    dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    dispatcher = ManagementCommandDispatcher(management_service(home))
     with configured_process_logging():
         result = await dispatcher.dispatch("/config")
 
@@ -239,7 +315,7 @@ async def test_config_command_renders_safe_persistence_failure(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_bytes(b'api_key = "raw-command-secret"\xff')
-    dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    dispatcher = ManagementCommandDispatcher(management_service(home))
     with configured_process_logging():
         result = await dispatcher.dispatch("/config")
 
@@ -261,7 +337,7 @@ async def test_config_command_keeps_undefined_source_inspectable(
     home.initialize()
     config_path = agent_home / "config.toml"
     config_path.write_text(SCHEMA_INVALID_CONFIG_CONTENT, encoding="utf-8")
-    dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    dispatcher = ManagementCommandDispatcher(management_service(home))
 
     result = await dispatcher.dispatch("/config")
 
@@ -279,7 +355,7 @@ async def test_config_command_generates_and_displays_missing_configuration(
     agent_home: Path,
 ) -> None:
     config_path = agent_home / "config.toml"
-    dispatcher = ManagementCommandDispatcher(ManagementViewService(AgentHome(agent_home)))
+    dispatcher = ManagementCommandDispatcher(management_service(AgentHome(agent_home)))
 
     result = await dispatcher.dispatch("/config")
 
@@ -301,7 +377,11 @@ async def test_memory_command_returns_renderable_complete_disk_text(
     )
     state.long_term_memory_path.write_text(content, encoding="utf-8")
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_manager=WorkspaceFileMemoryStore(state))
+        management_service(
+            home,
+            workspace_state=state,
+            memory_manager=MemoryManager(state),
+        )
     )
 
     result = await dispatcher.dispatch("/memory")
@@ -320,9 +400,14 @@ async def test_memory_command_renders_safe_persistence_failure(
     home.initialize()
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
+    memory_manager = MemoryManager(state)
     state.long_term_memory_path.unlink()
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_manager=WorkspaceFileMemoryStore(state))
+        management_service(
+            home,
+            workspace_state=state,
+            memory_manager=memory_manager,
+        )
     )
     with configured_process_logging():
         result = await dispatcher.dispatch("/memory")
@@ -349,12 +434,12 @@ async def test_status_command_renders_safe_persistence_failure(
 
     home = AgentHome(agent_home)
     home.initialize()
-    status_service = RuntimeStatusService(
-        current_agent_loop=failing_loop,
-        monotonic=lambda: 0.0,
-    )
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, status_service=status_service)
+        management_service(
+            home,
+            current_agent_loop=failing_loop,
+            monotonic=lambda: 0.0,
+        )
     )
     with configured_process_logging():
         result = await dispatcher.dispatch("/status")
@@ -393,32 +478,33 @@ async def test_status_command_renders_actual_runtime_and_session_state(
         },
     )
     session.last_consolidated = 1
-    status_service = RuntimeStatusService(
-        current_agent_loop=lambda: _StatusProjectionLoop(
-            RuntimeStatusInput(
-                system_prompt="abcd",
-                retained_messages=(),
-                tool_definitions=(),
-                runtime_context="",
-                session_id=session.session_id,
-                session_title="New Conversation",
-                session_message_count=len(session.messages),
-                last_consolidated=session.last_consolidated,
-                cumulative_usage=(
-                    ("model_calls", 1),
-                    ("input_tokens", 10),
-                    ("output_tokens", 3),
-                    ("total_tokens", 13),
-                ),
-                chat_model="fallback/chat-model",
-                context_window=8,
-                generation_started_at=10.0,
-            )
-        ),
-        monotonic=lambda: 75.8,
-    )
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, status_service=status_service)
+        management_service(
+            home,
+            workspace_state=state,
+            current_agent_loop=lambda: _StatusProjectionLoop(
+                RuntimeStatusInput(
+                    system_prompt="abcd",
+                    retained_messages=(),
+                    tool_definitions=(),
+                    runtime_context="",
+                    session_id=session.session_id,
+                    session_title="New Conversation",
+                    session_message_count=len(session.messages),
+                    last_consolidated=session.last_consolidated,
+                    cumulative_usage=(
+                        ("model_calls", 1),
+                        ("input_tokens", 10),
+                        ("output_tokens", 3),
+                        ("total_tokens", 13),
+                    ),
+                    chat_model="fallback/chat-model",
+                    context_window=8,
+                    generation_started_at=10.0,
+                )
+            ),
+            monotonic=lambda: 75.8,
+        )
     )
 
     result = await dispatcher.dispatch("/status")
@@ -439,6 +525,7 @@ async def test_status_command_renders_actual_runtime_and_session_state(
             "output_tokens": 3,
             "total_tokens": 13,
         },
+        "schedule": {"status": "available", "active_job_count": 0},
     }
 
 
@@ -450,7 +537,7 @@ async def test_unknown_or_inexact_slash_command_is_left_unhandled(
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
-    dispatcher = ManagementCommandDispatcher(ManagementViewService(home))
+    dispatcher = ManagementCommandDispatcher(management_service(home))
 
     result = await dispatcher.dispatch(command)
 
@@ -469,7 +556,11 @@ async def test_config_and_memory_commands_bypass_conversation_and_provider(
     (agent_home / "config.toml").write_text(CONFIG_CONTENT, encoding="utf-8")
     state.long_term_memory_path.write_text("current memory\n", encoding="utf-8")
     dispatcher = ManagementCommandDispatcher(
-        ManagementViewService(home, memory_manager=MemoryManager(state))
+        management_service(
+            home,
+            workspace_state=state,
+            memory_manager=MemoryManager(state),
+        )
     )
     conversation = ConversationProviderSpy()
 

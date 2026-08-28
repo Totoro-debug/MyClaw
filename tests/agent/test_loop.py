@@ -412,7 +412,7 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
 
     router = _Router(())
     tasks_before = asyncio.all_tasks()
-    loop, session = _runtime(tmp_path, router)
+    loop, session, _bus = _runtime(tmp_path, router)
 
     assert counts == {
         "session": 1,
@@ -474,7 +474,7 @@ def _runtime(
     title_prompt: str | None = None,
     skill_snapshot: SkillSnapshot | None = None,
     monotonic_now: Callable[[], float] | None = None,
-) -> tuple[AgentLoop, Session]:
+) -> tuple[AgentLoop, Session, MessageBus]:
     agent_home = AgentHome(tmp_path / "agent-home")
     agent_home.initialize()
     workspace = tmp_path / "workspace"
@@ -483,6 +483,7 @@ def _runtime(
     state.initialize(agent_home_root=agent_home.path)
     (agent_home.path / "config.toml").write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
     configuration = ConfigLoader(agent_home).load()
+
     async def execute_user_job(job: ScheduleJob) -> None:
         del job
 
@@ -520,12 +521,13 @@ def _runtime(
             )
         return await selected_context_preparer(active_session, current_user)
 
+    bus = MessageBus()
     loop = AgentLoop(
         workspace_path=workspace,
         workspace_state=state,
         agent_home=agent_home,
         configuration=configuration,
-        bus=MessageBus(),
+        bus=bus,
         schedule_service=schedule,
         model_router=router,
         memory_manager=MemoryManager(state),
@@ -541,7 +543,7 @@ def _runtime(
         loop._skill_snapshot = skill_snapshot
         loop._context_builder._skill_snapshot = skill_snapshot
     object.__setattr__(loop, "_prepare_foreground_context", prepare)
-    return loop, loop.session
+    return loop, loop.session, bus
 
 
 @pytest.mark.asyncio
@@ -555,7 +557,7 @@ async def test_agent_loop_status_projection_starts_uptime_only_after_activation(
         monotonic_calls += 1
         return 42.5
 
-    loop, _session = _runtime(
+    loop, _session, _bus = _runtime(
         tmp_path,
         _Router(()),
         monotonic_now=monotonic_now,
@@ -587,7 +589,7 @@ async def test_agent_loop_failed_activation_does_not_publish_or_duplicate_consum
             raise RuntimeError("monotonic clock failed")
         return 84.5
 
-    loop, _session = _runtime(
+    loop, _session, _bus = _runtime(
         tmp_path,
         _Router(()),
         monotonic_now=monotonic_now,
@@ -638,7 +640,7 @@ async def test_replacement_barrier_blocks_a_late_foreground_commit_until_release
             self.commit_completed.set()
 
     router = _ConcurrentTitleRouter()
-    loop, session = _runtime(tmp_path, router)
+    loop, session, _bus = _runtime(tmp_path, router)
     commit_gate = ObservableCommitLock()
     loop._foreground_commit_gate = commit_gate
     session.add_message("user", "Existing turn suppresses title work.")
@@ -670,7 +672,7 @@ async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effec
     tmp_path: Path,
 ) -> None:
     router = _Router(())
-    loop, session = _runtime(tmp_path, router)
+    loop, session, _bus = _runtime(tmp_path, router)
     session.add_message("user", "Status snapshot input")
     session.last_consolidated = 0
 
@@ -744,17 +746,17 @@ async def _context(
     ]
 
 
-async def _terminals(loop: AgentLoop, count: int) -> list[OutboundMessage]:
+async def _terminals(bus: MessageBus, count: int) -> list[OutboundMessage]:
     terminals: list[OutboundMessage] = []
     while len(terminals) < count:
-        message = await loop.bus.get_outbound()
+        message = await bus.get_outbound()
         if message.metadata.get("_streamed") is True:
             terminals.append(message)
     return terminals
 
 
 def test_agent_loop_exposes_public_control_seam(tmp_path: Path) -> None:
-    loop, _session = _runtime(tmp_path, _Router((_response("unused"),)))
+    loop, _session, _bus = _runtime(tmp_path, _Router((_response("unused"),)))
 
     assert loop.control is loop
     assert loop.control.has_active_run is False
@@ -767,7 +769,7 @@ async def test_loop_consumes_foreground_inputs_fifo_and_publishes_one_terminal_e
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     router = _Router((_response("one"), _response("two"), _response("three")))
-    loop, session = _runtime(tmp_path, router)
+    loop, session, _bus = _runtime(tmp_path, router)
     append_calls = 0
     persist_calls = 0
     original_append = Session.append_messages
@@ -792,9 +794,9 @@ async def test_loop_consumes_foreground_inputs_fifo_and_publishes_one_terminal_e
     await loop.start()
     try:
         for content in ("one", "two", "three"):
-            await loop.bus.put_inbound(InboundMessage(content))
+            await _bus.put_inbound(InboundMessage(content))
 
-        terminals = await _terminals(loop, 3)
+        terminals = await _terminals(_bus, 3)
 
         assert len(router.calls) == 3
         assert [
@@ -852,7 +854,7 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
             },
         ]
 
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         context_preparer_with_invocation=prepare,
@@ -862,8 +864,8 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
     )
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage(raw_input))
-        await _terminals(loop, 1)
+        await _bus.put_inbound(InboundMessage(raw_input))
+        await _terminals(_bus, 1)
     finally:
         await loop.close()
 
@@ -916,7 +918,7 @@ async def test_published_manual_skill_snapshot_ignores_later_file_changes(
             },
         ]
 
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         context_preparer_with_invocation=prepare,
@@ -926,8 +928,8 @@ async def test_published_manual_skill_snapshot_ignores_later_file_changes(
     )
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage(raw_input))
-        await _terminals(loop, 1)
+        await _bus.put_inbound(InboundMessage(raw_input))
+        await _terminals(_bus, 1)
     finally:
         await loop.close()
 
@@ -957,17 +959,17 @@ async def test_loop_preparation_failure_has_no_session_commit_and_fifo_continues
             raise ModelCallError(ErrorInfo("model_failed", "preparation failed"))
         return [{"role": "system", "content": "test"}, {"role": "user", "content": "ok"}]
 
-    loop, session = _runtime(tmp_path, router, context_preparer=prepare)
+    loop, session, _bus = _runtime(tmp_path, router, context_preparer=prepare)
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("first"))
-        await loop.bus.put_inbound(InboundMessage("second"))
-        first = await loop.bus.get_outbound()
+        await _bus.put_inbound(InboundMessage("first"))
+        await _bus.put_inbound(InboundMessage("second"))
+        first = await _bus.get_outbound()
         while first.metadata.get("_streamed") is not True:
-            first = await loop.bus.get_outbound()
-        second = await loop.bus.get_outbound()
+            first = await _bus.get_outbound()
+        second = await _bus.get_outbound()
         while second.metadata.get("_streamed") is not True:
-            second = await loop.bus.get_outbound()
+            second = await _bus.get_outbound()
 
         assert first.type == "system_control"
         assert first.metadata["error_code"] == "model_failed"
@@ -993,7 +995,7 @@ async def test_loop_commits_failed_runner_result_once_before_one_safe_terminal(
         "total_tokens": 6,
     }
     router = _Router((ModelCallError(ErrorInfo("model_failed", "provider failed")),))
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         task_framer=_FramingFake(
@@ -1023,8 +1025,8 @@ async def test_loop_commits_failed_runner_result_once_before_one_safe_terminal(
     monkeypatch.setattr(Session, "persist", persist)
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("failed input"))
-        terminal = (await _terminals(loop, 1))[0]
+        await _bus.put_inbound(InboundMessage("failed input"))
+        terminal = (await _terminals(_bus, 1))[0]
 
         assert terminal.type == "system_control"
         assert terminal.content == "provider failed"
@@ -1064,7 +1066,7 @@ async def test_loop_commits_max_iteration_repair_once_before_safe_terminal(
         "total_tokens": 6,
     }
     router = _MaxRouter()
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         task_framer=_FramingFake(
@@ -1094,8 +1096,8 @@ async def test_loop_commits_max_iteration_repair_once_before_safe_terminal(
     monkeypatch.setattr(Session, "persist", persist)
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("bounded input"))
-        terminal = (await _terminals(loop, 1))[0]
+        await _bus.put_inbound(InboundMessage("bounded input"))
+        terminal = (await _terminals(_bus, 1))[0]
 
         assert len(router.calls) == 50
         assert terminal.type == "system_control"
@@ -1144,7 +1146,7 @@ async def test_loop_cancellation_repairs_and_keeps_the_next_queued_input(
         },
         status="resolved",
     )
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         task_framer=_FramingFake((framing_result, framing_result)),
@@ -1172,11 +1174,11 @@ async def test_loop_cancellation_repairs_and_keeps_the_next_queued_input(
     monkeypatch.setattr(Session, "persist", persist)
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("cancelled input"))
-        await loop.bus.put_inbound(InboundMessage("queued input"))
+        await _bus.put_inbound(InboundMessage("cancelled input"))
+        await _bus.put_inbound(InboundMessage("queued input"))
         await started.wait()
         await loop.cancel_active_run()
-        terminals = await _terminals(loop, 2)
+        terminals = await _terminals(_bus, 2)
 
         assert router.calls == ["call", "call"]
         assert [terminal.metadata for terminal in terminals] == [
@@ -1227,7 +1229,7 @@ async def test_loop_confirmation_uses_one_direct_pending_future_and_cancels_it(
             ),
         )
     )
-    loop, _session = _runtime(tmp_path, router)
+    loop, _session, _bus = _runtime(tmp_path, router)
     requests: list[ConfirmationRequestView] = []
     requested = asyncio.Event()
 
@@ -1238,7 +1240,7 @@ async def test_loop_confirmation_uses_one_direct_pending_future_and_cancels_it(
     loop.bind_confirmation_callback(on_confirmation)
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("confirm this"))
+        await _bus.put_inbound(InboundMessage("confirm this"))
         await requested.wait()
 
         assert len(requests) == 1
@@ -1248,7 +1250,7 @@ async def test_loop_confirmation_uses_one_direct_pending_future_and_cancels_it(
             loop.respond_to_confirmation(uuid4(), "approved")
 
         await loop.cancel_active_run()
-        terminal = (await _terminals(loop, 1))[0]
+        terminal = (await _terminals(_bus, 1))[0]
 
         assert terminal.metadata == {
             "finish_reason": "cancelled",
@@ -1277,14 +1279,14 @@ async def test_preparation_cancellation_publishes_the_cancelled_terminal(
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
-    loop, session = _runtime(tmp_path, _Router(()), context_preparer=prepare)
+    loop, session, _bus = _runtime(tmp_path, _Router(()), context_preparer=prepare)
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("cancel during preparation"))
+        await _bus.put_inbound(InboundMessage("cancel during preparation"))
         await started.wait()
 
         await loop.cancel_active_run()
-        terminal = (await _terminals(loop, 1))[0]
+        terminal = (await _terminals(_bus, 1))[0]
 
         assert terminal.type == "system_control"
         assert terminal.content == "MyClaw 已取消本轮对话。"
@@ -1311,7 +1313,7 @@ async def test_preparation_failure_does_not_start_title_or_accumulate_usage(
         raise ModelCallError(ErrorInfo("model_failed", "preparation failed"))
 
     router = _Router((_response("must not become a title"),))
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         context_preparer=fail_preparation,
@@ -1319,8 +1321,8 @@ async def test_preparation_failure_does_not_start_title_or_accumulate_usage(
     )
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("uncommitted input"))
-        _ = await _terminals(loop, 1)
+        await _bus.put_inbound(InboundMessage("uncommitted input"))
+        _ = await _terminals(_bus, 1)
         for _ in range(5):
             await asyncio.sleep(0)
 
@@ -1354,7 +1356,7 @@ async def test_async_preparation_failure_discards_parallel_title_result(
         raise ModelCallError(ErrorInfo("model_failed", "preparation failed"))
 
     router = _ConcurrentTitleRouter()
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         context_preparer=fail_after_waiting,
@@ -1362,7 +1364,7 @@ async def test_async_preparation_failure_discards_parallel_title_result(
     )
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("uncommitted input"))
+        await _bus.put_inbound(InboundMessage("uncommitted input"))
         await preparation_started.wait()
         for _ in range(100):
             if "title" in router.calls:
@@ -1373,7 +1375,7 @@ async def test_async_preparation_failure_discards_parallel_title_result(
         assert session.metadata["title"] == "Untitled session"
 
         release_preparation.set()
-        terminal = (await _terminals(loop, 1))[0]
+        terminal = (await _terminals(_bus, 1))[0]
 
         assert terminal.metadata == {
             "finish_reason": "failed",
@@ -1398,10 +1400,10 @@ async def test_first_message_title_runs_while_foreground_chat_is_blocked(
     tmp_path: Path,
 ) -> None:
     router = _ConcurrentTitleRouter()
-    loop, session = _runtime(tmp_path, router, title_prompt="Generate a title")
+    loop, session, _bus = _runtime(tmp_path, router, title_prompt="Generate a title")
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("first input"))
+        await _bus.put_inbound(InboundMessage("first input"))
         await router.chat_started.wait()
         for _ in range(100):
             if session.metadata["title"] != "Untitled session":
@@ -1411,7 +1413,7 @@ async def test_first_message_title_runs_while_foreground_chat_is_blocked(
         assert session.metadata["title"] == "Generated while chat blocked"
 
         router.release_chat.set()
-        assert (await _terminals(loop, 1))[0].metadata == {"_streamed": True}
+        assert (await _terminals(_bus, 1))[0].metadata == {"_streamed": True}
     finally:
         router.release_chat.set()
         await loop.close()
@@ -1423,7 +1425,7 @@ async def test_slow_title_keeps_one_session_log_owner_across_the_next_fifo_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     router = _SlowTitleLogRouter()
-    loop, session = _runtime(tmp_path, router, title_prompt="Generate a title")
+    loop, session, _bus = _runtime(tmp_path, router, title_prompt="Generate a title")
     active_contexts = 0
     maximum_contexts = 0
     original_session_log = real_session_log
@@ -1442,12 +1444,12 @@ async def test_slow_title_keeps_one_session_log_owner_across_the_next_fifo_turn(
     monkeypatch.setattr("myclaw.agent.loop.session_log", observed_session_log)
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("first input"))
-        _ = await _terminals(loop, 1)
+        await _bus.put_inbound(InboundMessage("first input"))
+        _ = await _terminals(_bus, 1)
         await router.title_started.wait()
 
-        await loop.bus.put_inbound(InboundMessage("second input"))
-        _ = await _terminals(loop, 1)
+        await _bus.put_inbound(InboundMessage("second input"))
+        _ = await _terminals(_bus, 1)
 
         router.release_title.set()
         for _ in range(100):
@@ -1476,7 +1478,7 @@ async def test_append_failure_reports_safe_terminal_and_fifo_consumer_continues(
         "output_tokens": 2,
         "total_tokens": 7,
     }
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         _Router(()),
         task_framer=_FramingFake(
@@ -1555,12 +1557,12 @@ async def test_append_failure_reports_safe_terminal_and_fifo_consumer_continues(
     monkeypatch.setattr(loop._runner, "run", run)
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("cannot commit"))
-        failed = (await _terminals(loop, 1))[0]
+        await _bus.put_inbound(InboundMessage("cannot commit"))
+        failed = (await _terminals(_bus, 1))[0]
         assert session.messages == before_messages
         assert session.metadata == before_metadata
-        await loop.bus.put_inbound(InboundMessage("next input"))
-        completed = (await _terminals(loop, 1))[0]
+        await _bus.put_inbound(InboundMessage("next input"))
+        completed = (await _terminals(_bus, 1))[0]
     finally:
         await loop.close()
 
@@ -1582,7 +1584,7 @@ async def test_persist_request_failure_is_silent_and_terminal_stays_ordered(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    loop, session = _runtime(tmp_path, _Router((_response("committed in memory"),)))
+    loop, session, _bus = _runtime(tmp_path, _Router((_response("committed in memory"),)))
 
     def fail_persist() -> None:
         raise OSError("private persistence detail")
@@ -1591,8 +1593,8 @@ async def test_persist_request_failure_is_silent_and_terminal_stays_ordered(
     capture = capture_diagnostics()
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("persist fails"))
-        terminal = (await _terminals(loop, 1))[0]
+        await _bus.put_inbound(InboundMessage("persist fails"))
+        terminal = (await _terminals(_bus, 1))[0]
     finally:
         capture.close()
         await loop.close()
@@ -1608,7 +1610,7 @@ async def test_loop_normal_close_saves_only_its_owned_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    loop, first = _runtime(tmp_path, _Router(()))
+    loop, first, _bus = _runtime(tmp_path, _Router(()))
     closed: list[str] = []
     first_close = first.close
 
@@ -1619,7 +1621,6 @@ async def test_loop_normal_close_saves_only_its_owned_session(
     monkeypatch.setattr(first, "close", close_first)
 
     await loop.close()
-    loop._close_sessions()
 
     assert closed == [first.session_id]
 
@@ -1628,7 +1629,7 @@ async def test_loop_normal_close_saves_only_its_owned_session(
 async def test_loop_abort_retains_cancelled_owned_tasks_until_cleanup_finishes(
     tmp_path: Path,
 ) -> None:
-    loop, _session = _runtime(tmp_path, _Router(()))
+    loop, _session, _bus = _runtime(tmp_path, _Router(()))
     started = asyncio.Event()
     release_cleanup = asyncio.Event()
     cleanup_finished = asyncio.Event()
@@ -1662,14 +1663,14 @@ async def test_loop_abort_retains_cancelled_owned_tasks_until_cleanup_finishes(
 
 @pytest.mark.asyncio
 async def test_terminal_loop_states_reject_restart(tmp_path: Path) -> None:
-    closed_loop, _closed_session = _runtime(tmp_path / "closed", _Router(()))
+    closed_loop, _closed_session, _closed_bus = _runtime(tmp_path / "closed", _Router(()))
     await closed_loop.start()
     await closed_loop.close()
 
     with pytest.raises(RuntimeError, match="Agent Loop is closed"):
         await closed_loop.start()
 
-    aborted_loop, _aborted_session = _runtime(tmp_path / "aborted", _Router(()))
+    aborted_loop, _aborted_session, _aborted_bus = _runtime(tmp_path / "aborted", _Router(()))
     await aborted_loop.start()
     await aborted_loop.abort()
 
@@ -1682,7 +1683,7 @@ async def test_close_transition_blocks_concurrent_preflight_and_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    loop, _session = _runtime(tmp_path, _Router(()))
+    loop, _session, _bus = _runtime(tmp_path, _Router(()))
     close_started = asyncio.Event()
     release_close = asyncio.Event()
 
@@ -1708,7 +1709,7 @@ async def test_close_transition_blocks_concurrent_preflight_and_start(
 async def test_abort_wins_before_normal_close_finalizes_the_session(
     tmp_path: Path,
 ) -> None:
-    loop, session = _runtime(tmp_path, _Router(()))
+    loop, session, _bus = _runtime(tmp_path, _Router(()))
     session.add_message("user", "preserve this turn")
     close_started = asyncio.Event()
     release_close = asyncio.Event()
@@ -1735,7 +1736,7 @@ async def test_blank_foreground_input_performs_zero_task_framing_attempts(
     tmp_path: Path,
 ) -> None:
     framer = DeterministicTaskFramingEvaluator()
-    loop, session = _runtime(tmp_path, _Router(()), task_framer=framer)
+    loop, session, _bus = _runtime(tmp_path, _Router(()), task_framer=framer)
     execution_ready = asyncio.Event()
 
     committed = await loop._execute_foreground_logged(
@@ -1762,7 +1763,7 @@ async def test_direct_bus_projects_completed_turn_without_session_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    loop, _session = _runtime(tmp_path, _Router((_response("completed without deltas"),)))
+    loop, _session, _bus = _runtime(tmp_path, _Router((_response("completed without deltas"),)))
 
     def reject_session_access(_loop: AgentLoop) -> Session:
         raise AssertionError("Terminal adapter must not access Session")
@@ -1771,10 +1772,10 @@ async def test_direct_bus_projects_completed_turn_without_session_access(
 
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("foreground input"))
+        await _bus.put_inbound(InboundMessage("foreground input"))
         observed: list[OutboundMessage] = []
         while not observed or observed[-1].metadata.get("_streamed") is not True:
-            observed.append(await loop.bus.get_outbound())
+            observed.append(await _bus.get_outbound())
     finally:
         await loop.close()
 
@@ -1808,13 +1809,13 @@ async def test_loop_publishes_the_exact_sparse_outbound_protocol_without_tool_re
             ),
         )
     )
-    loop, session = _runtime(tmp_path, router)
+    loop, session, _bus = _runtime(tmp_path, router)
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("sparse output"))
+        await _bus.put_inbound(InboundMessage("sparse output"))
         observed: list[OutboundMessage] = []
         while not observed or observed[-1].metadata.get("_streamed") is not True:
-            observed.append(await loop.bus.get_outbound())
+            observed.append(await _bus.get_outbound())
 
         assert [(message.type, message.content, message.metadata) for message in observed] == [
             ("model_reasoning", "reasoning", {"_stream_delta": True}),
@@ -1838,7 +1839,6 @@ async def test_loop_publishes_the_exact_sparse_outbound_protocol_without_tool_re
         ]
     finally:
         await loop.close()
-        loop._close_sessions()
 
 
 @pytest.mark.asyncio
@@ -1847,15 +1847,15 @@ async def test_close_normally_cancels_active_run_without_dequeuing_the_next_mess
 ) -> None:
     started = asyncio.Event()
     router = _BlockingRouter(started)
-    loop, session = _runtime(tmp_path, router)
+    loop, session, _bus = _runtime(tmp_path, router)
     queued = InboundMessage("remains queued")
     await loop.start()
-    await loop.bus.put_inbound(InboundMessage("active input"))
-    await loop.bus.put_inbound(queued)
+    await _bus.put_inbound(InboundMessage("active input"))
+    await _bus.put_inbound(queued)
     await started.wait()
 
     await loop.close()
-    terminal = (await _terminals(loop, 1))[0]
+    terminal = (await _terminals(_bus, 1))[0]
 
     assert terminal.metadata == {
         "finish_reason": "cancelled",
@@ -1865,9 +1865,8 @@ async def test_close_normally_cancels_active_run_without_dequeuing_the_next_mess
     assert [message["content"] for message in session.messages if message["role"] == "user"] == [
         "active input"
     ]
-    assert await loop.bus.inbound_snapshot() == (queued,)
+    assert await _bus.inbound_snapshot() == (queued,)
     assert router.calls == ["call"]
-    loop._close_sessions()
 
 
 @pytest.mark.asyncio
@@ -1899,7 +1898,7 @@ async def test_foreground_frames_once_with_exact_session_inputs_and_atomic_proje
             {"role": "user", "content": current["content"]},
         ]
 
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         _Router((_response("answer"),)),
         context_preparer_with_blackboard=prepare,
@@ -1924,8 +1923,8 @@ async def test_foreground_frames_once_with_exact_session_inputs_and_atomic_proje
 
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("raw <blackboard> input"))
-        terminal = (await _terminals(loop, 1))[0]
+        await _bus.put_inbound(InboundMessage("raw <blackboard> input"))
+        terminal = (await _terminals(_bus, 1))[0]
     finally:
         await loop.close()
 
@@ -2026,7 +2025,7 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
             },
         ]
 
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         context_preparer_with_blackboard=prepare,
@@ -2044,8 +2043,8 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
     monkeypatch.setattr(session, "append_messages", append_messages)
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("raw tool input"))
-        terminal = (await _terminals(loop, 1))[0]
+        await _bus.put_inbound(InboundMessage("raw tool input"))
+        terminal = (await _terminals(_bus, 1))[0]
     finally:
         await loop.close()
 
@@ -2131,7 +2130,7 @@ async def test_invalid_and_model_failed_framing_statuses_fail_open_and_clear_on_
         observed.append(blackboard)
         return [{"role": "system", "content": "test"}]
 
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         _Router((_response("raw answer"),)),
         context_preparer_with_blackboard=prepare,
@@ -2143,8 +2142,8 @@ async def test_invalid_and_model_failed_framing_statuses_fail_open_and_clear_on_
 
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("continue without parsed framing"))
-        terminal = (await _terminals(loop, 1))[0]
+        await _bus.put_inbound(InboundMessage("continue without parsed framing"))
+        terminal = (await _terminals(_bus, 1))[0]
     finally:
         await loop.close()
 
@@ -2165,7 +2164,7 @@ async def test_framing_cancellation_reclaims_first_title_task_without_commit(
     tmp_path: Path,
 ) -> None:
     framer = BlockingTaskFramingEvaluator()
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         _ConcurrentTitleRouter(),
         task_framer=framer,
@@ -2173,10 +2172,10 @@ async def test_framing_cancellation_reclaims_first_title_task_without_commit(
     )
 
     await loop.start()
-    await loop.bus.put_inbound(InboundMessage("cancel before the Agent Run"))
+    await _bus.put_inbound(InboundMessage("cancel before the Agent Run"))
     await framer.started.wait()
     await loop.cancel_active_run()
-    terminal = (await _terminals(loop, 1))[0]
+    terminal = (await _terminals(_bus, 1))[0]
     await loop.close()
 
     assert terminal.metadata == {
@@ -2210,7 +2209,7 @@ async def test_framing_contract_errors_propagate_and_reclaim_first_title_task(
     match: str,
 ) -> None:
     router = _ConcurrentTitleRouter()
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         task_framer=framer,
@@ -2226,7 +2225,7 @@ async def test_framing_contract_errors_propagate_and_reclaim_first_title_task(
             execution_ready=execution_ready,
         )
 
-    outbound = asyncio.create_task(loop.bus.get_outbound())
+    outbound = asyncio.create_task(_bus.get_outbound())
     done, _ = await asyncio.wait((outbound,), timeout=0)
     assert not done
     outbound.cancel()
@@ -2268,7 +2267,7 @@ async def test_context_failure_after_framing_preserves_previous_blackboard_and_u
         del active, current, blackboard
         raise ModelCallError(ErrorInfo("model_failed", "context failed"))
 
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         _Router(()),
         context_preparer_with_blackboard=fail_context,
@@ -2281,8 +2280,8 @@ async def test_context_failure_after_framing_preserves_previous_blackboard_and_u
 
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("context fails after framing"))
-        terminal = (await _terminals(loop, 1))[0]
+        await _bus.put_inbound(InboundMessage("context fails after framing"))
+        terminal = (await _terminals(_bus, 1))[0]
     finally:
         await loop.close()
 
@@ -2327,7 +2326,7 @@ async def test_context_cancellation_after_framing_preserves_previous_blackboard_
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         _Router(()),
         context_preparer_with_blackboard=block_context,
@@ -2339,10 +2338,10 @@ async def test_context_cancellation_after_framing_preserves_previous_blackboard_
     before_usage = session.metadata["token_usage"]
 
     await loop.start()
-    await loop.bus.put_inbound(InboundMessage("context cancellation after framing"))
+    await _bus.put_inbound(InboundMessage("context cancellation after framing"))
     await started.wait()
     await loop.cancel_active_run()
-    terminal = (await _terminals(loop, 1))[0]
+    terminal = (await _terminals(_bus, 1))[0]
     await loop.close()
 
     assert terminal.metadata == {
@@ -2373,7 +2372,7 @@ async def test_title_usage_is_preserved_when_title_finishes_before_foreground_co
         (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
     )
     router = _ConcurrentTitleRouter()
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         task_framer=framer,
@@ -2382,7 +2381,7 @@ async def test_title_usage_is_preserved_when_title_finishes_before_foreground_co
 
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("title and foreground race"))
+        await _bus.put_inbound(InboundMessage("title and foreground race"))
         await router.chat_started.wait()
         for _ in range(100):
             if session.metadata["title"] != "Untitled session":
@@ -2398,7 +2397,7 @@ async def test_title_usage_is_preserved_when_title_finishes_before_foreground_co
         }
 
         router.release_chat.set()
-        terminal = (await _terminals(loop, 1))[0]
+        terminal = (await _terminals(_bus, 1))[0]
     finally:
         router.release_chat.set()
         await loop.close()
@@ -2436,7 +2435,7 @@ async def test_foreground_commit_preserves_staged_framing_until_slow_title_finis
         )
     )
     router = _SlowTitleLogRouter()
-    loop, session = _runtime(
+    loop, session, _bus = _runtime(
         tmp_path,
         router,
         task_framer=framer,
@@ -2444,8 +2443,8 @@ async def test_foreground_commit_preserves_staged_framing_until_slow_title_finis
     )
 
     await loop.start()
-    await loop.bus.put_inbound(InboundMessage("foreground commits first"))
-    terminal = (await _terminals(loop, 1))[0]
+    await _bus.put_inbound(InboundMessage("foreground commits first"))
+    terminal = (await _terminals(_bus, 1))[0]
     await router.title_started.wait()
 
     assert terminal.metadata == {"_streamed": True}
@@ -2484,11 +2483,11 @@ async def test_late_title_is_persisted_by_the_next_completed_turn(tmp_path: Path
         title=_response("Generated late title"),
         delay_title=True,
     )
-    loop, session = _runtime(tmp_path, router, title_prompt="Generate a title")
+    loop, session, _bus = _runtime(tmp_path, router, title_prompt="Generate a title")
 
     await loop.start()
     try:
-        await collect_foreground_outbound(loop, "First input.")
+        await collect_foreground_outbound(_bus, "First input.")
         await router.title_started.wait()
         await session.wait_for_pending_persist()
         assert Session.load(session.workspace_state, session.session_id).metadata["title"] == (
@@ -2505,7 +2504,7 @@ async def test_late_title_is_persisted_by_the_next_completed_turn(tmp_path: Path
             "Untitled session"
         )
 
-        await collect_foreground_outbound(loop, "Second input.")
+        await collect_foreground_outbound(_bus, "Second input.")
         await session.wait_for_pending_persist()
     finally:
         router.release_title.set()
@@ -2546,11 +2545,11 @@ async def test_invalid_title_uses_first_input_fallback_and_keeps_usage(
         else _response('""', input_tokens=3, output_tokens=1)
     )
     router = _TitleBehaviorRouter((_response("First response.", input_tokens=5),), title=title)
-    loop, session = _runtime(tmp_path, router, title_prompt="Generate a title")
+    loop, session, _bus = _runtime(tmp_path, router, title_prompt="Generate a title")
 
     await loop.start()
     try:
-        await collect_foreground_outbound(loop, "  Meaningful first question.  ")
+        await collect_foreground_outbound(_bus, "  Meaningful first question.  ")
         for _ in range(100):
             if session.metadata["token_usage"]["model_calls"] == 2:
                 break
@@ -2580,13 +2579,11 @@ async def test_close_applies_first_input_title_fallback_before_final_save(
         delay_title=True,
         block_first_foreground=cancel_turn,
     )
-    loop, session = _runtime(tmp_path, router, title_prompt="Generate a title")
+    loop, session, _bus = _runtime(tmp_path, router, title_prompt="Generate a title")
 
     await loop.start()
     if cancel_turn:
-        turn = asyncio.create_task(
-            collect_foreground_outbound(loop, "  Cancelled first title.  ")
-        )
+        turn = asyncio.create_task(collect_foreground_outbound(_bus, "  Cancelled first title.  "))
         await router.foreground_started.wait()
         await router.title_started.wait()
         await loop.cancel_active_run()
@@ -2594,7 +2591,7 @@ async def test_close_applies_first_input_title_fallback_before_final_save(
         assert terminal.metadata["finish_reason"] == "cancelled"
         expected_title = "Cancelled first title."
     else:
-        await collect_foreground_outbound(loop, "  Shutdown fallback title.  ")
+        await collect_foreground_outbound(_bus, "  Shutdown fallback title.  ")
         await router.title_started.wait()
         expected_title = "Shutdown fallback title."
 
@@ -2607,7 +2604,7 @@ async def test_close_applies_first_input_title_fallback_before_final_save(
 
 @pytest.mark.asyncio
 async def test_loop_close_swallows_final_session_failure(tmp_path: Path) -> None:
-    loop, session = _runtime(tmp_path, _Router(()))
+    loop, session, _bus = _runtime(tmp_path, _Router(()))
     capture = capture_diagnostics()
 
     def fail_close() -> None:
@@ -2678,7 +2675,7 @@ async def test_default_agent_loop_wiring_reduces_keep_replace_and_clear(
             )
 
     router = DefaultRouter()
-    loop, session = _runtime(tmp_path, router, use_default_task_framer=True)
+    loop, session, _bus = _runtime(tmp_path, router, use_default_task_framer=True)
     if previous is not None:
         session.update_metadata(
             blackboard={
@@ -2689,8 +2686,8 @@ async def test_default_agent_loop_wiring_reduces_keep_replace_and_clear(
 
     await loop.start()
     try:
-        await loop.bus.put_inbound(InboundMessage("default wiring input"))
-        terminal = (await _terminals(loop, 1))[0]
+        await _bus.put_inbound(InboundMessage("default wiring input"))
+        terminal = (await _terminals(_bus, 1))[0]
     finally:
         await loop.close()
 

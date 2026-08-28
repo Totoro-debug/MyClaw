@@ -45,17 +45,19 @@ from myclaw.agent.loop import (
     TerminalAgentLoopControl,
 )
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
-from myclaw.management.commands import MANAGEMENT_COMMANDS, RESUME_MANAGEMENT_COMMAND
+from myclaw.management.commands import (
+    MANAGEMENT_COMMANDS,
+    RESUME_MANAGEMENT_COMMAND,
+    ManagementCommandDispatcher,
+)
 from myclaw.management.service import FatalManagementError, SessionListingEntry
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
-from myclaw.terminal.repl import ManagementDispatcher
 
 __all__ = [
     "TerminalConversationApp",
     "TerminalConversationError",
     "is_interactive_terminal",
-    "run_terminal_conversation",
 ]
 
 _COMPACT_MESSAGE_MAX_WIDTH = 60
@@ -1792,7 +1794,7 @@ class TerminalConversationApp(App[None]):
         *,
         bus: MessageBus,
         control: TerminalAgentLoopControl,
-        management_dispatcher: ManagementDispatcher | None,
+        management_dispatcher: ManagementCommandDispatcher,
         monotonic: Callable[[], float] = monotonic_now,
         skill_metadata: tuple[SkillMetadata, ...] = (),
     ) -> None:
@@ -2375,21 +2377,19 @@ class TerminalConversationApp(App[None]):
             self.exit()
             return
 
-        dispatcher = self._management_dispatcher
-        if dispatcher is not None:
-            result = await dispatcher.dispatch(text)
-            if result.handled:
-                message.text_area.remember_submission(text)
-                message.text_area.text = ""
-                if result.resume_sessions is not None:
-                    await self._open_resume_picker(
-                        result.resume_sessions,
-                        message.text_area,
-                        skipped_count=result.resume_skipped_count,
-                    )
-                else:
-                    await self._mount_management_rows(text, result.output)
-                return
+        result = await self._management_dispatcher.dispatch(text)
+        if result.handled:
+            message.text_area.remember_submission(text)
+            message.text_area.text = ""
+            if result.resume_sessions is not None:
+                await self._open_resume_picker(
+                    result.resume_sessions,
+                    message.text_area,
+                    skipped_count=result.resume_skipped_count,
+                )
+            else:
+                await self._mount_management_rows(text, result.output)
+            return
 
         message.text_area.remember_submission(text)
         message.text_area.text = ""
@@ -3003,12 +3003,6 @@ class TerminalConversationApp(App[None]):
     ) -> None:
         try:
             dispatcher = self._management_dispatcher
-            if dispatcher is None:
-                await self._mount_management_rows(
-                    _RESUME_MANAGEMENT_COMMAND_TOKEN,
-                    "Session resume is unavailable.",
-                )
-                return
             previous_control = self._control
             force = False
             if self._control.has_active_run:
@@ -3499,23 +3493,3 @@ def is_interactive_terminal() -> bool:
             stream_is_interactive(sys.stderr, sys.__stderr__),
         )
     )
-
-
-def run_terminal_conversation(
-    *,
-    bus: MessageBus,
-    control: TerminalAgentLoopControl,
-    management_dispatcher: ManagementDispatcher | None,
-    skill_metadata: tuple[SkillMetadata, ...] = (),
-) -> None:
-    """Run a Terminal Conversation around already-composed presentation seams."""
-    if not is_interactive_terminal():
-        raise TerminalConversationError(
-            "Terminal Conversation requires interactive stdin, stdout, and stderr TTYs."
-        )
-    TerminalConversationApp(
-        bus=bus,
-        control=control,
-        management_dispatcher=management_dispatcher,
-        skill_metadata=skill_metadata,
-    ).run()

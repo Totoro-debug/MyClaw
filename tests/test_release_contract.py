@@ -1,4 +1,5 @@
 import ast
+import importlib.util
 import os
 import re
 import shutil
@@ -71,12 +72,12 @@ _ISSUE_202_PERSISTENCE_EVIDENCE = {
         "tests/memory/test_records.py::test_summary_entry_serializes_with_exactly_three_keys",
     ),
     "Cursor": (
-        "tests/memory/test_memory_task.py::"
-        "test_memory_store_atomically_persists_the_canonical_summary_cursor",
+        "tests/memory/test_memory_manager.py::"
+        "test_manager_appends_and_claims_summaries_with_cursor_preadvance",
     ),
     "Long-term Memory": (
-        "tests/memory/test_memory_task.py::"
-        "test_memory_store_atomically_replaces_exact_long_term_memory",
+        "tests/memory/test_memory_manager.py::"
+        "test_manager_reads_disk_and_refreshes_snapshot_after_an_edit",
     ),
     "Schedule": (
         "tests/scheduling/test_schedule_model.py::"
@@ -136,6 +137,35 @@ _ISSUE_202_FORBIDDEN_PARENT_IMPORTS = {
     "myclaw.memory": {"memory_scheduler"},
 }
 
+_STANDARDS_2_3_FORBIDDEN_MODULES = (
+    "myclaw.agent.repl",
+    "myclaw.memory.memory_task",
+    "myclaw.terminal.repl",
+)
+_STANDARDS_2_3_FORBIDDEN_NAMES = {
+    "LongTermMemoryStore",
+    "ManagementDispatcher",
+    "MemoryEditFileTool",
+    "MemoryReadFileTool",
+    "MemoryStore",
+    "MemoryTaskModelRouter",
+    "MemoryTaskResult",
+    "SummaryAppender",
+    "SummaryCursorStore",
+    "SummaryStore",
+    "WorkspaceFileMemoryStore",
+    "_abandon_unstarted",
+    "_close_sessions",
+    "_publish_unlocked",
+    "_register_dream_job_sync",
+    "_register_system_job_sync",
+    "_unbind_management",
+    "_wait_for_abort",
+    "last_foreground_route_status",
+    "run_repl",
+    "run_terminal_conversation",
+}
+
 
 def _issue_202_ast(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -166,6 +196,19 @@ def _issue_202_method_names(class_node: ast.ClassDef) -> set[str]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and not node.name.startswith("_")
     }
+
+
+def _issue_202_direct_method(
+    class_node: ast.ClassDef,
+    name: str,
+) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    matches = [
+        node
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    ]
+    assert len(matches) == 1, name
+    return matches[0]
 
 
 def _issue_202_parameter_names(
@@ -474,8 +517,15 @@ def test_clean_distributions_omit_deleted_agent_module_and_import_cleanly(
     with zipfile.ZipFile(wheels[0]) as archive:
         wheel_members = {member.replace("\\", "/") for member in archive.namelist()}
 
-    assert not any(member.endswith("/myclaw/agent/runtime.py") for member in sdist_members)
-    assert "myclaw/agent/runtime.py" not in wheel_members
+    deleted_modules = (
+        "myclaw/agent/runtime.py",
+        "myclaw/agent/repl.py",
+        "myclaw/memory/memory_task.py",
+        "myclaw/terminal/repl.py",
+    )
+    for deleted_module in deleted_modules:
+        assert not any(member.endswith(f"/{deleted_module}") for member in sdist_members)
+        assert deleted_module not in wheel_members
 
     install_root = tmp_path / "clean-install"
     install_result = subprocess.run(
@@ -507,14 +557,20 @@ def test_clean_distributions_omit_deleted_agent_module_and_import_cleanly(
                 "import importlib.util\n"
                 "import myclaw\n"
                 "import myclaw.terminal.cli\n"
-                "legacy_module = '.'.join(('myclaw', 'agent', 'runtime'))\n"
-                "assert importlib.util.find_spec(legacy_module) is None\n"
-                "try:\n"
-                "    importlib.import_module(legacy_module)\n"
-                "except ModuleNotFoundError:\n"
-                "    pass\n"
-                "else:\n"
-                "    raise AssertionError('deleted Agent module is importable')\n"
+                "legacy_modules = (\n"
+                "    'myclaw.agent.runtime',\n"
+                "    'myclaw.agent.repl',\n"
+                "    'myclaw.memory.memory_task',\n"
+                "    'myclaw.terminal.repl',\n"
+                ")\n"
+                "for legacy_module in legacy_modules:\n"
+                "    assert importlib.util.find_spec(legacy_module) is None\n"
+                "    try:\n"
+                "        importlib.import_module(legacy_module)\n"
+                "    except ModuleNotFoundError:\n"
+                "        pass\n"
+                "    else:\n"
+                "        raise AssertionError(f'deleted module is importable: {legacy_module}')\n"
             ),
         ],
         cwd=clean_import_dir,
@@ -1046,6 +1102,137 @@ def test_issue_202_active_stale_symbol_scan_is_precise_and_empty() -> None:
     assert not (ROOT / "myclaw" / "agent" / "workspace.py").exists()
     legacy_scheduler_module = "_".join(("memory", "scheduler"))
     assert not (ROOT / "myclaw" / "memory" / f"{legacy_scheduler_module}.py").exists()
+
+
+def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
+    violations: list[str] = []
+    source_paths = (
+        *sorted((ROOT / "myclaw").rglob("*.py")),
+        *sorted((ROOT / "tests").rglob("*.py")),
+    )
+    for path in source_paths:
+        relative = path.relative_to(ROOT).as_posix()
+        tree = _issue_202_ast(path)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in _STANDARDS_2_3_FORBIDDEN_NAMES:
+                    violations.append(f"{relative}:{node.lineno}: declaration {node.name}")
+            if isinstance(node, ast.Name) and node.id in _STANDARDS_2_3_FORBIDDEN_NAMES:
+                violations.append(f"{relative}:{node.lineno}: name {node.id}")
+            if isinstance(node, ast.Attribute) and node.attr in _STANDARDS_2_3_FORBIDDEN_NAMES:
+                violations.append(f"{relative}:{node.lineno}: attribute {node.attr}")
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in _STANDARDS_2_3_FORBIDDEN_MODULES:
+                        violations.append(f"{relative}:{node.lineno}: import {alias.name}")
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if module in _STANDARDS_2_3_FORBIDDEN_MODULES:
+                    violations.append(f"{relative}:{node.lineno}: import from {module}")
+
+    for module in _STANDARDS_2_3_FORBIDDEN_MODULES:
+        path = ROOT.joinpath(*module.split(".")).with_suffix(".py")
+        if path.exists():
+            violations.append(f"{path.relative_to(ROOT).as_posix()}: deleted module exists")
+        if importlib.util.find_spec(module) is not None:
+            violations.append(f"{module}: deleted module is discoverable")
+
+    assert violations == []
+
+    conversation_summary = _issue_202_class(
+        _issue_202_ast(ROOT / "myclaw" / "memory" / "conversation_summary.py"),
+        "ConversationSummaryManager",
+    )
+    summary_init = _issue_202_direct_method(conversation_summary, "__init__")
+    assert _issue_202_parameter_names(summary_init) == (
+        "self",
+        "provider",
+        "memory_manager",
+        "route_context_window",
+        "route_max_output",
+        "consolidation_message_threshold",
+        "tools",
+        "now",
+        "project_messages",
+    )
+    assert all(default is None for default in summary_init.args.kw_defaults)
+
+    management = _issue_202_class(
+        _issue_202_ast(ROOT / "myclaw" / "management" / "service.py"),
+        "ManagementViewService",
+    )
+    management_init = _issue_202_direct_method(management, "__init__")
+    assert _issue_202_parameter_names(management_init) == (
+        "self",
+        "agent_home",
+        "current_agent_loop",
+        "workspace_state",
+        "replace_agent_loop",
+        "prepare_session_resume",
+        "memory_manager",
+        "dream",
+        "schedule_status",
+        "now",
+        "monotonic",
+    )
+    assert management_init.args.defaults == []
+    assert all(default is None for default in management_init.args.kw_defaults)
+
+    terminal = _issue_202_class(
+        _issue_202_ast(ROOT / "myclaw" / "terminal" / "conversation.py"),
+        "TerminalConversationApp",
+    )
+    terminal_init = _issue_202_direct_method(terminal, "__init__")
+    assert _issue_202_parameter_names(terminal_init) == (
+        "self",
+        "bus",
+        "control",
+        "management_dispatcher",
+        "monotonic",
+        "skill_metadata",
+    )
+    management_index = tuple(argument.arg for argument in terminal_init.args.kwonlyargs).index(
+        "management_dispatcher"
+    )
+    assert terminal_init.args.kw_defaults[management_index] is None
+
+    agent_loop = _issue_202_class(
+        _issue_202_ast(ROOT / "myclaw" / "agent" / "loop.py"),
+        "AgentLoop",
+    )
+    assert "bus" not in _issue_202_method_names(agent_loop)
+
+    summary_store = _issue_202_class(
+        _issue_202_ast(ROOT / "myclaw" / "memory" / "store.py"),
+        "WorkspaceJsonlSummaryStore",
+    )
+    assert "append_summary" not in _issue_202_method_names(summary_store)
+
+    schedule_store = _issue_202_class(
+        _issue_202_ast(ROOT / "myclaw" / "schedule" / "store.py"),
+        "WorkspaceScheduleStore",
+    )
+    assert _issue_202_parameter_names(_issue_202_direct_method(schedule_store, "_publish")) == (
+        "self",
+        "candidate",
+    )
+
+    terminal_design = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(
+        encoding="utf-8"
+    )
+    runtime_contracts = (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8")
+    release_readiness = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
+    implementation_plan = (ROOT / "docs" / "cli-composition-root-implementation-plan.md").read_text(
+        encoding="utf-8"
+    )
+    assert "run_repl" not in terminal_design
+    assert "run_repl" not in runtime_contracts
+    assert "class SummaryStore" not in runtime_contracts
+    assert "class MemoryStore" not in runtime_contracts
+    assert "tests/memory/test_memory_task.py" not in release_readiness
+    assert "ManagementDispatcher" not in implementation_plan
+    assert "current_memory_manager" not in implementation_plan
+    assert "current_dream" not in implementation_plan
 
 
 def test_issue_202_authoritative_documents_identify_one_current_composition_boundary() -> None:

@@ -11,8 +11,7 @@ from myclaw.agent.prompts import conversation_summary_input, conversation_summar
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
-from myclaw.memory.records import SummaryEntry
-from myclaw.memory.store import SummaryStore, WorkspaceJsonlSummaryStore
+from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
 from myclaw.session.projection import project_session_message
@@ -26,10 +25,7 @@ type SummaryProjection = Callable[
 
 __all__ = [
     "ConversationSummaryManager",
-    "SummaryAppender",
     "SummaryModelRouter",
-    "SummaryStore",
-    "WorkspaceJsonlSummaryStore",
 ]
 
 
@@ -45,12 +41,6 @@ class SummaryModelRouter(Protocol):
     ) -> ModelResponse: ...
 
 
-class SummaryAppender(Protocol):
-    """Append summaries through the owning Memory Manager or store adapter."""
-
-    async def append_summary(self, content: str, timestamp: datetime) -> SummaryEntry: ...
-
-
 class ConversationSummaryManager:
     """Compress eligible early Session messages before an Agent Run model call."""
 
@@ -58,7 +48,7 @@ class ConversationSummaryManager:
         self,
         *,
         provider: SummaryModelRouter,
-        summaries: SummaryAppender,
+        memory_manager: MemoryManager,
         route_context_window: int,
         route_max_output: int,
         consolidation_message_threshold: int,
@@ -67,7 +57,7 @@ class ConversationSummaryManager:
         project_messages: SummaryProjection,
     ) -> None:
         self._provider = provider
-        self._summaries = summaries
+        self._memory_manager = memory_manager
         self._route_context_window = route_context_window
         self._route_max_output = route_max_output
         self._message_threshold = consolidation_message_threshold
@@ -178,7 +168,7 @@ class ConversationSummaryManager:
         session.update_metadata(usage_delta={"model_calls": 1, **response.usage.to_dict()})
         try:
             new_last_consolidated = session.last_consolidated + cutoff
-            await self._summaries.append_summary(
+            await self._memory_manager.append_summary(
                 content=response.message.content,
                 timestamp=self._persisted_now(),
             )

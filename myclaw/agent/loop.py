@@ -276,7 +276,7 @@ class AgentLoop:
         runner = AgentRunner(model_router)
         summary_manager = ConversationSummaryManager(
             provider=cast(SummaryModelRouter, model_router),
-            summaries=memory_manager,
+            memory_manager=memory_manager,
             route_context_window=chat_route.context_window,
             route_max_output=chat_route.max_output,
             consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
@@ -344,18 +344,8 @@ class AgentLoop:
         self._last_foreground_route_status: ModelRouteStatus | None = None
 
     @property
-    def bus(self) -> MessageBus:
-        if self._aborted:
-            raise RuntimeError("Agent Loop is no longer active")
-        return self._bus
-
-    @property
     def control(self) -> TerminalAgentLoopControl:
         return self
-
-    @property
-    def last_foreground_route_status(self) -> ModelRouteStatus | None:
-        return self._last_foreground_route_status
 
     @property
     def session(self) -> Session:
@@ -631,15 +621,6 @@ class AgentLoop:
         self._session.abandon()
         self._session_abandoned = True
 
-    def _abandon_unstarted(self) -> None:
-        """Release a synchronously constructed but never activated generation."""
-        if self._started or self._closed:
-            return
-        self._request_abort()
-        self._abandon_session()
-        self._clear_owned_task_references()
-        self._closed = True
-
     def _retain_aborted_task(self, task: asyncio.Task[Any] | None) -> None:
         if task is None or task.done():
             return
@@ -658,20 +639,6 @@ class AgentLoop:
                 "Aborted Agent Loop task failed type={}",
                 type(error).__name__,
             )
-
-    async def _wait_for_abort(self) -> None:
-        """Compatibility barrier for Runtime's coordinated abort path."""
-        if not self._aborted:
-            return
-        task = self._abort_task
-        if task is None:
-            task = asyncio.create_task(self._finish_abort())
-            self._abort_task = task
-        await await_task_preserving_cancellation(task)
-
-    def _close_sessions(self) -> None:
-        """Close the foreground Session during normal awaited Runtime shutdown."""
-        self._close_session()
 
     async def cancel_active_run(self) -> None:
         if self._aborted:

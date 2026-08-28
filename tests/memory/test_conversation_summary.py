@@ -12,10 +12,9 @@ from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import _project_foreground_messages, _project_schedule_messages
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
-from myclaw.memory.conversation_summary import (
-    ConversationSummaryManager,
-    WorkspaceJsonlSummaryStore,
-)
+from myclaw.memory.conversation_summary import ConversationSummaryManager
+from myclaw.memory.manager import MemoryManager
+from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -120,7 +119,7 @@ def _project_messages(
 
 def _manager(
     provider: ScriptedFakeProvider,
-    summaries: WorkspaceJsonlSummaryStore,
+    memory_manager: MemoryManager,
     *,
     context_window: int = 10_000,
     max_output: int = 1_000,
@@ -137,7 +136,7 @@ def _manager(
     )
     return ConversationSummaryManager(
         provider=ScriptedFakeRouter(provider),
-        summaries=summaries,
+        memory_manager=memory_manager,
         route_context_window=context_window,
         route_max_output=max_output,
         consolidation_message_threshold=threshold,
@@ -145,6 +144,10 @@ def _manager(
         now=lambda: NOW,
         project_messages=projection,
     )
+
+
+async def _claimed_entries(memory_manager: MemoryManager) -> tuple[SummaryEntry, ...]:
+    return (await memory_manager.claim_summaries(limit=10)).entries
 
 
 def _add_assistant(
@@ -181,9 +184,9 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
     state = _state(workspace)
     session = _session_with_history(state)
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
 
-    prepared = await _manager(provider, summaries).prepare(session)
+    prepared = await _manager(provider, memory_manager).prepare(session)
 
     assert prepared is session
     assert session.last_consolidated == 2
@@ -205,7 +208,7 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
     assert "First answer." in summary_input
     assert "Second question." not in summary_input
     assert "future_field" not in summary_input
-    assert (await summaries.after(0, 10))[0].content == "First turn summary."
+    assert (await _claimed_entries(memory_manager))[0].content == "First turn summary."
 
 
 @pytest.mark.asyncio
@@ -226,10 +229,10 @@ async def test_summary_candidate_includes_current_user_without_publishing_it(
         return _project_messages(list(messages), system_prompt="CHAT SYSTEM")
 
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
     manager = ConversationSummaryManager(
         provider=ScriptedFakeRouter(provider),
-        summaries=summaries,
+        memory_manager=memory_manager,
         route_context_window=10_000,
         route_max_output=1_000,
         consolidation_message_threshold=4,
@@ -267,7 +270,7 @@ async def test_token_budget_summarizes_roughly_half_the_available_input(
 
     await _manager(
         provider,
-        WorkspaceJsonlSummaryStore(state),
+        MemoryManager(state),
         context_window=1_024,
         max_output=128,
         threshold=100,
@@ -301,8 +304,8 @@ async def test_repeated_summary_preparation_advances_last_consolidated_once_per_
             _response("Summary two."),
         )
     )
-    summaries = WorkspaceJsonlSummaryStore(state)
-    manager = _manager(provider, summaries)
+    memory_manager = MemoryManager(state)
+    manager = _manager(provider, memory_manager)
 
     first = await manager.prepare(session)
     first_position = first.last_consolidated
@@ -316,7 +319,7 @@ async def test_repeated_summary_preparation_advances_last_consolidated_once_per_
     assert second is session
     assert first_position == 2
     assert second.last_consolidated == 4
-    assert [entry.index for entry in await summaries.after(0, 10)] == [1, 2]
+    assert [entry.index for entry in await _claimed_entries(memory_manager)] == [1, 2]
     second_request = provider.complete_requests[1]
     summary_input = second_request.messages[1]["content"]
     assert isinstance(summary_input, str)
@@ -330,12 +333,12 @@ async def test_summary_persistence_failure_leaves_last_consolidated_unchanged(
 ) -> None:
     state = _state(workspace)
     session = _session_with_history(state)
-    summaries = WorkspaceJsonlSummaryStore(state)
-    summaries.path.mkdir()
+    memory_manager = MemoryManager(state)
+    (state.memory_directory / "summary.jsonl").mkdir()
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
 
     with pytest.raises(ModelCallError) as raised:
-        await _manager(provider, summaries).prepare(session)
+        await _manager(provider, memory_manager).prepare(session)
 
     assert raised.value.error.code == "persistence_error"
     assert session.last_consolidated == 0
@@ -355,12 +358,12 @@ async def test_oversized_system_prompt_fails_without_summary_or_last_consolidate
     session = Session.create(state)
     session.add_message("user", "Do not discard this current input.")
     provider = ScriptedFakeProvider()
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
         await _manager(
             provider,
-            summaries,
+            memory_manager,
             context_window=1_024,
             max_output=128,
             threshold=100,
@@ -370,7 +373,7 @@ async def test_oversized_system_prompt_fails_without_summary_or_last_consolidate
     assert raised.value.error.code == "memory_context_too_large"
     assert provider.complete_requests == []
     assert session.last_consolidated == 0
-    assert not summaries.path.exists()
+    assert not (state.memory_directory / "summary.jsonl").exists()
 
 
 @pytest.mark.asyncio
@@ -380,11 +383,11 @@ async def test_system_prompt_budget_keeps_raw_prompt_boundary(
     state = _state(workspace)
     session = _session_with_history(state)
     provider = ScriptedFakeProvider(completions=(_response("Boundary summary."),))
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
 
     await _manager(
         provider,
-        summaries,
+        memory_manager,
         context_window=613,
         max_output=500,
         threshold=100,
@@ -392,7 +395,7 @@ async def test_system_prompt_budget_keeps_raw_prompt_boundary(
     ).prepare(session)
 
     assert session.last_consolidated == 4
-    assert len(await summaries.after(0, 10)) == 1
+    assert len(await _claimed_entries(memory_manager)) == 1
 
 
 @pytest.mark.asyncio
@@ -402,12 +405,12 @@ async def test_oversized_system_prompt_without_user_keeps_failure(
     state = _state(workspace)
     session = Session.create(state)
     provider = ScriptedFakeProvider()
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
         await _manager(
             provider,
-            summaries,
+            memory_manager,
             context_window=1_024,
             max_output=128,
             system_prompt="M" * 4_000,
@@ -425,12 +428,12 @@ async def test_assistant_only_over_threshold_keeps_no_safe_cutoff_failure(
     session = Session.create(state)
     _add_assistant(session, "Assistant-only history.")
     provider = ScriptedFakeProvider()
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
         await _manager(
             provider,
-            summaries,
+            memory_manager,
             threshold=1,
         ).prepare(session)
 
@@ -447,12 +450,12 @@ async def test_context_overflow_without_old_complete_turn_keeps_current_message(
     current_input = "Current only: " + "x" * 4_000
     session.add_message("user", current_input)
     provider = ScriptedFakeProvider()
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
         await _manager(
             provider,
-            summaries,
+            memory_manager,
             context_window=1_024,
             max_output=128,
             threshold=100,
@@ -462,7 +465,7 @@ async def test_context_overflow_without_old_complete_turn_keeps_current_message(
     assert provider.complete_requests == []
     assert session.last_consolidated == 0
     assert [message["content"] for message in session.messages] == [current_input]
-    assert not summaries.path.exists()
+    assert not (state.memory_directory / "summary.jsonl").exists()
 
 
 @pytest.mark.asyncio
@@ -476,12 +479,12 @@ async def test_oversized_current_input_does_not_summarize_earlier_history(
     current_input = "Current oversized input: " + "x" * 4_000
     current_user = {"role": "user", "content": current_input}
     provider = ScriptedFakeProvider(completions=(_response("Must not be used."),))
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
         await _manager(
             provider,
-            summaries,
+            memory_manager,
             context_window=1_024,
             max_output=128,
             threshold=100,
@@ -494,7 +497,7 @@ async def test_oversized_current_input_does_not_summarize_earlier_history(
         "Earlier question.",
         "Earlier answer.",
     ]
-    assert not summaries.path.exists()
+    assert not (state.memory_directory / "summary.jsonl").exists()
 
 
 @pytest.mark.asyncio
@@ -505,15 +508,15 @@ async def test_summary_provider_failure_preserves_user_visible_model_error(
     session = _session_with_history(state)
     failure = ModelCallError(ErrorInfo(code="model_failed", message="PRIVATE FAILURE"))
     provider = ScriptedFakeProvider(completions=(failure,))
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _manager(provider, summaries).prepare(session)
+        await _manager(provider, memory_manager).prepare(session)
 
     assert raised.value.error.code == "model_failed"
     assert raised.value.error.message == "PRIVATE FAILURE"
     assert session.last_consolidated == 0
-    assert not summaries.path.exists()
+    assert not (state.memory_directory / "summary.jsonl").exists()
 
 
 @pytest.mark.asyncio
@@ -544,7 +547,7 @@ async def test_token_cutoff_excludes_schedule_continuation_from_history_budget(
         },
     ]
     provider = ScriptedFakeProvider(completions=(_response("Scheduled summary."),))
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
 
     def project_schedule(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         return _project_schedule_messages(
@@ -556,7 +559,7 @@ async def test_token_cutoff_excludes_schedule_continuation_from_history_budget(
 
     await _manager(
         provider,
-        summaries,
+        memory_manager,
         context_window=2_500,
         max_output=500,
         threshold=100,
@@ -624,11 +627,11 @@ async def test_cutoff_keeps_retained_suffix_at_user_boundary(
         else:
             _add_assistant(session, content)
     provider = ScriptedFakeProvider(completions=(_response("Aligned summary."),))
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
 
     await _manager(
         provider,
-        summaries,
+        memory_manager,
         context_window=100_000,
         max_output=4_096,
         threshold=6,
@@ -659,7 +662,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
     session = _session_with_history(state)
     original_messages = deepcopy(session.messages)
     provider = _DirectSummaryProvider(_response("Lane summary."))
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
     tool_schema: OpenAIToolSchema = {
         "type": "function",
         "function": {
@@ -694,7 +697,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
 
     manager = ConversationSummaryManager(
         provider=provider,
-        summaries=summaries,
+        memory_manager=memory_manager,
         route_context_window=1_024,
         route_max_output=128,
         consolidation_message_threshold=100,
@@ -707,7 +710,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
 
     assert session.last_consolidated == 4
     assert session.messages == original_messages
-    assert [entry.content for entry in await summaries.after(0, 10)] == ["Lane summary."]
+    assert [entry.content for entry in await _claimed_entries(memory_manager)] == ["Lane summary."]
 
 
 @pytest.mark.asyncio
@@ -722,7 +725,7 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
     )
     context = ContextBuilder(workspace, "UTC", clock=lambda: NOW)
     provider = ScriptedFakeProvider(completions=(_response("Summary without Blackboard."),))
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
     projected_calls: list[list[dict[str, Any]]] = []
 
     def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -738,7 +741,7 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
 
     await _manager(
         provider,
-        summaries,
+        memory_manager,
         threshold=4,
         project_messages=project_messages,
     ).prepare(
@@ -760,7 +763,7 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
     assert blackboard.goal not in summary_input
     assert blackboard.completion_boundary not in summary_input
     assert all("blackboard" not in message for message in session.messages)
-    assert [entry.content for entry in await summaries.after(0, 10)] == [
+    assert [entry.content for entry in await _claimed_entries(memory_manager)] == [
         "Summary without Blackboard."
     ]
 
@@ -788,7 +791,7 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
         artifact=None,
     )
     provider = _DirectSummaryProvider(_response("Projected summary."))
-    summaries = WorkspaceJsonlSummaryStore(state)
+    memory_manager = MemoryManager(state)
     projection_calls: list[tuple[Sequence[dict[str, Any]], dict[str, Any]]] = []
     tool_schema: OpenAIToolSchema = {
         "type": "function",
@@ -810,7 +813,7 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
 
     manager = ConversationSummaryManager(
         provider=provider,
-        summaries=summaries,
+        memory_manager=memory_manager,
         route_context_window=1_024,
         route_max_output=128,
         consolidation_message_threshold=100,

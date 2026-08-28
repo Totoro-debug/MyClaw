@@ -3,7 +3,6 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from time import monotonic
 from typing import Protocol
 
 from loguru import logger
@@ -182,11 +181,7 @@ class RuntimeStatusService:
         if projection.context_window <= 0:
             raise ValueError("Runtime status context window must be positive")
         started_at = projection.generation_started_at
-        uptime = (
-            0
-            if started_at is None
-            else max(0, int(self._monotonic() - started_at))
-        )
+        uptime = 0 if started_at is None else max(0, int(self._monotonic() - started_at))
         return RuntimeStatus(
             version=self._version,
             chat_model=projection.chat_model,
@@ -197,11 +192,7 @@ class RuntimeStatusService:
             session_message_count=projection.session_message_count,
             last_consolidated=projection.last_consolidated,
             cumulative_usage=dict(projection.cumulative_usage),
-            schedule=(
-                None
-                if self._schedule_status is None
-                else dict(self._schedule_status())
-            ),
+            schedule=(None if self._schedule_status is None else dict(self._schedule_status())),
         )
 
 
@@ -224,53 +215,29 @@ class ManagementViewService:
         self,
         agent_home: AgentHome,
         *,
-        status_service: RuntimeStatusService | None = None,
-        current_agent_loop: Callable[[], _StatusProjectionLoop] | None = None,
-        workspace_state: WorkspaceState | None = None,
-        replace_agent_loop: Callable[[str, bool], Awaitable[None]] | None = None,
-        replace_session: Callable[[str, bool], Awaitable[None]] | None = None,
-        prepare_session_resume: Callable[[str], Awaitable[None]] | None = None,
-        now: Callable[[], datetime] | None = None,
-        monotonic: Callable[[], float] = monotonic,
-        memory_manager: _MemoryReader | None = None,
-        current_memory_manager: Callable[[], _MemoryReader] | None = None,
-        dream: _DreamRunner | None = None,
-        current_dream: Callable[[], _DreamRunner] | None = None,
-        schedule_status: Callable[[], dict[str, object]] | None = None,
+        current_agent_loop: Callable[[], _StatusProjectionLoop],
+        workspace_state: WorkspaceState,
+        replace_agent_loop: Callable[[str, bool], Awaitable[None]],
+        prepare_session_resume: Callable[[str], Awaitable[None]],
+        memory_manager: _MemoryReader,
+        dream: _DreamRunner,
+        schedule_status: Callable[[], dict[str, object]],
+        now: Callable[[], datetime],
+        monotonic: Callable[[], float],
     ) -> None:
         self._config = ConfigLoader(agent_home)
-        self._status_service = (
-            status_service
-            if status_service is not None
-            else (
-                None
-                if current_agent_loop is None
-                else RuntimeStatusService(
-                    current_agent_loop=current_agent_loop,
-                    monotonic=monotonic,
-                    schedule_status=schedule_status,
-                )
-            )
+        self._status_service = RuntimeStatusService(
+            current_agent_loop=current_agent_loop,
+            monotonic=monotonic,
+            schedule_status=schedule_status,
         )
         self._current_agent_loop = current_agent_loop
         self._workspace_state = workspace_state
-        self._replace_agent_loop = (
-            replace_agent_loop if replace_agent_loop is not None else replace_session
-        )
+        self._replace_agent_loop = replace_agent_loop
         self._prepare_session_resume = prepare_session_resume
         self._now = now
-        if memory_manager is not None and current_memory_manager is not None:
-            raise TypeError("Specify either memory_manager or current_memory_manager")
-        self._memory_reader = (
-            current_memory_manager
-            if current_memory_manager is not None
-            else (None if memory_manager is None else lambda: memory_manager)
-        )
-        if dream is not None and current_dream is not None:
-            raise TypeError("Specify either dream or current_dream")
-        self._dream = (
-            current_dream if current_dream is not None else (None if dream is None else lambda: dream)
-        )
+        self._memory_reader = memory_manager
+        self._dream = dream
         self._aborted = False
 
     def deactivate(self) -> None:
@@ -284,9 +251,7 @@ class ManagementViewService:
             )
 
     def _ensure_current_generation(self) -> None:
-        current_agent_loop = self._current_agent_loop
-        if current_agent_loop is not None:
-            current_agent_loop()
+        self._current_agent_loop()
 
     async def config_view(self) -> ConfigView:
         """Return complete redacted User Configuration content."""
@@ -306,13 +271,8 @@ class ManagementViewService:
         """Return the complete current Long-term Memory file."""
         self._ensure_active()
         self._ensure_current_generation()
-        memory_reader = self._memory_reader
-        if memory_reader is None:
-            raise ManagementError(
-                ErrorInfo("route_unavailable", "Long-term Memory is unavailable.")
-            )
         try:
-            return await memory_reader().read_long_term()
+            return await self._memory_reader.read_long_term()
         except ManagementError:
             raise
         except (OSError, UnicodeError, ValueError) as error:
@@ -324,16 +284,11 @@ class ManagementViewService:
         """Run one foreground Memory Task and return its safe summary."""
         self._ensure_active()
         self._ensure_current_generation()
-        dream = self._dream
-        if dream is None:
-            raise ManagementError(ErrorInfo("route_unavailable", "Memory Task is unavailable."))
-        return await dream().run()
+        return await self._dream.run()
 
     async def status(self) -> RuntimeStatus:
         """Return the injected Runtime status snapshot."""
         self._ensure_active()
-        if self._status_service is None:
-            raise ManagementError(ErrorInfo("route_unavailable", "Runtime status is unavailable."))
         try:
             return await self._status_service.status()
         except ManagementError:
@@ -350,9 +305,11 @@ class ManagementViewService:
     async def resumable_listing(self) -> SessionListingReport:
         """Return one atomic Session picker result including skipped diagnostics."""
         self._ensure_active()
+        self._ensure_current_generation()
+        return await self._resumable_listing()
+
+    async def _resumable_listing(self) -> SessionListingReport:
         workspace_state = self._workspace_state
-        if workspace_state is None:
-            raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
         summaries: list[SessionListingEntry] = []
         skipped_count = 0
         try:
@@ -408,14 +365,9 @@ class ManagementViewService:
         """Revalidate and select one Session from the current Workspace."""
         self._ensure_active()
         self._ensure_current_generation()
-        workspace_state = self._workspace_state
-        replace_agent_loop = self._replace_agent_loop
-        if workspace_state is None or replace_agent_loop is None:
-            raise ManagementError(ErrorInfo("route_unavailable", "Session resume is unavailable."))
-        prepare_session_resume = self._prepare_session_resume
-        if prepare_session_resume is not None:
-            await prepare_session_resume(session_id)
-        sessions = await self.resumable_sessions()
+        await self._prepare_session_resume(session_id)
+        listing = await self._resumable_listing()
+        sessions = listing.sessions
         if session_id not in {summary.id for summary in sessions}:
             raise ManagementError(
                 ErrorInfo(
@@ -423,7 +375,7 @@ class ManagementViewService:
                     "The selected Conversation Session is not resumable.",
                 )
             )
-        await replace_agent_loop(session_id, force)
+        await self._replace_agent_loop(session_id, force)
         return ResumeResult(session_id=session_id)
 
 

@@ -9,7 +9,6 @@ from typing import Protocol
 from loguru import logger
 
 from myclaw.config.config import ConfigView
-from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.service import (
     FatalManagementError,
@@ -80,12 +79,7 @@ class ManagementCommandDispatcher:
     """Dispatch exact built-in commands without entering conversation flow."""
 
     def __init__(self, management: ManagementPort) -> None:
-        self._management: ManagementPort | None = management
-
-    def _unbind_management(self, management: ManagementPort) -> None:
-        """Enter a safe empty state only if this generation is still selected."""
-        if self._management is management:
-            self._management = None
+        self._management = management
 
     async def dispatch(self, command: str) -> ManagementCommandResult:
         """Return rendered output for a recognized Management Command."""
@@ -93,10 +87,7 @@ class ManagementCommandDispatcher:
             parsed_command = _MANAGEMENT_COMMAND_BY_TOKEN.get(command)
             if parsed_command is None:
                 return ManagementCommandResult(handled=False, output=None)
-            management = self._management
-            if management is None:
-                return self._unavailable_result()
-            return await self._dispatch(parsed_command, management)
+            return await self._dispatch(parsed_command, self._management)
 
     async def _dispatch(
         self,
@@ -191,11 +182,8 @@ class ManagementCommandDispatcher:
 
     async def resume(self, session_id: str, *, force: bool = False) -> ManagementCommandResult:
         with without_session_log():
-            management = self._management
-            if management is None:
-                return self._unavailable_result()
             try:
-                result = await management.resume(session_id, force=force)
+                result = await self._management.resume(session_id, force=force)
             except FatalManagementError:
                 raise
             except ManagementError as management_error:
@@ -215,11 +203,3 @@ class ManagementCommandDispatcher:
                     output=output,
                     resumed_session_id=result.session_id,
                 )
-
-    @staticmethod
-    def _unavailable_result() -> ManagementCommandResult:
-        error = ErrorInfo("route_unavailable", "Runtime Generation is unavailable.")
-        return ManagementCommandResult(
-            handled=True,
-            output=f"{error.code}: {error.message}",
-        )

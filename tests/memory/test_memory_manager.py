@@ -6,8 +6,7 @@ import pytest
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
-from myclaw.memory.manager import MemoryManager
-from myclaw.memory.memory_task import MemoryManager as FacadeMemoryManager
+from myclaw.memory.manager import MemoryManager, SummaryClaimError
 from myclaw.memory.records import SummaryEntry
 from myclaw.memory.store import (
     WorkspaceJsonlSummaryStore,
@@ -43,13 +42,16 @@ async def test_manager_owns_persistence_and_caches_the_startup_snapshot(
     assert isinstance(manager._summary_store, WorkspaceJsonlSummaryStore)
     assert isinstance(manager._cursor_store, WorkspaceSummaryCursorStore)
     assert isinstance(manager._long_term_store, WorkspaceLongTermMemoryStore)
-    assert len(
-        {
-            id(manager._summary_store),
-            id(manager._cursor_store),
-            id(manager._long_term_store),
-        }
-    ) == 3
+    assert (
+        len(
+            {
+                id(manager._summary_store),
+                id(manager._cursor_store),
+                id(manager._long_term_store),
+            }
+        )
+        == 3
+    )
 
 
 @pytest.mark.asyncio
@@ -61,15 +63,22 @@ async def test_manager_appends_and_claims_summaries_with_cursor_preadvance(
     state = _state(agent_home)
     manager = MemoryManager(state)
     await manager.append_summary("A durable preference.", NOW)
+    await manager.append_summary("A second durable preference.", NOW)
 
-    claim = await manager.claim_summaries(limit=10)
+    first_claim = await manager.claim_summaries(limit=1)
+    second_claim = await manager.claim_summaries(limit=1)
 
-    assert claim.previous_cursor == 0
-    assert claim.cursor == 1
-    assert claim.entries == (
+    assert first_claim.previous_cursor == 0
+    assert first_claim.cursor == 1
+    assert first_claim.entries == (
         SummaryEntry(index=1, timestamp=NOW, content="A durable preference."),
     )
-    assert (state.memory_directory / ".cursor").read_text(encoding="ascii") == "1\n"
+    assert second_claim.previous_cursor == 1
+    assert second_claim.cursor == 2
+    assert second_claim.entries == (
+        SummaryEntry(index=2, timestamp=NOW, content="A second durable preference."),
+    )
+    assert (state.memory_directory / ".cursor").read_bytes() == b"2\n"
 
 
 @pytest.mark.asyncio
@@ -93,6 +102,50 @@ async def test_manager_reads_disk_and_refreshes_snapshot_after_an_edit(
     assert updated == replacement
     assert await manager.read_long_term() == replacement
     assert manager.memory_snapshot() == replacement
+    assert state.long_term_memory_path.read_bytes() == replacement.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "cursor_bytes",
+    (b"not-a-cursor\n", b"-1\n", b"1", b"1 \n", b"1\n2\n"),
+)
+@pytest.mark.asyncio
+async def test_manager_rejects_corrupt_canonical_cursor_without_mutation(
+    agent_home: Path,
+    cursor_bytes: bytes,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = _state(agent_home)
+    cursor_path = state.memory_directory / ".cursor"
+    cursor_path.write_bytes(cursor_bytes)
+    manager = MemoryManager(state)
+
+    with pytest.raises(SummaryClaimError) as raised:
+        await manager.claim_summaries(limit=10)
+
+    assert raised.value.cursor == 0
+    assert raised.value.phase == "read"
+    assert cursor_path.read_bytes() == cursor_bytes
+
+
+@pytest.mark.asyncio
+async def test_manager_rejects_external_hard_linked_cursor(agent_home: Path) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    state = _state(agent_home)
+    outside_cursor = agent_home.parent / "outside-cursor"
+    outside_cursor.write_bytes(b"999\n")
+    cursor_path = state.memory_directory / ".cursor"
+    cursor_path.hardlink_to(outside_cursor)
+    manager = MemoryManager(state)
+
+    with pytest.raises(SummaryClaimError) as raised:
+        await manager.claim_summaries(limit=10)
+
+    assert raised.value.cursor == 0
+    assert raised.value.phase == "read"
+    assert outside_cursor.read_bytes() == b"999\n"
 
 
 def test_manager_module_has_no_execution_dependencies() -> None:
@@ -104,27 +157,19 @@ def test_manager_module_has_no_execution_dependencies() -> None:
         for alias in node.names
     }
     imported_from_names = {
-        node.module or ""
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
+        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
     }
     imported = imported_names | imported_from_names
 
     assert not any(
-        name.startswith((
-            "myclaw.agent.runner",
-            "myclaw.agent.prompts",
-            "myclaw.provider",
-            "myclaw.tools",
-            "myclaw.schedule",
-        ))
+        name.startswith(
+            (
+                "myclaw.agent.runner",
+                "myclaw.agent.prompts",
+                "myclaw.provider",
+                "myclaw.tools",
+                "myclaw.schedule",
+            )
+        )
         for name in imported
     )
-
-
-def test_memory_task_facade_contains_only_reexports() -> None:
-    source = Path("myclaw/memory/memory_task.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-
-    assert FacadeMemoryManager is MemoryManager
-    assert not any(isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) for node in tree.body)

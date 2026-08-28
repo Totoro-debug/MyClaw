@@ -261,9 +261,7 @@ async def _run_cli_conversation(
                     nonlocal replacement_barrier_held
                     if not replacement_barrier_held:
                         return
-                    await old_loop._release_replacement_barrier(
-                        resume_inbound=resume_inbound
-                    )
+                    await old_loop._release_replacement_barrier(resume_inbound=resume_inbound)
                     replacement_barrier_held = False
 
                 async def reject_prepared_target(target: AgentLoop) -> None:
@@ -377,13 +375,9 @@ async def _run_cli_conversation(
                     current_loop = None
                     if management is not None:
                         management.deactivate()
-                    raise FatalManagementError(
-                        _RUNTIME_SESSION_REPLACEMENT_ERROR
-                    ) from error
+                    raise FatalManagementError(_RUNTIME_SESSION_REPLACEMENT_ERROR) from error
                 finally:
-                    await release_replacement_barrier(
-                        resume_inbound=not destructive_started
-                    )
+                    await release_replacement_barrier(resume_inbound=not destructive_started)
 
         initial_loop = create_agent_loop(None)
         active_loop = initial_loop
@@ -403,11 +397,11 @@ async def _run_cli_conversation(
             workspace_state=workspace_state,
             replace_agent_loop=replace_agent_loop,
             prepare_session_resume=prepare_session_resume,
+            memory_manager=memory_manager,
+            dream=dream,
+            schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
             now=_local_now,
             monotonic=monotonic,
-            current_memory_manager=lambda: memory_manager,
-            current_dream=lambda: dream,
-            schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
         )
         dispatcher = ManagementCommandDispatcher(management)
         terminal_app = TerminalConversationApp(

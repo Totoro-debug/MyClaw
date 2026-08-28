@@ -315,7 +315,7 @@ rules remain in `tests/management/test_management_views.py`.
 | `tests/scheduling/test_schedule_runtime.py::test_runtime_schedule_failure_logs_one_safe_session_warning` | `tests/scheduling/test_schedule_agent_loop.py::test_schedule_failure_logs_one_safe_session_warning` | failure, security; Schedule/Session Log |
 | `tests/scheduling/test_schedule_service.py::test_prepared_runtime_executes_at_job_with_schedule_route_and_partition` | `tests/scheduling/test_schedule_service.py::test_agent_loop_executes_at_job_with_schedule_route_and_partition` | identity, order; Schedule/AgentLoop |
 | `tests/scheduling/test_schedule_service.py::test_prepared_runtime_runs_foreground_while_every_job_is_active` | `tests/scheduling/test_schedule_service.py::test_agent_loop_runs_foreground_while_every_job_is_active` | order, cancellation; Schedule/AgentLoop |
-| `tests/memory/test_memory_task.py::test_runtime_dream_uses_memory_route_with_static_default_fallback` | `tests/memory/test_memory_task.py::test_dream_uses_memory_route_with_static_default_fallback` | identity, failure; Memory/Dream |
+| `tests/memory/test_memory_task.py::test_runtime_dream_uses_memory_route_with_static_default_fallback` | `tests/memory/test_dream.py::test_dream_uses_the_memory_route_with_static_default_fallback` | identity, failure; Memory/Dream |
 | `tests/sessions/test_session_resume.py::test_resume_selects_the_loaded_session_for_the_runtime_owner` | `tests/sessions/test_session_resume.py::test_resume_selects_the_loaded_session_for_the_agent_loop_owner` | identity, persist; Session/AgentLoop |
 | `tests/terminal/test_conversation.py::test_terminal_conversation_uses_the_prepared_runtime_lifecycle` | `tests/terminal/test_conversation.py::test_terminal_conversation_uses_the_direct_terminal_loop_lifecycle` | startup, order, failure; Terminal/AgentLoop |
 | `tests/terminal/test_conversation.py::test_prepared_runtime_exec_confirmation_preserves_the_exact_long_command` | `tests/terminal/test_conversation.py::test_direct_terminal_loop_exec_confirmation_preserves_the_exact_long_command` | security; Terminal/AgentLoop |
@@ -329,10 +329,90 @@ rules remain in `tests/management/test_management_views.py`.
 | `tests/test_runtime_replacement_contract.py::test_cli_and_legacy_share_same_session_replacement_release_contract[legacy]` | deleted as the legacy-owner duplicate; the CLI node above retains the public contract | replacement, identity, order; CLI |
 | `tests/test_permission_loop.py::test_foreground_mutations_execute_without_a_permission_pause` | same node, direct `AgentLoop`/`MessageBus` composition | security, identity; AgentLoop/ToolGateway |
 
+## Standards 2 and 3 convergence addendum
+
+This addendum records the final-interface cleanup performed from clean collection
+`dc3ff20f4a9ac290f4b3b57934c102356b02b929`. Parameterized nodes are listed
+individually because every expanded node was part of the measured baseline.
+
+### Collection accounting
+
+| Measure | Nodes |
+| --- | ---: |
+| Convergence baseline collection | 1448 |
+| Deleted `test_memory_task.py` nodes | -30 |
+| Deleted Memory facade-only node | -1 |
+| Deleted REPL-file nodes | -10 |
+| Deleted headless Terminal wrapper nodes | -6 |
+| Added `MemoryManager` final-interface contracts | +6 |
+| Added `Dream` final-interface contracts | +5 |
+| Added Management result-projection contracts | +3 |
+| Added Terminal unknown-slash contract | +1 |
+| Added source/import/distribution absence contract | +1 |
+| Final collection | 1417 |
+
+The equation balances exactly: `1448 - 30 - 1 - 10 - 6 + 6 + 5 + 3 + 1 + 1 = 1417`.
+
+### Deleted Memory nodes
+
+| Deleted node | Surviving target or disposition |
+| --- | --- |
+| `tests/memory/test_memory_task.py::test_summary_store_returns_the_limited_batch_after_the_cursor` | `tests/memory/test_memory_manager.py::test_manager_appends_and_claims_summaries_with_cursor_preadvance` |
+| `tests/memory/test_memory_task.py::test_memory_store_treats_a_missing_summary_cursor_as_zero` | `tests/memory/test_memory_manager.py::test_manager_appends_and_claims_summaries_with_cursor_preadvance` |
+| `tests/memory/test_memory_task.py::test_memory_store_atomically_persists_the_canonical_summary_cursor` | `tests/memory/test_memory_manager.py::test_manager_appends_and_claims_summaries_with_cursor_preadvance` |
+| `tests/memory/test_memory_task.py::test_memory_store_atomically_replaces_exact_long_term_memory` | `tests/memory/test_memory_manager.py::test_manager_reads_disk_and_refreshes_snapshot_after_an_edit` |
+| `tests/memory/test_memory_task.py::test_memory_tools_export_common_schemas_with_zero_retries` | `tests/memory/test_dream.py::test_dream_processes_claimed_summaries_through_restricted_memory_route` |
+| `tests/memory/test_memory_task.py::test_manual_memory_task_returns_exact_zero_work_result_without_a_model_call` | `tests/memory/test_dream.py::test_dream_returns_without_a_provider_call_when_no_summary_is_pending` |
+| `tests/memory/test_memory_task.py::test_wait_until_idle_returns_for_idle_and_current_memory_tasks` | `tests/memory/test_dream.py::test_dream_close_waits_for_active_work_and_releases_the_task` |
+| `tests/memory/test_memory_task.py::test_memory_task_uses_the_direct_memory_route_and_dictionary_messages` | `tests/memory/test_dream.py::test_dream_processes_claimed_summaries_through_restricted_memory_route` |
+| `tests/memory/test_memory_task.py::test_memory_task_direct_router_receives_tool_results_as_follow_up_dictionaries` | `tests/memory/test_dream.py::test_dream_edit_refreshes_the_manager_snapshot_after_a_successful_edit` |
+| `tests/memory/test_memory_task.py::test_manual_memory_task_does_not_borrow_a_foreground_session_log` | `tests/memory/test_dream.py::test_dream_processes_claimed_summaries_through_restricted_memory_route` |
+| `tests/memory/test_memory_task.py::test_memory_task_without_an_edit_advances_the_summary_cursor` | `tests/memory/test_dream.py::test_dream_processes_claimed_summaries_through_restricted_memory_route` |
+| `tests/memory/test_memory_task.py::test_memory_task_advances_the_summary_cursor_before_model_work` | `tests/memory/test_dream.py::test_dream_model_failure_keeps_the_accepted_cursor` |
+| `tests/memory/test_memory_task.py::test_memory_task_preadvances_summary_cursor_before_exact_edit` | `tests/memory/test_dream.py::test_dream_edit_refreshes_the_manager_snapshot_after_a_successful_edit` |
+| `tests/memory/test_memory_task.py::test_memory_task_catalog_denies_every_non_long_term_memory_path` | `tests/memory/test_dream.py::test_dream_tool_failure_keeps_the_accepted_cursor_without_retry` |
+| `tests/memory/test_memory_task.py::test_required_memory_edit_failure_keeps_the_advanced_summary_cursor` | `tests/memory/test_dream.py::test_dream_edit_failure_keeps_the_accepted_cursor` |
+| `tests/memory/test_memory_task.py::test_unexpected_memory_tool_failure_is_logged_once_at_the_task_boundary` | `tests/memory/test_dream.py::test_dream_logs_an_unexpected_tool_failure_once_at_its_boundary` |
+| `tests/memory/test_memory_task.py::test_conversation_summary_read_failure_is_logged_only_at_memory_task_boundary` | `tests/memory/test_dream.py::test_dream_logs_a_corrupt_summary_failure_once_without_leaking_content` |
+| `tests/memory/test_memory_task.py::test_restricted_memory_catalog_never_reads_through_an_external_hard_link` | `tests/memory/test_dream.py::test_dream_never_reads_through_an_external_long_term_memory_hard_link` |
+| `tests/memory/test_memory_task.py::test_overlapping_manual_memory_task_is_rejected_without_a_second_model_call` | `tests/memory/test_dream.py::test_dream_concurrent_runs_claim_once_and_do_not_reenter` |
+| `tests/memory/test_memory_task.py::test_overlapping_manual_memory_task_ignores_a_corrupt_cursor` | `tests/memory/test_dream.py::test_dream_concurrent_runs_claim_once_and_do_not_reenter`; the injected mid-run Cursor corruption was a duplicate proof that the rejected call performs no second claim |
+| `tests/memory/test_memory_task.py::test_dream_command_returns_exact_no_pending_output_without_a_model_call` | `tests/management/test_management_commands.py::test_dream_command_projects_the_complete_final_result[no-pending]` |
+| `tests/memory/test_memory_task.py::test_dream_uses_memory_route_with_static_default_fallback` | `tests/memory/test_dream.py::test_dream_uses_the_memory_route_with_static_default_fallback` |
+| `tests/memory/test_memory_task.py::test_dream_command_renders_model_failure_after_advancing_cursor` | `tests/management/test_management_commands.py::test_dream_command_projects_the_complete_final_result[model-failure]`; Cursor pre-advance is independently owned by `test_dream_model_failure_keeps_the_accepted_cursor` |
+| `tests/memory/test_memory_task.py::test_dream_reports_cursor_publication_failure_as_unprocessed` | `tests/memory/test_dream.py::test_dream_cursor_publication_failure_is_unprocessed_and_logged_once`; result rendering is independently owned by `test_dream_command_projects_the_complete_final_result[cursor-publication-failure]` |
+| `tests/memory/test_memory_task.py::test_dream_reports_corrupt_cursor_without_calling_the_model[not-a-cursor\n]` | `tests/memory/test_memory_manager.py::test_manager_rejects_corrupt_canonical_cursor_without_mutation[not-a-cursor\n]` |
+| `tests/memory/test_memory_task.py::test_dream_reports_corrupt_cursor_without_calling_the_model[-1\n]` | `tests/memory/test_memory_manager.py::test_manager_rejects_corrupt_canonical_cursor_without_mutation[-1\n]` |
+| `tests/memory/test_memory_task.py::test_dream_reports_corrupt_cursor_without_calling_the_model[1]` | `tests/memory/test_memory_manager.py::test_manager_rejects_corrupt_canonical_cursor_without_mutation[1]` |
+| `tests/memory/test_memory_task.py::test_dream_reports_corrupt_cursor_without_calling_the_model[1 \n]` | `tests/memory/test_memory_manager.py::test_manager_rejects_corrupt_canonical_cursor_without_mutation[1 \n]` |
+| `tests/memory/test_memory_task.py::test_dream_reports_corrupt_cursor_without_calling_the_model[1\n2\n]` | `tests/memory/test_memory_manager.py::test_manager_rejects_corrupt_canonical_cursor_without_mutation[1\n2\n]` |
+| `tests/memory/test_memory_task.py::test_memory_task_rejects_an_external_hard_linked_cursor` | `tests/memory/test_memory_manager.py::test_manager_rejects_external_hard_linked_cursor` |
+| `tests/memory/test_memory_manager.py::test_memory_task_facade_contains_only_reexports` | Legacy-only: the forwarding module and its identity assertion were deleted; source/import/wheel absence is owned by `tests/test_release_contract.py::test_standards_2_3_legacy_interfaces_are_absent_from_source` and `test_clean_distributions_omit_deleted_agent_module_and_import_cleanly` |
+
+### Deleted REPL and headless Terminal nodes
+
+| Deleted node | Surviving target or disposition |
+| --- | --- |
+| `tests/test_repl.py::test_terminal_repl_is_a_thin_compatibility_export` | Legacy-only: both forwarding modules are intentionally absent; absence is enforced by the release contracts |
+| `tests/test_repl.py::test_repl_ignores_blank_and_exit_input_without_creating_inbound_messages` | Legacy-only: the plain input loop no longer exists; Textual blank and exit behavior remains covered at its product boundary |
+| `tests/test_repl.py::test_repl_projects_sparse_segments_tool_arguments_and_one_terminal_marker` | `tests/terminal/test_conversation.py::test_tool_activity_renders_raw_arguments_until_terminal_marker` |
+| `tests/test_repl.py::test_repl_keeps_unknown_slash_input_on_the_inbound_bus_and_dispatches_management` | `tests/terminal/test_conversation.py::test_unknown_slash_input_remains_an_ordinary_foreground_turn` |
+| `tests/test_repl.py::test_repl_task_cancellation_requests_control_cancel_and_repairs_input_loop` | `tests/terminal/test_conversation.py::test_active_turn_keeps_input_editable_and_cancellable_before_a_later_turn` |
+| `tests/test_repl_confirmation.py::test_repl_displays_normalized_confirmation_and_accepts_only_yes_or_no_contract` | Legacy-only: the removed line prompt accepted text; Textual owns the current button and keyboard Confirmation contract |
+| `tests/test_repl_confirmation.py::test_repl_confirmation_declines_on_no_or_empty_input[no]` | Legacy-only: the removed line prompt has no product seam |
+| `tests/test_repl_confirmation.py::test_repl_confirmation_declines_on_no_or_empty_input[n]` | Legacy-only: the removed line prompt has no product seam |
+| `tests/test_repl_confirmation.py::test_repl_confirmation_declines_on_no_or_empty_input[]` | Legacy-only: the removed line prompt has no product seam |
+| `tests/terminal/test_repl_bus.py::test_repl_preserves_tool_output_when_confirmation_is_ready_together` | `tests/terminal/test_conversation.py::test_intermediate_model_output_and_tools_share_one_activity_group` |
+| `tests/terminal/test_conversation.py::test_non_tty_terminal_streams_are_rejected_before_textual_starts[stdin]` | Duplicate of the installed public entry contract `tests/test_cli.py::test_installed_myclaw_rejects_valid_configuration_without_a_tty` |
+| `tests/terminal/test_conversation.py::test_non_tty_terminal_streams_are_rejected_before_textual_starts[stdout]` | Duplicate of `tests/test_cli.py::test_installed_myclaw_rejects_valid_configuration_without_a_tty` |
+| `tests/terminal/test_conversation.py::test_non_tty_terminal_streams_are_rejected_before_textual_starts[stderr]` | Duplicate of `tests/test_cli.py::test_installed_myclaw_rejects_valid_configuration_without_a_tty` |
+| `tests/terminal/test_conversation.py::test_non_tty_terminal_streams_are_rejected_before_textual_starts[__stdin__]` | Duplicate of `tests/test_cli.py::test_installed_myclaw_rejects_valid_configuration_without_a_tty` |
+| `tests/terminal/test_conversation.py::test_non_tty_terminal_streams_are_rejected_before_textual_starts[__stdout__]` | Duplicate of `tests/test_cli.py::test_installed_myclaw_rejects_valid_configuration_without_a_tty` |
+| `tests/terminal/test_conversation.py::test_non_tty_terminal_streams_are_rejected_before_textual_starts[__stderr__]` | Duplicate of `tests/test_cli.py::test_installed_myclaw_rejects_valid_configuration_without_a_tty` |
+
 ## Protected boundaries
 
-The protected CONTEXT, ADR 0014/0016/0017, PRD, Runtime Contracts, and
-implementation-plan files were not edited by this migration. The only tracked
-documentation changes are this issue-owned ledger and factual architecture,
-test-path, and verification-evidence updates in `docs/release-readiness.md` and
-`docs/security-fault-review.md`.
+The original Issue #201 migration did not edit its protected architecture
+authorities. This convergence addendum makes only factual final-interface and
+evidence updates to Runtime Contracts, Terminal design, release readiness, and
+the implementation plan; it does not change ADR-0017's accepted ownership model.

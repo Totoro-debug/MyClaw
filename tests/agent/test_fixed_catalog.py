@@ -146,7 +146,7 @@ def _agent_loop(
     provider: _FixedCatalogProvider,
     *,
     config_text: str = VALID_CONFIG,
-) -> tuple[AgentLoop, ModelRouter, ScheduleService]:
+) -> tuple[AgentLoop, ModelRouter, ScheduleService, MessageBus]:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
@@ -172,12 +172,13 @@ def _agent_loop(
         execute_user_job=execute_user_job,
         execute_dream=execute_dream,
     )
+    bus = MessageBus()
     loop = AgentLoop(
         workspace_path=workspace,
         workspace_state=state,
         agent_home=home,
         configuration=configuration,
-        bus=MessageBus(),
+        bus=bus,
         schedule_service=schedule,
         model_router=router,
         memory_manager=MemoryManager(state),
@@ -187,7 +188,7 @@ def _agent_loop(
         monotonic_now=lambda: 0.0,
     )
     loop._task_framer = DeterministicTaskFramingEvaluator()
-    return loop, router, schedule
+    return loop, router, schedule, bus
 
 
 async def _close_loop(
@@ -220,12 +221,12 @@ async def test_agent_loop_uses_fixed_catalog_for_provider_confirmation_and_persi
             _response(content="Done."),
         )
     )
-    loop, router, schedule = _agent_loop(agent_home, workspace, provider)
+    loop, router, schedule, bus = _agent_loop(agent_home, workspace, provider)
     confirmations: list[ConfirmationRequestView] = []
     loop.bind_confirmation_callback(confirmations.append)
     try:
         await loop.start()
-        turn = asyncio.create_task(collect_foreground_outbound(loop, "Read the file."))
+        turn = asyncio.create_task(collect_foreground_outbound(bus, "Read the file."))
         while not confirmations:
             await asyncio.sleep(0)
         confirmation = confirmations[0]
@@ -277,7 +278,7 @@ async def test_agent_loop_reads_known_skill_path_without_confirmation(
             _response(content="Done."),
         )
     )
-    loop, router, schedule = _agent_loop(agent_home, workspace, provider)
+    loop, router, schedule, bus = _agent_loop(agent_home, workspace, provider)
     confirmations: list[ConfirmationRequestView] = []
 
     def approve(request: ConfirmationRequestView) -> None:
@@ -287,7 +288,7 @@ async def test_agent_loop_reads_known_skill_path_without_confirmation(
     loop.bind_confirmation_callback(approve)
     try:
         await loop.start()
-        await collect_foreground_outbound(loop, "Read the skill.")
+        await collect_foreground_outbound(bus, "Read the skill.")
     finally:
         await _close_loop(loop, router, schedule)
 
@@ -344,11 +345,13 @@ async def test_agent_loop_advertises_and_persists_multiple_autonomous_skill_read
             _response(content="Used both Skills."),
         )
     )
-    loop, router, schedule = _agent_loop(agent_home, workspace, provider, config_text=config_text)
+    loop, router, schedule, bus = _agent_loop(
+        agent_home, workspace, provider, config_text=config_text
+    )
     session_id = loop.session.session_id
     try:
         await loop.start()
-        messages = await collect_foreground_outbound(loop, "Use both Skills.")
+        messages = await collect_foreground_outbound(bus, "Use both Skills.")
     finally:
         await _close_loop(loop, router, schedule)
 
@@ -428,7 +431,7 @@ async def test_agent_loop_keeps_artifact_and_log_correlation_when_persist_fails(
     config_text = VALID_CONFIG.replace(
         "max_tool_result_chars = 60000", "max_tool_result_chars = 1000"
     )
-    loop, router, schedule = _agent_loop(
+    loop, router, schedule, bus = _agent_loop(
         agent_home,
         workspace,
         provider,
@@ -441,7 +444,7 @@ async def test_agent_loop_keeps_artifact_and_log_correlation_when_persist_fails(
     loop.session.persist = fail_persist  # type: ignore[method-assign]
     try:
         await loop.start()
-        messages = await collect_foreground_outbound(loop, "Inspect large.txt.")
+        messages = await collect_foreground_outbound(bus, "Inspect large.txt.")
     finally:
         await _close_loop(loop, router, schedule)
 
@@ -493,10 +496,10 @@ async def test_agent_loop_tool_failure_keeps_private_diagnostics_out_of_public_o
             _response(content="Search failed safely."),
         )
     )
-    loop, router, schedule = _agent_loop(agent_home, workspace, provider)
+    loop, router, schedule, bus = _agent_loop(agent_home, workspace, provider)
     try:
         await loop.start()
-        messages = await collect_foreground_outbound(loop, private_query)
+        messages = await collect_foreground_outbound(bus, private_query)
     finally:
         await _close_loop(loop, router, schedule)
 
@@ -523,10 +526,10 @@ async def test_agent_loop_model_failure_logs_private_cause_but_emits_safe_termin
         failure.__cause__ = RuntimeError("RAW_PROVIDER_BODY auth=PRIVATE_MODEL_CREDENTIAL")
         failures.append(failure)
     provider = _FixedCatalogProvider(failures)
-    loop, router, schedule = _agent_loop(agent_home, workspace, provider)
+    loop, router, schedule, bus = _agent_loop(agent_home, workspace, provider)
     try:
         await loop.start()
-        messages = await collect_foreground_outbound(loop, "PRIVATE_FOREGROUND_PROMPT")
+        messages = await collect_foreground_outbound(bus, "PRIVATE_FOREGROUND_PROMPT")
     finally:
         await _close_loop(loop, router, schedule)
 
@@ -548,8 +551,7 @@ async def test_agent_loop_continues_when_session_log_path_is_unavailable(
     workspace: Path,
 ) -> None:
     failures = [
-        ModelCallError(ErrorInfo("model_failed", "The model request failed."))
-        for _ in range(5)
+        ModelCallError(ErrorInfo("model_failed", "The model request failed.")) for _ in range(5)
     ]
     provider = _FixedCatalogProvider(
         (
@@ -564,12 +566,12 @@ async def test_agent_loop_continues_when_session_log_path_is_unavailable(
             *failures,
         )
     )
-    loop, router, schedule = _agent_loop(agent_home, workspace, provider)
+    loop, router, schedule, bus = _agent_loop(agent_home, workspace, provider)
     unavailable_logs = workspace / ".myclaw" / "logs"
     unavailable_logs.write_text("Session Log unavailable", encoding="utf-8")
     try:
         await loop.start()
-        messages = await collect_foreground_outbound(loop, "Fail-open request.")
+        messages = await collect_foreground_outbound(bus, "Fail-open request.")
     finally:
         await _close_loop(loop, router, schedule)
 
@@ -631,9 +633,9 @@ async def test_agent_loop_cancellation_reaches_an_active_fixed_catalog_tool(
             ),
         )
     )
-    loop, router, schedule = _agent_loop(agent_home, workspace, provider)
+    loop, router, schedule, bus = _agent_loop(agent_home, workspace, provider)
     await loop.start()
-    turn = asyncio.create_task(collect_foreground_outbound(loop, "Fetch the URL."))
+    turn = asyncio.create_task(collect_foreground_outbound(bus, "Fetch the URL."))
     try:
         await started.wait()
         await loop.cancel_active_run()

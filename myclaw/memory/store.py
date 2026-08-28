@@ -7,7 +7,6 @@ import json
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.memory.records import SummaryEntry
@@ -16,14 +15,6 @@ from myclaw.utils.time import format_rfc3339_milliseconds
 
 type AtomicReplaceBytes = Callable[[Path, bytes], None]
 type AtomicReplaceText = Callable[[Path, str], None]
-
-
-class SummaryStore(Protocol):
-    """Append and read the ordered Conversation Summary stream."""
-
-    async def append(self, content: str, timestamp: datetime) -> SummaryEntry: ...
-
-    async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]: ...
 
 
 class WorkspaceJsonlSummaryStore:
@@ -48,9 +39,6 @@ class WorkspaceJsonlSummaryStore:
             entry = SummaryEntry(index=next_index, timestamp=timestamp, content=content)
             self._append_exact(entry)
             return entry
-
-    async def append_summary(self, content: str, timestamp: datetime) -> SummaryEntry:
-        return await self.append(content, timestamp)
 
     async def after(self, cursor: int, limit: int) -> tuple[SummaryEntry, ...]:
         async with self._lock:
@@ -114,41 +102,8 @@ class WorkspaceJsonlSummaryStore:
         )
 
 
-class MemoryStore(Protocol):
-    """Compatibility port combining Long-term Memory and Summary Cursor persistence."""
-
-    async def read_long_term(self) -> str: ...
-
-    async def replace_long_term(self, content: str) -> None: ...
-
-    async def read_summary_cursor(self) -> int: ...
-
-    async def write_summary_cursor(self, index: int) -> None: ...
-
-
 class MemoryPathDeniedError(PermissionError):
     """Raised when Long-term Memory aliases or identifies another file kind."""
-
-
-class SummaryCursorStore(Protocol):
-    """Persist the accepted position in the Conversation Summary stream."""
-
-    async def read(self) -> int: ...
-
-    async def write(self, index: int) -> None: ...
-
-
-class LongTermMemoryStore(Protocol):
-    """Persist the sole Long-term Memory document."""
-
-    @property
-    def path(self) -> Path: ...
-
-    async def read(self) -> str: ...
-
-    async def replace(self, content: str) -> None: ...
-
-    def read_sync(self) -> str: ...
 
 
 class _WorkspaceMemoryStore:
@@ -248,42 +203,3 @@ class WorkspaceSummaryCursorStore(_WorkspaceMemoryStore):
         async with self._lock:
             self._require_private_cursor_location()
             self._replace_text(self._path, f"{index}\n")
-
-
-class WorkspaceFileMemoryStore:
-    """Typed compatibility adapter over the two dedicated file stores."""
-
-    def __init__(
-        self,
-        workspace_state: WorkspaceState,
-        *,
-        replace_text: AtomicReplaceText = HOST_FILESYSTEM.atomic_replace_text,
-    ) -> None:
-        self.workspace_state = workspace_state
-        self._long_term = WorkspaceLongTermMemoryStore(
-            workspace_state,
-            replace_text=replace_text,
-        )
-        self._cursor = WorkspaceSummaryCursorStore(
-            workspace_state,
-            replace_text=replace_text,
-        )
-
-    @property
-    def long_term_path(self) -> Path:
-        return self._long_term.path
-
-    async def read_long_term(self) -> str:
-        return await self._long_term.read()
-
-    async def replace_long_term(self, content: str) -> None:
-        await self._long_term.replace(content)
-
-    def read_long_term_sync(self) -> str:
-        return self._long_term.read_sync()
-
-    async def read_summary_cursor(self) -> int:
-        return await self._cursor.read()
-
-    async def write_summary_cursor(self, index: int) -> None:
-        await self._cursor.write(index)

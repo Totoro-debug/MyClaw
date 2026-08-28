@@ -9,8 +9,9 @@ import pytest
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
-from myclaw.management.service import ManagementError, ManagementViewService
+from myclaw.management.service import ManagementError
 from myclaw.session.session import Session
+from tests.management.factories import management_service
 
 NOW = datetime(2026, 8, 4, 14, 30, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 SESSION_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -153,7 +154,7 @@ async def test_resume_listing_rejects_a_redirected_sessions_directory(
     _redirect_directory(state, workspace, "sessions")
 
     with pytest.raises(ManagementError) as captured:
-        await ManagementViewService(home, workspace_state=state).resumable_listing()
+        await management_service(home, workspace_state=state).resumable_listing()
 
     assert captured.value.error.code == "persistence_error"
 

@@ -21,11 +21,11 @@ from myclaw.agent.message_bus import MessageBus
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
+from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import FatalManagementError, ManagementError, ManagementViewService
 from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.conversation import TerminalConversationApp
-from myclaw.terminal.repl import ManagementDispatcher
 from tests.configuration.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,
@@ -334,7 +334,7 @@ class _FatalResumeProbe:
     schedule: Any
     router: Any
     dream: Any
-    dispatcher: ManagementDispatcher
+    dispatcher: ManagementCommandDispatcher
     target_id: str
     secret: str
 
@@ -353,13 +353,12 @@ def _invoke_cli_resume_preparation_failure(
     schedule_instance: Any = None
     router_instance: Any = None
     dream_instance: Any = None
-    dispatcher_instance: ManagementDispatcher | None = None
+    dispatcher_instance: ManagementCommandDispatcher | None = None
     persist_wait_count = 0
     persist_gate_started = asyncio.Event()
     release_persist_gate = asyncio.Event()
     target_secret = (
-        "sk-target-secret C:\\sensitive\\skill\\SKILL.md "
-        "Skill body: never print these instructions"
+        "sk-target-secret C:\\sensitive\\skill\\SKILL.md Skill body: never print these instructions"
     )
     safe_preflight_error = ErrorInfo(
         "skill_context_too_large",
@@ -593,11 +592,10 @@ def _invoke_cli_resume_preparation_failure(
             *,
             bus: MessageBus,
             control: TerminalAgentLoopControl,
-            management_dispatcher: ManagementDispatcher | None,
+            management_dispatcher: ManagementCommandDispatcher,
             skill_metadata: tuple[SkillMetadata, ...] = (),
         ) -> None:
             nonlocal app_instance, dispatcher_instance
-            assert management_dispatcher is not None
             super().__init__(
                 bus=bus,
                 control=control,
@@ -677,9 +675,7 @@ def _invoke_cli_resume_preparation_failure(
                 )
                 current = asyncio.current_task()
                 self.remaining_task_count = sum(
-                    1
-                    for task in asyncio.all_tasks()
-                    if task is not current and not task.done()
+                    1 for task in asyncio.all_tasks() if task is not current and not task.done()
                 )
             finally:
                 loop.set_exception_handler(previous_exception_handler)
@@ -771,13 +767,16 @@ def _assert_fatal_resume_preparation(
     assert probe.schedule.close_calls == 1
     assert probe.dream.close_calls == 1
     assert probe.router.close_calls == 1
-    assert max(
-        old.close_calls,
-        target.close_calls,
-        probe.schedule.close_calls,
-        probe.dream.close_calls,
-        probe.router.close_calls,
-    ) <= 1
+    assert (
+        max(
+            old.close_calls,
+            target.close_calls,
+            probe.schedule.close_calls,
+            probe.dream.close_calls,
+            probe.router.close_calls,
+        )
+        <= 1
+    )
     assert old.control.confirmation_callback is None
     assert probe.current_callback() is old
     unavailable = asyncio.run(probe.dispatcher.resume(probe.target_id))
@@ -1101,7 +1100,13 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
         "schedule_resume",
         "target_schedule_job",
     ]
-    assert events[27:] == ["schedule_pause", "schedule_close", "target_close", "dream_close", "router_close"]
+    assert events[27:] == [
+        "schedule_pause",
+        "schedule_close",
+        "target_close",
+        "dream_close",
+        "router_close",
+    ]
     assert events.count("old_init") == 1
     assert events.count("target_init") == 2
     assert len(bus_instances) == 1
@@ -1200,7 +1205,9 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
             nonlocal initial_loop, target_loop
             session_id = kwargs["session_id"]
             self.session = FakeSession()
-            self.control = FakeControl() if session_id is None else SimpleNamespace(has_active_run=False)
+            self.control = (
+                FakeControl() if session_id is None else SimpleNamespace(has_active_run=False)
+            )
             self.skill_metadata = ()
             if session_id is None:
                 initial_loop = self
@@ -1497,9 +1504,7 @@ async def test_cli_same_session_resume_waits_for_pending_persist_before_target_l
 
     assert events.index("persist_wait_started") < events.index("late_inbound_attempt")
     assert events.index("late_inbound_attempt") < events.index("replacement_barrier_release:True")
-    assert events.index("replacement_barrier_release:True") < events.index(
-        "persist_wait_finished"
-    )
+    assert events.index("replacement_barrier_release:True") < events.index("persist_wait_finished")
     assert events.index("persist_wait_finished") < events.index("target_init")
     assert events.count("replacement_barrier_pause") == 2
     assert events.count("target_init") == 1
@@ -1743,9 +1748,7 @@ def test_cli_reports_unexpected_startup_failure_without_raw_exception_output(
         result = CliRunner().invoke(cli.app, [])
 
         assert result.exit_code == 1
-        assert result.output.count(
-            "persistence_error: MyClaw runtime could not be started."
-        ) == 1
+        assert result.output.count("persistence_error: MyClaw runtime could not be started.") == 1
         assert secret not in result.output
         assert "Traceback" not in result.output
 

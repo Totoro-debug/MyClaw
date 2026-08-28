@@ -9,16 +9,14 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
 from myclaw.management.service import (
     ManagementError,
-    ManagementViewService,
     RuntimeStatus,
     RuntimeStatusInput,
     RuntimeStatusService,
-    SessionListingEntry,
 )
 from myclaw.memory.dream import DreamResult
 from myclaw.memory.manager import MemoryManager
-from myclaw.memory.store import WorkspaceFileMemoryStore
 from myclaw.session.session import Session
+from tests.management.factories import management_service
 
 CONFIG_WITH_PLAINTEXT_KEYS = """# User Configuration remains source-preserved.
 [models.providers.primary]
@@ -112,7 +110,7 @@ async def test_config_view_returns_complete_source_with_plaintext_keys_redacted(
     config_path = agent_home / "config.toml"
     config_path.write_text(CONFIG_WITH_PLAINTEXT_KEYS, encoding="utf-8")
 
-    view = await ManagementViewService(home).config_view()
+    view = await management_service(home).config_view()
 
     assert (view.path, view.redacted_content, view.error) == (
         config_path,
@@ -130,7 +128,7 @@ async def test_config_view_converts_decode_failure_to_safe_persistence_error(
     (agent_home / "config.toml").write_bytes(b'api_key = "raw-secret"\xff')
 
     with pytest.raises(ManagementError) as raised:
-        await ManagementViewService(home).config_view()
+        await management_service(home).config_view()
 
     assert (raised.value.error.code, raised.value.error.message) == (
         "persistence_error",
@@ -150,7 +148,11 @@ async def test_memory_view_reads_complete_latest_utf8_content_on_every_call(
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     memory_path = state.long_term_memory_path
     memory_path.write_text("initial memory\n", encoding="utf-8")
-    service = ManagementViewService(home, memory_manager=MemoryManager(state))
+    service = management_service(
+        home,
+        workspace_state=state,
+        memory_manager=MemoryManager(state),
+    )
 
     initial = await service.memory_view()
     updated_content = "# Long-term Memory\n\n\u7528\u6237\u504f\u597d\n" + (
@@ -172,11 +174,14 @@ async def test_memory_view_converts_decode_failure_to_safe_persistence_error(
     home.initialize()
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
+    memory_manager = MemoryManager(state)
     state.long_term_memory_path.write_bytes(b"raw-secret\xff")
 
     with pytest.raises(ManagementError) as raised:
-        await ManagementViewService(
-            home, memory_manager=WorkspaceFileMemoryStore(state)
+        await management_service(
+            home,
+            workspace_state=state,
+            memory_manager=memory_manager,
         ).memory_view()
 
     assert (raised.value.error.code, raised.value.error.message) == (
@@ -196,11 +201,14 @@ async def test_memory_view_converts_read_failure_to_safe_persistence_error(
     home.initialize()
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=Path.home() / ".myclaw")
+    memory_manager = MemoryManager(state)
     state.long_term_memory_path.unlink()
 
     with pytest.raises(ManagementError) as raised:
-        await ManagementViewService(
-            home, memory_manager=WorkspaceFileMemoryStore(state)
+        await management_service(
+            home,
+            workspace_state=state,
+            memory_manager=memory_manager,
         ).memory_view()
 
     assert (raised.value.error.code, raised.value.error.message) == (
@@ -224,7 +232,9 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
     monotonic = iter((112.9,)).__next__
-    status_service = RuntimeStatusService(
+    management = management_service(
+        home,
+        workspace_state=state,
         current_agent_loop=lambda: _StatusProjectionLoop(
             RuntimeStatusInput(
                 system_prompt="abcd",
@@ -246,7 +256,6 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
         ),
         monotonic=monotonic,
     )
-    management = ManagementViewService(home, status_service=status_service)
 
     status = await management.status()
 
@@ -265,6 +274,7 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
             "output_tokens": 0,
             "total_tokens": 0,
         },
+        schedule={"status": "available", "active_job_count": 0},
     )
 
 
@@ -391,7 +401,7 @@ async def test_management_status_builds_once_from_the_current_loop_projection(
         schedule_calls += 1
         return {"status": "available", "active_job_count": 2}
 
-    service = ManagementViewService(
+    service = management_service(
         home,
         current_agent_loop=current_loop,
         monotonic=lambda: 15.0,
@@ -429,7 +439,7 @@ async def test_status_uptime_clamps_a_monotonic_clock_rollback_to_zero(
             generation_started_at=100.0,
         )
     )
-    service = ManagementViewService(
+    service = management_service(
         home,
         current_agent_loop=lambda: loop,
         monotonic=lambda: 50.0,
@@ -467,8 +477,6 @@ async def test_generation_sensitive_views_snapshot_each_current_provider_once(
     memory = _MemoryReader("current memory")
     dream = _DreamRunner()
     current_loop_calls = 0
-    memory_provider_calls = 0
-    dream_provider_calls = 0
     replacements: list[tuple[str, bool]] = []
 
     def current_loop() -> _StatusProjectionLoop:
@@ -476,26 +484,16 @@ async def test_generation_sensitive_views_snapshot_each_current_provider_once(
         current_loop_calls += 1
         return loop
 
-    def current_memory() -> _MemoryReader:
-        nonlocal memory_provider_calls
-        memory_provider_calls += 1
-        return memory
-
-    def current_dream() -> _DreamRunner:
-        nonlocal dream_provider_calls
-        dream_provider_calls += 1
-        return dream
-
     async def replace_agent_loop(session_id: str, force: bool) -> None:
         replacements.append((session_id, force))
 
-    service = ManagementViewService(
+    service = management_service(
         home,
         current_agent_loop=current_loop,
         workspace_state=state,
         replace_agent_loop=replace_agent_loop,
-        current_memory_manager=current_memory,
-        current_dream=current_dream,
+        memory_manager=memory,
+        dream=dream,
     )
 
     assert await service.memory_view() == "current memory"
@@ -505,9 +503,7 @@ async def test_generation_sensitive_views_snapshot_each_current_provider_once(
     assert dream_result.status == "Dream complete"
     assert resume_result.session_id == target.session_id
     assert current_loop_calls == 3
-    assert memory_provider_calls == 1
     assert memory.calls == 1
-    assert dream_provider_calls == 1
     assert dream.calls == 1
     assert replacements == [(target.session_id, True)]
 
@@ -524,7 +520,6 @@ async def test_generation_sensitive_views_snapshot_each_current_provider_once(
 async def test_resume_prepares_before_loading_resumable_sessions(
     agent_home: Path,
     workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = AgentHome(agent_home)
     home.initialize()
@@ -536,7 +531,6 @@ async def test_resume_prepares_before_loading_resumable_sessions(
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
     target.add_message("user", "Resume target")
-    target.close()
     loop = _StatusProjectionLoop(
         RuntimeStatusInput(
             system_prompt="current",
@@ -550,37 +544,25 @@ async def test_resume_prepares_before_loading_resumable_sessions(
     async def prepare_session_resume(session_id: str) -> None:
         assert session_id == target.session_id
         events.append("prepare")
-
-    async def load_resumable_sessions() -> tuple[SessionListingEntry, ...]:
-        events.append("session_load")
-        return (
-            SessionListingEntry(
-                id=target.session_id,
-                title="Resume target",
-                created_at=target.created_at,
-                updated_at=target.updated_at,
-                message_count=len(target.messages),
-            ),
-        )
+        target.close()
 
     async def replace_agent_loop(session_id: str, force: bool) -> None:
         assert session_id == target.session_id
         assert force is False
         events.append("replace")
 
-    service = ManagementViewService(
+    service = management_service(
         home,
         current_agent_loop=lambda: loop,
         workspace_state=state,
         replace_agent_loop=replace_agent_loop,
         prepare_session_resume=prepare_session_resume,
     )
-    monkeypatch.setattr(service, "resumable_sessions", load_resumable_sessions)
 
     result = await service.resume(target.session_id)
 
     assert result.session_id == target.session_id
-    assert events == ["prepare", "session_load", "replace"]
+    assert events == ["prepare", "replace"]
 
 
 @pytest.mark.asyncio
@@ -595,37 +577,36 @@ async def test_generation_sensitive_views_keep_unavailable_error_and_skip_resour
     memory = _MemoryReader("must not be read")
     dream = _DreamRunner()
     current_calls = 0
-    memory_provider_calls = 0
-    dream_provider_calls = 0
+    schedule_calls = 0
+    prepare_calls = 0
     replacements: list[tuple[str, bool]] = []
 
     def unavailable_loop() -> _StatusProjectionLoop:
         nonlocal current_calls
         current_calls += 1
-        raise ManagementError(
-            ErrorInfo("route_unavailable", "Runtime Generation is unavailable.")
-        )
+        raise ManagementError(ErrorInfo("route_unavailable", "Runtime Generation is unavailable."))
 
-    def current_memory() -> _MemoryReader:
-        nonlocal memory_provider_calls
-        memory_provider_calls += 1
-        return memory
+    def schedule_status() -> dict[str, object]:
+        nonlocal schedule_calls
+        schedule_calls += 1
+        return {"status": "available"}
 
-    def current_dream() -> _DreamRunner:
-        nonlocal dream_provider_calls
-        dream_provider_calls += 1
-        return dream
+    async def prepare_session_resume(_session_id: str) -> None:
+        nonlocal prepare_calls
+        prepare_calls += 1
 
     async def replace_agent_loop(session_id: str, force: bool) -> None:
         replacements.append((session_id, force))
 
-    service = ManagementViewService(
+    service = management_service(
         home,
         current_agent_loop=unavailable_loop,
         workspace_state=state,
         replace_agent_loop=replace_agent_loop,
-        current_memory_manager=current_memory,
-        current_dream=current_dream,
+        prepare_session_resume=prepare_session_resume,
+        memory_manager=memory,
+        dream=dream,
+        schedule_status=schedule_status,
     )
     unavailable_id = "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000"
 
@@ -633,6 +614,7 @@ async def test_generation_sensitive_views_keep_unavailable_error_and_skip_resour
         service.status,
         service.memory_view,
         service.dream,
+        service.resumable_listing,
         lambda: service.resume(unavailable_id),
     )
     for operation in operations:
@@ -643,9 +625,9 @@ async def test_generation_sensitive_views_keep_unavailable_error_and_skip_resour
             "Runtime Generation is unavailable.",
         )
 
-    assert current_calls == 4
-    assert memory_provider_calls == 0
-    assert dream_provider_calls == 0
+    assert current_calls == 5
+    assert schedule_calls == 0
+    assert prepare_calls == 0
     assert memory.calls == 0
     assert dream.calls == 0
     assert replacements == []

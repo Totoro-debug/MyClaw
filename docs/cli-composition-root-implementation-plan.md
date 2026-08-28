@@ -312,7 +312,7 @@ class TerminalConversationApp:
         *,
         bus: MessageBus,
         control: TerminalAgentLoopControl,
-        management_dispatcher: ManagementDispatcher,
+        management_dispatcher: ManagementCommandDispatcher,
         skill_metadata: tuple[SkillMetadata, ...],
     ) -> None: ...
 
@@ -331,16 +331,17 @@ Management Service 接口保持现有命令契约，但其依赖改为：
 class ManagementViewService:
     def __init__(
         self,
-        ...,
+        agent_home: AgentHome,
+        *,
         current_agent_loop: Callable[[], AgentLoop],
         workspace_state: WorkspaceState,
         replace_agent_loop: Callable[[str, bool], Awaitable[None]],
         prepare_session_resume: Callable[[str], Awaitable[None]],
+        memory_manager: MemoryManager,
+        dream: Dream,
+        schedule_status: Callable[[], dict[str, object]],
         now: Callable[[], datetime],
         monotonic: Callable[[], float],
-        current_memory_manager: Callable[[], MemoryManager],
-        current_dream: Callable[[], Dream],
-        schedule_status: Callable[[], dict[str, object]],
     ) -> None: ...
 ```
 
@@ -873,7 +874,7 @@ old Session 仍不做 final save。相比当前实现，Agent Loop 与 Schedule 
 - `myclaw/skills/loader.py`（如采用独立 module）
 - `myclaw/memory/manager.py`（新增）
 - `myclaw/memory/dream.py`（新增）
-- `myclaw/memory/memory_task.py`（拆分后删除或只保留兼容 export，T7 前归零）
+- `myclaw/memory/memory_task.py`（拆分完成后删除；不保留兼容 export）
 - `myclaw/memory/memory_scheduler.py`（删除）
 - `myclaw/memory/conversation_summary.py`
 - `myclaw/schedule/model.py`
@@ -899,7 +900,7 @@ old Session 仍不做 final save。相比当前实现，Agent Loop 与 Schedule 
 - `tests/agent/test_schedule_loop.py`
 - `tests/agent/test_context.py`
 - `tests/skills/test_catalog.py`
-- `tests/memory/test_memory_task.py`（迁移为 Dream/Manager tests）
+- `tests/memory/test_memory_task.py`（有效 cases 迁入 Dream/Manager tests 后删除）
 - `tests/memory/test_memory_scheduler.py`（有效 cases 迁入 Schedule tests 后删除）
 - `tests/memory/test_conversation_summary.py`
 - `tests/scheduling/test_schedule_model.py`

@@ -265,7 +265,7 @@ def _loop(
     ] = _schedule_context,
     externalize_result_for: Callable[[Session], Callable[[ToolResult], ToolResult]] | None = None,
     task_framer: TaskFramingEvaluator | None = None,
-) -> tuple[AgentLoop, WorkspaceState, ScheduleService]:
+) -> tuple[AgentLoop, WorkspaceState, ScheduleService, MessageBus]:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
     agent_home = AgentHome(tmp_path / "agent-home")
@@ -274,6 +274,7 @@ def _loop(
     configuration = ConfigLoader(agent_home).load()
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=tmp_path / "agent-home")
+
     async def execute_user_job(job: ScheduleJob) -> None:
         del job
 
@@ -286,12 +287,13 @@ def _loop(
         execute_user_job=execute_user_job,
         execute_dream=execute_dream,
     )
+    bus = MessageBus()
     loop = AgentLoop(
         workspace_path=workspace,
         workspace_state=state,
         agent_home=agent_home,
         configuration=configuration,
-        bus=MessageBus(),
+        bus=bus,
         schedule_service=service,
         model_router=router,
         memory_manager=MemoryManager(state),
@@ -309,7 +311,7 @@ def _loop(
         object.__setattr__(loop, "_result_externalizer_for", externalize_result_for)
     object.__setattr__(loop, "_prepare_foreground_context", _foreground_context)
     object.__setattr__(loop, "_prepare_schedule_context", schedule_context_preparer)
-    return loop, state, service
+    return loop, state, service, bus
 
 
 async def _foreground_context(
@@ -337,8 +339,8 @@ class _Clock:
         await asyncio.Event().wait()
 
 
-async def _assert_no_outbound(loop: AgentLoop) -> None:
-    outbound = asyncio.create_task(loop.bus.get_outbound())
+async def _assert_no_outbound(bus: MessageBus) -> None:
+    outbound = asyncio.create_task(bus.get_outbound())
     done, _ = await asyncio.wait((outbound,), timeout=0)
     assert not done
     outbound.cancel()
@@ -351,9 +353,9 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
 ) -> None:
     router = _ScheduleRouter()
     framer = DeterministicTaskFramingEvaluator()
-    loop, state, _ = _loop(tmp_path, router, task_framer=framer)
+    loop, state, _, _bus = _loop(tmp_path, router, task_framer=framer)
 
-    outbound = asyncio.create_task(loop.bus.get_outbound())
+    outbound = asyncio.create_task(_bus.get_outbound())
     await loop.run_schedule_job(_job())
 
     done, _ = await asyncio.wait((outbound,), timeout=0)
@@ -378,7 +380,7 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
 
 @pytest.mark.asyncio
 async def test_schedule_run_rejects_system_job_before_session_creation(tmp_path: Path) -> None:
-    loop, state, _service = _loop(tmp_path, _ScheduleRouter())
+    loop, state, _service, _bus = _loop(tmp_path, _ScheduleRouter())
     system_job = ScheduleJob(
         job_id=DREAM_JOB_ID,
         source="system",
@@ -400,7 +402,7 @@ async def test_schedule_run_drains_session_persist_before_return(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    loop, _state, _service = _loop(tmp_path, _ScheduleRouter())
+    loop, _state, _service, _bus = _loop(tmp_path, _ScheduleRouter())
     persist_started = asyncio.Event()
     release_persist = asyncio.Event()
     captured: list[Session] = []
@@ -453,7 +455,7 @@ async def test_schedule_run_reloads_canonical_session_and_closes_each_run(
             {"role": "user", "content": current_user["content"]},
         ]
 
-    loop, state, _ = _loop(
+    loop, state, _, _bus = _loop(
         tmp_path,
         router,
         schedule_context_preparer=prepare_context,
@@ -498,13 +500,13 @@ async def test_schedule_failed_runner_persists_safe_error_and_maps_job_failure(
     tmp_path: Path,
 ) -> None:
     router = _ScheduleRouter(ModelCallError(ErrorInfo("provider_unavailable", "safe failure")))
-    loop, state, _ = _loop(tmp_path, router)
+    loop, state, _, _bus = _loop(tmp_path, router)
 
     with pytest.raises(ScheduleJobExecutionError) as raised:
         await loop.run_schedule_job(_job())
 
     assert raised.value.error == ErrorInfo("provider_unavailable", "safe failure")
-    await _assert_no_outbound(loop)
+    await _assert_no_outbound(_bus)
     schedule_session = Session.load(
         state,
         f"schedule_{JOB_ID}",
@@ -523,7 +525,7 @@ async def test_schedule_max_iterations_finishes_tools_without_a_fifty_first_mode
     tmp_path: Path,
 ) -> None:
     router = _MaxScheduleRouter()
-    loop, state, _ = _loop(tmp_path, router)
+    loop, state, _, _bus = _loop(tmp_path, router)
 
     with pytest.raises(ScheduleJobExecutionError) as raised:
         await loop.run_schedule_job(_job())
@@ -543,13 +545,13 @@ async def test_schedule_cancelled_runner_persists_user_and_propagates_cancelled_
     tmp_path: Path,
 ) -> None:
     router = _ScheduleRouter()
-    loop, state, service = _loop(tmp_path, router)
+    loop, state, service, _bus = _loop(tmp_path, router)
     await service.close()
 
     with pytest.raises(asyncio.CancelledError):
         await loop.run_schedule_job(_job())
 
-    await _assert_no_outbound(loop)
+    await _assert_no_outbound(_bus)
     schedule_session = Session.load(
         state,
         f"schedule_{JOB_ID}",
@@ -579,11 +581,11 @@ async def test_schedule_context_preparation_failures_reset_contextvar_and_preser
         del session, current_user
         raise asyncio.CancelledError()
 
-    success_loop, _, _ = _loop(tmp_path / "success", _ScheduleRouter())
+    success_loop, _, _, _success_bus = _loop(tmp_path / "success", _ScheduleRouter())
     await success_loop.run_schedule_job(_job())
     assert ScheduleTool._in_schedule_job.get() is False
 
-    failed_loop, failed_state, _ = _loop(
+    failed_loop, failed_state, _, _failed_bus = _loop(
         tmp_path / "failed",
         _ScheduleRouter(),
         schedule_context_preparer=unexpected_context,
@@ -593,7 +595,7 @@ async def test_schedule_context_preparation_failures_reset_contextvar_and_preser
     assert failed.value.error.code == "model_failed"
     assert ScheduleTool._in_schedule_job.get() is False
 
-    cancelled_loop, cancelled_state, _ = _loop(
+    cancelled_loop, cancelled_state, _, _cancelled_bus = _loop(
         tmp_path / "cancelled",
         _ScheduleRouter(),
         schedule_context_preparer=cancelled_context,
@@ -652,13 +654,13 @@ async def test_schedule_confirmation_required_tool_is_refused_without_foreground
         ),
         _ScheduleRouter._response(),
     )
-    loop, state, _ = _loop(tmp_path, router)
+    loop, state, _, _bus = _loop(tmp_path, router)
     confirmation_requests: list[object] = []
     loop.bind_confirmation_callback(confirmation_requests.append)
 
     await loop.run_schedule_job(_job())
 
-    await _assert_no_outbound(loop)
+    await _assert_no_outbound(_bus)
     schedule_session = Session.load(
         state,
         f"schedule_{JOB_ID}",
@@ -687,7 +689,7 @@ async def test_schedule_agent_reads_known_skill_path_via_shared_gateway(tmp_path
         ),
         _ScheduleRouter._response(),
     )
-    loop, state, _ = _loop(
+    loop, state, _, _bus = _loop(
         tmp_path,
         router,
         skill_snapshot=SkillSnapshot(root=skill_root, skills=()),
@@ -697,7 +699,7 @@ async def test_schedule_agent_reads_known_skill_path_via_shared_gateway(tmp_path
 
     await loop.run_schedule_job(_job())
 
-    await _assert_no_outbound(loop)
+    await _assert_no_outbound(_bus)
     schedule_session = Session.load(
         state,
         f"schedule_{JOB_ID}",
@@ -740,7 +742,7 @@ async def test_schedule_oversized_result_uses_canonical_schedule_artifact_sessio
         ),
         _ScheduleRouter._response(),
     )
-    loop, state, _ = _loop(
+    loop, state, _, _bus = _loop(
         tmp_path,
         router,
         externalize_result_for=externalizer_for,
@@ -767,9 +769,9 @@ async def test_foreground_cancel_does_not_cancel_overlapping_schedule_run(
     tmp_path: Path,
 ) -> None:
     router = _OverlapRouter()
-    loop, state, _ = _loop(tmp_path, router)
+    loop, state, _, _bus = _loop(tmp_path, router)
     await loop.start()
-    await loop.bus.put_inbound(InboundMessage("foreground input"))
+    await _bus.put_inbound(InboundMessage("foreground input"))
     await router.foreground_started.wait()
 
     schedule_task = asyncio.create_task(loop.run_schedule_job(_job()))
@@ -777,7 +779,7 @@ async def test_foreground_cancel_does_not_cancel_overlapping_schedule_run(
     await loop.cancel_active_run()
     assert not schedule_task.done()
 
-    foreground_terminal = await loop.bus.get_outbound()
+    foreground_terminal = await _bus.get_outbound()
     assert foreground_terminal.type == "system_control"
     assert foreground_terminal.metadata["finish_reason"] == "cancelled"
 
@@ -805,6 +807,7 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
     agent_home.initialize()
     (agent_home.path / "config.toml").write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
     configuration = ConfigLoader(agent_home).load()
+
     async def execute_user_job(job: ScheduleJob) -> None:
         del job
 
@@ -818,12 +821,13 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
         execute_dream=execute_dream,
     )
     router = _ScheduleToolOverlapRouter(service)
+    bus = MessageBus()
     loop = AgentLoop(
         workspace_path=workspace,
         workspace_state=state,
         agent_home=agent_home,
         configuration=configuration,
-        bus=MessageBus(),
+        bus=bus,
         schedule_service=service,
         model_router=router,
         memory_manager=MemoryManager(state),
@@ -841,9 +845,9 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
         await router.schedule_started.wait()
         assert not schedule_task.done()
 
-        await loop.bus.put_inbound(InboundMessage("create a foreground Schedule Job"))
+        await bus.put_inbound(InboundMessage("create a foreground Schedule Job"))
         while True:
-            outbound = await loop.bus.get_outbound()
+            outbound = await bus.get_outbound()
             if outbound.metadata.get("_streamed") is True:
                 break
 
@@ -852,7 +856,7 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
         assert foreground_jobs[0].message == "foreground add"
         assert not schedule_task.done()
 
-        schedule_outbound = asyncio.create_task(loop.bus.get_outbound())
+        schedule_outbound = asyncio.create_task(bus.get_outbound())
         router.schedule_release.set()
         await schedule_task
         done, _ = await asyncio.wait((schedule_outbound,), timeout=0)

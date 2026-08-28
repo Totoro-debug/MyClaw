@@ -308,7 +308,7 @@ def _agent_loop(
     *,
     schedule_clock: object,
     config_text: str = VALID_CONFIG,
-) -> tuple[AgentLoop, ModelRouter, ScheduleService]:
+) -> tuple[AgentLoop, ModelRouter, ScheduleService, MessageBus]:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
@@ -333,12 +333,13 @@ def _agent_loop(
         execute_user_job=execute_user_job,
         execute_dream=execute_dream,
     )
+    bus = MessageBus()
     loop = AgentLoop(
         workspace_path=workspace,
         workspace_state=state,
         agent_home=home,
         configuration=configuration,
-        bus=MessageBus(),
+        bus=bus,
         schedule_service=schedule,
         model_router=router,
         memory_manager=MemoryManager(state),
@@ -348,7 +349,7 @@ def _agent_loop(
         monotonic_now=schedule_clock.monotonic,  # type: ignore[attr-defined]
     )
     loop._task_framer = DeterministicTaskFramingEvaluator()
-    return loop, router, schedule
+    return loop, router, schedule, bus
 
 
 @pytest.mark.asyncio
@@ -1419,7 +1420,7 @@ async def test_agent_loop_executes_at_job_with_schedule_route_and_partition(
             ),
         )
     )
-    loop, router, schedule = _agent_loop(
+    loop, router, schedule, _bus = _agent_loop(
         agent_home,
         workspace,
         provider,
@@ -1458,7 +1459,7 @@ async def test_agent_loop_runs_foreground_while_every_job_is_active(
         _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
     )
     provider = ConcurrentScheduleAndForegroundProvider()
-    loop, router, schedule = _agent_loop(
+    loop, router, schedule, bus = _agent_loop(
         agent_home,
         workspace,
         provider,
@@ -1471,7 +1472,7 @@ async def test_agent_loop_runs_foreground_while_every_job_is_active(
         await provider.schedule_started.wait()
         assert schedule.status_snapshot().active_job_count == 1
 
-        messages = await collect_foreground_outbound(loop, "Run the foreground request.")
+        messages = await collect_foreground_outbound(bus, "Run the foreground request.")
 
         assert messages[-1].metadata == {"_streamed": True}
         assert schedule.status_snapshot().active_job_count == 1

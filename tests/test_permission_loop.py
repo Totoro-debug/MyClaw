@@ -34,7 +34,7 @@ def _agent_loop(
     home: AgentHome,
     workspace: Path,
     provider: ScriptedFakeProvider,
-) -> tuple[AgentLoop, ModelRouter, ScheduleService]:
+) -> tuple[AgentLoop, ModelRouter, ScheduleService, MessageBus]:
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=home.path)
     configuration = ConfigLoader(home).load()
@@ -57,12 +57,13 @@ def _agent_loop(
         execute_user_job=execute_user_job,
         execute_dream=execute_dream,
     )
+    bus = MessageBus()
     loop = AgentLoop(
         workspace_path=workspace,
         workspace_state=state,
         agent_home=home,
         configuration=configuration,
-        bus=MessageBus(),
+        bus=bus,
         schedule_service=schedule,
         model_router=router,
         memory_manager=MemoryManager(state),
@@ -71,7 +72,7 @@ def _agent_loop(
         new_uuid=uuid4,
         monotonic_now=lambda: 0.0,
     )
-    return loop, router, schedule
+    return loop, router, schedule, bus
 
 
 @pytest.mark.asyncio
@@ -132,12 +133,12 @@ async def test_foreground_mutations_execute_without_a_permission_pause(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    loop, router, schedule = _agent_loop(home, workspace, provider)
+    loop, router, schedule, bus = _agent_loop(home, workspace, provider)
     confirmations: list[object] = []
     loop.bind_confirmation_callback(confirmations.append)
     try:
         await loop.start()
-        messages = await collect_foreground_outbound(loop, "Change the files.")
+        messages = await collect_foreground_outbound(bus, "Change the files.")
     finally:
         await loop.close()
         await schedule.close()

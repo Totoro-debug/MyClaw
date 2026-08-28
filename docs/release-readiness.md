@@ -100,8 +100,8 @@ exists without executing its node.
 | --- | --- |
 | Session | `tests/sessions/test_session.py::test_persist_writes_one_complete_compact_utf8_snapshot_atomically` |
 | Summary | `tests/memory/test_records.py::test_summary_entry_serializes_with_exactly_three_keys` |
-| Cursor | `tests/memory/test_memory_task.py::test_memory_store_atomically_persists_the_canonical_summary_cursor` |
-| Long-term Memory | `tests/memory/test_memory_task.py::test_memory_store_atomically_replaces_exact_long_term_memory` |
+| Cursor | `tests/memory/test_memory_manager.py::test_manager_appends_and_claims_summaries_with_cursor_preadvance` |
+| Long-term Memory | `tests/memory/test_memory_manager.py::test_manager_reads_disk_and_refreshes_snapshot_after_an_edit` |
 | Schedule | `tests/scheduling/test_schedule_model.py::test_schedule_job_round_trips_the_strict_persisted_shape` |
 | Artifact | `tests/tools/test_base_tool.py::test_base_tool_result_handler_writes_a_bounded_workspace_artifact` |
 | Dream System Job | `tests/scheduling/test_schedule_dream.py::test_dream_registration_persists_a_hidden_recurring_system_job`; `tests/scheduling/test_schedule_dream.py::test_exact_dream_registration_performs_zero_store_writes`; `tests/scheduling/test_schedule_dream.py::test_due_dream_job_dispatches_directly_without_user_or_session_execution` |

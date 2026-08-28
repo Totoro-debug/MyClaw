@@ -7,8 +7,8 @@ import pytest
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
-from myclaw.management.service import ManagementViewService
 from myclaw.session.session import Session, SessionStoragePartition
+from tests.management.factories import management_service
 
 NOW = datetime(2026, 8, 1, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 FIRST_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -41,7 +41,7 @@ async def test_resume_listing_returns_current_workspace_sessions_in_update_order
     older.close()
     newer.update_metadata(title="Newest session")
     newer.close()
-    service = ManagementViewService(home, workspace_state=state)
+    service = management_service(home, workspace_state=state)
 
     listing = await service.resumable_listing()
 
@@ -67,7 +67,7 @@ async def test_resume_listing_excludes_schedule_session_partition(
     schedule.add_message("user", "Background work")
     schedule.close()
 
-    listing = await ManagementViewService(home, workspace_state=state).resumable_listing()
+    listing = await management_service(home, workspace_state=state).resumable_listing()
 
     assert listing.sessions == ()
     assert listing.skipped_count == 0
@@ -90,7 +90,7 @@ async def test_resume_listing_skips_corrupt_entries_without_mutating_them(
     corrupt_path.write_text("not-json\n", encoding="utf-8")
     before = corrupt_path.read_bytes()
 
-    listing = await ManagementViewService(home, workspace_state=state).resumable_listing()
+    listing = await management_service(home, workspace_state=state).resumable_listing()
 
     assert listing.skipped_count == 1
     assert [item.id for item in listing.sessions] == [valid.session_id]
@@ -127,7 +127,7 @@ async def test_resume_listing_skips_a_session_with_malformed_field_types(
         encoding="utf-8",
     )
 
-    listing = await ManagementViewService(home, workspace_state=state).resumable_listing()
+    listing = await management_service(home, workspace_state=state).resumable_listing()
 
     assert listing.skipped_count == 1
     assert [item.id for item in listing.sessions] == [valid.session_id]
@@ -145,13 +145,13 @@ async def test_resume_selects_the_loaded_session_for_the_agent_loop_owner(
     target.close()
     selected: list[tuple[str, bool]] = []
 
-    async def replace_session(session_id: str, force: bool) -> None:
+    async def replace_agent_loop(session_id: str, force: bool) -> None:
         selected.append((session_id, force))
 
-    service = ManagementViewService(
+    service = management_service(
         home,
         workspace_state=state,
-        replace_session=replace_session,
+        replace_agent_loop=replace_agent_loop,
     )
 
     result = await service.resume(target.session_id)

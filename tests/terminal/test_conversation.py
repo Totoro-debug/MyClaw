@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -52,9 +51,7 @@ from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.conversation import (
     TerminalConversationApp,
-    TerminalConversationError,
     _format_activity_duration,
-    run_terminal_conversation,
 )
 from myclaw.terminal.conversation import (
     _MessageBusRunProjection as _AgentRunProjection,
@@ -632,6 +629,35 @@ class _ScriptedControl:
         return False
 
 
+class _UnavailableManagement:
+    @staticmethod
+    def _unavailable() -> None:
+        raise ManagementError(ErrorInfo("route_unavailable", "Runtime Generation is unavailable."))
+
+    async def config_view(self) -> Any:
+        self._unavailable()
+
+    async def status(self) -> Any:
+        self._unavailable()
+
+    async def memory_view(self) -> str:
+        self._unavailable()
+
+    async def dream(self) -> DreamResult:
+        self._unavailable()
+
+    async def resumable_listing(self) -> Any:
+        self._unavailable()
+
+    async def resume(self, _session_id: str, *, force: bool = False) -> Any:
+        del force
+        self._unavailable()
+
+
+def _management_dispatcher() -> ManagementCommandDispatcher:
+    return ManagementCommandDispatcher(cast(Any, _UnavailableManagement()))
+
+
 class FakeTerminalBackend:
     def __init__(self, source: _ScriptedSource) -> None:
         self.source = source
@@ -646,7 +672,7 @@ class FakeTerminalBackend:
 
         self.bus.put_outbound = record_outbound  # type: ignore[method-assign]
         self.control = _ScriptedControl(source)
-        self.management_dispatcher: object | None = None
+        self.management_dispatcher = _management_dispatcher()
         self.session_id = "test-session"
         self.start_calls = 0
         self.close_calls = 0
@@ -874,10 +900,11 @@ class FailingCloseBackend(FakeTerminalBackend):
 
 def _terminal_backend(
     source: _ScriptedSource,
-    management_dispatcher: object | None = None,
+    management_dispatcher: ManagementCommandDispatcher | None = None,
 ) -> FakeTerminalBackend:
     backend = FakeTerminalBackend(source)
-    backend.management_dispatcher = management_dispatcher
+    if management_dispatcher is not None:
+        backend.management_dispatcher = management_dispatcher
     return backend
 
 
@@ -885,33 +912,34 @@ def _direct_terminal_loop(
     agent_home: Path,
     workspace: Path,
     provider: _FixedCatalogProvider,
-) -> AgentLoop:
-    loop, router, schedule = _direct_agent_loop(agent_home, workspace, provider)
+) -> tuple[AgentLoop, MessageBus]:
+    loop, router, schedule, bus = _direct_agent_loop(agent_home, workspace, provider)
 
     async def close_components() -> None:
         await schedule.close()
         await router.close()
 
     object.__setattr__(loop, "_terminal_test_cleanup", close_components)
-    return loop
+    return loop, bus
 
 
 def _terminal_app(
     runtime: Any,
     *,
+    bus: MessageBus | None = None,
     app_type: type[TerminalConversationApp] = TerminalConversationApp,
     monotonic: Callable[[], float] | None = None,
     skill_metadata: tuple[SkillMetadata, ...] = (),
-    management_dispatcher: object | None = None,
+    management_dispatcher: ManagementCommandDispatcher | None = None,
     cleanup: Callable[[], Awaitable[None]] | None = None,
 ) -> TerminalConversationApp:
     dispatcher = (
-        getattr(runtime, "management_dispatcher", None)
+        getattr(runtime, "management_dispatcher", _management_dispatcher())
         if management_dispatcher is None
         else management_dispatcher
     )
     kwargs: dict[str, object] = {
-        "bus": runtime.bus,
+        "bus": runtime.bus if bus is None else bus,
         "control": runtime.control,
         "management_dispatcher": dispatcher,
         "skill_metadata": skill_metadata,
@@ -1117,7 +1145,7 @@ async def test_rebind_agent_loop_only_replaces_generation_presentation() -> None
     app = TerminalConversationApp(
         bus=bus,
         control=initial_control,
-        management_dispatcher=None,
+        management_dispatcher=_management_dispatcher(),
         skill_metadata=initial_metadata,
     )
 
@@ -1133,7 +1161,7 @@ async def test_rebind_agent_loop_only_replaces_generation_presentation() -> None
         await pilot.pause()
 
         assert app._bus is bus
-        assert app._management_dispatcher is None
+        assert isinstance(app._management_dispatcher, ManagementCommandDispatcher)
         assert app._control is target_control
         assert app._skill_metadata == target_metadata
         assert "Target projection" in _visible_screen_text(app)
@@ -1147,7 +1175,7 @@ async def test_rebind_discards_a_stale_inbound_snapshot_callback() -> None:
     app = TerminalConversationApp(
         bus=bus,
         control=initial_control,
-        management_dispatcher=None,
+        management_dispatcher=_management_dispatcher(),
     )
 
     async with app.run_test(size=(80, 24)):
@@ -1179,7 +1207,7 @@ async def test_terminal_unmount_clears_ui_owned_generation_state() -> None:
     app = TerminalConversationApp(
         bus=MessageBus(),
         control=_DirectControl(),
-        management_dispatcher=None,
+        management_dispatcher=_management_dispatcher(),
     )
 
     async with app.run_test(size=(80, 24)):
@@ -1549,9 +1577,7 @@ async def test_resume_picker_scrolls_in_management_order_and_selects_by_keyboard
             session = Session.create(
                 initial.session.workspace_state,
                 now=_constant_datetime(datetime(2027, 1, 1, 0, index, tzinfo=UTC)),
-                new_uuid=_constant_uuid(
-                    UUID(f"00000000-0000-4000-8000-{index + 1:012x}")
-                ),
+                new_uuid=_constant_uuid(UUID(f"00000000-0000-4000-8000-{index + 1:012x}")),
             )
             session.update_metadata(title=f"Session {index:02d}")
             session.add_message("user", f"Content {index:02d}.")
@@ -1571,10 +1597,9 @@ async def test_resume_picker_scrolls_in_management_order_and_selects_by_keyboard
         await pilot.press(*(("down",) * 23), "enter")
 
         async with asyncio.timeout(3):
-            while (
-                cast(AgentLoop, app._control).session.session_id != sessions[0].session_id
-                or "Content 00." not in _visible_screen_text(app)
-            ):
+            while cast(AgentLoop, app._control).session.session_id != sessions[
+                0
+            ].session_id or "Content 00." not in _visible_screen_text(app):
                 await pilot.pause()
 
         assert "Content 00." in _visible_screen_text(app)
@@ -1812,8 +1837,7 @@ async def test_resume_projects_unknown_reversed_and_unclassifiable_history_safel
         groups = list(app.query(".agent-run-activity-group"))
         assert len(groups) == 2
         headings = [
-            str(group.query_one(".agent-run-activity-heading", Static).content)
-            for group in groups
+            str(group.query_one(".agent-run-activity-heading", Static).content) for group in groups
         ]
         assert headings == ["\u25bc 1s", "\u25bc 0s"]
         assert all(group.query_one(".agent-run-activity-content").display for group in groups)
@@ -1961,7 +1985,7 @@ async def test_up_drain_keeps_an_inbound_consumed_during_the_atomic_drain() -> N
     app = TerminalConversationApp(
         bus=bus,
         control=control,
-        management_dispatcher=None,
+        management_dispatcher=_management_dispatcher(),
     )
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("first"), "enter")
@@ -2000,7 +2024,7 @@ async def test_sparse_protocol_errors_and_duplicate_terminal_do_not_poison_next_
     app = TerminalConversationApp(
         bus=bus,
         control=control,
-        management_dispatcher=None,
+        management_dispatcher=_management_dispatcher(),
     )
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("malformed"), "enter")
@@ -2084,6 +2108,20 @@ async def test_nonblank_enter_echoes_user_before_consuming_agent_events() -> Non
             conversation.continue_to_output()
             await asyncio.wait_for(submission, timeout=1)
             await _wait_for_turn(app)
+
+
+@pytest.mark.asyncio
+async def test_unknown_slash_input_remains_an_ordinary_foreground_turn() -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/unknown"), "enter")
+        await _wait_for_turn(app)
+
+        assert conversation.submissions == ["/unknown"]
+        assert runtime.inbound_history == [InboundMessage(content="/unknown")]
 
 
 @pytest.mark.asyncio
@@ -2916,12 +2954,12 @@ async def test_replacing_the_display_stops_a_frozen_run_timer(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    runtime = _direct_terminal_loop(
+    runtime, bus = _direct_terminal_loop(
         agent_home,
         workspace,
         _FixedCatalogProvider(()),
     )
-    app = _terminal_app(runtime)
+    app = _terminal_app(runtime, bus=bus)
 
     async with app.run_test(size=(80, 24)):
         projection = _AgentRunProjection(app, TURN_ID)
@@ -3055,6 +3093,9 @@ async def test_manual_activity_disclosure_keeps_heading_position_while_content_g
         heading = app.query_one(".agent-run-activity-heading", Static)
         content = app.query_one(".agent-run-activity-content")
         assert not content.display
+        async with asyncio.timeout(2):
+            while heading.region.y < 0 or heading.region.bottom > app.screen.size.height:
+                await pilot.pause()
 
         await pilot.click(".agent-run-activity-heading")
         async with asyncio.timeout(1):
@@ -3815,8 +3856,12 @@ async def test_markdown_structure_is_visible_while_the_fenced_block_is_incomplet
         submission = asyncio.create_task(pilot.press(*list("progress"), "enter"))
         try:
             await asyncio.wait_for(conversation.first_delta_emitted.wait(), timeout=1)
-            await asyncio.sleep(0.05)
-            await pilot.pause()
+            async with asyncio.timeout(2):
+                while not all(
+                    marker in _visible_screen_text(app)
+                    for marker in ("Heading", "first item", "quoted text", "value=1")
+                ):
+                    await pilot.pause()
 
             visible_text = _visible_screen_text(app)
             assert "Heading" in visible_text
@@ -4071,8 +4116,8 @@ async def test_terminal_conversation_uses_the_direct_terminal_loop_lifecycle(
     workspace: Path,
 ) -> None:
     provider = _FixedCatalogProvider((_response(content="Prepared runtime answer."),))
-    runtime = _direct_terminal_loop(agent_home, workspace, provider)
-    app = _terminal_app(runtime)
+    runtime, bus = _direct_terminal_loop(agent_home, workspace, provider)
+    app = _terminal_app(runtime, bus=bus)
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("h", "i", "enter")
@@ -4133,8 +4178,8 @@ async def test_terminal_renders_reasoning_from_each_tool_loop_model_call(
             _response(content="Final answer."),
         )
     )
-    runtime = _direct_terminal_loop(agent_home, workspace, provider)
-    app = _terminal_app(runtime)
+    runtime, bus = _direct_terminal_loop(agent_home, workspace, provider)
+    app = _terminal_app(runtime, bus=bus)
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -4167,8 +4212,8 @@ async def test_direct_terminal_loop_exec_confirmation_preserves_the_exact_long_c
             _response(content="The command was declined."),
         )
     )
-    runtime = _direct_terminal_loop(agent_home, workspace, provider)
-    app = _terminal_app(runtime)
+    runtime, bus = _direct_terminal_loop(agent_home, workspace, provider)
+    app = _terminal_app(runtime, bus=bus)
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("run it"), "enter"))
@@ -4209,8 +4254,8 @@ async def test_direct_terminal_loop_close_cancels_the_pending_confirmation_futur
             ),
         )
     )
-    runtime = _direct_terminal_loop(agent_home, workspace, provider)
-    app = _terminal_app(runtime)
+    runtime, bus = _direct_terminal_loop(agent_home, workspace, provider)
+    app = _terminal_app(runtime, bus=bus)
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("run it"), "enter"))
@@ -4228,8 +4273,8 @@ async def test_direct_terminal_loop_cancellation_preserves_partial_and_allows_ne
     workspace: Path,
 ) -> None:
     provider = CancellableProvider()
-    runtime = _direct_terminal_loop(agent_home, workspace, provider)
-    app = _terminal_app(runtime)
+    runtime, bus = _direct_terminal_loop(agent_home, workspace, provider)
+    app = _terminal_app(runtime, bus=bus)
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("first"), "enter"))
@@ -4435,9 +4480,12 @@ async def test_conversation_scrollbar_supports_pointer_dragging() -> None:
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("drag"), "enter")
-        await asyncio.sleep(0.1)
+        await _wait_for_turn(app)
         display = app.query_one("#conversation-display")
         scrollbar = display.vertical_scrollbar
+        async with asyncio.timeout(2):
+            while scrollbar.region.height < 6 or scrollbar.region.x <= 0:
+                await pilot.pause()
         start = (scrollbar.region.x, scrollbar.region.bottom - 2)
         end = (scrollbar.region.x, scrollbar.region.bottom - 5)
 
@@ -4540,21 +4588,22 @@ async def test_historical_resize_preserves_a_visible_message_anchor() -> None:
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("resize"), "enter")
-        await asyncio.sleep(0.1)
+        await _wait_for_turn(app)
         display = app.query_one("#conversation-display")
         await pilot.press("ctrl+home")
         await pilot.press("pagedown")
-        await asyncio.sleep(0.05)
+        await pilot.pause()
         before_resize = _visible_screen_text(app)
         anchor = next(
             f"anchor {index:02d}" for index in range(50) if f"anchor {index:02d}" in before_resize
         )
 
         await pilot.resize_terminal(40, 24)
-        await asyncio.sleep(0.1)
-        after_resize = _visible_screen_text(app)
+        async with asyncio.timeout(2):
+            while anchor not in _visible_screen_text(app):
+                await pilot.pause()
 
-        assert anchor in after_resize
+        assert anchor in _visible_screen_text(app)
         assert not display.is_vertical_scroll_end
 
 
@@ -5143,38 +5192,6 @@ async def test_partial_terminal_stop_failure_restores_all_modes_before_runtime_c
     assert runtime.close_saw_terminal_restored
 
 
-@pytest.mark.parametrize(
-    "redirected_stream",
-    ("stdin", "stdout", "stderr", "__stdin__", "__stdout__", "__stderr__"),
-)
-def test_non_tty_terminal_streams_are_rejected_before_textual_starts(
-    monkeypatch: pytest.MonkeyPatch,
-    redirected_stream: str,
-) -> None:
-    class TerminalStream:
-        def __init__(self, interactive: bool) -> None:
-            self._interactive = interactive
-
-        def isatty(self) -> bool:
-            return self._interactive
-
-    stream_names = ("stdin", "stdout", "stderr", "__stdin__", "__stdout__", "__stderr__")
-    for stream_name in stream_names:
-        monkeypatch.setattr(sys, stream_name, TerminalStream(stream_name != redirected_stream))
-
-    def app_must_not_start(_: object) -> None:
-        raise AssertionError("Textual started for a non-TTY invocation")
-
-    monkeypatch.setattr(TerminalConversationApp, "run", app_must_not_start)
-
-    with pytest.raises(TerminalConversationError, match="interactive stdin, stdout, and stderr"):
-        run_terminal_conversation(
-            bus=MessageBus(),
-            control=_DirectControl(),
-            management_dispatcher=None,
-        )
-
-
 @pytest.mark.asyncio
 async def test_management_completion_supports_keyboard_filtering_and_escape() -> None:
     conversation = ScriptedRunSource()
@@ -5515,9 +5532,9 @@ async def test_management_error_row_preserves_later_command_interaction(
             )
 
     provider = _FixedCatalogProvider(())
-    runtime = _direct_terminal_loop(agent_home, workspace, provider)
+    runtime, bus = _direct_terminal_loop(agent_home, workspace, provider)
     dispatcher = ManagementCommandDispatcher(cast(Any, Management()))
-    app = _terminal_app(runtime, management_dispatcher=dispatcher)
+    app = _terminal_app(runtime, bus=bus, management_dispatcher=dispatcher)
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("/memory"), "enter")

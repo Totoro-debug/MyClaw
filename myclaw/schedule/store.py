@@ -128,31 +128,10 @@ class WorkspaceScheduleStore:
             candidate = (
                 (*self._jobs, reconciled)
                 if current is None
-                else tuple(
-                    reconciled if item.job_id == job.job_id else item for item in self._jobs
-                )
+                else tuple(reconciled if item.job_id == job.job_id else item for item in self._jobs)
             )
-            self._publish_locked(candidate)
+            self._publish(candidate)
             return copy.deepcopy(reconciled)
-
-    def _register_system_job_sync(self, job: ScheduleJob) -> ScheduleJob:
-        """Reconcile a system Job before the dispatcher has any waiters."""
-        _require_system_job(job)
-        self._ensure_available()
-        current = next((item for item in self._jobs if item.job_id == job.job_id), None)
-        if current is not None and current.source != "system":
-            raise ScheduleStateError(self.path)
-        reconciled = _reconcile_system_job(current, job)
-        if reconciled is None:
-            assert current is not None
-            return copy.deepcopy(current)
-        candidate = (
-            (*self._jobs, reconciled)
-            if current is None
-            else tuple(reconciled if item.job_id == job.job_id else item for item in self._jobs)
-        )
-        self._publish_unlocked(candidate)
-        return copy.deepcopy(reconciled)
 
     async def _add_job(self, job: ScheduleJob) -> ScheduleJob:
         if not isinstance(job, ScheduleJob):
@@ -166,7 +145,7 @@ class WorkspaceScheduleStore:
             if any(existing.job_id == job.job_id for existing in self._jobs):
                 raise ValueError("Schedule Job ID already exists")
             candidate = (*self._jobs, copy.deepcopy(job))
-            self._publish_locked(candidate)
+            self._publish(candidate)
             return copy.deepcopy(job)
 
     async def remove_user_job(
@@ -271,7 +250,7 @@ class WorkspaceScheduleStore:
                 updated_at_ms=max(current.updated_at_ms, commit_now),
             )
             candidate = tuple(updated if job.job_id == job_id else job for job in self._jobs)
-            self._publish_locked(candidate)
+            self._publish(candidate)
             return copy.deepcopy(updated)
 
     async def wait_for_change(self, revision: int) -> int:
@@ -317,20 +296,14 @@ class WorkspaceScheduleStore:
                 elif current != expected:
                     return False
             candidate = tuple(job for job in self._jobs if job.job_id != job_id)
-            self._publish_locked(candidate)
+            self._publish(candidate)
             return True
 
     def _ensure_available(self) -> None:
         if self._faulted:
             raise ScheduleStoreFaultedError("Schedule Store is faulted")
 
-    def _publish_locked(self, candidate: tuple[ScheduleJob, ...]) -> None:
-        self._publish(candidate, notify=True)
-
-    def _publish_unlocked(self, candidate: tuple[ScheduleJob, ...]) -> None:
-        self._publish(candidate, notify=False)
-
-    def _publish(self, candidate: tuple[ScheduleJob, ...], *, notify: bool) -> None:
+    def _publish(self, candidate: tuple[ScheduleJob, ...]) -> None:
         try:
             encoded = _serialize_document(candidate)
             if _parse_document(encoded) != candidate:
@@ -339,13 +312,11 @@ class WorkspaceScheduleStore:
             self._replace_text(self.path, encoded)
         except Exception:
             self._faulted = True
-            if notify:
-                self._condition.notify_all()
+            self._condition.notify_all()
             raise
         self._jobs = copy.deepcopy(candidate)
         self._revision += 1
-        if notify:
-            self._condition.notify_all()
+        self._condition.notify_all()
 
     def _require_write_location(self) -> None:
         workspace_root = self.workspace_state.workspace_path.resolve(strict=True)

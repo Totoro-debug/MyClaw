@@ -116,7 +116,7 @@ async def _exercise_cli_contract(
     configuration: UserConfiguration,
     monkeypatch: pytest.MonkeyPatch,
     before_resume: Callable[[AgentLoop], None] | None = None,
-    verify_target: Callable[[AgentLoop], Awaitable[None]] | None = None,
+    verify_target: Callable[[AgentLoop, MessageBus], Awaitable[None]] | None = None,
 ) -> tuple[list[str], AgentLoop, tuple[SkillMetadata, ...]]:
     app: _CliContractApp | None = None
 
@@ -132,7 +132,7 @@ async def _exercise_cli_contract(
 
         async def verify_same_session_target(self, loop: AgentLoop) -> None:
             if verify_target is not None:
-                await verify_target(loop)
+                await verify_target(loop, self._bus)
 
     monkeypatch.setattr(cli, "TerminalConversationApp", ContractApp)
     await cli._run_cli_conversation(
@@ -160,9 +160,7 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
     current_skill.write_bytes(
         b"---\nname: current\ndescription: Original\nalways: true\n---\nOriginal body\n"
     )
-    removed_skill.write_bytes(
-        b"---\nname: removed\ndescription: Removed\n---\nRemoved body\n"
-    )
+    removed_skill.write_bytes(b"---\nname: removed\ndescription: Removed\n---\nRemoved body\n")
     configuration = _configuration(
         agent_home,
         VALID_CONFIG.replace(
@@ -218,11 +216,12 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
             b"---\nname: added\ndescription: Added\nalways: true\n---\nAdded body\n"
         )
 
-    async def assert_refreshed(target: AgentLoop) -> None:
-        assert [
-            (metadata.name, metadata.description) for metadata in target.skill_metadata
-        ] == [("added", "Added"), ("current", "Refreshed")]
-        messages = await collect_foreground_outbound(target, "Inspect refreshed Skills.")
+    async def assert_refreshed(target: AgentLoop, bus: MessageBus) -> None:
+        assert [(metadata.name, metadata.description) for metadata in target.skill_metadata] == [
+            ("added", "Added"),
+            ("current", "Refreshed"),
+        ]
+        messages = await collect_foreground_outbound(bus, "Inspect refreshed Skills.")
         assert any(message.content == "Fresh Skill prompt observed." for message in messages)
         assert len(provider.stream_requests) == 1
         system_prompt = provider.stream_requests[0].messages[0]["content"]
@@ -246,9 +245,10 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
     )
 
     assert events == ["quiesce", "rebind"]
-    assert [
-        (metadata.name, metadata.description) for metadata in rebound_metadata
-    ] == [("added", "Added"), ("current", "Refreshed")]
+    assert [(metadata.name, metadata.description) for metadata in rebound_metadata] == [
+        ("added", "Added"),
+        ("current", "Refreshed"),
+    ]
     assert len(constructed) == 2
     assert constructed == [constructed[0], target]
 

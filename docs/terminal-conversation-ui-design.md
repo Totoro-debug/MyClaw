@@ -119,7 +119,7 @@ This document records the agreed user-facing contract for MyClaw's Command-line 
 
 ## Host And Lifecycle
 
-- Textual `>=8.2.8,<9` hosts the full-screen UI. The existing headless `run_repl` seam remains available for Runtime and adapter tests, not as a user-selected UI.
+- Textual `>=8.2.8,<9` hosts the sole full-screen Terminal Conversation. Non-interactive input is rejected by the CLI; there is no plain or headless REPL fallback.
 - A narrow enhanced-keyboard adapter detects and enables modifier-aware Enter input where the terminal protocol supports it. Unsupported terminals use `Ctrl+J` for reliable multiline entry.
 - Mouse reporting covers conversation-wheel events and Confirmation controls.
 - Interactive lists and confirmation options accept clicks. Conversation and code-block scrollbars appear only on overflow and support pointer dragging; ordinary content remains non-interactive.
