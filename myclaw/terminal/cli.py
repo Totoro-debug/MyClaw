@@ -45,6 +45,32 @@ app = typer.Typer(
 )
 console = Console()
 
+_SKILL_CONTEXT_TOO_LARGE_ERROR = ErrorInfo(
+    "skill_context_too_large",
+    "Always-loaded Skill content exceeds the foreground chat input budget.",
+)
+_WORKSPACE_STATE_INITIALIZATION_ERROR = ErrorInfo(
+    "persistence_error",
+    "Workspace State could not be initialized at the reserved path.",
+)
+_TARGET_SESSION_PREPARATION_ERROR = ErrorInfo(
+    "persistence_error",
+    "Conversation Session could not be prepared.",
+)
+_RUNTIME_SESSION_REPLACEMENT_ERROR = ErrorInfo(
+    "persistence_error",
+    "Runtime Session replacement could not be completed.",
+)
+_RUNTIME_STARTUP_ERROR = ErrorInfo(
+    "persistence_error",
+    "MyClaw runtime could not be started.",
+)
+_SAFE_FATAL_MANAGEMENT_ERRORS = (
+    _SKILL_CONTEXT_TOO_LARGE_ERROR,
+    _TARGET_SESSION_PREPARATION_ERROR,
+    _RUNTIME_SESSION_REPLACEMENT_ERROR,
+)
+
 
 def _local_now() -> datetime:
     return datetime.now().astimezone()
@@ -62,6 +88,32 @@ def _print_error_info(error: ErrorInfo) -> None:
 def _print_error(error: ErrorInfo, path: object) -> None:
     _print_error_info(error)
     console.print(f"Path: {path}", markup=False, highlight=False, soft_wrap=True)
+
+
+def _approved_error_info(
+    error: Exception,
+    *,
+    approved: tuple[ErrorInfo, ...],
+    fallback: ErrorInfo,
+) -> ErrorInfo:
+    """Return only an exact, approved safe value from a domain exception."""
+    candidate = vars(error).get("error")
+    if type(candidate) is ErrorInfo and candidate in approved:
+        return candidate
+    return fallback
+
+
+def _fatal_target_preparation_error(error: Exception) -> FatalManagementError:
+    """Map only an established safe domain error across the fatal boundary."""
+    if isinstance(error, SkillContextTooLargeError):
+        return FatalManagementError(
+            _approved_error_info(
+                error,
+                approved=(_SKILL_CONTEXT_TOO_LARGE_ERROR,),
+                fallback=_TARGET_SESSION_PREPARATION_ERROR,
+            )
+        )
+    return FatalManagementError(_TARGET_SESSION_PREPARATION_ERROR)
 
 
 async def _run_cli_conversation(
@@ -226,7 +278,21 @@ async def _run_cli_conversation(
                     await old_loop._pause_for_replacement()
                     replacement_barrier_held = True
                     await wait_for_session_persist(old_loop, session_id)
+                except asyncio.CancelledError:
+                    pending_target = None
+                    await release_replacement_barrier(resume_inbound=True)
+                    raise
+                except Exception as error:
+                    pending_target = None
+                    await release_replacement_barrier(resume_inbound=True)
+                    raise ManagementError(
+                        ErrorInfo(
+                            "persistence_error",
+                            "Conversation Session could not be prepared.",
+                        )
+                    ) from error
 
+                try:
                     target = create_agent_loop(session_id)
                     pending_target = target
                     target.preflight()
@@ -246,29 +312,18 @@ async def _run_cli_conversation(
                     target_cleanup_error: Exception | None = None
                     if target is not None:
                         try:
-                            await abort_target_for_management(target)
+                            await abort_loop_once(target)
                         except asyncio.CancelledError:
                             raise
                         except Exception as caught:
                             target_cleanup_error = caught
                     pending_target = None
-                    await release_replacement_barrier(resume_inbound=True)
                     if target_cleanup_error is not None:
-                        raise ManagementError(
-                            ErrorInfo(
-                                "persistence_error",
-                                "Conversation Session could not be prepared.",
-                            )
-                        ) from BaseExceptionGroup(
+                        raise _fatal_target_preparation_error(error) from BaseExceptionGroup(
                             "Conversation Session preparation cleanup failed",
                             (error, target_cleanup_error),
                         )
-                    raise ManagementError(
-                        ErrorInfo(
-                            "persistence_error",
-                            "Conversation Session could not be prepared.",
-                        )
-                    ) from error
+                    raise _fatal_target_preparation_error(error) from error
 
                 assert target is not None
                 try:
@@ -323,10 +378,7 @@ async def _run_cli_conversation(
                     if management is not None:
                         management.deactivate()
                     raise FatalManagementError(
-                        ErrorInfo(
-                            "persistence_error",
-                            "Runtime Session replacement could not be completed.",
-                        )
+                        _RUNTIME_SESSION_REPLACEMENT_ERROR
                     ) from error
                 finally:
                     await release_replacement_barrier(
@@ -471,23 +523,29 @@ def main(context: typer.Context) -> None:
                 configuration=configuration,
             )
         )
-    except WorkspaceStateError as workspace_state_error:
-        _print_error_info(workspace_state_error.error)
+    except WorkspaceStateError:
+        _print_error_info(_WORKSPACE_STATE_INITIALIZATION_ERROR)
         raise typer.Exit(code=1) from None
     except SkillContextTooLargeError as skill_error:
-        _print_error_info(skill_error.error)
+        _print_error_info(
+            _approved_error_info(
+                skill_error,
+                approved=(_SKILL_CONTEXT_TOO_LARGE_ERROR,),
+                fallback=_RUNTIME_STARTUP_ERROR,
+            )
+        )
         raise typer.Exit(code=1) from None
     except FatalManagementError as fatal_error:
-        _print_error_info(fatal_error.error)
-        raise typer.Exit(code=1) from None
-    except Exception as startup_error:
-        error_info = getattr(startup_error, "error", None)
-        if not isinstance(error_info, ErrorInfo):
-            error_info = ErrorInfo(
-                "persistence_error",
-                "MyClaw runtime could not be started.",
+        _print_error_info(
+            _approved_error_info(
+                fatal_error,
+                approved=_SAFE_FATAL_MANAGEMENT_ERRORS,
+                fallback=_RUNTIME_STARTUP_ERROR,
             )
-        _print_error_info(error_info)
+        )
+        raise typer.Exit(code=1) from None
+    except Exception:
+        _print_error_info(_RUNTIME_STARTUP_ERROR)
         raise typer.Exit(code=1) from None
 
 

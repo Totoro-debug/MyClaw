@@ -6,19 +6,26 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
+from uuid import UUID
 
 import pytest
 from typer.testing import CliRunner
 
 import myclaw.terminal.cli as cli
-from myclaw.agent.loop import SkillContextTooLargeError
-from myclaw.agent.workspace_state import WorkspaceStateError
+from myclaw.agent.loop import SkillContextTooLargeError, TerminalAgentLoopControl
+from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
-from myclaw.management.service import FatalManagementError, ManagementError
+from myclaw.management.service import FatalManagementError, ManagementError, ManagementViewService
+from myclaw.session.session import Session
+from myclaw.skills.catalog import SkillMetadata
+from myclaw.terminal.conversation import TerminalConversationApp
+from myclaw.terminal.repl import ManagementDispatcher
 from tests.configuration.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,
@@ -316,66 +323,141 @@ async def test_cli_async_root_cleans_partial_startup_without_registering_dream_j
     ]
 
 
-@pytest.mark.asyncio
-async def test_cli_resume_preflight_failure_preserves_current_generation(
+@dataclass(slots=True)
+class _FatalResumeProbe:
+    result: Any
+    events: list[str]
+    app: Any
+    loops: list[Any]
+    current_callback: Callable[[], object]
+    bus: Any
+    schedule: Any
+    router: Any
+    dream: Any
+    dispatcher: ManagementDispatcher
+    target_id: str
+    secret: str
+
+
+def _invoke_cli_resume_preparation_failure(
+    *,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-) -> None:
+    failure_kind: Literal["constructor", "preflight"],
+) -> _FatalResumeProbe:
     events: list[str] = []
+    loops: list[Any] = []
     current_callback: Callable[[], object] | None = None
-    replace_callback: Callable[[str, bool], Awaitable[None]] | None = None
-    initial_loop: object | None = None
+    app_instance: Any = None
+    bus_instance: Any = None
+    schedule_instance: Any = None
+    router_instance: Any = None
+    dream_instance: Any = None
+    dispatcher_instance: ManagementDispatcher | None = None
+    persist_wait_count = 0
+    persist_gate_started = asyncio.Event()
+    release_persist_gate = asyncio.Event()
+    target_secret = (
+        "sk-target-secret C:\\sensitive\\skill\\SKILL.md "
+        "Skill body: never print these instructions"
+    )
+    safe_preflight_error = ErrorInfo(
+        "skill_context_too_large",
+        "Always-loaded Skill content exceeds the foreground chat input budget.",
+    )
 
-    class FakeSession:
-        session_id = "old"
-
-        async def wait_for_pending_persist(self) -> None:
-            events.append("old_wait_for_persist")
-
-    class FakeControl:
-        has_active_run = False
-
-    class FakeWorkspaceState:
-        def __init__(self, workspace_path: Path) -> None:
-            self.workspace_path = workspace_path
-
-        def initialize(self, *, agent_home_root: Path) -> None:
-            del agent_home_root
+    home = AgentHome(tmp_path / "agent-home")
+    home.initialize()
+    (home.path / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=home.path)
+    target_session = Session.create(
+        state,
+        now=lambda: cli._local_now(),
+        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
+    )
+    target_session.add_message("user", "Target session")
+    target_session.close()
+    target_id = target_session.session_id
 
     class FakeBus:
+        def __init__(self) -> None:
+            nonlocal bus_instance
+            self.reset_calls = 0
+            self.inbound_callback: Callable[[tuple[object, ...]], None] | None = None
+            self.outbound_blocker = asyncio.Event()
+            bus_instance = self
+
+        async def inbound_snapshot(self) -> tuple[object, ...]:
+            return ()
+
+        def set_inbound_changed_callback(
+            self,
+            callback: Callable[[tuple[object, ...]], None],
+        ) -> None:
+            self.inbound_callback = callback
+
+        def unbind_inbound_changed_callback(
+            self,
+            callback: Callable[[tuple[object, ...]], None],
+        ) -> None:
+            if self.inbound_callback is callback:
+                self.inbound_callback = None
+
+        async def get_outbound(self) -> object:
+            await self.outbound_blocker.wait()
+            raise AssertionError("Fake outbound blocker must be cancelled")
+
         async def reset(self) -> None:
+            self.reset_calls += 1
             events.append("bus_reset")
 
     class FakeRouter:
         def __init__(self, **kwargs: object) -> None:
+            nonlocal router_instance
             del kwargs
+            self.close_calls = 0
+            events.append("router_init")
+            router_instance = self
 
         async def close(self) -> None:
+            self.close_calls += 1
             events.append("router_close")
 
     class FakeMemoryManager:
-        def __init__(self, workspace_state: FakeWorkspaceState) -> None:
+        def __init__(self, workspace_state: object) -> None:
             del workspace_state
 
     class FakeDream:
         def __init__(self, **kwargs: object) -> None:
+            nonlocal dream_instance
             del kwargs
+            self.close_calls = 0
+            dream_instance = self
 
         async def run(self) -> object:
             raise AssertionError("Dream must not run")
 
         async def close(self) -> None:
+            self.close_calls += 1
             events.append("dream_close")
 
     class FakeScheduleService:
         def __init__(self, **kwargs: object) -> None:
+            nonlocal schedule_instance
             del kwargs
+            self.pause_calls = 0
+            self.close_calls = 0
+            self.resume_calls = 0
+            schedule_instance = self
 
         def context_timezone_name(self) -> str:
             return "Asia/Shanghai"
 
         def _prepare_start(self) -> None:
-            return None
+            events.append("schedule_preflight")
 
         async def register_dream_job(self, **kwargs: object) -> None:
             del kwargs
@@ -384,118 +466,362 @@ async def test_cli_resume_preflight_failure_preserves_current_generation(
             events.append("schedule_start")
 
         async def pause_and_drain(self) -> None:
+            self.pause_calls += 1
             events.append("schedule_pause")
 
+        def resume(self) -> None:
+            self.resume_calls += 1
+            events.append("schedule_resume")
+
         async def close(self) -> None:
+            self.close_calls += 1
             events.append("schedule_close")
 
         def status_snapshot(self) -> object:
             return SimpleNamespace(to_dict=lambda: {})
 
-    class FakeAgentLoop:
-        def __init__(self, **kwargs: object) -> None:
-            nonlocal initial_loop
-            session_id = kwargs["session_id"]
+    class FakeControl:
+        def __init__(self, session_id: str) -> None:
             self.session_id = session_id
-            self.control = FakeControl()
-            self.skill_metadata = ()
-            self.session = FakeSession()
-            if session_id is None:
-                initial_loop = self
-                events.append("old_init")
-            else:
-                events.append("target_init")
+            self.confirmation_callback: Callable[[object], None] | None = None
 
-        def preflight(self) -> None:
-            if self.session_id is not None:
-                events.append("target_preflight")
-                assert current_callback is not None
-                assert current_callback() is initial_loop
-                raise RuntimeError("target preflight failed")
-            events.append("old_preflight")
+        @property
+        def has_active_run(self) -> bool:
+            return False
 
-        async def start(self) -> None:
-            events.append("target_start" if self.session_id is not None else "old_start")
+        @property
+        def has_pending_confirmation(self) -> bool:
+            return False
 
-        async def close(self) -> None:
-            events.append("old_close")
+        async def cancel_active_run(self) -> None:
+            raise AssertionError("No active run may be cancelled")
 
-        async def abort(self) -> None:
-            events.append("target_abort" if self.session_id is not None else "old_abort")
+        def bind_confirmation_callback(self, callback: Callable[[object], None]) -> None:
+            self.confirmation_callback = callback
 
-        async def _pause_for_replacement(self) -> None:
-            return None
+        def unbind_confirmation_callback(self, callback: Callable[[object], None]) -> None:
+            if self.confirmation_callback is callback:
+                self.confirmation_callback = None
 
-        async def _release_replacement_barrier(self, *, resume_inbound: bool) -> None:
-            del resume_inbound
+        def respond_to_confirmation(self, *args: object) -> None:
+            raise AssertionError(f"Unexpected confirmation response: {args!r}")
 
         def project_foreground_conversation(self) -> object:
             return SimpleNamespace(session_id=self.session_id, messages=())
 
-    class FakeManagementService:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            nonlocal current_callback, replace_callback
-            del args
-            current_callback = cast(Callable[[], object], kwargs["current_agent_loop"])
-            replace_callback = cast(
-                Callable[[str, bool], Awaitable[None]],
-                kwargs["replace_agent_loop"],
-            )
+    class FakeSession:
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
 
-        def deactivate(self) -> None:
-            return None
+        async def wait_for_pending_persist(self) -> None:
+            nonlocal persist_wait_count
+            persist_wait_count += 1
+            events.append(f"old_persist_wait:{persist_wait_count}")
+            if persist_wait_count == 2:
+                persist_gate_started.set()
+                await release_persist_gate.wait()
+                events.append("old_persist_gate_released")
 
-    class FakeDispatcher:
-        def __init__(self, management: object) -> None:
-            del management
-
-    class FakeApp:
+    class FakeAgentLoop:
         def __init__(self, **kwargs: object) -> None:
-            del kwargs
+            session_id = cast(str | None, kwargs["session_id"])
+            self.is_target = session_id is not None
+            self.session_id = target_id
+            self.control = FakeControl(target_id)
+            self.skill_metadata = ()
+            self.session = FakeSession(self.session_id)
+            self.close_calls = 0
+            self.abort_calls = 0
+            self.replacement_barrier_held = False
+            loops.append(self)
+            if not self.is_target:
+                events.append("old_init")
+            else:
+                events.append("target_init")
+                if failure_kind == "constructor":
+                    raise SkillContextTooLargeError(
+                        ErrorInfo("skill_context_too_large", target_secret)
+                    )
 
-        async def run_async(self) -> None:
-            assert replace_callback is not None
-            try:
-                await replace_callback("target", False)
-            except ManagementError as error:
-                assert error.error.code == "persistence_error"
-                events.append("management_error")
+        def preflight(self) -> None:
+            if not self.is_target:
+                events.append("old_preflight")
+                return
+            events.append("target_preflight")
+            if failure_kind == "preflight":
+                try:
+                    raise RuntimeError(target_secret)
+                except RuntimeError as cause:
+                    raise SkillContextTooLargeError(safe_preflight_error) from cause
+
+        async def start(self) -> None:
+            events.append("target_start" if self.is_target else "old_start")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if not self.is_target:
+                assert self.replacement_barrier_held is True
+            events.append("target_close" if self.is_target else "old_close")
+
+        async def abort(self) -> None:
+            self.abort_calls += 1
+            events.append("target_abort" if self.is_target else "old_abort")
+
+        async def _pause_for_replacement(self) -> None:
+            assert self.replacement_barrier_held is False
+            self.replacement_barrier_held = True
+            events.append("old_quiesce")
+
+        async def _release_replacement_barrier(self, *, resume_inbound: bool) -> None:
+            self.replacement_barrier_held = False
+            events.append(f"old_barrier_release:{resume_inbound}")
+
+        def project_foreground_conversation(self) -> object:
+            return SimpleNamespace(session_id=self.session_id, messages=())
+
+    def recording_management_service(
+        agent_home: AgentHome,
+        **kwargs: Any,
+    ) -> ManagementViewService:
+        nonlocal current_callback
+        current_callback = cast(Callable[[], object], kwargs["current_agent_loop"])
+        return ManagementViewService(agent_home, **kwargs)
+
+    class FatalResumeApp(TerminalConversationApp):
+        def __init__(
+            self,
+            *,
+            bus: MessageBus,
+            control: TerminalAgentLoopControl,
+            management_dispatcher: ManagementDispatcher | None,
+            skill_metadata: tuple[SkillMetadata, ...] = (),
+        ) -> None:
+            nonlocal app_instance, dispatcher_instance
+            assert management_dispatcher is not None
+            super().__init__(
+                bus=bus,
+                control=control,
+                management_dispatcher=management_dispatcher,
+                skill_metadata=skill_metadata,
+            )
+            self.exit_calls = 0
+            self.remaining_task_count = -1
+            self.resume_task_retrieved = False
+            self.loop_error_contexts: list[dict[str, object]] = []
+            self.ui_stopped = False
+            app_instance = self
+            dispatcher_instance = management_dispatcher
+
+        def exit(
+            self,
+            result: None = None,
+            return_code: int = 0,
+            message: Any = None,
+        ) -> None:
+            self.exit_calls += 1
+            events.append(f"terminal_exit:{return_code}")
+            super().exit(result=result, return_code=return_code, message=message)
+
+        async def _mount_management_rows(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            events.append("management_render")
 
         async def quiesce_for_rebind(self) -> None:
-            events.append("quiesce")
+            events.append("presentation_quiesce")
+            await super().quiesce_for_rebind()
 
-        async def rebind_agent_loop(self, **kwargs: object) -> None:
-            del kwargs
-            events.append("rebind")
+        async def rebind_agent_loop(self, **kwargs: Any) -> None:
+            events.append("presentation_rebind")
+            await super().rebind_agent_loop(**kwargs)
 
-    monkeypatch.setattr(cli, "WorkspaceState", FakeWorkspaceState)
+        async def run_async(self, **options: Any) -> None:
+            del options
+            loop = asyncio.get_running_loop()
+            previous_exception_handler = loop.get_exception_handler()
+
+            def capture_loop_error(
+                active_loop: asyncio.AbstractEventLoop,
+                context: dict[str, Any],
+            ) -> None:
+                del active_loop
+                self.loop_error_contexts.append(dict(context))
+
+            loop.set_exception_handler(capture_loop_error)
+            try:
+                async with self.run_test(size=(80, 24)):
+                    input_area = cast(Any, self.query_one("#conversation-input"))
+                    input_area.read_only = True
+                    resume_task = asyncio.create_task(
+                        self._resume_selected_session(target_id, cast(Any, input_area)),
+                        name="fatal-resume-test-driver",
+                    )
+                    try:
+                        await asyncio.wait_for(persist_gate_started.wait(), timeout=1)
+                        assert loops[0].replacement_barrier_held is True
+                        assert "target_init" not in events
+                        events.append("persist_gate_observed")
+                        release_persist_gate.set()
+                        await resume_task
+                        resume_task.result()
+                        self.resume_task_retrieved = True
+                    finally:
+                        if not resume_task.done():
+                            resume_task.cancel()
+                        await asyncio.gather(resume_task, return_exceptions=True)
+                self.ui_stopped = (
+                    self._closing
+                    and self._presentation_quiesced
+                    and self._outbound_worker is None
+                    and self._resume_worker is None
+                    and self._bus_callback is None
+                )
+                current = asyncio.current_task()
+                self.remaining_task_count = sum(
+                    1
+                    for task in asyncio.all_tasks()
+                    if task is not current and not task.done()
+                )
+            finally:
+                loop.set_exception_handler(previous_exception_handler)
+            assert current_callback is not None
+            assert current_callback() is loops[0]
+            events.append("terminal_run_return")
+
+    monkeypatch.setattr(AgentHome, "production", lambda: home)
+    monkeypatch.setattr(cli, "is_interactive_terminal", lambda: True)
     monkeypatch.setattr(cli, "MessageBus", FakeBus)
     monkeypatch.setattr(cli, "ModelRouter", FakeRouter)
     monkeypatch.setattr(cli, "MemoryManager", FakeMemoryManager)
     monkeypatch.setattr(cli, "Dream", FakeDream)
     monkeypatch.setattr(cli, "ScheduleService", FakeScheduleService)
     monkeypatch.setattr(cli, "AgentLoop", FakeAgentLoop)
-    monkeypatch.setattr(cli, "ManagementViewService", FakeManagementService)
-    monkeypatch.setattr(cli, "ManagementCommandDispatcher", FakeDispatcher)
-    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
+    monkeypatch.setattr(cli, "ManagementViewService", recording_management_service)
+    monkeypatch.setattr(cli, "TerminalConversationApp", FatalResumeApp)
+    monkeypatch.chdir(workspace)
 
-    home = AgentHome(tmp_path / "agent-home")
-    configuration: Any = SimpleNamespace(
-        memory=SimpleNamespace(schedule="0 * * * *", batch_size=10),
-        runtime=SimpleNamespace(max_iterations=50),
+    result = CliRunner().invoke(cli.app, [])
+    assert app_instance is not None
+    assert current_callback is not None
+    assert bus_instance is not None
+    assert schedule_instance is not None
+    assert router_instance is not None
+    assert dream_instance is not None
+    assert dispatcher_instance is not None
+    return _FatalResumeProbe(
+        result=result,
+        events=events,
+        app=app_instance,
+        loops=loops,
+        current_callback=current_callback,
+        bus=bus_instance,
+        schedule=schedule_instance,
+        router=router_instance,
+        dream=dream_instance,
+        dispatcher=dispatcher_instance,
+        target_id=target_id,
+        secret=target_secret,
     )
 
-    await cli._run_cli_conversation(
-        agent_home=home,
-        workspace=tmp_path / "workspace",
-        configuration=configuration,
-    )
 
-    assert "quiesce" not in events
-    assert "rebind" not in events
+def _assert_fatal_resume_preparation(
+    probe: _FatalResumeProbe,
+    *,
+    safe_error: str,
+    target_abort_count: int,
+) -> None:
+    result = probe.result
+    events = probe.events
+    app = probe.app
+    old = cast(Any, probe.loops[0])
+    target = cast(Any, probe.loops[1])
+
+    assert result.exit_code == 1
+    assert result.output.count(safe_error) == 1
+    assert probe.secret not in result.output
+    assert "Traceback" not in result.output
+    assert app.exit_calls == 1
+    assert app.fatal_management_error is not None
+    assert app.ui_stopped is True
+    assert app.resume_task_retrieved is True
+    assert app.remaining_task_count == 0
+    assert app.loop_error_contexts == []
+    assert events.index("old_quiesce") < events.index("old_persist_wait:2")
+    assert events.index("old_persist_wait:2") < events.index("persist_gate_observed")
+    assert events.index("persist_gate_observed") < events.index("old_persist_gate_released")
+    assert events.index("old_persist_gate_released") < events.index("target_init")
+    assert events.index("terminal_exit:1") < events.index("schedule_pause")
+    assert events.index("schedule_pause") < events.index("old_close")
+    assert events[: events.index("terminal_exit:1")].count("schedule_pause") == 0
+    assert "presentation_quiesce" not in events
+    assert "presentation_rebind" not in events
+    assert "target_start" not in events
+    assert "old_abort" not in events
+    assert "old_barrier_release:True" not in events
     assert "bus_reset" not in events
-    assert events.index("target_preflight") < events.index("target_abort")
-    assert events.index("target_abort") < events.index("management_error")
+    assert "management_render" not in events
+    assert old.replacement_barrier_held is True
+    assert old.close_calls == 1
+    assert old.abort_calls == 0
+    assert target.close_calls == 0
+    assert target.abort_calls == target_abort_count
+    assert probe.bus.reset_calls == 0
+    assert probe.bus.inbound_callback is None
+    assert probe.schedule.pause_calls == 1
+    assert probe.schedule.resume_calls == 0
+    assert probe.schedule.close_calls == 1
+    assert probe.dream.close_calls == 1
+    assert probe.router.close_calls == 1
+    assert max(
+        old.close_calls,
+        target.close_calls,
+        probe.schedule.close_calls,
+        probe.dream.close_calls,
+        probe.router.close_calls,
+    ) <= 1
+    assert old.control.confirmation_callback is None
+    assert probe.current_callback() is old
+    unavailable = asyncio.run(probe.dispatcher.resume(probe.target_id))
+    assert unavailable.output == "route_unavailable: Runtime Generation is no longer active."
+
+
+def test_cli_resume_constructor_failure_terminates_safely(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    probe = _invoke_cli_resume_preparation_failure(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        failure_kind="constructor",
+    )
+
+    _assert_fatal_resume_preparation(
+        probe,
+        safe_error="persistence_error: Conversation Session could not be prepared.",
+        target_abort_count=0,
+    )
+    assert "target_preflight" not in probe.events
+
+
+def test_cli_resume_preflight_failure_terminates_safely(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    probe = _invoke_cli_resume_preparation_failure(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        failure_kind="preflight",
+    )
+
+    _assert_fatal_resume_preparation(
+        probe,
+        safe_error=(
+            "skill_context_too_large: Always-loaded Skill content exceeds the "
+            "foreground chat input budget."
+        ),
+        target_abort_count=1,
+    )
+    assert probe.events.index("target_init") < probe.events.index("target_preflight")
+    assert probe.events.index("target_preflight") < probe.events.index("target_abort")
 
 
 @pytest.mark.asyncio
@@ -1392,19 +1718,36 @@ def test_cli_reports_unexpected_startup_failure_without_raw_exception_output(
     monkeypatch.setattr(cli, "is_interactive_terminal", lambda: True)
     secret = "sk-startup-secret C:\\sensitive\\skill\\SKILL.md"
 
-    def fail_startup(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise RuntimeError(secret)
-
-    monkeypatch.setattr(cli, "_run_cli_conversation", fail_startup)
     monkeypatch.chdir(workspace)
 
-    result = CliRunner().invoke(cli.app, [])
+    class ErrorCarryingFailure(RuntimeError):
+        def __init__(self) -> None:
+            self.error = ErrorInfo("persistence_error", secret)
+            super().__init__(secret)
 
-    assert result.exit_code == 1
-    assert result.output.count("persistence_error:") == 1
-    assert secret not in result.output
-    assert "Traceback" not in result.output
+    failures = (
+        ErrorCarryingFailure(),
+        SkillContextTooLargeError(ErrorInfo("skill_context_too_large", secret)),
+        FatalManagementError(ErrorInfo("persistence_error", secret)),
+    )
+    for failure in failures:
+
+        async def fail_startup(
+            failure_to_raise: Exception = failure,
+            **kwargs: object,
+        ) -> None:
+            del kwargs
+            raise failure_to_raise
+
+        monkeypatch.setattr(cli, "_run_cli_conversation", fail_startup)
+        result = CliRunner().invoke(cli.app, [])
+
+        assert result.exit_code == 1
+        assert result.output.count(
+            "persistence_error: MyClaw runtime could not be started."
+        ) == 1
+        assert secret not in result.output
+        assert "Traceback" not in result.output
 
 
 def test_cli_workspace_state_failure_outputs_one_safe_error_without_path(
