@@ -1,5 +1,6 @@
 """Reusable boundary fakes and pytest fixtures."""
 
+from tests.fixtures.agent_loop import collect_foreground_outbound
 from tests.fixtures.clock import FakeClock
 from tests.fixtures.framing import (
     BlockingTaskFramingEvaluator,
@@ -27,6 +28,7 @@ __all__ = [
     "ScriptedFakeRouter",
     "SingleToolGateway",
     "StreamScript",
+    "collect_foreground_outbound",
     "unexpected_provider_factory",
     "write_schedule_state",
 ]

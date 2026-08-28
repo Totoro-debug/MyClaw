@@ -1,7 +1,12 @@
 import ast
+import os
 import re
+import shutil
 import subprocess
+import sys
+import tarfile
 import tomllib
+import zipfile
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -144,6 +149,99 @@ def test_distribution_metadata_builds_one_host_neutral_wheel() -> None:
     setup_path = ROOT / "setup.cfg"
     setup = setup_path.read_text(encoding="utf-8") if setup_path.exists() else ""
     assert "plat_name" not in setup
+
+
+def _ignore_unclean_build_inputs(_directory: str, names: list[str]) -> set[str]:
+    ignored = {".codegraph", ".git", ".pytest_cache", "build", "dist", "__pycache__"}
+    return {name for name in names if name in ignored or name.endswith(".egg-info")}
+
+
+def test_clean_distributions_omit_deleted_agent_module_and_import_cleanly(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    shutil.copytree(ROOT, source_root, ignore=_ignore_unclean_build_inputs)
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+
+    build_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--no-isolation",
+            "--sdist",
+            "--wheel",
+            "--outdir",
+            str(artifact_dir),
+        ],
+        cwd=source_root,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert build_result.returncode == 0, build_result.stderr
+
+    sdists = tuple(artifact_dir.glob("myclaw-*.tar.gz"))
+    wheels = tuple(artifact_dir.glob("myclaw-*.whl"))
+    assert len(sdists) == 1
+    assert len(wheels) == 1
+
+    with tarfile.open(sdists[0], "r:gz") as archive:
+        sdist_members = {member.name.replace("\\", "/") for member in archive.getmembers()}
+    with zipfile.ZipFile(wheels[0]) as archive:
+        wheel_members = {member.replace("\\", "/") for member in archive.namelist()}
+
+    assert not any(member.endswith("/myclaw/agent/runtime.py") for member in sdist_members)
+    assert "myclaw/agent/runtime.py" not in wheel_members
+
+    install_root = tmp_path / "clean-install"
+    install_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-deps",
+            "--target",
+            str(install_root),
+            str(wheels[0]),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert install_result.returncode == 0, install_result.stderr
+
+    clean_import_dir = tmp_path / "clean-import"
+    clean_import_dir.mkdir()
+    import_result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import importlib\n"
+                "import importlib.util\n"
+                "import myclaw\n"
+                "import myclaw.terminal.cli\n"
+                "legacy_module = '.'.join(('myclaw', 'agent', 'runtime'))\n"
+                "assert importlib.util.find_spec(legacy_module) is None\n"
+                "try:\n"
+                "    importlib.import_module(legacy_module)\n"
+                "except ModuleNotFoundError:\n"
+                "    pass\n"
+                "else:\n"
+                "    raise AssertionError('deleted Agent module is importable')\n"
+            ),
+        ],
+        cwd=clean_import_dir,
+        env={**os.environ, "PYTHONPATH": str(install_root)},
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert import_result.returncode == 0, import_result.stderr
 
 
 def test_active_code_has_no_platform_support_gate() -> None:

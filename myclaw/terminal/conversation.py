@@ -2124,9 +2124,9 @@ class TerminalConversationApp(App[None]):
         self._bus_snapshot = ()
         active_projection = self._active_run_projection
         if active_projection is not None:
-            active_projection.stop()
+            await active_projection.close()
         for run in self._consumed_runs:
-            run.projection.stop()
+            await run.projection.close()
         self._consumed_runs.clear()
         self._run_ready = Event()
         self._cancel_requested_turn = None

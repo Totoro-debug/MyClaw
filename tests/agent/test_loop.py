@@ -50,7 +50,11 @@ from myclaw.skills.catalog import (
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
-from tests.fixtures import BlockingTaskFramingEvaluator, DeterministicTaskFramingEvaluator
+from tests.fixtures import (
+    BlockingTaskFramingEvaluator,
+    DeterministicTaskFramingEvaluator,
+    collect_foreground_outbound,
+)
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 
@@ -281,6 +285,52 @@ class _EventRouter(_Router):
         async def replay() -> AsyncIterator[ModelStreamEvent]:
             for event in events:
                 yield event
+
+        return replay()
+
+
+class _TitleBehaviorRouter(_Router):
+    def __init__(
+        self,
+        foreground: Sequence[ModelResponse],
+        *,
+        title: ModelResponse,
+        delay_title: bool = False,
+        block_first_foreground: bool = False,
+    ) -> None:
+        super().__init__(())
+        self._foreground = deque(foreground)
+        self._title = title
+        self._delay_title = delay_title
+        self._block_first_foreground = block_first_foreground
+        self.title_started = asyncio.Event()
+        self.release_title = asyncio.Event()
+        self.foreground_started = asyncio.Event()
+
+    def stream(
+        self,
+        route: Literal["chat", "schedule"],
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del route, tools, continuation
+        is_title = messages[0].get("content") == "Generate a title"
+        self.calls.append("title" if is_title else "chat")
+
+        async def replay() -> AsyncIterator[ModelStreamEvent]:
+            if is_title:
+                self.title_started.set()
+                if self._delay_title:
+                    await self.release_title.wait()
+                yield ModelCompleted(response=self._title)
+                return
+            self.foreground_started.set()
+            if self._block_first_foreground:
+                self._block_first_foreground = False
+                await asyncio.Event().wait()
+            yield ModelCompleted(response=self._foreground.popleft())
 
         return replay()
 
@@ -2425,6 +2475,152 @@ async def test_foreground_commit_preserves_staged_framing_until_slow_title_finis
         "output_tokens": 4,
         "total_tokens": 11,
     }
+
+
+@pytest.mark.asyncio
+async def test_late_title_is_persisted_by_the_next_completed_turn(tmp_path: Path) -> None:
+    router = _TitleBehaviorRouter(
+        (_response("First response."), _response("Second response.")),
+        title=_response("Generated late title"),
+        delay_title=True,
+    )
+    loop, session = _runtime(tmp_path, router, title_prompt="Generate a title")
+
+    await loop.start()
+    try:
+        await collect_foreground_outbound(loop, "First input.")
+        await router.title_started.wait()
+        await session.wait_for_pending_persist()
+        assert Session.load(session.workspace_state, session.session_id).metadata["title"] == (
+            "Untitled session"
+        )
+
+        router.release_title.set()
+        for _ in range(100):
+            if session.metadata["title"] == "Generated late title":
+                break
+            await asyncio.sleep(0)
+        assert session.metadata["title"] == "Generated late title"
+        assert Session.load(session.workspace_state, session.session_id).metadata["title"] == (
+            "Untitled session"
+        )
+
+        await collect_foreground_outbound(loop, "Second input.")
+        await session.wait_for_pending_persist()
+    finally:
+        router.release_title.set()
+        await loop.close()
+
+    reloaded = Session.load(session.workspace_state, session.session_id)
+    assert reloaded.metadata["title"] == "Generated late title"
+    assert [message["role"] for message in reloaded.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_title", ["tool_call", "empty"])
+async def test_invalid_title_uses_first_input_fallback_and_keeps_usage(
+    tmp_path: Path,
+    invalid_title: str,
+) -> None:
+    title = (
+        ModelResponse(
+            message=AssistantModelMessage(
+                content="Do not use this title",
+                tool_calls=(
+                    ModelToolCall(
+                        id="invalid-title",
+                        name="read_file",
+                        arguments='{"path":"README.md"}',
+                    ),
+                ),
+            ),
+            usage=ModelUsage(input_tokens=3, output_tokens=2, total_tokens=5),
+            finish_reason="tool_calls",
+        )
+        if invalid_title == "tool_call"
+        else _response('""', input_tokens=3, output_tokens=1)
+    )
+    router = _TitleBehaviorRouter((_response("First response.", input_tokens=5),), title=title)
+    loop, session = _runtime(tmp_path, router, title_prompt="Generate a title")
+
+    await loop.start()
+    try:
+        await collect_foreground_outbound(loop, "  Meaningful first question.  ")
+        for _ in range(100):
+            if session.metadata["token_usage"]["model_calls"] == 2:
+                break
+            await asyncio.sleep(0)
+    finally:
+        await loop.close()
+
+    title_output_tokens = 2 if invalid_title == "tool_call" else 1
+    assert session.metadata["title"] == "Meaningful first question."
+    assert session.metadata["token_usage"] == {
+        "model_calls": 2,
+        "input_tokens": 8,
+        "output_tokens": 1 + title_output_tokens,
+        "total_tokens": 9 + title_output_tokens,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_turn", [False, True])
+async def test_close_applies_first_input_title_fallback_before_final_save(
+    tmp_path: Path,
+    cancel_turn: bool,
+) -> None:
+    router = _TitleBehaviorRouter(
+        (_response("Foreground response."),),
+        title=_response("Unreleased title"),
+        delay_title=True,
+        block_first_foreground=cancel_turn,
+    )
+    loop, session = _runtime(tmp_path, router, title_prompt="Generate a title")
+
+    await loop.start()
+    if cancel_turn:
+        turn = asyncio.create_task(
+            collect_foreground_outbound(loop, "  Cancelled first title.  ")
+        )
+        await router.foreground_started.wait()
+        await router.title_started.wait()
+        await loop.cancel_active_run()
+        terminal = (await turn)[-1]
+        assert terminal.metadata["finish_reason"] == "cancelled"
+        expected_title = "Cancelled first title."
+    else:
+        await collect_foreground_outbound(loop, "  Shutdown fallback title.  ")
+        await router.title_started.wait()
+        expected_title = "Shutdown fallback title."
+
+    await loop.close()
+
+    assert session.metadata["title"] == expected_title
+    reloaded = Session.load(session.workspace_state, session.session_id)
+    assert reloaded.metadata["title"] == expected_title
+
+
+@pytest.mark.asyncio
+async def test_loop_close_swallows_final_session_failure(tmp_path: Path) -> None:
+    loop, session = _runtime(tmp_path, _Router(()))
+    capture = capture_diagnostics()
+
+    def fail_close() -> None:
+        raise OSError("private final Session close failure")
+
+    session.close = fail_close  # type: ignore[method-assign]
+    try:
+        await loop.close()
+    finally:
+        capture.close()
+
+    assert "Agent Loop Session close failed type=OSError" in capture.event_text
+    assert "private final Session close failure" not in capture.event_text
 
 
 @pytest.mark.asyncio

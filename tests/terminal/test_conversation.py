@@ -30,19 +30,16 @@ from textual.pilot import Pilot
 from textual.widget import Widget
 from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 
-from myclaw.agent.loop import ConfirmationRequestView, ForegroundConversationProjection
+import myclaw.terminal.cli as cli
+from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ForegroundConversationProjection
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.prompts import session_title_prompt
-from myclaw.agent.runtime import (
-    PreparedRuntime,
-    RuntimeGenerationPresentation,
-    RuntimeHost,
-)
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
-from myclaw.management.commands import ManagementCommandResult
-from myclaw.management.service import FatalManagementError
+from myclaw.management.commands import ManagementCommandDispatcher, ManagementCommandResult
+from myclaw.management.service import FatalManagementError, ManagementError
+from myclaw.memory.dream import DreamResult
 from myclaw.provider.models import (
     ModelCompleted,
     ModelContinuation,
@@ -69,16 +66,10 @@ from myclaw.tools.tool_gateway import (
     ModelToolCall,
 )
 from myclaw.utils.json_types import JsonObject
-from tests.agent.test_fixed_catalog_runtime import (
-    _BlockingClock,
-    _response,
-    _RuntimeProvider,
-)
-from tests.agent.test_fixed_catalog_runtime import (
-    _runtime as _prepared_runtime,
-)
+from tests.agent.test_fixed_catalog import _agent_loop as _direct_agent_loop
+from tests.agent.test_fixed_catalog import _FixedCatalogProvider, _response
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ProviderCall
+from tests.fixtures import DeterministicTaskFramingEvaluator, ProviderCall
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 TURN_ID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
@@ -420,7 +411,7 @@ class CancellableRunSource(_ScriptedSource):
         return True
 
 
-class CancellableRuntimeProvider(_RuntimeProvider):
+class CancellableProvider(_FixedCatalogProvider):
     def __init__(self) -> None:
         super().__init__(())
         self.first_delta_emitted = asyncio.Event()
@@ -641,7 +632,7 @@ class _ScriptedControl:
         return False
 
 
-class FakePreparedRuntime:
+class FakeTerminalBackend:
     def __init__(self, source: _ScriptedSource) -> None:
         self.source = source
         self.bus = MessageBus()
@@ -727,42 +718,32 @@ class FakePreparedRuntime:
         return ()
 
 
-class _TestCompositionDriver:
-    """Keep test runtime ownership outside the Textual application lifecycle."""
+class _TerminalTestDriver:
+    """Keep test backend ownership outside the Textual application lifecycle."""
 
     def __init__(
         self,
         app: TerminalConversationApp,
-        runtime: PreparedRuntime | RuntimeHost,
+        runtime: Any,
+        cleanup: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._app = app
         self._runtime = runtime
-        self._rebind: Callable[[RuntimeGenerationPresentation], Awaitable[None]] | None = None
-        if isinstance(runtime, RuntimeHost):
-
-            async def rebind(presentation: RuntimeGenerationPresentation) -> None:
-                await app.rebind_agent_loop(
-                    control=presentation.control,
-                    skill_metadata=presentation.skill_metadata,
-                    session_projection=presentation.session_projection,
-                )
-
-            runtime.bind_terminal(rebind, quiesce=app.quiesce_for_rebind)
-            self._rebind = rebind
+        self._cleanup = cleanup
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._app, name)
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name in {"_app", "_runtime", "_rebind"}:
+        if name in {"_app", "_runtime", "_cleanup"}:
             object.__setattr__(self, name, value)
         else:
             setattr(self._app, name, value)
 
-    async def _close_runtime(self) -> None:
-        if self._rebind is not None:
-            cast(RuntimeHost, self._runtime).unbind_terminal(self._rebind)
+    async def _close_backend(self) -> None:
         await self._runtime.close()
+        if self._cleanup is not None:
+            await self._cleanup()
 
     @asynccontextmanager
     async def run_test(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
@@ -775,7 +756,7 @@ class _TestCompositionDriver:
             primary_error = error
         finally:
             try:
-                await self._close_runtime()
+                await self._close_backend()
             except BaseException as cleanup_error:
                 if primary_error is not None:
                     cause = primary_error.__cause__
@@ -798,7 +779,7 @@ class _TestCompositionDriver:
             primary_error = error
         finally:
             try:
-                await self._close_runtime()
+                await self._close_backend()
             except BaseException as cleanup_error:
                 if primary_error is not None:
                     raise primary_error from cleanup_error
@@ -868,7 +849,7 @@ class KeyboardLifecycleDriver(Driver):
         self.operations.append(("close", ""))
 
 
-class CloseOrderingRuntime(FakePreparedRuntime):
+class CloseOrderingBackend(FakeTerminalBackend):
     def __init__(self, source: BlockingRunSource) -> None:
         super().__init__(source)
         self._blocking_source = source
@@ -879,68 +860,102 @@ class CloseOrderingRuntime(FakePreparedRuntime):
         self.close_saw_stream_closed = self._blocking_source.closed.is_set()
 
 
-class FailingStartRuntime(FakePreparedRuntime):
+class FailingStartBackend(FakeTerminalBackend):
     async def start(self) -> None:
         self.start_calls += 1
         raise RuntimeError("runtime startup failed")
 
 
-class FailingCloseRuntime(FakePreparedRuntime):
+class FailingCloseBackend(FakeTerminalBackend):
     async def close(self) -> None:
         await super().close()
         raise RuntimeError("runtime cleanup failed")
 
 
-def _runtime(
+def _terminal_backend(
     source: _ScriptedSource,
     management_dispatcher: object | None = None,
-) -> FakePreparedRuntime:
-    runtime = FakePreparedRuntime(source)
-    runtime.management_dispatcher = management_dispatcher
-    return runtime
+) -> FakeTerminalBackend:
+    backend = FakeTerminalBackend(source)
+    backend.management_dispatcher = management_dispatcher
+    return backend
+
+
+def _direct_terminal_loop(
+    agent_home: Path,
+    workspace: Path,
+    provider: _FixedCatalogProvider,
+) -> AgentLoop:
+    loop, router, schedule = _direct_agent_loop(agent_home, workspace, provider)
+
+    async def close_components() -> None:
+        await schedule.close()
+        await router.close()
+
+    object.__setattr__(loop, "_terminal_test_cleanup", close_components)
+    return loop
 
 
 def _terminal_app(
-    runtime: PreparedRuntime | RuntimeHost,
+    runtime: Any,
     *,
     app_type: type[TerminalConversationApp] = TerminalConversationApp,
     monotonic: Callable[[], float] | None = None,
     skill_metadata: tuple[SkillMetadata, ...] = (),
+    management_dispatcher: object | None = None,
+    cleanup: Callable[[], Awaitable[None]] | None = None,
 ) -> TerminalConversationApp:
+    dispatcher = (
+        getattr(runtime, "management_dispatcher", None)
+        if management_dispatcher is None
+        else management_dispatcher
+    )
     kwargs: dict[str, object] = {
         "bus": runtime.bus,
         "control": runtime.control,
-        "management_dispatcher": runtime.management_dispatcher,
+        "management_dispatcher": dispatcher,
         "skill_metadata": skill_metadata,
     }
     if monotonic is not None:
         kwargs["monotonic"] = monotonic
     app = app_type(**kwargs)  # type: ignore[arg-type]
-    return cast(TerminalConversationApp, _TestCompositionDriver(app, runtime))
+    test_cleanup = cleanup or getattr(runtime, "_terminal_test_cleanup", None)
+    return cast(TerminalConversationApp, _TerminalTestDriver(app, runtime, test_cleanup))
 
 
-class _GenerationHost(RuntimeHost):
-    @property
-    def session(self) -> Session:
-        return self.generation.session
-
-
-def _generation_host(
+async def _run_cli_terminal_case(
+    *,
     agent_home: Path,
     workspace: Path,
-    provider: _RuntimeProvider,
-) -> _GenerationHost:
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: Callable[[TerminalConversationApp, Pilot[None]], Awaitable[None]],
+    provider: _FixedCatalogProvider | None = None,
+    size: tuple[int, int] = (80, 24),
+) -> None:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    return _GenerationHost(
+    configuration = ConfigLoader(home).load()
+    selected_provider = provider or _FixedCatalogProvider(())
+
+    class DeterministicAgentLoop(AgentLoop):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._task_framer = DeterministicTaskFramingEvaluator()
+
+    class ScenarioApp(TerminalConversationApp):
+        async def run_async(self, **options: Any) -> None:
+            del options
+            async with self.run_test(size=size) as pilot:
+                await scenario(self, pilot)
+
+    monkeypatch.setattr(cli, "AgentLoop", DeterministicAgentLoop)
+    monkeypatch.setattr(cli, "TerminalConversationApp", ScenarioApp)
+    monkeypatch.setattr(cli, "create_provider", lambda _configuration: selected_provider)
+    await cli._run_cli_conversation(
         agent_home=home,
         workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _configuration: provider,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-        schedule_scheduler_clock=_BlockingClock(),
+        configuration=configuration,
     )
 
 
@@ -1217,10 +1232,702 @@ async def _wait_for_confirmation(app: TerminalConversationApp, pilot: Pilot[None
 
 
 @pytest.mark.asyncio
+async def test_resume_picker_orders_sessions_and_cancellation_preserves_display(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        initial = cast(AgentLoop, app._control)
+        older = Session.create(
+            initial.session.workspace_state,
+            now=lambda: NOW.replace(hour=10),
+            new_uuid=lambda: UUID("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
+        )
+        older.update_metadata(title="Older session")
+        older.add_message("user", "Older persisted question.")
+        older.close()
+        target = Session.create(
+            initial.session.workspace_state,
+            now=lambda: NOW,
+            new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
+        )
+        target.update_metadata(title="Target session")
+        target.add_message("user", "Persisted question.")
+        target.close()
+
+        await pilot.press(*list("/status"), "enter", "ctrl+home")
+        before_resume = _visible_screen_text(app)
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+
+        picker_text = _visible_screen_text(app)
+        assert picker_text.index("Target session") < picker_text.index("Older session")
+        assert target.session_id not in picker_text
+        assert older.session_id not in picker_text
+        assert target.updated_at.astimezone().strftime("%Y-%m-%d %H:%M") in picker_text
+        assert app.screen.focused is app.screen.query_one("#session-picker-options", OptionList)
+
+        await pilot.click(offset=(1, 1))
+        assert app.screen.id == "session-picker"
+        await pilot.press("escape", "ctrl+home")
+        await pilot.pause()
+        assert app._control is initial
+        assert _visible_screen_text(app) == before_resume
+
+    await _run_cli_terminal_case(
+        agent_home=agent_home,
+        workspace=workspace,
+        monkeypatch=monkeypatch,
+        scenario=scenario,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_selection_rebinds_sanitized_session_projection(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        initial = cast(AgentLoop, app._control)
+        target = Session.create(
+            initial.session.workspace_state,
+            now=lambda: NOW,
+            new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+        )
+        target.update_metadata(title="Restored session")
+        target.add_message("user", "Persisted question.")
+        target.add_message(
+            "assistant",
+            "Persisted **answer**.",
+            tool_calls=[],
+            status="completed",
+            error=None,
+            token_usage={
+                "model_calls": 1,
+                "input_tokens": 2,
+                "output_tokens": 3,
+                "total_tokens": 5,
+            },
+        )
+        target.add_message(
+            "assistant",
+            "",
+            tool_calls=[
+                {
+                    "id": "call-restored",
+                    "name": "read_file",
+                    "arguments": '{"api_key":"private"}',
+                },
+                {"id": "call-error", "name": "exec", "arguments": '{"command":"private"}'},
+                {
+                    "id": "call-refused",
+                    "name": "web_fetch",
+                    "arguments": '{"url":"private"}',
+                },
+            ],
+            status="completed",
+            error=None,
+            token_usage={
+                "model_calls": 1,
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+        )
+        target.add_message(
+            "tool",
+            "private tool result",
+            tool_call_id="call-restored",
+            name="read_file",
+            status="success",
+            artifact=None,
+        )
+        target.add_message(
+            "tool",
+            "STDERR permission denied; STDOUT secret bytes",
+            tool_call_id="call-error",
+            name="exec",
+            status="error",
+            artifact=None,
+        )
+        target.add_message(
+            "tool",
+            "private refusal detail",
+            tool_call_id="call-refused",
+            name="web_fetch",
+            status="refused",
+            artifact=None,
+        )
+        target.add_message(
+            "assistant",
+            "Persisted partial answer.",
+            tool_calls=[],
+            status="interrupted",
+            error={"code": "turn_cancelled", "message": "Turn interrupted by user."},
+            token_usage={
+                "model_calls": 1,
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+        )
+        target.add_message(
+            "assistant",
+            "",
+            tool_calls=[],
+            status="error",
+            error={"code": "model_failed", "message": "Persisted model failure."},
+            token_usage={
+                "model_calls": 1,
+                "input_tokens": 1,
+                "output_tokens": 0,
+                "total_tokens": 1,
+            },
+        )
+        target.close()
+
+        await pilot.press(*list("/status"), "enter")
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+
+        async with asyncio.timeout(3):
+            while (
+                cast(AgentLoop, app._control).session.session_id != target.session_id
+                or "Persisted model failure." not in _visible_screen_text(app)
+            ):
+                await pilot.pause()
+
+        visible_text = _visible_screen_text(app)
+        expected_order = (
+            "Persisted answer.",
+            "Completed: read_file",
+            "Failed: exec - The operation did not complete.",
+            "Rejected: web_fetch",
+            "Persisted partial answer.",
+            "Persisted model failure.",
+        )
+        assert all(value in visible_text for value in expected_order)
+        assert [visible_text.index(value) for value in expected_order] == sorted(
+            visible_text.index(value) for value in expected_order
+        )
+        for secret in (
+            "private tool result",
+            "private refusal detail",
+            "call-restored",
+            "call-error",
+            "call-refused",
+            "api_key",
+            "STDERR",
+            "STDOUT",
+            "secret bytes",
+        ):
+            assert secret not in visible_text
+        assert "Command: /status" not in visible_text
+        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
+
+    await _run_cli_terminal_case(
+        agent_home=agent_home,
+        workspace=workspace,
+        monkeypatch=monkeypatch,
+        scenario=scenario,
+        size=(100, 40),
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_resume_decline_then_force_rebinds_the_same_bus(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = CancellableProvider()
+
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        old = cast(AgentLoop, app._control)
+        shared_bus = app._bus
+        target = Session.create(
+            old.session.workspace_state,
+            now=lambda: datetime(2027, 1, 1, tzinfo=UTC),
+            new_uuid=uuid4,
+        )
+        target.add_message("user", "Approve target")
+        target.close()
+
+        await pilot.press(*list("active work"), "enter")
+        await asyncio.wait_for(provider.first_delta_emitted.wait(), timeout=2)
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+        async with asyncio.timeout(2):
+            while app.screen.id != "session-switch-confirmation":
+                await pilot.pause()
+
+        assert app._control is old
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app._control is old
+        assert old.control.has_active_run
+
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+        async with asyncio.timeout(2):
+            while app.screen.id != "session-switch-confirmation":
+                await pilot.pause()
+        await pilot.press("right", "enter")
+
+        async with asyncio.timeout(3):
+            while app._control is old:
+                await pilot.pause()
+        selected = app._control
+        assert selected.session.session_id == target.session_id
+        assert app._bus is shared_bus
+        assert old._aborted
+        assert old._execution_task is None
+        await pilot.pause(0.1)
+
+    await _run_cli_terminal_case(
+        agent_home=agent_home,
+        workspace=workspace,
+        monkeypatch=monkeypatch,
+        scenario=scenario,
+        provider=provider,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_picker_mouse_selection_rebinds_the_clicked_session(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        initial = cast(AgentLoop, app._control)
+        target = Session.create(
+            initial.session.workspace_state,
+            now=lambda: datetime(2027, 1, 1, tzinfo=UTC),
+            new_uuid=uuid4,
+        )
+        target.update_metadata(title="Mouse target")
+        target.add_message("user", "Mouse-selected content.")
+        target.close()
+
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.click("#session-picker-options", offset=(4, 1))
+
+        async with asyncio.timeout(3):
+            while (
+                cast(AgentLoop, app._control).session.session_id != target.session_id
+                or "Mouse-selected content." not in _visible_screen_text(app)
+            ):
+                await pilot.pause()
+
+        assert "Mouse-selected content." in _visible_screen_text(app)
+
+    await _run_cli_terminal_case(
+        agent_home=agent_home,
+        workspace=workspace,
+        monkeypatch=monkeypatch,
+        scenario=scenario,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_picker_scrolls_in_management_order_and_selects_by_keyboard(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        initial = cast(AgentLoop, app._control)
+        sessions: list[Session] = []
+        for index in range(24):
+            session = Session.create(
+                initial.session.workspace_state,
+                now=_constant_datetime(datetime(2027, 1, 1, 0, index, tzinfo=UTC)),
+                new_uuid=_constant_uuid(
+                    UUID(f"00000000-0000-4000-8000-{index + 1:012x}")
+                ),
+            )
+            session.update_metadata(title=f"Session {index:02d}")
+            session.add_message("user", f"Content {index:02d}.")
+            session.close()
+            sessions.append(session)
+
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        visible_text = _visible_screen_text(app)
+        assert visible_text.index("Session 23") < visible_text.index("Session 22")
+        options = app.screen.query_one("#session-picker-options", OptionList)
+        assert options.max_scroll_y > 0
+
+        await pilot._post_mouse_events([MouseScrollDown], offset=(40, 10), times=3)
+        await pilot.pause()
+        assert options.scroll_y > 0
+        await pilot.press(*(("down",) * 23), "enter")
+
+        async with asyncio.timeout(3):
+            while (
+                cast(AgentLoop, app._control).session.session_id != sessions[0].session_id
+                or "Content 00." not in _visible_screen_text(app)
+            ):
+                await pilot.pause()
+
+        assert "Content 00." in _visible_screen_text(app)
+
+    await _run_cli_terminal_case(
+        agent_home=agent_home,
+        workspace=workspace,
+        monkeypatch=monkeypatch,
+        scenario=scenario,
+        size=(80, 20),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_serializes_input_until_cli_rebind_finishes(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        initial = cast(AgentLoop, app._control)
+        target = Session.create(
+            initial.session.workspace_state,
+            now=lambda: datetime(2027, 1, 1, tzinfo=UTC),
+            new_uuid=uuid4,
+        )
+        target.update_metadata(title="Delayed target")
+        target.add_message("user", "Delayed restored content.")
+        target.close()
+        dispatcher = cast(ManagementCommandDispatcher, app._management_dispatcher)
+        original_resume = dispatcher.resume
+        resume_started = asyncio.Event()
+        continue_resume = asyncio.Event()
+        resume_finished = asyncio.Event()
+        resume_errors: list[BaseException] = []
+
+        async def delayed_resume(
+            session_id: str,
+            *,
+            force: bool = False,
+        ) -> ManagementCommandResult:
+            resume_started.set()
+            await continue_resume.wait()
+            try:
+                return await original_resume(session_id, force=force)
+            except BaseException as error:
+                resume_errors.append(error)
+                raise
+            finally:
+                resume_finished.set()
+
+        monkeypatch.setattr(dispatcher, "resume", delayed_resume)
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+        await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert input_area.read_only
+        assert app.screen.id == "_default"
+        await pilot.press(*list("racing turn"), "enter", *list("/resume"), "enter")
+        assert input_area.text == ""
+        assert app.screen.id == "_default"
+
+        continue_resume.set()
+        await asyncio.wait_for(resume_finished.wait(), timeout=2)
+        assert resume_errors == []
+        async with asyncio.timeout(3):
+            while (
+                cast(AgentLoop, app._control).session.session_id != target.session_id
+                or input_area.read_only
+                or "Delayed restored content." not in _visible_screen_text(app)
+            ):
+                await pilot.pause()
+
+        await pilot.press(*list("/status"), "enter")
+        await pilot.press("ctrl+home")
+        assert "Command: /status" in _visible_screen_text(app)
+
+    await _run_cli_terminal_case(
+        agent_home=agent_home,
+        workspace=workspace,
+        monkeypatch=monkeypatch,
+        scenario=scenario,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resumed_long_history_starts_latest_and_preserves_input_history(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        initial = cast(AgentLoop, app._control)
+        target = Session.create(
+            initial.session.workspace_state,
+            now=lambda: datetime(2027, 1, 1, tzinfo=UTC),
+            new_uuid=uuid4,
+        )
+        target.update_metadata(title="Long target")
+        for index in range(60):
+            target.add_message("user", f"Restored line {index:02d} " + "x" * 40)
+        target.close()
+
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+        display = app.query_one("#conversation-display")
+        async with asyncio.timeout(3):
+            while (
+                cast(AgentLoop, app._control).session.session_id != target.session_id
+                or not display.is_vertical_scroll_end
+                or "Restored line 59" not in _visible_screen_text(app)
+            ):
+                await pilot.pause()
+
+        assert not app.query_one("#new-content").display
+        await pilot.resize_terminal(40, 20)
+        await pilot.pause()
+        assert display.is_vertical_scroll_end
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert app.screen.focused is input_area
+        await pilot.press("up")
+        assert input_area.text == "/resume"
+
+    await _run_cli_terminal_case(
+        agent_home=agent_home,
+        workspace=workspace,
+        monkeypatch=monkeypatch,
+        scenario=scenario,
+        size=(60, 20),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_projects_unknown_reversed_and_unclassifiable_history_safely(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        initial = cast(AgentLoop, app._control)
+        target = Session.create(
+            initial.session.workspace_state,
+            now=lambda: datetime(2027, 1, 1, tzinfo=UTC),
+            new_uuid=uuid4,
+        )
+        target.update_metadata(title="Historical edge cases")
+        target.add_message(
+            "assistant",
+            "Before the first user message.",
+            tool_calls=[],
+            status="completed",
+            error=None,
+            token_usage={
+                "model_calls": 1,
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+        )
+        target.add_message(
+            "tool",
+            "private pre-user result",
+            tool_call_id="orphan-pre-user",
+            name="read_file",
+            status="success",
+            artifact=None,
+        )
+        target.add_message("user", "Question with an orphan tool result.")
+        target.add_message(
+            "tool",
+            "private orphan result",
+            tool_call_id="orphan-in-run",
+            name="read_file",
+            status="success",
+            artifact=None,
+        )
+        target.add_message("user", "Wait for the operation.")
+        target.add_message(
+            "assistant",
+            "Still waiting for a result.",
+            tool_calls=[{"id": "call-pending", "name": "read_file", "arguments": "{}"}],
+            status="completed",
+            error=None,
+            token_usage={
+                "model_calls": 1,
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+        )
+        target.add_message("user", "Run with reversed timestamps.")
+        target.add_message(
+            "assistant",
+            "Historical activity.",
+            tool_calls=[{"id": "call-reversed", "name": "read_file", "arguments": "{}"}],
+            status="completed",
+            error=None,
+            token_usage={
+                "model_calls": 1,
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+        )
+        target.messages[4]["timestamp"] = datetime(2027, 1, 1, tzinfo=UTC).isoformat(
+            timespec="milliseconds"
+        )
+        target.messages[5]["timestamp"] = (
+            datetime(2027, 1, 1, tzinfo=UTC) + timedelta(seconds=1)
+        ).isoformat(timespec="milliseconds")
+        target.messages[6]["timestamp"] = (
+            datetime(2027, 1, 1, tzinfo=UTC) + timedelta(seconds=10)
+        ).isoformat(timespec="milliseconds")
+        target.messages[7]["timestamp"] = (
+            datetime(2027, 1, 1, tzinfo=UTC) + timedelta(seconds=5)
+        ).isoformat(timespec="milliseconds")
+        target.close()
+
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+        async with asyncio.timeout(3):
+            while "Historical activity." not in _visible_screen_text(app):
+                await pilot.pause()
+
+        visible_text = _visible_screen_text(app)
+        assert "Before the first user message." in visible_text
+        assert "Question with an orphan tool result." in visible_text
+        assert visible_text.count("Completed: read_file") == 2
+        assert "private pre-user result" not in visible_text
+        assert "private orphan result" not in visible_text
+        groups = list(app.query(".agent-run-activity-group"))
+        assert len(groups) == 2
+        headings = [
+            str(group.query_one(".agent-run-activity-heading", Static).content)
+            for group in groups
+        ]
+        assert headings == ["\u25bc 1s", "\u25bc 0s"]
+        assert all(group.query_one(".agent-run-activity-content").display for group in groups)
+        assert "Turn cancelled." not in visible_text
+        assert "Turn failed." not in visible_text
+        assert "Completed with no response." not in visible_text
+        await pilot.click(".agent-run-activity-heading")
+        assert not groups[0].query_one(".agent-run-activity-content").display
+
+    await _run_cli_terminal_case(
+        agent_home=agent_home,
+        workspace=workspace,
+        monkeypatch=monkeypatch,
+        scenario=scenario,
+        size=(100, 30),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_stale_selection_preserves_current_display_and_interaction(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        initial = cast(AgentLoop, app._control)
+        target = Session.create(
+            initial.session.workspace_state,
+            now=lambda: NOW,
+            new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
+        )
+        target.update_metadata(title="Stale target")
+        target.add_message("user", "Should not be restored.")
+        target.close()
+        target_path = target.workspace_state.sessions_directory / f"{target.session_id}.jsonl"
+
+        await pilot.press(*list("/status"), "enter")
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        target_path.unlink()
+        await pilot.press("enter")
+
+        async with asyncio.timeout(2):
+            while "model_invalid_request:" not in _visible_screen_text(app):
+                await pilot.pause()
+        failure_text = _visible_screen_text(app)
+        input_area = app.query_one("#conversation-input", TextArea)
+        assert app._control is initial
+        assert app.is_running
+        assert not input_area.read_only
+        assert "Should not be restored." not in failure_text
+        assert "not\nresumable." in failure_text
+
+    await _run_cli_terminal_case(
+        agent_home=agent_home,
+        workspace=workspace,
+        monkeypatch=monkeypatch,
+        scenario=scenario,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fatal_resume_failure_exits_without_rendering_private_error(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_error = "reset secret C:\\sensitive\\bus"
+    visible_after_failure = ""
+
+    async def fail_reset(_bus: MessageBus) -> None:
+        raise RuntimeError(private_error)
+
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        nonlocal visible_after_failure
+        initial = cast(AgentLoop, app._control)
+        target = Session.create(
+            initial.session.workspace_state,
+            now=lambda: NOW,
+            new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+        )
+        target.update_metadata(title="Fatal target")
+        target.add_message("user", "Must not be rendered after fatal replacement failure.")
+        target.close()
+
+        await pilot.press(*list("/resume"), "enter")
+        await _wait_for_session_picker(app, pilot)
+        await pilot.press("enter")
+        async with asyncio.timeout(3):
+            while app.is_running:
+                await pilot.pause()
+        visible_after_failure = _visible_screen_text(app)
+        assert isinstance(app.fatal_management_error, FatalManagementError)
+
+    monkeypatch.setattr(MessageBus, "reset", fail_reset)
+    with pytest.raises(FatalManagementError) as raised:
+        await _run_cli_terminal_case(
+            agent_home=agent_home,
+            workspace=workspace,
+            monkeypatch=monkeypatch,
+            scenario=scenario,
+        )
+
+    assert raised.value.error.code == "persistence_error"
+    assert private_error not in str(raised.value)
+    assert private_error not in visible_after_failure
+    assert "Must not be rendered after fatal replacement failure." not in visible_after_failure
+
+
+@pytest.mark.asyncio
 async def test_terminal_conversation_starts_blank_and_focuses_input() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)):
         visible_text = _visible_screen_text(app)
@@ -1344,8 +2051,8 @@ async def test_sparse_protocol_errors_and_duplicate_terminal_do_not_poison_next_
 @pytest.mark.asyncio
 async def test_terminal_conversation_inherits_the_terminal_background() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)):
         input_area = app.screen.focused
@@ -1359,8 +2066,8 @@ async def test_terminal_conversation_inherits_the_terminal_background() -> None:
 async def test_nonblank_enter_echoes_user_before_consuming_agent_events() -> None:
     app: TerminalConversationApp
     conversation = ScriptedRunSource(pause_before_output=True)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press("h", "i", "enter"))
@@ -1382,8 +2089,8 @@ async def test_nonblank_enter_echoes_user_before_consuming_agent_events() -> Non
 @pytest.mark.asyncio
 async def test_active_turn_keeps_input_editable_and_cancellable_before_a_later_turn() -> None:
     conversation = CancellableRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("first"), "enter"))
@@ -1439,8 +2146,8 @@ async def test_active_turn_keeps_input_editable_and_cancellable_before_a_later_t
 @pytest.mark.asyncio
 async def test_up_drains_pending_fifo_and_reenter_submits_one_multiline_inbound() -> None:
     conversation = CancellableRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("first"), "enter"))
@@ -1472,8 +2179,8 @@ async def test_up_drains_pending_fifo_and_reenter_submits_one_multiline_inbound(
 @pytest.mark.asyncio
 async def test_repeated_or_delayed_active_ctrl_c_stays_bound_to_the_cancelled_turn() -> None:
     conversation = CancellableRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("first"), "enter"))
@@ -1499,8 +2206,8 @@ async def test_repeated_or_delayed_active_ctrl_c_stays_bound_to_the_cancelled_tu
 @pytest.mark.asyncio
 async def test_ctrl_c_clears_an_idle_draft_without_exiting() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1514,8 +2221,8 @@ async def test_ctrl_c_clears_an_idle_draft_without_exiting() -> None:
 @pytest.mark.asyncio
 async def test_ctrl_c_on_empty_idle_input_exits() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("ctrl+c")
@@ -1527,8 +2234,8 @@ async def test_ctrl_c_on_empty_idle_input_exits() -> None:
 @pytest.mark.asyncio
 async def test_ctrl_d_deletes_forward_when_draft_is_nonempty() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1543,8 +2250,8 @@ async def test_ctrl_d_deletes_forward_when_draft_is_nonempty() -> None:
 @pytest.mark.asyncio
 async def test_ctrl_d_on_empty_input_exits() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("ctrl+d")
@@ -1556,8 +2263,8 @@ async def test_ctrl_d_on_empty_input_exits() -> None:
 @pytest.mark.asyncio
 async def test_ctrl_d_during_an_active_turn_settles_stream_before_runtime_close() -> None:
     conversation = BlockingRunSource()
-    runtime = CloseOrderingRuntime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = CloseOrderingBackend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("active"), "enter"))
@@ -1576,8 +2283,8 @@ async def test_ctrl_d_during_an_active_turn_settles_stream_before_runtime_close(
 @pytest.mark.parametrize("command", [" EXIT ", " qUiT "])
 async def test_exit_and_quit_commands_exit_without_submitting(command: str) -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list(command), "enter")
@@ -1591,8 +2298,8 @@ async def test_exit_and_quit_commands_exit_without_submitting(command: str) -> N
 @pytest.mark.parametrize("command", ["exit now", "quitter"])
 async def test_exit_like_text_is_submitted_as_an_ordinary_turn(command: str) -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list(command), "enter")
@@ -1605,8 +2312,8 @@ async def test_exit_like_text_is_submitted_as_an_ordinary_turn(command: str) -> 
 @pytest.mark.asyncio
 async def test_multiline_submission_preserves_text_and_ctrl_j_inserts_a_newline() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("first line"), "ctrl+j", *list("second line"), "enter")
@@ -1619,8 +2326,8 @@ async def test_multiline_submission_preserves_text_and_ctrl_j_inserts_a_newline(
 @pytest.mark.asyncio
 async def test_supported_modifier_enter_sequences_insert_newlines_without_submitting() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1643,8 +2350,8 @@ async def test_textual_driver_lifecycle_balances_enhanced_keyboard_mode(
     monkeypatch.setenv("KITTY_WINDOW_ID", "1")
     KeyboardLifecycleDriver.operations = []
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
     app.driver_class = KeyboardLifecycleDriver
 
     async def exit_when_ready(_: object) -> None:
@@ -1666,8 +2373,8 @@ async def test_textual_driver_lifecycle_balances_enhanced_keyboard_mode(
 @pytest.mark.asyncio
 async def test_malformed_enhanced_keyboard_report_does_not_break_ordinary_submission() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1682,8 +2389,8 @@ async def test_malformed_enhanced_keyboard_report_does_not_break_ordinary_submis
 @pytest.mark.asyncio
 async def test_whitespace_only_submission_is_ignored() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1699,8 +2406,8 @@ async def test_whitespace_only_submission_is_ignored() -> None:
 @pytest.mark.asyncio
 async def test_multiline_paste_is_inserted_without_implicit_submission() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1719,8 +2426,8 @@ async def test_multiline_paste_is_inserted_without_implicit_submission() -> None
 @pytest.mark.asyncio
 async def test_multiline_input_grows_to_six_rows_then_scrolls_internally() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -1747,8 +2454,8 @@ async def test_accepted_submissions_are_recalled_only_within_the_runtime_lifetim
         deltas_by_submission=((), (), ()),
         completed_contents=("", "", ""),
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("first"), "enter")
@@ -1766,8 +2473,8 @@ async def test_accepted_submissions_are_recalled_only_within_the_runtime_lifetim
         await pilot.press("down")
         assert input_area.text == ""
 
-    next_runtime = _runtime(ScriptedRunSource())
-    next_app = _terminal_app(cast(PreparedRuntime, next_runtime))
+    next_runtime = _terminal_backend(ScriptedRunSource())
+    next_app = _terminal_app(cast(Any, next_runtime))
     async with next_app.run_test(size=(80, 24)) as pilot:
         next_input = next_app.query_one("#conversation-input", TextArea)
         await pilot.press("up")
@@ -1778,8 +2485,8 @@ async def test_accepted_submissions_are_recalled_only_within_the_runtime_lifetim
 async def test_scrolling_conversation_keeps_composer_focus_and_draft() -> None:
     content = "\n".join(f"line {index:02d}" for index in range(80))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("seed"), "enter")
@@ -1798,8 +2505,8 @@ async def test_text_deltas_update_one_assistant_markdown_and_terminal_marker_clo
         pause_after_first_delta=True,
         completed_content="First answer.",
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press("h", "i", "enter"))
@@ -1839,8 +2546,8 @@ async def test_intermediate_model_output_and_tools_share_one_activity_group() ->
             _completed_response(),
         )
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -1888,7 +2595,7 @@ async def test_intermediate_completion_reparents_stream_candidate_and_empty_outp
             _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
     mounted_assistants: list[tuple[Markdown, Widget | None]] = []
     mount_assistant = app._mount_assistant
 
@@ -1927,7 +2634,7 @@ async def test_tool_start_reclassifies_a_streamed_candidate_without_model_comple
             _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -1951,7 +2658,7 @@ async def test_direct_terminal_marker_preserves_the_current_candidate() -> None:
             _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -1967,7 +2674,7 @@ async def test_direct_terminal_marker_preserves_the_current_candidate() -> None:
 @pytest.mark.asyncio
 async def test_first_terminal_event_finishes_without_waiting_for_more_events() -> None:
     conversation = TerminalThenBlockingRunSource()
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2010,7 +2717,7 @@ async def test_duplicate_or_late_model_completion_reconciles_grouped_candidate(
     events: tuple[_ScriptItem, ...],
 ) -> None:
     conversation = ToolMessageSequenceRunSource(events)
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2036,7 +2743,7 @@ async def test_reasoning_transition_reopens_the_completed_response_stream() -> N
             _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2062,7 +2769,7 @@ async def test_late_delta_after_completed_candidate_does_not_reopen_its_stream()
             _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2076,7 +2783,7 @@ async def test_late_delta_after_completed_candidate_does_not_reopen_its_stream()
 @pytest.mark.asyncio
 async def test_successful_empty_terminal_content_shows_status_without_activity() -> None:
     conversation = ScriptedRunSource(deltas=(), completed_content="")
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("empty"), "enter")
@@ -2096,7 +2803,7 @@ async def test_first_terminal_event_remains_authoritative() -> None:
             _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2116,7 +2823,7 @@ async def test_first_terminal_event_remains_authoritative() -> None:
 @pytest.mark.asyncio
 async def test_event_stream_failure_groups_candidate_and_finishes_unfinished_tool() -> None:
     conversation = ExplodingRunSource()
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2136,7 +2843,7 @@ async def test_event_stream_failure_groups_candidate_and_finishes_unfinished_too
 @pytest.mark.asyncio
 async def test_event_stream_failure_without_activity_does_not_create_empty_group() -> None:
     conversation = ToolMessageSequenceRunSource(())
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2153,7 +2860,7 @@ async def test_failed_no_tool_candidate_becomes_expanded_activity() -> None:
         outcomes=("failed",),
         failure_message="Model unavailable.",
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2175,7 +2882,7 @@ async def test_failure_before_visible_activity_does_not_create_empty_group() -> 
         outcomes=("failed",),
         failure_message="Model unavailable.",
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2192,7 +2899,7 @@ async def test_empty_cancelled_content_removes_candidate_without_empty_group() -
         outcomes=("cancelled",),
         cancelled_content="",
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("cancel"), "enter")
@@ -2209,10 +2916,10 @@ async def test_replacing_the_display_stops_a_frozen_run_timer(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    runtime = _prepared_runtime(
+    runtime = _direct_terminal_loop(
         agent_home,
         workspace,
-        _RuntimeProvider(()),
+        _FixedCatalogProvider(()),
     )
     app = _terminal_app(runtime)
 
@@ -2254,7 +2961,7 @@ async def test_activity_timing_includes_wait_before_first_outbound() -> None:
         pause_before=True,
     )
     app = _terminal_app(
-        cast(PreparedRuntime, _runtime(conversation)),
+        cast(Any, _terminal_backend(conversation)),
         monotonic=lambda: clock[0],
     )
 
@@ -2280,7 +2987,7 @@ async def test_activity_heading_starts_with_accumulated_time_and_freezes_on_succ
     )
     conversation = ToolMessageSequenceRunSource(events, pause_after=(0, 1))
     app = _terminal_app(
-        cast(PreparedRuntime, _runtime(conversation)),
+        cast(Any, _terminal_backend(conversation)),
         monotonic=lambda: clock[0],
     )
     async with app.run_test(size=(80, 24)) as pilot:
@@ -2340,7 +3047,7 @@ async def test_manual_activity_disclosure_keeps_heading_position_while_content_g
             _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2383,7 +3090,7 @@ async def test_failed_activity_group_is_mouse_toggleable_without_moving_composer
             _failed_response("The Agent Run failed."),
         )
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -2415,8 +3122,8 @@ async def test_tool_confirmation_defaults_to_decline_and_shows_effective_operati
         reason="The path resolves outside the current Workspace.",
         warnings=("Review the target before allowing access.",),
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2458,8 +3165,8 @@ async def test_write_confirmation_hides_content_and_unknown_details() -> None:
         tool_name="write_file",
         details={"path": "outside.txt", "content": secret, "internal": "raw-result"},
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(42, 16)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("write"), "enter"))
@@ -2492,8 +3199,8 @@ async def test_web_fetch_confirmation_redacts_url_credentials_and_query_values()
             "format": "markdown",
         },
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("fetch"), "enter"))
@@ -2521,8 +3228,8 @@ async def test_exec_confirmation_shows_exact_command_and_arrow_keys_select_appro
         details={"command": command, "cwd": ".", "timeout": 45},
         reason="The Exec command matches a known destructive operation.",
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(100, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("run"), "enter"))
@@ -2569,8 +3276,8 @@ async def test_confirmation_buttons_resolve_the_pending_tool_with_mouse(
     decision: ConfirmationDecision,
 ) -> None:
     conversation = ConfirmationRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2591,8 +3298,8 @@ async def test_confirmation_buttons_resolve_the_pending_tool_with_mouse(
 @pytest.mark.parametrize("key", ("escape", "ctrl+c"))
 async def test_confirmation_escape_and_ctrl_c_decline_only_the_pending_tool(key: str) -> None:
     conversation = ConfirmationRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2617,8 +3324,8 @@ async def test_confirmation_escape_and_ctrl_c_decline_only_the_pending_tool(key:
 @pytest.mark.asyncio
 async def test_clicking_outside_confirmation_keeps_it_open_without_a_decision() -> None:
     conversation = ConfirmationRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2640,8 +3347,8 @@ async def test_clicking_outside_confirmation_keeps_it_open_without_a_decision() 
 @pytest.mark.asyncio
 async def test_duplicate_late_confirmation_is_shown_once_and_does_not_fail_the_turn() -> None:
     conversation = DuplicateLateConfirmationRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2659,8 +3366,8 @@ async def test_duplicate_late_confirmation_is_shown_once_and_does_not_fail_the_t
 @pytest.mark.asyncio
 async def test_multiple_confirmations_are_resolved_in_order_with_a_fresh_safe_default() -> None:
     conversation = MultipleConfirmationRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2685,8 +3392,8 @@ async def test_multiple_confirmations_are_resolved_in_order_with_a_fresh_safe_de
 @pytest.mark.asyncio
 async def test_application_teardown_cancels_an_open_confirmation_without_a_decision() -> None:
     conversation = ConfirmationRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
     submission: asyncio.Task[None]
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -2704,8 +3411,8 @@ async def test_tool_activity_renders_raw_arguments_until_terminal_marker() -> No
     conversation = ToolActivityRunSource(
         start_summary='Running read_file {"arguments":{"path":"C:/private.txt"}}',
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -2760,7 +3467,7 @@ async def test_tool_rows_isolate_calls_and_turns_without_tool_result_projection(
         _completed_response(),
     )
     conversation = ToolMessageSequenceRunSource(first_turn, second_turn)
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("first"), "enter")
@@ -2800,7 +3507,7 @@ async def test_tool_row_updates_preserve_historical_follow_and_resize_state() ->
         second_events,
         pause_after=(1, 0),
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 20)) as pilot:
         await pilot.press(*list("seed"), "enter")
@@ -2868,7 +3575,7 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
         second_events,
         pause_after=tuple((1, event_index) for event_index in range(5)),
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("history"), "enter")
@@ -2978,7 +3685,7 @@ async def test_activity_group_resize_preserves_scroll_mode_anchor_and_input_focu
             _completed_response(),
         ),
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(70, 22)) as pilot:
         await pilot.press(*list("history"), "enter")
@@ -3025,7 +3732,7 @@ async def test_activity_content_uses_main_vertical_scroll_and_keeps_code_horizon
             _completed_response(),
         )
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(48, 20)) as pilot:
         await pilot.press(*list("inspect"), "enter")
@@ -3072,8 +3779,8 @@ async def test_streamed_markdown_preserves_reading_structure_and_link_urls() -> 
         deltas=tuple(content),
         completed_content=content,
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(100, 40)) as pilot:
         await pilot.press(*list("read"), "enter")
@@ -3101,8 +3808,8 @@ async def test_markdown_structure_is_visible_while_the_fenced_block_is_incomplet
         deltas=(partial, "\n```\n"),
         completed_content=content,
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("progress"), "enter"))
@@ -3129,8 +3836,8 @@ async def test_high_frequency_deltas_are_preserved_until_the_terminal_marker() -
         deltas=tuple(streamed_content),
         completed_content="# Complete\n\nExact final content.",
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await asyncio.wait_for(pilot.press(*list("burst"), "enter"), timeout=5)
@@ -3152,8 +3859,8 @@ async def test_long_markdown_code_lines_remain_unwrapped_in_a_narrow_terminal() 
         deltas=tuple(content),
         completed_content=content,
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(48, 20)) as pilot:
         await pilot.press(*list("code"), "enter")
@@ -3181,8 +3888,8 @@ async def test_incomplete_streamed_markdown_remains_visible_before_completion() 
         deltas=("[documentation](", "https://example.com/docs)\n\n```python\n", "value = 1\n```"),
         completed_content=content,
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("partial"), "enter"))
@@ -3211,8 +3918,8 @@ async def test_streamed_markdown_reflows_cjk_content_after_resize() -> None:
         deltas=tuple(content),
         completed_content=content,
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("cjk"), "enter")
@@ -3251,8 +3958,8 @@ async def test_terminal_outcomes_settle_markdown_and_allow_a_subsequent_turn(
         cancelled_content=cancelled_content,
         failure_message="Model unavailable.",
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("first"), "enter")
@@ -3275,8 +3982,8 @@ async def test_cancelled_terminal_marker_renders_the_cancelled_status() -> None:
         outcomes=("cancelled",),
         cancelled_content="Retained partial response.",
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("cancel"), "enter")
@@ -3294,7 +4001,7 @@ async def test_cancelled_terminal_marker_keeps_the_streamed_candidate_in_activit
         outcomes=("cancelled",),
         cancelled_content="authoritative partial",
     )
-    app = _terminal_app(cast(PreparedRuntime, _runtime(conversation)))
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("cancel"), "enter")
@@ -3316,8 +4023,8 @@ async def test_markdown_failure_still_closes_the_conversation_event_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conversation = FailingRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
     markdown_stream = FailingMarkdownStream()
     monkeypatch.setattr(
         Markdown,
@@ -3335,12 +4042,12 @@ async def test_markdown_failure_still_closes_the_conversation_event_stream(
 
 
 @pytest.mark.asyncio
-async def test_runtime_cleanup_failure_does_not_mask_an_application_failure(
+async def test_terminal_cleanup_failure_does_not_mask_an_application_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conversation = FailingRunSource()
-    runtime = FailingCloseRuntime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = FailingCloseBackend(conversation)
+    app = _terminal_app(cast(Any, runtime))
     markdown_stream = FailingMarkdownStream()
     monkeypatch.setattr(
         Markdown,
@@ -3359,12 +4066,12 @@ async def test_runtime_cleanup_failure_does_not_mask_an_application_failure(
 
 
 @pytest.mark.asyncio
-async def test_terminal_conversation_uses_the_prepared_runtime_lifecycle(
+async def test_terminal_conversation_uses_the_direct_terminal_loop_lifecycle(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    provider = _RuntimeProvider((_response(content="Prepared runtime answer."),))
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    provider = _FixedCatalogProvider((_response(content="Prepared runtime answer."),))
+    runtime = _direct_terminal_loop(agent_home, workspace, provider)
     app = _terminal_app(runtime)
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -3383,7 +4090,7 @@ async def test_terminal_renders_reasoning_from_each_tool_loop_model_call(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    class MultiReasoningProvider(_RuntimeProvider):
+    class MultiReasoningProvider(_FixedCatalogProvider):
         async def stream(
             self,
             *,
@@ -3426,7 +4133,7 @@ async def test_terminal_renders_reasoning_from_each_tool_loop_model_call(
             _response(content="Final answer."),
         )
     )
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _direct_terminal_loop(agent_home, workspace, provider)
     app = _terminal_app(runtime)
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -3442,12 +4149,12 @@ async def test_terminal_renders_reasoning_from_each_tool_loop_model_call(
 
 
 @pytest.mark.asyncio
-async def test_prepared_runtime_exec_confirmation_preserves_the_exact_long_command(
+async def test_direct_terminal_loop_exec_confirmation_preserves_the_exact_long_command(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     command = f'printf "{"x" * 300}" && rm -rf "build output"'
-    provider = _RuntimeProvider(
+    provider = _FixedCatalogProvider(
         (
             _response(
                 content="",
@@ -3460,7 +4167,7 @@ async def test_prepared_runtime_exec_confirmation_preserves_the_exact_long_comma
             _response(content="The command was declined."),
         )
     )
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _direct_terminal_loop(agent_home, workspace, provider)
     app = _terminal_app(runtime)
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -3486,11 +4193,11 @@ async def test_prepared_runtime_exec_confirmation_preserves_the_exact_long_comma
 
 
 @pytest.mark.asyncio
-async def test_prepared_runtime_close_cancels_the_pending_confirmation_future(
+async def test_direct_terminal_loop_close_cancels_the_pending_confirmation_future(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    provider = _RuntimeProvider(
+    provider = _FixedCatalogProvider(
         (
             _response(
                 content="",
@@ -3502,7 +4209,7 @@ async def test_prepared_runtime_close_cancels_the_pending_confirmation_future(
             ),
         )
     )
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    runtime = _direct_terminal_loop(agent_home, workspace, provider)
     app = _terminal_app(runtime)
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -3516,12 +4223,12 @@ async def test_prepared_runtime_close_cancels_the_pending_confirmation_future(
 
 
 @pytest.mark.asyncio
-async def test_prepared_runtime_cancellation_preserves_partial_and_allows_next_turn(
+async def test_direct_terminal_loop_cancellation_preserves_partial_and_allows_next_turn(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    provider = CancellableRuntimeProvider()
-    runtime = _prepared_runtime(agent_home, workspace, provider)
+    provider = CancellableProvider()
+    runtime = _direct_terminal_loop(agent_home, workspace, provider)
     app = _terminal_app(runtime)
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -3545,8 +4252,8 @@ async def test_prepared_runtime_cancellation_preserves_partial_and_allows_next_t
 @pytest.mark.asyncio
 async def test_narrow_terminal_uses_full_message_width_for_readable_content() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
     content = "0123456789ABCDEFGHIJ"
 
     async with app.run_test(size=(30, 16)) as pilot:
@@ -3559,8 +4266,8 @@ async def test_narrow_terminal_uses_full_message_width_for_readable_content() ->
 @pytest.mark.asyncio
 async def test_wide_terminal_constrains_messages_to_a_comfortable_line_width() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
     terminal_width = 80
     content = "X" * 100
 
@@ -3577,8 +4284,8 @@ async def test_wide_terminal_constrains_messages_to_a_comfortable_line_width() -
 @pytest.mark.asyncio
 async def test_messages_are_side_aligned_with_role_accents_on_wide_terminals() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("user"), "enter")
@@ -3599,8 +4306,8 @@ async def test_messages_are_side_aligned_with_role_accents_on_wide_terminals() -
 @pytest.mark.asyncio
 async def test_cjk_double_width_content_reflows_when_terminal_is_resized() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
     content = "界" * 20
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -3622,8 +4329,8 @@ async def test_cjk_double_width_content_reflows_when_terminal_is_resized() -> No
 @pytest.mark.asyncio
 async def test_role_accents_remain_visible_with_limited_ansi_colors() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
     app.ansi_color = True
 
     async with app.run_test(size=(40, 18)) as pilot:
@@ -3642,8 +4349,8 @@ async def test_role_accents_remain_visible_without_terminal_color(
 ) -> None:
     monkeypatch.setenv("NO_COLOR", "1")
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(40, 18)) as pilot:
         await pilot.press(*list("hello"), "enter")
@@ -3659,8 +4366,8 @@ async def test_role_accents_remain_visible_without_terminal_color(
 async def test_conversation_navigation_keys_keep_input_focus() -> None:
     content = "\n".join(f"line {index:02d} " + "x" * 30 for index in range(80))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("navigate"), "enter")
@@ -3690,8 +4397,8 @@ async def test_conversation_navigation_keys_keep_input_focus() -> None:
 async def test_mouse_scroll_keeps_input_focus_and_scrollbar_is_overflow_only() -> None:
     content = "\n".join(f"line {index:02d} " + "x" * 30 for index in range(80))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("scroll"), "enter")
@@ -3712,8 +4419,8 @@ async def test_mouse_scroll_keeps_input_focus_and_scrollbar_is_overflow_only() -
         assert display.is_vertical_scroll_end
         assert isinstance(app.screen.focused, TextArea)
 
-    empty_runtime = _runtime(ScriptedRunSource())
-    empty_app = _terminal_app(cast(PreparedRuntime, empty_runtime))
+    empty_runtime = _terminal_backend(ScriptedRunSource())
+    empty_app = _terminal_app(cast(Any, empty_runtime))
     async with empty_app.run_test(size=(60, 20)):
         empty_display = empty_app.query_one("#conversation-display")
         assert not empty_display.vertical_scrollbar.display
@@ -3723,8 +4430,8 @@ async def test_mouse_scroll_keeps_input_focus_and_scrollbar_is_overflow_only() -
 async def test_conversation_scrollbar_supports_pointer_dragging() -> None:
     content = "\n".join(f"line {index:02d}" for index in range(100))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("drag"), "enter")
@@ -3746,8 +4453,8 @@ async def test_conversation_scrollbar_supports_pointer_dragging() -> None:
 async def test_dragging_scrollbar_to_bottom_resumes_follow_mode() -> None:
     content = "\n".join(f"line {index:02d}" for index in range(100))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("seed"), "enter")
@@ -3779,8 +4486,8 @@ async def test_historical_streaming_pauses_follow_and_exposes_new_content() -> N
         deltas_by_submission=((history,), ("New ", "content.")),
         completed_contents=(history, "New content."),
     )
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("seed"), "enter")
@@ -3828,8 +4535,8 @@ async def test_historical_streaming_pauses_follow_and_exposes_new_content() -> N
 async def test_historical_resize_preserves_a_visible_message_anchor() -> None:
     content = "\n".join(f"anchor {index:02d} " + "z" * 35 for index in range(50))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("resize"), "enter")
@@ -3855,8 +4562,8 @@ async def test_historical_resize_preserves_a_visible_message_anchor() -> None:
 async def test_bottom_follow_is_preserved_when_resize_reflows_content() -> None:
     content = "\n".join(f"line {index:02d} " + "x" * 60 for index in range(80))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("resize"), "enter")
@@ -3879,8 +4586,8 @@ async def test_bottom_follow_is_preserved_when_resize_reflows_content() -> None:
 async def test_user_scroll_takes_over_from_rapid_resize_callbacks() -> None:
     content = "\n".join(f"resize {index:03d} " + "x" * 70 for index in range(90))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("resize"), "enter")
@@ -3909,8 +4616,8 @@ async def test_user_scroll_takes_over_from_rapid_resize_callbacks() -> None:
 async def test_historical_resize_preserves_anchor_within_one_long_message() -> None:
     content = "\n".join(f"anchor {index:03d} " + "z" * 55 for index in range(80))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(100, 24)) as pilot:
         await pilot.press(*list("resize"), "enter")
@@ -3934,8 +4641,8 @@ async def test_historical_resize_preserves_anchor_within_one_long_message() -> N
 @pytest.mark.asyncio
 async def test_shutdown_settles_stream_worker_before_runtime_close() -> None:
     conversation = BlockingRunSource()
-    runtime = CloseOrderingRuntime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = CloseOrderingBackend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("block"), "enter")
@@ -3949,8 +4656,8 @@ async def test_shutdown_settles_stream_worker_before_runtime_close() -> None:
 @pytest.mark.asyncio
 async def test_failed_stream_terminal_still_closes_runtime_once() -> None:
     conversation = FailingCancellationCleanupRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.press(*list("block"), "enter")
@@ -3972,7 +4679,7 @@ async def test_minimum_terminal_size_has_an_exact_20_by_10_boundary(
     size: tuple[int, int],
     undersized: bool,
 ) -> None:
-    app = _terminal_app(cast(PreparedRuntime, _runtime(ScriptedRunSource())))
+    app = _terminal_app(cast(Any, _terminal_backend(ScriptedRunSource())))
 
     async with app.run_test(size=size):
         visible_text = _visible_screen_text(app)
@@ -3984,8 +4691,8 @@ async def test_minimum_terminal_size_has_an_exact_20_by_10_boundary(
 @pytest.mark.asyncio
 async def test_undersized_terminal_replaces_presentation_and_recovers_input() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(19, 9)) as pilot:
         size_state = app.query_one("#size-insufficient", Static)
@@ -4013,8 +4720,8 @@ async def test_undersized_terminal_replaces_presentation_and_recovers_input() ->
 @pytest.mark.asyncio
 async def test_undersized_recovery_preserves_completion_draft_history_and_focus() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -4046,8 +4753,8 @@ async def test_undersized_recovery_preserves_completion_draft_history_and_focus(
 @pytest.mark.asyncio
 async def test_undersized_recovery_preserves_active_turn_state() -> None:
     conversation = BlockingRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("block"), "enter")
@@ -4070,8 +4777,8 @@ async def test_undersized_recovery_preserves_active_turn_state() -> None:
 @pytest.mark.asyncio
 async def test_undersized_terminal_blocks_an_open_confirmation_until_recovery() -> None:
     conversation = ConfirmationRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("inspect"), "enter"))
@@ -4108,8 +4815,8 @@ async def test_undersized_terminal_blocks_an_open_confirmation_until_recovery() 
 async def test_resize_back_from_undersized_terminal_restores_historical_anchor() -> None:
     content = "\n".join(f"anchor {index:02d} " + "z" * 35 for index in range(50))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("anchor"), "enter")
@@ -4140,8 +4847,8 @@ async def test_resize_back_from_undersized_terminal_restores_historical_anchor()
 async def test_resize_back_from_undersized_terminal_restores_bottom_follow() -> None:
     content = "\n".join(f"line {index:02d} " + "x" * 50 for index in range(50))
     conversation = ScriptedRunSource(deltas=(content,), completed_content=content)
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("bottom"), "enter")
@@ -4165,7 +4872,7 @@ async def test_resize_back_from_undersized_terminal_restores_bottom_follow() -> 
 
 
 @pytest.mark.asyncio
-async def test_runtime_start_failure_closes_after_external_driver_start() -> None:
+async def test_terminal_start_failure_closes_after_external_driver_start() -> None:
     terminal_state = {"restored": False}
 
     class RecordingDriver(KeyboardLifecycleDriver):
@@ -4177,7 +4884,7 @@ async def test_runtime_start_failure_closes_after_external_driver_start() -> Non
             super().stop_application_mode()
             terminal_state["restored"] = True
 
-    class RecordingRuntime(FailingStartRuntime):
+    class RecordingBackend(FailingStartBackend):
         def __init__(self, conversation: _ScriptedSource) -> None:
             super().__init__(conversation)
             self.close_saw_terminal_restored = False
@@ -4186,8 +4893,8 @@ async def test_runtime_start_failure_closes_after_external_driver_start() -> Non
             self.close_saw_terminal_restored = terminal_state["restored"]
             await super().close()
 
-    runtime = RecordingRuntime(ScriptedRunSource())
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = RecordingBackend(ScriptedRunSource())
+    app = _terminal_app(cast(Any, runtime))
     app.driver_class = RecordingDriver
 
     with pytest.raises(RuntimeError, match="runtime startup failed"):
@@ -4199,7 +4906,7 @@ async def test_runtime_start_failure_closes_after_external_driver_start() -> Non
 
 
 @pytest.mark.asyncio
-async def test_runtime_cleanup_failure_still_restores_terminal_first() -> None:
+async def test_terminal_cleanup_failure_still_restores_terminal_first() -> None:
     terminal_state = {"restored": False}
 
     class RecordingDriver(KeyboardLifecycleDriver):
@@ -4211,7 +4918,7 @@ async def test_runtime_cleanup_failure_still_restores_terminal_first() -> None:
             super().stop_application_mode()
             terminal_state["restored"] = True
 
-    class RecordingRuntime(FailingCloseRuntime):
+    class RecordingBackend(FailingCloseBackend):
         def __init__(self, conversation: _ScriptedSource) -> None:
             super().__init__(conversation)
             self.close_saw_terminal_restored = False
@@ -4220,8 +4927,8 @@ async def test_runtime_cleanup_failure_still_restores_terminal_first() -> None:
             self.close_saw_terminal_restored = terminal_state["restored"]
             await super().close()
 
-    runtime = RecordingRuntime(ScriptedRunSource())
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = RecordingBackend(ScriptedRunSource())
+    app = _terminal_app(cast(Any, runtime))
     app.driver_class = RecordingDriver
 
     with pytest.raises(RuntimeError, match="runtime cleanup failed"):
@@ -4233,8 +4940,8 @@ async def test_runtime_cleanup_failure_still_restores_terminal_first() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_start_and_cleanup_failure_preserves_the_start_error() -> None:
-    class FailingStartAndCloseRuntime(FakePreparedRuntime):
+async def test_terminal_start_and_cleanup_failure_preserves_the_start_error() -> None:
+    class FailingStartAndCloseBackend(FakeTerminalBackend):
         async def start(self) -> None:
             self.start_calls += 1
             raise RuntimeError("runtime startup failed")
@@ -4243,8 +4950,8 @@ async def test_runtime_start_and_cleanup_failure_preserves_the_start_error() -> 
             self.close_calls += 1
             raise RuntimeError("runtime cleanup failed")
 
-    runtime = FailingStartAndCloseRuntime(ScriptedRunSource())
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = FailingStartAndCloseBackend(ScriptedRunSource())
+    app = _terminal_app(cast(Any, runtime))
     app.driver_class = KeyboardLifecycleDriver
 
     with pytest.raises(RuntimeError, match="runtime startup failed") as raised:
@@ -4266,7 +4973,7 @@ async def test_terminal_start_failure_attempts_application_mode_restore() -> Non
             raise RuntimeError("terminal startup failed")
 
     KeyboardLifecycleDriver.operations = []
-    app = _terminal_app(cast(PreparedRuntime, _runtime(ScriptedRunSource())))
+    app = _terminal_app(cast(Any, _terminal_backend(ScriptedRunSource())))
     app.driver_class = FailingStartDriver
 
     with pytest.raises(RuntimeError, match="terminal startup failed"):
@@ -4287,7 +4994,7 @@ async def test_terminal_stop_failure_still_restores_enhanced_keyboard_mode(
             raise RuntimeError("terminal cleanup failed")
 
     KeyboardLifecycleDriver.operations = []
-    app = _terminal_app(cast(PreparedRuntime, _runtime(ScriptedRunSource())))
+    app = _terminal_app(cast(Any, _terminal_backend(ScriptedRunSource())))
     app.driver_class = FailingStopDriver
 
     with pytest.raises(RuntimeError, match="terminal cleanup failed"):
@@ -4316,8 +5023,8 @@ async def test_terminal_stop_failure_does_not_mask_an_application_body_failure(
 
     monkeypatch.setattr(TerminalConversationApp, "compose", failing_compose)
 
-    runtime = _runtime(ScriptedRunSource())
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(ScriptedRunSource())
+    app = _terminal_app(cast(Any, runtime))
     app.driver_class = FailingStopDriver
 
     with pytest.raises(RuntimeError, match="application body failed") as raised:
@@ -4407,7 +5114,7 @@ async def test_partial_terminal_stop_failure_restores_all_modes_before_runtime_c
             if self._restore_console is not None:
                 self._restore_console()
 
-    class RecordingRuntime(FakePreparedRuntime):
+    class RecordingBackend(FakeTerminalBackend):
         def __init__(self, conversation: _ScriptedSource) -> None:
             super().__init__(conversation)
             self.close_saw_terminal_restored = False
@@ -4424,8 +5131,8 @@ async def test_partial_terminal_stop_failure_restores_all_modes_before_runtime_c
             }
             await super().close()
 
-    runtime = RecordingRuntime(ScriptedRunSource())
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = RecordingBackend(ScriptedRunSource())
+    app = _terminal_app(cast(Any, runtime))
     app.driver_class = PartialStopDriver
 
     with pytest.raises(RuntimeError, match="terminal cleanup failed"):
@@ -4471,8 +5178,8 @@ def test_non_tty_terminal_streams_are_rejected_before_textual_starts(
 @pytest.mark.asyncio
 async def test_management_completion_supports_keyboard_filtering_and_escape() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         input_area = app.query_one("#conversation-input", TextArea)
@@ -4555,7 +5262,7 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
 async def test_management_completion_keeps_the_composer_visible(
     size: tuple[int, int],
 ) -> None:
-    app = _terminal_app(cast(PreparedRuntime, _runtime(ScriptedRunSource())))
+    app = _terminal_app(cast(Any, _terminal_backend(ScriptedRunSource())))
 
     async with app.run_test(size=size) as pilot:
         await pilot.press("/")
@@ -4601,8 +5308,8 @@ async def test_management_completion_keeps_the_composer_visible(
 @pytest.mark.asyncio
 async def test_management_completion_mouse_selection_updates_the_composer() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("/")
@@ -4627,7 +5334,7 @@ async def test_management_completion_mouse_selection_updates_the_composer() -> N
 @pytest.mark.asyncio
 async def test_skill_completion_merges_after_management_commands_with_safe_labels() -> None:
     conversation = ScriptedRunSource()
-    runtime = cast(PreparedRuntime, _runtime(conversation))
+    runtime = cast(Any, _terminal_backend(conversation))
     skills = (
         SkillMetadata(
             name="alpha",
@@ -4669,7 +5376,7 @@ async def test_skill_completion_labels_are_single_line_at_narrow_sizes_and_stop_
     description_chunk = "segment\n\t[bold] \\path\u2003"
     long_description = (description_chunk * ((1024 // len(description_chunk)) + 1))[:1024]
     assert len(long_description) == 1024
-    runtime = cast(PreparedRuntime, _runtime(ScriptedRunSource()))
+    runtime = cast(Any, _terminal_backend(ScriptedRunSource()))
     app = _terminal_app(
         runtime,
         skill_metadata=(
@@ -4718,8 +5425,8 @@ async def test_skill_completion_selection_inserts_only_the_skill_invocation(
     selection: Literal["enter", "exact-enter", "mouse"],
 ) -> None:
     conversation = ScriptedRunSource()
-    fake_runtime = _runtime(conversation)
-    runtime = cast(PreparedRuntime, fake_runtime)
+    fake_runtime = _terminal_backend(conversation)
+    runtime = cast(Any, fake_runtime)
     app = _terminal_app(
         runtime,
         skill_metadata=(
@@ -4764,8 +5471,8 @@ async def test_completion_tab_does_not_accept_or_submit_highlighted_candidate(
     candidate_text: str,
 ) -> None:
     conversation = ScriptedRunSource()
-    fake_runtime = _runtime(conversation)
-    runtime = cast(PreparedRuntime, fake_runtime)
+    fake_runtime = _terminal_backend(conversation)
+    runtime = cast(Any, fake_runtime)
     app = _terminal_app(
         runtime,
         skill_metadata=(
@@ -4788,1387 +5495,29 @@ async def test_completion_tab_does_not_accept_or_submit_highlighted_candidate(
 
 
 @pytest.mark.asyncio
-async def test_runtime_rebind_clears_stale_skill_completion_state(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    first_skill = agent_home / "skills" / "first" / "SKILL.md"
-    first_skill.parent.mkdir(parents=True)
-    first_skill.write_bytes(b"---\nname: first\ndescription: Original first\n---\n")
-    runtime = _generation_host(agent_home, workspace, _RuntimeProvider(()))
-    bindings = runtime.bindings
-    app = _terminal_app(runtime, skill_metadata=bindings.skill_metadata)
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.add_message("user", "Persisted target")
-    target.close()
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("/", *(("down",) * 5))
-        completion = app.query_one("#command-completion", OptionList)
-        assert completion.highlighted == 5
-
-        first_skill.write_bytes(b"---\nname: first\ndescription: Changed first\n---\n")
-        second_skill = agent_home / "skills" / "second" / "SKILL.md"
-        second_skill.parent.mkdir(parents=True)
-        second_skill.write_bytes(b"---\nname: second\ndescription: New second\n---\n")
-        result = await runtime.management_dispatcher.resume(target.session_id)
-        await pilot.pause()
-
-        input_area = app.query_one("#conversation-input", TextArea)
-        assert result.resumed_session_id == target.session_id
-        assert input_area.text == ""
-        assert not completion.display
-        assert not completion.options
-        assert completion.highlighted is None
-
-        await pilot.press("/")
-        await pilot.pause()
-        assert [str(option.prompt) for option in completion.options] == [
-            "/config - View User Configuration",
-            "/status - View Runtime Status",
-            "/resume - Resume a Conversation Session",
-            "/memory - View Long-term Memory",
-            "/dream - Process pending Conversation Summaries",
-            "/first - Changed first",
-            "/second - New second",
-        ]
-        assert completion.highlighted == 0
-        assert app.screen.focused is input_area
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("command", "output_marker"),
-    (
-        ("/config", "Path:"),
-        ("/status", '"version": "0.1.0"'),
-        ("/memory", "# Long-term Memory"),
-        ("/dream", "No pending summaries"),
-    ),
-)
-async def test_supported_management_commands_use_the_prepared_runtime_without_session_messages(
-    agent_home: Path,
-    workspace: Path,
-    command: str,
-    output_marker: str,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
-    original_session = runtime.session
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list(command), "enter")
-        await pilot.pause()
-        await pilot.press("ctrl+home")
-
-        visible_text = _visible_screen_text(app)
-        assert visible_text.count(f"Command: {command}") == 1
-        assert output_marker in visible_text
-        assert runtime.session is original_session
-        assert original_session.messages == []
-        assert provider.stream_requests == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("command", ("/ordinary", "/CONFIG", "/config extra", "/memory "))
-async def test_inexact_slash_input_reaches_the_active_message_bus_unchanged(
-    agent_home: Path,
-    workspace: Path,
-    command: str,
-) -> None:
-    provider = _RuntimeProvider((_response(content="Ordinary slash response."),))
-    runtime = _prepared_runtime(agent_home, workspace, provider)
-    original_session = runtime.session
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list(command), "enter")
-        await _wait_for_turn(app)
-
-        assert runtime.session is original_session
-        assert original_session.messages[0]["role"] == "user"
-        assert original_session.messages[0]["content"] == command
-        assert provider.stream_requests
-
-
-@pytest.mark.asyncio
-async def test_empty_resume_picker_cancellation_preserves_existing_management_rows(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/dream"), "enter")
-        await pilot.press("ctrl+home")
-        before_resume = _visible_screen_text(app)
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-
-        assert "No resumable Conversation Sessions." in _visible_screen_text(app)
-        await pilot.click(offset=(1, 1))
-        assert app.screen.id == "session-picker"
-        await pilot.press("escape", "ctrl+home")
-        await pilot.pause()
-
-        visible_text = _visible_screen_text(app)
-        assert visible_text == before_resume
-        assert "Command: /dream" in visible_text
-        assert "No pending summaries" in visible_text
-        assert "Command: /resume" not in visible_text
-        assert runtime.session.messages == []
-        assert provider.stream_requests == []
-
-
-@pytest.mark.asyncio
-async def test_resume_opens_a_picker_with_title_and_local_update_time(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    older = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW.replace(hour=10),
-        new_uuid=lambda: UUID("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
-    )
-    older.update_metadata(title="Older session")
-    older.add_message("user", "Older persisted question.")
-    older.close()
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
-    )
-    target.update_metadata(title="Target session")
-    target.add_message("user", "Persisted question.")
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-
-        visible_text = _visible_screen_text(app)
-        assert app.screen.id == "session-picker"
-        assert "Target session" in visible_text
-        assert visible_text.index("Target session") < visible_text.index("Older session")
-        assert target.session_id not in visible_text
-        assert older.session_id not in visible_text
-        assert target.updated_at.astimezone().strftime("%Y-%m-%d %H:%M") in visible_text
-        assert app.screen.focused is app.screen.query_one("#session-picker-options", OptionList)
-
-
-@pytest.mark.asyncio
-async def test_resume_selection_rebuilds_the_display_from_the_selected_session(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Restored session")
-    target.add_message("user", "Persisted question.")
-    target.add_message(
-        "assistant",
-        "Persisted **answer**.",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 2,
-            "output_tokens": 3,
-            "total_tokens": 5,
-        },
-    )
-    target.add_message(
-        "assistant",
-        "",
-        tool_calls=[
-            {
-                "id": "call-restored",
-                "name": "read_file",
-                "arguments": '{"api_key":"private"}',
-            },
-            {"id": "call-error", "name": "exec", "arguments": '{"command":"private"}'},
-            {"id": "call-refused", "name": "web_fetch", "arguments": '{"url":"private"}'},
-        ],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.add_message(
-        "tool",
-        "private tool result",
-        tool_call_id="call-restored",
-        name="read_file",
-        status="success",
-        artifact=None,
-    )
-    target.add_message(
-        "tool",
-        "STDERR permission denied; STDOUT secret bytes",
-        tool_call_id="call-error",
-        name="exec",
-        status="error",
-        artifact=None,
-    )
-    target.add_message(
-        "tool",
-        "private refusal detail",
-        tool_call_id="call-refused",
-        name="web_fetch",
-        status="refused",
-        artifact=None,
-    )
-    target.add_message(
-        "assistant",
-        "Persisted partial answer.",
-        tool_calls=[],
-        status="interrupted",
-        error={"code": "turn_cancelled", "message": "Turn interrupted by user."},
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.add_message(
-        "assistant",
-        "",
-        tool_calls=[],
-        status="error",
-        error={"code": "model_failed", "message": "Persisted model failure."},
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 0,
-            "total_tokens": 1,
-        },
-    )
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(100, 40)) as pilot:
-        await pilot.press(*list("/status"), "enter")
-        await pilot.pause()
-        await pilot.press("ctrl+home")
-        assert "Command: /status" in _visible_screen_text(app)
-
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        expected_projection = (
-            "Persisted question.",
-            "Persisted answer.",
-            "Completed: read_file",
-            "Failed: exec - The operation did not complete.",
-            "Rejected: web_fetch",
-            "Persisted partial answer.",
-            "Persisted model failure.",
-        )
-        async with asyncio.timeout(2):
-            while runtime.session.session_id != target.session_id or any(
-                expected not in _visible_screen_text(app) for expected in expected_projection
-            ):
-                await pilot.pause()
-
-        visible_text = _visible_screen_text(app)
-        assert app.screen.id == "_default"
-        assert runtime.session.session_id == target.session_id
-        assert "Persisted question." in visible_text
-        assert "Persisted answer." in visible_text
-        assert "Completed: read_file" in visible_text
-        assert "Failed: exec - The operation did not complete." in visible_text
-        assert "Rejected: web_fetch" in visible_text
-        assert "Persisted partial answer." in visible_text
-        assert "Turn cancelled." not in visible_text
-        assert "Persisted model failure." in visible_text
-        assert "private tool result" not in visible_text
-        assert "private refusal detail" not in visible_text
-        assert "call-restored" not in visible_text
-        assert "call-error" not in visible_text
-        assert "call-refused" not in visible_text
-        assert "api_key" not in visible_text
-        assert "STDERR" not in visible_text
-        assert "STDOUT" not in visible_text
-        assert "secret bytes" not in visible_text
-        assert visible_text.index("Persisted answer.") < visible_text.index("Completed: read_file")
-        assert visible_text.index("Completed: read_file") < visible_text.index("Failed: exec")
-        assert visible_text.index("Failed: exec") < visible_text.index("Rejected: web_fetch")
-        assert visible_text.index("Rejected: web_fetch") < visible_text.index(
-            "Persisted partial answer."
-        )
-        assert "Command: /status" not in visible_text
-        assert "Command: /resume" not in visible_text
-        assert app.screen.focused is app.query_one("#conversation-input", TextArea)
-
-
-@pytest.mark.asyncio
-async def test_resume_rebuilds_a_successful_tool_run_activity_group(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(10))
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: next(timestamps),
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Restored tool run")
-    target.add_message("user", "Read the file.")
-    target.add_message(
-        "assistant",
-        "I will inspect it first.",
-        tool_calls=[{"id": "call-restored", "name": "read_file", "arguments": '{"path":"x"}'}],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.add_message(
-        "tool",
-        "private result",
-        tool_call_id="call-restored",
-        name="read_file",
-        status="success",
-        artifact=None,
-    )
-    target.add_message(
-        "assistant",
-        "The file is ready.",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while (
-                runtime.session.session_id != target.session_id
-                or "The file is ready." not in _visible_screen_text(app)
-            ):
-                await pilot.pause()
-
-        group = app.query_one(".agent-run-activity-group")
-        activity = group.query_one(".agent-run-activity-content")
-        visible_text = _visible_screen_text(app)
-
-        assert "The file is ready." in visible_text
-        assert activity.query_one(Markdown).source == "I will inspect it first."
-        assert not activity.display
-        assert "\u25b6 3s" in visible_text
-        await pilot.click(".agent-run-activity-heading")
-        visible_text = _visible_screen_text(app)
-        assert "private result" not in visible_text
-        assert "Completed: read_file" in visible_text
-        assert visible_text.index("I will inspect it first.") < visible_text.index(
-            "Completed: read_file"
-        )
-        assert visible_text.index("Completed: read_file") < visible_text.index("The file is ready.")
-
-
-@pytest.mark.asyncio
-async def test_resume_groups_a_recognizable_tool_result_after_the_final_response(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(10))
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: next(timestamps),
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Late recognizable Tool result")
-    target.add_message("user", "Read the file.")
-    target.add_message(
-        "assistant",
-        "I will inspect it first.",
-        tool_calls=[{"id": "call-late", "name": "read_file", "arguments": '{"path":"x"}'}],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.add_message(
-        "assistant",
-        "The file is ready.",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.add_message(
-        "tool",
-        "private result",
-        tool_call_id="call-late",
-        name="read_file",
-        status="success",
-        artifact=None,
-    )
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while "The file is ready." not in _visible_screen_text(app):
-                await pilot.pause()
-
-        group = app.query_one(".agent-run-activity-group")
-        activity = group.query_one(".agent-run-activity-content")
-        visible_text = _visible_screen_text(app)
-
-        assert not activity.display
-        assert "\u25b6 2s" in visible_text
-        assert "The file is ready." in visible_text
-        assert "I will inspect it first." not in visible_text
-        assert "Completed: read_file" not in visible_text
-
-        await pilot.click(".agent-run-activity-heading")
-        visible_text = _visible_screen_text(app)
-        assert "private result" not in visible_text
-        assert visible_text.index("I will inspect it first.") < visible_text.index(
-            "Completed: read_file"
-        )
-        assert visible_text.index("Completed: read_file") < visible_text.index("The file is ready.")
-
-
-@pytest.mark.asyncio
-async def test_resume_uses_the_last_completed_no_tool_assistant_as_final_response(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(12))
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: next(timestamps),
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Multiple final candidates")
-    target.add_message("user", "First question")
-    target.add_message(
-        "assistant",
-        "Earlier failed activity.",
-        tool_calls=[],
-        status="error",
-        error={"code": "model_failed", "message": "Stale model failure."},
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.add_message(
-        "assistant",
-        "Earlier activity.",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.add_message(
-        "assistant",
-        "Final answer.",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.add_message("user", "Second question")
-    target.add_message(
-        "assistant",
-        "   ",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while "Final answer." not in _visible_screen_text(app):
-                await pilot.pause()
-
-        groups = list(app.query(".agent-run-activity-group"))
-        assert len(groups) == 1
-        group = groups[0]
-        activity = group.query_one(".agent-run-activity-content")
-        visible_text = _visible_screen_text(app)
-        assert "Final answer." in visible_text
-        assert "\u25b6 3s" in visible_text
-        assert not activity.display
-        assert "Earlier activity." not in visible_text
-        assert "Completed with no response." in visible_text
-        assert "Stale model failure." not in visible_text
-
-        await pilot.click(".agent-run-activity-heading")
-        visible_text = _visible_screen_text(app)
-        assert "Earlier failed activity." in visible_text
-        assert "Earlier activity." in visible_text
-        assert visible_text.index("Earlier activity.") < visible_text.index("Final answer.")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("status", "error", "expected_status"),
-    [
-        (
-            "interrupted",
-            {"code": "turn_cancelled", "message": "cancelled"},
-            "Turn cancelled.",
-        ),
-        (
-            "error",
-            {"code": "model_failed", "message": "Persisted model failure."},
-            "Persisted model failure.",
-        ),
-    ],
-)
-async def test_resume_expands_cancelled_and_failed_activity_groups(
-    agent_home: Path,
-    workspace: Path,
-    status: Literal["interrupted", "error"],
-    error: dict[str, str],
-    expected_status: str,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(8))
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: next(timestamps),
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title=f"Restored {status} run")
-    target.add_message("user", "Run the operation.")
-    stale_status: Literal["interrupted", "error"] = (
-        "error" if status == "interrupted" else "interrupted"
-    )
-    stale_error = (
-        {"code": "model_failed", "message": "Stale model failure."}
-        if stale_status == "error"
-        else {"code": "turn_cancelled", "message": "cancelled"}
-    )
-    target.add_message(
-        "assistant",
-        "Earlier terminal activity.",
-        tool_calls=[],
-        status=stale_status,
-        error=stale_error,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.add_message(
-        "assistant",
-        "Partial activity.",
-        tool_calls=[],
-        status=status,
-        error=error,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while "Partial activity." not in _visible_screen_text(app):
-                await pilot.pause()
-
-        group = app.query_one(".agent-run-activity-group")
-        content = group.query_one(".agent-run-activity-content")
-        visible_text = _visible_screen_text(app)
-        assert content.display
-        assert str(group.query_one(".agent-run-activity-heading", Static).content) == "\u25bc 2s"
-        assert expected_status in visible_text
-        stale_terminal_status = (
-            "Stale model failure." if status == "interrupted" else "Turn cancelled."
-        )
-        assert stale_terminal_status not in visible_text
-
-        await pilot.click(".agent-run-activity-heading")
-        assert not content.display
-
-
-@pytest.mark.asyncio
-async def test_resume_keeps_unknown_outcome_expanded_without_inventing_status(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    timestamps = iter(NOW + timedelta(seconds=offset) for offset in range(6))
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: next(timestamps),
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Unknown outcome")
-    target.add_message("user", "Wait for the operation.")
-    target.add_message(
-        "assistant",
-        "Still waiting for a result.",
-        tool_calls=[{"id": "call-pending", "name": "read_file", "arguments": "{}"}],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while "Still waiting for a result." not in _visible_screen_text(app):
-                await pilot.pause()
-
-        group = app.query_one(".agent-run-activity-group")
-        content = group.query_one(".agent-run-activity-content")
-        visible_text = _visible_screen_text(app)
-        assert content.display
-        assert str(group.query_one(".agent-run-activity-heading", Static).content) == "\u25bc 1s"
-        assert "Turn cancelled." not in visible_text
-        assert "Turn failed." not in visible_text
-        assert "Completed with no response." not in visible_text
-
-        await pilot.click(".agent-run-activity-heading")
-        assert not content.display
-
-
-@pytest.mark.asyncio
-async def test_resume_clamps_reversed_historical_duration_to_zero(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Reversed timestamps")
-    target.add_message("user", "Run with reversed timestamps.")
-    target.add_message(
-        "assistant",
-        "Historical activity.",
-        tool_calls=[{"id": "call-reversed", "name": "read_file", "arguments": "{}"}],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.messages[0]["timestamp"] = (NOW + timedelta(seconds=5)).isoformat(
-        timespec="milliseconds"
-    )
-    target.messages[1]["timestamp"] = NOW.isoformat(timespec="milliseconds")
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while "Historical activity." not in _visible_screen_text(app):
-                await pilot.pause()
-
-        heading = app.query_one(".agent-run-activity-heading", Static)
-        assert str(heading.content) == "\u25bc 0s"
-
-
-@pytest.mark.asyncio
-async def test_resume_keeps_pre_user_messages_and_unclassifiable_runs_flat(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Unclassifiable history")
-    target.add_message(
-        "assistant",
-        "Before the first user message.",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
-    )
-    target.add_message(
-        "tool",
-        "private pre-user result",
-        tool_call_id="orphan-pre-user",
-        name="read_file",
-        status="success",
-        artifact=None,
-    )
-    target.add_message("user", "Question with an orphan tool result.")
-    target.add_message(
-        "tool",
-        "private orphan result",
-        tool_call_id="orphan-in-run",
-        name="read_file",
-        status="success",
-        artifact=None,
-    )
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while "Question with an orphan tool result." not in _visible_screen_text(app):
-                await pilot.pause()
-
-        visible_text = _visible_screen_text(app)
-        assert not list(app.query(".agent-run-activity-group"))
-        assert "Before the first user message." in visible_text
-        assert "Question with an orphan tool result." in visible_text
-        assert visible_text.count("Completed: read_file") == 2
-        assert "private pre-user result" not in visible_text
-        assert "private orphan result" not in visible_text
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cancel_key", ("escape", "ctrl+c"))
-async def test_resume_picker_cancellation_and_outside_click_preserve_current_display(
-    agent_home: Path,
-    workspace: Path,
-    cancel_key: str,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    initial_session_id = runtime.session.session_id
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
-    )
-    target.update_metadata(title="Target session")
-    target.add_message("user", "Target content.")
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/status"), "enter")
-        await pilot.pause()
-        await pilot.press("ctrl+home")
-        before_resume = _visible_screen_text(app)
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-
-        await pilot.click(offset=(1, 1))
-        assert app.screen.id == "session-picker"
-        await pilot.press("left", "right")
-        assert app.screen.id == "session-picker"
-        assert runtime.session.session_id == initial_session_id
-        assert app.screen.query_one("#session-picker-options", OptionList).has_focus
-        await pilot.press(cancel_key)
-        await pilot.pause()
-        assert app.is_running
-        input_area = app.query_one("#conversation-input", TextArea)
-        assert not input_area.read_only
-        await pilot.press("ctrl+home")
-
-        visible_text = _visible_screen_text(app)
-        assert app.screen.id == "_default"
-        assert runtime.session.session_id == initial_session_id
-        assert visible_text == before_resume
-        assert "Command: /status" in visible_text
-        assert "Command: /resume" not in visible_text
-        assert "Target content." not in visible_text
-        assert app.screen.focused is input_area
-
-
-@pytest.mark.asyncio
-async def test_resume_picker_mouse_selection_switches_to_the_clicked_session(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Mouse target")
-    target.add_message("user", "Mouse-selected content.")
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.click("#session-picker-options", offset=(4, 1))
-
-        async with asyncio.timeout(2):
-            while (
-                runtime.session.session_id != target.session_id
-                or "Mouse-selected content." not in _visible_screen_text(app)
-            ):
-                await pilot.pause()
-
-        assert runtime.session.session_id == target.session_id
-        assert "Mouse-selected content." in _visible_screen_text(app)
-
-
-@pytest.mark.asyncio
-async def test_resume_failure_after_a_stale_listing_preserves_the_current_display(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    initial_session_id = runtime.session.session_id
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
-    )
-    target.update_metadata(title="Stale target")
-    target.add_message("user", "Should not be restored.")
-    target.close()
-    target_path = target.workspace_state.sessions_directory / f"{target.session_id}.jsonl"
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/status"), "enter")
-        await pilot.pause()
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        target_path.unlink()
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while "model_invalid_request:" not in _visible_screen_text(app):
-                await pilot.pause()
-        failure_text = _visible_screen_text(app)
-        await pilot.press("ctrl+home")
-
-        visible_text = _visible_screen_text(app)
-        assert runtime.session.session_id == initial_session_id
-        assert "Command: /status" in visible_text
-        assert "Should not be restored." not in visible_text
-        assert "model_invalid_request:" in failure_text
-        assert "not\nresumable." in failure_text
-
-
-@pytest.mark.asyncio
-async def test_resume_picker_scrolls_in_management_order_and_selects_by_keyboard(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    sessions: list[Session] = []
-    for index in range(24):
-        session_now = NOW.replace(minute=index)
-        session_uuid = UUID(f"00000000-0000-4000-8000-{index + 1:012x}")
-        session = Session.create(
-            runtime.session.workspace_state,
-            now=_constant_datetime(session_now),
-            new_uuid=_constant_uuid(session_uuid),
-        )
-        session.update_metadata(title=f"Session {index:02d}")
-        session.add_message("user", f"Content {index:02d}.")
-        session.close()
-        sessions.append(session)
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 20)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-
-        visible_text = _visible_screen_text(app)
-        assert visible_text.index("Session 23") < visible_text.index("Session 22")
-        options = app.screen.query_one("#session-picker-options", OptionList)
-        assert options.max_scroll_y > 0
-
-        await pilot._post_mouse_events([MouseScrollDown], offset=(40, 10), times=3)
-        await pilot.pause()
-        assert options.scroll_y > 0
-        await pilot.press(*(("down",) * 23))
-        await pilot.pause()
-        assert options.scroll_y > 0
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while runtime.session.session_id != sessions[
-                0
-            ].session_id or "Content 00." not in _visible_screen_text(app):
-                await pilot.pause()
-        assert "Content 00." in _visible_screen_text(app)
-
-
-@pytest.mark.asyncio
-async def test_resume_picker_reports_corrupt_entries_without_mutating_them(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Valid target")
-    target.add_message("user", "Valid restored content.")
-    target.close()
-    corrupt_path = target.workspace_state.sessions_directory / (
-        "20260811-120000-000000_00000000-0000-0000-0000-000000000000.jsonl"
-    )
-    corrupt_content = b"{not-json\n"
-    corrupt_path.write_bytes(corrupt_content)
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-
-        visible_text = _visible_screen_text(app)
-        assert "Skipped 1 corrupt Conversation Session." in visible_text
-        assert "Valid target" in visible_text
-        assert corrupt_path.read_bytes() == corrupt_content
-
-        await pilot.press("enter")
-        async with asyncio.timeout(2):
-            while (
-                runtime.session.session_id != target.session_id
-                or "Valid restored content." not in _visible_screen_text(app)
-            ):
-                await pilot.pause()
-
-        assert corrupt_path.read_bytes() == corrupt_content
-        assert "Valid restored content." in _visible_screen_text(app)
-
-
-@pytest.mark.asyncio
-async def test_resume_listing_failure_preserves_session_and_existing_display(
-    agent_home: Path,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    initial_session = runtime.session
-    original_dispatch = runtime.management_dispatcher.dispatch
-
-    async def dispatch_with_listing_failure(command: str) -> ManagementCommandResult:
-        if command == "/resume":
-            return ManagementCommandResult(
-                handled=True,
-                output="persistence_error: Conversation Sessions could not be listed.",
-            )
-        return await original_dispatch(command)
-
-    monkeypatch.setattr(runtime.management_dispatcher, "dispatch", dispatch_with_listing_failure)
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/status"), "enter")
-        await pilot.press(*list("/resume"), "enter")
-        async with asyncio.timeout(2):
-            while "could not be listed" not in _visible_screen_text(app):
-                await pilot.pause()
-
-        failure_text = _visible_screen_text(app)
-        await pilot.press("ctrl+home")
-        visible_text = _visible_screen_text(app)
-        assert app.screen.id == "_default"
-        assert runtime.session is initial_session
-        assert "Command: /status" in visible_text
-        assert "Conversation Sessions could not be listed." in failure_text
-
-
-@pytest.mark.asyncio
-async def test_resume_requires_result_and_runtime_authority_to_agree(
-    agent_home: Path,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    initial_session = runtime.session
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Authority target")
-    target.add_message("user", "Must not be projected without authority.")
-    target.close()
-
-    async def inconsistent_resume(
-        session_id: str,
-        *,
-        force: bool = False,
-    ) -> ManagementCommandResult:
-        del force
-        return ManagementCommandResult(
-            handled=True,
-            output=f"Resumed session {session_id}.",
-            resumed_session_id=session_id,
-        )
-
-    monkeypatch.setattr(runtime.management_dispatcher, "resume", inconsistent_resume)
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/status"), "enter")
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while "did not select" not in _visible_screen_text(app):
-                await pilot.pause()
-        failure_text = _visible_screen_text(app)
-        await pilot.press("ctrl+home")
-
-        visible_text = _visible_screen_text(app)
-        assert runtime.session is initial_session
-        assert "Command: /status" in visible_text
-        assert "Must not be projected without authority." not in visible_text
-        assert "Session resume did not select" in failure_text
-
-
-@pytest.mark.asyncio
-async def test_unexpected_resume_exception_preserves_session_display_and_interaction(
-    agent_home: Path,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    initial_session = runtime.session
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Failing target")
-    target.add_message("user", "Must remain hidden after an exception.")
-    target.close()
-
-    async def failing_resume(
-        session_id: str,
-        *,
-        force: bool = False,
-    ) -> ManagementCommandResult:
-        del session_id, force
-        raise RuntimeError("private failure detail")
-
-    monkeypatch.setattr(runtime.management_dispatcher, "resume", failing_resume)
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/status"), "enter")
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while "Session resume failed." not in _visible_screen_text(app):
-                await pilot.pause()
-        failure_text = _visible_screen_text(app)
-        input_area = app.query_one("#conversation-input", TextArea)
-        await pilot.press("ctrl+home")
-
-        visible_text = _visible_screen_text(app)
-        assert runtime.session is initial_session
-        assert app.is_running
-        assert not input_area.read_only
-        assert "Command: /status" in visible_text
-        assert "Must remain hidden after an exception." not in visible_text
-        assert "Session resume failed." in failure_text
-        assert "private failure detail" not in failure_text
-
-
-@pytest.mark.asyncio
-async def test_fatal_resume_failure_exits_terminal_without_rendering_raw_error(
-    agent_home: Path,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Fatal target")
-    target.add_message("user", "Must not be rendered after fatal replacement failure.")
-    target.close()
-    fatal = FatalManagementError(
-        ErrorInfo("persistence_error", "Runtime Session replacement could not be completed.")
-    )
-
-    async def failing_resume(
-        session_id: str,
-        *,
-        force: bool = False,
-    ) -> ManagementCommandResult:
-        del session_id, force
-        raise fatal
-
-    monkeypatch.setattr(runtime.management_dispatcher, "resume", failing_resume)
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        async with asyncio.timeout(2):
-            while app.is_running:
-                await pilot.pause()
-
-        assert not app.is_running
-        assert app.fatal_management_error is fatal
-        assert "Must not be rendered after fatal replacement failure." not in _visible_screen_text(app)
-
-
-@pytest.mark.asyncio
-async def test_resume_selection_serializes_input_until_rebuild_finishes(
-    agent_home: Path,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Delayed target")
-    target.add_message("user", "Delayed restored content.")
-    target.close()
-    resume_started = asyncio.Event()
-    continue_resume = asyncio.Event()
-    resume_finished = asyncio.Event()
-    resume_errors: list[BaseException] = []
-    original_resume = runtime.management_dispatcher.resume
-
-    async def delayed_resume(
-        session_id: str,
-        *,
-        force: bool = False,
-    ) -> ManagementCommandResult:
-        resume_started.set()
-        await continue_resume.wait()
-        try:
-            return await original_resume(session_id, force=force)
-        except BaseException as error:
-            resume_errors.append(error)
-            raise
-        finally:
-            resume_finished.set()
-
-    monkeypatch.setattr(runtime.management_dispatcher, "resume", delayed_resume)
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-        await asyncio.wait_for(resume_started.wait(), timeout=1)
-
-        input_area = app.query_one("#conversation-input", TextArea)
-        assert input_area.read_only
-        assert app.screen.id == "_default"
-        await pilot.press(*list("racing turn"), "enter", *list("/resume"), "enter")
-        assert input_area.text == ""
-        assert provider.stream_requests == []
-        assert app.screen.id == "_default"
-
-        continue_resume.set()
-        await asyncio.wait_for(resume_finished.wait(), timeout=1)
-        assert resume_errors == []
-        async with asyncio.timeout(2):
-            while (
-                runtime.session.session_id != target.session_id
-                or input_area.read_only
-                or "Delayed restored content." not in _visible_screen_text(app)
-            ):
-                await pilot.pause()
-
-        assert "Delayed restored content." in _visible_screen_text(app)
-        await pilot.press(*list("/status"), "enter")
-        await pilot.press("ctrl+home")
-        assert "Command: /status" in _visible_screen_text(app)
-        assert provider.stream_requests == []
-
-
-@pytest.mark.asyncio
-async def test_resumed_long_history_starts_latest_and_preserves_runtime_input_history(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _generation_host(agent_home, workspace, provider)
-    target = Session.create(
-        runtime.session.workspace_state,
-        now=lambda: NOW,
-        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
-    )
-    target.update_metadata(title="Long target")
-    for index in range(60):
-        target.add_message("user", f"Restored line {index:02d} " + "x" * 40)
-    target.close()
-    app = _terminal_app(runtime)
-
-    async with app.run_test(size=(60, 20)) as pilot:
-        await pilot.press(*list("/resume"), "enter")
-        await _wait_for_session_picker(app, pilot)
-        await pilot.press("enter")
-
-        display = app.query_one("#conversation-display")
-        async with asyncio.timeout(2):
-            while (
-                runtime.session.session_id != target.session_id
-                or not display.is_vertical_scroll_end
-                or "Restored line 59" not in _visible_screen_text(app)
-            ):
-                await pilot.pause()
-
-        assert "Restored line 59" in _visible_screen_text(app)
-        assert not app.query_one("#new-content").display
-        await pilot.resize_terminal(40, 20)
-        await pilot.pause()
-        assert display.is_vertical_scroll_end
-
-        input_area = app.query_one("#conversation-input", TextArea)
-        assert app.screen.focused is input_area
-        await pilot.press("up")
-        assert input_area.text == "/resume"
-
-
-@pytest.mark.asyncio
 async def test_management_error_row_preserves_later_command_interaction(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    provider = _RuntimeProvider(())
-    runtime = _prepared_runtime(agent_home, workspace, provider)
-    runtime.session.workspace_state.long_term_memory_path.unlink()
-    app = _terminal_app(runtime)
+    class Management:
+        async def memory_view(self) -> str:
+            raise ManagementError(
+                ErrorInfo("persistence_error", "Long-term Memory could not be read.")
+            )
+
+        async def dream(self) -> DreamResult:
+            return DreamResult(
+                status="No pending summaries",
+                processed_count=0,
+                memory_updated=False,
+                cursor=0,
+                error=None,
+            )
+
+    provider = _FixedCatalogProvider(())
+    runtime = _direct_terminal_loop(agent_home, workspace, provider)
+    dispatcher = ManagementCommandDispatcher(cast(Any, Management()))
+    app = _terminal_app(runtime, management_dispatcher=dispatcher)
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("/memory"), "enter")
@@ -6185,8 +5534,8 @@ async def test_management_error_row_preserves_later_command_interaction(
 @pytest.mark.asyncio
 async def test_completion_direction_keys_take_precedence_over_composer_and_input_history() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("previous"), "enter")
@@ -6213,8 +5562,8 @@ async def test_completion_direction_keys_take_precedence_over_composer_and_input
 @pytest.mark.asyncio
 async def test_completion_ctrl_c_closes_completion_before_idle_draft_behavior() -> None:
     conversation = ScriptedRunSource()
-    runtime = _runtime(conversation)
-    app = _terminal_app(cast(PreparedRuntime, runtime))
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press(*list("previous"), "enter")

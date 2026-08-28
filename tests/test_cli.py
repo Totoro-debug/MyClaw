@@ -1,4 +1,6 @@
 import asyncio
+import importlib
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -13,7 +15,6 @@ from typer.testing import CliRunner
 
 import myclaw.terminal.cli as cli
 from myclaw.agent.loop import SkillContextTooLargeError
-from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.workspace_state import WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import ErrorInfo
@@ -26,6 +27,14 @@ from tests.configuration.test_config import (
     REDACTION_CONFIG,
     VALID_CONFIG,
 )
+
+
+def test_legacy_runtime_module_is_not_discoverable() -> None:
+    legacy_module = ".".join(("myclaw", "agent", "runtime"))
+    assert not (Path(__file__).resolve().parents[1] / "myclaw" / "agent" / "runtime.py").exists()
+    assert importlib.util.find_spec(legacy_module) is None
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(legacy_module)
 
 
 @pytest.mark.asyncio
@@ -157,8 +166,7 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
     )
 
     source = Path(cli.__file__).read_text(encoding="utf-8")
-    assert "myclaw.agent.runtime" not in source
-    assert "RuntimeHost" not in source
+    assert "async def _run_cli_conversation" in source
 
     await cli._run_cli_conversation(
         agent_home=home,
@@ -782,7 +790,7 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
 
 
 @pytest.mark.asyncio
-async def test_cli_resume_active_without_force_keeps_old_generation_untouched(
+async def test_cli_resume_active_requires_force_before_replacing_the_generation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -790,6 +798,7 @@ async def test_cli_resume_active_without_force_keeps_old_generation_untouched(
     current_callback: Callable[[], object] | None = None
     replace_callback: Callable[[str, bool], Awaitable[None]] | None = None
     initial_loop: object | None = None
+    target_loop: object | None = None
 
     class FakeSession:
         session_id = "old-session"
@@ -851,6 +860,9 @@ async def test_cli_resume_active_without_force_keeps_old_generation_untouched(
         async def pause_and_drain(self) -> None:
             events.append("schedule_pause")
 
+        def resume(self) -> None:
+            events.append("schedule_resume")
+
         async def close(self) -> None:
             events.append("schedule_close")
 
@@ -859,7 +871,7 @@ async def test_cli_resume_active_without_force_keeps_old_generation_untouched(
 
     class FakeAgentLoop:
         def __init__(self, **kwargs: object) -> None:
-            nonlocal initial_loop
+            nonlocal initial_loop, target_loop
             session_id = kwargs["session_id"]
             self.session = FakeSession()
             self.control = FakeControl() if session_id is None else SimpleNamespace(has_active_run=False)
@@ -868,13 +880,14 @@ async def test_cli_resume_active_without_force_keeps_old_generation_untouched(
                 initial_loop = self
                 events.append("old_init")
             else:
+                target_loop = self
                 events.append("target_init")
 
         def preflight(self) -> None:
             events.append("old_preflight" if self is initial_loop else "target_preflight")
 
         async def start(self) -> None:
-            events.append("old_start")
+            events.append("old_start" if self is initial_loop else "target_start")
 
         async def close(self) -> None:
             events.append("old_close")
@@ -919,6 +932,10 @@ async def test_cli_resume_active_without_force_keeps_old_generation_untouched(
             except ManagementError as error:
                 assert error.error.code == "model_invalid_request"
                 events.append("management_error")
+            assert current_callback is not None
+            assert current_callback() is initial_loop
+            await replace_callback("target", True)
+            assert current_callback() is target_loop
 
         async def quiesce_for_rebind(self) -> None:
             events.append("quiesce")
@@ -952,10 +969,14 @@ async def test_cli_resume_active_without_force_keeps_old_generation_untouched(
 
     assert events.index("target_preflight") < events.index("target_abort")
     assert events.index("target_abort") < events.index("management_error")
-    assert "quiesce" not in events
-    assert "rebind" not in events
-    assert "bus_reset" not in events
-    assert "old_abort" not in events
+    assert events.index("management_error") < events.index("old_abort")
+    assert events.index("old_abort") < events.index("bus_reset")
+    assert events.index("bus_reset") < events.index("rebind")
+    assert events.index("rebind") < events.index("target_start")
+    assert events.index("target_start") < events.index("schedule_resume")
+    assert events.count("target_init") == 2
+    assert events.count("target_abort") == 1
+    assert events.count("old_abort") == 1
 
 
 @pytest.mark.asyncio
@@ -1071,10 +1092,10 @@ async def test_cli_same_session_resume_waits_for_pending_persist_before_target_l
             events.append("target_abort" if self is target_loop else "old_abort")
 
         async def _pause_for_replacement(self) -> None:
-            return None
+            events.append("replacement_barrier_pause")
 
         async def _release_replacement_barrier(self, *, resume_inbound: bool) -> None:
-            del resume_inbound
+            events.append(f"replacement_barrier_release:{resume_inbound}")
 
         def project_foreground_conversation(self) -> object:
             return SimpleNamespace(session_id=self.session.session_id, messages=())
@@ -1109,8 +1130,13 @@ async def test_cli_same_session_resume_waits_for_pending_persist_before_target_l
             assert callable(current_callback)
             assert current_callback() is initial_loop
             assert "target_init" not in events
+            replacement.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await replacement
+            assert current_callback() is initial_loop
+            assert events.count("replacement_barrier_release:True") == 1
             release_persist.set()
-            await replacement
+            await replace_callback("same-session", False)
             assert current_callback() is target_loop
 
         async def quiesce_for_rebind(self) -> None:
@@ -1144,8 +1170,12 @@ async def test_cli_same_session_resume_waits_for_pending_persist_before_target_l
     )
 
     assert events.index("persist_wait_started") < events.index("late_inbound_attempt")
-    assert events.index("late_inbound_attempt") < events.index("persist_wait_finished")
+    assert events.index("late_inbound_attempt") < events.index("replacement_barrier_release:True")
+    assert events.index("replacement_barrier_release:True") < events.index(
+        "persist_wait_finished"
+    )
     assert events.index("persist_wait_finished") < events.index("target_init")
+    assert events.count("replacement_barrier_pause") == 2
     assert events.count("target_init") == 1
 
 
@@ -1432,327 +1462,6 @@ def test_cli_reports_fatal_replacement_failure_once_without_raw_exception_output
     assert result.output.count("persistence_error:") == 1
     assert secret not in result.output
     assert "Traceback" not in result.output
-
-
-@pytest.mark.asyncio
-async def test_composition_driver_owns_runtime_lifecycle_outside_terminal_mount(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-
-    class FakeApp:
-        def __init__(self, **kwargs: object) -> None:
-            del kwargs
-            events.append("app_init")
-
-        async def quiesce_for_rebind(self) -> None:
-            events.append("quiesce")
-
-        async def rebind_agent_loop(self, **kwargs: object) -> None:
-            del kwargs
-            events.append("rebind")
-
-        async def run_async(self) -> None:
-            events.append("app_run")
-
-    class FakeRuntime:
-        bus = object()
-        control = object()
-        management_dispatcher = object()
-        presentation = SimpleNamespace(control=control, skill_metadata=())
-
-        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
-            del rebind, quiesce
-            events.append("bind")
-
-        def unbind_terminal(self, rebind: object) -> None:
-            del rebind
-            events.append("unbind")
-
-        async def start(self) -> None:
-            events.append("start")
-
-        async def close(self) -> None:
-            events.append("close")
-
-    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
-
-    await cli._run_runtime_conversation(FakeRuntime())
-
-    assert events == ["app_init", "bind", "start", "app_run", "unbind", "close"]
-
-
-@pytest.mark.asyncio
-async def test_composition_driver_closes_runtime_when_initial_start_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-
-    class FakeApp:
-        def __init__(self, **kwargs: object) -> None:
-            del kwargs
-            events.append("app_init")
-
-        async def quiesce_for_rebind(self) -> None:
-            events.append("quiesce")
-
-        async def rebind_agent_loop(self, **kwargs: object) -> None:
-            del kwargs
-            events.append("rebind")
-
-        async def run_async(self) -> None:
-            events.append("app_run")
-
-    class FakeRuntime:
-        bus = object()
-        control = object()
-        management_dispatcher = object()
-        presentation = SimpleNamespace(control=control, skill_metadata=())
-
-        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
-            del rebind, quiesce
-            events.append("bind")
-
-        def unbind_terminal(self, rebind: object) -> None:
-            del rebind
-            events.append("unbind")
-
-        async def start(self) -> None:
-            events.append("start")
-            raise RuntimeError("initial runtime startup failed")
-
-        async def close(self) -> None:
-            events.append("close")
-
-    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
-
-    with pytest.raises(RuntimeError, match="initial runtime startup failed"):
-        await cli._run_runtime_conversation(FakeRuntime())
-
-    assert events == ["app_init", "bind", "start", "unbind", "close"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure_point", ("app_init", "bind"))
-async def test_composition_driver_closes_runtime_when_setup_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    failure_point: str,
-) -> None:
-    events: list[str] = []
-
-    class FakeApp:
-        def __init__(self, **kwargs: object) -> None:
-            del kwargs
-            events.append("app_init")
-            if failure_point == "app_init":
-                raise RuntimeError("application setup failed")
-
-        async def quiesce_for_rebind(self) -> None:
-            raise AssertionError("quiesce must not run")
-
-        async def rebind_agent_loop(self, **kwargs: object) -> None:
-            del kwargs
-            raise AssertionError("rebind must not run")
-
-        async def run_async(self) -> None:
-            raise AssertionError("application must not run")
-
-    class FakeRuntime:
-        bus = object()
-        control = object()
-        management_dispatcher = object()
-        presentation = SimpleNamespace(control=control, skill_metadata=())
-
-        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
-            del rebind, quiesce
-            events.append("bind")
-            raise RuntimeError("terminal binding failed")
-
-        def unbind_terminal(self, rebind: object) -> None:
-            del rebind
-            events.append("unbind")
-
-        async def start(self) -> None:
-            events.append("start")
-
-        async def close(self) -> None:
-            events.append("close")
-
-    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
-
-    expected = "application setup failed" if failure_point == "app_init" else "terminal binding failed"
-    with pytest.raises(RuntimeError, match=expected):
-        await cli._run_runtime_conversation(FakeRuntime())
-
-    prefix = ["app_init"] if failure_point == "app_init" else ["app_init", "bind"]
-    assert events == [*prefix, "close"]
-
-
-@pytest.mark.asyncio
-async def test_composition_driver_closes_once_when_application_is_cancelled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-
-    class FakeApp:
-        def __init__(self, **kwargs: object) -> None:
-            del kwargs
-            events.append("app_init")
-
-        async def quiesce_for_rebind(self) -> None:
-            events.append("quiesce")
-
-        async def rebind_agent_loop(self, **kwargs: object) -> None:
-            del kwargs
-
-        async def run_async(self) -> None:
-            events.append("app_run")
-            raise asyncio.CancelledError()
-
-    class FakeRuntime:
-        bus = object()
-        control = object()
-        management_dispatcher = object()
-        presentation = SimpleNamespace(control=control, skill_metadata=())
-
-        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
-            del rebind, quiesce
-            events.append("bind")
-
-        def unbind_terminal(self, rebind: object) -> None:
-            del rebind
-            events.append("unbind")
-
-        async def start(self) -> None:
-            events.append("start")
-
-        async def close(self) -> None:
-            events.append("close")
-
-    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
-
-    with pytest.raises(asyncio.CancelledError):
-        await cli._run_runtime_conversation(FakeRuntime())
-
-    assert events == ["app_init", "bind", "start", "app_run", "unbind", "close"]
-    assert events.count("close") == 1
-
-
-@pytest.mark.asyncio
-async def test_composition_driver_preserves_messages_queued_before_app_mount(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-    bus = MessageBus()
-    inbound = InboundMessage(content="queued before mount")
-    outbound = OutboundMessage(type="model_response", content="queued before mount")
-    mounted_snapshot: tuple[InboundMessage, ...] | None = None
-    mounted_outbound: OutboundMessage | None = None
-
-    class FakeApp:
-        def __init__(self, **kwargs: object) -> None:
-            assert kwargs["bus"] is bus
-
-        async def quiesce_for_rebind(self) -> None:
-            return
-
-        async def rebind_agent_loop(self, **kwargs: object) -> None:
-            del kwargs
-
-        async def run_async(self) -> None:
-            nonlocal mounted_snapshot, mounted_outbound
-            events.append("mount")
-            mounted_snapshot = await bus.inbound_snapshot()
-            mounted_outbound = await bus.get_outbound()
-
-    class FakeRuntime:
-        control = object()
-        management_dispatcher = object()
-        presentation = SimpleNamespace(control=control, skill_metadata=())
-
-        @property
-        def bus(self) -> MessageBus:
-            return bus
-
-        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
-            del rebind, quiesce
-
-        def unbind_terminal(self, rebind: object) -> None:
-            del rebind
-
-        async def start(self) -> None:
-            events.append("start")
-            await bus.put_inbound(inbound)
-            await bus.put_outbound(outbound)
-
-        async def close(self) -> None:
-            events.append("close")
-
-    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
-
-    await cli._run_runtime_conversation(FakeRuntime())
-
-    assert events == ["start", "mount", "close"]
-    assert mounted_snapshot == (inbound,)
-    assert mounted_outbound is outbound
-
-
-@pytest.mark.asyncio
-async def test_composition_driver_retrieves_close_task_that_emits_after_app_exit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    bus = MessageBus()
-    close_calls = 0
-
-    class FakeApp:
-        def __init__(self, **kwargs: object) -> None:
-            del kwargs
-
-        async def quiesce_for_rebind(self) -> None:
-            return
-
-        async def rebind_agent_loop(self, **kwargs: object) -> None:
-            del kwargs
-
-        async def run_async(self) -> None:
-            return
-
-    class FakeRuntime:
-        control = object()
-        management_dispatcher = object()
-        presentation = SimpleNamespace(control=control, skill_metadata=())
-
-        @property
-        def bus(self) -> MessageBus:
-            return bus
-
-        def bind_terminal(self, rebind: object, *, quiesce: object) -> None:
-            del rebind, quiesce
-
-        def unbind_terminal(self, rebind: object) -> None:
-            del rebind
-
-        async def start(self) -> None:
-            return
-
-        async def close(self) -> None:
-            nonlocal close_calls
-            close_calls += 1
-
-            async def emit() -> None:
-                await bus.put_outbound(
-                    OutboundMessage(type="system_control", content="closed")
-                )
-
-            await asyncio.create_task(emit(), name="close-outbound")
-
-    monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
-
-    await cli._run_runtime_conversation(FakeRuntime())
-
-    assert close_calls == 1
-    assert (await bus.get_outbound()).content == "closed"
-    assert all(task.get_name() != "close-outbound" for task in asyncio.all_tasks())
 
 
 @pytest.mark.parametrize(

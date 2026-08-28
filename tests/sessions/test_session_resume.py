@@ -5,26 +5,14 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.runtime import prepare_runtime
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ConfigLoader
 from myclaw.management.service import ManagementViewService
-from myclaw.provider.models import (
-    AssistantModelMessage,
-    ModelCompleted,
-    ModelResponse,
-    ModelUsage,
-)
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.terminal.repl import run_repl
-from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import ScriptedFakeProvider, StreamScript
 
 NOW = datetime(2026, 8, 1, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 FIRST_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 SECOND_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
-TURN_UUID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
 
 
 def _state(workspace: Path, agent_home: Path) -> WorkspaceState:
@@ -146,7 +134,7 @@ async def test_resume_listing_skips_a_session_with_malformed_field_types(
 
 
 @pytest.mark.asyncio
-async def test_resume_selects_the_loaded_session_for_the_runtime_owner(
+async def test_resume_selects_the_loaded_session_for_the_agent_loop_owner(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -170,83 +158,3 @@ async def test_resume_selects_the_loaded_session_for_the_runtime_owner(
 
     assert result.session_id == target.session_id
     assert selected == [(target.session_id, False)]
-
-
-class _ScriptedInput:
-    def __init__(self, values: tuple[str | None, ...]) -> None:
-        self._values = iter(values)
-
-    async def read(self) -> str | None:
-        return next(self._values)
-
-
-class _RecordingWriter:
-    def __init__(self) -> None:
-        self.operations: list[tuple[str, str]] = []
-
-    async def write_delta(self, delta: str) -> None:
-        self.operations.append(("delta", delta))
-
-    async def finish_turn(self) -> None:
-        self.operations.append(("finish", ""))
-
-    async def write_line(self, content: str) -> None:
-        self.operations.append(("line", content))
-
-
-@pytest.mark.asyncio
-async def test_repl_resume_cannot_bypass_the_runtime_host_generation_owner(
-    agent_home: Path,
-    workspace: Path,
-) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    state = _state(workspace, agent_home)
-    target = _session(state, SECOND_UUID, "Target session")
-    target.close()
-    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    provider = ScriptedFakeProvider(
-        streams=(
-            StreamScript(
-                events=(
-                    ModelCompleted(
-                        response=ModelResponse(
-                            message=AssistantModelMessage(content="Continued answer."),
-                            usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
-                            finish_reason="stop",
-                        )
-                    ),
-                )
-            ),
-        )
-    )
-    runtime = prepare_runtime(
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _configuration: provider,
-        now=lambda: NOW,
-        new_uuid=lambda: FIRST_UUID,
-    )
-    initial_session_id = runtime.session_id
-    await runtime.start()
-    writer = _RecordingWriter()
-    await run_repl(
-        bus=runtime.bus,
-        control=runtime.control,
-        input_reader=_ScriptedInput(("/resume", "1", "Continue here", "exit")),
-        writer=writer,
-        management_dispatcher=runtime.management_dispatcher,
-    )
-    await runtime.close()
-
-    assert runtime.session_id == initial_session_id
-    assert writer.operations[0][1].startswith("Resumable sessions:\n1. Target session |")
-    assert writer.operations[1] == (
-        "line",
-        "route_unavailable: Session resume is unavailable.",
-    )
-    assert writer.operations[-1] == ("finish", "")
-    assert [
-        message["content"] for message in runtime.session.messages if message["role"] == "user"
-    ][-1] == ("Continue here")

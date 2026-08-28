@@ -1,4 +1,4 @@
-"""End-to-end Schedule acceptance through Runtime composition boundaries."""
+"""End-to-end Schedule acceptance through AgentLoop boundaries."""
 
 from __future__ import annotations
 
@@ -15,18 +15,23 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.message_bus import OutboundMessage
+from myclaw.agent.loop import AgentLoop
+from myclaw.agent.message_bus import MessageBus
 from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult
-from myclaw.agent.runtime import PreparedRuntime, prepare_runtime
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
+from myclaw.management.commands import ManagementCommandDispatcher
+from myclaw.management.service import ManagementViewService
 from myclaw.memory.conversation_summary import (
     ConversationSummaryManager,
     WorkspaceJsonlSummaryStore,
 )
+from myclaw.memory.dream import Dream
+from myclaw.memory.manager import MemoryManager
 from myclaw.memory.memory_task import WorkspaceFileMemoryStore
+from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
@@ -37,15 +42,19 @@ from myclaw.provider.models import (
     ReasoningEffort,
 )
 from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
-from myclaw.schedule.service import ScheduleClock
+from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import DeterministicTaskFramingEvaluator, FakeClock, ProviderCall
+from tests.fixtures import (
+    DeterministicTaskFramingEvaluator,
+    FakeClock,
+    ProviderCall,
+    collect_foreground_outbound,
+)
 from tests.fixtures.diagnostic_capture import capture_diagnostics
-from tests.runtime_bus import collect_foreground_outbound
 
 NOW = datetime(2026, 8, 7, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -69,8 +78,8 @@ class _BlockingClock:
         await self._sleep_forever.wait()
 
 
-class _RuntimeProvider:
-    """Route-aware provider transcript used by Runtime composition tests."""
+class _ScheduleProvider:
+    """Route-aware provider transcript used by Schedule and AgentLoop tests."""
 
     def __init__(
         self,
@@ -214,35 +223,69 @@ def _due_job(*, message: str = "Run this.") -> ScheduleJob:
     )
 
 
-def _runtime(
+def _agent_loop(
     agent_home: Path,
     workspace: Path,
-    provider: _RuntimeProvider,
+    provider: _ScheduleProvider,
     *,
     schedule_clock: ScheduleClock,
     config_text: str = VALID_CONFIG,
-) -> PreparedRuntime:
+) -> tuple[AgentLoop, ModelRouter, ScheduleService, Dream, ManagementCommandDispatcher]:
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
-    runtime = prepare_runtime(
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
+    configuration = ConfigLoader(home).load()
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=home.path)
+    router = ModelRouter(
+        configuration=configuration,
         provider_factory=lambda _configuration: provider,
+    )
+    memory_manager = MemoryManager(state)
+    dream = Dream(
+        memory_manager=memory_manager,
+        model_router=router,
+        batch_size=configuration.memory.batch_size,
+        max_iterations=configuration.runtime.max_iterations,
+    )
+    loop: AgentLoop | None = None
+
+    async def execute_user_job(job: ScheduleJob) -> None:
+        assert loop is not None
+        await loop.run_schedule_job(job)
+
+    schedule = ScheduleService(
+        workspace_state=state,
+        clock=schedule_clock,
+        execute_user_job=execute_user_job,
+        execute_dream=dream.run,
+    )
+    loop = AgentLoop(
+        workspace_path=workspace,
+        workspace_state=state,
+        agent_home=home,
+        configuration=configuration,
+        bus=MessageBus(),
+        schedule_service=schedule,
+        model_router=router,
+        memory_manager=memory_manager,
+        session_id=None,
         now=lambda: NOW,
         new_uuid=lambda: JOB_UUID,
-        schedule_scheduler_clock=schedule_clock,
+        monotonic_now=schedule_clock.monotonic,
     )
-    runtime.agent_loop._task_framer = DeterministicTaskFramingEvaluator()
-    return runtime
-
-
-async def _submit_turn(
-    runtime: PreparedRuntime,
-    text: str,
-) -> tuple[OutboundMessage, ...]:
-    return await collect_foreground_outbound(runtime, text)
+    loop._task_framer = DeterministicTaskFramingEvaluator()
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(
+            home,
+            current_agent_loop=lambda: loop,
+            workspace_state=state,
+            memory_manager=memory_manager,
+            dream=dream,
+            schedule_status=lambda: schedule.status_snapshot().to_dict(),
+        )
+    )
+    return loop, router, schedule, dream, dispatcher
 
 
 async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 3.0) -> None:
@@ -257,20 +300,32 @@ def _schedule_state(workspace: Path) -> WorkspaceScheduleStore:
     return WorkspaceScheduleStore(WorkspaceState(workspace))
 
 
-def _tool_json(runtime: PreparedRuntime) -> list[dict[str, object]]:
+def _tool_json(loop: AgentLoop) -> list[dict[str, object]]:
     return [
         cast(dict[str, object], json.loads(cast(str, message["content"])))
-        for message in runtime.session.messages
+        for message in loop.session.messages
         if message.get("role") == "tool" and cast(str, message["content"]).startswith("{")
     ]
 
 
+async def _close_components(
+    loop: AgentLoop,
+    router: ModelRouter,
+    schedule: ScheduleService,
+    dream: Dream,
+) -> None:
+    await schedule.close()
+    await loop.close()
+    await dream.close()
+    await router.close()
+
+
 @pytest.mark.asyncio
-async def test_runtime_conversation_manages_schedule_jobs_without_confirmation(
+async def test_agent_loop_manages_schedule_jobs_without_confirmation(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    provider = _RuntimeProvider(
+    provider = _ScheduleProvider(
         chat_responses=(
             _schedule_tool_response(
                 "call_add",
@@ -286,27 +341,27 @@ async def test_runtime_conversation_manages_schedule_jobs_without_confirmation(
             _response("Removed."),
         )
     )
-    runtime = _runtime(
+    loop, router, schedule, dream, _dispatcher = _agent_loop(
         agent_home,
         workspace,
         provider,
         schedule_clock=_BlockingClock(NOW),
     )
-    await runtime.start()
+    await loop.start()
     try:
-        await _submit_turn(runtime, "Schedule the report.")
+        await collect_foreground_outbound(loop, "Schedule the report.")
 
         jobs = await _schedule_state(workspace).public_snapshot()
         assert len(jobs) == 1
         job_id = jobs[0].job_id
         assert jobs[0].message == "ship report"
 
-        await _submit_turn(runtime, "List my Schedule Jobs.")
+        await collect_foreground_outbound(loop, "List my Schedule Jobs.")
         provider._responses["chat"][0] = _schedule_tool_response(
             "call_remove",
             {"action": "remove", "job_id": job_id},
         )
-        results = _tool_json(runtime)
+        results = _tool_json(loop)
         assert results[0]["action"] == "add"
         assert results[1] == {
             "jobs": [
@@ -318,15 +373,15 @@ async def test_runtime_conversation_manages_schedule_jobs_without_confirmation(
             ]
         }
 
-        await _submit_turn(runtime, "Remove that Schedule Job.")
+        await collect_foreground_outbound(loop, "Remove that Schedule Job.")
         assert await _schedule_state(workspace).public_snapshot() == ()
-        assert _tool_json(runtime)[-1]["action"] == "remove"
+        assert _tool_json(loop)[-1]["action"] == "remove"
     finally:
-        await runtime.close()
+        await _close_components(loop, router, schedule, dream)
 
 
 @pytest.mark.asyncio
-async def test_runtime_schedule_uses_its_own_complete_context_projection(
+async def test_schedule_uses_its_own_complete_context_projection(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -342,19 +397,30 @@ async def test_runtime_schedule_uses_its_own_complete_context_projection(
             updated_at_ms=1,
         )
     )
-    provider = _RuntimeProvider(schedule_responses=(_response("Background result."),))
+    provider = _ScheduleProvider(schedule_responses=(_response("Background result."),))
 
     def fail_foreground_context(*args: object, **kwargs: object) -> list[dict[str, object]]:
         del args, kwargs
         raise AssertionError("Schedule must not use ContextBuilder")
 
-    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    loop, router, schedule, dream, _dispatcher = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+    )
+    await loop.start()
     monkeypatch.setattr(ContextBuilder, "build_messages", fail_foreground_context)
-    await runtime.start()
+    schedule.start()
     try:
-        await _wait_until(lambda: runtime.schedule_service.status_snapshot().active_job_count == 0)
+        await _wait_until(
+            lambda: (
+                len(provider.direct_complete_messages) == 1
+                and schedule.status_snapshot().active_job_count == 0
+            )
+        )
     finally:
-        await runtime.close()
+        await _close_components(loop, router, schedule, dream)
 
     assert len(provider.direct_complete_messages) == 1
     messages, tools = provider.direct_complete_messages[0]
@@ -390,7 +456,7 @@ async def test_runtime_schedule_uses_its_own_complete_context_projection(
 
 
 @pytest.mark.asyncio
-async def test_runtime_schedule_tool_loop_persists_each_message_from_awaitable_run(
+async def test_schedule_tool_loop_persists_each_message_from_awaitable_run(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -405,7 +471,7 @@ async def test_runtime_schedule_tool_loop_persists_each_message_from_awaitable_r
             updated_at_ms=1,
         )
     )
-    provider = _RuntimeProvider(
+    provider = _ScheduleProvider(
         schedule_responses=(
             _response(
                 "",
@@ -421,17 +487,23 @@ async def test_runtime_schedule_tool_loop_persists_each_message_from_awaitable_r
             _response("The memory template was read."),
         )
     )
-    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
-    await runtime.start()
+    loop, router, schedule, dream, _dispatcher = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+    )
+    await loop.start()
+    schedule.start()
     try:
         await _wait_until(
             lambda: (
                 len(provider.direct_complete_messages) == 2
-                and runtime.schedule_service.status_snapshot().active_job_count == 0
+                and schedule.status_snapshot().active_job_count == 0
             )
         )
     finally:
-        await runtime.close()
+        await _close_components(loop, router, schedule, dream)
 
     second_messages, _ = provider.direct_complete_messages[1]
     assert [message["role"] for message in second_messages] == [
@@ -466,7 +538,7 @@ async def test_runtime_schedule_tool_loop_persists_each_message_from_awaitable_r
 
 
 @pytest.mark.asyncio
-async def test_runtime_schedule_tool_loop_does_not_prepare_summary_inside_agent_run(
+async def test_schedule_tool_loop_does_not_prepare_summary_inside_agent_run(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -501,7 +573,7 @@ async def test_runtime_schedule_tool_loop_does_not_prepare_summary_inside_agent_
         },
     )
     schedule_session.close()
-    provider = _RuntimeProvider(
+    provider = _ScheduleProvider(
         schedule_responses=(
             _response(
                 "",
@@ -514,7 +586,7 @@ async def test_runtime_schedule_tool_loop_does_not_prepare_summary_inside_agent_
             _response("Continuation completed."),
         ),
     )
-    runtime = _runtime(
+    loop, router, schedule, dream, _dispatcher = _agent_loop(
         agent_home,
         workspace,
         provider,
@@ -522,17 +594,18 @@ async def test_runtime_schedule_tool_loop_does_not_prepare_summary_inside_agent_
         config_text=config_text,
     )
 
-    await runtime.start()
+    await loop.start()
+    schedule.start()
     try:
         await _wait_until(
             lambda: (
                 [_is_schedule_call(request) for request in provider.complete_requests]
                 == [True, True]
-                and runtime.schedule_service.status_snapshot().active_job_count == 0
+                and schedule.status_snapshot().active_job_count == 0
             )
         )
     finally:
-        await runtime.close()
+        await _close_components(loop, router, schedule, dream)
 
     schedule_messages = [messages for messages, _tools in provider.direct_complete_messages]
     assert [message["role"] for message in schedule_messages[1]] == [
@@ -554,7 +627,7 @@ async def test_runtime_schedule_tool_loop_does_not_prepare_summary_inside_agent_
 
 
 @pytest.mark.asyncio
-async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule_run(
+async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -624,7 +697,7 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
         new_user_info,
         1,
     )
-    provider = _RuntimeProvider(
+    provider = _ScheduleProvider(
         schedule_responses=(
             _response("First scheduled result."),
             _response("Second scheduled result."),
@@ -659,7 +732,7 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
         ),
     )
     clock = FakeClock(NOW)
-    runtime = _runtime(
+    loop, router, schedule, dream_owner, dispatcher = _agent_loop(
         agent_home,
         workspace,
         provider,
@@ -667,7 +740,8 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
         config_text=config_text,
     )
     try:
-        await runtime.start()
+        await loop.start()
+        schedule.start()
         await _wait_until(
             lambda: (
                 len(
@@ -678,7 +752,7 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
                     ]
                 )
                 == 1
-                and runtime.schedule_service.status_snapshot().active_job_count == 0
+                and schedule.status_snapshot().active_job_count == 0
             )
         )
         summaries = WorkspaceJsonlSummaryStore(state)
@@ -686,8 +760,8 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
             "Schedule history summary."
         ]
 
-        dream = await runtime.management_dispatcher.dispatch("/dream")
-        assert dream.output is not None
+        dream_result = await dispatcher.dispatch("/dream")
+        assert dream_result.output is not None
         assert await WorkspaceFileMemoryStore(state).read_summary_cursor() == 1
         assert memory_path.read_text(encoding="utf-8") == new_memory
 
@@ -702,7 +776,7 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
                     ]
                 )
                 == 2
-                and runtime.schedule_service.status_snapshot().active_job_count == 0
+                and schedule.status_snapshot().active_job_count == 0
             )
         )
         schedule_requests = [
@@ -719,15 +793,15 @@ async def test_runtime_schedule_summary_flows_through_memory_to_a_later_schedule
             "Second schedule history summary.",
         ]
     finally:
-        await runtime.close()
+        await _close_components(loop, router, schedule, dream_owner)
 
 
 @pytest.mark.asyncio
-async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_session_out_of_resume(
+async def test_schedule_dispatcher_wakes_for_due_at_job_and_keeps_schedule_session_out_of_resume(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    provider = _RuntimeProvider(
+    provider = _ScheduleProvider(
         chat_responses=(
             _schedule_tool_response(
                 "call_due_add",
@@ -742,15 +816,21 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
         schedule_responses=(_response("Background result."),),
     )
     clock = FakeClock(NOW)
-    runtime = _runtime(agent_home, workspace, provider, schedule_clock=clock)
-    await runtime.start()
+    loop, router, schedule, dream, dispatcher = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=clock,
+    )
+    await loop.start()
+    schedule.start()
     try:
-        events = await _submit_turn(runtime, "Schedule this due task.")
+        events = await collect_foreground_outbound(loop, "Schedule this due task.")
         assert events[-1].metadata == {"_streamed": True}
         await _wait_until(
             lambda: (
                 len(provider.complete_requests) == 1
-                and runtime.schedule_service.status_snapshot().active_job_count == 0
+                and schedule.status_snapshot().active_job_count == 0
             )
         )
 
@@ -789,7 +869,7 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
             workspace / ".myclaw" / "schedule-sessions" / f"{schedule_session_id}.jsonl"
         ).exists()
 
-        resume = await runtime.management_dispatcher.dispatch("/resume")
+        resume = await dispatcher.dispatch("/resume")
         assert resume.output is not None
         assert schedule_session_id not in resume.output
         assert {message.type for message in events} <= {
@@ -799,35 +879,45 @@ async def test_runtime_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessio
             "system_control",
         }
     finally:
-        await runtime.close()
+        await _close_components(loop, router, schedule, dream)
 
 
-def test_runtime_wires_schedule_service_user_executor_to_agent_loop(
+def test_schedule_service_user_executor_is_bound_to_agent_loop(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    provider = _RuntimeProvider()
-    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    provider = _ScheduleProvider()
+    loop, _router, schedule, _dream, _dispatcher = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+    )
 
-    callback = runtime.schedule_service._execute_user_job
+    callback = schedule._execute_user_job
     closure_values = tuple(
         cell.cell_contents
         for cell in (callback.__closure__ or ())
     )
-    assert runtime.agent_loop in closure_values
+    assert loop in closure_values
 
 
 @pytest.mark.asyncio
-async def test_runtime_foreground_and_schedule_share_runner_and_gateway_identity(
+async def test_foreground_and_schedule_share_runner_and_gateway_identity(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = _RuntimeProvider(
+    provider = _ScheduleProvider(
         chat_responses=(_response("Foreground result."),),
         schedule_responses=(_response("Schedule result."),),
     )
-    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    loop, router, schedule, dream, _dispatcher = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+    )
     observed: list[tuple[AgentRunner, object, str, object, object]] = []
     original_run = AgentRunner.run
 
@@ -848,13 +938,15 @@ async def test_runtime_foreground_and_schedule_share_runner_and_gateway_identity
         return await original_run(runner, initial_messages, **kwargs)
 
     monkeypatch.setattr(AgentRunner, "run", record_run)
-    callback = runtime.agent_loop.run_schedule_job
-    await runtime.start()
+    callback = loop.run_schedule_job
+    await loop.start()
     try:
-        assert (await _submit_turn(runtime, "Run foreground."))[-1].metadata == {"_streamed": True}
+        assert (await collect_foreground_outbound(loop, "Run foreground."))[-1].metadata == {
+            "_streamed": True
+        }
         await callback(_due_job(message="Run Schedule."))
     finally:
-        await runtime.close()
+        await _close_components(loop, router, schedule, dream)
 
     assert len(observed) == 2
     assert observed[0][0] is observed[1][0]
@@ -866,14 +958,14 @@ async def test_runtime_foreground_and_schedule_share_runner_and_gateway_identity
 
 
 @pytest.mark.asyncio
-async def test_runtime_externalizers_keep_foreground_and_schedule_artifacts_separate(
+async def test_foreground_and_schedule_artifacts_remain_separate(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     large_file = workspace / "large.txt"
     large_file.parent.mkdir(parents=True, exist_ok=True)
     large_file.write_text("x\n" * 4000, encoding="utf-8")
-    provider = _RuntimeProvider(
+    provider = _ScheduleProvider(
         chat_responses=(
             _response(
                 "",
@@ -900,24 +992,24 @@ async def test_runtime_externalizers_keep_foreground_and_schedule_artifacts_sepa
     config_text = VALID_CONFIG.replace(
         "max_tool_result_chars = 60000", "max_tool_result_chars = 1000"
     )
-    runtime = _runtime(
+    loop, router, schedule, dream, _dispatcher = _agent_loop(
         agent_home,
         workspace,
         provider,
         schedule_clock=_BlockingClock(NOW),
         config_text=config_text,
     )
-    callback = runtime.agent_loop.run_schedule_job
-    await runtime.start()
+    callback = loop.run_schedule_job
+    await loop.start()
     try:
-        await _submit_turn(runtime, "Read the large file in foreground.")
+        await collect_foreground_outbound(loop, "Read the large file in foreground.")
         await callback(_due_job(message="Read the large file in Schedule."))
-        foreground_session_id = runtime.session.session_id
+        foreground_session_id = loop.session.session_id
         foreground_tool = next(
-            message for message in runtime.session.messages if message["role"] == "tool"
+            message for message in loop.session.messages if message["role"] == "tool"
         )
     finally:
-        await runtime.close()
+        await _close_components(loop, router, schedule, dream)
 
     state = WorkspaceState(workspace)
     schedule_session = Session.load(
@@ -943,13 +1035,13 @@ async def test_runtime_externalizers_keep_foreground_and_schedule_artifacts_sepa
 
 
 @pytest.mark.asyncio
-async def test_runtime_schedule_session_uses_schedule_clock_for_persisted_timestamps(
+async def test_schedule_session_uses_schedule_clock_for_persisted_timestamps(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     schedule_now = NOW + timedelta(hours=2)
-    provider = _RuntimeProvider(schedule_responses=(_response("Background result."),))
-    runtime = _runtime(
+    provider = _ScheduleProvider(schedule_responses=(_response("Background result."),))
+    loop, router, schedule, dream, _dispatcher = _agent_loop(
         agent_home,
         workspace,
         provider,
@@ -963,11 +1055,11 @@ async def test_runtime_schedule_session_uses_schedule_clock_for_persisted_timest
         updated_at_ms=1,
     )
 
-    callback = runtime.agent_loop.run_schedule_job
+    callback = loop.run_schedule_job
     try:
         await callback(job)
     finally:
-        await runtime.close()
+        await _close_components(loop, router, schedule, dream)
 
     schedule_session = Session.load(
         WorkspaceState(workspace),
@@ -981,7 +1073,7 @@ async def test_runtime_schedule_session_uses_schedule_clock_for_persisted_timest
 
 
 @pytest.mark.asyncio
-async def test_runtime_shutdown_during_schedule_model_persists_user_and_keeps_job_pending(
+async def test_schedule_shutdown_during_model_persists_user_and_keeps_job_pending(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -990,15 +1082,20 @@ async def test_runtime_shutdown_during_schedule_model_persists_user_and_keeps_jo
     job = _due_job(message="Block in the Schedule model.")
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(job)
-    provider = _RuntimeProvider(
+    provider = _ScheduleProvider(
         schedule_responses=(_response("Unused."),),
         block_schedule_call=1,
     )
-    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    loop, router, schedule, dream, _dispatcher = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+    )
 
-    runtime.schedule_service.start()
+    schedule.start()
     await provider.schedule_block_started.wait()
-    await runtime.close()
+    await _close_components(loop, router, schedule, dream)
 
     assert await store.snapshot() == (job,)
     schedule_session = Session.load(
@@ -1012,7 +1109,7 @@ async def test_runtime_shutdown_during_schedule_model_persists_user_and_keeps_jo
 
 
 @pytest.mark.asyncio
-async def test_runtime_shutdown_during_schedule_preparation_persists_user(
+async def test_schedule_shutdown_during_preparation_persists_user(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1022,7 +1119,7 @@ async def test_runtime_shutdown_during_schedule_preparation_persists_user(
     job = _due_job(message="Block in Schedule context preparation.")
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(job)
-    provider = _RuntimeProvider(schedule_responses=(_response("Unused."),))
+    provider = _ScheduleProvider(schedule_responses=(_response("Unused."),))
     context_started = asyncio.Event()
     context_never_completes = asyncio.Event()
     original_prepare = ConversationSummaryManager.prepare
@@ -1053,11 +1150,16 @@ async def test_runtime_shutdown_during_schedule_preparation_persists_user(
         )
 
     monkeypatch.setattr(ConversationSummaryManager, "prepare", block_schedule_preparation)
-    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    loop, router, schedule, dream, _dispatcher = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+    )
 
-    runtime.schedule_service.start()
+    schedule.start()
     await context_started.wait()
-    await runtime.close()
+    await _close_components(loop, router, schedule, dream)
 
     assert provider.complete_requests == []
     assert await store.snapshot() == (job,)
@@ -1072,7 +1174,7 @@ async def test_runtime_shutdown_during_schedule_preparation_persists_user(
 
 
 @pytest.mark.asyncio
-async def test_runtime_schedule_failure_logs_one_safe_session_warning(
+async def test_schedule_failure_logs_one_safe_session_warning(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1082,7 +1184,7 @@ async def test_runtime_schedule_failure_logs_one_safe_session_warning(
     job = _due_job(message="Fail safely during Schedule preparation.")
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(job)
-    provider = _RuntimeProvider()
+    provider = _ScheduleProvider()
     failure_started = asyncio.Event()
     original_prepare = ConversationSummaryManager.prepare
 
@@ -1113,13 +1215,18 @@ async def test_runtime_schedule_failure_logs_one_safe_session_warning(
 
     monkeypatch.setattr(ConversationSummaryManager, "prepare", fail_schedule_preparation)
     capture = capture_diagnostics()
-    runtime = _runtime(agent_home, workspace, provider, schedule_clock=_BlockingClock(NOW))
+    loop, router, schedule, dream, _dispatcher = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+    )
     try:
-        runtime.schedule_service.start()
+        schedule.start()
         await failure_started.wait()
-        await _wait_until(lambda: runtime.schedule_service.status_snapshot().active_job_count == 0)
+        await _wait_until(lambda: schedule.status_snapshot().active_job_count == 0)
     finally:
-        await runtime.close()
+        await _close_components(loop, router, schedule, dream)
         capture.close()
 
     assert await _schedule_state(workspace).public_snapshot() == ()

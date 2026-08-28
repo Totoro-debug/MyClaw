@@ -4,11 +4,9 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
-from uuid import uuid4
 
 import pytest
 
-from myclaw.agent.runtime import prepare_runtime
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
@@ -1113,7 +1111,7 @@ async def test_dream_command_returns_exact_no_pending_output_without_a_model_cal
 
 
 @pytest.mark.asyncio
-async def test_runtime_dream_uses_memory_route_with_static_default_fallback(
+async def test_dream_uses_memory_route_with_static_default_fallback(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -1126,17 +1124,30 @@ async def test_runtime_dream_uses_memory_route_with_static_default_fallback(
     summaries = WorkspaceJsonlSummaryStore(state)
     await summaries.append("The user prefers concise status reports.", NOW)
     provider = ScriptedFakeProvider(completions=(_response("No durable update is needed."),))
-    runtime = prepare_runtime(
-        agent_home=home,
-        workspace=workspace,
+    memory_manager = MemoryManager(state)
+    router = ModelRouter(
         configuration=configuration,
         provider_factory=lambda _configuration: provider,
-        now=lambda: NOW,
-        new_uuid=uuid4,
     )
-
-    result = await runtime.management_dispatcher.dispatch("/dream")
-    await runtime.close()
+    dream = Dream(
+        memory_manager=memory_manager,
+        model_router=router,
+        batch_size=configuration.memory.batch_size,
+        max_iterations=configuration.runtime.max_iterations,
+    )
+    dispatcher = ManagementCommandDispatcher(
+        ManagementViewService(
+            home,
+            workspace_state=state,
+            memory_manager=memory_manager,
+            dream=dream,
+        )
+    )
+    try:
+        result = await dispatcher.dispatch("/dream")
+    finally:
+        await dream.close()
+        await router.close()
 
     assert result.output == (
         "Processed 1 summary; Long-term Memory unchanged.\n"

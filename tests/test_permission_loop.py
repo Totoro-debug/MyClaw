@@ -4,24 +4,74 @@ from uuid import uuid4
 
 import pytest
 
-from myclaw.agent.runtime import prepare_runtime
+from myclaw.agent.loop import AgentLoop
+from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
+from myclaw.memory.manager import MemoryManager
+from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelResponse,
     ModelUsage,
 )
+from myclaw.schedule.service import ScheduleService
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
+    FakeClock,
     ScriptedFakeProvider,
     StreamScript,
+    collect_foreground_outbound,
 )
-from tests.runtime_bus import collect_foreground_outbound
 
 NOW = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=timezone(timedelta(hours=8)))
+
+
+def _agent_loop(
+    home: AgentHome,
+    workspace: Path,
+    provider: ScriptedFakeProvider,
+) -> tuple[AgentLoop, ModelRouter, ScheduleService]:
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=home.path)
+    configuration = ConfigLoader(home).load()
+    router = ModelRouter(
+        configuration=configuration,
+        provider_factory=lambda _configuration: provider,
+    )
+    loop: AgentLoop | None = None
+
+    async def execute_user_job(job: object) -> None:
+        assert loop is not None
+        await loop.run_schedule_job(job)  # type: ignore[arg-type]
+
+    async def execute_dream() -> None:
+        return None
+
+    schedule = ScheduleService(
+        workspace_state=state,
+        clock=FakeClock(NOW),
+        execute_user_job=execute_user_job,
+        execute_dream=execute_dream,
+    )
+    loop = AgentLoop(
+        workspace_path=workspace,
+        workspace_state=state,
+        agent_home=home,
+        configuration=configuration,
+        bus=MessageBus(),
+        schedule_service=schedule,
+        model_router=router,
+        memory_manager=MemoryManager(state),
+        session_id=None,
+        now=lambda: NOW,
+        new_uuid=uuid4,
+        monotonic_now=lambda: 0.0,
+    )
+    return loop, router, schedule
 
 
 @pytest.mark.asyncio
@@ -82,26 +132,21 @@ async def test_foreground_mutations_execute_without_a_permission_pause(
     home = AgentHome(agent_home)
     home.initialize()
     (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
-    runtime = prepare_runtime(
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _configuration: provider,
-        now=lambda: NOW,
-        new_uuid=uuid4,
-    )
+    loop, router, schedule = _agent_loop(home, workspace, provider)
     confirmations: list[object] = []
-    runtime.control.bind_confirmation_callback(confirmations.append)
+    loop.bind_confirmation_callback(confirmations.append)
     try:
-        await runtime.start()
-        messages = await collect_foreground_outbound(runtime, "Change the files.")
+        await loop.start()
+        messages = await collect_foreground_outbound(loop, "Change the files.")
     finally:
-        await runtime.close()
+        await loop.close()
+        await schedule.close()
+        await router.close()
 
     assert confirmations == []
     assert (workspace / "created.txt").read_text(encoding="utf-8") == "must not be written"
     assert target.read_text(encoding="utf-8") == "after"
-    tool_messages = [message for message in runtime.session.messages if message["role"] == "tool"]
+    tool_messages = [message for message in loop.session.messages if message["role"] == "tool"]
     assert [message["status"] for message in tool_messages] == ["success", "success"]
     follow_up = provider.stream_requests[1]
     model_results = [message for message in follow_up.messages if message["role"] == "tool"]

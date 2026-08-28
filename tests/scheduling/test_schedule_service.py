@@ -5,20 +5,24 @@ from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from myclaw.agent.runtime import prepare_runtime
+from myclaw.agent.loop import AgentLoop
+from myclaw.agent.message_bus import MessageBus
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
+from myclaw.memory.manager import MemoryManager
+from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
     ModelContinuation,
+    ModelProvider,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
@@ -35,9 +39,9 @@ from tests.fixtures import (
     DeterministicTaskFramingEvaluator,
     ProviderCall,
     ScriptedFakeProvider,
+    collect_foreground_outbound,
 )
 from tests.fixtures.diagnostic_capture import capture_diagnostics
-from tests.runtime_bus import collect_foreground_outbound
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
 OTHER_UUID = UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e")
@@ -295,6 +299,56 @@ def _service(**kwargs: Any) -> ScheduleService:
     )
     service._store = store
     return service
+
+
+def _agent_loop(
+    agent_home: Path,
+    workspace: Path,
+    provider: ModelProvider,
+    *,
+    schedule_clock: object,
+    config_text: str = VALID_CONFIG,
+) -> tuple[AgentLoop, ModelRouter, ScheduleService]:
+    home = AgentHome(agent_home)
+    home.initialize()
+    (agent_home / "config.toml").write_text(config_text, encoding="utf-8")
+    state = _state(workspace, agent_home)
+    configuration = ConfigLoader(home).load()
+    router = ModelRouter(
+        configuration=configuration,
+        provider_factory=lambda _configuration: provider,
+    )
+    loop: AgentLoop | None = None
+
+    async def execute_user_job(job: ScheduleJob) -> None:
+        assert loop is not None
+        await loop.run_schedule_job(job)
+
+    async def execute_dream() -> None:
+        return None
+
+    schedule = ScheduleService(
+        workspace_state=state,
+        clock=schedule_clock,  # type: ignore[arg-type]
+        execute_user_job=execute_user_job,
+        execute_dream=execute_dream,
+    )
+    loop = AgentLoop(
+        workspace_path=workspace,
+        workspace_state=state,
+        agent_home=home,
+        configuration=configuration,
+        bus=MessageBus(),
+        schedule_service=schedule,
+        model_router=router,
+        memory_manager=MemoryManager(state),
+        session_id=None,
+        now=lambda: START,
+        new_uuid=lambda: OTHER_UUID,
+        monotonic_now=schedule_clock.monotonic,  # type: ignore[attr-defined]
+    )
+    loop._task_framer = DeterministicTaskFramingEvaluator()
+    return loop, router, schedule
 
 
 @pytest.mark.asyncio
@@ -1349,13 +1403,10 @@ async def test_callback_cancelled_payload_keeps_at_job_pending(
 
 
 @pytest.mark.asyncio
-async def test_prepared_runtime_executes_at_job_with_schedule_route_and_partition(
+async def test_agent_loop_executes_at_job_with_schedule_route_and_partition(
     workspace: Path,
     agent_home: Path,
 ) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     state = _state(workspace, agent_home)
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(_job())
@@ -1368,23 +1419,23 @@ async def test_prepared_runtime_executes_at_job_with_schedule_route_and_partitio
             ),
         )
     )
-    runtime = prepare_runtime(
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _configuration: provider,
-        now=lambda: START,
-        new_uuid=lambda: OTHER_UUID,
+    loop, router, schedule = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=ControlledClock(START),
     )
 
-    runtime.schedule_service.start()
+    schedule.start()
     await _wait_until(lambda: len(provider.complete_requests) == 1)
-    await _wait_until(lambda: runtime.schedule_service.status_snapshot().active_job_count == 0)
-    await runtime.close()
+    await _wait_until(lambda: schedule.status_snapshot().active_job_count == 0)
+    await loop.close()
+    await schedule.close()
+    await router.close()
 
     request = provider.complete_requests[0]
     assert len(request.tools) == 10
-    assert await runtime.schedule_service.public_snapshot() == ()
+    assert await schedule.public_snapshot() == ()
     session = Session.load(
         state,
         f"schedule_{JOB_UUID}",
@@ -1397,44 +1448,40 @@ async def test_prepared_runtime_executes_at_job_with_schedule_route_and_partitio
 
 
 @pytest.mark.asyncio
-async def test_prepared_runtime_runs_foreground_while_every_job_is_active(
+async def test_agent_loop_runs_foreground_while_every_job_is_active(
     workspace: Path,
     agent_home: Path,
 ) -> None:
-    home = AgentHome(agent_home)
-    home.initialize()
-    (agent_home / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
     state = _state(workspace, agent_home)
     store = WorkspaceScheduleStore(state)
     await store.add_user_job(
         _every_job(created_at_ms=int((START - timedelta(seconds=20)).timestamp() * 1000))
     )
     provider = ConcurrentScheduleAndForegroundProvider()
-    runtime = prepare_runtime(
-        agent_home=home,
-        workspace=workspace,
-        configuration=ConfigLoader(home).load(),
-        provider_factory=lambda _configuration: provider,
-        now=lambda: START,
-        new_uuid=uuid4,
-        schedule_scheduler_clock=ControlledClock(START),
+    loop, router, schedule = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=ControlledClock(START),
     )
-    runtime.agent_loop._task_framer = DeterministicTaskFramingEvaluator()
 
-    await runtime.start()
+    await loop.start()
+    schedule.start()
     try:
         await provider.schedule_started.wait()
-        assert runtime.schedule_service.status_snapshot().active_job_count == 1
+        assert schedule.status_snapshot().active_job_count == 1
 
-        messages = await collect_foreground_outbound(runtime, "Run the foreground request.")
+        messages = await collect_foreground_outbound(loop, "Run the foreground request.")
 
         assert messages[-1].metadata == {"_streamed": True}
-        assert runtime.schedule_service.status_snapshot().active_job_count == 1
+        assert schedule.status_snapshot().active_job_count == 1
         assert len(provider.complete_requests[0].tools) == 10
         assert provider.stream_requests
     finally:
         provider.release_schedule.set()
-        await runtime.close()
+        await loop.close()
+        await schedule.close()
+        await router.close()
 
 
 @pytest.mark.asyncio

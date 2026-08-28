@@ -1,11 +1,9 @@
 """Command-line entry point for MyClaw."""
 
 import asyncio
-from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any
 from uuid import uuid4
 
 import typer
@@ -64,53 +62,6 @@ def _print_error_info(error: ErrorInfo) -> None:
 def _print_error(error: ErrorInfo, path: object) -> None:
     _print_error_info(error)
     console.print(f"Path: {path}", markup=False, highlight=False, soft_wrap=True)
-
-
-async def _run_runtime_conversation(runtime: Any) -> None:
-    """Own runtime lifecycle around the presentation-only Textual application."""
-    rebind: Callable[[Any], Awaitable[None]] | None = None
-    terminal_bound = False
-    primary_error: BaseException | None = None
-    try:
-        presentation = runtime.presentation
-        app = TerminalConversationApp(
-            bus=runtime.bus,
-            control=presentation.control,
-            management_dispatcher=runtime.management_dispatcher,
-            skill_metadata=presentation.skill_metadata,
-        )
-
-        async def rebind_target(target: Any) -> None:
-            await app.rebind_agent_loop(
-                control=target.control,
-                skill_metadata=target.skill_metadata,
-                session_projection=target.session_projection,
-            )
-
-        rebind = rebind_target
-        runtime.bind_terminal(rebind, quiesce=app.quiesce_for_rebind)
-        terminal_bound = True
-        await runtime.start()
-        await app.run_async()
-    except BaseException as error:
-        primary_error = error
-    finally:
-        if terminal_bound and rebind is not None:
-            runtime.unbind_terminal(rebind)
-        try:
-            await runtime.close()
-        except BaseException as cleanup_error:
-            if primary_error is None:
-                raise
-            cause = primary_error.__cause__
-            if cause is None:
-                raise primary_error from cleanup_error
-            raise primary_error from BaseExceptionGroup(
-                "Terminal Conversation cleanup failed",
-                (cause, cleanup_error),
-            )
-    if primary_error is not None:
-        raise primary_error
 
 
 async def _run_cli_conversation(
