@@ -1,6 +1,6 @@
 # MyClaw Release Readiness
 
-Status: **issue #202 closure verified from clean `d60b96d1beed98b4325d2913b674be32d669adb3` plus the staged nine-file documentation patch on 2026-08-28; no release was uploaded**
+Status: **Spec remediation for issues #194, #199, #201, and #202 verified from `65b24d13748327ff46126563928897a67d2c4ee8` plus the current T5 test and evidence patch on 2026-08-28; no release was uploaded**
 
 This document is the evidence index for the current implementation. It records active
 contracts, current test locations, current verification results, and present release risks.
@@ -24,15 +24,29 @@ contracts, current test locations, current verification results, and present rel
 
 | Gate | Command | Current result |
 | --- | --- | --- |
-| Full behavior suite | `python -m pytest -q` | Passed: 1,438 passed and 10 conditionally skipped on Windows |
+| Full behavior suite | `python -m pytest -q` | Passed: 1,407 passed and 10 conditionally skipped on Windows; 1,417 nodes total |
 | Lint | `python -m ruff check .` | Passed: 0 violations |
 | Format | `python -m ruff format --check .` | Baseline check remains informational; no unrelated bulk formatting is made |
-| Types | `python -m mypy` | Passed: 170 source files checked |
+| Types | `python -m mypy` | Passed: 164 source files checked |
 | Distribution build | `python -m build --no-isolation` | Passed: one sdist and one `myclaw-0.1.0-py3-none-any.whl` built |
-| Tracked Markdown local links and active-design stale checks | `python -m pytest -q tests/test_release_contract.py` | Passed: 24 tests; 42 tracked Markdown files, no unresolved local inline/reference targets, and no stale structural findings |
+| Tracked Markdown local links and active-design stale checks | `python -m pytest -q tests/test_release_contract.py` | Passed: 25 tests; 42 tracked Markdown files, no unresolved local inline/reference targets, and no stale structural findings |
 
-Release contract tests: 24 passed; 42 tracked Markdown files. Mapped owner-node execution: 14 passed after 14 nodes were collected. `git diff --check` and the staged prospective
-patch check both returned `0`.
+Release contract tests: 25 passed; 42 tracked Markdown files. Mapped owner-node execution: 14 passed after 14 nodes were collected. `git diff --check` returned `0` for the current patch; the earlier staged prospective patch check also returned `0`.
+
+## Spec Remediation Verification
+
+Commit `65b24d13748327ff46126563928897a67d2c4ee8` contains the production and owner-test
+cutover for issues #194, #199, and #201. The only follow-up code change is confined to
+`tests/terminal/test_conversation.py`: the always-raising unavailable helper returns
+`Never`, and one redundant dispatcher cast is removed. No file under `myclaw/` changed.
+
+The final gates ran serially on 2026-08-28 without a concurrent Python verification
+process. The full suite accounted for exactly 1,417 nodes: 1,407 passed, 10 were skipped
+under existing Windows link/terminal platform conditions, and none failed. Ruff reported
+zero violations, Mypy reported zero errors across 164 source files, and the build produced
+exactly one sdist and one wheel. The 25 release contract tests passed, including clean
+distribution checks and structural absence checks for the retired Memory, Terminal/REPL,
+Schedule, and Management compatibility surfaces.
 
 ## Issue #202 Closure Evidence
 

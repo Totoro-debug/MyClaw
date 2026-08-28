@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal, Never, cast
 from uuid import UUID, uuid4
 from xml.etree import ElementTree
 
@@ -631,7 +631,7 @@ class _ScriptedControl:
 
 class _UnavailableManagement:
     @staticmethod
-    def _unavailable() -> None:
+    def _unavailable() -> Never:
         raise ManagementError(ErrorInfo("route_unavailable", "Runtime Generation is unavailable."))
 
     async def config_view(self) -> Any:
@@ -1629,7 +1629,7 @@ async def test_resume_serializes_input_until_cli_rebind_finishes(
         target.update_metadata(title="Delayed target")
         target.add_message("user", "Delayed restored content.")
         target.close()
-        dispatcher = cast(ManagementCommandDispatcher, app._management_dispatcher)
+        dispatcher = app._management_dispatcher
         original_resume = dispatcher.resume
         resume_started = asyncio.Event()
         continue_resume = asyncio.Event()
