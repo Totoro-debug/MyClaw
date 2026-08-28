@@ -137,6 +137,21 @@ structural boundary.
 - The active documentation contract test structurally verifies ADR frontmatter, the three CONTEXT glossary definitions, the scoped PRD routing contract, complete-document host projection, strict raw Skill names, real startup-budget inputs, restored Tab behavior, and explicit obsolete markers across the authoritative active documents.
 - The tracked-link test derives its source set from `git ls-files -- '*.md'`, including the adopted ADR-0017 and CLI composition plan. It audits the repository's simple inline/reference local-link forms, not full CommonMark: external schemes and pure fragments are excluded, while local targets are URL-decoded, stripped of fragments, and resolved relative to their source document.
 
+## Issue #195 Terminal Commit Cancellation Evidence
+
+Verification executed on Windows x64 on 2026-08-28:
+
+- `python -m pytest tests/scheduling -q`: `186 passed`.
+- Runtime Generation, CLI replacement, Dream and Schedule focused command: `254 passed, 1 skipped`;
+  the skip is the Windows Python runtime's missing `termios/pty` harness.
+- `python -m pytest -q`: `1412 passed, 10 skipped`; all skips are explained Windows
+  symlink-privilege or `termios/pty` capability gates, with `0` failures.
+- `python -m ruff check .`: return code `0`.
+- `python -m mypy myclaw tests`: return code `0`, `164` source files checked.
+- `git diff --check`: return code `0`.
+- `python -m build`: return code `0`; both sdist and wheel built successfully.
+- Schedule persisted field-set changes: `0`; Store schema and serialization were not modified.
+
 ## Accepted Risks and Unverified Environments
 
 - There is no platform gate. Windows x64 is currently validated; macOS Intel and Apple

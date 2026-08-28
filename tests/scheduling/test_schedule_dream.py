@@ -88,12 +88,14 @@ class _BlockingOperation:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.cancelled = asyncio.Event()
+        self.cancellation_count = 0
 
     async def run(self, *args: object, **kwargs: object) -> object:
         self.started.set()
         try:
             await self.release.wait()
         except asyncio.CancelledError:
+            self.cancellation_count += 1
             self.cancelled.set()
             raise
         return await self._operation(*args, **kwargs)
@@ -680,7 +682,7 @@ async def test_pause_and_drain_cancels_user_and_dream_then_resume_keeps_progress
 
 
 @pytest.mark.asyncio
-async def test_pause_and_drain_waits_for_a_completed_user_terminal_commit(
+async def test_pause_and_drain_cancels_one_shot_terminal_commit_and_retries_once(
     workspace: Path,
     agent_home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -721,32 +723,32 @@ async def test_pause_and_drain_waits_for_a_completed_user_terminal_commit(
 
     paused = asyncio.create_task(service.pause_and_drain())
     await drain.started.wait()
-    assert not paused.done()
-    assert not commit.cancelled.is_set()
-    assert service.status_snapshot().active_job_count == 1
-
-    paused.cancel()
-    commit.release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await paused
-    await service.pause_and_drain()
+    await commit.cancelled.wait()
+    await paused
 
     assert callbacks == 1
-    assert await store.snapshot() == ()
+    assert commit.cancellation_count == 1
+    assert await store.snapshot() == (job,)
     assert service._run_tasks == set()
     assert service._terminal_commit_tasks == set()
     assert service.status_snapshot().active_job_count == 0
+    assert job.job_id not in service._consumed_at_jobs
 
+    commit.release.set()
     clock.wait_started = asyncio.Event()
     service.resume()
     await clock.wait_started.wait()
-    assert callbacks == 1
+    for _ in range(100):
+        if callbacks == 2 and await store.snapshot() == ():
+            break
+        await asyncio.sleep(0)
+    assert callbacks == 2
     assert await store.snapshot() == ()
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_pause_and_drain_waits_for_a_completed_recurring_terminal_commit(
+async def test_pause_and_drain_cancels_recurring_terminal_commit_without_immediate_replay(
     workspace: Path,
     agent_home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -791,24 +793,319 @@ async def test_pause_and_drain_waits_for_a_completed_recurring_terminal_commit(
 
     paused = asyncio.create_task(service.pause_and_drain())
     await drain.started.wait()
-    assert not paused.done()
-    assert not commit.cancelled.is_set()
-
-    commit.release.set()
+    await commit.cancelled.wait()
     await paused
 
     persisted = (await store.snapshot())[0]
-    assert persisted.state.last_status == "ok"
+    assert persisted.state == ScheduleJobState()
+    assert commit.cancellation_count == 1
     assert callback_count == 1
     assert service.status_snapshot().active_job_count == 0
     assert service._run_tasks == set()
     assert service._terminal_commit_tasks == set()
+    assert service._faulted is False
+    assert service._terminal_store_error_logged is False
 
     try:
+        commit.release.set()
         clock.wait_started = asyncio.Event()
         service.resume()
         assert id(service) == service_identity
         assert id(service._store) == store_identity
+        await clock.wait_started.wait()
+        assert callback_count == 1
+
+        clock.advance(59)
+        assert callback_count == 1
+
+        clock.advance(1)
+        await next_occurrence_started.wait()
+        assert callback_count == 2
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_terminal_commit_wins_the_pause_race_without_replay(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Keep a completed recurring terminal commit.",
+        schedule=JobSchedule.every(60),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    callback_count = 0
+    terminal_committed = asyncio.Event()
+    next_occurrence_started = asyncio.Event()
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        nonlocal callback_count
+        assert active_job.job_id == job.job_id
+        callback_count += 1
+        if callback_count == 2:
+            next_occurrence_started.set()
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+    original_commit = service._store.commit_terminal
+
+    async def observed_commit(*args: object, **kwargs: object) -> ScheduleJob | None:
+        committed = await original_commit(*args, **kwargs)  # type: ignore[arg-type]
+        terminal_committed.set()
+        return committed
+
+    monkeypatch.setattr(service._store, "commit_terminal", observed_commit)
+
+    service.start()
+    await terminal_committed.wait()
+    await service.pause_and_drain()
+
+    persisted = (await service._store.snapshot())[0]
+    assert persisted.state.last_status == "ok"
+    assert callback_count == 1
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+    assert service.status_snapshot().active_job_count == 0
+
+    try:
+        clock.wait_started = asyncio.Event()
+        service.resume()
+        await clock.wait_started.wait()
+        assert callback_count == 1
+
+        clock.advance(59)
+        assert callback_count == 1
+
+        clock.advance(1)
+        await next_occurrence_started.wait()
+        assert callback_count == 2
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_and_drain_catches_terminal_commit_created_during_run_cancellation(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Finish cancellation cleanup before terminal persistence.",
+        schedule=JobSchedule.every(60),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    run_started = asyncio.Event()
+    run_cancelled = asyncio.Event()
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        assert active_job.job_id == job.job_id
+        run_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            run_cancelled.set()
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+    commit = _BlockingOperation(service._store.commit_terminal)
+    monkeypatch.setattr(service._store, "commit_terminal", commit.run)
+
+    service.start()
+    await run_started.wait()
+    paused = asyncio.create_task(service.pause_and_drain())
+    await run_cancelled.wait()
+    await paused
+
+    assert commit.release.is_set() is False
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+    assert service.status_snapshot().active_job_count == 0
+    assert (await service._store.snapshot())[0].state == ScheduleJobState()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pause_waiter_observes_terminal_drain_before_cancellation_propagates(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Drain terminal cancellation cleanup.",
+        schedule=JobSchedule.at("2026-08-07T11:59:00.000+00:00"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    terminal_started = asyncio.Event()
+    terminal_cancelled = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    cancellation_count = 0
+
+    async def blocked_remove(*args: object, **kwargs: object) -> bool:
+        nonlocal cancellation_count
+        del args, kwargs
+        terminal_started.set()
+        try:
+            await asyncio.Event().wait()
+            raise AssertionError("blocked terminal removal returned without cancellation")
+        except asyncio.CancelledError:
+            cancellation_count += 1
+            terminal_cancelled.set()
+            await cleanup_release.wait()
+            raise
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=lambda active_job: _completed_user_job(active_job, job),
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+    monkeypatch.setattr(service._store, "_remove_terminal_job", blocked_remove)
+    drain = _DrainObserver(service._cancel_and_drain_job_tasks)
+    monkeypatch.setattr(service, "_cancel_and_drain_job_tasks", drain.drain)
+
+    service.start()
+    await terminal_started.wait()
+    paused = asyncio.create_task(service.pause_and_drain())
+    await drain.started.wait()
+    paused.cancel()
+    await terminal_cancelled.wait()
+
+    assert not paused.done()
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await paused
+
+    assert cancellation_count == 1
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+    assert service.status_snapshot().active_job_count == 0
+    assert await service._store.snapshot() == (job,)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_close_waits_for_terminal_commit_without_cancelling_it(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Finish terminal persistence during direct close.",
+        schedule=JobSchedule.at("2026-08-07T11:59:00.000+00:00"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=lambda active_job: _completed_user_job(active_job, job),
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+    commit = _BlockingOperation(service._store._remove_terminal_job)
+    monkeypatch.setattr(service._store, "_remove_terminal_job", commit.run)
+    close_observer = _DrainObserver(service._close_owned_tasks)
+    monkeypatch.setattr(service, "_close_owned_tasks", close_observer.drain)
+
+    service.start()
+    await commit.started.wait()
+    closing = asyncio.create_task(service.close())
+    await close_observer.started.wait()
+
+    assert not closing.done()
+    assert commit.cancellation_count == 0
+    commit.release.set()
+    await closing
+
+    assert commit.cancellation_count == 0
+    assert await service._store.snapshot() == ()
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+    assert service.status_snapshot().active_job_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pause_and_drain_preserves_next_cron_occurrence_after_terminal_cancellation(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    clock = _AdvancingClock()
+    job = ScheduleJob(
+        job_id="550e8400-e29b-41d4-a716-446655440000",
+        message="Run one Cron occurrence.",
+        schedule=JobSchedule.cron("* * * * *", "UTC"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    callback_count = 0
+    next_occurrence_started = asyncio.Event()
+
+    async def execute_user_job(active_job: ScheduleJob) -> None:
+        nonlocal callback_count
+        assert active_job.job_id == job.job_id
+        callback_count += 1
+        if callback_count == 2:
+            next_occurrence_started.set()
+
+    service = ScheduleService(
+        workspace_state=state,
+        clock=clock,
+        execute_user_job=execute_user_job,
+        execute_dream=lambda: _unexpected_dream(),
+    )
+    await service.add_user_job(job)
+    commit = _BlockingOperation(service._store.commit_terminal)
+    monkeypatch.setattr(service._store, "commit_terminal", commit.run)
+
+    service.start()
+    await clock.wait_started.wait()
+    clock.advance(60)
+    await commit.started.wait()
+    paused = asyncio.create_task(service.pause_and_drain())
+    await commit.cancelled.wait()
+    await paused
+
+    assert callback_count == 1
+    assert commit.cancellation_count == 1
+    assert (await service._store.snapshot())[0].state == ScheduleJobState()
+    assert service._run_tasks == set()
+    assert service._terminal_commit_tasks == set()
+    assert service.status_snapshot().active_job_count == 0
+
+    try:
+        commit.release.set()
+        clock.wait_started = asyncio.Event()
+        service.resume()
         await clock.wait_started.wait()
         assert callback_count == 1
 
@@ -1536,6 +1833,10 @@ async def test_close_rejects_a_run_registered_after_its_initial_task_snapshot(
 
 async def _unexpected_user_job(job: ScheduleJob) -> None:
     raise AssertionError(f"unexpected User Job: {job.job_id}")
+
+
+async def _completed_user_job(active_job: ScheduleJob, expected: ScheduleJob) -> None:
+    assert active_job == expected
 
 
 async def _unexpected_dream() -> object:

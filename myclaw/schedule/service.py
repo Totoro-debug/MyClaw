@@ -104,6 +104,7 @@ class ScheduleService:
         self._paused = False
         self._dispatcher_error_logged = False
         self._terminal_store_error_logged = False
+        self._cancel_terminal_commits = False
 
     def start(self) -> None:
         """Start the single dispatcher; repeated starts are idempotent."""
@@ -170,6 +171,7 @@ class ScheduleService:
         if not self._paused:
             return
         self._paused = False
+        self._cancel_terminal_commits = False
         self._pause_task = None
         self._prepare_start()
         self._activate_prepared()
@@ -200,6 +202,7 @@ class ScheduleService:
         self._aborted = True
         self._closing.set()
         self._paused = True
+        self._cancel_terminal_commits = True
         loop_task = self._loop_task
         if loop_task is not None and not loop_task.done():
             loop_task.cancel()
@@ -258,7 +261,7 @@ class ScheduleService:
             await asyncio.gather(loop_task, return_exceptions=True)
         self._loop_task = None
         retry_at_jobs = self._consumed_at_jobs.intersection(self._active_job_ids)
-        await self._cancel_and_drain_job_tasks(cancel_terminal=False)
+        await self._cancel_and_drain_job_tasks(cancel_terminal=True)
         retry_at_jobs.update(self._retry_at_jobs_after_resume)
         self._consumed_at_jobs.difference_update(retry_at_jobs)
         self._retry_at_jobs_after_resume.clear()
@@ -268,13 +271,15 @@ class ScheduleService:
         loop_task = self._loop_task
         if loop_task is not None and loop_task is not asyncio.current_task():
             await asyncio.gather(loop_task, return_exceptions=True)
-        await self._cancel_and_drain_job_tasks()
+        await self._cancel_and_drain_job_tasks(cancel_terminal=True)
         self._loop_task = None
         self._active_job_ids.clear()
         self._every_deadlines.clear()
         self._cron_cursors.clear()
 
-    async def _cancel_and_drain_job_tasks(self, *, cancel_terminal: bool = True) -> None:
+    async def _cancel_and_drain_job_tasks(self, *, cancel_terminal: bool) -> None:
+        if cancel_terminal:
+            self._cancel_terminal_commits = True
         while self._run_tasks or self._terminal_commit_tasks:
             run_tasks = tuple(self._run_tasks)
             terminal_tasks = tuple(self._terminal_commit_tasks)
@@ -632,11 +637,12 @@ class ScheduleService:
         error: str | None,
     ) -> None:
         finished_at_ms = _epoch_milliseconds(self._clock.now())
+        every_deadline: _EveryDeadline | None = None
         if job.schedule.kind == "every":
             every_seconds = job.schedule.every_seconds
             if every_seconds is None:
                 raise ValueError("every Schedule Job must define every_seconds")
-            self._every_deadlines[job.job_id] = _EveryDeadline(
+            every_deadline = _EveryDeadline(
                 anchor_ms=finished_at_ms,
                 deadline=self._clock.monotonic() + every_seconds,
                 every_seconds=every_seconds,
@@ -659,6 +665,8 @@ class ScheduleService:
         )
         self._terminal_commit_tasks.add(operation)
         operation.add_done_callback(self._terminal_commit_tasks.discard)
+        if self._cancel_terminal_commits and not operation.done():
+            operation.cancel()
         cancellation: asyncio.CancelledError | None = None
         failure: BaseException | None = None
         while not operation.done():
@@ -677,6 +685,8 @@ class ScheduleService:
                     cancellation = caught
             except BaseException as caught:
                 failure = caught
+        if failure is None and not operation.cancelled() and every_deadline is not None:
+            self._every_deadlines[job.job_id] = every_deadline
         if failure is not None and not isinstance(failure, asyncio.CancelledError):
             self._latch_fault()
             if not self._terminal_store_error_logged:

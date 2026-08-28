@@ -833,6 +833,15 @@ The final linearization refinement formed during later implementation review is 
 
 `current unavailable` means the CLI clears its current reference before old-loop abort/drain. The target is successfully started and activated before that reference is published; Schedule resumes only after publication. Any target construction or preflight failure is fatal, terminates Terminal Conversation, and is handled by the CLI `finally` path. Selection of the current Session also performs the full flow. Schedule Service, Dream, Memory Manager, Model Router and Message Bus are not closed or rebuilt during replacement.
 
+`pause_and_drain()` 在线性化 paused state 后取消并等待 dispatcher、所有 active User/System
+Schedule Job run task 以及已登记或在 run cancellation 清理期间新建的 terminal-commit task；caller
+cancellation 不会截断共享 pause barrier，只有 owned task 全部归零后才向 caller 传播。
+未提交的 `at` terminal removal 保持 persisted pending，并在 `resume()` 后重试一次；取消的 `every`
+terminal commit 保留 reservation 已推进的 monotonic deadline，取消的 `cron` terminal commit 保留已推进的
+Cron cursor，因此二者都只在下一个正常 occurrence 执行。已经完成 Store publication 的 terminal commit
+保持其 persisted state 与完成时刻 cadence。直接调用 `ScheduleService.close()` 仍等待已开始的 terminal
+commit 而不取消；CLI shutdown 先调用 `pause_and_drain()`，因此使用 pause 的取消语义。
+
 After Terminal `run_async()` returns, the actual CLI shutdown call chain is `Management deactivate -> Schedule pause_and_drain + close -> pending/active Agent Loop abort or close -> Dream close -> Model Router close`. Terminal exit/unmount cleanup has already run at the first boundary; the CLI does not call a separate Terminal business-component close. Accepted Tool/Artifact/Memory/Schedule side effects are not rolled back.
 
 ## TOOL_SCHEMA：Tool Gateway 契约
