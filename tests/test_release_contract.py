@@ -1236,6 +1236,10 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
 
 
 def test_issue_202_authoritative_documents_identify_one_current_composition_boundary() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    workspace_state_adr = (
+        ROOT / "docs" / "adr" / "0005-store-workspace-state-in-workspace.md"
+    ).read_text(encoding="utf-8")
     adr_0014 = (
         ROOT / "docs" / "adr" / "0014-use-message-bus-agent-loop-and-agent-runner.md"
     ).read_text(encoding="utf-8")
@@ -1249,9 +1253,55 @@ def test_issue_202_authoritative_documents_identify_one_current_composition_boun
     context = (ROOT / "CONTEXT.md").read_text(encoding="utf-8")
     prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
     runtime_contract = (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8")
+    terminal_design = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(
+        encoding="utf-8"
+    )
+    issue_195_plan = (
+        ROOT / "docs" / "issue-195-terminal-commit-cancellation-fix-plan.md"
+    ).read_text(encoding="utf-8")
+    release_readiness = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
     plan = (ROOT / "docs" / "cli-composition-root-implementation-plan.md").read_text(
         encoding="utf-8"
     )
+
+    for stale_claim in (
+        "Runtime Host",
+        "Memory Task",
+        "重新校验并读取完整 `SKILL.md`",
+        "每个 Schedule Job 使用独立 Schedule Session",
+        "<encoded_tool_call_id>",
+    ):
+        assert stale_claim not in readme
+    assert "| CLI composition root |" in readme
+    assert "Runtime Generation Skill Snapshot" in readme
+    assert "Dream System Job" in readme
+    assert "创建或校正 `schedule.json`" in readme
+    assert (
+        "Registration of the Dream System Job also creates or reconciles `schedule.json`"
+        in workspace_state_adr
+    )
+
+    assert "`Tab` is not intercepted" in terminal_design
+    assert (
+        "Selecting any Conversation Session, including the already active Session"
+        in terminal_design
+    )
+    assert "shared Runtime-Lifetime Message Bus" in terminal_design
+    assert "Target construction or preflight failure is fatal" in terminal_design
+    assert "already active Session is a no-op" not in terminal_design
+
+    issue_195_status = issue_195_plan.splitlines()[2]
+    assert "已完成" in issue_195_status
+    assert "修复前实现事实" in issue_195_plan
+    assert "待评审" not in issue_195_status
+    assert "相比当前实现" not in plan
+
+    current_gates = release_readiness.split("## Verification Gates", maxsplit=1)[1].split(
+        "\n## ", maxsplit=1
+    )[0]
+    assert "1,412 passed" in current_gates
+    assert "1,422 nodes total" in current_gates
+    assert "1,407 passed" not in current_gates
 
     assert _adr_status(adr_0017_path) == "accepted"
     assert "superseded by [ADR-0017]" in adr_0014

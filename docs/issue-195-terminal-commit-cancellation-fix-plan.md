@@ -1,6 +1,6 @@
 # Issue #195 Terminal Commit Cancellation Fix Plan
 
-状态：待评审。本文只定义修复方案，不授权或包含生产代码修改。
+状态：已完成。修复已由 commit `7c84fcb8a05e015f8ffcbb530b7c801de19a4a70` 交付；本文保留经评审的实施方案与修复前事实基线，当前行为以 Runtime Contracts 和实现为准。
 
 ## 1. 问题与事实依据
 
@@ -17,7 +17,7 @@ terminal-commit task，可能令 `/resume` 长时间或无限等待。
 - ADR-0017 将 `pause_and_drain` 固定在 destructive cutover 之前，因此该方法不返回，CLI 就不会
   进入 old Agent Loop abort、Message Bus reset、Terminal rebind 或 target start。
 
-当前实现事实：
+修复前实现事实（`7c84fcb` 之前）：
 
 1. `ScheduleService._run_job()` 在执行完成后调用 `_commit_terminal()`。
 2. `_commit_terminal()` 创建独立 `asyncio.Task`，登记到 `_terminal_commit_tasks`，并通过
@@ -67,8 +67,8 @@ terminal-commit task，却在 pause Interface 中只等待、不取消该 task�
 
 ### 2.2 非目标
 
-- 不修改 Issue #188 与 ADR-0017 之间的 current Agent Loop publication 顺序冲突。
-- 不修改 Dream/Memory Task 领域术语。
+- 不重开 ADR-0017 与后续实施评审已经收口的 current Agent Loop publication 顺序；本修复沿用该替换序列。
+- 不修改 Dream 的领域模型或长期记忆行为。
 - 不增加自动重试队列、持久化 retry 字段、schema version 或跨进程锁。
 - 不给 pause 增加 wall-clock timeout。timeout 会让 Service 在 owned task 尚未退出时向 CLI 假报
   drain 完成，破坏所有权和零晚到写入保证。
@@ -328,3 +328,11 @@ T2 为契约与证据更新，可独立反向提交；不得通过把失败测�
 - T2 全量验证与发布证据通过。
 - 改动范围仅包含实现当前 finding 必需的 Schedule implementation、tests 和契约文档。
 - Issue #188/#195、ADR-0017、runtime contracts 与实际 `pause_and_drain()` 行为之间不存在未记录冲突。
+
+## 10. 完成证据
+
+- T0–T2 已随 `7c84fcb` 完成，GitHub Issue #195 已关闭。
+- `python -m pytest tests/scheduling -q`：`186 passed`。
+- Runtime Generation、CLI replacement、Dream 与 Schedule 定向验证：`254 passed, 1 skipped`；skip 来自 Windows Python 缺少 `termios/pty` harness。
+- `python -m pytest -q`：`1412 passed, 10 skipped`，失败数为 `0`。
+- Ruff、Mypy、sdist/wheel build 与 `git diff --check` 均通过；Schedule persisted field set 变化数为 `0`。

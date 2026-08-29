@@ -835,7 +835,7 @@ current reference 单点更新；target failure 直接终止 Conversation。
 ### 8.9 Shutdown 与副作用
 
 正常 shutdown 必须 awaited。forced replacement 不回滚已接受的 Tool、Artifact、Memory 或 Schedule side effect；
-old Session 仍不做 final save。相比当前实现，Agent Loop 与 Schedule task 会在切换前被取消并等待，减少迟到输出，
+old Session 仍不做 final save。相比迁移前实现，Agent Loop 与 Schedule task 会在切换前被取消并等待，减少迟到输出，
 但不引入跨文件 transaction 或 side-effect rollback。
 
 ## 9. 最小变更控制

@@ -1,6 +1,6 @@
 # MyClaw Release Readiness
 
-Status: **Spec remediation for issues #194, #199, #201, and #202 verified from `65b24d13748327ff46126563928897a67d2c4ee8` plus the current T5 test and evidence patch on 2026-08-28; no release was uploaded**
+Status: **Issues #194, #195, #199, #201, and #202 verified through `7c84fcb8a05e015f8ffcbb530b7c801de19a4a70` on 2026-08-28; no release was uploaded**
 
 This document is the evidence index for the current implementation. It records active
 contracts, current test locations, current verification results, and present release risks.
@@ -24,14 +24,14 @@ contracts, current test locations, current verification results, and present rel
 
 | Gate | Command | Current result |
 | --- | --- | --- |
-| Full behavior suite | `python -m pytest -q` | Passed: 1,407 passed and 10 conditionally skipped on Windows; 1,417 nodes total |
+| Full behavior suite | `python -m pytest -q` | Passed: 1,412 passed and 10 conditionally skipped on Windows; 1,422 nodes total |
 | Lint | `python -m ruff check .` | Passed: 0 violations |
 | Format | `python -m ruff format --check .` | Baseline check remains informational; no unrelated bulk formatting is made |
 | Types | `python -m mypy` | Passed: 164 source files checked |
 | Distribution build | `python -m build --no-isolation` | Passed: one sdist and one `myclaw-0.1.0-py3-none-any.whl` built |
 | Tracked Markdown local links and active-design stale checks | `python -m pytest -q tests/test_release_contract.py` | Passed: 25 tests; 42 tracked Markdown files, no unresolved local inline/reference targets, and no stale structural findings |
 
-Release contract tests: 25 passed; 42 tracked Markdown files. Mapped owner-node execution: 14 passed after 14 nodes were collected. `git diff --check` returned `0` for the current patch; the earlier staged prospective patch check also returned `0`.
+Current full-suite evidence: 1,412 passed and 10 conditionally skipped on Windows; 1,422 nodes total. Release contract tests: 25 passed; 42 tracked Markdown files. Mapped owner-node execution: 14 passed after 14 nodes were collected. `git diff --check` returned `0` for the current patch; the earlier staged prospective patch check also returned `0`.
 
 ## Spec Remediation Verification
 

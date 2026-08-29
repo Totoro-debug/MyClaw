@@ -27,4 +27,4 @@ The current layout is:
   schedule.json
 ```
 
-Startup creates the root, internal Git ignore rule, `memory/`, `sessions/`, and missing Long-term Memory template; the remaining paths are created on demand. Known records validate their own formats, unknown entries and legacy scheduled-work state remain untouched, and the fixed file Tools can access Workspace State through normal Workspace path resolution subject to operating-system permissions.
+Startup creates the root, internal Git ignore rule, `memory/`, `sessions/`, and missing Long-term Memory template. Registration of the Dream System Job also creates or reconciles `schedule.json`; the remaining paths are created on demand. Known records validate their own formats, unknown entries and legacy scheduled-work state remain untouched, and the fixed file Tools can access Workspace State through normal Workspace path resolution subject to operating-system permissions.

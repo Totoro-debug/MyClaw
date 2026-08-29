@@ -11,7 +11,7 @@ MyClaw 不是多租户 Agent 平台，也不是后台常驻服务。每次运行
 - **多模型路由**：支持 `openai-compatible` 和 `anthropic` Provider，并可为聊天、记忆和定时任务分别配置模型。
 - **固定工具目录**：内置文件操作、目录检索、命令执行、Web 搜索、Web 获取和定时任务等十项 Tool，通过统一的 Tool Gateway 执行校验与授权。
 - **三层记忆系统**：由 Short-term Memory、Conversation Summary 和 Long-term Memory 组成。
-- **Skill 渐进加载**：从 Agent Home 发现用户编写的 Skill，支持手动斜杠调用、模型自主选择和可选的启动时加载。
+- **Skill 发现与渐进使用**：从 Agent Home 捕获 Runtime Generation 级完整 Skill Snapshot，支持手动斜杠调用、模型自主读取和可选的 System Prompt 投影。
 - **任务连续性**：在普通前台输入之前执行 Task Framing，用隐藏 Blackboard 维护当前目标和完成边界。
 - **Workspace 隔离**：每个启动目录拥有独立的 Session、Memory、Schedule、Artifact 和 Session Log。
 
@@ -107,7 +107,7 @@ Model Route 按用途选择模型：
 | --- | --- |
 | `default` | 其他 Route 不存在或允许回退时使用 |
 | `chat` | 前台对话、Session 标题和 Task Framing |
-| `memory` | Conversation Summary 与 Memory Task |
+| `memory` | Conversation Summary 与 Dream |
 | `schedule` | Schedule Job |
 
 只配置 `default` 即可启动。删除某个用途专用的 Route 后，该用途会回退到 `default`。每个 Route 的 `model` 必须同时出现在对应 Provider 的 `models` 数组中。
@@ -196,7 +196,7 @@ description: 将复杂需求整理为清晰、可执行的计划
 /planner 为下周的发布工作制定计划
 ```
 
-MyClaw 会重新校验并读取完整 `SKILL.md`，把 Skill 文档和 `/planner` 后面的请求一起提供给当前前台 Agent Run。Conversation Session 只持久化用户输入的原始斜杠命令。
+MyClaw 使用当前 Runtime Generation 创建时已经完整读取、校验并冻结的 `SKILL.md`，把 Skill 文档和 `/planner` 后面的请求一起提供给当前前台 Agent Run；手动调用不会再次访问磁盘。Conversation Session 只持久化用户输入的原始斜杠命令。
 
 未知的斜杠输入、大小写不匹配的名称或不完整名称不会触发 Skill，而是作为普通输入处理。
 
@@ -221,7 +221,7 @@ always: true
 enable_skill_always_load = true
 ```
 
-启动时加载的完整内容在本次 Runtime Lifetime 内保持冻结，修改后需要重启。此模式没有固定的 Skill 文件大小上限，但内容仍受聊天模型输入预算约束；超出预算时启动会以 `skill_context_too_large` 失败。
+启动时加载的完整内容在当前 Runtime Generation 内保持冻结；启动或任意 `/resume` 创建新的 Agent Loop 时会重新扫描并捕获 Skill Snapshot。此模式没有固定的 Skill 文件大小上限，但内容仍受聊天模型输入预算约束；超出预算时该 Agent Loop 的同步 preflight 会以 `skill_context_too_large` 终止 Terminal Conversation。
 
 ## 项目架构
 
@@ -231,11 +231,11 @@ MyClaw 使用宿主无关的组合根，将终端呈现、Agent 编排、模型�
 myclaw/
 ├── terminal/       全屏 Terminal Conversation、键盘适配与 CLI 入口
 ├── management/     管理命令分发及只读/受控管理视图
-├── agent/          Runtime、Message Bus、Agent Loop、Agent Runner 与上下文构建
+├── agent/          Message Bus、Agent Loop、Agent Runner 与上下文构建
 ├── provider/       Model Router、Provider 工厂及协议适配器
 ├── tools/          Tool Gateway、权限策略和固定 Tool 实现
 ├── session/        Conversation Session 及模型消息投影
-├── memory/         Conversation Summary、Long-term Memory 与 Memory Task
+├── memory/         Conversation Summary、Long-term Memory、Memory Manager 与 Dream
 ├── schedule/       Schedule Job、Schedule Service 与 Workspace 存储
 ├── skills/         Skill Catalog、校验和渐进加载
 ├── config/         Agent Home 与 User Configuration
@@ -249,15 +249,15 @@ myclaw/
 | 组件 | 职责 |
 | --- | --- |
 | Terminal Conversation | 接收用户输入，渲染回复、推理、Tool 活动和确认对话框 |
-| Runtime Host | 持有当前 Runtime Generation，并在恢复 Session 时完成替换与重绑定 |
-| Message Bus | 在一个 Agent Loop 内传递临时的 Inbound/Outbound Message |
+| CLI composition root | 拥有 Runtime Lifetime 级组件、当前 Agent Loop 引用、Session 替换和关闭顺序 |
+| Message Bus | 在整个 Runtime Lifetime 内复用，在 Terminal Conversation 与当前 Agent Loop 间传递临时 Inbound/Outbound Message |
 | Agent Loop | 串行处理前台输入，管理 Session、Task Framing、Tool 和结果持久化 |
 | Agent Runner | 执行一次有迭代上限的 ReAct 模型与 Tool 循环 |
 | Model Router | 按逻辑 Route 解析 Provider 和模型，并处理限定重试与回退 |
 | Tool Gateway | Tool 调用的唯一公共入口，负责解析、校验、授权、执行和结果归一化 |
-| Memory System | 压缩历史消息，并把稳定信息更新到 Workspace 级 Long-term Memory |
-| Schedule Service | 保存、触发和取消 Schedule Job，使用独立 Schedule Session |
-| Skill Catalog | 在 Runtime Lifetime 启动时发现并冻结有效 Skill 元数据 |
+| Memory Manager 与 Dream | 管理 Summary/Cursor/Long-term Memory 状态，并通过独立 Dream Runner 处理长期记忆 |
+| Schedule Service | 保存、触发和取消 Schedule Job；User Job 调用当前 Agent Loop，Dream System Job 直接调用 Dream |
+| Skill Snapshot | 每个 Agent Loop 创建时完整读取并冻结有效 Skill 文档，对模型按用途投影元数据或正文 |
 
 ### 固定 Tool Catalog
 
@@ -284,9 +284,10 @@ Tool Catalog 不能通过配置增删或替换，固定包含：
 CLI
   → 读取 ~/.myclaw/config.toml
   → 以当前目录建立 Workspace
-  → 发现并校验 Skill Catalog
   → 初始化 <workspace>/.myclaw/
-  → 组合 Runtime Host 与 Runtime Generation
+  → 组合 Runtime Lifetime 级 Message Bus、Model Router、Memory Manager、Dream 与 Schedule Service
+  → 创建并 preflight 初始 Agent Loop，同时捕获 Runtime Generation Skill Snapshot
+  → 注册或校正 Dream System Job，并创建或校正 schedule.json
   → 启动 Terminal Conversation
 ```
 
@@ -315,7 +316,7 @@ CLI
 较早的 Session 消息
   → Conversation Summary
   → <workspace>/.myclaw/memory/summary.jsonl
-  → 定时或 /dream 触发 Memory Task
+  → Dream System Job 或 /dream 触发 Dream
   → memory Route 判断并更新 memory.md
   → 推进 Summary Cursor
 ```
@@ -326,9 +327,10 @@ Short-term Memory 是 Session 中尚未被摘要覆盖的后缀；Conversation S
 ### Schedule
 
 Schedule Service 从 Workspace 的 `schedule.json` 读取任务，在 Runtime Lifetime 内
-等待触发时间。每个 Schedule Job 使用独立 Schedule Session 和 `schedule` Route，
-共享固定 Tool Gateway 与 Agent Runner，但不会向前台 Outbound Message 流发布执行
-过程。非交互式 Schedule Agent Run 会拒绝需要用户确认的操作。
+等待触发时间。User Schedule Job 使用独立 Schedule Session 和 `schedule` Route，并通过
+当前 Agent Loop 共享该 Runtime Generation 的 Tool Gateway 与 Agent Runner；Dream System
+Job 则直接调用 `Dream.run()`，不创建 Schedule Session 或进入 Agent Loop。两条路径都不会
+向前台 Outbound Message 流发布执行过程，也没有交互式确认通道。
 
 ## 本地数据与目录
 
@@ -364,13 +366,14 @@ Agent Home 固定为当前账户的 `~/.myclaw/`，不能通过配置切换：
 │   └── schedule_<job_id>.jsonl
 ├── artifacts/
 │   └── <session_id>/
-│       └── <encoded_tool_call_id>.txt
+│       └── <tool_call_id_or_uuid4>.txt
 └── logs/
     └── <session_id>.log
 ```
 
-启动时只创建 Workspace State 根目录、内部 `.gitignore`、`memory/`、`sessions/`
-以及缺失的 `memory.md`；其余文件和目录由对应功能按需创建。
+启动时创建 Workspace State 根目录、内部 `.gitignore`、`memory/`、`sessions/`、缺失的
+`memory.md`，并在注册 Dream System Job 时创建或校正 `schedule.json`；其余文件和目录由
+对应功能按需创建。
 
 建议将 Workspace 与其中的 `.myclaw` 一起备份。不要在 MyClaw 运行期间手动编辑Session、Summary、Summary Cursor 或 Schedule 状态文件。
 
