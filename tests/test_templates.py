@@ -196,7 +196,11 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
             long_term_memory="# Memory\n",
         ),
         session_title_prompt(),
-        blackboard_prompt(),
+        blackboard_prompt(
+            user_input="Current input",
+            last_task="null",
+            latest_assistant_content="Latest assistant content",
+        ),
         conversation_summary_prompt(),
         memory_task_prompt(long_term_path=PureWindowsPath(r"D:\workspace\memory.md")),
     )
@@ -242,7 +246,11 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
             long_term_memory="# Memory\n",
         ),
         session_title_prompt(),
-        blackboard_prompt(),
+        blackboard_prompt(
+            user_input="Current input",
+            last_task="null",
+            latest_assistant_content="Latest assistant content",
+        ),
         conversation_summary_prompt(),
         memory_task_prompt(long_term_path=PureWindowsPath(r"D:\workspace\memory.md")),
     )
@@ -274,6 +282,42 @@ def test_chat_system_prompt_uses_the_fixed_catalog_guidance() -> None:
     )
 
 
+def test_blackboard_prompt_renders_exact_filled_system_content() -> None:
+    assert blackboard_prompt(
+        user_input="继续 {raw}。",
+        last_task='{"task_goal":"旧目标","completion_boundary":"旧边界"}',
+        latest_assistant_content="上一次回复。\n第二行。",
+    ) == (
+        "你是一个分析任务目标与任务完成边界的专家，只负责从 User input、Last Task、Latest assistant content "  # noqa: RUF001
+        "三块内容中判断是否需要更新或删除旧的任务，绝对不能直接回答用户疑问、输出任务的完成步骤。\n\n\n"  # noqa: RUF001
+        "## 要求\n"
+        "- 绝对不能直接回答用户疑问、输出任务的完成步骤。\n"
+        "- 用户输入为最高优先级，即使用户输入与旧任务定义冲突，也必须优先理解并遵守用户输入。\n"  # noqa: RUF001
+        "- `action` 字段取值只能是 `keep`、`replace` 或 `clear`。\n"
+        "- 当前任务保持不变时 `action` 字段取 `keep`，任务定义完全变更时 `action` 字段取 `replace`，"  # noqa: RUF001
+        "任务完成或者无任务时 `action` 字段取 `clear`。\n"
+        "- 当用户输入没有明确目标时，`action` 字段应该取 `clear`。例如：闲聊 “你好”、“hello”，"  # noqa: RUF001
+        "无明确要求的询问 “我会成功吗” 等。\n"
+        "- `task_goal` 字段描述任务目标，`completion_boundary` 字段描述任务完成的边界。\n\n\n"  # noqa: RUF001
+        "## 输出\n"
+        "输出格式必须直接使用如下 JSON 对象，并且必须包含 `action` `task_goal` `completion_boundary` 三个字段。\n"  # noqa: RUF001
+        "``` JSON\n"
+        "{\n"
+        '  "action": "keep | replace | clear",\n'
+        '  "task_goal": "string | null",\n'
+        '  "completion_boundary": "string | null"\n'
+        "}\n"
+        "```\n\n\n"
+        "## 输入\n\n"
+        "### User input\n"
+        "继续 {raw}。\n\n"
+        "### Last Task\n"
+        '{"task_goal":"旧目标","completion_boundary":"旧边界"}\n\n'
+        "### Latest assistant content\n"
+        "上一次回复。\n第二行。"
+    )
+
+
 def test_specialized_model_templates_render_exact_prompts() -> None:
     summary = SummaryEntry(index=1, timestamp=NOW, content="Remember this.")
     long_term_path = PureWindowsPath(r"D:\workspace\.myclaw\memory\memory.md")
@@ -281,16 +325,6 @@ def test_specialized_model_templates_render_exact_prompts() -> None:
     assert session_title_prompt() == (
         "Generate a concise title for this Conversation Session.\n"
         "Return only the title. Do not call tools or add commentary."
-    )
-    assert blackboard_prompt() == (
-        "You are the MyClaw Task Framing evaluator.\n"
-        "Do not answer the user's task or create execution steps.\n"
-        "Choose keep when the current task remains the same, replace when the complete task definition changes, and clear when no task remains.\n"
-        "Return exactly one JSON object with exactly these keys: action, goal, completion_boundary.\n"
-        "The action must be keep, replace, or clear. Keep and clear require null goal and completion_boundary. Replace requires concise, observable, non-empty string values for both fields.\n"
-        "When previous_blackboard is null, keep cannot produce a usable Blackboard.\n"
-        "Use only the supplied previous Blackboard, latest assistant content, and current user input. Do not invent requirements.\n"
-        "The latest assistant content may represent success, failure, or cancellation; do not infer task boundaries from that status alone."
     )
     assert conversation_summary_prompt() == (
         "Summarize the provided earlier conversation messages.\n"

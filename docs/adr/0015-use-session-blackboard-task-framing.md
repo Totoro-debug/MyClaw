@@ -20,11 +20,14 @@ Invocation, MyClaw performs an isolated Task Framing call through the configured
 Model Route with no Tools. Task Framing uses the same Runtime Lifetime-owned Model Router
 instance supplied to the Agent Loop; it does not construct or own another router. The
 call receives only the previous Blackboard, the complete content of the latest assistant
-Session message, and the new raw user input. Its strict JSON decision keeps, replaces, or
-clears one Blackboard containing exactly `goal` and `completion_boundary`. The output
-parser may extract JSON from a raw response, one Markdown fence, or surrounding prose,
-but the resulting object and action invariants remain strict. Prompts require concise
-values, but the Runtime imposes no Blackboard character limit.
+Session message, and the new raw user input. These values are embedded into one
+parameterized System Prompt; the request contains no additional User Message. Its strict
+JSON decision contains exactly `action`, `task_goal`, and `completion_boundary`.
+`task_goal` maps to the Blackboard's internal `goal` field, so the decision keeps,
+replaces, or clears one Blackboard containing exactly `goal` and
+`completion_boundary`. The output parser may extract JSON from a raw response, one
+Markdown fence, or surrounding prose, but the resulting object and action invariants
+remain strict. The Runtime imposes no Blackboard character limit.
 
 A Manual Skill Invocation and Task Framing are mutually exclusive within one foreground
 Agent Run. A manually invoked Skill does not read, generate, project, update, or clear a

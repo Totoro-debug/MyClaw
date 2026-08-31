@@ -14,7 +14,7 @@ from myclaw.provider.models import ModelMessages, ModelResponse
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.utils.validation import token_usage_validation_issue
 
-_DECISION_KEYS = frozenset({"action", "goal", "completion_boundary"})
+_DECISION_KEYS = frozenset({"action", "task_goal", "completion_boundary"})
 _NOT_PARSED = object()
 
 
@@ -144,12 +144,15 @@ class TaskFramer:
             last_assistant_content=last_assistant_content,
             current_user_input=current_user_input,
         )
-        payload = json.dumps(
-            {
-                "previous_blackboard": encode_blackboard(previous),
-                "last_assistant_content": last_assistant_content,
-                "current_user_input": current_user_input,
-            },
+        last_task = json.dumps(
+            (
+                None
+                if previous is None
+                else {
+                    "task_goal": previous.goal,
+                    "completion_boundary": previous.completion_boundary,
+                }
+            ),
             ensure_ascii=False,
             separators=(",", ":"),
             allow_nan=False,
@@ -158,8 +161,14 @@ class TaskFramer:
             response = await self._router.complete(
                 "chat",
                 messages=[
-                    {"role": "system", "content": blackboard_prompt()},
-                    {"role": "user", "content": payload},
+                    {
+                        "role": "system",
+                        "content": blackboard_prompt(
+                            user_input=current_user_input,
+                            last_task=last_task,
+                            latest_assistant_content=last_assistant_content,
+                        ),
+                    },
                 ],
                 tools=(),
             )
@@ -293,20 +302,20 @@ def _reduce_decision(
     if not isinstance(decision, dict) or set(decision) != _DECISION_KEYS:
         return False, None
     action = decision["action"]
-    goal = decision["goal"]
+    task_goal = decision["task_goal"]
     completion_boundary = decision["completion_boundary"]
     if not isinstance(action, str):
         return False, None
     if action in {"keep", "clear"}:
-        if goal is not None or completion_boundary is not None:
+        if task_goal is not None or completion_boundary is not None:
             return False, None
         return True, previous if action == "keep" else None
     if action != "replace":
         return False, None
-    if not isinstance(goal, str) or not isinstance(completion_boundary, str):
+    if not isinstance(task_goal, str) or not isinstance(completion_boundary, str):
         return False, None
     try:
-        return True, Blackboard(goal=goal, completion_boundary=completion_boundary)
+        return True, Blackboard(goal=task_goal, completion_boundary=completion_boundary)
     except (TypeError, ValueError):
         return False, None
 

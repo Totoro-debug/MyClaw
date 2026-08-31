@@ -2834,21 +2834,21 @@ async def test_loop_close_swallows_final_session_failure(tmp_path: Path) -> None
     ("decision", "previous", "expected"),
     [
         (
-            {"action": "keep", "goal": None, "completion_boundary": None},
+            {"action": "keep", "task_goal": None, "completion_boundary": None},
             Blackboard(goal="Previous goal", completion_boundary="Previous boundary"),
             Blackboard(goal="Previous goal", completion_boundary="Previous boundary"),
         ),
         (
             {
                 "action": "replace",
-                "goal": "Default goal",
+                "task_goal": "Default goal",
                 "completion_boundary": "Default boundary",
             },
             None,
             Blackboard(goal="Default goal", completion_boundary="Default boundary"),
         ),
         (
-            {"action": "clear", "goal": None, "completion_boundary": None},
+            {"action": "clear", "task_goal": None, "completion_boundary": None},
             Blackboard(goal="Previous goal", completion_boundary="Previous boundary"),
             None,
         ),
@@ -2906,21 +2906,25 @@ async def test_default_agent_loop_wiring_reduces_keep_replace_and_clear(
     route, messages, tools = router.direct_calls[0]
     assert route == "chat"
     assert tools == ()
-    assert messages[1]["content"] == json.dumps(
-        {
-            "previous_blackboard": (
-                None
-                if previous is None
-                else {
-                    "goal": previous.goal,
-                    "completion_boundary": previous.completion_boundary,
-                }
-            ),
-            "last_assistant_content": "",
-            "current_user_input": "default wiring input",
-        },
+    assert len(messages) == 1
+    assert messages[0]["role"] == "system"
+    expected_last_task = json.dumps(
+        (
+            None
+            if previous is None
+            else {
+                "task_goal": previous.goal,
+                "completion_boundary": previous.completion_boundary,
+            }
+        ),
+        ensure_ascii=False,
         separators=(",", ":"),
     )
+    system_content = messages[0]["content"]
+    assert isinstance(system_content, str)
+    assert "### User input\ndefault wiring input" in system_content
+    assert f"### Last Task\n{expected_last_task}" in system_content
+    assert system_content.endswith("### Latest assistant content\n")
     if expected is None:
         assert "blackboard" not in session.metadata
     else:

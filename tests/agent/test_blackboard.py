@@ -79,13 +79,13 @@ def _response(content: str, *, input_tokens: int = 7, output_tokens: int = 3) ->
 
 def _decision(
     action: str,
-    goal: str | None,
+    task_goal: str | None,
     completion_boundary: str | None,
 ) -> str:
     return json.dumps(
         {
             "action": action,
-            "goal": goal,
+            "task_goal": task_goal,
             "completion_boundary": completion_boundary,
         },
         ensure_ascii=False,
@@ -249,7 +249,7 @@ def test_encode_blackboard_has_one_strict_public_shape() -> None:
 
 
 @pytest.mark.asyncio
-async def test_frame_sends_only_the_three_complete_json_inputs_and_no_tools() -> None:
+async def test_frame_sends_only_one_filled_system_message_and_no_tools() -> None:
     previous = Blackboard(goal="Old goal", completion_boundary="Old boundary")
     last_assistant_content = 'Assistant {answer} with "quotes" and C:\\path'
     current_user_input = "继续: 保留换行\n以及非 ASCII 内容。"
@@ -273,25 +273,36 @@ async def test_frame_sends_only_the_three_complete_json_inputs_and_no_tools() ->
     call = router.calls[0]
     assert call["route"] == "chat"
     assert call["tools"] == ()
-    assert call["messages"] == [
-        {"role": "system", "content": blackboard_prompt()},
+    last_task = json.dumps(
         {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "previous_blackboard": encode_blackboard(previous),
-                    "last_assistant_content": last_assistant_content,
-                    "current_user_input": current_user_input,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
+            "task_goal": previous.goal,
+            "completion_boundary": previous.completion_boundary,
         },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    assert call["messages"] == [
+        {
+            "role": "system",
+            "content": blackboard_prompt(
+                user_input=current_user_input,
+                last_task=last_task,
+                latest_assistant_content=last_assistant_content,
+            ),
+        }
     ]
+    system_content = call["messages"][0]["content"]
+    assert isinstance(system_content, str)
+    assert current_user_input in system_content
+    assert last_task in system_content
+    assert last_assistant_content in system_content
+    assert "{User input}" not in system_content
+    assert "{Last Task}" not in system_content
+    assert "{Latest assistant content}" not in system_content
 
 
 @pytest.mark.asyncio
-async def test_frame_preserves_empty_last_assistant_content_as_json_string() -> None:
+async def test_frame_fills_empty_latest_assistant_content_without_a_user_message() -> None:
     router = _FakeRouter(_response(_decision("clear", None, None)))
 
     result = await TaskFramer(router).frame(
@@ -305,10 +316,16 @@ async def test_frame_preserves_empty_last_assistant_content_as_json_string() -> 
     call = router.calls[0]
     messages = call["messages"]
     assert isinstance(messages, Sequence)
-    user_message = messages[1]
-    assert user_message["content"] == (
-        '{"previous_blackboard":null,"last_assistant_content":"","current_user_input":"cancel"}'
-    )
+    assert messages == [
+        {
+            "role": "system",
+            "content": blackboard_prompt(
+                user_input="cancel",
+                last_task="null",
+                latest_assistant_content="",
+            ),
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -336,9 +353,9 @@ async def test_frame_reduces_keep_replace_and_clear_with_or_without_previous(
     previous: Blackboard | None,
     expected: Blackboard | None,
 ) -> None:
-    goal = None if action != "replace" else "New"
+    task_goal = None if action != "replace" else "New"
     boundary = None if action != "replace" else "New boundary"
-    router = _FakeRouter(_response(_decision(action, goal, boundary)))
+    router = _FakeRouter(_response(_decision(action, task_goal, boundary)))
 
     result = await TaskFramer(router).frame(
         previous=previous,
@@ -381,7 +398,7 @@ async def test_balanced_scan_handles_quoted_braces_escaped_quotes_and_backslashe
         + json.dumps(
             {
                 "action": "replace",
-                "goal": 'Keep {braces} and "quotes"',
+                "task_goal": 'Keep {braces} and "quotes"',
                 "completion_boundary": r"Use C:\path and finish {it}",
             },
             ensure_ascii=False,
@@ -408,7 +425,8 @@ async def test_balanced_scan_handles_quoted_braces_escaped_quotes_and_backslashe
 async def test_balanced_scan_ignores_an_unmatched_quote_before_the_first_object() -> None:
     router = _FakeRouter(
         _response(
-            'Provider says "decision: {"action":"clear","goal":null,"completion_boundary":null}'
+            'Provider says "decision: {"action":"clear","task_goal":null,'
+            '"completion_boundary":null}'
         )
     )
 
@@ -433,7 +451,7 @@ async def test_balanced_scan_does_not_skip_an_earlier_braced_prose_fragment() ->
     router = _FakeRouter(
         _response(
             "Provider note {not JSON} then "
-            '{"action":"clear","goal":null,"completion_boundary":null}'
+            '{"action":"clear","task_goal":null,"completion_boundary":null}'
         )
     )
 
@@ -458,31 +476,35 @@ async def test_balanced_scan_does_not_skip_an_earlier_braced_prose_fragment() ->
     [
         "not JSON",
         "[]",
-        "{'action':'clear','goal':null,'completion_boundary':null}",
-        '{"action":"clear","goal":null,"completion_boundary":null,}',
-        '{"action":null,"goal":null,"completion_boundary":null}',
-        '{"action":1,"goal":null,"completion_boundary":null}',
-        '{"action":"rename","goal":null,"completion_boundary":null}',
-        '{"action":"keep","goal":"goal","completion_boundary":null}',
-        '{"action":"keep","goal":null,"completion_boundary":"boundary"}',
-        '{"action":"clear","goal":"goal","completion_boundary":null}',
-        '{"action":"clear","goal":null,"completion_boundary":"boundary"}',
-        '{"action":"replace","goal":"","completion_boundary":"boundary"}',
-        '{"action":"replace","goal":"   ","completion_boundary":"boundary"}',
-        '{"action":"replace","goal":null,"completion_boundary":"boundary"}',
-        '{"action":"replace","goal":1,"completion_boundary":"boundary"}',
-        '{"action":"replace","goal":"goal","completion_boundary":null}',
-        '{"action":"replace","goal":"goal","completion_boundary":1}',
-        '{"action":"replace","goal":"goal","completion_boundary":""}',
-        '{"action":"replace","goal":"goal","completion_boundary":"   "}',
-        '{"action":"replace","goal":"goal","completion_boundary":NaN}',
-        '{"action":"replace","goal":"goal","completion_boundary":Infinity}',
-        '{"action":"replace","goal":"goal","completion_boundary":-Infinity}',
-        '{"action":"replace","goal":"first","goal":"second","completion_boundary":"boundary"}',
-        '{"action":"replace","goal":"goal"}',
-        '{"action":"replace","goal":"goal","completion_boundary":"boundary","extra":true}',
-        '{"task":"replace","goal":"goal","completion_boundary":"boundary"}',
-        '{"action":"replace","goal":"goal"} prose {"action":"clear","goal":null,"completion_boundary":null}',
+        "{'action':'clear','task_goal':null,'completion_boundary':null}",
+        '{"action":"clear","task_goal":null,"completion_boundary":null,}',
+        '{"action":null,"task_goal":null,"completion_boundary":null}',
+        '{"action":1,"task_goal":null,"completion_boundary":null}',
+        '{"action":"rename","task_goal":null,"completion_boundary":null}',
+        '{"action":"keep","task_goal":"goal","completion_boundary":null}',
+        '{"action":"keep","task_goal":null,"completion_boundary":"boundary"}',
+        '{"action":"clear","task_goal":"goal","completion_boundary":null}',
+        '{"action":"clear","task_goal":null,"completion_boundary":"boundary"}',
+        '{"action":"replace","task_goal":"","completion_boundary":"boundary"}',
+        '{"action":"replace","task_goal":"   ","completion_boundary":"boundary"}',
+        '{"action":"replace","task_goal":null,"completion_boundary":"boundary"}',
+        '{"action":"replace","task_goal":1,"completion_boundary":"boundary"}',
+        '{"action":"replace","task_goal":"goal","completion_boundary":null}',
+        '{"action":"replace","task_goal":"goal","completion_boundary":1}',
+        '{"action":"replace","task_goal":"goal","completion_boundary":""}',
+        '{"action":"replace","task_goal":"goal","completion_boundary":"   "}',
+        '{"action":"replace","task_goal":"goal","completion_boundary":NaN}',
+        '{"action":"replace","task_goal":"goal","completion_boundary":Infinity}',
+        '{"action":"replace","task_goal":"goal","completion_boundary":-Infinity}',
+        '{"action":"replace","task_goal":"first","task_goal":"second",'
+        '"completion_boundary":"boundary"}',
+        '{"action":"replace","task_goal":"goal"}',
+        '{"action":"replace","task_goal":"goal","completion_boundary":"boundary",'
+        '"extra":true}',
+        '{"task":"replace","task_goal":"goal","completion_boundary":"boundary"}',
+        '{"action":"replace","task_goal":"goal"} prose '
+        '{"action":"clear","task_goal":null,"completion_boundary":null}',
+        '{"action":"replace","goal":"legacy","completion_boundary":"boundary"}',
         "```json\n" + _decision("replace", "Goal", "Boundary") + " trailing prose\n```",
     ],
 )
@@ -555,8 +577,8 @@ async def test_frame_uses_first_balanced_object_and_preserves_usage(
 @pytest.mark.asyncio
 async def test_frame_rejects_a_later_valid_object_when_the_first_is_invalid() -> None:
     response_content = (
-        '{"action":"replace","goal":"","completion_boundary":"invalid"} prose '
-        '{"action":"clear","goal":null,"completion_boundary":null}'
+        '{"action":"replace","task_goal":"","completion_boundary":"invalid"} prose '
+        '{"action":"clear","task_goal":null,"completion_boundary":null}'
     )
     router = _FakeRouter(_response(response_content))
 
@@ -647,11 +669,18 @@ async def test_frame_rejects_wrong_public_input_types_without_coercion(
 
 
 def test_blackboard_prompt_is_versioned_and_restricts_the_domain() -> None:
-    prompt = blackboard_prompt()
+    prompt = blackboard_prompt(
+        user_input="Current input",
+        last_task="null",
+        latest_assistant_content="Latest assistant content",
+    )
 
     assert "keep" in prompt
     assert "replace" in prompt
     assert "clear" in prompt
     assert "JSON" in prompt
+    assert "task_goal" in prompt
     assert "completion_boundary" in prompt
-    assert "Do not answer the user's task" in prompt
+    assert "绝对不能直接回答用户疑问" in prompt
+    assert "Current input" in prompt
+    assert "Latest assistant content" in prompt

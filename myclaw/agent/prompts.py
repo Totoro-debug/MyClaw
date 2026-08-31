@@ -140,9 +140,21 @@ def session_title_prompt() -> str:
     return render_template("session-title-prompt.md")
 
 
-def blackboard_prompt() -> str:
+def blackboard_prompt(
+    *,
+    user_input: str,
+    last_task: str,
+    latest_assistant_content: str,
+) -> str:
     """Return the isolated prompt used for Task Framing."""
-    return render_template("blackboard-system-prompt.md")
+    return render_template(
+        "blackboard-system-prompt.md",
+        **{
+            "User input": user_input,
+            "Last Task": last_task,
+            "Latest assistant content": latest_assistant_content,
+        },
+    )
 
 
 def conversation_summary_prompt() -> str:
