@@ -45,13 +45,12 @@ def current_user_input(
         )
     if blackboard_projection is None:
         return rendered
-    serialized = json.dumps(
-        blackboard_projection,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
+    blackboard = render_template(
+        "blackboard.md",
+        task_goal=blackboard_projection["goal"],
+        completion_boundary=blackboard_projection["completion_boundary"],
     )
-    return f"{rendered}\n\n<blackboard>\n{serialized}\n</blackboard>"
+    return f"{rendered}\n\n{blackboard}"
 
 
 def runtime_context(*, current_time: datetime, session_id: str) -> str:
@@ -78,7 +77,7 @@ def foreground_chat_system_prompt(
     long_term_memory: str,
     skill_snapshot: SkillSnapshot | None = None,
 ) -> str:
-    """Compose the foreground prompt with optional Skill metadata and Blackboard guidance."""
+    """Compose the foreground prompt with optional Skill metadata."""
     sections = [chat_system_prompt(workspace=workspace, long_term_memory=long_term_memory)]
     if skill_snapshot is not None and skill_snapshot.skills:
         entries = "\n".join(
@@ -97,7 +96,6 @@ def foreground_chat_system_prompt(
         )
         if always_entries:
             sections.append(render_template("skill-always-load.md", entries=always_entries))
-    sections.append(render_template("blackboard-guidance.md"))
     return "\n\n".join(sections)
 
 

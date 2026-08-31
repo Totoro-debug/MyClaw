@@ -369,6 +369,10 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
         "runner": 0,
         "persist": 0,
     }
+    constructor_args: dict[str, list[tuple[Any, ...]]] = {
+        name: []
+        for name in ("context_builder", "summary_manager", "task_framer", "tool_gateway", "runner")
+    }
 
     original_create = Session.create
     original_persist = Session.persist
@@ -393,6 +397,7 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
     def record_factory(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
         def recording(*args: Any, **kwargs: Any) -> Any:
             counts[name] += 1
+            constructor_args[name].append(args)
             return original(*args, **kwargs)
 
         return recording
@@ -427,6 +432,9 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
     }
     assert asyncio.all_tasks() == tasks_before
     assert router.calls == []
+    assert constructor_args["task_framer"][0][0] is router
+    assert constructor_args["runner"][0][0] is router
+    assert loop._model_router is router
     assert not (session.workspace_state.sessions_directory / f"{session.session_id}.jsonl").exists()
 
     await loop.abort()
@@ -544,6 +552,20 @@ def _runtime(
         loop._context_builder._skill_snapshot = skill_snapshot
     object.__setattr__(loop, "_prepare_foreground_context", prepare)
     return loop, loop.session, bus
+
+
+def _planner_skill_snapshot(tmp_path: Path) -> SkillSnapshot:
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
+        encoding="utf-8",
+    )
+    return SkillLoader(
+        root=tmp_path / "agent-home" / "skills",
+        reserved_names=(),
+        enable_always_load=False,
+    ).load()
 
 
 @pytest.mark.asyncio
@@ -842,8 +864,9 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
         blackboard: Blackboard | None,
         manual_invocation: ManualSkillInvocation | None,
     ) -> list[dict[str, Any]]:
-        del active_session, blackboard
+        del active_session
         observed.append((deepcopy(current_user), manual_invocation))
+        assert blackboard is None
         assert manual_invocation is not None
         return [
             {"role": "system", "content": "test"},
@@ -862,6 +885,11 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
         title_prompt="Generate a title",
         skill_snapshot=snapshot,
     )
+    previous_blackboard = {
+        "goal": "Preserved goal",
+        "completion_boundary": "Preserved boundary",
+    }
+    session.update_metadata(blackboard=previous_blackboard)
     await loop.start()
     try:
         await _bus.put_inbound(InboundMessage(raw_input))
@@ -872,7 +900,7 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
     assert len(router.calls) == 2
     assert raw_input in router.calls
     assert f"<skill>{document}</skill><request>Do the work</request>" in router.calls
-    assert framer.calls == [(None, "", raw_input)]
+    assert framer.calls == []
     assert observed[0][0] == {"role": "user", "content": raw_input}
     assert observed[0][1] is not None
     assert observed[0][1].body == document
@@ -880,6 +908,7 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
     assert [message["content"] for message in session.messages if message["role"] == "user"] == [
         raw_input
     ]
+    assert session.metadata["blackboard"] == previous_blackboard
 
 
 @pytest.mark.asyncio
@@ -907,7 +936,8 @@ async def test_published_manual_skill_snapshot_ignores_later_file_changes(
         blackboard: Blackboard | None,
         manual_invocation: ManualSkillInvocation | None,
     ) -> list[dict[str, Any]]:
-        del active_session, current_user, blackboard
+        del active_session, current_user
+        assert blackboard is None
         assert manual_invocation is not None
         return [
             {"role": "system", "content": "test"},
@@ -935,10 +965,194 @@ async def test_published_manual_skill_snapshot_ignores_later_file_changes(
 
     assert len(router.calls) == 2
     assert f"<skill>{document}</skill><request>request</request>" in router.calls
-    assert framer.calls == [(None, "", raw_input)]
+    assert framer.calls == []
     assert [message["content"] for message in session.messages if message["role"] == "user"] == [
         raw_input
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_input", "expected_framing_calls"),
+    [
+        ("ordinary input", 1),
+        ("/unknown", 1),
+        (" /planner", 1),
+        ("/Planner", 1),
+        ("/planner", 0),
+        ("/planner\u2003request", 0),
+    ],
+)
+async def test_only_exact_manual_skill_invocations_skip_task_framing(
+    tmp_path: Path,
+    raw_input: str,
+    expected_framing_calls: int,
+) -> None:
+    snapshot = _planner_skill_snapshot(tmp_path)
+    framer = _FramingFake()
+    loop, _session, bus = _runtime(
+        tmp_path,
+        _Router((_response("Completed"),)),
+        task_framer=framer,
+        skill_snapshot=snapshot,
+    )
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage(raw_input))
+        await _terminals(bus, 1)
+    finally:
+        await loop.close()
+
+    assert len(framer.calls) == expected_framing_calls
+
+
+@pytest.mark.asyncio
+async def test_ordinary_turn_after_manual_skill_reuses_preserved_blackboard(
+    tmp_path: Path,
+) -> None:
+    snapshot = _planner_skill_snapshot(tmp_path)
+    previous = Blackboard(goal="Preserved goal", completion_boundary="Preserved boundary")
+    framer = _FramingFake(
+        (
+            FramingResult(
+                blackboard=previous,
+                usage_delta={
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                status="resolved",
+            ),
+        )
+    )
+    loop, session, bus = _runtime(
+        tmp_path,
+        _Router((_response("Manual result"), _response("Ordinary result"))),
+        task_framer=framer,
+        skill_snapshot=snapshot,
+    )
+    session.update_metadata(
+        blackboard={
+            "goal": previous.goal,
+            "completion_boundary": previous.completion_boundary,
+        }
+    )
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("/planner do it"))
+        await _terminals(bus, 1)
+        await bus.put_inbound(InboundMessage("ordinary follow-up"))
+        await _terminals(bus, 1)
+    finally:
+        await loop.close()
+
+    assert framer.calls == [(previous, "Manual result", "ordinary follow-up")]
+    assert session.metadata["blackboard"] == {
+        "goal": previous.goal,
+        "completion_boundary": previous.completion_boundary,
+    }
+
+
+@pytest.mark.asyncio
+async def test_manual_skill_context_failure_preserves_blackboard_and_usage(
+    tmp_path: Path,
+) -> None:
+    snapshot = _planner_skill_snapshot(tmp_path)
+    framer = _FramingFake()
+
+    async def fail_context(
+        active_session: Session,
+        current_user: dict[str, Any],
+        blackboard: Blackboard | None,
+        manual_invocation: ManualSkillInvocation | None,
+    ) -> list[dict[str, Any]]:
+        del active_session, current_user
+        assert blackboard is None
+        assert manual_invocation is not None
+        raise ModelCallError(ErrorInfo("model_failed", "context failed"))
+
+    loop, session, bus = _runtime(
+        tmp_path,
+        _Router(()),
+        context_preparer_with_invocation=fail_context,
+        task_framer=framer,
+        skill_snapshot=snapshot,
+    )
+    session.update_metadata(
+        blackboard={
+            "goal": "Preserved goal",
+            "completion_boundary": "Preserved boundary",
+        }
+    )
+    before_metadata = deepcopy(session.metadata)
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("/planner fail"))
+        terminal = (await _terminals(bus, 1))[0]
+    finally:
+        await loop.close()
+
+    assert terminal.metadata["finish_reason"] == "failed"
+    assert framer.calls == []
+    assert session.metadata == before_metadata
+    assert session.messages == []
+
+
+@pytest.mark.asyncio
+async def test_manual_skill_context_cancellation_preserves_blackboard_and_usage(
+    tmp_path: Path,
+) -> None:
+    snapshot = _planner_skill_snapshot(tmp_path)
+    framer = _FramingFake()
+    started = asyncio.Event()
+
+    async def block_context(
+        active_session: Session,
+        current_user: dict[str, Any],
+        blackboard: Blackboard | None,
+        manual_invocation: ManualSkillInvocation | None,
+    ) -> list[dict[str, Any]]:
+        del active_session, current_user
+        assert blackboard is None
+        assert manual_invocation is not None
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    loop, session, bus = _runtime(
+        tmp_path,
+        _Router(()),
+        context_preparer_with_invocation=block_context,
+        task_framer=framer,
+        skill_snapshot=snapshot,
+    )
+    session.update_metadata(
+        blackboard={
+            "goal": "Preserved goal",
+            "completion_boundary": "Preserved boundary",
+        }
+    )
+    before_metadata = deepcopy(session.metadata)
+
+    await loop.start()
+    await bus.put_inbound(InboundMessage("/planner wait"))
+    await started.wait()
+    await loop.cancel_active_run()
+    terminal = (await _terminals(bus, 1))[0]
+    await loop.close()
+
+    assert terminal.metadata == {
+        "finish_reason": "cancelled",
+        "error_code": "turn_cancelled",
+        "_streamed": True,
+    }
+    assert framer.calls == []
+    assert session.metadata == before_metadata
+    assert session.messages == []
 
 
 @pytest.mark.asyncio
@@ -2004,10 +2218,8 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
 
     router = ToolLoopRouter()
     context_calls: list[Blackboard | None] = []
-    projected_blackboard = json.dumps(
-        {"goal": staged.goal, "completion_boundary": staged.completion_boundary},
-        ensure_ascii=False,
-        separators=(",", ":"),
+    projected_blackboard = (
+        f"## Task goal\n\n{staged.goal}\n\n## Completion boundary\n\n{staged.completion_boundary}"
     )
 
     async def prepare(
@@ -2021,7 +2233,7 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
             {"role": "system", "content": "test"},
             {
                 "role": "user",
-                "content": f"{current['content']}\n<blackboard>{projected_blackboard}</blackboard>",
+                "content": f"{current['content']}\n\n{projected_blackboard}",
             },
         ]
 
@@ -2053,10 +2265,7 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
     assert context_calls == [staged]
     assert context_calls[0] is staged
     assert len(router.requests) == 2
-    assert all(
-        request[1]["content"].endswith(f"<blackboard>{projected_blackboard}</blackboard>")
-        for request in router.requests
-    )
+    assert all(request[1]["content"].endswith(projected_blackboard) for request in router.requests)
     assert append_calls == 1
     assert [message["role"] for message in session.messages] == [
         "user",
@@ -2693,6 +2902,7 @@ async def test_default_agent_loop_wiring_reduces_keep_replace_and_clear(
 
     assert terminal.metadata == {"_streamed": True}
     assert len(router.direct_calls) == 1
+    assert len(router.calls) == 1
     route, messages, tools = router.direct_calls[0]
     assert route == "chat"
     assert tools == ()
@@ -2724,3 +2934,48 @@ async def test_default_agent_loop_wiring_reduces_keep_replace_and_clear(
         "output_tokens": 3,
         "total_tokens": 9,
     }
+
+
+@pytest.mark.asyncio
+async def test_default_agent_loop_wiring_skips_router_completion_for_manual_skill(
+    tmp_path: Path,
+) -> None:
+    class DefaultRouter(_Router):
+        def __init__(self) -> None:
+            super().__init__((_response("manual answer"),))
+            self.direct_calls: list[tuple[str, Sequence[dict[str, Any]]]] = []
+
+        async def complete(
+            self,
+            route: Literal["chat", "schedule"],
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[OpenAIToolSchema],
+            continuation: ModelContinuation | None = None,
+        ) -> ModelResponse:
+            del tools, continuation
+            self.direct_calls.append((route, messages))
+            return _response('{"action":"clear","goal":null,"completion_boundary":null}')
+
+    snapshot = _planner_skill_snapshot(tmp_path)
+    router = DefaultRouter()
+    loop, session, bus = _runtime(
+        tmp_path,
+        router,
+        use_default_task_framer=True,
+        skill_snapshot=snapshot,
+    )
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("/planner do it"))
+        terminal = (await _terminals(bus, 1))[0]
+    finally:
+        await loop.close()
+
+    assert terminal.metadata == {"_streamed": True}
+    assert router.direct_calls == []
+    assert len(router.calls) == 1
+    assert [message["content"] for message in session.messages if message["role"] == "user"] == [
+        "/planner do it"
+    ]

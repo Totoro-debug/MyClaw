@@ -432,7 +432,8 @@ async def test_schedule_uses_its_own_complete_context_projection(
     messages, tools = provider.direct_complete_messages[0]
     assert messages[0]["role"] == "system"
     assert str(workspace) in cast(str, messages[0]["content"])
-    assert "The final <blackboard> block" not in cast(str, messages[0]["content"])
+    assert "## Task goal" not in cast(str, messages[0]["content"])
+    assert "## Completion boundary" not in cast(str, messages[0]["content"])
     assert messages[-1]["role"] == "user"
     assert messages[-1] == {
         "role": "user",

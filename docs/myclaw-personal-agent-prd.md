@@ -13,7 +13,7 @@
 - 用户运行 `myclaw` 进入长驻前台 Terminal Conversation；非-TTY 启动以 `interactive_terminal_required` 拒绝，不回退到 headless prompt。
 - 每个有效 Terminal Conversation 启动准备一个新的 Workspace-scoped Conversation Session；未发送用户消息就退出时不持久化空 session。
 - CLI 是 Runtime Lifetime 的唯一 composition root；Agent Loop 通过 Message Bus、Management Port、Model Route、Tool Gateway 和 memory/session 存储边界承担当前 Session 的 Runtime Generation。
-- 每个非空普通前台输入在 Agent Run 前经过隔离的 Task Framing，用一个隐藏 Blackboard 明确当前任务目标与完成边界。
+- 每个非空且不是 Manual Skill Invocation 的普通前台输入在 Agent Run 前经过隔离的 Task Framing，用一个隐藏 Blackboard 明确当前任务目标与完成边界；手动 Skill 轮完全不使用且不改变 Blackboard。
 - Agent Home 固定为 `~/.myclaw/`，采用 file-first persistence。
 - Terminal Conversation 支持 streaming、前台 Agent Run 期间的 Inbound FIFO 排队、后台 Dream、Schedule Jobs、Session resume 和管理 slash commands；Schedule actions 不请求 Tool Confirmation；Exec、Web、resolved escape 和其他 Workspace 外部路径按具体目标执行一次性确认，只有 `read_file` 对 canonical Agent Home Skill root 无需 Tool Confirmation。
 - 首版非交互管理只支持 `myclaw config`，不支持 one-shot 对话。
@@ -31,11 +31,11 @@
   `_stream_end`、`_streamed` 三种 sparse marker；它只有一个 Terminal consumer，Tool
   result、Schedule output、Dream output 永不进入 Outbound。Message Bus 没有独立
   close、abort、replay、broadcast、version 或 backpressure lifecycle。
-- 每个非空普通 foreground input 使用 `chat` Model Route 做一次无 Tools、无 continuation
+- 每个非空且不是 Manual Skill Invocation 的普通 foreground input 使用 `chat` Model Route 做一次无 Tools、无 continuation
   的 Task Framing completion。输入只包含上一个 Blackboard、最新 assistant content
   和当前 raw user input；结果 keep、replace 或 clear 由 `goal` 与
   `completion_boundary` 组成的唯一 Blackboard。暂存结果只投影到当前
-  model-visible user message 末尾，persisted user message 保持 raw input。
+  model-visible user message 末尾的 `## Task goal` 与 `## Completion boundary` Markdown sections，persisted user message 保持 raw input。Manual Skill Invocation 的 Task Framing call、Blackboard projection 和 Task Framing usage 均为 `0`，已有 `metadata.blackboard` 不更新也不删除。
 - Agent Runner 的 constructor 只拥有 Model Router；`AgentRunner.run()` 是所有需要有限
   model/Tool ReAct 的请求的唯一执行入口，当前由 foreground `chat`、User Schedule Job
   `schedule` 和 Dream `memory` 三条 lane 调用。只需一次 completion 且不进入 ReAct 的
@@ -48,6 +48,7 @@
   `MyClaw 已取消本轮对话。` 均由 runtime contracts 定义。Provider-visible
   reasoning 只保留 Provider 返回内容；opaque continuation 只在同一 Tool loop 内传递，
   不进入 Session 或 Outbound。
+- TaskFramer 与 Agent Runner 接收传给同一 Agent Loop 的同一个 Model Router 对象；CLI composition root 继续独占 Router 构造、Runtime Lifetime ownership 与最终 close。
 - Schedule Service 创建并独占 Store；CLI 向它提供 User Job 和 Dream 两条稳定 executor。
   User executor 每次解引用当前 Agent Loop，并与 foreground 共享该 generation 的 Gateway/Runner
   identity，但使用独立 Schedule Session、context、cancel 和 externalizer state；Dream executor
@@ -130,7 +131,7 @@
 - 每个 Terminal Conversation invocation 创建一个独立 Runtime Lifetime；它在任一时刻拥有
   一个 active Runtime Generation，并可在成功切换 Conversation Session 时替换该 generation。
 - 用户消息进入前台队列并串行执行；Dream 和 Schedule Jobs 在同一 runtime 内异步运行。
-- 每个非空普通前台输入在 Agent Run 前做 Task Framing；Management Command、Schedule 和 Dream 路径不做任务框定。
+- 每个非空且不是 Manual Skill Invocation 的普通前台输入在 Agent Run 前做 Task Framing；Manual Skill Invocation、Management Command、Schedule 和 Dream 路径不做任务框定。
 - Blackboard 只解释当前任务，不分解子任务、不控制 Agent Runner、不授权 Tool，且没有命令、Tool、event 或 UI 表面。
 - Ctrl+C 只取消当前前台 turn。
 - 输入 `exit` 或 `quit`（忽略前后空白、大小写不敏感）退出 Terminal Conversation 并立即取消后台任务。
@@ -192,13 +193,14 @@
 
 ### Task Framing and Blackboard
 
-- 每个非空普通 foreground user input 在 Conversation Summary 与主 Agent Runner 之前做一次隔离 Task Framing；Management Command、Schedule Job 和 Dream 不进入该路径。
+- 每个非空且不是 Manual Skill Invocation 的普通 foreground user input 在 Conversation Summary 与主 Agent Runner 之前做一次隔离 Task Framing；Manual Skill Invocation、Management Command、Schedule Job 和 Dream 不进入该路径。
 - Task Framing 只读取上一个 Blackboard、Session 中最新 assistant message 的完整 content 和当前 raw input，不接收全部历史、Long-term Memory 或 Tools。
 - strict decision 只能 keep、replace 或 clear；Blackboard 恰好包含经过 trim 的非空 `goal` 与 `completion_boundary`，不设字符数上限。
-- staged Blackboard 只附加在当前 model-visible user message 最后一个 Runtime-owned `<blackboard>` block 中；persisted user message 始终是 raw input。
+- staged Blackboard 只附加在当前 model-visible user message 末尾的 `## Task goal` 与 `## Completion boundary` Markdown sections 中；两个值逐字符保留，persisted user message 始终是 raw input。Foreground System Prompt 不包含 Blackboard guidance。
 - Blackboard 只提供任务解释，不是任务列表、计划、workflow state 或 Tool 授权边界。
 - completed Task Framing 的 usage 与 staged Blackboard 只随已接受的主 Agent Run increment 一起 commit。正常 failed、cancelled 或 max-iterations Runner result 仍有已接受 increment；主运行准备失败或取消保留旧 Blackboard。
 - invalid framing response 和 framing model failure 都降级为无 Blackboard 的 raw input；若主 increment 随后 commit，当前 Blackboard 被清除。
+- Manual Skill Invocation 不 decode 旧 Blackboard、不读取 latest assistant content 用于 framing、不投影 Blackboard，也不提交 framing usage 或 Blackboard mutation；已有 `metadata.blackboard` 对该轮保持逐值不变。
 
 ### Memory system
 
@@ -316,6 +318,8 @@
 - framing retry、default fallback、model failure、invalid response、cancellation 和 Runtime replacement。
 - staged Blackboard 在 Summary/context 重建中保持同一值，只投影到当前 model input，不改变 persisted raw user message。
 - accepted Runner result 的 Blackboard/usage atomic commit，以及 preparation failure/cancellation 的旧状态保留。
+- Manual Skill Invocation 的 Task Framing call、Blackboard projection 和 Task Framing usage 精确为 `0`，且已有 `metadata.blackboard` mutation 为 no-op；随后普通轮恢复正常 framing。
+- TaskFramer、AgentRunner 与 AgentLoop 保存的 Model Router 对象身份相同，且 replacement/close 不接管 Router lifecycle。
 - Management、Schedule 和 Dream 路径零 Task Framing call，Blackboard 不影响 Tool Confirmation 或授权。
 
 ### Required memory tests

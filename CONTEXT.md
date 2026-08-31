@@ -77,7 +77,7 @@ A hidden task definition attached to a Conversation Session and its foreground A
 _Avoid_: Task list, plan, workflow state, progress tracker
 
 **Task Framing**:
-The interpretation of a new ordinary user input against the current Blackboard and latest assistant response to keep, replace, or clear the current task definition.
+The interpretation of an eligible new foreground user input against the current Blackboard and latest assistant response to keep, replace, or clear the current task definition. It is mutually exclusive with a Manual Skill Invocation in the same Agent Run.
 _Avoid_: Task decomposition, planning, orchestration, progress update
 
 **Runtime Context**:
@@ -103,6 +103,10 @@ _Avoid_: live Skill directory, Tool Catalog, Runtime Lifetime cache
 **Skill Invocation**:
 The selection and application of one Skill's instructions to a foreground Agent Run, initiated explicitly by the user or autonomously by the model.
 _Avoid_: Management Command, Tool capability, Skill discovery
+
+**Manual Skill Invocation**:
+A Skill Invocation initiated explicitly when the user names an available Skill in the foreground input.
+_Avoid_: Autonomous Skill Invocation, always-loaded Skill, Management Command
 
 **Conversation Session**:
 A durable conversational thread owned by one Workspace and represented by one active in-memory Session authority during foreground execution.

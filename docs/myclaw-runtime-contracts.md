@@ -66,7 +66,7 @@
 | D14 | BaseTool 在成功结果超过 `4096` 字符时写入 `.myclaw/artifacts/<session>/<id>.txt` | 限制模型上下文同时保留完整结果 |
 | D15 | 配置、持久化、模型与服务错误使用稳定 code；Tool Error/Result 使用安全扁平 message | 上层逻辑不依赖易变终端文案 |
 | D16 | Exec 不提供 OS 级文件系统、网络或进程隔离 | cwd 和字符串检查不能制造虚假 sandbox 保证 |
-| D17 | 每个非空普通前台输入在 Agent Run 前做 Task Framing，Blackboard 与 usage 只随已接受 increment 提交 | 在跨输入保留一个明确任务边界，不引入计划或执行控制产品 |
+| D17 | 每个非空且不是 Manual Skill Invocation 的普通前台输入在 Agent Run 前做 Task Framing，Blackboard 与 usage 只随已接受 increment 提交；手动 Skill 轮为 metadata no-op | 在跨输入保留一个明确任务边界，不引入计划或执行控制产品 |
 | D18 | CLI 是唯一 Runtime composition root；一个 Session-scoped Agent Loop 承担一个 Runtime Generation | 让创建位置、生命周期与真实 ownership 一致，不保留代理所有组件的 Runtime 聚合层 |
 
 D01-D18 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Framing 边界由本文后续章节与对应 ADR 定义。
@@ -464,6 +464,8 @@ Foreground chat 在上述共有部分之后按当前 Runtime Generation Skill Sn
 
 Foreground 的 metadata projection 与最终 chat request 使用同一 Catalog block；这不改变 Conversation Summary provider 的独立 prompt，后者仍接收 `0` 个 Skill metadata 或 body。
 
+Foreground System Prompt 不包含 Blackboard guidance。Blackboard 只通过合格普通 foreground turn 的 current user message 投影，Tool schema、Permission Policy、Tool Confirmation 与 Tool Gateway 继续作为代码级权威边界。
+
 手动 Skill invocation 是独立的 foreground projection path：只有 raw input 在字符 `0` 以 `/` 开始、且第一个
 Unicode whitespace 之前的 token 与 Catalog 中的 Skill name 完全一致（区分大小写）时才匹配。无 delimiter
 时 request 为空；匹配 delimiter 只移除一个，其后的空格、换行和其它字符逐字保留。匹配后 Agent Loop
@@ -485,9 +487,13 @@ session_id: <session_id>
 <raw user content>
 </user_input>
 
-<blackboard>
-{"goal":"Inspect the project","completion_boundary":"Report the findings"}
-</blackboard>
+## Task goal
+
+Inspect the project
+
+## Completion boundary
+
+Report the findings
 ```
 
 成功的手动 invocation 不把 raw slash input 放进 model-visible current user，而是使用一个独立的
@@ -501,15 +507,15 @@ projection 不会去重、覆盖或额外修改该既有 block。
 - session JSONL 只保存 raw user content，不保存上述 wrapper。
 - 历史 user messages 不重复添加新的 Runtime Context。
 - Workspace 已在 identity prompt 中，不在每轮 wrapper 重复。
-- `<blackboard>` 只在 staged Blackboard 存在时追加，且必须是当前 user message 最后一个 Runtime-owned block。User raw content 中的相同 markup 不作为 Blackboard。
-- Foreground system prompt 明确 Blackboard 只是目标/完成边界解释，不能授权文件、网络、Exec 或任何 Tool 操作。
+- staged Blackboard 存在时，current user message 末尾只追加 `## Task goal` 与 `## Completion boundary` 两个 Markdown section；字段值在既有 outer-whitespace trim 后逐字符插入，不做 Markdown escaping 或内部归一化。
+- 成功的 Manual Skill Invocation 不投影 Blackboard；已持久化 Blackboard 对该轮不可见且保持原样。
 - User Schedule Job 不额外注入旧任务 ID 字段；Dream 使用专门 prompt，不伪装成 chat user input。
 
 ### 8.3 专用 prompts
 
 - Session title：只接收规范化后的首条 user content，不注入 Long-term Memory、tools 或 conversation history。
 - Task Framing：只接收 previous Blackboard、latest assistant content 和 current raw user input 组成的 compact JSON，使用独立 system prompt 且 `tools=()`。
-- Manual Skill invocation：Title 与 Task Framing 继续接收 current raw slash input；只有最终 foreground context 接收 typed invocation。手动 body 与 extracted request 在同一个 current `user` message 的不同 JSON-delimited blocks 中各出现一次，不能写入 Session、Blackboard 或 System Prompt；unknown/non-matching slash input 继续 ordinary foreground input。
+- Manual Skill invocation：Title 仍可接收 current raw slash input；Task Framing call count、Blackboard projection 与 Task Framing usage 均为 `0`。只有最终 foreground context 接收 typed invocation。手动 body 与 extracted request 在同一个 current `user` message 的不同 JSON-delimited blocks 中各出现一次，不能写入 Session、Blackboard 或 System Prompt；已有 `metadata.blackboard` 不更新也不删除，unknown/non-matching slash input 继续 ordinary foreground input。
 - Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory、Tool Catalog、Skill metadata 或 Skill body。
 - Dream：接收 Summary Cursor 后的 batch 和四分区维护规则，并只暴露 restricted memory tools。
 - User Schedule Job：使用共有 chat/schedule system composition，把 Job message 作为 Schedule Session 的普通 user message，不接收 Skill metadata。Dream System Job 只触发 Dream，不生成该 prompt。Session title、Task Framing 和 Dream 同样不接收 Skill metadata。
@@ -669,7 +675,7 @@ backpressure lifecycle；Tool result 永不进入 Outbound。
 
 ### 10.2 Task Framing and Blackboard
 
-`AgentLoop` 在每个非空普通 foreground `InboundMessage` 的主 Agent Run 准备前调用一次 `TaskFramingEvaluator`。Management Command、User Schedule execution、Conversation Summary 模型调用和 Dream 不自行做 Task Framing；Conversation Summary/context preparation 使用该轮已 staged 的同一 Blackboard。
+`AgentLoop` 在每个非空且不是 Manual Skill Invocation 的普通 foreground `InboundMessage` 主 Agent Run 准备前调用一次 `TaskFramingEvaluator`。Manual Skill Invocation、Management Command、User Schedule execution、Conversation Summary 模型调用和 Dream 不自行做 Task Framing；Conversation Summary/context preparation 使用合格普通轮已 staged 的同一 Blackboard。
 
 最小值与接口形状：
 
@@ -695,7 +701,7 @@ class TaskFramingEvaluator(Protocol):
     ) -> FramingResult: ...
 ```
 
-Task Framing 使用 `ModelRouter.complete("chat", ..., tools=())`，因此复用 chat route 的总共五次 attempt budget、retry、default fallback 与 cancellation，但不传 Tools 或 continuation。模型只接收 previous Blackboard、Session 中最新 assistant message 的完整 content 和 current raw user input 组成的 compact JSON。
+Task Framing 使用 `ModelRouter.complete("chat", ..., tools=())`，因此复用 chat route 的总共五次 attempt budget、retry、default fallback 与 cancellation，但不传 Tools 或 continuation。`TaskFramer` 与 `AgentRunner` 接收并保存传给同一 `AgentLoop` 的同一个 Model Router 对象；Router 的构造、Runtime Lifetime ownership 与最终 close 仍只属于 CLI composition root。模型只接收 previous Blackboard、Session 中最新 assistant message 的完整 content 和 current raw user input 组成的 compact JSON。
 
 返回 decision 只能是：
 
@@ -705,9 +711,21 @@ Task Framing 使用 `ModelRouter.complete("chat", ..., tools=())`，因此复用
 
 解析器按顺序接受完整 raw JSON、一个 Markdown fenced JSON，或外层 prose 中的第一个平衡 JSON object；多个/破损 fence、多余字段、错误类型或违反 action invariant 都是 `invalid_response`。`resolved` 必须有四字段 usage，Blackboard 可为 `None`；`invalid_response` 必须有 usage 且 Blackboard 为 `None`；`model_failed` 的 Blackboard 和 usage 都为 `None`。
 
-resolved Blackboard 被 staged 给当前 foreground Agent Run。Model-visible current user message 保留 raw input 并在末尾追加一个 compact `<blackboard>` block；Session user message 只保存 raw input。Blackboard 不进入 Outbound，不允许 Tool 读写，也不能改变 Tool Confirmation 或其他安全判断。
+resolved Blackboard 被 staged 给当前 foreground Agent Run。Model-visible current user message 保留 raw input，并在末尾按以下逐字符模板追加 Markdown；Session user message 只保存 raw input。Blackboard 不进入 Outbound，不允许 Tool 读写，也不能改变 Tool Confirmation 或其他安全判断。
+
+```markdown
+## Task goal
+
+{task_goal}
+
+## Completion boundary
+
+{completion_boundary}
+```
 
 Agent Loop 只通过一次 `Session.append_messages()` 把主 Runner increment、Task Framing usage 和 `metadata.blackboard` update/removal 一起提交。正常 `failed`、`cancelled` 和 `max_iterations` 结果含有已接受且修复后的 increment，因此仍提交 staged state。Context/Summary/Runner 准备失败或取消保留 previous Blackboard；`invalid_response` 或 `model_failed` 在主 increment 成功提交时清除当前 Blackboard。
+
+Manual Skill Invocation 与以上 framing/commit 分支互斥：该轮不 decode previous Blackboard、不读取 latest assistant content 用于 Task Framing、不调用 evaluator，也不向 Context、Summary budget 或 Runner 投影 Blackboard；Task Framing usage 为 `None`，`metadata.blackboard` update/removal 均为 no-op。下一次合格普通输入才重新读取并评估此前保存的值。
 
 ### 10.3 AgentRunner
 

@@ -751,7 +751,9 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
 
     assert projected_calls
     assert any(
-        "<blackboard>" in str(message.get("content"))
+        f"## Task goal\n\n{blackboard.goal}" in str(message.get("content"))
+        and f"## Completion boundary\n\n{blackboard.completion_boundary}"
+        in str(message.get("content"))
         for projection in projected_calls
         for message in projection
         if message["role"] == "user"
@@ -759,7 +761,8 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
     summary_request = provider.complete_requests[0]
     summary_input = summary_request.messages[1]["content"]
     assert isinstance(summary_input, str)
-    assert "<blackboard>" not in summary_input
+    assert "## Task goal" not in summary_input
+    assert "## Completion boundary" not in summary_input
     assert blackboard.goal not in summary_input
     assert blackboard.completion_boundary not in summary_input
     assert all("blackboard" not in message for message in session.messages)

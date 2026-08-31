@@ -924,30 +924,35 @@ class AgentLoop:
         if not inbound.content.strip():
             return False
 
-        previous_blackboard = decode_blackboard(active_session.metadata.get("blackboard"))
-        last_assistant_content = _latest_assistant_content(active_session)
-        try:
-            framing_result = await self._task_framer.frame(
-                previous=previous_blackboard,
-                last_assistant_content=last_assistant_content,
-                current_user_input=inbound.content,
-            )
-            if not isinstance(framing_result, FramingResult):
-                raise TypeError("Task Framing evaluator returned an invalid result")
-        except asyncio.CancelledError:
-            if not self._cancel_requested:
-                raise
-            await self._publish_preparation_failure(
-                ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
-            )
-            return False
+        if manual_invocation is None:
+            previous_blackboard = decode_blackboard(active_session.metadata.get("blackboard"))
+            last_assistant_content = _latest_assistant_content(active_session)
+            try:
+                framing_result = await self._task_framer.frame(
+                    previous=previous_blackboard,
+                    last_assistant_content=last_assistant_content,
+                    current_user_input=inbound.content,
+                )
+                if not isinstance(framing_result, FramingResult):
+                    raise TypeError("Task Framing evaluator returned an invalid result")
+            except asyncio.CancelledError:
+                if not self._cancel_requested:
+                    raise
+                await self._publish_preparation_failure(
+                    ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
+                )
+                return False
 
-        if framing_result.status != "resolved":
-            _runtime_logger().warning(
-                "Task Framing degraded status={}",
-                framing_result.status,
-            )
-        staged_blackboard = framing_result.blackboard
+            if framing_result.status != "resolved":
+                _runtime_logger().warning(
+                    "Task Framing degraded status={}",
+                    framing_result.status,
+                )
+            staged_blackboard = framing_result.blackboard
+            framing_usage = framing_result.usage_delta
+        else:
+            staged_blackboard = None
+            framing_usage = None
         try:
             initial_messages = await self._prepare_foreground_context(
                 active_session,
@@ -996,9 +1001,13 @@ class AgentLoop:
         if self._aborted:
             return False
 
-        if staged_blackboard is None:
+        metadata_removals: tuple[str, ...]
+        if manual_invocation is not None:
             metadata_updates = None
-            metadata_removals: tuple[str, ...] = ("blackboard",)
+            metadata_removals = ()
+        elif staged_blackboard is None:
+            metadata_updates = None
+            metadata_removals = ("blackboard",)
         else:
             encoded_blackboard = encode_blackboard(staged_blackboard)
             assert encoded_blackboard is not None
@@ -1013,7 +1022,7 @@ class AgentLoop:
                     [deepcopy(current_user), *deepcopy(result.messages)],
                     metadata_updates=metadata_updates,
                     metadata_removals=metadata_removals,
-                    usage_delta=framing_result.usage_delta,
+                    usage_delta=framing_usage,
                 )
             except Exception as failure:
                 _runtime_logger().opt(exception=failure).error(
