@@ -383,7 +383,11 @@ _INLINE_MARKDOWN_LINK = re.compile(
 _REFERENCE_MARKDOWN_LINK = re.compile(r"(?m)^\s*\[[^\]\n]+\]:\s*(?P<target><[^>\n]+>|\S+)")
 _EXPECTED_REMOVED_MARKDOWN_PATHS = frozenset(
     {
+        ROOT / "myclaw" / "templates" / "blackboard.md",
+        ROOT / "myclaw" / "templates" / "current-user-input.md",
         ROOT / "myclaw" / "templates" / "memory-task-input.md",
+        ROOT / "myclaw" / "templates" / "runtime-context.md",
+        ROOT / "myclaw" / "templates" / "user-input.md",
     }
 )
 

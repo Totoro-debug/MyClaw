@@ -11,8 +11,9 @@ from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
 from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
 
-_SKILL_METADATA_TRANSLATION: dict[int, str] = {
+_MARKDOWN_SAFE_JSON_TRANSLATION: dict[int, str] = {
     ord("&"): r"\u0026",
+    ord("`"): r"\u0060",
     ord("<"): r"\u003c",
     ord(">"): r"\u003e",
 }
@@ -28,37 +29,40 @@ def current_user_input(
 ) -> str:
     """Wrap one current user projection and optionally append Runtime-owned blocks."""
     if manual_invocation is None:
-        rendered = render_template(
-            "current-user-input.md",
-            runtime_context=runtime_context(current_time=current_time, session_id=session_id),
-            user_input=render_template("user-input.md", content=content),
+        rendered = (
+            f"{runtime_context(current_time=current_time, session_id=session_id)}\n\n"
+            "## User Input\n\n"
+            f"{content}"
         )
     else:
         rendered = (
             f"{runtime_context(current_time=current_time, session_id=session_id)}\n\n"
-            "<skill_instructions>\n"
+            "## Skill Instructions\n\n"
+            "```json\n"
             f"{_skill_manual_json(manual_invocation)}\n"
-            "</skill_instructions>\n\n"
-            "<user_request>\n"
+            "```\n\n"
+            "## User Request\n\n"
+            "```json\n"
             f"{_skill_request_json(manual_invocation.request)}\n"
-            "</user_request>"
+            "```"
         )
     if blackboard_projection is None:
         return rendered
-    blackboard = render_template(
-        "blackboard.md",
-        task_goal=blackboard_projection["goal"],
-        completion_boundary=blackboard_projection["completion_boundary"],
+    blackboard = (
+        "## Task goal\n\n"
+        f"{blackboard_projection['goal']}\n\n"
+        "## Completion boundary\n\n"
+        f"{blackboard_projection['completion_boundary']}"
     )
     return f"{rendered}\n\n{blackboard}"
 
 
 def runtime_context(*, current_time: datetime, session_id: str) -> str:
     """Render the per-turn metadata included in the next model request."""
-    return render_template(
-        "runtime-context.md",
-        current_time=format_rfc3339_milliseconds(current_time),
-        session_id=session_id,
+    return (
+        "## Runtime Context\n\n"
+        f"- Current time: {format_rfc3339_milliseconds(current_time)}\n"
+        f"- Session ID: {session_id}"
     )
 
 
@@ -136,7 +140,7 @@ def _skill_metadata_json(*, name: str, description: str, path: str) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
-    return serialized.translate(_SKILL_METADATA_TRANSLATION)
+    return serialized.translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
 
 
 def _skill_always_json(*, name: str, body: str) -> str:
@@ -146,7 +150,7 @@ def _skill_always_json(*, name: str, body: str) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
-    return serialized.translate(_SKILL_METADATA_TRANSLATION)
+    return serialized.translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
 
 
 def _skill_manual_json(invocation: ManualSkillInvocation) -> str:
@@ -156,13 +160,13 @@ def _skill_manual_json(invocation: ManualSkillInvocation) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
-    return serialized.translate(_SKILL_METADATA_TRANSLATION)
+    return serialized.translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
 
 
 def _skill_request_json(request: str) -> str:
     return json.dumps(
         request, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-    ).translate(_SKILL_METADATA_TRANSLATION)
+    ).translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
 
 
 def session_title_prompt() -> str:

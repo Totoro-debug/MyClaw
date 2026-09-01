@@ -27,10 +27,7 @@ from myclaw.agent.message_bus import (
     OutboundMessageType,
 )
 from myclaw.agent.prompts import (
-    chat_system_prompt,
     current_user_input,
-    foreground_chat_system_prompt,
-    session_title_prompt,
 )
 from myclaw.agent.runner import (
     AgentRunner,
@@ -261,7 +258,7 @@ class AgentLoop:
             workspace_path,
             schedule_service.context_timezone_name() or get_localzone_name(),
             agent_home=agent_home.path,
-            clock=now,
+            memory_manager=memory_manager,
             skill_loader=skill_loader,
         )
         tool_gateway = ToolGateway(
@@ -280,7 +277,6 @@ class AgentLoop:
             now=now,
             project_messages=self._project_foreground_summary_messages,
         )
-        title_prompt: str | None = session_title_prompt()
         active_session = (
             Session.create(workspace_state, now=now, new_uuid=new_uuid)
             if session_id is None
@@ -306,7 +302,6 @@ class AgentLoop:
         self._now = now
         self._monotonic_now = monotonic_now
         self._schedule_now = schedule_service.current_time
-        self._title_prompt = title_prompt
         self._tool_gateway = tool_gateway
         self._model_router = model_router
         self._memory_manager = memory_manager
@@ -440,7 +435,6 @@ class AgentLoop:
                 context_builder=self._context_builder,
                 history=(),
                 session_id=self._session.session_id,
-                long_term_memory=self._memory_manager.memory_snapshot(),
                 tool_schemas=self.tool_schemas,
             )
             available_input = chat_route.context_window - chat_route.max_output
@@ -1055,12 +1049,7 @@ class AgentLoop:
         manual_invocation: ManualSkillInvocation | None = None,
     ) -> list[dict[str, Any]]:
         memory_snapshot = self._memory_manager.memory_snapshot()
-        current_system_prompt = foreground_chat_system_prompt(
-            workspace=self._workspace_path,
-            agent_home=self._agent_home.path,
-            long_term_memory=memory_snapshot,
-            skill_loader=self._skill_loader,
-        )
+        current_system_prompt = self._context_builder.foreground_system_prompt()
         route = self._configuration.resolve_route("chat").route
 
         def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1101,12 +1090,7 @@ class AgentLoop:
         active_session: Session,
         current_user: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        memory_snapshot = self._memory_manager.memory_snapshot()
-        current_system_prompt = chat_system_prompt(
-            workspace=self._workspace_path,
-            agent_home=self._agent_home.path,
-            long_term_memory=memory_snapshot,
-        )
+        current_system_prompt = self._context_builder.schedule_system_prompt()
         route = self._configuration.resolve_route("schedule").route
 
         def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1143,12 +1127,7 @@ class AgentLoop:
         messages: Sequence[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         memory_snapshot = self._memory_manager.memory_snapshot()
-        system_prompt = foreground_chat_system_prompt(
-            workspace=self._workspace_path,
-            agent_home=self._agent_home.path,
-            long_term_memory=memory_snapshot,
-            skill_loader=self._skill_loader,
-        )
+        system_prompt = self._context_builder.foreground_system_prompt()
         if _last_user_index(messages) == len(messages):
             return _project_without_current_user(messages, system_prompt=system_prompt)
         return _project_foreground_messages(
@@ -1180,7 +1159,6 @@ class AgentLoop:
             context_builder=self._context_builder,
             history=messages[last_consolidated:],
             session_id=session_id,
-            long_term_memory=self._memory_manager.memory_snapshot(),
             tool_schemas=self.tool_schemas,
             session_title=title,
             session_message_count=len(messages),
@@ -1365,7 +1343,6 @@ class AgentLoop:
         if (
             self._closing
             or self._aborted
-            or self._title_prompt is None
             or not content.strip()
             or session.metadata.get("title") != "Untitled session"
             or session.session_id in self._title_work
@@ -1468,12 +1445,12 @@ class AgentLoop:
         return title, usage_delta
 
     def _router_stream_title(self, content: str) -> Any:
+        messages = self._context_builder.build_title_messages(
+            Session._normalize_title(content)
+        )
         return self._model_router.stream(
             "chat",
-            messages=[
-                {"role": "system", "content": self._title_prompt or ""},
-                {"role": "user", "content": Session._normalize_title(content)},
-            ],
+            messages=messages,
             tools=(),
             continuation=None,
         )
@@ -1525,7 +1502,6 @@ def _foreground_runtime_status_input(
     context_builder: ContextBuilder,
     history: Sequence[dict[str, Any]],
     session_id: str,
-    long_term_memory: str,
     tool_schemas: tuple[OpenAIToolSchema, ...],
     session_title: str = "",
     session_message_count: int = 0,
@@ -1536,12 +1512,7 @@ def _foreground_runtime_status_input(
     generation_started_at: float | None = None,
 ) -> RuntimeStatusInput:
     """Project and serialize a minimum foreground request for status and preflight."""
-    projected = context_builder.build_messages(
-        history=history,
-        current_user={"role": "user", "content": ""},
-        session_id=session_id,
-        long_term_memory=long_term_memory,
-    )
+    projected = context_builder.build_status_messages(history, session_id=session_id)
     projected_system = projected[0].get("content")
     if not isinstance(projected_system, str):
         raise TypeError("Context Builder status system message is malformed")

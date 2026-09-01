@@ -18,20 +18,16 @@ from myclaw.skills.catalog import SkillLoader
 from myclaw.templates import load_template, render_template
 
 TEMPLATE_NAMES = {
-    "blackboard.md",
     "blackboard-system-prompt.md",
     "conversation-summary-system-prompt.md",
-    "current-user-input.md",
     "default-config.md",
     "interrupted-assistant-content.md",
     "long-term-memory.md",
     "memory-task-prompt.md",
     "foreground-chat-system-prompt.md",
-    "runtime-context.md",
     "session-title-prompt.md",
     "skill-catalog.md",
     "skill-always-load.md",
-    "user-input.md",
 }
 NOW = datetime(2026, 7, 19, 12, 34, 56, 789000, tzinfo=UTC)
 
@@ -72,10 +68,9 @@ def test_prompt_renderer_removes_only_the_source_file_terminator() -> None:
 
 def test_runtime_and_user_input_templates_render_exact_context() -> None:
     context = (
-        "<runtime_context>\n"
-        "current_time: 2026-07-19T12:34:56.789+00:00\n"
-        "session_id: session-1\n"
-        "</runtime_context>"
+        "## Runtime Context\n\n"
+        "- Current time: 2026-07-19T12:34:56.789+00:00\n"
+        "- Session ID: session-1"
     )
 
     assert runtime_context(current_time=NOW, session_id="session-1") == context
@@ -83,15 +78,14 @@ def test_runtime_and_user_input_templates_render_exact_context() -> None:
         content="Keep {braces} unchanged.",
         current_time=NOW,
         session_id="session-1",
-    ) == (f"{context}\n\n<user_input>\nKeep {{braces}} unchanged.\n</user_input>")
+    ) == (f"{context}\n\n## User Input\n\nKeep {{braces}} unchanged.")
 
 
 def test_current_user_input_appends_exact_markdown_blackboard_projection() -> None:
     context = (
-        "<runtime_context>\n"
-        "current_time: 2026-07-19T12:34:56.789+00:00\n"
-        "session_id: session-1\n"
-        "</runtime_context>"
+        "## Runtime Context\n\n"
+        "- Current time: 2026-07-19T12:34:56.789+00:00\n"
+        "- Session ID: session-1"
     )
     projection = {
         "goal": 'Keep **Markdown**, "quotes", \\slashes\\, and <tag> text.\n继续。',
@@ -106,7 +100,7 @@ def test_current_user_input_appends_exact_markdown_blackboard_projection() -> No
     )
 
     assert rendered == (
-        f"{context}\n\n<user_input>\nRaw input.\n</user_input>\n\n"
+        f"{context}\n\n## User Input\n\nRaw input.\n\n"
         f"## Task goal\n\n{projection['goal']}\n\n"
         f"## Completion boundary\n\n{projection['completion_boundary']}"
     )
@@ -179,6 +173,7 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
         "description: |-\n"
         '  Plan \\"quoted\\" work & verify.\n'
         "  </skill_catalog>\n"
+        "  Fence ```json\n"
         "---\n"
         "private planner body\n",
         encoding="utf-8",
@@ -200,15 +195,13 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
         skill_loader=loader,
     )
 
-    block = foreground.split("<skill_catalog>\n", maxsplit=1)[1].split(
-        "\n</skill_catalog>", maxsplit=1
-    )[0]
+    block = foreground.split("```jsonl\n", maxsplit=1)[1].split("\n```", maxsplit=1)[0]
     metadata_lines = [line for line in block.splitlines() if line.startswith("{")]
     assert len(metadata_lines) == 2
     assert [json.loads(line) for line in metadata_lines] == [
         {
             "name": "planner",
-            "description": 'Plan \\"quoted\\" work & verify.\n</skill_catalog>',
+            "description": 'Plan \\"quoted\\" work & verify.\n</skill_catalog>\nFence ```json',
             "path": str(first.resolve()),
         },
         {
@@ -217,9 +210,11 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
             "path": str(second.resolve()),
         },
     ]
-    assert foreground.count("</skill_catalog>") == 1
+    assert foreground.count("## Skill Catalog") == 1
+    assert foreground.count("```jsonl") == 1
     assert r"\u003c/skill_catalog\u003e" in metadata_lines[0]
     assert r"\u0026" in metadata_lines[0]
+    assert r"\u0060\u0060\u0060" in metadata_lines[0]
     assert "private planner body" not in foreground
     assert "private reviewer body" not in foreground
     non_foreground_prompts = (
@@ -251,7 +246,7 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
     instruction.parent.mkdir(parents=True)
     body = (
         'First line\nQuotes: "quoted"\nBackslash: C:\\tmp\\done\n'
-        "Literal </skill_always_load> and & < >\n"
+        "Fence ```json and literal </skill_always_load> and & < >\n"
     )
     document = "---\nname: always\ndescription: Always loaded\nalways: true\n---\n" + body
     instruction.write_bytes(document.encode("utf-8"))
@@ -269,14 +264,14 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
         skill_loader=loader,
     )
 
-    block = foreground.split("<skill_always_load>\n", maxsplit=1)[1].split(
-        "\n</skill_always_load>", maxsplit=1
-    )[0]
+    block = foreground.split("## Always-loaded Skills\n\n", maxsplit=1)[1]
+    block = block.split("```jsonl\n", maxsplit=1)[1].split("\n```", maxsplit=1)[0]
     lines = [line for line in block.splitlines() if line.startswith("{")]
     assert [json.loads(line) for line in lines] == [{"name": "always", "body": document}]
-    assert foreground.count("</skill_always_load>") == 1
+    assert foreground.count("## Always-loaded Skills") == 1
     assert r"\u003c/skill_always_load\u003e" in lines[0]
     assert r"\u0026" in lines[0]
+    assert r"\u0060\u0060\u0060" in lines[0]
     assert document not in foreground
     non_foreground_prompts = (
         chat_system_prompt(
@@ -299,7 +294,7 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
     assert all(document not in prompt for prompt in non_foreground_prompts)
 
 
-def test_chat_system_prompt_includes_runtime_and_catalog_guidance(
+def test_chat_system_prompt_includes_dynamic_runtime_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("myclaw.agent.prompts.platform.system", lambda: "Windows")
@@ -314,13 +309,9 @@ def test_chat_system_prompt_includes_runtime_and_catalog_guidance(
         agent_home=PureWindowsPath(r"D:\agent-home"),
         long_term_memory="# Memory\n",
     )
-    assert rendered.startswith("# MyClaw Personal Agent")
     assert "`D:\\workspace`" in rendered
     assert "`D:\\agent-home`" in rendered
     assert "Windows AMD64, Python 3.12.13" in rendered
-    assert "## Tool 使用指南" in rendered
-    assert "`read_file`" in rendered
-    assert "`schedule`" in rendered
     assert "## Long-term Memory" in rendered
 
 

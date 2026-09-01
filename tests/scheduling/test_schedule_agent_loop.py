@@ -447,13 +447,11 @@ async def test_schedule_uses_its_own_complete_context_projection(
     assert messages[-1] == {
         "role": "user",
         "content": (
-            "<runtime_context>\n"
-            f"current_time: {NOW.isoformat(timespec='milliseconds')}\n"
-            f"session_id: schedule_{JOB_UUID}\n"
-            "</runtime_context>\n\n"
-            "<user_input>\n"
-            "Run this.\n"
-            "</user_input>"
+            "## Runtime Context\n\n"
+            f"- Current time: {NOW.isoformat(timespec='milliseconds')}\n"
+            f"- Session ID: schedule_{JOB_UUID}\n\n"
+            "## User Input\n\n"
+            "Run this."
         ),
     }
     assert all("timestamp" not in message for message in messages)

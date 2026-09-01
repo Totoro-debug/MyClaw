@@ -459,9 +459,9 @@ chat 和 schedule 的共有 system-level context 按以下固定顺序组装：
 
 User Configuration 不得插入或替换 identity/system prompt。缓存的 OpenAI-format Tool schema snapshots 通过 provider 的结构化 tools 字段发送，不把 JSON schema 重复拼入自然语言 guidance。
 
-Foreground chat 在上述共有部分之后按当前 Runtime Generation Skill Snapshot order 追加一个 `<skill_catalog>` metadata-only block。每个 Skill 是独占一行的 compact JSON object，字段顺序固定为 name、description、path；JSON 文本中的 `&`、`<`、`>` 使用 Unicode escape，确保 metadata 不能产生 literal block delimiter。该 block 只指导模型使用普通 `read_file` 读取已知 canonical absolute path；模型需要更多内容时可按 `offset`/`limit` 继续分页，不需要证明 EOF。
+Foreground chat 在上述共有部分之后按当前 Runtime Generation Skill Snapshot order 追加一个 `## Skill Catalog` Markdown section 和 fenced JSONL block。每个 Skill 是独占一行的 compact JSON object，字段顺序固定为 name、description、path；JSON 文本中的反引号以及 `&`、`<`、`>` 使用 Unicode escape，确保 metadata 不能产生 literal block delimiter。该 block 只指导模型使用普通 `read_file` 读取已知 canonical absolute path；模型需要更多内容时可按 `offset`/`limit` 继续分页，不需要证明 EOF。
 
-当 Skill Snapshot 的 always-loaded subset 非空时，Foreground chat 随后按相同 Snapshot order 追加一个 `<skill_always_load>` intentional System block。每个 opted-in Skill 是一行 compact JSON object，字段顺序固定为 name、body；body 字段承载逐字符一致的完整 `SKILL.md` document。document 的 frontmatter、换行、引号、反斜杠及任意文字（包括类似 closing delimiter 的文字）由 JSON 字符串编码承载，`&`、`<`、`>` 使用 Unicode escape。模板的真实 `</skill_always_load>` closing delimiter 恰好一个；Runtime 不做 raw interpolation，也不截断 document。Foreground consolidation/budget projection 与最终 chat request 使用完全相同的编码后 prompt。该 always document 只进入 Foreground chat：Schedule、Session title、Task Framing、实际 Conversation Summary provider 和 Dream 均接收 `0` 个 Skill document；Summary 的 foreground budget projection 可包含同一完整 foreground prompt，但不把 document 发送给 Summary provider。Schedule prompt 不追加 Skill metadata 或 document。
+当 Skill Snapshot 的 always-loaded subset 非空时，Foreground chat 随后按相同 Snapshot order 追加一个 `## Always-loaded Skills` Markdown section 和 fenced JSONL block。每个 opted-in Skill 是一行 compact JSON object，字段顺序固定为 name、body；body 字段承载逐字符一致的完整 `SKILL.md` document。document 的 frontmatter、换行、引号、反斜杠及任意文字均由 JSON 字符串编码承载，反引号以及 `&`、`<`、`>` 使用 Unicode escape。Runtime 不做 raw interpolation，也不截断 document。Foreground consolidation/budget projection 与最终 chat request 使用完全相同的编码后 prompt。该 always document 只进入 Foreground chat：Schedule、Session title、Task Framing、实际 Conversation Summary provider 和 Dream 均接收 `0` 个 Skill document；Summary 的 foreground budget projection 可包含同一完整 foreground prompt，但不把 document 发送给 Summary provider。Schedule prompt 不追加 Skill metadata 或 document。
 
 Foreground 的 metadata projection 与最终 chat request 使用同一 Catalog block；这不改变 Conversation Summary provider 的独立 prompt，后者仍接收 `0` 个 Skill metadata 或 body。
 
@@ -476,17 +476,17 @@ Unicode whitespace 之前的 token 与 Catalog 中的 Skill name 完全一致（
 
 ### 8.2 当前 user input 的 Runtime Context
 
-发给 chat/schedule model 的当前 user message临时转换为：
+发给 chat/schedule model 的当前 user message 临时转换为：
 
-```text
-<runtime_context>
-current_time: 2026-07-11T15:30:12.123+08:00
-session_id: <session_id>
-</runtime_context>
+````text
+## Runtime Context
 
-<user_input>
+- Current time: 2026-07-11T15:30:12.123+08:00
+- Session ID: <session_id>
+
+## User Input
+
 <raw user content>
-</user_input>
 
 ## Task goal
 
@@ -495,12 +495,12 @@ Inspect the project
 ## Completion boundary
 
 Report the findings
-```
+````
 
 成功的手动 invocation 不把 raw slash input 放进 model-visible current user，而是使用一个独立的
-`<skill_instructions>` compact JSON object（`name`、`body`）和一个独立的 `<user_request>` compact JSON
-string。body 字段承载逐字符一致的完整 `SKILL.md` document；document、request 的换行、引号、反斜杠及 literal closing delimiter 均由 JSON 编码承载，`&`、`<`、`>`
-使用 Unicode escape；两个真实 closing delimiter 各只有一个。该 ephemeral projection 只存在于本次
+`## Skill Instructions` fenced JSON object（`name`、`body`）和一个独立的 `## User Request` fenced JSON
+string。body 字段承载逐字符一致的完整 `SKILL.md` document；document、request 的换行、引号、反斜杠及 Markdown fence 内容均由 JSON 编码承载，反引号以及 `&`、`<`、`>`
+使用 Unicode escape。该 ephemeral projection 只存在于本次
 foreground user message，Skill body 不进入 System Prompt；raw slash input 仍是唯一持久化的 Session user
 message。若同一 Skill 已在当前 Runtime Generation Skill Snapshot 中属于 always-loaded subset，它仍按 always System contract 出现，manual user
 projection 不会去重、覆盖或额外修改该既有 block。
@@ -550,7 +550,7 @@ Skill Snapshot.
 ### 8.4 Context budget 与 consolidation
 
 - 可用输入预算为已解析 chat route 的 `context_window - max_output`。
-- Agent Loop 同步构造在读取当前 Long-term Memory、构造 Skill Loader/Snapshot、`ContextBuilder`、固定 Tool schemas 和其他会话内组件之后，但在启动任何 task 前执行 Skill budget preflight。它以空 history 和空 current user content 调用与最终 Foreground chat 相同的 `ContextBuilder.build_messages()`，并与 `/status` 共享 compact JSON 序列化 seam，将真实 System Prompt、当前 user Runtime Context wrapper 和固定十个结构化 Tool schemas 投影为 `RuntimeStatusInput`，再调用现有 `estimate_input_tokens`（所有 UTF-8 bytes 合计后向上取整 `/ 4`）。`estimated == available` 允许，`estimated > available` 抛出独立 `SkillContextTooLargeError`，稳定 code 为 `skill_context_too_large`，document 不截断。每次启动或 `/resume` 都重扫完整 Skill documents 并对新 Snapshot 做 preflight；Session retained history 不参与该 startup configuration check。
+- Agent Loop 同步构造在读取当前 Long-term Memory、构造 Skill Loader/Snapshot、`ContextBuilder`、固定 Tool schemas 和其他会话内组件之后，但在启动任何 task 前执行 Skill budget preflight。它以空 history 和空 current user content 调用 `ContextBuilder.build_status_messages()`，并与 `/status` 共享 compact JSON 序列化 seam，将真实 System Prompt、当前 user Runtime Context wrapper 和固定十个结构化 Tool schemas 投影为 `RuntimeStatusInput`，再调用现有 `estimate_input_tokens`（所有 UTF-8 bytes 合计后向上取整 `/ 4`）。`estimated == available` 允许，`estimated > available` 抛出独立 `SkillContextTooLargeError`，稳定 code 为 `skill_context_too_large`，document 不截断。每次启动或 `/resume` 都重扫完整 Skill documents 并对新 Snapshot 做 preflight；Session retained history 不参与该 startup configuration check。
 - 估算对象包含 system prompt、retained session messages、当前 Runtime Context、user input 和结构化 tool definitions。
 - foreground manual invocation 的 body/request 通过 transient typed projection 计入 retained-current budget 与 cutoff；实际 Summary provider 仍只接收选中的 raw historical Session records，不接收手动 Skill instructions 或 request。
 - 在每次 chat route model call 前检查预算和 `consolidation_message_threshold`，包括一个 tool loop 中后续的 chat model call。

@@ -557,7 +557,19 @@ def _runtime(
     if not use_default_blackboard_generator:
         generator = blackboard_generator or _BlackboardGeneratorFake()
         object.__setattr__(loop, "_generate_blackboard", generator.generate)
-    object.__setattr__(loop, "_title_prompt", title_prompt)
+    if title_prompt is None:
+        def disable_title(_session: Session, _content: str) -> None:
+            return None
+
+        object.__setattr__(loop, "_start_title_if_needed", disable_title)
+    else:
+        def build_title_messages(content: str) -> list[dict[str, Any]]:
+            return [
+                {"role": "system", "content": title_prompt},
+                {"role": "user", "content": content},
+            ]
+
+        object.__setattr__(loop._context_builder, "build_title_messages", build_title_messages)
     if skill_loader is not None:
         loop._skill_loader = skill_loader
         loop._context_builder._skill_loader = skill_loader
@@ -1622,6 +1634,55 @@ async def test_async_preparation_failure_discards_parallel_title_result(
     finally:
         release_preparation.set()
         await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_title_request_uses_context_builder_messages_without_loop_override(
+    tmp_path: Path,
+) -> None:
+    router = _Router(())
+    loop, _session, _bus = _runtime(
+        tmp_path,
+        router,
+        title_prompt="Loop-owned title prompt",
+    )
+    builder_inputs: list[str] = []
+    captured_messages: list[dict[str, Any]] = []
+
+    def build_title_messages(content: str) -> list[dict[str, Any]]:
+        builder_inputs.append(content)
+        return [
+            {"role": "system", "content": "Builder-owned title prompt"},
+            {"role": "user", "content": content},
+        ]
+
+    def stream(
+        route: Literal["chat", "schedule"],
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del route, tools, continuation
+        captured_messages.extend(deepcopy(messages))
+
+        async def replay() -> AsyncIterator[ModelStreamEvent]:
+            yield ModelCompleted(response=_response("Generated title"))
+
+        return replay()
+
+    object.__setattr__(loop._context_builder, "build_title_messages", build_title_messages)
+    object.__setattr__(router, "stream", stream)
+
+    events = loop._router_stream_title("  First title input.  ")
+    _ = [event async for event in events]
+
+    assert builder_inputs == ["First title input."]
+    assert captured_messages == [
+        {"role": "system", "content": "Builder-owned title prompt"},
+        {"role": "user", "content": "First title input."},
+    ]
+    await loop.close()
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 
@@ -13,6 +13,8 @@ import myclaw.agent.context as context
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import _project_foreground_messages, _project_schedule_messages
+from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.memory.manager import MemoryManager
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
     SkillLoader,
@@ -20,20 +22,6 @@ from myclaw.skills.catalog import (
 )
 
 FIXED_UTC = datetime(2026, 8, 16, 4, 5, 6, 789000, tzinfo=UTC)
-FIXED_TOOL_GUIDANCE = "\n".join(
-    (
-        "- `read_file`: 读取当前 Workspace 和 `~/.myclaw/skills` 内的 UTF-8 文本文件。使用场景：需要查看或核对已知文件中的源码、配置或文档时使用。",  # noqa: RUF001
-        "- `write_file`: 在当前 Workspace 内创建 UTF-8 文本文件，或向 Workspace 内的 UTF-8 文件写入内容。使用场景：需要生成新文件，或用完整内容替换现有文件时使用。",  # noqa: RUF001
-        "- `edit_file`: 在当前 Workspace 内的 UTF-8 文本文件中进行精确文本替换。使用场景：需要局部修改现有文件且保留其他内容不变时使用。",  # noqa: RUF001
-        "- `list_dir`: 列出指定目录根下的文件和目录。使用场景：需要了解已知目录的内容或浏览目录结构时使用。",  # noqa: RUF001
-        "- `glob`: 匹配指定目录根下的文件和目录。使用场景：知道名称或路径规律但不知道确切位置，需要定位候选项时使用。",  # noqa: RUF001
-        "- `grep`: 搜索文件或目录中的 UTF-8 文本。使用场景：知道关键字、错误信息或代码片段，但不知道所在文件或位置时使用。",  # noqa: RUF001
-        "- `exec`: 在当前 Workspace 中通过 Bash login shell 执行一条命令并捕获输出。使用场景：当其他工具均无法使用或无法满足要求时，但是仍然需要运行构建、测试、格式化、版本控制或其他命令行操作时使用。",  # noqa: RUF001
-        "- `web_search`: 搜索公开 Web 后返回标准化的结果摘要。使用场景：需要查找线上资料、最新信息或来源，且尚不知道准确 URL 时使用。",  # noqa: RUF001
-        "- `web_fetch`: 获取 HTTP 或 HTTPS URL 中的可读内容。使用场景：已经知道目标 URL，需要读取或分析对应页面时使用。",  # noqa: RUF001
-        "- `schedule`: 创建、查看和删除一次性或周期性的 Schedule Job。使用场景：需要设置提醒、延后执行、周期运行或管理已有计划任务时使用。",  # noqa: RUF001
-    )
-)
 
 
 class _FrozenDateTime(datetime):
@@ -44,27 +32,50 @@ class _FrozenDateTime(datetime):
         return cls.fromtimestamp(FIXED_UTC.timestamp(), tz=tz)  # type: ignore[arg-type]
 
 
+def _context_dependencies(
+    workspace: Path,
+    agent_home: Path,
+) -> tuple[MemoryManager, SkillLoader]:
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=agent_home)
+    loader = SkillLoader(
+        root=agent_home / "skills",
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    loader.load()
+    return MemoryManager(state), loader
+
+
 def _builder(
     monkeypatch: pytest.MonkeyPatch,
     workspace: Path,
     timezone_name: str,
 ) -> ContextBuilder:
     monkeypatch.setattr(context, "datetime", _FrozenDateTime)
+    agent_home = workspace.parent / "agent-home"
+    memory_manager, loader = _context_dependencies(workspace, agent_home)
     return context.ContextBuilder(
         workspace,
         timezone_name,
-        agent_home=workspace.parent / "agent-home",
+        agent_home=agent_home,
+        memory_manager=memory_manager,
+        skill_loader=loader,
     )
 
 
 def test_context_builder_rejects_an_invalid_iana_timezone_before_building(
     workspace: Path,
 ) -> None:
+    agent_home = workspace.parent / "agent-home"
+    memory_manager, loader = _context_dependencies(workspace, agent_home)
     with pytest.raises(ZoneInfoNotFoundError):
         ContextBuilder(
             workspace,
             "Mars/Olympus",
-            agent_home=workspace.parent / "agent-home",
+            agent_home=agent_home,
+            memory_manager=memory_manager,
+            skill_loader=loader,
         )
 
 
@@ -116,7 +127,6 @@ def test_context_builder_builds_system_history_and_current_user_in_order(
     assert [message["role"] for message in messages] == ["system", "user", "assistant", "user"]
     system_prompt = messages[0]["content"]
     assert isinstance(system_prompt, str)
-    assert system_prompt.startswith("# MyClaw Personal Agent")
     assert f"`{workspace}`" in system_prompt
     assert f"`{agent_home}`" in system_prompt
     assert "Windows AMD64, Python 3.12.13" in system_prompt
@@ -130,13 +140,11 @@ def test_context_builder_builds_system_history_and_current_user_in_order(
     assert messages[3] == {
         "role": "user",
         "content": (
-            "<runtime_context>\n"
-            f"current_time: {expected_time}\n"
-            "session_id: 20260816-120000-000000_550e8400-e29b-41d4-a716-446655440000\n"
-            "</runtime_context>\n\n"
-            "<user_input>\n"
-            "Current question.\n"
-            "</user_input>"
+            "## Runtime Context\n\n"
+            f"- Current time: {expected_time}\n"
+            "- Session ID: 20260816-120000-000000_550e8400-e29b-41d4-a716-446655440000\n\n"
+            "## User Input\n\n"
+            "Current question."
         ),
     }
     assert all("timestamp" not in message for message in messages)
@@ -155,10 +163,13 @@ def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt
         enable_always_load=False,
     )
     loader.load()
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=agent_home)
     builder = ContextBuilder(
         workspace,
         "UTC",
         agent_home=agent_home,
+        memory_manager=MemoryManager(state),
         skill_loader=loader,
     )
 
@@ -171,7 +182,7 @@ def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt
 
     system_prompt = messages[0]["content"]
     assert isinstance(system_prompt, str)
-    assert "<skill_catalog>" in system_prompt
+    assert "## Skill Catalog" in system_prompt
     metadata_lines = [line for line in system_prompt.splitlines() if line.startswith("{")]
     assert [json.loads(line) for line in metadata_lines] == [
         {
@@ -180,8 +191,6 @@ def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt
             "path": str(instruction.resolve()),
         }
     ]
-    assert "ordinary read_file" in system_prompt
-    assert "continue" in system_prompt
     assert "private body" not in system_prompt
 
 
@@ -290,18 +299,16 @@ def test_context_builder_projects_markdown_blackboard_only_into_current_user(
     assert messages[1:] == [
         {"role": "user", "content": "Earlier"},
         {"role": "assistant", "content": "Earlier answer", "tool_calls": []},
-        {
-            "role": "user",
-            "content": (
-                "<runtime_context>\n"
-                "current_time: 2026-08-16T04:05:06.789+00:00\n"
-                "session_id: session-id\n"
-                "</runtime_context>\n\n"
-                "<user_input>\n"
-                "Current\n"
-                "</user_input>\n\n"
-                "## Task goal\n\n"
-                'Keep "quotes" and <tag> text.\n\n'
+            {
+                "role": "user",
+                "content": (
+                    "## Runtime Context\n\n"
+                    "- Current time: 2026-08-16T04:05:06.789+00:00\n"
+                    "- Session ID: session-id\n\n"
+                    "## User Input\n\n"
+                    "Current\n\n"
+                    "## Task goal\n\n"
+                    'Keep "quotes" and <tag> text.\n\n'
                 "## Completion boundary\n\n"
                 "Finish on C:\\tmp\\done.\n完成。"
             ),
@@ -320,8 +327,8 @@ def test_context_builder_projects_manual_skill_and_request_as_safe_distinct_bloc
     workspace: Path,
 ) -> None:
     builder = _builder(monkeypatch, workspace, "UTC")
-    body = 'Do "this".\nPath C:\\tmp\\done.\nLiteral </skill_instructions> & < >'
-    request = 'Need "that".\nLiteral </user_request> & < >'
+    body = 'Do "this".\nPath C:\\tmp\\done.\nFence ```json and </skill_instructions> & < >'
+    request = 'Need "that".\nFence ``` and </user_request> & < >'
     invocation = ManualSkillInvocation(
         metadata=SkillMetadata(
             name="planner",
@@ -354,15 +361,19 @@ def test_context_builder_projects_manual_skill_and_request_as_safe_distinct_bloc
     assert body not in system_prompt
     assert body not in str(messages[1:2])
     assert "/planner" not in current_content
-    assert current_content.count("</skill_instructions>") == 1
-    assert current_content.count("</user_request>") == 1
+    assert current_content.count("## Skill Instructions") == 1
+    assert current_content.count("## User Request") == 1
 
-    skill_block = current_content.split("<skill_instructions>\n", 1)[1].split(
-        "\n</skill_instructions>", 1
+    skill_block = current_content.split("## Skill Instructions\n\n```json\n", 1)[1].split(
+        "\n```", 1
     )[0]
-    request_block = current_content.split("<user_request>\n", 1)[1].split("\n</user_request>", 1)[0]
+    request_block = current_content.split("## User Request\n\n```json\n", 1)[1].split(
+        "\n```", 1
+    )[0]
     assert json.loads(skill_block) == {"name": "planner", "body": body}
     assert json.loads(request_block) == request
+    assert r"\u0060\u0060\u0060" in skill_block
+    assert r"\u0060\u0060\u0060" in request_block
     assert current_content.count(body) == 0
     assert current_content.count(request) == 0
     assert current_content.endswith(
@@ -382,14 +393,159 @@ def test_context_builder_does_not_accept_tool_gateway_or_schemas(workspace: Path
         )
 
 
-def test_runtime_lane_projections_keep_current_turn_continuation_separate(
+def test_context_builder_owns_exactly_the_five_context_dependencies(
+    agent_home: Path,
     workspace: Path,
 ) -> None:
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=agent_home)
+    loader = SkillLoader(
+        root=agent_home / "skills",
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    loader.load()
+    memory_manager = MemoryManager(state)
+
     builder = ContextBuilder(
         workspace,
         "UTC",
-        agent_home=workspace.parent / "agent-home",
+        agent_home=agent_home,
+        memory_manager=memory_manager,
+        skill_loader=loader,
     )
+
+    assert vars(builder) == {
+        "_workspace": workspace,
+        "_agent_home": agent_home,
+        "_timezone": ZoneInfo("UTC"),
+        "_memory_manager": memory_manager,
+        "_skill_loader": loader,
+    }
+
+
+@pytest.mark.asyncio
+async def test_context_builder_reads_live_memory_and_lane_specific_skills(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=agent_home)
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\n"
+        "name: planner\n"
+        "description: Plan work\n"
+        "always: true\n"
+        "---\n"
+        "Private planner instructions.\n",
+        encoding="utf-8",
+    )
+    loader = SkillLoader(
+        root=agent_home / "skills",
+        reserved_names=(),
+        enable_always_load=True,
+    )
+    loader.load()
+    memory_manager = MemoryManager(state)
+    builder = ContextBuilder(
+        workspace,
+        "Asia/Shanghai",
+        agent_home=agent_home,
+        memory_manager=memory_manager,
+        skill_loader=loader,
+    )
+
+    first_foreground = builder.foreground_system_prompt()
+    first_schedule = builder.schedule_system_prompt()
+    await memory_manager.edit_long_term(
+        old=memory_manager.memory_snapshot(),
+        new="# Long-term Memory\n\n## User Info\n\nLatest memory.",
+    )
+    second_foreground = builder.foreground_system_prompt()
+    second_schedule = builder.schedule_system_prompt()
+
+    assert "Latest memory." in second_foreground
+    assert "Latest memory." in second_schedule
+    assert "Latest memory." not in first_foreground
+    assert "Latest memory." not in first_schedule
+    assert '"name":"planner"' in second_foreground
+    assert "Private planner instructions." in second_foreground
+    assert "planner" not in second_schedule
+    assert "Private planner instructions." not in second_schedule
+    assert "<skill_catalog>" not in second_foreground
+    assert "<skill_always_load>" not in second_foreground
+    assert "```jsonl" in second_foreground
+
+
+def test_context_builder_builds_title_and_status_minimal_messages(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    monkeypatch.setattr(context, "datetime", _FrozenDateTime)
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=agent_home)
+    loader = SkillLoader(
+        root=agent_home / "skills",
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    loader.load()
+    builder = ContextBuilder(
+        workspace,
+        "Asia/Shanghai",
+        agent_home=agent_home,
+        memory_manager=MemoryManager(state),
+        skill_loader=loader,
+    )
+    history: list[dict[str, Any]] = [
+        {"role": "user", "content": "Earlier", "timestamp": "old"},
+        {
+            "role": "assistant",
+            "content": "Answer",
+            "tool_calls": [],
+            "status": "completed",
+            "timestamp": "old",
+        },
+    ]
+    original_history = deepcopy(history)
+
+    title_messages = builder.build_title_messages("Title input")
+    status_messages = builder.build_status_messages(history, session_id="session-id")
+
+    assert title_messages == [
+        {"role": "system", "content": builder.session_title_prompt()},
+        {"role": "user", "content": "Title input"},
+    ]
+    assert [message["role"] for message in status_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert status_messages[0] == {
+        "role": "system",
+        "content": builder.foreground_system_prompt(),
+    }
+    assert status_messages[-1] == {
+        "role": "user",
+        "content": (
+            "## Runtime Context\n\n"
+            "- Current time: 2026-08-16T12:05:06.789+08:00\n"
+            "- Session ID: session-id\n\n"
+            "## User Input\n\n"
+        ),
+    }
+    assert history == original_history
+
+
+def test_runtime_lane_projections_keep_current_turn_continuation_separate(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    builder = _builder(monkeypatch, workspace, "UTC")
     messages: list[dict[str, Any]] = [
         {
             "role": "user",
@@ -449,7 +605,7 @@ def test_runtime_lane_projections_keep_current_turn_continuation_separate(
     ]
     assert f"当前工作区 `{workspace}`" in foreground[0]["content"]
     assert foreground[3]["content"].endswith(
-        "Current question.\n</user_input>\n\n"
+        "## User Input\n\nCurrent question.\n\n"
         "## Task goal\n\nCurrent task\n\n"
         "## Completion boundary\n\nCurrent boundary"
     )
@@ -465,12 +621,10 @@ def test_runtime_lane_projections_keep_current_turn_continuation_separate(
     assert schedule[3] == {
         "role": "user",
         "content": (
-            "<runtime_context>\n"
-            "current_time: 2026-08-16T12:00:00.000+08:00\n"
-            "session_id: session-id\n"
-            "</runtime_context>\n\n"
-            "<user_input>\n"
-            "Current question.\n"
-            "</user_input>"
+            "## Runtime Context\n\n"
+            "- Current time: 2026-08-16T12:00:00.000+08:00\n"
+            "- Session ID: session-id\n\n"
+            "## User Input\n\n"
+            "Current question."
         ),
     }

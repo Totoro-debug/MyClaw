@@ -25,6 +25,7 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from myclaw.session.session import Session
+from myclaw.skills.catalog import SkillLoader
 from myclaw.templates import render_template
 from myclaw.tools.base import OpenAIToolSchema
 from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter
@@ -725,10 +726,18 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
         },
     }
     if lane == "chat":
+        skill_loader = SkillLoader(
+            root=workspace.parent / "agent-home" / "skills",
+            reserved_names=(),
+            enable_always_load=False,
+        )
+        skill_loader.load()
         context = ContextBuilder(
             workspace,
             "UTC",
             agent_home=workspace.parent / "agent-home",
+            memory_manager=memory_manager,
+            skill_loader=skill_loader,
         )
 
         def project_messages(
@@ -780,14 +789,21 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
         goal="Keep the current task framed.",
         completion_boundary="The raw input remains the only persisted user message.",
     )
+    memory_manager = MemoryManager(state)
+    skill_loader = SkillLoader(
+        root=workspace.parent / "agent-home" / "skills",
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    skill_loader.load()
     context = ContextBuilder(
         workspace,
         "UTC",
         agent_home=workspace.parent / "agent-home",
-        clock=lambda: NOW,
+        memory_manager=memory_manager,
+        skill_loader=skill_loader,
     )
     provider = ScriptedFakeProvider(completions=(_response("Summary without Blackboard."),))
-    memory_manager = MemoryManager(state)
     projected_calls: list[list[dict[str, Any]]] = []
 
     def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:

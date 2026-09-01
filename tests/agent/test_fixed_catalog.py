@@ -359,7 +359,8 @@ async def test_agent_loop_advertises_and_persists_multiple_autonomous_skill_read
     assert len(provider.stream_requests) == 4
     system_prompt = provider.stream_requests[0].messages[0]["content"]
     assert isinstance(system_prompt, str)
-    assert system_prompt.count("<skill_catalog>") == 1
+    assert system_prompt.count("## Skill Catalog") == 1
+    assert system_prompt.count("```jsonl") == 1
     metadata_lines = [line for line in system_prompt.splitlines() if line.startswith("{")]
     assert [json.loads(line) for line in metadata_lines] == [
         {

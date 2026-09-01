@@ -1,7 +1,10 @@
 import ast
+import inspect
 from pathlib import Path
 
 import pytest
+
+from myclaw.agent.context import ContextBuilder
 
 PROJECT_ROOT = Path(__file__).parents[2]
 PACKAGE_ROOT = PROJECT_ROOT / "myclaw"
@@ -138,6 +141,55 @@ def test_terminal_depends_on_ports_instead_of_tool_implementations() -> None:
     ]
 
     assert violations == []
+
+
+def test_context_builder_constructor_owns_only_context_dependencies() -> None:
+    parameters = inspect.signature(ContextBuilder.__init__).parameters
+
+    assert tuple(parameters) == (
+        "self",
+        "workspace",
+        "timezone_name",
+        "agent_home",
+        "memory_manager",
+        "skill_loader",
+    )
+    assert parameters["agent_home"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["memory_manager"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["skill_loader"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "clock" not in parameters
+    assert "tool_gateway" not in parameters
+    assert "tool_schema" not in parameters
+    assert "router" not in parameters
+    assert "model_router" not in parameters
+
+
+def test_context_builder_does_not_import_model_request_runtime_boundaries() -> None:
+    path = PACKAGE_ROOT / "agent" / "context.py"
+    forbidden_prefixes = (
+        "myclaw.provider",
+        "myclaw.router",
+        "myclaw.tools",
+    )
+    violations = [
+        f"{path.relative_to(PROJECT_ROOT)}:{line} imports {module}"
+        for module, line in _imports(path)
+        if any(module == prefix or module.startswith(f"{prefix}.") for prefix in forbidden_prefixes)
+    ]
+
+    assert violations == []
+
+
+def test_agent_loop_does_not_retain_a_title_prompt_outside_context_builder() -> None:
+    path = PACKAGE_ROOT / "agent" / "loop.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    retained_title_prompts = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "_title_prompt"
+    ]
+
+    assert retained_title_prompts == []
 
 
 def test_agent_modules_do_not_depend_on_terminal_presentation() -> None:
