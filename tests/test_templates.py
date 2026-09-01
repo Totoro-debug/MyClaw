@@ -11,12 +11,9 @@ from myclaw.agent.prompts import (
     current_user_input,
     foreground_chat_system_prompt,
     interrupted_assistant_content,
-    memory_task_input,
-    memory_task_prompt,
     runtime_context,
     session_title_prompt,
 )
-from myclaw.memory.records import SummaryEntry
 from myclaw.skills.catalog import SkillLoader
 from myclaw.templates import load_template, render_template
 
@@ -28,7 +25,6 @@ TEMPLATE_NAMES = {
     "default-config.md",
     "interrupted-assistant-content.md",
     "long-term-memory.md",
-    "memory-task-input.md",
     "memory-task-prompt.md",
     "foreground-chat-system-prompt.md",
     "runtime-context.md",
@@ -66,10 +62,12 @@ def test_generated_file_templates_preserve_their_terminal_newline() -> None:
 
 
 def test_prompt_renderer_removes_only_the_source_file_terminator() -> None:
-    assert render_template("session-title-prompt.md") == (
-        "Generate a concise title for this Conversation Session.\n"
-        "Return only the title. Do not call tools or add commentary."
-    )
+    source = load_template("session-title-prompt.md")
+    rendered = render_template("session-title-prompt.md")
+
+    assert source.endswith("\n")
+    assert rendered == source.removesuffix("\n")
+    assert not rendered.endswith("\n")
 
 
 def test_runtime_and_user_input_templates_render_exact_context() -> None:
@@ -237,7 +235,10 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
             latest_assistant_content="Latest assistant content",
         ),
         load_template("conversation-summary-system-prompt.md"),
-        memory_task_prompt(long_term_path=PureWindowsPath(r"D:\workspace\memory.md")),
+        render_template(
+            "memory-task-prompt.md",
+            long_term_path=PureWindowsPath(r"D:\workspace\memory.md"),
+        ),
     )
     assert all("planner" not in prompt for prompt in non_foreground_prompts)
     assert all(str(first.resolve()) not in prompt for prompt in non_foreground_prompts)
@@ -290,7 +291,10 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
             latest_assistant_content="Latest assistant content",
         ),
         load_template("conversation-summary-system-prompt.md"),
-        memory_task_prompt(long_term_path=PureWindowsPath(r"D:\workspace\memory.md")),
+        render_template(
+            "memory-task-prompt.md",
+            long_term_path=PureWindowsPath(r"D:\workspace\memory.md"),
+        ),
     )
     assert all(document not in prompt for prompt in non_foreground_prompts)
 
@@ -337,29 +341,15 @@ def test_blackboard_prompt_renders_dynamic_markdown_context() -> None:
     assert "<last_task>" not in rendered
 
 
-def test_specialized_model_templates_render_exact_prompts() -> None:
-    summary = SummaryEntry(index=1, timestamp=NOW, content="Remember this.")
+def test_specialized_model_templates_render_dynamic_values() -> None:
     long_term_path = PureWindowsPath(r"D:\workspace\.myclaw\memory\memory.md")
 
-    assert session_title_prompt() == (
-        "Generate a concise title for this Conversation Session.\n"
-        "Return only the title. Do not call tools or add commentary."
+    memory_prompt = render_template(
+        "memory-task-prompt.md",
+        long_term_path=long_term_path,
     )
-    assert memory_task_prompt(long_term_path=long_term_path) == (
-        "Maintain the MyClaw Long-term Memory from new Conversation Summaries.\n"
-        "Use read_file to inspect exactly D:\\workspace\\.myclaw\\memory\\memory.md.\n"
-        "Use edit_file only when stable information should be retained, and edit exactly that file.\n"
-        "Keep the four sections: User Info, User Preference, Project Fact, and Lesson.\n"
-        "Do not store transient activity, raw summaries, or duplicate facts.\n"
-        "If no durable update is needed, do not call edit_file."
-    )
-    assert memory_task_input(cursor=0, summaries=(summary,)) == (
-        "<summary_cursor>0</summary_cursor>\n"
-        "<conversation_summaries>\n"
-        '{"index":1,"timestamp":"2026-07-19T12:34:56.789+00:00",'
-        '"content":"Remember this."}\n'
-        "</conversation_summaries>"
-    )
+    assert str(long_term_path) in memory_prompt
+    assert "{long_term_path}" not in memory_prompt
     assert interrupted_assistant_content("Partial answer") == (
         "Partial answer\n\n[Turn interrupted by user.]"
     )

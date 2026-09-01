@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -11,7 +12,6 @@ from typing import Annotated, Any, Literal, Protocol
 
 from loguru import logger
 
-from myclaw.agent.prompts import memory_task_input, memory_task_prompt
 from myclaw.agent.runner import (
     AgentRunner,
     AgentRunnerMemoryRouter,
@@ -28,9 +28,12 @@ from myclaw.memory.manager import (
 )
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelContinuation, ModelMessages, ModelResponse
+from myclaw.templates import render_template
 from myclaw.tools.base import BaseTool, OpenAIToolSchema, ToolError, ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.validation import require_nonnegative_int
+
+_MEMORY_JSON_TRANSLATION = str.maketrans({"`": r"\u0060"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,18 +309,32 @@ class Dream:
                 cursor=claim.cursor,
             )
 
+        records = "\n".join(
+            json.dumps(
+                entry.to_dict(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).translate(_MEMORY_JSON_TRANSLATION)
+            for entry in claim.entries
+        )
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
-                "content": memory_task_prompt(
+                "content": render_template(
+                    "memory-task-prompt.md",
                     long_term_path=self._memory_manager.long_term_path
                 ),
             },
             {
                 "role": "user",
-                "content": memory_task_input(
-                    cursor=claim.previous_cursor,
-                    summaries=claim.entries,
+                "content": (
+                    "## Summary Cursor\n\n"
+                    f"{claim.previous_cursor}\n\n"
+                    "## Conversation Summaries\n\n"
+                    "```jsonl\n"
+                    f"{records}\n"
+                    "```"
                 ),
             },
         ]

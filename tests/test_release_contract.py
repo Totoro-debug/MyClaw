@@ -381,6 +381,11 @@ _INLINE_MARKDOWN_LINK = re.compile(
     r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\)"
 )
 _REFERENCE_MARKDOWN_LINK = re.compile(r"(?m)^\s*\[[^\]\n]+\]:\s*(?P<target><[^>\n]+>|\S+)")
+_EXPECTED_REMOVED_MARKDOWN_PATHS = frozenset(
+    {
+        ROOT / "myclaw" / "templates" / "memory-task-input.md",
+    }
+)
 
 
 def _tracked_markdown_paths() -> tuple[Path, ...]:
@@ -401,6 +406,21 @@ def test_tracked_markdown_inventory_preserves_missing_paths(
         ROOT / "README.md",
         ROOT / "docs" / "unexpected-missing.md",
     )
+
+
+def test_tracked_markdown_link_contract_rejects_unexpected_deleted_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unexpected = ROOT / "docs" / "unexpected-missing.md"
+    monkeypatch.setitem(globals(), "_tracked_markdown_paths", lambda: (unexpected,))
+    monkeypatch.setattr(
+        subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: b"docs/unexpected-missing.md\n",
+    )
+
+    with pytest.raises(AssertionError, match=r"unexpected-missing\.md"):
+        test_tracked_markdown_local_links_resolve()
 
 
 def _markdown_link_targets(content: str) -> tuple[str, ...]:
@@ -744,6 +764,10 @@ def test_tracked_markdown_local_links_resolve() -> None:
 
     missing: list[str] = []
     for source in tracked:
+        if not source.exists():
+            if source not in _EXPECTED_REMOVED_MARKDOWN_PATHS:
+                missing.append(f"{source.relative_to(ROOT)}: tracked Markdown source is missing")
+            continue
         content = source.read_text(encoding="utf-8")
         for target in _markdown_link_targets(content):
             local_path = _local_markdown_path(target)

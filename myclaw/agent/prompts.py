@@ -7,7 +7,6 @@ import platform
 from datetime import datetime
 from pathlib import PurePath
 
-from myclaw.memory.records import SummaryEntry
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
 from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
@@ -185,21 +184,6 @@ def blackboard_prompt(
             "Last Task": last_task,
             "Latest assistant content": latest_assistant_content,
         },
-    )
-
-
-def memory_task_prompt(*, long_term_path: PurePath) -> str:
-    """Return the restricted four-section Long-term Memory maintenance prompt."""
-    return render_template("memory-task-prompt.md", long_term_path=long_term_path)
-
-
-def memory_task_input(*, cursor: int, summaries: tuple[SummaryEntry, ...]) -> str:
-    """Render only the pending ordered Conversation Summary batch."""
-    records = "\n".join(entry.to_json_line().rstrip("\n") for entry in summaries)
-    return render_template(
-        "memory-task-input.md",
-        cursor=cursor,
-        records=records,
     )
 
 

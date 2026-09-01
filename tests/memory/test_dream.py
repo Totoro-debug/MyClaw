@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -15,6 +16,7 @@ from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import AssistantModelMessage, ModelResponse, ModelUsage
+from myclaw.templates import render_template
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter
@@ -47,6 +49,10 @@ def _response(
         usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
         finish_reason="tool_calls" if tool_calls else "stop",
     )
+
+
+def _reject_nonstandard_json_constant(value: str) -> object:
+    raise ValueError(f"non-standard JSON constant: {value}")
 
 
 class _BlockingRouter:
@@ -168,6 +174,84 @@ async def test_dream_processes_claimed_summaries_through_restricted_memory_route
     assert "The user prefers concise reports." in str(request.messages[1]["content"])
     assert provider.stream_requests == []
     assert not manager.workspace_state.logs_directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_dream_builds_a_fenced_markdown_memory_request_at_its_execution_boundary(
+    agent_home: Path,
+) -> None:
+    manager = _manager(agent_home)
+    await manager.append_summary("Already claimed.", NOW)
+    initial_claim = await manager.claim_summaries(1)
+    assert initial_claim.cursor == 1
+    summary_contents = (
+        'Unicode 雪 and "quoted" data.\n```\n<tag> & `backtick` and C:\\tmp\\done.',
+        r"HTML </script>; literal \u0060 plus NaN remains text.",
+    )
+    for content in summary_contents:
+        await manager.append_summary(content, NOW)
+    provider = ScriptedFakeProvider(completions=(_response("No durable update."),))
+    dream = Dream(
+        memory_manager=manager,
+        model_router=ScriptedFakeRouter(provider),
+        batch_size=10,
+        max_iterations=50,
+    )
+
+    result = await dream.run()
+
+    assert result == DreamResult(
+        status="Processed 2 summaries; Long-term Memory unchanged.",
+        processed_count=2,
+        memory_updated=False,
+        cursor=3,
+    )
+    request = provider.complete_requests[0]
+    assert [message["role"] for message in request.messages] == ["system", "user"]
+    assert request.messages[0] == {
+        "role": "system",
+        "content": render_template(
+            "memory-task-prompt.md",
+            long_term_path=manager.long_term_path,
+        ),
+    }
+    assert all(set(message) == {"role", "content"} for message in request.messages)
+
+    user_context = request.messages[1]["content"]
+    assert isinstance(user_context, str)
+    tokens = MarkdownIt("commonmark").parse(user_context)
+    assert [token.content for token in tokens if token.type == "inline"] == [
+        "Summary Cursor",
+        "1",
+        "Conversation Summaries",
+    ]
+    fences = [token for token in tokens if token.type == "fence"]
+    assert len(fences) == 1
+    assert fences[0].info == "jsonl"
+    payload = fences[0].content
+    assert "`" not in payload
+    assert [
+        json.loads(line, parse_constant=_reject_nonstandard_json_constant)
+        for line in payload.splitlines()
+    ] == [
+        {
+            "index": 2,
+            "timestamp": "2026-08-27T10:00:00.000+08:00",
+            "content": summary_contents[0],
+        },
+        {
+            "index": 3,
+            "timestamp": "2026-08-27T10:00:00.000+08:00",
+            "content": summary_contents[1],
+        },
+    ]
+    message_payload = json.dumps(request.messages, ensure_ascii=False)
+    for forbidden in ("contextbuilder", '"function"', "skill_catalog", "blackboard", "session_id"):
+        assert forbidden not in message_payload.casefold()
+    assert [schema["function"]["name"] for schema in request.tools] == [
+        "read_file",
+        "edit_file",
+    ]
 
 
 @pytest.mark.asyncio
