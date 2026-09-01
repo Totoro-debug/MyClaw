@@ -672,7 +672,11 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
         },
     }
     if lane == "chat":
-        context = ContextBuilder(workspace, "UTC")
+        context = ContextBuilder(
+            workspace,
+            "UTC",
+            agent_home=workspace.parent / "agent-home",
+        )
 
         def project_messages(
             messages: Sequence[dict[str, Any]],
@@ -723,7 +727,12 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
         goal="Keep the current task framed.",
         completion_boundary="The raw input remains the only persisted user message.",
     )
-    context = ContextBuilder(workspace, "UTC", clock=lambda: NOW)
+    context = ContextBuilder(
+        workspace,
+        "UTC",
+        agent_home=workspace.parent / "agent-home",
+        clock=lambda: NOW,
+    )
     provider = ScriptedFakeProvider(completions=(_response("Summary without Blackboard."),))
     memory_manager = MemoryManager(state)
     projected_calls: list[list[dict[str, Any]]] = []

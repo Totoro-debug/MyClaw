@@ -452,9 +452,10 @@ is accepted by ADR-0009 and does not provide cross-process coordination.
 
 chat 和 schedule 的共有 system-level context 按以下固定顺序组装：
 
-1. 内置 identity prompt，其中包含 normalized absolute Workspace。
-2. 完整的 runtime-startup Long-term Memory snapshot，以明确的 `<long_term_memory>` delimiter 包裹。
-3. 固定 Tool Catalog 的 guidance，以明确的 `<tool_guidance>` delimiter 包裹。
+1. 基础 Markdown System Prompt 直接声明内置 identity，并包含 normalized absolute Workspace 与 composition-root 注入的 Agent Home path。
+2. host Runtime metadata，置于 `## Runtime` Markdown 章节，固定包含 `platform.system()`、`platform.machine()` 和当前 Python version 的结果。
+3. 固定 Tool Catalog 的中文 guidance，置于 `## Tool 使用指南` Markdown 章节；Tool 名称保持不变。
+4. 完整的 runtime-startup Long-term Memory snapshot，置于 `## Long-term Memory` Markdown 章节。
 
 User Configuration 不得插入或替换 identity/system prompt。缓存的 OpenAI-format Tool schema snapshots 通过 provider 的结构化 tools 字段发送，不把 JSON schema 重复拼入自然语言 guidance。
 

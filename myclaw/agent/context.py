@@ -23,14 +23,18 @@ class ContextBuilder:
         workspace: Path,
         timezone_name: str,
         *,
+        agent_home: Path,
         clock: Callable[[], datetime] | None = None,
         skill_snapshot: SkillSnapshot | None = None,
     ) -> None:
         if not isinstance(workspace, Path):
             raise TypeError("Context Builder requires a Path")
+        if not isinstance(agent_home, Path):
+            raise TypeError("Context Builder requires an Agent Home Path")
         if skill_snapshot is not None and not isinstance(skill_snapshot, SkillSnapshot):
             raise TypeError("Context Builder requires a Runtime Skill snapshot")
         self._workspace = workspace
+        self._agent_home = agent_home
         self._timezone = ZoneInfo(timezone_name)
         self._clock = clock
         self._skill_snapshot = skill_snapshot
@@ -60,6 +64,7 @@ class ContextBuilder:
                 "role": "system",
                 "content": foreground_chat_system_prompt(
                     workspace=self._workspace,
+                    agent_home=self._agent_home,
                     long_term_memory=long_term_memory,
                     skill_snapshot=self._skill_snapshot,
                 ),

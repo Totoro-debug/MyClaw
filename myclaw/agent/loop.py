@@ -264,6 +264,7 @@ class AgentLoop:
         context_builder = ContextBuilder(
             workspace_path,
             schedule_service.context_timezone_name() or get_localzone_name(),
+            agent_home=agent_home.path,
             clock=now,
             skill_snapshot=skill_snapshot,
         )
@@ -1051,6 +1052,7 @@ class AgentLoop:
         memory_snapshot = self._memory_manager.memory_snapshot()
         current_system_prompt = foreground_chat_system_prompt(
             workspace=self._workspace_path,
+            agent_home=self._agent_home.path,
             long_term_memory=memory_snapshot,
             skill_snapshot=self._skill_snapshot,
         )
@@ -1097,6 +1099,7 @@ class AgentLoop:
         memory_snapshot = self._memory_manager.memory_snapshot()
         current_system_prompt = chat_system_prompt(
             workspace=self._workspace_path,
+            agent_home=self._agent_home.path,
             long_term_memory=memory_snapshot,
         )
         route = self._configuration.resolve_route("schedule").route
@@ -1137,6 +1140,7 @@ class AgentLoop:
         memory_snapshot = self._memory_manager.memory_snapshot()
         system_prompt = foreground_chat_system_prompt(
             workspace=self._workspace_path,
+            agent_home=self._agent_home.path,
             long_term_memory=memory_snapshot,
             skill_snapshot=self._skill_snapshot,
         )

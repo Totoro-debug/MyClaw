@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import platform
 from datetime import datetime
 from pathlib import PurePath
 
@@ -62,11 +63,22 @@ def runtime_context(*, current_time: datetime, session_id: str) -> str:
     )
 
 
-def chat_system_prompt(*, workspace: PurePath, long_term_memory: str) -> str:
+def chat_system_prompt(
+    *,
+    workspace: PurePath,
+    agent_home: PurePath,
+    long_term_memory: str,
+) -> str:
     """Compose the fixed Tool-guidance System Prompt."""
+    runtime = (
+        f"{platform.system()} "
+        f"{platform.machine()}, Python {platform.python_version()}"
+    )
     return render_template(
         "foreground-chat-system-prompt.md",
-        identity=render_template("builtin-identity.md", workspace=workspace),
+        workspace=workspace,
+        agent_home=agent_home,
+        runtime=runtime,
         long_term_memory=long_term_memory,
     )
 
@@ -74,11 +86,18 @@ def chat_system_prompt(*, workspace: PurePath, long_term_memory: str) -> str:
 def foreground_chat_system_prompt(
     *,
     workspace: PurePath,
+    agent_home: PurePath,
     long_term_memory: str,
     skill_snapshot: SkillSnapshot | None = None,
 ) -> str:
     """Compose the foreground prompt with optional Skill metadata."""
-    sections = [chat_system_prompt(workspace=workspace, long_term_memory=long_term_memory)]
+    sections = [
+        chat_system_prompt(
+            workspace=workspace,
+            agent_home=agent_home,
+            long_term_memory=long_term_memory,
+        )
+    ]
     if skill_snapshot is not None and skill_snapshot.skills:
         entries = "\n".join(
             _skill_metadata_json(

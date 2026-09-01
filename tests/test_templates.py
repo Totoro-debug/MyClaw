@@ -5,6 +5,7 @@ from pathlib import Path, PureWindowsPath
 
 import pytest
 
+import myclaw.agent.prompts as prompts
 from myclaw.agent.prompts import (
     blackboard_prompt,
     chat_system_prompt,
@@ -23,7 +24,6 @@ from myclaw.skills.catalog import SkillLoader
 from myclaw.templates import load_template, render_template
 
 TEMPLATE_NAMES = {
-    "builtin-identity.md",
     "blackboard.md",
     "blackboard-system-prompt.md",
     "conversation-summary-input.md",
@@ -125,11 +125,13 @@ def test_current_user_input_appends_exact_markdown_blackboard_projection() -> No
 def test_foreground_chat_system_prompt_matches_stable_base_without_skills() -> None:
     base = chat_system_prompt(
         workspace=PureWindowsPath(r"D:\\workspace"),
+        agent_home=PureWindowsPath(r"D:\\agent-home"),
         long_term_memory="# Memory\n",
     )
     assert (
         foreground_chat_system_prompt(
             workspace=PureWindowsPath(r"D:\\workspace"),
+            agent_home=PureWindowsPath(r"D:\\agent-home"),
             long_term_memory="# Memory\n",
         )
         == base
@@ -164,6 +166,7 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
     ).load()
     foreground = foreground_chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),
+        agent_home=PureWindowsPath(r"D:\agent-home"),
         long_term_memory="# Memory\n",
         skill_snapshot=snapshot,
     )
@@ -193,6 +196,7 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
     non_foreground_prompts = (
         chat_system_prompt(
             workspace=PureWindowsPath(r"D:\workspace"),
+            agent_home=PureWindowsPath(r"D:\agent-home"),
             long_term_memory="# Memory\n",
         ),
         session_title_prompt(),
@@ -227,6 +231,7 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
 
     foreground = foreground_chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),
+        agent_home=PureWindowsPath(r"D:\agent-home"),
         long_term_memory="# Memory\n",
         skill_snapshot=snapshot,
     )
@@ -243,6 +248,7 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
     non_foreground_prompts = (
         chat_system_prompt(
             workspace=PureWindowsPath(r"D:\workspace"),
+            agent_home=PureWindowsPath(r"D:\agent-home"),
             long_term_memory="# Memory\n",
         ),
         session_title_prompt(),
@@ -257,28 +263,38 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
     assert all(document not in prompt for prompt in non_foreground_prompts)
 
 
-def test_chat_system_prompt_uses_the_fixed_catalog_guidance() -> None:
+def test_chat_system_prompt_uses_the_fixed_catalog_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(prompts.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(prompts.platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(prompts.platform, "python_version", lambda: "3.12.13")
+
     assert chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),
+        agent_home=PureWindowsPath(r"D:\agent-home"),
         long_term_memory="# Memory\n",
     ) == (
-        "You are the MyClaw Personal Agent.\n"
-        "Act within the user's current Workspace.\n"
-        "Workspace: D:\\workspace\n\n"
-        "<long_term_memory>\n"
+        "# MyClaw Personal Agent\n\n"
+        "你是 MyClaw，一个 AI 助手，你只被允许在用户的当前工作区 "  # noqa: RUF001
+        "`D:\\workspace` 内工作。\n\n"
+        "MyClaw Home 目录位于 `D:\\agent-home`。\n\n\n"
+        "## Runtime\n\n"
+        "Windows AMD64, Python 3.12.13\n\n\n"
+        "## Tool 使用指南\n\n"
+        "- `read_file`: 读取当前 Workspace 和 `~/.myclaw/skills` 内的 UTF-8 文本文件。使用场景：需要查看或核对已知文件中的源码、配置或文档时使用。\n"  # noqa: RUF001
+        "- `write_file`: 在当前 Workspace 内创建 UTF-8 文本文件，或向 Workspace 内的 UTF-8 文件写入内容。使用场景：需要生成新文件，或用完整内容替换现有文件时使用。\n"  # noqa: RUF001
+        "- `edit_file`: 在当前 Workspace 内的 UTF-8 文本文件中进行精确文本替换。使用场景：需要局部修改现有文件且保留其他内容不变时使用。\n"  # noqa: RUF001
+        "- `list_dir`: 列出指定目录根下的文件和目录。使用场景：需要了解已知目录的内容或浏览目录结构时使用。\n"  # noqa: RUF001
+        "- `glob`: 匹配指定目录根下的文件和目录。使用场景：知道名称或路径规律但不知道确切位置，需要定位候选项时使用。\n"  # noqa: RUF001
+        "- `grep`: 搜索文件或目录中的 UTF-8 文本。使用场景：知道关键字、错误信息或代码片段，但不知道所在文件或位置时使用。\n"  # noqa: RUF001
+        "- `exec`: 在当前 Workspace 中通过 Bash login shell 执行一条命令并捕获输出。使用场景：当其他工具均无法使用或无法满足要求时，但是仍然需要运行构建、测试、格式化、版本控制或其他命令行操作时使用。\n"  # noqa: RUF001
+        "- `web_search`: 搜索公开 Web 后返回标准化的结果摘要。使用场景：需要查找线上资料、最新信息或来源，且尚不知道准确 URL 时使用。\n"  # noqa: RUF001
+        "- `web_fetch`: 获取 HTTP 或 HTTPS URL 中的可读内容。使用场景：已经知道目标 URL，需要读取或分析对应页面时使用。\n"  # noqa: RUF001
+        "- `schedule`: 创建、查看和删除一次性或周期性的 Schedule Job。使用场景：需要设置提醒、延后执行、周期运行或管理已有计划任务时使用。\n\n\n"  # noqa: RUF001
+        "## Long-term Memory\n\n"
+        "以下内容是当前 Workspace 的 Long-term Memory:\n\n"
         "# Memory\n"
-        "</long_term_memory>\n\n"
-        "<tool_guidance>\n"
-        "- read_file: Read UTF-8 text lines from a file within the current Workspace.\n"
-        "- write_file: Write UTF-8 text to a file within the current Workspace.\n"
-        "- edit_file: Replace exact UTF-8 text in a file within the current Workspace.\n"
-        "- list_dir: List files and directories within a directory root.\n"
-        "- glob: Match files and directories beneath a directory root.\n"
-        "- grep: Search UTF-8 text in a file or directory.\n"
-        "- exec: Run one Bash login-shell command with captured output in the current Workspace.\n"
-        "- web_search: Search the public web and return normalized result summaries.\n"
-        "- web_fetch: Fetch readable content from an HTTP or HTTPS URL.\n"
-        "- schedule: Manage one-time and recurring Schedule Jobs.</tool_guidance>"
     )
 
 
