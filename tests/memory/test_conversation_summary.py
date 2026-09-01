@@ -10,6 +10,7 @@ import pytest
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import _project_foreground_messages, _project_schedule_messages
+from myclaw.agent.prompts import conversation_summary_prompt
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.memory.conversation_summary import ConversationSummaryManager
@@ -856,10 +857,7 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
     assert isinstance(messages, list)
     assert messages[0] == {
         "role": "system",
-        "content": (
-            "Summarize the provided earlier conversation messages.\n"
-            "Preserve decisions, user intent, important facts, and unresolved work concisely."
-        ),
+        "content": conversation_summary_prompt(),
     }
     assert messages[1]["role"] == "user"
     assert "First question." in messages[1]["content"]

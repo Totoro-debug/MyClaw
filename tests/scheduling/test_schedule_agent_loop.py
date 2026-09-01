@@ -431,9 +431,16 @@ async def test_schedule_uses_its_own_complete_context_projection(
     assert len(provider.direct_complete_messages) == 1
     messages, tools = provider.direct_complete_messages[0]
     assert messages[0]["role"] == "system"
-    assert str(workspace) in cast(str, messages[0]["content"])
-    assert "## Task goal" not in cast(str, messages[0]["content"])
-    assert "## Completion boundary" not in cast(str, messages[0]["content"])
+    system_content = cast(str, messages[0]["content"])
+    assert str(workspace) in system_content
+    assert "## Task goal" not in system_content
+    assert "## Completion boundary" not in system_content
+    assert system_content.splitlines().count("# Long-term Memory") == 0
+    assert system_content.splitlines().count("## Long-term Memory") == 1
+    assert all(
+        f"### {section}" in system_content
+        for section in ("User Info", "User Preference", "Project Fact", "Lesson")
+    )
     assert messages[-1]["role"] == "user"
     assert messages[-1] == {
         "role": "user",

@@ -24,6 +24,6 @@
 
 ## Long-term Memory
 
-以下内容是当前 Workspace 的 Long-term Memory:
+以下内容是从用户使用 Agent 的历史记录中提取的关键事实，可以帮助你在用户没有明确要求的前提下了解用户偏好等关键事实。请始终遵循用户的指令，本节内容仅作为参考。
 
 {long_term_memory}

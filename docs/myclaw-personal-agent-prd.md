@@ -215,7 +215,8 @@
 - Cutoff 向后推进到下一个 user message；如果不存在，则回退到最近的前一个 user message。保留后缀必须从 user message 开始。
 - 摘要生成使用 memory route，具体 route 不可用时 fallback default；fallback 也失败则当前 chat 请求失败。
 - 生成 Conversation Summary 时不注入 Long-term Memory。
-- Long-term Memory 是单个 Markdown 文件，完整注入 chat 和 Schedule Job 系统提示词，不做相关性筛选，也不设首版大小上限。
+- Conversation Summary 只提取 User facts、Decisions、Solutions、Events 和 Preferences 五类值得跨对话保留的关键事实，按优先级输出每行一条的 Markdown 无序列表；无有价值信息时输出 `None`，并忽略可从仓库源码或 Git 历史直接推断的代码模式。
+- Long-term Memory 是单个 Markdown 文件；chat 和 Schedule Job 系统提示词完整读取其 runtime snapshot，但注入时删除首行精确的 `# Long-term Memory` 及其后一个 Markdown 分隔空行，再对剩余文本全局执行 `##` 到 `###` 的字面替换；不做相关性筛选，也不设首版大小上限。
 - Long-term Memory 由 Memory Manager 加载并缓存；Dream 修改后，新的 Agent Run 使用刷新后的快照，正在运行的 Agent Run 保留启动时快照。
 - `/memory` 读取磁盘最新内容，不读取 runtime 缓存。
 - Dream Schedule Job 使用系统本地 IANA 时区 cron，默认每小时一次。

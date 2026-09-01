@@ -138,6 +138,43 @@ def test_foreground_chat_system_prompt_matches_stable_base_without_skills() -> N
     )
 
 
+def test_chat_prompts_project_long_term_memory_heading_levels() -> None:
+    memory = "# Long-term Memory\n\n## User Info\n\nInline ## marker.\n\n### Nested Detail\n"
+    base = chat_system_prompt(
+        workspace=PureWindowsPath(r"D:\\workspace"),
+        agent_home=PureWindowsPath(r"D:\\agent-home"),
+        long_term_memory=memory,
+    )
+
+    assert base.endswith(
+        "## Long-term Memory\n\n"
+        "以下内容是当前 Workspace 的 Long-term Memory:\n\n"
+        "### User Info\n\n"
+        "Inline ### marker.\n\n"
+        "#### Nested Detail\n"
+    )
+    assert base.splitlines().count("# Long-term Memory") == 0
+    assert base.splitlines().count("## Long-term Memory") == 1
+    assert (
+        foreground_chat_system_prompt(
+            workspace=PureWindowsPath(r"D:\\workspace"),
+            agent_home=PureWindowsPath(r"D:\\agent-home"),
+            long_term_memory=memory,
+        )
+        == base
+    )
+
+
+def test_chat_prompt_preserves_a_noncanonical_first_memory_line() -> None:
+    rendered = chat_system_prompt(
+        workspace=PureWindowsPath(r"D:\\workspace"),
+        agent_home=PureWindowsPath(r"D:\\agent-home"),
+        long_term_memory="# Other Memory\n\n## Fact\n",
+    )
+
+    assert rendered.endswith("# Other Memory\n\n### Fact\n")
+
+
 def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
     tmp_path: Path,
 ) -> None:
@@ -343,8 +380,21 @@ def test_specialized_model_templates_render_exact_prompts() -> None:
         "Return only the title. Do not call tools or add commentary."
     )
     assert conversation_summary_prompt() == (
-        "Summarize the provided earlier conversation messages.\n"
-        "Preserve decisions, user intent, important facts, and unresolved work concisely."
+        "请从本次对话中提取关键事实。仅输出符合以下类别的内容，其余内容一律忽略：\n\n"  # noqa: RUF001
+        "- User facts：个人信息、偏好、明确表达的观点及习惯。\n"  # noqa: RUF001
+        "- Decisions：已作出的选择或得出的结论。\n"  # noqa: RUF001
+        "- Solutions：通过反复尝试后验证有效的方法，尤其是在其他尝试失败后发现的非显而易见的解决方式。\n"  # noqa: RUF001
+        "- Events：计划、截止日期及其他值得记录的重要事项。\n"  # noqa: RUF001
+        "- Preferences：沟通风格及工具使用偏好。\n\n\n"  # noqa: RUF001
+        "## 优先级\n"
+        "User facts and preferences > solutions > decisions > events > environment facts。\n\n\n"
+        "## 输出\n"
+        "- 输出格式应该采用 Markdown 的无序列表格式，每一行只包含一条事实。\n"  # noqa: RUF001
+        "- 每条输出不要增加额外的说明、前提等内容。\n"
+        "- 如果没有任何有价值的信息，直接输出： `None`\n\n\n"  # noqa: RUF001
+        "## 要求\n"
+        "- 不要为了记录而提取过多内容，有价值、值得记录的事实是能够避免用户日后重复说明的信息。\n"  # noqa: RUF001
+        "- 在一个代码仓库中，应该忽略可直接从源代码或 Git 历史中推断出的代码模式。"  # noqa: RUF001
     )
     assert conversation_summary_input(messages='[{"role":"user","content":"Hi"}]') == (
         '<conversation_messages>\n[{"role":"user","content":"Hi"}]\n</conversation_messages>'

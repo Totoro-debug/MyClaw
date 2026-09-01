@@ -1,2 +1,22 @@
-Summarize the provided earlier conversation messages.
-Preserve decisions, user intent, important facts, and unresolved work concisely.
+请从本次对话中提取关键事实。仅输出符合以下类别的内容，其余内容一律忽略：
+
+- User facts：个人信息、偏好、明确表达的观点及习惯。
+- Decisions：已作出的选择或得出的结论。
+- Solutions：通过反复尝试后验证有效的方法，尤其是在其他尝试失败后发现的非显而易见的解决方式。
+- Events：计划、截止日期及其他值得记录的重要事项。
+- Preferences：沟通风格及工具使用偏好。
+
+
+## 优先级
+User facts and preferences > solutions > decisions > events > environment facts。
+
+
+## 输出
+- 输出格式应该采用 Markdown 的无序列表格式，每一行只包含一条事实。
+- 每条输出不要增加额外的说明、前提等内容。
+- 如果没有任何有价值的信息，直接输出： `None`
+
+
+## 要求
+- 不要为了记录而提取过多内容，有价值、值得记录的事实是能够避免用户日后重复说明的信息。
+- 在一个代码仓库中，应该忽略可直接从源代码或 Git 历史中推断出的代码模式。

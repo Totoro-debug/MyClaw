@@ -63,6 +63,18 @@ def runtime_context(*, current_time: datetime, session_id: str) -> str:
     )
 
 
+def _project_long_term_memory(long_term_memory: str) -> str:
+    """Nest the persisted Long-term Memory document in its prompt section."""
+    heading = "# Long-term Memory"
+    if long_term_memory == heading:
+        projected = ""
+    elif long_term_memory.startswith(f"{heading}\n"):
+        projected = long_term_memory.removeprefix(f"{heading}\n").removeprefix("\n")
+    else:
+        projected = long_term_memory
+    return projected.replace("##", "###")
+
+
 def chat_system_prompt(
     *,
     workspace: PurePath,
@@ -79,7 +91,7 @@ def chat_system_prompt(
         workspace=workspace,
         agent_home=agent_home,
         runtime=runtime,
-        long_term_memory=long_term_memory,
+        long_term_memory=_project_long_term_memory(long_term_memory),
     )
 
 

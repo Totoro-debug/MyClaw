@@ -455,7 +455,7 @@ chat 和 schedule 的共有 system-level context 按以下固定顺序组装：
 1. 基础 Markdown System Prompt 直接声明内置 identity，并包含 normalized absolute Workspace 与 composition-root 注入的 Agent Home path。
 2. host Runtime metadata，置于 `## Runtime` Markdown 章节，固定包含 `platform.system()`、`platform.machine()` 和当前 Python version 的结果。
 3. 固定 Tool Catalog 的中文 guidance，置于 `## Tool 使用指南` Markdown 章节；Tool 名称保持不变。
-4. 完整的 runtime-startup Long-term Memory snapshot，置于 `## Long-term Memory` Markdown 章节。
+4. 完整读取 runtime-startup Long-term Memory snapshot，并经固定 Markdown 投影后置于 `## Long-term Memory` 章节：删除首行精确的 `# Long-term Memory` 及其后一个 Markdown 分隔空行，再对剩余文本全局执行 `##` 到 `###` 的字面替换。
 
 User Configuration 不得插入或替换 identity/system prompt。缓存的 OpenAI-format Tool schema snapshots 通过 provider 的结构化 tools 字段发送，不把 JSON schema 重复拼入自然语言 guidance。
 
@@ -517,7 +517,7 @@ projection 不会去重、覆盖或额外修改该既有 block。
 - Session title：只接收规范化后的首条 user content，不注入 Long-term Memory、tools 或 conversation history。
 - Task Framing：只接收 previous Blackboard、latest assistant content 和 current raw user input 组成的 compact JSON，使用独立 system prompt 且 `tools=()`。
 - Manual Skill invocation：Title 仍可接收 current raw slash input；Task Framing call count、Blackboard projection 与 Task Framing usage 均为 `0`。只有最终 foreground context 接收 typed invocation。手动 body 与 extracted request 在同一个 current `user` message 的不同 JSON-delimited blocks 中各出现一次，不能写入 Session、Blackboard 或 System Prompt；已有 `metadata.blackboard` 不更新也不删除，unknown/non-matching slash input 继续 ordinary foreground input。
-- Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory、Tool Catalog、Skill metadata 或 Skill body。
+- Conversation Summary：只接收本次选中的早期 Session messages，不注入 Long-term Memory、Tool Catalog、Skill metadata 或 Skill body；system prompt 只允许提取 User facts、Decisions、Solutions、Events 和 Preferences 五类关键事实，要求每行一条 Markdown 无序列表，无有价值信息时输出 `None`，并忽略可从仓库源码或 Git 历史直接推断的代码模式。
 - Dream：接收 Summary Cursor 后的 batch 和四分区维护规则，并只暴露 restricted memory tools。
 - User Schedule Job：使用共有 chat/schedule system composition，把 Job message 作为 Schedule Session 的普通 user message，不接收 Skill metadata。Dream System Job 只触发 Dream，不生成该 prompt。Session title、Task Framing 和 Dream 同样不接收 Skill metadata。
 
