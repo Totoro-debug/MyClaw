@@ -11,7 +11,7 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.agent.blackboard import Blackboard, TaskFramingEvaluator
+from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import InboundMessage, MessageBus
 from myclaw.agent.workspace_state import WorkspaceState
@@ -36,7 +36,7 @@ from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
-from tests.fixtures import DeterministicTaskFramingEvaluator
+from tests.fixtures import DeterministicBlackboardGenerator
 
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
 JOB_ID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -264,7 +264,7 @@ def _loop(
         Awaitable[list[dict[str, Any]]],
     ] = _schedule_context,
     externalize_result_for: Callable[[Session], Callable[[ToolResult], ToolResult]] | None = None,
-    task_framer: TaskFramingEvaluator | None = None,
+    blackboard_generator: Any | None = None,
 ) -> tuple[AgentLoop, WorkspaceState, ScheduleService, MessageBus]:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
@@ -302,8 +302,8 @@ def _loop(
         new_uuid=lambda: JOB_ID,
         monotonic_now=lambda: 0.0,
     )
-    if task_framer is not None:
-        object.__setattr__(loop, "_task_framer", task_framer)
+    if blackboard_generator is not None:
+        object.__setattr__(loop, "_generate_blackboard", blackboard_generator.generate)
     if skill_loader is not None:
         loop._skill_loader = skill_loader
         loop._context_builder._skill_loader = skill_loader
@@ -352,8 +352,8 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
     tmp_path: Path,
 ) -> None:
     router = _ScheduleRouter()
-    framer = DeterministicTaskFramingEvaluator()
-    loop, state, _, _bus = _loop(tmp_path, router, task_framer=framer)
+    generator = DeterministicBlackboardGenerator()
+    loop, state, _, _bus = _loop(tmp_path, router, blackboard_generator=generator)
 
     outbound = asyncio.create_task(_bus.get_outbound())
     await loop.run_schedule_job(_job())
@@ -375,7 +375,7 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
     assert schedule_session.messages[-1]["content"] == "scheduled result"
     assert router.routes == ["schedule"]
     assert router.requests[0][1] == 10
-    assert framer.calls == 0
+    assert generator.calls == 0
 
 
 @pytest.mark.asyncio
@@ -842,7 +842,7 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
         new_uuid=lambda: JOB_ID,
         monotonic_now=lambda: 0.0,
     )
-    object.__setattr__(loop, "_task_framer", DeterministicTaskFramingEvaluator())
+    object.__setattr__(loop, "_generate_blackboard", DeterministicBlackboardGenerator().generate)
     object.__setattr__(loop, "_prepare_foreground_context", _foreground_context)
     object.__setattr__(loop, "_prepare_schedule_context", _schedule_context)
     await loop.start()

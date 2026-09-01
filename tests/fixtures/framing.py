@@ -3,13 +3,13 @@ import asyncio
 from myclaw.agent.blackboard import Blackboard, FramingResult
 
 
-class DeterministicTaskFramingEvaluator:
+class DeterministicBlackboardGenerator:
     """Resolve to an empty Blackboard with a neutral usage delta."""
 
     def __init__(self) -> None:
         self.calls = 0
 
-    async def frame(
+    async def generate(
         self,
         *,
         previous: Blackboard | None,
@@ -30,14 +30,14 @@ class DeterministicTaskFramingEvaluator:
         )
 
 
-class BlockingTaskFramingEvaluator:
+class BlockingBlackboardGenerator:
     """Block until cancellation and expose deterministic lifecycle handshakes."""
 
     def __init__(self) -> None:
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
 
-    async def frame(
+    async def generate(
         self,
         *,
         previous: Blackboard | None,

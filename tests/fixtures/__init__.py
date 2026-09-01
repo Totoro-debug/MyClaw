@@ -3,8 +3,8 @@
 from tests.fixtures.agent_loop import collect_foreground_outbound
 from tests.fixtures.clock import FakeClock
 from tests.fixtures.framing import (
-    BlockingTaskFramingEvaluator,
-    DeterministicTaskFramingEvaluator,
+    BlockingBlackboardGenerator,
+    DeterministicBlackboardGenerator,
 )
 from tests.fixtures.gateway import SingleToolGateway
 from tests.fixtures.provider import (
@@ -18,8 +18,8 @@ from tests.fixtures.schedule import write_schedule_state
 from tests.fixtures.tool import FakeTool, FakeToolCall
 
 __all__ = [
-    "BlockingTaskFramingEvaluator",
-    "DeterministicTaskFramingEvaluator",
+    "BlockingBlackboardGenerator",
+    "DeterministicBlackboardGenerator",
     "FakeClock",
     "FakeTool",
     "FakeToolCall",

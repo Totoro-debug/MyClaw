@@ -23,8 +23,8 @@ from myclaw.provider.models import AssistantModelMessage, ModelCompleted, ModelR
 from myclaw.skills.catalog import SkillMetadata
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
-    BlockingTaskFramingEvaluator,
-    DeterministicTaskFramingEvaluator,
+    BlockingBlackboardGenerator,
+    DeterministicBlackboardGenerator,
     ScriptedFakeProvider,
     StreamScript,
     collect_foreground_outbound,
@@ -194,7 +194,9 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
 
     def recording_init(loop: AgentLoop, *args: Any, **kwargs: Any) -> None:
         original_init(loop, *args, **kwargs)
-        loop._task_framer = DeterministicTaskFramingEvaluator()
+        object.__setattr__(
+            loop, "_generate_blackboard", DeterministicBlackboardGenerator().generate
+        )
         constructed.append(loop)
 
     monkeypatch.setattr(AgentLoop, "__init__", recording_init)
@@ -262,13 +264,17 @@ async def test_cli_force_replacement_cancels_framing_without_old_session_late_wr
     configuration = _configuration(agent_home)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    blocker = BlockingTaskFramingEvaluator()
+    blocker = BlockingBlackboardGenerator()
     constructed: list[AgentLoop] = []
     original_init = AgentLoop.__init__
 
     def recording_init(loop: AgentLoop, *args: Any, **kwargs: Any) -> None:
         original_init(loop, *args, **kwargs)
-        loop._task_framer = blocker if not constructed else DeterministicTaskFramingEvaluator()
+        object.__setattr__(
+            loop,
+            "_generate_blackboard",
+            blocker.generate if not constructed else DeterministicBlackboardGenerator().generate,
+        )
         constructed.append(loop)
 
     class FramingAbortApp:

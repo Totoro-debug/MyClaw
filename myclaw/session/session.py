@@ -718,17 +718,15 @@ def _normalize_blackboard_metadata(
 ) -> None:
     if "blackboard" not in metadata:
         return
-    from myclaw.agent.blackboard import decode_blackboard, encode_blackboard
+    from myclaw.agent.blackboard import Blackboard
 
-    blackboard = decode_blackboard(metadata["blackboard"])
+    blackboard = Blackboard.from_dict(metadata["blackboard"])
     if blackboard is None:
         if invalid_is_absent:
             del metadata["blackboard"]
             return
         raise ValueError("metadata.blackboard must be a valid Blackboard")
-    encoded = encode_blackboard(blackboard)
-    assert encoded is not None
-    metadata["blackboard"] = encoded
+    metadata["blackboard"] = blackboard.to_dict()
 
 
 def _copy_metadata_updates(value: dict[str, Any] | None) -> dict[str, Any]:

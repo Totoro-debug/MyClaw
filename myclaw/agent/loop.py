@@ -18,10 +18,6 @@ from tzlocal import get_localzone_name
 from myclaw.agent.blackboard import (
     Blackboard,
     FramingResult,
-    TaskFramer,
-    TaskFramingEvaluator,
-    decode_blackboard,
-    encode_blackboard,
 )
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.message_bus import (
@@ -268,7 +264,6 @@ class AgentLoop:
             clock=now,
             skill_loader=skill_loader,
         )
-        task_framer: TaskFramingEvaluator = TaskFramer(model_router)
         tool_gateway = ToolGateway(
             workspace=workspace_path,
             schedule_service=schedule_service,
@@ -308,7 +303,6 @@ class AgentLoop:
         self._schedule_service = schedule_service
         self._context_builder = context_builder
         self._summary_manager = summary_manager
-        self._task_framer = task_framer
         self._now = now
         self._monotonic_now = monotonic_now
         self._schedule_now = schedule_service.current_time
@@ -924,16 +918,16 @@ class AgentLoop:
             return False
 
         if manual_invocation is None:
-            previous_blackboard = decode_blackboard(active_session.metadata.get("blackboard"))
+            previous_blackboard = Blackboard.from_dict(active_session.metadata.get("blackboard"))
             last_assistant_content = _latest_assistant_content(active_session)
             try:
-                framing_result = await self._task_framer.frame(
+                framing_result = await self._generate_blackboard(
                     previous=previous_blackboard,
                     last_assistant_content=last_assistant_content,
                     current_user_input=inbound.content,
                 )
                 if not isinstance(framing_result, FramingResult):
-                    raise TypeError("Task Framing evaluator returned an invalid result")
+                    raise TypeError("Blackboard generation returned an invalid result")
             except asyncio.CancelledError:
                 if not self._cancel_requested:
                     raise
@@ -1008,9 +1002,7 @@ class AgentLoop:
             metadata_updates = None
             metadata_removals = ("blackboard",)
         else:
-            encoded_blackboard = encode_blackboard(staged_blackboard)
-            assert encoded_blackboard is not None
-            metadata_updates = {"blackboard": encoded_blackboard}
+            metadata_updates = {"blackboard": staged_blackboard.to_dict()}
             metadata_removals = ()
 
         async with self._foreground_commit_gate:
@@ -1038,6 +1030,21 @@ class AgentLoop:
                 pass
         await self._publish_terminal(result)
         return True
+
+    async def _generate_blackboard(
+        self,
+        *,
+        previous: Blackboard | None,
+        last_assistant_content: str,
+        current_user_input: str,
+    ) -> FramingResult:
+        """Generate one staged Blackboard without retaining the Model Router on it."""
+        return await Blackboard.generate(
+            self._model_router,
+            previous=previous,
+            last_assistant_content=last_assistant_content,
+            current_user_input=current_user_input,
+        )
 
     async def _prepare_foreground_context(
         self,

@@ -28,7 +28,9 @@
 {User input}
 
 ### Last Task
+```json
 {Last Task}
+```
 
 ### Latest assistant content
 {Latest assistant content}

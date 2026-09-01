@@ -66,7 +66,7 @@ from myclaw.utils.json_types import JsonObject
 from tests.agent.test_fixed_catalog import _agent_loop as _direct_agent_loop
 from tests.agent.test_fixed_catalog import _FixedCatalogProvider, _response
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import DeterministicTaskFramingEvaluator, ProviderCall
+from tests.fixtures import DeterministicBlackboardGenerator, ProviderCall
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 TURN_ID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
@@ -969,7 +969,9 @@ async def _run_cli_terminal_case(
     class DeterministicAgentLoop(AgentLoop):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            self._task_framer = DeterministicTaskFramingEvaluator()
+            object.__setattr__(
+                self, "_generate_blackboard", DeterministicBlackboardGenerator().generate
+            )
 
     class ScenarioApp(TerminalConversationApp):
         async def run_async(self, **options: Any) -> None:

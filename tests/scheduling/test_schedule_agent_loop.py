@@ -44,7 +44,7 @@ from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
-    DeterministicTaskFramingEvaluator,
+    DeterministicBlackboardGenerator,
     FakeClock,
     ProviderCall,
     collect_foreground_outbound,
@@ -278,7 +278,9 @@ def _agent_loop(
         new_uuid=lambda: JOB_UUID,
         monotonic_now=schedule_clock.monotonic,
     )
-    loop._task_framer = DeterministicTaskFramingEvaluator()
+    object.__setattr__(
+        loop, "_generate_blackboard", DeterministicBlackboardGenerator().generate
+    )
     dispatcher = ManagementCommandDispatcher(
         management_service(
             home,

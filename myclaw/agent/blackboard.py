@@ -1,4 +1,4 @@
-"""Task Framing value objects and direct Model Route evaluator."""
+"""Blackboard task framing value object and direct Model Route generation."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ _NOT_PARSED = object()
 
 
 class TaskFramingModelRouter(Protocol):
-    """The direct chat completion seam used by Task Framing."""
+    """The direct chat completion seam used by Blackboard generation."""
 
     async def complete(
         self,
@@ -47,31 +47,90 @@ class Blackboard:
         object.__setattr__(self, "goal", goal)
         object.__setattr__(self, "completion_boundary", completion_boundary)
 
+    @classmethod
+    def from_dict(cls, value: object) -> Blackboard | None:
+        """Decode an optional persisted Blackboard shape without raising."""
+        if not isinstance(value, dict) or set(value) != {"goal", "completion_boundary"}:
+            return None
+        goal = value["goal"]
+        completion_boundary = value["completion_boundary"]
+        if not isinstance(goal, str) or not isinstance(completion_boundary, str):
+            return None
+        try:
+            return cls(goal=goal, completion_boundary=completion_boundary)
+        except (TypeError, ValueError):
+            return None
 
-def decode_blackboard(value: object) -> Blackboard | None:
-    """Decode an optional persisted Blackboard shape without raising."""
-    if not isinstance(value, dict) or set(value) != {"goal", "completion_boundary"}:
-        return None
-    goal = value["goal"]
-    completion_boundary = value["completion_boundary"]
-    if not isinstance(goal, str) or not isinstance(completion_boundary, str):
-        return None
-    try:
-        return Blackboard(goal=goal, completion_boundary=completion_boundary)
-    except (TypeError, ValueError):
-        return None
+    def to_dict(self) -> dict[str, str]:
+        """Encode this Blackboard using its canonical persisted shape."""
+        return {
+            "goal": self.goal,
+            "completion_boundary": self.completion_boundary,
+        }
 
+    @classmethod
+    async def generate(
+        cls,
+        router: TaskFramingModelRouter,
+        *,
+        previous: Blackboard | None,
+        last_assistant_content: str,
+        current_user_input: str,
+    ) -> FramingResult:
+        """Resolve one raw input using one isolated chat completion."""
+        _validate_frame_inputs(
+            previous=previous,
+            last_assistant_content=last_assistant_content,
+            current_user_input=current_user_input,
+        )
+        last_task = json.dumps(
+            (
+                None
+                if previous is None
+                else {
+                    "task_goal": previous.goal,
+                    "completion_boundary": previous.completion_boundary,
+                }
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        try:
+            response = await router.complete(
+                "chat",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": blackboard_prompt(
+                            user_input=current_user_input,
+                            last_task=last_task,
+                            latest_assistant_content=last_assistant_content,
+                        ),
+                    },
+                ],
+                tools=(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return FramingResult(
+                blackboard=None,
+                usage_delta=None,
+                status="model_failed",
+            )
 
-def encode_blackboard(value: Blackboard | None) -> dict[str, str] | None:
-    """Encode one canonical Blackboard or omit the optional value."""
-    if value is None:
-        return None
-    if not isinstance(value, Blackboard):
-        raise TypeError("value must be a Blackboard or None")
-    return {
-        "goal": value.goal,
-        "completion_boundary": value.completion_boundary,
-    }
+        usage_delta = {
+            "model_calls": 1,
+            **response.usage.to_dict(),
+        }
+        decision = _extract_decision(response.message.content)
+        resolved, blackboard = _reduce_decision(decision, previous)
+        return FramingResult(
+            blackboard=blackboard,
+            usage_delta=usage_delta,
+            status="resolved" if resolved else "invalid_response",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,87 +170,6 @@ class FramingResult:
             raise ValueError("Framing usage values must be nonnegative integers")
         if usage_issue == "total":
             raise ValueError("Framing usage total_tokens must equal input plus output")
-
-
-class TaskFramingEvaluator(Protocol):
-    """Public seam for evaluating one foreground input's task framing."""
-
-    async def frame(
-        self,
-        *,
-        previous: Blackboard | None,
-        last_assistant_content: str,
-        current_user_input: str,
-    ) -> FramingResult: ...
-
-
-class TaskFramer:
-    """Evaluate one raw foreground input against the previous Blackboard."""
-
-    def __init__(self, router: TaskFramingModelRouter) -> None:
-        self._router = router
-
-    async def frame(
-        self,
-        *,
-        previous: Blackboard | None,
-        last_assistant_content: str,
-        current_user_input: str,
-    ) -> FramingResult:
-        """Resolve one raw input using a single isolated chat completion."""
-        _validate_frame_inputs(
-            previous=previous,
-            last_assistant_content=last_assistant_content,
-            current_user_input=current_user_input,
-        )
-        last_task = json.dumps(
-            (
-                None
-                if previous is None
-                else {
-                    "task_goal": previous.goal,
-                    "completion_boundary": previous.completion_boundary,
-                }
-            ),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        try:
-            response = await self._router.complete(
-                "chat",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": blackboard_prompt(
-                            user_input=current_user_input,
-                            last_task=last_task,
-                            latest_assistant_content=last_assistant_content,
-                        ),
-                    },
-                ],
-                tools=(),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return FramingResult(
-                blackboard=None,
-                usage_delta=None,
-                status="model_failed",
-            )
-
-        usage_delta = {
-            "model_calls": 1,
-            **response.usage.to_dict(),
-        }
-        decision = _extract_decision(response.message.content)
-        resolved, blackboard = _reduce_decision(decision, previous)
-        return FramingResult(
-            blackboard=blackboard,
-            usage_delta=usage_delta,
-            status="resolved" if resolved else "invalid_response",
-        )
 
 
 def _validate_frame_inputs(
@@ -323,9 +301,5 @@ def _reduce_decision(
 __all__ = [
     "Blackboard",
     "FramingResult",
-    "TaskFramer",
-    "TaskFramingEvaluator",
     "TaskFramingModelRouter",
-    "decode_blackboard",
-    "encode_blackboard",
 ]

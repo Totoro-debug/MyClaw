@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from myclaw.agent.blackboard import Blackboard, encode_blackboard
+from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.prompts import current_user_input, foreground_chat_system_prompt
 from myclaw.session.projection import project_session_message
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
@@ -58,7 +58,9 @@ class ContextBuilder:
             manual_invocation, ManualSkillInvocation
         ):
             raise TypeError("Context Builder requires a Manual Skill Invocation")
-        blackboard_projection = encode_blackboard(blackboard)
+        if blackboard is not None and not isinstance(blackboard, Blackboard):
+            raise TypeError("value must be a Blackboard or None")
+        blackboard_projection = None if blackboard is None else blackboard.to_dict()
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",

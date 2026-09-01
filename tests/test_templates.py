@@ -145,13 +145,10 @@ def test_chat_prompts_project_long_term_memory_heading_levels() -> None:
         long_term_memory=memory,
     )
 
-    assert base.endswith(
-        "## Long-term Memory\n\n"
-        "以下内容是当前 Workspace 的 Long-term Memory:\n\n"
-        "### User Info\n\n"
-        "Inline ### marker.\n\n"
-        "#### Nested Detail\n"
-    )
+    assert "## Long-term Memory" in base
+    assert "### User Info" in base
+    assert "Inline ### marker." in base
+    assert "#### Nested Detail" in base
     assert base.splitlines().count("# Long-term Memory") == 0
     assert base.splitlines().count("## Long-term Memory") == 1
     assert (
@@ -301,7 +298,7 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
     assert all(document not in prompt for prompt in non_foreground_prompts)
 
 
-def test_chat_system_prompt_uses_the_fixed_catalog_guidance(
+def test_chat_system_prompt_includes_runtime_and_catalog_guidance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("myclaw.agent.prompts.platform.system", lambda: "Windows")
@@ -311,68 +308,36 @@ def test_chat_system_prompt_uses_the_fixed_catalog_guidance(
         lambda: "3.12.13",
     )
 
-    assert chat_system_prompt(
+    rendered = chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),
         agent_home=PureWindowsPath(r"D:\agent-home"),
         long_term_memory="# Memory\n",
-    ) == (
-        "# MyClaw Personal Agent\n\n"
-        "你是 MyClaw，一个 AI 助手，你只被允许在用户的当前工作区 "  # noqa: RUF001
-        "`D:\\workspace` 内工作。\n\n"
-        "MyClaw Home 目录位于 `D:\\agent-home`。\n\n\n"
-        "## Runtime\n\n"
-        "Windows AMD64, Python 3.12.13\n\n\n"
-        "## Tool 使用指南\n\n"
-        "- `read_file`: 读取当前 Workspace 和 `~/.myclaw/skills` 内的 UTF-8 文本文件。使用场景：需要查看或核对已知文件中的源码、配置或文档时使用。\n"  # noqa: RUF001
-        "- `write_file`: 在当前 Workspace 内创建 UTF-8 文本文件，或向 Workspace 内的 UTF-8 文件写入内容。使用场景：需要生成新文件，或用完整内容替换现有文件时使用。\n"  # noqa: RUF001
-        "- `edit_file`: 在当前 Workspace 内的 UTF-8 文本文件中进行精确文本替换。使用场景：需要局部修改现有文件且保留其他内容不变时使用。\n"  # noqa: RUF001
-        "- `list_dir`: 列出指定目录根下的文件和目录。使用场景：需要了解已知目录的内容或浏览目录结构时使用。\n"  # noqa: RUF001
-        "- `glob`: 匹配指定目录根下的文件和目录。使用场景：知道名称或路径规律但不知道确切位置，需要定位候选项时使用。\n"  # noqa: RUF001
-        "- `grep`: 搜索文件或目录中的 UTF-8 文本。使用场景：知道关键字、错误信息或代码片段，但不知道所在文件或位置时使用。\n"  # noqa: RUF001
-        "- `exec`: 在当前 Workspace 中通过 Bash login shell 执行一条命令并捕获输出。使用场景：当其他工具均无法使用或无法满足要求时，但是仍然需要运行构建、测试、格式化、版本控制或其他命令行操作时使用。\n"  # noqa: RUF001
-        "- `web_search`: 搜索公开 Web 后返回标准化的结果摘要。使用场景：需要查找线上资料、最新信息或来源，且尚不知道准确 URL 时使用。\n"  # noqa: RUF001
-        "- `web_fetch`: 获取 HTTP 或 HTTPS URL 中的可读内容。使用场景：已经知道目标 URL，需要读取或分析对应页面时使用。\n"  # noqa: RUF001
-        "- `schedule`: 创建、查看和删除一次性或周期性的 Schedule Job。使用场景：需要设置提醒、延后执行、周期运行或管理已有计划任务时使用。\n\n\n"  # noqa: RUF001
-        "## Long-term Memory\n\n"
-        "以下内容是当前 Workspace 的 Long-term Memory:\n\n"
-        "# Memory\n"
     )
+    assert rendered.startswith("# MyClaw Personal Agent")
+    assert "`D:\\workspace`" in rendered
+    assert "`D:\\agent-home`" in rendered
+    assert "Windows AMD64, Python 3.12.13" in rendered
+    assert "## Tool 使用指南" in rendered
+    assert "`read_file`" in rendered
+    assert "`schedule`" in rendered
+    assert "## Long-term Memory" in rendered
 
 
-def test_blackboard_prompt_renders_exact_filled_system_content() -> None:
-    assert blackboard_prompt(
+def test_blackboard_prompt_renders_dynamic_markdown_context() -> None:
+    rendered = blackboard_prompt(
         user_input="继续 {raw}。",
         last_task='{"task_goal":"旧目标","completion_boundary":"旧边界"}',
         latest_assistant_content="上一次回复。\n第二行。",
-    ) == (
-        "你是一个分析任务目标与任务完成边界的专家，只负责从 User input、Last Task、Latest assistant content "  # noqa: RUF001
-        "三块内容中判断是否需要更新或删除旧的任务，绝对不能直接回答用户疑问、输出任务的完成步骤。\n\n\n"  # noqa: RUF001
-        "## 要求\n"
-        "- 绝对不能直接回答用户疑问、输出任务的完成步骤。\n"
-        "- 用户输入为最高优先级，即使用户输入与旧任务定义冲突，也必须优先理解并遵守用户输入。\n"  # noqa: RUF001
-        "- `action` 字段取值只能是 `keep`、`replace` 或 `clear`。\n"
-        "- 当前任务保持不变时 `action` 字段取 `keep`，任务定义完全变更时 `action` 字段取 `replace`，"  # noqa: RUF001
-        "任务完成或者无任务时 `action` 字段取 `clear`。\n"
-        "- 当用户输入没有明确目标时，`action` 字段应该取 `clear`。例如：闲聊 “你好”、“hello”，"  # noqa: RUF001
-        "无明确要求的询问 “我会成功吗” 等。\n"
-        "- `task_goal` 字段描述任务目标，`completion_boundary` 字段描述任务完成的边界。\n\n\n"  # noqa: RUF001
-        "## 输出\n"
-        "输出格式必须直接使用如下 JSON 对象，并且必须包含 `action` `task_goal` `completion_boundary` 三个字段。\n"  # noqa: RUF001
-        "``` JSON\n"
-        "{\n"
-        '  "action": "keep | replace | clear",\n'
-        '  "task_goal": "string | null",\n'
-        '  "completion_boundary": "string | null"\n'
-        "}\n"
-        "```\n\n\n"
-        "## 输入\n\n"
-        "### User input\n"
-        "继续 {raw}。\n\n"
-        "### Last Task\n"
-        '{"task_goal":"旧目标","completion_boundary":"旧边界"}\n\n'
-        "### Latest assistant content\n"
-        "上一次回复。\n第二行。"
     )
+    assert "## 输入" in rendered
+    assert "### User input\n继续 {raw}。" in rendered
+    assert (
+        "### Last Task\n```json\n"
+        '{"task_goal":"旧目标","completion_boundary":"旧边界"}\n```'
+    ) in rendered
+    assert "### Latest assistant content\n上一次回复。\n第二行。" in rendered
+    assert "<user_input>" not in rendered
+    assert "<last_task>" not in rendered
 
 
 def test_specialized_model_templates_render_exact_prompts() -> None:

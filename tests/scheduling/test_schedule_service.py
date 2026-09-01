@@ -36,7 +36,7 @@ from myclaw.utils import scheduler as scheduler_module
 from myclaw.utils.scheduler import AsyncioSchedulerClock
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
-    DeterministicTaskFramingEvaluator,
+    DeterministicBlackboardGenerator,
     ProviderCall,
     ScriptedFakeProvider,
     collect_foreground_outbound,
@@ -348,7 +348,9 @@ def _agent_loop(
         new_uuid=lambda: OTHER_UUID,
         monotonic_now=schedule_clock.monotonic,  # type: ignore[attr-defined]
     )
-    loop._task_framer = DeterministicTaskFramingEvaluator()
+    object.__setattr__(
+        loop, "_generate_blackboard", DeterministicBlackboardGenerator().generate
+    )
     return loop, router, schedule, bus
 
 
