@@ -14,6 +14,7 @@ from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
+from myclaw.session.projection import _last_user_index
 from myclaw.session.session import Session
 from myclaw.templates import render_template
 from myclaw.tools.base import OpenAIToolSchema
@@ -267,13 +268,6 @@ def _projected_history_bytes(messages: Sequence[dict[str, Any]]) -> int:
         len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         for message in messages[1:history_end]
     )
-
-
-def _last_user_index(messages: Sequence[dict[str, Any]]) -> int:
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "user":
-            return index
-    return len(messages)
 
 
 def _summary_system_prompt() -> str:

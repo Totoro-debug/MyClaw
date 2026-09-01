@@ -12,7 +12,7 @@ import pytest
 import myclaw.agent.context as context
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.loop import _project_foreground_messages, _project_schedule_messages
+from myclaw.agent.loop import _project_schedule_messages
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.memory.manager import MemoryManager
 from myclaw.skills.catalog import (
@@ -117,11 +117,9 @@ def test_context_builder_builds_system_history_and_current_user_in_order(
         "timestamp": "2026-08-16T12:00:00.000+08:00",
     }
 
-    messages = builder.build_messages(
-        history=history,
-        current_user=current_user,
+    messages = builder.build_foreground_messages(
+        [*history, current_user],
         session_id="20260816-120000-000000_550e8400-e29b-41d4-a716-446655440000",
-        long_term_memory="# Memory\nRemember this.",
     )
 
     assert [message["role"] for message in messages] == ["system", "user", "assistant", "user"]
@@ -130,7 +128,7 @@ def test_context_builder_builds_system_history_and_current_user_in_order(
     assert f"`{workspace}`" in system_prompt
     assert f"`{agent_home}`" in system_prompt
     assert "Windows AMD64, Python 3.12.13" in system_prompt
-    assert "Remember this." in system_prompt
+    assert "# Long-term Memory" in system_prompt
     assert messages[1] == {"role": "user", "content": "Earlier question."}
     assert messages[2] == {
         "role": "assistant",
@@ -148,6 +146,82 @@ def test_context_builder_builds_system_history_and_current_user_in_order(
         ),
     }
     assert all("timestamp" not in message for message in messages)
+
+
+def test_context_builder_builds_foreground_request_from_one_ordered_input(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    builder = _builder(monkeypatch, workspace, "UTC")
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "Earlier question.", "timestamp": "old"},
+        {
+            "role": "assistant",
+            "content": "Earlier answer.",
+            "tool_calls": [],
+            "status": "completed",
+            "timestamp": "old",
+        },
+        {"role": "user", "content": "Current question.", "timestamp": "old"},
+        {
+            "role": "assistant",
+            "content": "Current tool call.",
+            "tool_calls": [{"id": "call-1", "name": "read_file", "arguments": "{}"}],
+            "status": "completed",
+            "timestamp": "old",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "content": "Tool output.",
+            "status": "success",
+            "artifact": None,
+            "timestamp": "old",
+        },
+    ]
+    original_messages = deepcopy(messages)
+
+    projected = builder.build_foreground_messages(messages, session_id="session-id")
+
+    assert [message["role"] for message in projected] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert projected[1:3] == [
+        {"role": "user", "content": "Earlier question."},
+        {"role": "assistant", "content": "Earlier answer.", "tool_calls": []},
+    ]
+    assert projected[3] == {
+        "role": "user",
+        "content": (
+            "## Runtime Context\n\n"
+            "- Current time: 2026-08-16T04:05:06.789+00:00\n"
+            "- Session ID: session-id\n\n"
+            "## User Input\n\n"
+            "Current question."
+        ),
+    }
+    assert projected[4:] == [
+        {
+            "role": "assistant",
+            "content": "Current tool call.",
+            "tool_calls": [
+                {"id": "call-1", "name": "read_file", "arguments": "{}"}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "content": "Tool output.",
+        },
+    ]
+    assert messages == original_messages
 
 
 def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt(
@@ -173,11 +247,9 @@ def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt
         skill_loader=loader,
     )
 
-    messages = builder.build_messages(
-        history=[],
-        current_user={"role": "user", "content": "Plan this."},
+    messages = builder.build_foreground_messages(
+        [{"role": "user", "content": "Plan this."}],
         session_id="session-id",
-        long_term_memory="memory",
     )
 
     system_prompt = messages[0]["content"]
@@ -233,11 +305,9 @@ def test_context_builder_projects_tool_and_interrupted_history_without_mutating_
     original_history = deepcopy(history)
     original_current_user = deepcopy(current_user)
 
-    messages = builder.build_messages(
-        history=history,
-        current_user=current_user,
+    messages = builder.build_foreground_messages(
+        [*history, current_user],
         session_id="session-id",
-        long_term_memory="memory",
     )
 
     assert messages[1] == {
@@ -288,11 +358,9 @@ def test_context_builder_projects_markdown_blackboard_only_into_current_user(
     current_user: dict[str, Any] = {"role": "user", "content": "Current", "timestamp": "old"}
     original_history = deepcopy(history)
     original_current_user = deepcopy(current_user)
-    messages = builder.build_messages(
-        history=history,
-        current_user=current_user,
+    messages = builder.build_foreground_messages(
+        [*history, current_user],
         session_id="session-id",
-        long_term_memory="memory",
         blackboard=blackboard,
     )
 
@@ -344,11 +412,9 @@ def test_context_builder_projects_manual_skill_and_request_as_safe_distinct_bloc
     original_current_user = deepcopy(current_user)
     blackboard = Blackboard(goal="Keep the task", completion_boundary="Finish the request")
 
-    messages = builder.build_messages(
-        history=history,
-        current_user=current_user,
+    messages = builder.build_foreground_messages(
+        [*history, current_user],
         session_id="session-id",
-        long_term_memory="memory",
         blackboard=blackboard,
         manual_invocation=invocation,
     )
@@ -376,9 +442,8 @@ def test_context_builder_projects_manual_skill_and_request_as_safe_distinct_bloc
     assert r"\u0060\u0060\u0060" in request_block
     assert current_content.count(body) == 0
     assert current_content.count(request) == 0
-    assert current_content.endswith(
-        "## Task goal\n\nKeep the task\n\n## Completion boundary\n\nFinish the request"
-    )
+    assert "## Task goal" not in current_content
+    assert "## Completion boundary" not in current_content
     assert history == original_history
     assert current_user == original_current_user
 
@@ -582,11 +647,9 @@ def test_runtime_lane_projections_keep_current_turn_continuation_separate(
         },
     ]
 
-    foreground = _project_foreground_messages(
-        builder,
+    foreground = builder.build_foreground_messages(
         messages,
         session_id="session-id",
-        long_term_memory="memory",
         blackboard=Blackboard(goal="Current task", completion_boundary="Current boundary"),
     )
     schedule = _project_schedule_messages(

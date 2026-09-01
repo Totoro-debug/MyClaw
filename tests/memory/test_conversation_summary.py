@@ -10,7 +10,7 @@ import pytest
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.loop import _project_foreground_messages, _project_schedule_messages
+from myclaw.agent.loop import _project_schedule_messages
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.memory.conversation_summary import ConversationSummaryManager
@@ -743,11 +743,9 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
         def project_messages(
             messages: Sequence[dict[str, Any]],
         ) -> list[dict[str, Any]]:
-            return _project_foreground_messages(
-                context,
+            return context.build_foreground_messages(
                 messages,
                 session_id=session.session_id,
-                long_term_memory="memory",
             )
 
     else:
@@ -807,11 +805,9 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
     projected_calls: list[list[dict[str, Any]]] = []
 
     def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-        projected = _project_foreground_messages(
-            context,
+        projected = context.build_foreground_messages(
             messages,
             session_id=session.session_id,
-            long_term_memory="memory",
             blackboard=blackboard,
         )
         projected_calls.append(deepcopy(projected))

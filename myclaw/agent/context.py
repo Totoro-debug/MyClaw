@@ -19,7 +19,7 @@ from myclaw.agent.prompts import (
     session_title_prompt as render_session_title_prompt,
 )
 from myclaw.memory.manager import MemoryManager
-from myclaw.session.projection import project_session_message
+from myclaw.session.projection import _last_user_index, project_session_message
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
 
 
@@ -86,73 +86,63 @@ class ContextBuilder:
         session_id: str,
     ) -> list[dict[str, Any]]:
         """Build the minimum foreground request used by status and preflight."""
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.foreground_system_prompt()}
-        ]
-        messages.extend(
-            projected
-            for message in history
-            if (projected := project_session_message(message)) is not None
+        return self.build_foreground_messages(
+            [*history, {"role": "user", "content": ""}],
+            session_id=session_id,
         )
-        messages.append(
-            {
-                "role": "user",
-                "content": current_user_input(
-                    content="",
-                    current_time=datetime.now(self._timezone),
-                    session_id=session_id,
-                ),
-            }
-        )
-        return messages
 
-    def build_messages(
+    def build_foreground_messages(
         self,
-        history: Sequence[dict[str, Any]],
-        current_user: dict[str, Any],
-        session_id: str,
-        long_term_memory: str,
+        messages: Sequence[dict[str, Any]],
         *,
+        session_id: str,
         blackboard: Blackboard | None = None,
         manual_invocation: ManualSkillInvocation | None = None,
     ) -> list[dict[str, Any]]:
-        """Build system-first context without mutating any caller-owned message."""
+        """Build the canonical initial Model Request Context for a foreground turn."""
         if manual_invocation is not None and not isinstance(
             manual_invocation, ManualSkillInvocation
         ):
             raise TypeError("Context Builder requires a Manual Skill Invocation")
         if blackboard is not None and not isinstance(blackboard, Blackboard):
             raise TypeError("value must be a Blackboard or None")
-        blackboard_projection = None if blackboard is None else blackboard.to_dict()
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": foreground_chat_system_prompt(
-                    workspace=self._workspace,
-                    agent_home=self._agent_home,
-                    long_term_memory=long_term_memory,
-                    skill_loader=self._skill_loader,
-                ),
-            }
+        current_user_index = _last_user_index(messages)
+        projected = [
+            {"role": "system", "content": self.foreground_system_prompt()},
         ]
-        messages.extend(
-            projected
-            for message in history
-            if (projected := project_session_message(message)) is not None
-        )
-        messages.append(
+        if current_user_index == len(messages):
+            projected.extend(_project_history_messages(messages))
+            return projected
+
+        projected.extend(_project_history_messages(messages[:current_user_index]))
+        projected.append(
             {
                 "role": "user",
                 "content": current_user_input(
-                    content=deepcopy(current_user["content"]),
+                    content=deepcopy(messages[current_user_index]["content"]),
                     current_time=datetime.now(self._timezone),
                     session_id=session_id,
-                    blackboard_projection=blackboard_projection,
+                    blackboard_projection=(
+                        None
+                        if manual_invocation is not None or blackboard is None
+                        else blackboard.to_dict()
+                    ),
                     manual_invocation=manual_invocation,
                 ),
             }
         )
-        return messages
+        projected.extend(_project_history_messages(messages[current_user_index + 1 :]))
+        return projected
+
+
+def _project_history_messages(
+    messages: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        projected
+        for message in messages
+        if (projected := project_session_message(message)) is not None
+    ]
 
 
 __all__ = ["ContextBuilder"]

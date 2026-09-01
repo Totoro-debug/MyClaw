@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from myclaw.agent.context import ContextBuilder
+from myclaw.session import projection as session_projection
 
 PROJECT_ROOT = Path(__file__).parents[2]
 PACKAGE_ROOT = PROJECT_ROOT / "myclaw"
@@ -190,6 +191,68 @@ def test_agent_loop_does_not_retain_a_title_prompt_outside_context_builder() -> 
     ]
 
     assert retained_title_prompts == []
+
+
+def test_agent_loop_delegates_foreground_context_construction_to_context_builder() -> None:
+    path = PACKAGE_ROOT / "agent" / "loop.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    agent_loop = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
+    )
+    methods = {
+        node.name: node
+        for node in agent_loop.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+    }
+
+    def calls_builder(method_name: str, builder_method: str) -> bool:
+        method = methods[method_name]
+        return any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == builder_method
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "_context_builder"
+            for node in ast.walk(method)
+        )
+
+    assert "render_template" not in source
+    assert "build_messages" not in source
+    assert "_project_foreground_messages" not in source
+    assert calls_builder("_prepare_foreground_context", "build_foreground_messages")
+    assert calls_builder("_project_foreground_summary_messages", "build_foreground_messages")
+
+
+def test_issue_209_preserves_schedule_context_ownership_for_issue_210() -> None:
+    path = PACKAGE_ROOT / "agent" / "loop.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    agent_loop = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
+    )
+    prepare_schedule = next(
+        node
+        for node in agent_loop.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_prepare_schedule_context"
+    )
+
+    assert not hasattr(ContextBuilder, "build_schedule_messages")
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_project_schedule_messages"
+        for node in ast.walk(prepare_schedule)
+    )
+
+
+def test_session_projection_current_turn_helper_remains_internal() -> None:
+    assert session_projection.__all__ == ["project_session_message"]
+    assert not hasattr(session_projection, "last_user_index")
+    assert hasattr(session_projection, "_last_user_index")
 
 
 def test_agent_modules_do_not_depend_on_terminal_presentation() -> None:

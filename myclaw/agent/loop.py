@@ -47,7 +47,6 @@ from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.conversation_summary import (
     ConversationSummaryManager,
     SummaryModelRouter,
-    _last_user_index,
 )
 from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
@@ -55,7 +54,7 @@ from myclaw.provider.model_router import ModelRouteStatus
 from myclaw.provider.models import ModelCompleted, ReasoningDelta, TextDelta
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
-from myclaw.session.projection import project_session_message
+from myclaw.session.projection import _last_user_index, project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader, SkillMetadata
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
@@ -1048,21 +1047,12 @@ class AgentLoop:
         *,
         manual_invocation: ManualSkillInvocation | None = None,
     ) -> list[dict[str, Any]]:
-        memory_snapshot = self._memory_manager.memory_snapshot()
-        current_system_prompt = self._context_builder.foreground_system_prompt()
         route = self._configuration.resolve_route("chat").route
 
         def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-            if _last_user_index(messages) == len(messages):
-                return _project_without_current_user(
-                    messages,
-                    system_prompt=current_system_prompt,
-                )
-            return _project_foreground_messages(
-                self._context_builder,
+            return self._context_builder.build_foreground_messages(
                 messages,
                 session_id=active_session.session_id,
-                long_term_memory=self._memory_manager.memory_snapshot(),
                 blackboard=blackboard,
                 manual_invocation=manual_invocation,
             )
@@ -1076,11 +1066,9 @@ class AgentLoop:
             tools=self.tool_schemas,
         )
         history = active_session.messages[active_session.last_consolidated :]
-        return _project_foreground_messages(
-            self._context_builder,
+        return self._context_builder.build_foreground_messages(
             [*history, current_user],
             session_id=active_session.session_id,
-            long_term_memory=memory_snapshot,
             blackboard=blackboard,
             manual_invocation=manual_invocation,
         )
@@ -1126,15 +1114,9 @@ class AgentLoop:
         self,
         messages: Sequence[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        memory_snapshot = self._memory_manager.memory_snapshot()
-        system_prompt = self._context_builder.foreground_system_prompt()
-        if _last_user_index(messages) == len(messages):
-            return _project_without_current_user(messages, system_prompt=system_prompt)
-        return _project_foreground_messages(
-            self._context_builder,
+        return self._context_builder.build_foreground_messages(
             messages,
             session_id=self._session.session_id,
-            long_term_memory=memory_snapshot,
         )
 
     def runtime_status_input(self) -> RuntimeStatusInput:
@@ -1535,28 +1517,6 @@ def _foreground_runtime_status_input(
         context_window=context_window,
         generation_started_at=generation_started_at,
     )
-
-
-def _project_foreground_messages(
-    context: ContextBuilder,
-    messages: Sequence[dict[str, Any]],
-    *,
-    session_id: str,
-    long_term_memory: str,
-    blackboard: Blackboard | None = None,
-    manual_invocation: ManualSkillInvocation | None = None,
-) -> list[dict[str, Any]]:
-    history, current_user, current_user_index = _current_turn(messages, lane="Foreground")
-    projected = context.build_messages(
-        history=history,
-        current_user=current_user,
-        session_id=session_id,
-        long_term_memory=long_term_memory,
-        blackboard=blackboard,
-        manual_invocation=manual_invocation,
-    )
-    projected.extend(_project_continuation(messages, current_user_index))
-    return projected
 
 
 def _project_schedule_messages(

@@ -14,6 +14,7 @@ from uuid import UUID
 
 import pytest
 
+import myclaw.agent.context as context
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import MessageBus
@@ -54,6 +55,14 @@ from tests.management.factories import management_service
 
 NOW = datetime(2026, 8, 7, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
+
+
+class _FrozenContextDateTime(datetime):
+    @classmethod
+    def now(cls, tz: object = None) -> _FrozenContextDateTime:
+        if tz is None:
+            return cls.fromtimestamp(NOW.timestamp(), tz=NOW.tzinfo)
+        return cls.fromtimestamp(NOW.timestamp(), tz=tz)  # type: ignore[arg-type]
 
 
 class _BlockingClock:
@@ -389,6 +398,82 @@ async def test_agent_loop_manages_schedule_jobs_without_confirmation(
 
 
 @pytest.mark.asyncio
+async def test_foreground_provider_receives_builder_complete_context_projection(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ScheduleProvider(
+        chat_responses=(_response("First answer."), _response("Second answer.")),
+    )
+    projection_calls: list[list[dict[str, Any]]] = []
+    original_prepare = ConversationSummaryManager.prepare
+
+    async def capture_projection(
+        manager: ConversationSummaryManager,
+        session: Session,
+        *,
+        current_user: dict[str, Any] | None = None,
+        continuation: Sequence[dict[str, Any]] = (),
+        project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+        route_context_window: int | None = None,
+        route_max_output: int | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
+    ) -> Session:
+        if current_user is not None:
+            assert project_messages is not None
+            projection_calls.append(
+                project_messages([*session.messages[session.last_consolidated:], current_user])
+            )
+        return await original_prepare(
+            manager,
+            session,
+            current_user=current_user,
+            continuation=continuation,
+            project_messages=project_messages,
+            route_context_window=route_context_window,
+            route_max_output=route_max_output,
+            tools=tools,
+        )
+
+    monkeypatch.setattr(ConversationSummaryManager, "prepare", capture_projection)
+    loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+    )
+    monkeypatch.setattr(context, "datetime", _FrozenContextDateTime)
+    await loop.start()
+    try:
+        await collect_foreground_outbound(_bus, "First question.")
+        await collect_foreground_outbound(_bus, "Second question.")
+    finally:
+        await _close_components(loop, router, schedule, dream)
+
+    assert len(provider.stream_requests) == 2
+    assert projection_calls == [call.messages for call in provider.stream_requests]
+    first_messages = provider.stream_requests[0].messages
+    assert [message["role"] for message in first_messages] == ["system", "user"]
+    assert "First question." in str(first_messages[-1]["content"])
+    second_messages = provider.stream_requests[1].messages
+    assert [message["role"] for message in second_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert second_messages[1] == {"role": "user", "content": "First question."}
+    assert second_messages[2] == {
+        "role": "assistant",
+        "content": "First answer.",
+        "tool_calls": [],
+    }
+    assert "Second question." in str(second_messages[3]["content"])
+    assert all("timestamp" not in message for message in second_messages)
+
+
+@pytest.mark.asyncio
 async def test_schedule_uses_its_own_complete_context_projection(
     agent_home: Path,
     workspace: Path,
@@ -418,7 +503,7 @@ async def test_schedule_uses_its_own_complete_context_projection(
         schedule_clock=_BlockingClock(NOW),
     )
     await loop.start()
-    monkeypatch.setattr(ContextBuilder, "build_messages", fail_foreground_context)
+    monkeypatch.setattr(ContextBuilder, "build_foreground_messages", fail_foreground_context)
     schedule.start()
     try:
         await _wait_until(
