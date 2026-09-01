@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import PurePath
 
 from myclaw.memory.records import SummaryEntry
-from myclaw.skills.catalog import ManualSkillInvocation, SkillSnapshot
+from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
 from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
 
@@ -100,7 +100,7 @@ def foreground_chat_system_prompt(
     workspace: PurePath,
     agent_home: PurePath,
     long_term_memory: str,
-    skill_snapshot: SkillSnapshot | None = None,
+    skill_loader: SkillLoader | None = None,
 ) -> str:
     """Compose the foreground prompt with optional Skill metadata."""
     sections = [
@@ -110,19 +110,19 @@ def foreground_chat_system_prompt(
             long_term_memory=long_term_memory,
         )
     ]
-    if skill_snapshot is not None and skill_snapshot.skills:
+    if skill_loader is not None and skill_loader.skills:
         entries = "\n".join(
             _skill_metadata_json(
                 name=metadata.name,
                 description=metadata.description,
                 path=str(metadata.path),
             )
-            for metadata in skill_snapshot.metadata
+            for metadata in skill_loader.metadata
         )
         sections.append(render_template("skill-catalog.md", entries=entries))
         always_entries = "\n".join(
             _skill_always_json(name=skill.metadata.name, body=skill.document)
-            for skill in skill_snapshot.skills
+            for skill in skill_loader.skills
             if skill.always
         )
         if always_entries:

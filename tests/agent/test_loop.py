@@ -43,9 +43,9 @@ from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleService
 from myclaw.session.session import Session
 from myclaw.skills.catalog import (
+    LoadedSkill,
     ManualSkillInvocation,
     SkillLoader,
-    SkillSnapshot,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -361,7 +361,7 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
     counts = {
         "session": 0,
         "skill_loader": 0,
-        "skill_snapshot": 0,
+        "skill_load": 0,
         "context_builder": 0,
         "summary_manager": 0,
         "task_framer": 0,
@@ -390,9 +390,13 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
             counts["skill_loader"] += 1
             super().__init__(*args, **kwargs)
 
-        def load(self) -> SkillSnapshot:
-            counts["skill_snapshot"] += 1
-            return super().load()
+        def load(
+            self,
+            *,
+            validate: Callable[[tuple[LoadedSkill, ...]], None] | None = None,
+        ) -> None:
+            counts["skill_load"] += 1
+            super().load(validate=validate)
 
     def record_factory(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
         def recording(*args: Any, **kwargs: Any) -> Any:
@@ -422,7 +426,7 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
     assert counts == {
         "session": 1,
         "skill_loader": 1,
-        "skill_snapshot": 1,
+        "skill_load": 1,
         "context_builder": 1,
         "summary_manager": 1,
         "task_framer": 1,
@@ -480,7 +484,7 @@ def _runtime(
     task_framer: TaskFramingEvaluator | None = None,
     use_default_task_framer: bool = False,
     title_prompt: str | None = None,
-    skill_snapshot: SkillSnapshot | None = None,
+    skill_loader: SkillLoader | None = None,
     monotonic_now: Callable[[], float] | None = None,
 ) -> tuple[AgentLoop, Session, MessageBus]:
     agent_home = AgentHome(tmp_path / "agent-home")
@@ -547,25 +551,27 @@ def _runtime(
     if not use_default_task_framer:
         object.__setattr__(loop, "_task_framer", task_framer or _FramingFake())
     object.__setattr__(loop, "_title_prompt", title_prompt)
-    if skill_snapshot is not None:
-        loop._skill_snapshot = skill_snapshot
-        loop._context_builder._skill_snapshot = skill_snapshot
+    if skill_loader is not None:
+        loop._skill_loader = skill_loader
+        loop._context_builder._skill_loader = skill_loader
     object.__setattr__(loop, "_prepare_foreground_context", prepare)
     return loop, loop.session, bus
 
 
-def _planner_skill_snapshot(tmp_path: Path) -> SkillSnapshot:
+def _planner_skill_loader(tmp_path: Path) -> SkillLoader:
     instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_text(
         "---\nname: planner\ndescription: Plan work\n---\nFollow the plan.\n",
         encoding="utf-8",
     )
-    return SkillLoader(
+    loader = SkillLoader(
         root=tmp_path / "agent-home" / "skills",
         reserved_names=(),
         enable_always_load=False,
-    ).load()
+    )
+    loader.load()
+    return loader
 
 
 @pytest.mark.asyncio
@@ -849,11 +855,12 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
     instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(document.encode("utf-8"))
-    snapshot = SkillLoader(
+    loader = SkillLoader(
         root=tmp_path / "agent-home" / "skills",
         reserved_names=(),
         enable_always_load=False,
-    ).load()
+    )
+    loader.load()
     router = _Router((_response("Generated title"), _response("Completed")))
     framer = _FramingFake()
     observed: list[tuple[dict[str, Any], ManualSkillInvocation | None]] = []
@@ -883,7 +890,7 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
         context_preparer_with_invocation=prepare,
         task_framer=framer,
         title_prompt="Generate a title",
-        skill_snapshot=snapshot,
+        skill_loader=loader,
     )
     previous_blackboard = {
         "goal": "Preserved goal",
@@ -912,7 +919,7 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
 
 
 @pytest.mark.asyncio
-async def test_published_manual_skill_snapshot_ignores_later_file_changes(
+async def test_published_manual_skill_loader_ignores_later_file_changes(
     tmp_path: Path,
 ) -> None:
     raw_input = "/planner request"
@@ -920,11 +927,12 @@ async def test_published_manual_skill_snapshot_ignores_later_file_changes(
     instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(document.encode("utf-8"))
-    snapshot = SkillLoader(
+    loader = SkillLoader(
         root=tmp_path / "agent-home" / "skills",
         reserved_names=(),
         enable_always_load=False,
-    ).load()
+    )
+    loader.load()
     instruction.unlink()
 
     router = _Router((_response("Generated title"), _response("Completed")))
@@ -954,7 +962,7 @@ async def test_published_manual_skill_snapshot_ignores_later_file_changes(
         context_preparer_with_invocation=prepare,
         task_framer=framer,
         title_prompt="Generate a title",
-        skill_snapshot=snapshot,
+        skill_loader=loader,
     )
     await loop.start()
     try:
@@ -988,13 +996,13 @@ async def test_only_exact_manual_skill_invocations_skip_task_framing(
     raw_input: str,
     expected_framing_calls: int,
 ) -> None:
-    snapshot = _planner_skill_snapshot(tmp_path)
+    loader = _planner_skill_loader(tmp_path)
     framer = _FramingFake()
     loop, _session, bus = _runtime(
         tmp_path,
         _Router((_response("Completed"),)),
         task_framer=framer,
-        skill_snapshot=snapshot,
+        skill_loader=loader,
     )
 
     await loop.start()
@@ -1011,7 +1019,7 @@ async def test_only_exact_manual_skill_invocations_skip_task_framing(
 async def test_ordinary_turn_after_manual_skill_reuses_preserved_blackboard(
     tmp_path: Path,
 ) -> None:
-    snapshot = _planner_skill_snapshot(tmp_path)
+    loader = _planner_skill_loader(tmp_path)
     previous = Blackboard(goal="Preserved goal", completion_boundary="Preserved boundary")
     framer = _FramingFake(
         (
@@ -1031,7 +1039,7 @@ async def test_ordinary_turn_after_manual_skill_reuses_preserved_blackboard(
         tmp_path,
         _Router((_response("Manual result"), _response("Ordinary result"))),
         task_framer=framer,
-        skill_snapshot=snapshot,
+        skill_loader=loader,
     )
     session.update_metadata(
         blackboard={
@@ -1060,7 +1068,7 @@ async def test_ordinary_turn_after_manual_skill_reuses_preserved_blackboard(
 async def test_manual_skill_context_failure_preserves_blackboard_and_usage(
     tmp_path: Path,
 ) -> None:
-    snapshot = _planner_skill_snapshot(tmp_path)
+    loader = _planner_skill_loader(tmp_path)
     framer = _FramingFake()
 
     async def fail_context(
@@ -1079,7 +1087,7 @@ async def test_manual_skill_context_failure_preserves_blackboard_and_usage(
         _Router(()),
         context_preparer_with_invocation=fail_context,
         task_framer=framer,
-        skill_snapshot=snapshot,
+        skill_loader=loader,
     )
     session.update_metadata(
         blackboard={
@@ -1106,7 +1114,7 @@ async def test_manual_skill_context_failure_preserves_blackboard_and_usage(
 async def test_manual_skill_context_cancellation_preserves_blackboard_and_usage(
     tmp_path: Path,
 ) -> None:
-    snapshot = _planner_skill_snapshot(tmp_path)
+    loader = _planner_skill_loader(tmp_path)
     framer = _FramingFake()
     started = asyncio.Event()
 
@@ -1128,7 +1136,7 @@ async def test_manual_skill_context_cancellation_preserves_blackboard_and_usage(
         _Router(()),
         context_preparer_with_invocation=block_context,
         task_framer=framer,
-        skill_snapshot=snapshot,
+        skill_loader=loader,
     )
     session.update_metadata(
         blackboard={
@@ -2961,13 +2969,13 @@ async def test_default_agent_loop_wiring_skips_router_completion_for_manual_skil
             self.direct_calls.append((route, messages))
             return _response('{"action":"clear","goal":null,"completion_boundary":null}')
 
-    snapshot = _planner_skill_snapshot(tmp_path)
+    loader = _planner_skill_loader(tmp_path)
     router = DefaultRouter()
     loop, session, bus = _runtime(
         tmp_path,
         router,
         use_default_task_framer=True,
-        skill_snapshot=snapshot,
+        skill_loader=loader,
     )
 
     await loop.start()

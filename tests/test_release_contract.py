@@ -117,8 +117,8 @@ _ISSUE_202_FORBIDDEN_RUNTIME_NAMES = (
     "_prepare_runtime",
     "MemoryTaskScheduler",
     "memory_scheduler",
-    "RuntimeSkillSnapshot",
-    "build_runtime_skill_snapshot",
+    "RuntimeSkill" + "Snapshot",
+    "build_runtime_skill" + "_snapshot",
     "SkillUnavailableError",
 )
 _ISSUE_202_FORBIDDEN_STRUCTURAL_NAMES = (
@@ -880,7 +880,14 @@ def test_issue_202_architecture_claims_match_source_ast_contracts() -> None:
         _issue_202_ast(ROOT / "myclaw" / "skills" / "catalog.py"),
         "SkillLoader",
     )
-    assert _issue_202_method_names(skill_loader) == {"load"}
+    assert _issue_202_method_names(skill_loader) == {
+        "root",
+        "skills",
+        "metadata",
+        "get",
+        "resolve_manual",
+        "load",
+    }
 
     message_bus = _issue_202_class(
         _issue_202_ast(ROOT / "myclaw" / "agent" / "message_bus.py"),

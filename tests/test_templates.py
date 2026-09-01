@@ -5,7 +5,6 @@ from pathlib import Path, PureWindowsPath
 
 import pytest
 
-import myclaw.agent.prompts as prompts
 from myclaw.agent.prompts import (
     blackboard_prompt,
     chat_system_prompt,
@@ -196,16 +195,17 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
         "---\nname: reviewer\ndescription: Review the work\n---\nprivate reviewer body\n",
         encoding="utf-8",
     )
-    snapshot = SkillLoader(
+    loader = SkillLoader(
         root=first.parents[1],
         reserved_names=(),
         enable_always_load=False,
-    ).load()
+    )
+    loader.load()
     foreground = foreground_chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),
         agent_home=PureWindowsPath(r"D:\agent-home"),
         long_term_memory="# Memory\n",
-        skill_snapshot=snapshot,
+        skill_loader=loader,
     )
 
     block = foreground.split("<skill_catalog>\n", maxsplit=1)[1].split(
@@ -260,17 +260,18 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
     )
     document = "---\nname: always\ndescription: Always loaded\nalways: true\n---\n" + body
     instruction.write_bytes(document.encode("utf-8"))
-    snapshot = SkillLoader(
+    loader = SkillLoader(
         root=instruction.parents[1],
         reserved_names=(),
         enable_always_load=True,
-    ).load()
+    )
+    loader.load()
 
     foreground = foreground_chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),
         agent_home=PureWindowsPath(r"D:\agent-home"),
         long_term_memory="# Memory\n",
-        skill_snapshot=snapshot,
+        skill_loader=loader,
     )
 
     block = foreground.split("<skill_always_load>\n", maxsplit=1)[1].split(
@@ -303,9 +304,12 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
 def test_chat_system_prompt_uses_the_fixed_catalog_guidance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(prompts.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(prompts.platform, "machine", lambda: "AMD64")
-    monkeypatch.setattr(prompts.platform, "python_version", lambda: "3.12.13")
+    monkeypatch.setattr("myclaw.agent.prompts.platform.system", lambda: "Windows")
+    monkeypatch.setattr("myclaw.agent.prompts.platform.machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        "myclaw.agent.prompts.platform.python_version",
+        lambda: "3.12.13",
+    )
 
     assert chat_system_prompt(
         workspace=PureWindowsPath(r"D:\workspace"),

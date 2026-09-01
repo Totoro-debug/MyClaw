@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,32 +51,45 @@ class ManualSkillInvocation:
     body: str
 
 
-@dataclass(frozen=True, slots=True)
-class SkillSnapshot:
-    """Immutable complete Skill documents for one Runtime Generation."""
+class SkillLoader:
+    """Discover and atomically publish valid complete Skill documents."""
 
-    root: Path
-    skills: tuple[LoadedSkill, ...]
+    def __init__(
+        self,
+        *,
+        root: Path,
+        reserved_names: Collection[str],
+        enable_always_load: bool,
+    ) -> None:
+        if not isinstance(root, Path):
+            raise TypeError("Skill Loader root must be a Path")
+        if not isinstance(enable_always_load, bool):
+            raise TypeError("Skill Loader always-load flag must be a boolean")
+        self._root = root.resolve()
+        self._reserved_names = frozenset(
+            name.removeprefix("/") for name in reserved_names
+        )
+        self._enable_always_load = enable_always_load
+        self._skills: tuple[LoadedSkill, ...] = ()
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.root, Path):
-            raise TypeError("Skill snapshot root must be a Path")
-        if not isinstance(self.skills, tuple) or not all(
-            isinstance(skill, LoadedSkill) for skill in self.skills
-        ):
-            raise TypeError("Skill snapshot skills must be a tuple of Loaded Skill")
-        names = [skill.metadata.name for skill in self.skills]
-        if len(set(names)) != len(names):
-            raise ValueError("Skill snapshot names must be unique")
+    @property
+    def root(self) -> Path:
+        """Return the canonical root used for Skill discovery and file access."""
+        return self._root
+
+    @property
+    def skills(self) -> tuple[LoadedSkill, ...]:
+        """Return the currently published immutable Skill state."""
+        return self._skills
 
     @property
     def metadata(self) -> tuple[SkillMetadata, ...]:
-        """Return the ordered metadata projection used by presentation surfaces."""
-        return tuple(skill.metadata for skill in self.skills)
+        """Return metadata for the currently published Skills in discovery order."""
+        return tuple(skill.metadata for skill in self._skills)
 
     def get(self, name: str) -> LoadedSkill | None:
-        """Return one captured Skill by its exact authored name."""
-        return next((skill for skill in self.skills if skill.metadata.name == name), None)
+        """Return one published Skill by its exact authored name."""
+        return next((skill for skill in self._skills if skill.metadata.name == name), None)
 
     def resolve_manual(self, raw_input: str) -> ManualSkillInvocation | None:
         """Resolve one exact slash invocation without filesystem access."""
@@ -105,95 +118,85 @@ class SkillSnapshot:
             body=skill.document,
         )
 
-
-class SkillLoader:
-    """Discover and atomically capture valid complete Skill documents."""
-
-    def __init__(
+    def load(
         self,
         *,
-        root: Path,
-        reserved_names: Collection[str],
-        enable_always_load: bool,
+        validate: Callable[[tuple[LoadedSkill, ...]], None] | None = None,
     ) -> None:
-        if not isinstance(root, Path):
-            raise TypeError("Skill Loader root must be a Path")
-        if not isinstance(enable_always_load, bool):
-            raise TypeError("Skill Loader always-load flag must be a boolean")
-        self._root = root.resolve()
-        self._reserved_names = frozenset(
-            name.removeprefix("/") for name in reserved_names
-        )
-        self._enable_always_load = enable_always_load
-
-    def load(self) -> SkillSnapshot:
-        """Return one immutable snapshot of the current Skill directory."""
+        """Stage, validate, and atomically publish the current Skill directory."""
         root = self._root
-        if not root.is_dir():
-            logger.info("Discovered Skills count=0")
-            return SkillSnapshot(root=root, skills=())
-
         try:
-            children = tuple(root.iterdir())
-        except OSError:
-            logger.warning("Skipping Skill discovery path={} reason=Skill root is unavailable", root)
-            logger.info("Discovered Skills count=0")
-            return SkillSnapshot(root=root, skills=())
+            root_is_directory = root.is_dir()
+        except (OSError, RuntimeError):
+            logger.warning("Skill discovery failed path={} reason=Skill root is unavailable", root)
+            raise
 
-        candidates: list[tuple[Path, Path]] = []
-        for candidate in children:
-            if not candidate.is_dir():
-                continue
+        if not root_is_directory:
+            candidate_skills: tuple[LoadedSkill, ...] = ()
+        else:
             try:
-                canonical_candidate = candidate.resolve(strict=True)
+                children = tuple(root.iterdir())
             except (OSError, RuntimeError):
-                _log_invalid(candidate, "Skill directory canonical path is unavailable")
-                continue
-            candidates.append((canonical_candidate, candidate))
+                logger.warning("Skill discovery failed path={} reason=Skill root is unavailable", root)
+                raise
 
-        skills: list[LoadedSkill] = []
-        names: set[str] = set()
-        for canonical_candidate, candidate in sorted(
-            candidates,
-            key=lambda item: (str(item[0]), str(item[1])),
-        ):
-            if not canonical_candidate.is_relative_to(root):
-                _log_invalid(candidate, "Skill directory canonical path escapes Skill root")
-                continue
+            candidates: list[tuple[Path, Path]] = []
+            for candidate in children:
+                if not candidate.is_dir():
+                    continue
+                try:
+                    canonical_candidate = candidate.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    _log_invalid(candidate, "Skill directory canonical path is unavailable")
+                    continue
+                candidates.append((canonical_candidate, candidate))
 
-            instruction = candidate / "SKILL.md"
-            try:
-                status = instruction.stat()
-            except OSError:
-                _log_invalid(candidate, "SKILL.md is unavailable")
-                continue
-            if not HOST_FILESYSTEM.is_regular_file(status):
-                _log_invalid(candidate, "SKILL.md is not a regular file")
-                continue
-            try:
-                path = instruction.resolve(strict=True)
-            except (OSError, RuntimeError):
-                _log_invalid(candidate, "SKILL.md canonical path is unavailable")
-                continue
-            if not path.is_relative_to(root):
-                _log_invalid(candidate, "SKILL.md canonical path escapes Skill root")
-                continue
+            skills: list[LoadedSkill] = []
+            names: set[str] = set()
+            for canonical_candidate, candidate in sorted(
+                candidates,
+                key=lambda item: (str(item[0]), str(item[1])),
+            ):
+                if not canonical_candidate.is_relative_to(root):
+                    _log_invalid(candidate, "Skill directory canonical path escapes Skill root")
+                    continue
 
-            skill, reason = self._load_candidate(instruction, path, root)
-            if skill is None:
-                _log_invalid(candidate, reason)
-                continue
-            if skill.metadata.name in self._reserved_names:
-                _log_invalid(candidate, "name is reserved")
-                continue
-            if skill.metadata.name in names:
-                _log_invalid(candidate, "name is duplicated")
-                continue
-            names.add(skill.metadata.name)
-            skills.append(skill)
+                instruction = candidate / "SKILL.md"
+                try:
+                    status = instruction.stat()
+                except OSError:
+                    _log_invalid(candidate, "SKILL.md is unavailable")
+                    continue
+                if not HOST_FILESYSTEM.is_regular_file(status):
+                    _log_invalid(candidate, "SKILL.md is not a regular file")
+                    continue
+                try:
+                    path = instruction.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    _log_invalid(candidate, "SKILL.md canonical path is unavailable")
+                    continue
+                if not path.is_relative_to(root):
+                    _log_invalid(candidate, "SKILL.md canonical path escapes Skill root")
+                    continue
 
-        logger.info("Discovered Skills count={}", len(skills))
-        return SkillSnapshot(root=root, skills=tuple(skills))
+                skill, reason = self._load_candidate(instruction, path, root)
+                if skill is None:
+                    _log_invalid(candidate, reason)
+                    continue
+                if skill.metadata.name in self._reserved_names:
+                    _log_invalid(candidate, "name is reserved")
+                    continue
+                if skill.metadata.name in names:
+                    _log_invalid(candidate, "name is duplicated")
+                    continue
+                names.add(skill.metadata.name)
+                skills.append(skill)
+            candidate_skills = tuple(skills)
+
+        if validate is not None:
+            validate(candidate_skills)
+        self._skills = candidate_skills
+        logger.info("Discovered Skills count={}", len(candidate_skills))
 
     def _load_candidate(
         self,
@@ -316,5 +319,4 @@ __all__ = [
     "ManualSkillInvocation",
     "SkillLoader",
     "SkillMetadata",
-    "SkillSnapshot",
 ]

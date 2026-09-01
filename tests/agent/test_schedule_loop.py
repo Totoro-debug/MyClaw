@@ -31,7 +31,7 @@ from myclaw.provider.models import (
 from myclaw.schedule.model import DREAM_JOB_ID, JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.skills.catalog import ManualSkillInvocation, SkillSnapshot
+from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
@@ -258,7 +258,7 @@ def _loop(
     tmp_path: Path,
     router: _ScheduleRouter,
     *,
-    skill_snapshot: SkillSnapshot | None = None,
+    skill_loader: SkillLoader | None = None,
     schedule_context_preparer: Callable[
         [Session, dict[str, Any]],
         Awaitable[list[dict[str, Any]]],
@@ -304,9 +304,9 @@ def _loop(
     )
     if task_framer is not None:
         object.__setattr__(loop, "_task_framer", task_framer)
-    if skill_snapshot is not None:
-        loop._skill_snapshot = skill_snapshot
-        loop._context_builder._skill_snapshot = skill_snapshot
+    if skill_loader is not None:
+        loop._skill_loader = skill_loader
+        loop._context_builder._skill_loader = skill_loader
     if externalize_result_for is not None:
         object.__setattr__(loop, "_result_externalizer_for", externalize_result_for)
     object.__setattr__(loop, "_prepare_foreground_context", _foreground_context)
@@ -689,10 +689,16 @@ async def test_schedule_agent_reads_known_skill_path_via_shared_gateway(tmp_path
         ),
         _ScheduleRouter._response(),
     )
+    skill_loader = SkillLoader(
+        root=skill_root,
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    skill_loader.load()
     loop, state, _, _bus = _loop(
         tmp_path,
         router,
-        skill_snapshot=SkillSnapshot(root=skill_root, skills=()),
+        skill_loader=skill_loader,
     )
     confirmation_requests: list[object] = []
     loop.bind_confirmation_callback(confirmation_requests.append)

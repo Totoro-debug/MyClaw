@@ -9,27 +9,29 @@ import pytest
 from loguru import logger
 
 from myclaw.management.commands import MANAGEMENT_COMMANDS
-from myclaw.skills.catalog import SkillLoader, SkillSnapshot
+from myclaw.skills.catalog import LoadedSkill, SkillLoader
 
 
-def _snapshot(
+def _loader(
     *,
     agent_home: Path,
     reserved_names: tuple[str, ...] = (),
     enable_always_load: bool = False,
-) -> SkillSnapshot:
-    return SkillLoader(
+) -> SkillLoader:
+    loader = SkillLoader(
         root=agent_home / "skills",
         reserved_names=reserved_names,
         enable_always_load=enable_always_load,
-    ).load()
+    )
+    loader.load()
+    return loader
 
 
 def test_missing_skills_root_is_empty_without_creating_directory(agent_home: Path) -> None:
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert snapshot.root == (agent_home / "skills").resolve()
-    assert snapshot.skills == ()
+    assert loader.root == (agent_home / "skills").resolve()
+    assert loader.skills == ()
     assert not (agent_home / "skills").exists()
 
 
@@ -37,10 +39,10 @@ def test_existing_empty_skills_root_is_empty(agent_home: Path) -> None:
     root = agent_home / "skills"
     root.mkdir(parents=True)
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert snapshot.root == root.resolve()
-    assert snapshot.skills == ()
+    assert loader.root == root.resolve()
+    assert loader.skills == ()
 
 
 def test_valid_candidate_retains_document_and_validated_metadata(agent_home: Path) -> None:
@@ -49,16 +51,104 @@ def test_valid_candidate_retains_document_and_validated_metadata(agent_home: Pat
     document = b'---\nname: "plan"\ndescription: "  Do useful work.  "\n---\nbody\r\n'
     instruction.write_bytes(document)
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert len(snapshot.skills) == 1
-    skill = snapshot.skills[0]
+    assert len(loader.skills) == 1
+    skill = loader.skills[0]
     assert skill.metadata.name == "plan"
     assert skill.metadata.description == "Do useful work."
     assert skill.metadata.path == instruction.resolve()
     assert skill.document == document.decode("utf-8")
     assert skill.always is False
-    assert snapshot.metadata == (skill.metadata,)
+    assert loader.metadata == (skill.metadata,)
+
+
+def test_successful_reload_replaces_published_frozen_state(agent_home: Path) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nfirst body\n",
+        encoding="utf-8",
+    )
+    loader = _loader(agent_home=agent_home)
+    first_skills = loader.skills
+
+    instruction.write_text(
+        "---\nname: reviewer\ndescription: Review work\n---\nsecond body\n",
+        encoding="utf-8",
+    )
+
+    loader.load()
+    assert loader.skills != first_skills
+    assert tuple(skill.metadata.name for skill in loader.skills) == ("reviewer",)
+    assert loader.get("planner") is None
+    invocation = loader.resolve_manual("/reviewer request")
+    assert invocation is not None
+    assert invocation.body.splitlines()[-1] == "second body"
+
+
+def test_failed_publication_validation_preserves_all_published_queries(
+    agent_home: Path,
+) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nfirst body\n",
+        encoding="utf-8",
+    )
+    loader = _loader(agent_home=agent_home)
+    before_skills = loader.skills
+    before_metadata = loader.metadata
+    before_skill = loader.get("planner")
+    before_invocation = loader.resolve_manual("/planner request")
+
+    instruction.write_text(
+        "---\nname: reviewer\ndescription: Review work\n---\nsecond body\n",
+        encoding="utf-8",
+    )
+
+    def reject(candidate: tuple[LoadedSkill, ...]) -> None:
+        assert tuple(skill.metadata.name for skill in candidate) == ("reviewer",)
+        raise ValueError("candidate rejected")
+
+    with pytest.raises(ValueError, match="candidate rejected"):
+        loader.load(validate=reject)
+
+    assert loader.skills == before_skills
+    assert loader.metadata == before_metadata
+    assert loader.get("planner") == before_skill
+    assert loader.resolve_manual("/planner request") == before_invocation
+    assert loader.resolve_manual("/reviewer request") is None
+
+
+def test_failed_skill_scan_preserves_published_state(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nfirst body\n",
+        encoding="utf-8",
+    )
+    loader = _loader(agent_home=agent_home)
+    before_skills = loader.skills
+    before_metadata = loader.metadata
+    before_skill = loader.get("planner")
+    before_invocation = loader.resolve_manual("/planner request")
+
+    def fail_scan(_path: Path) -> tuple[Path, ...]:
+        raise OSError("scan failed")
+
+    monkeypatch.setattr(Path, "iterdir", fail_scan)
+
+    with pytest.raises(OSError, match="scan failed"):
+        loader.load()
+
+    assert loader.skills == before_skills
+    assert loader.metadata == before_metadata
+    assert loader.get("planner") == before_skill
+    assert loader.resolve_manual("/planner request") == before_invocation
 
 
 def test_reserved_management_command_names_are_excluded(agent_home: Path) -> None:
@@ -70,12 +160,12 @@ def test_reserved_management_command_names_are_excluded(agent_home: Path) -> Non
             f"---\nname: {name}\ndescription: Reserved command guide\n---\n".encode()
         )
 
-    snapshot = _snapshot(
+    loader = _loader(
         agent_home=agent_home,
         reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
     )
 
-    assert snapshot.skills == ()
+    assert loader.skills == ()
 
 
 def test_first_valid_duplicate_in_canonical_path_order_wins(agent_home: Path) -> None:
@@ -85,9 +175,9 @@ def test_first_valid_duplicate_in_canonical_path_order_wins(agent_home: Path) ->
         instruction.parent.mkdir(parents=True)
         instruction.write_bytes(b"---\nname: duplicate\ndescription: Same name\n---\n")
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert tuple(skill.metadata.path for skill in snapshot.skills) == (earlier.resolve(),)
+    assert tuple(skill.metadata.path for skill in loader.skills) == (earlier.resolve(),)
 
 
 def test_valid_entries_follow_canonical_path_order(agent_home: Path) -> None:
@@ -99,9 +189,9 @@ def test_valid_entries_follow_canonical_path_order(agent_home: Path) -> None:
             f"---\nname: {name}\ndescription: Valid metadata\n---\n".encode()
         )
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert tuple(skill.metadata.name for skill in snapshot.skills) == ("earlier", "later")
+    assert tuple(skill.metadata.name for skill in loader.skills) == ("earlier", "later")
 
 
 def test_only_direct_child_skill_directories_are_scanned(agent_home: Path) -> None:
@@ -113,9 +203,9 @@ def test_only_direct_child_skill_directories_are_scanned(agent_home: Path) -> No
             f"---\nname: {name}\ndescription: Valid metadata\n---\n".encode()
         )
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert tuple(skill.metadata.name for skill in snapshot.skills) == ("direct",)
+    assert tuple(skill.metadata.name for skill in loader.skills) == ("direct",)
 
 
 @pytest.mark.parametrize(
@@ -134,9 +224,9 @@ def test_invalid_frontmatter_shapes_are_excluded(agent_home: Path, document: byt
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(document)
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert snapshot.skills == ()
+    assert loader.skills == ()
 
 
 @pytest.mark.parametrize(
@@ -165,9 +255,9 @@ def test_name_character_and_length_contract(
         f'---\nname: "{name}"\ndescription: "Valid description"\n---\n'.encode()
     )
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert bool(snapshot.skills) is accepted
+    assert bool(loader.skills) is accepted
 
 
 @pytest.mark.parametrize(
@@ -191,11 +281,11 @@ def test_description_trimmed_length_contract(
         f'---\nname: "description"\ndescription: "{description}"\n---\n'.encode()
     )
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert bool(snapshot.skills) is accepted
+    assert bool(loader.skills) is accepted
     if accepted:
-        assert snapshot.skills[0].metadata.description == description.strip()
+        assert loader.skills[0].metadata.description == description.strip()
 
 
 def test_non_utf8_document_is_excluded_without_logging_its_body(agent_home: Path) -> None:
@@ -207,11 +297,11 @@ def test_non_utf8_document_is_excluded_without_logging_its_body(agent_home: Path
     diagnostics = StringIO()
     handler = logger.add(diagnostics, format="{message}", level="WARNING")
     try:
-        snapshot = _snapshot(agent_home=agent_home)
+        loader = _loader(agent_home=agent_home)
     finally:
         logger.remove(handler)
 
-    assert snapshot.skills == ()
+    assert loader.skills == ()
     assert "SECRET-BODY" not in diagnostics.getvalue()
 
 
@@ -219,9 +309,9 @@ def test_non_regular_instruction_path_is_excluded(agent_home: Path) -> None:
     instruction = agent_home / "skills" / "directory-instruction" / "SKILL.md"
     instruction.mkdir(parents=True)
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert snapshot.skills == ()
+    assert loader.skills == ()
 
 
 def test_invalid_candidate_diagnostic_contains_path_and_reason_but_not_document(
@@ -236,11 +326,11 @@ def test_invalid_candidate_diagnostic_contains_path_and_reason_but_not_document(
     diagnostics = StringIO()
     handler = logger.add(diagnostics, format="{message}", level="WARNING")
     try:
-        snapshot = _snapshot(agent_home=agent_home)
+        loader = _loader(agent_home=agent_home)
     finally:
         logger.remove(handler)
 
-    assert snapshot.skills == ()
+    assert loader.skills == ()
     assert str(instruction.parent) in diagnostics.getvalue()
     assert "SECRET-SKILL-BODY" not in diagnostics.getvalue()
 
@@ -294,16 +384,16 @@ def test_loader_reads_each_candidate_once_as_one_complete_bytes_read(
 
     monkeypatch.setattr(Path, "open", recording_open)
 
-    snapshot = _snapshot(agent_home=agent_home, reserved_names=("/config",))
+    loader = _loader(agent_home=agent_home, reserved_names=("/config",))
 
-    assert tuple(skill.metadata.name for skill in snapshot.skills) == ("shared",)
+    assert tuple(skill.metadata.name for skill in loader.skills) == ("shared",)
     assert opens == len(documents)
     assert [(path.parent.name, size) for path, size in reads] == [
         (name, -1) for name in documents
     ]
 
 
-def test_snapshot_is_immutable_and_manual_resolution_does_not_read_disk(
+def test_loader_published_state_is_immutable_and_manual_resolution_does_not_read_disk(
     agent_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -311,24 +401,24 @@ def test_snapshot_is_immutable_and_manual_resolution_does_not_read_disk(
     instruction.parent.mkdir(parents=True)
     document = b"---\nname: planner\ndescription: Planner\n---\nfirst\n"
     instruction.write_bytes(document)
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
     with pytest.raises(AttributeError):
-        snapshot.skills[0].document = "changed"  # type: ignore[misc]
+        loader.skills[0].document = "changed"  # type: ignore[misc]
     with pytest.raises(AttributeError):
-        snapshot.skills.append(snapshot.skills[0])  # type: ignore[attr-defined]
+        loader.skills.append(loader.skills[0])  # type: ignore[attr-defined]
 
     instruction.unlink()
 
     def deny_open(*args: object, **kwargs: object) -> None:
         del args, kwargs
-        raise AssertionError("manual resolution must use the published snapshot")
+        raise AssertionError("manual resolution must use the published loader state")
 
     monkeypatch.setattr(Path, "open", deny_open)
-    invocation = snapshot.resolve_manual("/planner do it")
+    invocation = loader.resolve_manual("/planner do it")
 
     assert invocation is not None
-    assert invocation.metadata == snapshot.skills[0].metadata
+    assert invocation.metadata == loader.skills[0].metadata
     assert invocation.request == "do it"
     assert invocation.body == document.decode("utf-8")
 
@@ -344,10 +434,10 @@ def test_manual_resolution_removes_only_first_unicode_whitespace_delimiter(
     instruction = agent_home / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: planner\ndescription: Plan work\n---\nbody\n")
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
     request = f"{delimiter}  keep\n\tthis"
 
-    invocation = snapshot.resolve_manual(f"/planner{request}")
+    invocation = loader.resolve_manual(f"/planner{request}")
 
     assert invocation is not None
     assert invocation.request == "  keep\n\tthis"
@@ -364,16 +454,16 @@ def test_manual_resolution_returns_none_for_non_matching_input(
     instruction = agent_home / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: planner\ndescription: Plan work\n---\nbody\n")
-    snapshot = _snapshot(agent_home=agent_home, reserved_names=("/config",))
+    loader = _loader(agent_home=agent_home, reserved_names=("/config",))
 
-    assert snapshot.resolve_manual(raw_input) is None
+    assert loader.resolve_manual(raw_input) is None
 
 
 def test_manual_resolution_rejects_non_string_input(agent_home: Path) -> None:
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
     with pytest.raises(TypeError, match="Skill input must be a string"):
-        snapshot.resolve_manual(cast(str, object()))
+        loader.resolve_manual(cast(str, object()))
 
 
 def test_enabled_always_skill_is_fully_loaded_once_and_frozen(
@@ -394,11 +484,11 @@ def test_enabled_always_skill_is_fully_loaded_once_and_frozen(
         return original_open(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", recording_open)
-    snapshot = _snapshot(agent_home=agent_home, enable_always_load=True)
+    loader = _loader(agent_home=agent_home, enable_always_load=True)
 
-    assert len(snapshot.skills) == 1
-    assert snapshot.skills[0].always is True
-    assert snapshot.skills[0].document == document.decode("utf-8")
+    assert len(loader.skills) == 1
+    assert loader.skills[0].always is True
+    assert loader.skills[0].document == document.decode("utf-8")
     assert opens == 1
 
 
@@ -414,10 +504,10 @@ def test_non_opted_in_skill_is_not_always_loaded(agent_home: Path, always_field:
         ).encode()
     )
 
-    snapshot = _snapshot(agent_home=agent_home, enable_always_load=True)
+    loader = _loader(agent_home=agent_home, enable_always_load=True)
 
-    assert len(snapshot.skills) == 1
-    assert snapshot.skills[0].always is False
+    assert len(loader.skills) == 1
+    assert loader.skills[0].always is False
 
 
 def test_disabled_always_field_is_not_interpreted_or_warned(agent_home: Path) -> None:
@@ -429,11 +519,11 @@ def test_disabled_always_field_is_not_interpreted_or_warned(agent_home: Path) ->
     diagnostics = StringIO()
     handler = logger.add(diagnostics, format="{message}", level="WARNING")
     try:
-        snapshot = _snapshot(agent_home=agent_home, enable_always_load=False)
+        loader = _loader(agent_home=agent_home, enable_always_load=False)
     finally:
         logger.remove(handler)
 
-    assert snapshot.skills[0].always is False
+    assert loader.skills[0].always is False
     assert "Ignoring non-boolean Skill always field" not in diagnostics.getvalue()
 
 
@@ -447,11 +537,11 @@ def test_non_boolean_always_warns_once_and_is_not_always_loaded(agent_home: Path
     diagnostics = StringIO()
     handler = logger.add(diagnostics, format="{message}", level="WARNING")
     try:
-        snapshot = _snapshot(agent_home=agent_home, enable_always_load=True)
+        loader = _loader(agent_home=agent_home, enable_always_load=True)
     finally:
         logger.remove(handler)
 
-    assert snapshot.skills[0].always is False
+    assert loader.skills[0].always is False
     assert diagnostics.getvalue().count("Ignoring non-boolean Skill always field") == 1
     assert "SECRET DOCUMENT" not in diagnostics.getvalue()
 
@@ -470,11 +560,11 @@ def test_duplicate_always_candidate_does_not_override_first_valid_entry(
         b"---\nname: duplicate\ndescription: Later candidate\nalways: true\n---\nsecond\n"
     )
 
-    snapshot = _snapshot(agent_home=agent_home, enable_always_load=True)
+    loader = _loader(agent_home=agent_home, enable_always_load=True)
 
-    assert len(snapshot.skills) == 1
-    assert snapshot.skills[0].metadata.description == "First candidate"
-    assert snapshot.skills[0].always is False
+    assert len(loader.skills) == 1
+    assert loader.skills[0].metadata.description == "First candidate"
+    assert loader.skills[0].always is False
 
 
 def test_instruction_symlink_escape_is_excluded_when_links_are_available(
@@ -490,9 +580,9 @@ def test_instruction_symlink_escape_is_excluded_when_links_are_available(
     except (OSError, NotImplementedError) as error:
         pytest.skip(f"file links unavailable: {error}")
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert snapshot.skills == ()
+    assert loader.skills == ()
 
 
 def test_skill_directory_reparse_escape_is_excluded_when_links_are_available(
@@ -517,9 +607,9 @@ def test_skill_directory_reparse_escape_is_excluded_when_links_are_available(
     except (OSError, NotImplementedError, subprocess.CalledProcessError) as error:
         pytest.skip(f"directory links unavailable: {error}")
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert snapshot.skills == ()
+    assert loader.skills == ()
 
 
 def test_regular_hardlink_instruction_remains_readable_when_available(agent_home: Path) -> None:
@@ -532,7 +622,7 @@ def test_regular_hardlink_instruction_remains_readable_when_available(agent_home
     except (OSError, NotImplementedError) as error:
         pytest.skip(f"hard links unavailable: {error}")
 
-    snapshot = _snapshot(agent_home=agent_home)
+    loader = _loader(agent_home=agent_home)
 
-    assert len(snapshot.skills) == 1
-    assert snapshot.skills[0].document.endswith("body\n")
+    assert len(loader.skills) == 1
+    assert loader.skills[0].document.endswith("body\n")

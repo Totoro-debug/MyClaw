@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfoNotFoundError
 import pytest
 
 import myclaw.agent.context as context
-import myclaw.agent.prompts as prompts
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import _project_foreground_messages, _project_schedule_messages
@@ -79,9 +78,12 @@ def test_context_builder_builds_system_history_and_current_user_in_order(
     timezone_name: str,
     expected_time: str,
 ) -> None:
-    monkeypatch.setattr(prompts.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(prompts.platform, "machine", lambda: "AMD64")
-    monkeypatch.setattr(prompts.platform, "python_version", lambda: "3.12.13")
+    monkeypatch.setattr("myclaw.agent.prompts.platform.system", lambda: "Windows")
+    monkeypatch.setattr("myclaw.agent.prompts.platform.machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        "myclaw.agent.prompts.platform.python_version",
+        lambda: "3.12.13",
+    )
     agent_home = workspace.parent / "agent-home"
     builder = _builder(monkeypatch, workspace, timezone_name)
     history: list[dict[str, Any]] = [
@@ -154,16 +156,17 @@ def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt
     instruction = agent_home / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(b"---\nname: planner\ndescription: Plan the work\n---\nprivate body\n")
-    snapshot = SkillLoader(
+    loader = SkillLoader(
         root=agent_home / "skills",
         reserved_names=(),
         enable_always_load=False,
-    ).load()
+    )
+    loader.load()
     builder = ContextBuilder(
         workspace,
         "UTC",
         agent_home=agent_home,
-        skill_snapshot=snapshot,
+        skill_loader=loader,
     )
 
     messages = builder.build_messages(

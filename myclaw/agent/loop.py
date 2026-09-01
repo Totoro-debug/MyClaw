@@ -260,19 +260,19 @@ class AgentLoop:
             reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
             enable_always_load=configuration.runtime.enable_skill_always_load,
         )
-        skill_snapshot = skill_loader.load()
+        skill_loader.load()
         context_builder = ContextBuilder(
             workspace_path,
             schedule_service.context_timezone_name() or get_localzone_name(),
             agent_home=agent_home.path,
             clock=now,
-            skill_snapshot=skill_snapshot,
+            skill_loader=skill_loader,
         )
         task_framer: TaskFramingEvaluator = TaskFramer(model_router)
         tool_gateway = ToolGateway(
             workspace=workspace_path,
             schedule_service=schedule_service,
-            skill_root=skill_snapshot.root,
+            skill_root=skill_loader.root,
         )
         runner = AgentRunner(model_router)
         summary_manager = ConversationSummaryManager(
@@ -305,7 +305,6 @@ class AgentLoop:
         self._configured_chat_context_window = configured_chat_context_window
         self._session = active_session
         self._skill_loader = skill_loader
-        self._skill_snapshot = skill_snapshot
         self._schedule_service = schedule_service
         self._context_builder = context_builder
         self._summary_manager = summary_manager
@@ -354,7 +353,7 @@ class AgentLoop:
 
     @property
     def skill_metadata(self) -> tuple[SkillMetadata, ...]:
-        return self._skill_snapshot.metadata
+        return self._skill_loader.metadata
 
     @property
     def tool_schemas(self) -> tuple[OpenAIToolSchema, ...]:
@@ -451,7 +450,7 @@ class AgentLoop:
                 tool_schemas=self.tool_schemas,
             )
             available_input = chat_route.context_window - chat_route.max_output
-            if any(skill.always for skill in self._skill_snapshot.skills):
+            if any(skill.always for skill in self._skill_loader.skills):
                 estimated = estimate_input_tokens(status_input)
                 if estimated > available_input:
                     raise SkillContextTooLargeError(
@@ -860,8 +859,7 @@ class AgentLoop:
     ) -> None:
         active_session = self._session
         manual_invocation = None
-        if self._skill_snapshot is not None:
-            manual_invocation = self._skill_snapshot.resolve_manual(inbound.content)
+        manual_invocation = self._skill_loader.resolve_manual(inbound.content)
         start_title = not active_session.messages
         created_title_work = (
             self._start_title_if_needed(active_session, inbound.content) if start_title else None
@@ -1054,7 +1052,7 @@ class AgentLoop:
             workspace=self._workspace_path,
             agent_home=self._agent_home.path,
             long_term_memory=memory_snapshot,
-            skill_snapshot=self._skill_snapshot,
+            skill_loader=self._skill_loader,
         )
         route = self._configuration.resolve_route("chat").route
 
@@ -1142,7 +1140,7 @@ class AgentLoop:
             workspace=self._workspace_path,
             agent_home=self._agent_home.path,
             long_term_memory=memory_snapshot,
-            skill_snapshot=self._skill_snapshot,
+            skill_loader=self._skill_loader,
         )
         if _last_user_index(messages) == len(messages):
             return _project_without_current_user(messages, system_prompt=system_prompt)

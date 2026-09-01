@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from myclaw.agent.blackboard import Blackboard, encode_blackboard
 from myclaw.agent.prompts import current_user_input, foreground_chat_system_prompt
 from myclaw.session.projection import project_session_message
-from myclaw.skills.catalog import ManualSkillInvocation, SkillSnapshot
+from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
 
 
 class ContextBuilder:
@@ -25,19 +25,19 @@ class ContextBuilder:
         *,
         agent_home: Path,
         clock: Callable[[], datetime] | None = None,
-        skill_snapshot: SkillSnapshot | None = None,
+        skill_loader: SkillLoader | None = None,
     ) -> None:
         if not isinstance(workspace, Path):
             raise TypeError("Context Builder requires a Path")
         if not isinstance(agent_home, Path):
             raise TypeError("Context Builder requires an Agent Home Path")
-        if skill_snapshot is not None and not isinstance(skill_snapshot, SkillSnapshot):
-            raise TypeError("Context Builder requires a Runtime Skill snapshot")
+        if skill_loader is not None and not isinstance(skill_loader, SkillLoader):
+            raise TypeError("Context Builder requires a Skill Loader")
         self._workspace = workspace
         self._agent_home = agent_home
         self._timezone = ZoneInfo(timezone_name)
         self._clock = clock
-        self._skill_snapshot = skill_snapshot
+        self._skill_loader = skill_loader
 
     def set_clock(self, clock: Callable[[], datetime] | None) -> None:
         """Override the clock used while composing Runtime Context in tests."""
@@ -66,7 +66,7 @@ class ContextBuilder:
                     workspace=self._workspace,
                     agent_home=self._agent_home,
                     long_term_memory=long_term_memory,
-                    skill_snapshot=self._skill_snapshot,
+                    skill_loader=self._skill_loader,
                 ),
             }
         ]
