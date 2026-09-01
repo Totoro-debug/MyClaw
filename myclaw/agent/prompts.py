@@ -188,16 +188,6 @@ def blackboard_prompt(
     )
 
 
-def conversation_summary_prompt() -> str:
-    """Return the isolated prompt used for Conversation Summary generation."""
-    return render_template("conversation-summary-system-prompt.md")
-
-
-def conversation_summary_input(*, messages: str) -> str:
-    """Wrap serialized earlier messages for Conversation Summary generation."""
-    return render_template("conversation-summary-input.md", messages=messages)
-
-
 def memory_task_prompt(*, long_term_path: PurePath) -> str:
     """Return the restricted four-section Long-term Memory maintenance prompt."""
     return render_template("memory-task-prompt.md", long_term_path=long_term_path)

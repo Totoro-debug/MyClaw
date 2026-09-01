@@ -8,8 +8,6 @@ import pytest
 from myclaw.agent.prompts import (
     blackboard_prompt,
     chat_system_prompt,
-    conversation_summary_input,
-    conversation_summary_prompt,
     current_user_input,
     foreground_chat_system_prompt,
     interrupted_assistant_content,
@@ -25,7 +23,6 @@ from myclaw.templates import load_template, render_template
 TEMPLATE_NAMES = {
     "blackboard.md",
     "blackboard-system-prompt.md",
-    "conversation-summary-input.md",
     "conversation-summary-system-prompt.md",
     "current-user-input.md",
     "default-config.md",
@@ -239,7 +236,7 @@ def test_skill_catalog_metadata_is_escaped_json_lines_and_foreground_only(
             last_task="null",
             latest_assistant_content="Latest assistant content",
         ),
-        conversation_summary_prompt(),
+        load_template("conversation-summary-system-prompt.md"),
         memory_task_prompt(long_term_path=PureWindowsPath(r"D:\workspace\memory.md")),
     )
     assert all("planner" not in prompt for prompt in non_foreground_prompts)
@@ -292,7 +289,7 @@ def test_always_skill_body_is_round_trip_json_lines_in_foreground_only(
             last_task="null",
             latest_assistant_content="Latest assistant content",
         ),
-        conversation_summary_prompt(),
+        load_template("conversation-summary-system-prompt.md"),
         memory_task_prompt(long_term_path=PureWindowsPath(r"D:\workspace\memory.md")),
     )
     assert all(document not in prompt for prompt in non_foreground_prompts)
@@ -347,26 +344,6 @@ def test_specialized_model_templates_render_exact_prompts() -> None:
     assert session_title_prompt() == (
         "Generate a concise title for this Conversation Session.\n"
         "Return only the title. Do not call tools or add commentary."
-    )
-    assert conversation_summary_prompt() == (
-        "请从本次对话中提取关键事实。仅输出符合以下类别的内容，其余内容一律忽略：\n\n"  # noqa: RUF001
-        "- User facts：个人信息、偏好、明确表达的观点及习惯。\n"  # noqa: RUF001
-        "- Decisions：已作出的选择或得出的结论。\n"  # noqa: RUF001
-        "- Solutions：通过反复尝试后验证有效的方法，尤其是在其他尝试失败后发现的非显而易见的解决方式。\n"  # noqa: RUF001
-        "- Events：计划、截止日期及其他值得记录的重要事项。\n"  # noqa: RUF001
-        "- Preferences：沟通风格及工具使用偏好。\n\n\n"  # noqa: RUF001
-        "## 优先级\n"
-        "User facts and preferences > solutions > decisions > events > environment facts。\n\n\n"
-        "## 输出\n"
-        "- 输出格式应该采用 Markdown 的无序列表格式，每一行只包含一条事实。\n"  # noqa: RUF001
-        "- 每条输出不要增加额外的说明、前提等内容。\n"
-        "- 如果没有任何有价值的信息，直接输出： `None`\n\n\n"  # noqa: RUF001
-        "## 要求\n"
-        "- 不要为了记录而提取过多内容，有价值、值得记录的事实是能够避免用户日后重复说明的信息。\n"  # noqa: RUF001
-        "- 在一个代码仓库中，应该忽略可直接从源代码或 Git 历史中推断出的代码模式。"  # noqa: RUF001
-    )
-    assert conversation_summary_input(messages='[{"role":"user","content":"Hi"}]') == (
-        '<conversation_messages>\n[{"role":"user","content":"Hi"}]\n</conversation_messages>'
     )
     assert memory_task_prompt(long_term_path=long_term_path) == (
         "Maintain the MyClaw Long-term Memory from new Conversation Summaries.\n"

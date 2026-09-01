@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import Callable, Sequence
 from copy import deepcopy
@@ -10,7 +11,6 @@ import pytest
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import _project_foreground_messages, _project_schedule_messages
-from myclaw.agent.prompts import conversation_summary_prompt
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.memory.conversation_summary import ConversationSummaryManager
@@ -25,6 +25,7 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from myclaw.session.session import Session
+from myclaw.templates import render_template
 from myclaw.tools.base import OpenAIToolSchema
 from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter
 
@@ -320,7 +321,12 @@ async def test_repeated_summary_preparation_advances_last_consolidated_once_per_
     assert second is session
     assert first_position == 2
     assert second.last_consolidated == 4
-    assert [entry.index for entry in await _claimed_entries(memory_manager)] == [1, 2]
+    assert [
+        (entry.index, entry.content) for entry in await _claimed_entries(memory_manager)
+    ] == [
+        (1, "Summary one."),
+        (2, "Summary two."),
+    ]
     second_request = provider.complete_requests[1]
     summary_input = second_request.messages[1]["content"]
     assert isinstance(summary_input, str)
@@ -516,6 +522,52 @@ async def test_summary_provider_failure_preserves_user_visible_model_error(
 
     assert raised.value.error.code == "model_failed"
     assert raised.value.error.message == "PRIVATE FAILURE"
+    assert session.last_consolidated == 0
+    assert not (state.memory_directory / "summary.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_summary_cancellation_propagates_without_persisting_or_advancing_cursor(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = _session_with_history(state)
+    memory_manager = MemoryManager(state)
+
+    class _BlockingProvider:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def complete(
+            self,
+            route: ModelRoute,
+            *,
+            messages: ModelMessages,
+            tools: Sequence[OpenAIToolSchema],
+        ) -> ModelResponse:
+            del route, messages, tools
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    provider = _BlockingProvider()
+    manager = ConversationSummaryManager(
+        provider=provider,
+        memory_manager=memory_manager,
+        route_context_window=10_000,
+        route_max_output=1_000,
+        consolidation_message_threshold=4,
+        tools=(),
+        now=lambda: NOW,
+        project_messages=lambda messages: _project_messages(messages, system_prompt="CHAT SYSTEM"),
+    )
+    task = asyncio.create_task(manager.prepare(session))
+
+    await provider.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
     assert session.last_consolidated == 0
     assert not (state.memory_directory / "summary.jsonl").exists()
 
@@ -814,13 +866,18 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
             "parameters": {"type": "object", "properties": {}},
         },
     }
+    foreground_skill = "PRIVATE FOREGROUND SKILL BODY"
+    blackboard_state = "PRIVATE BLACKBOARD STATE"
 
     def project_messages(
         messages: Sequence[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         projection_calls.append((messages, messages[-1]))
         return [
-            {"role": "system", "content": "lane system"},
+            {
+                "role": "system",
+                "content": f"lane system\n{foreground_skill}\n{blackboard_state}",
+            },
             *[{"role": message["role"], "content": message["content"]} for message in messages],
         ]
 
@@ -855,10 +912,139 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
     assert provider.calls[0]["route"] == "memory"
     messages = provider.calls[0]["messages"]
     assert isinstance(messages, list)
+    assert len(messages) == 2
+    assert [message["role"] for message in messages] == ["system", "user"]
     assert messages[0] == {
         "role": "system",
-        "content": conversation_summary_prompt(),
+        "content": render_template("conversation-summary-system-prompt.md"),
     }
     assert messages[1]["role"] == "user"
-    assert "First question." in messages[1]["content"]
+    summary_input = messages[1]["content"]
+    assert isinstance(summary_input, str)
+    prefix = "## Conversation Messages\n\n```json\n"
+    suffix = "\n```"
+    assert summary_input.startswith(prefix)
+    assert summary_input.endswith(suffix)
+    assert "<conversation_messages>" not in summary_input
+    assert "</conversation_messages>" not in summary_input
+    assert all(
+        marker not in str(message["content"])
+        for message in messages
+        for marker in (foreground_skill, blackboard_state)
+    )
+    assert json.loads(summary_input[len(prefix) : -len(suffix)]) == [
+        {"role": "user", "content": "First question."},
+        {"role": "assistant", "content": "First answer.", "tool_calls": []},
+        {"role": "user", "content": "Second question."},
+        {"role": "assistant", "content": "Second answer.", "tool_calls": []},
+    ]
     assert provider.calls[0]["tools"] == ()
+
+
+@pytest.mark.asyncio
+async def test_summary_projects_owned_message_shapes_without_mutating_session(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    session.add_message("user", "First question.")
+    session.add_message(
+        "assistant",
+        "Partial answer.",
+        tool_calls=[],
+        status="interrupted",
+        error={"code": "turn_cancelled", "message": "Turn interrupted by user."},
+        token_usage=_usage(),
+    )
+    session.add_message(
+        "assistant",
+        "",
+        tool_calls=[],
+        status="error",
+        error={"code": "model_failed", "message": "Hidden failure."},
+        token_usage=_usage(),
+    )
+    session.add_message("user", "Second question.")
+    session.add_message(
+        "assistant",
+        "Calling tool.",
+        tool_calls=[{"id": "call-1", "name": "read_file", "arguments": '{"path":"x"}'}],
+        status="completed",
+        error=None,
+        token_usage=_usage(),
+    )
+    session.add_message(
+        "tool",
+        "Tool result.",
+        tool_call_id="call-1",
+        name="read_file",
+        status="success",
+        artifact=None,
+    )
+    _add_assistant(session, "Final answer.")
+    session.add_message("user", "Current question.")
+    original_messages = deepcopy(session.messages)
+    provider = ScriptedFakeProvider(completions=(_response("Summary."),))
+
+    await _manager(
+        provider,
+        MemoryManager(state),
+        threshold=8,
+    ).prepare(session)
+
+    summary_input = provider.complete_requests[0].messages[1]["content"]
+    assert isinstance(summary_input, str)
+    prefix = "## Conversation Messages\n\n```json\n"
+    suffix = "\n```"
+    assert json.loads(summary_input[len(prefix) : -len(suffix)]) == [
+        {"role": "user", "content": "First question."},
+        {
+            "role": "assistant",
+            "content": "Partial answer.\n\n[Turn interrupted by user.]",
+            "tool_calls": [],
+        },
+        {"role": "user", "content": "Second question."},
+        {
+            "role": "assistant",
+            "content": "Calling tool.",
+            "tool_calls": [
+                {"id": "call-1", "name": "read_file", "arguments": '{"path":"x"}'}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "content": "Tool result.",
+        },
+        {"role": "assistant", "content": "Final answer.", "tool_calls": []},
+    ]
+    assert session.messages == original_messages
+
+
+@pytest.mark.asyncio
+async def test_summary_fences_escape_dynamic_markdown_delimiters_without_changing_data(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    fence_sensitive = 'Quotes: "quoted"\\slash\n```\n<tag> & 继续'
+    session.add_message("user", fence_sensitive)
+    session.add_message("user", "Current question.")
+    provider = ScriptedFakeProvider(completions=(_response("Summary."),))
+
+    await _manager(
+        provider,
+        MemoryManager(state),
+        threshold=2,
+    ).prepare(session)
+
+    summary_input = provider.complete_requests[0].messages[1]["content"]
+    assert isinstance(summary_input, str)
+    prefix = "## Conversation Messages\n\n```json\n"
+    suffix = "\n```"
+    payload = summary_input[len(prefix) : -len(suffix)]
+    assert summary_input.startswith(prefix)
+    assert summary_input.endswith(suffix)
+    assert "```" not in payload
+    assert json.loads(payload) == [{"role": "user", "content": fence_sensitive}]

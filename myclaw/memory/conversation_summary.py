@@ -4,24 +4,26 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Protocol
 
-from myclaw.agent.prompts import conversation_summary_input, conversation_summary_prompt
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
-from myclaw.session.projection import project_session_message
 from myclaw.session.session import Session
+from myclaw.templates import render_template
 from myclaw.tools.base import OpenAIToolSchema
 
 type SummaryProjection = Callable[
     [Sequence[dict[str, Any]]],
     list[dict[str, Any]],
 ]
+
+_SUMMARY_JSON_TRANSLATION = str.maketrans({"`": r"\u0060"})
 
 __all__ = [
     "ConversationSummaryManager",
@@ -160,8 +162,8 @@ class ConversationSummaryManager:
         response = await self._provider.complete(
             "memory",
             messages=[
-                {"role": "system", "content": conversation_summary_prompt()},
-                {"role": "user", "content": _summary_input(selected)},
+                {"role": "system", "content": _summary_system_prompt()},
+                {"role": "user", "content": _summary_user_context(selected)},
             ],
             tools=(),
         )
@@ -274,16 +276,53 @@ def _last_user_index(messages: Sequence[dict[str, Any]]) -> int:
     return len(messages)
 
 
-def _summary_input(messages: list[dict[str, Any]]) -> str:
+def _summary_system_prompt() -> str:
+    return render_template("conversation-summary-system-prompt.md")
+
+
+def _project_summary_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    role = message["role"]
+    if role == "user":
+        return {"role": "user", "content": deepcopy(message["content"])}
+
+    if role == "assistant":
+        content = message["content"]
+        tool_calls = [
+            {
+                "id": deepcopy(tool_call["id"]),
+                "name": deepcopy(tool_call["name"]),
+                "arguments": deepcopy(tool_call["arguments"]),
+            }
+            for tool_call in message["tool_calls"]
+        ]
+        if message["status"] == "error" and not content and not tool_calls:
+            return None
+        if message["status"] == "interrupted":
+            content = render_template("interrupted-assistant-content.md", content=content)
+        return {
+            "role": "assistant",
+            "content": deepcopy(content),
+            "tool_calls": tool_calls,
+        }
+
+    return {
+        "role": "tool",
+        "tool_call_id": deepcopy(message["tool_call_id"]),
+        "name": deepcopy(message["name"]),
+        "content": deepcopy(message["content"]),
+    }
+
+
+def _summary_user_context(messages: list[dict[str, Any]]) -> str:
     records = [
         projected
         for message in messages
-        if (projected := project_session_message(message)) is not None
+        if (projected := _project_summary_message(message)) is not None
     ]
-    return conversation_summary_input(
-        messages=json.dumps(
-            records,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-    )
+    serialized = json.dumps(
+        records,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).translate(_SUMMARY_JSON_TRANSLATION)
+    return f"## Conversation Messages\n\n```json\n{serialized}\n```"

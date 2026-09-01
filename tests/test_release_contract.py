@@ -12,6 +12,7 @@ import zipfile
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import pytest
 import yaml  # type: ignore[import-untyped]
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -388,6 +389,18 @@ def _tracked_markdown_paths() -> tuple[Path, ...]:
         cwd=ROOT,
     ).decode("utf-8")
     return tuple(ROOT / Path(relative) for relative in output.split("\0") if relative)
+
+
+def test_tracked_markdown_inventory_preserves_missing_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = b"README.md\0docs/unexpected-missing.md\0"
+    monkeypatch.setattr(subprocess, "check_output", lambda *_args, **_kwargs: output)
+
+    assert _tracked_markdown_paths() == (
+        ROOT / "README.md",
+        ROOT / "docs" / "unexpected-missing.md",
+    )
 
 
 def _markdown_link_targets(content: str) -> tuple[str, ...]:
