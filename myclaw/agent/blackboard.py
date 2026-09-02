@@ -5,29 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal
 
-from myclaw.provider.models import ModelMessages, ModelResponse
 from myclaw.templates import render_template
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.utils.validation import token_usage_validation_issue
+
+if TYPE_CHECKING:
+    from myclaw.agent.runner import AgentRunnerRouter
 
 _DECISION_KEYS = frozenset({"action", "task_goal", "completion_boundary"})
 _NOT_PARSED = object()
-
-
-class TaskFramingModelRouter(Protocol):
-    """The direct chat completion seam used by Blackboard generation."""
-
-    async def complete(
-        self,
-        route: Literal["chat"],
-        *,
-        messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
-    ) -> ModelResponse: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +59,7 @@ class Blackboard:
     @classmethod
     async def generate(
         cls,
-        router: TaskFramingModelRouter,
+        router: AgentRunnerRouter,
         *,
         previous: Blackboard | None,
         last_assistant_content: str,
@@ -317,5 +305,4 @@ def _reduce_decision(
 __all__ = [
     "Blackboard",
     "FramingResult",
-    "TaskFramingModelRouter",
 ]

@@ -13,14 +13,14 @@ from pathlib import Path
 from threading import Event as ThreadEvent
 from threading import Thread
 from types import TracebackType
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal
 from uuid import uuid4
 
 import pytest
 from loguru import logger
 
 import myclaw.agent.loop as loop_module
-from myclaw.agent.blackboard import Blackboard, FramingResult
+from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, SkillContextTooLargeError
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runner import AgentRunnerResult, AgentRunnerRouter
@@ -55,8 +55,8 @@ from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import (
-    BlockingBlackboardGenerator,
-    DeterministicBlackboardGenerator,
+    BlockingTaskFramingRouterAdapter,
+    TaskFramingRouterAdapter,
     collect_foreground_outbound,
 )
 from tests.fixtures.diagnostic_capture import capture_diagnostics
@@ -108,62 +108,6 @@ class _Router:
     ) -> ModelResponse:
         del route, messages, tools, continuation
         raise AssertionError("unexpected direct completion")
-
-
-class _BlackboardGenerator(Protocol):
-    async def generate(
-        self,
-        *,
-        previous: Blackboard | None,
-        last_assistant_content: str,
-        current_user_input: str,
-    ) -> FramingResult: ...
-
-
-class _BlackboardGeneratorFake:
-    def __init__(
-        self,
-        outcomes: Sequence[FramingResult | BaseException] = (),
-    ) -> None:
-        self._outcomes = deque(outcomes)
-        self.calls: list[tuple[Blackboard | None, str, str]] = []
-
-    async def generate(
-        self,
-        *,
-        previous: Blackboard | None,
-        last_assistant_content: str,
-        current_user_input: str,
-    ) -> FramingResult:
-        self.calls.append((previous, last_assistant_content, current_user_input))
-        if self._outcomes:
-            outcome = self._outcomes.popleft()
-        else:
-            outcome = FramingResult(
-                blackboard=None,
-                usage_delta={
-                    "model_calls": 0,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "total_tokens": 0,
-                },
-                status="resolved",
-            )
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-
-class _InvalidBlackboardGenerator:
-    async def generate(
-        self,
-        *,
-        previous: Blackboard | None,
-        last_assistant_content: str,
-        current_user_input: str,
-    ) -> FramingResult:
-        del previous, last_assistant_content, current_user_input
-        return cast(FramingResult, object())
 
 
 class _MaxRouter(_Router):
@@ -433,7 +377,7 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
 
     router = _Router(())
     tasks_before = asyncio.all_tasks()
-    loop, session, _bus = _runtime(tmp_path, router)
+    loop, session, _bus = _runtime(tmp_path, router, task_framing_outcomes=None)
 
     assert counts == {
         "session": 1,
@@ -475,6 +419,26 @@ def _response(
     )
 
 
+def _framing_response(
+    blackboard: Blackboard,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+) -> ModelResponse:
+    return _response(
+        json.dumps(
+            {
+                "action": "replace",
+                "task_goal": blackboard.goal,
+                "completion_boundary": blackboard.completion_boundary,
+            },
+            separators=(",", ":"),
+        ),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
 def _runtime(
     tmp_path: Path,
     router: AgentRunnerRouter,
@@ -491,8 +455,7 @@ def _runtime(
         Awaitable[list[dict[str, Any]]],
     ]
     | None = None,
-    blackboard_generator: _BlackboardGenerator | None = None,
-    use_default_blackboard_generator: bool = False,
+    task_framing_outcomes: Sequence[ModelResponse | BaseException] | None = (),
     title_prompt: str | None = None,
     skill_loader: SkillLoader | None = None,
     monotonic_now: Callable[[], float] | None = None,
@@ -549,6 +512,11 @@ def _runtime(
         return await selected_context_preparer(active_session, current_user)
 
     bus = MessageBus()
+    model_router = (
+        router
+        if task_framing_outcomes is None
+        else TaskFramingRouterAdapter(router, task_framing_outcomes)
+    )
     loop = AgentLoop(
         workspace_path=workspace,
         workspace_state=state,
@@ -556,16 +524,13 @@ def _runtime(
         configuration=configuration,
         bus=bus,
         schedule_service=schedule,
-        model_router=router,
+        model_router=model_router,
         memory_manager=MemoryManager(state),
         session_id=None,
         now=_Clock().now,
         new_uuid=uuid4,
         monotonic_now=(lambda: 0.0) if monotonic_now is None else monotonic_now,
     )
-    if not use_default_blackboard_generator:
-        generator = blackboard_generator or _BlackboardGeneratorFake()
-        object.__setattr__(loop, "_generate_blackboard", generator.generate)
     if title_prompt is None:
         def disable_title(_session: Session, _content: str) -> None:
             return None
@@ -1021,7 +986,6 @@ async def test_reload_during_active_run_preserves_old_request_and_updates_future
     loop, session, bus = _runtime(
         tmp_path,
         router,
-        blackboard_generator=_BlackboardGeneratorFake(),
         use_default_context_preparer=True,
     )
     before_messages = deepcopy(session.messages)
@@ -1126,7 +1090,6 @@ async def test_reload_during_context_preparation_keeps_run_skill_snapshot(
     loop, session, bus = _runtime(
         tmp_path,
         router,
-        blackboard_generator=_BlackboardGeneratorFake(),
         use_default_context_preparer=True,
     )
     preparation_started = asyncio.Event()
@@ -1233,8 +1196,9 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
         enable_always_load=False,
     )
     loader.load()
-    router = _Router((_response("Generated title"), _response("Completed")))
-    framer = _BlackboardGeneratorFake()
+    router = TaskFramingRouterAdapter(
+        _Router((_response("Generated title"), _response("Completed")))
+    )
     observed: list[tuple[dict[str, Any], ManualSkillInvocation | None]] = []
 
     async def prepare(
@@ -1260,7 +1224,7 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
         tmp_path,
         router,
         context_preparer_with_invocation=prepare,
-        blackboard_generator=framer,
+        task_framing_outcomes=None,
         title_prompt="Generate a title",
         skill_loader=loader,
     )
@@ -1279,7 +1243,7 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
     assert len(router.calls) == 2
     assert raw_input in router.calls
     assert f"<skill>{document}</skill><request>Do the work</request>" in router.calls
-    assert framer.calls == []
+    assert router.framing_requests == []
     assert observed[0][0] == {"role": "user", "content": raw_input}
     assert observed[0][1] is not None
     assert observed[0][1].body == document
@@ -1307,8 +1271,9 @@ async def test_published_manual_skill_loader_ignores_later_file_changes(
     loader.load()
     instruction.unlink()
 
-    router = _Router((_response("Generated title"), _response("Completed")))
-    framer = _BlackboardGeneratorFake()
+    router = TaskFramingRouterAdapter(
+        _Router((_response("Generated title"), _response("Completed")))
+    )
 
     async def prepare(
         active_session: Session,
@@ -1332,7 +1297,7 @@ async def test_published_manual_skill_loader_ignores_later_file_changes(
         tmp_path,
         router,
         context_preparer_with_invocation=prepare,
-        blackboard_generator=framer,
+        task_framing_outcomes=None,
         title_prompt="Generate a title",
         skill_loader=loader,
     )
@@ -1345,7 +1310,7 @@ async def test_published_manual_skill_loader_ignores_later_file_changes(
 
     assert len(router.calls) == 2
     assert f"<skill>{document}</skill><request>request</request>" in router.calls
-    assert framer.calls == []
+    assert router.framing_requests == []
     assert [message["content"] for message in session.messages if message["role"] == "user"] == [
         raw_input
     ]
@@ -1369,11 +1334,11 @@ async def test_only_exact_manual_skill_invocations_skip_task_framing(
     expected_framing_calls: int,
 ) -> None:
     loader = _planner_skill_loader(tmp_path)
-    framer = _BlackboardGeneratorFake()
+    router = TaskFramingRouterAdapter(_Router((_response("Completed"),)))
     loop, _session, bus = _runtime(
         tmp_path,
-        _Router((_response("Completed"),)),
-        blackboard_generator=framer,
+        router,
+        task_framing_outcomes=None,
         skill_loader=loader,
     )
 
@@ -1384,7 +1349,7 @@ async def test_only_exact_manual_skill_invocations_skip_task_framing(
     finally:
         await loop.close()
 
-    assert len(framer.calls) == expected_framing_calls
+    assert len(router.framing_requests) == expected_framing_calls
 
 
 @pytest.mark.asyncio
@@ -1393,24 +1358,20 @@ async def test_ordinary_turn_after_manual_skill_reuses_preserved_blackboard(
 ) -> None:
     loader = _planner_skill_loader(tmp_path)
     previous = Blackboard(goal="Preserved goal", completion_boundary="Preserved boundary")
-    framer = _BlackboardGeneratorFake(
+    router = TaskFramingRouterAdapter(
+        _Router((_response("Manual result"), _response("Ordinary result"))),
         (
-            FramingResult(
-                blackboard=previous,
-                usage_delta={
-                    "model_calls": 0,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "total_tokens": 0,
-                },
-                status="resolved",
+            _response(
+                '{"action":"keep","task_goal":null,"completion_boundary":null}',
+                input_tokens=0,
+                output_tokens=0,
             ),
-        )
+        ),
     )
     loop, session, bus = _runtime(
         tmp_path,
-        _Router((_response("Manual result"), _response("Ordinary result"))),
-        blackboard_generator=framer,
+        router,
+        task_framing_outcomes=None,
         skill_loader=loader,
     )
     session.update_metadata(
@@ -1429,7 +1390,12 @@ async def test_ordinary_turn_after_manual_skill_reuses_preserved_blackboard(
     finally:
         await loop.close()
 
-    assert framer.calls == [(previous, "Manual result", "ordinary follow-up")]
+    assert len(router.framing_requests) == 1
+    framing_content = router.framing_requests[0][0]["content"]
+    assert isinstance(framing_content, str)
+    assert "ordinary follow-up" in framing_content
+    assert "Manual result" in framing_content
+    assert '"task_goal":"Preserved goal"' in framing_content
     assert session.metadata["blackboard"] == {
         "goal": previous.goal,
         "completion_boundary": previous.completion_boundary,
@@ -1441,7 +1407,7 @@ async def test_manual_skill_context_failure_preserves_blackboard_and_usage(
     tmp_path: Path,
 ) -> None:
     loader = _planner_skill_loader(tmp_path)
-    framer = _BlackboardGeneratorFake()
+    router = TaskFramingRouterAdapter(_Router(()))
 
     async def fail_context(
         active_session: Session,
@@ -1456,9 +1422,9 @@ async def test_manual_skill_context_failure_preserves_blackboard_and_usage(
 
     loop, session, bus = _runtime(
         tmp_path,
-        _Router(()),
+        router,
         context_preparer_with_invocation=fail_context,
-        blackboard_generator=framer,
+        task_framing_outcomes=None,
         skill_loader=loader,
     )
     session.update_metadata(
@@ -1477,7 +1443,7 @@ async def test_manual_skill_context_failure_preserves_blackboard_and_usage(
         await loop.close()
 
     assert terminal.metadata["finish_reason"] == "failed"
-    assert framer.calls == []
+    assert router.framing_requests == []
     assert session.metadata == before_metadata
     assert session.messages == []
 
@@ -1487,7 +1453,7 @@ async def test_manual_skill_context_cancellation_preserves_blackboard_and_usage(
     tmp_path: Path,
 ) -> None:
     loader = _planner_skill_loader(tmp_path)
-    framer = _BlackboardGeneratorFake()
+    router = TaskFramingRouterAdapter(_Router(()))
     started = asyncio.Event()
 
     async def block_context(
@@ -1505,9 +1471,9 @@ async def test_manual_skill_context_cancellation_preserves_blackboard_and_usage(
 
     loop, session, bus = _runtime(
         tmp_path,
-        _Router(()),
+        router,
         context_preparer_with_invocation=block_context,
-        blackboard_generator=framer,
+        task_framing_outcomes=None,
         skill_loader=loader,
     )
     session.update_metadata(
@@ -1530,7 +1496,7 @@ async def test_manual_skill_context_cancellation_preserves_blackboard_and_usage(
         "error_code": "turn_cancelled",
         "_streamed": True,
     }
-    assert framer.calls == []
+    assert router.framing_requests == []
     assert session.metadata == before_metadata
     assert session.messages == []
 
@@ -1582,18 +1548,12 @@ async def test_loop_commits_failed_runner_result_once_before_one_safe_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     staged = Blackboard(goal="Failed goal", completion_boundary="Failed boundary")
-    framing_usage = {
-        "model_calls": 1,
-        "input_tokens": 4,
-        "output_tokens": 2,
-        "total_tokens": 6,
-    }
     router = _Router((ModelCallError(ErrorInfo("model_failed", "provider failed")),))
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        blackboard_generator=_BlackboardGeneratorFake(
-            (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
+        task_framing_outcomes=(
+            _framing_response(staged, input_tokens=4, output_tokens=2),
         ),
     )
     append_calls = 0
@@ -1653,18 +1613,12 @@ async def test_loop_commits_max_iteration_repair_once_before_safe_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     staged = Blackboard(goal="Bounded goal", completion_boundary="Bounded boundary")
-    framing_usage = {
-        "model_calls": 1,
-        "input_tokens": 4,
-        "output_tokens": 2,
-        "total_tokens": 6,
-    }
     router = _MaxRouter()
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        blackboard_generator=_BlackboardGeneratorFake(
-            (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
+        task_framing_outcomes=(
+            _framing_response(staged, input_tokens=4, output_tokens=2),
         ),
     )
     append_calls = 0
@@ -1730,20 +1684,13 @@ async def test_loop_cancellation_repairs_and_keeps_the_next_queued_input(
     started = asyncio.Event()
     router = _BlockingRouter(started)
     staged = Blackboard(goal="Cancelled goal", completion_boundary="Cancelled boundary")
-    framing_result = FramingResult(
-        blackboard=staged,
-        usage_delta={
-            "model_calls": 1,
-            "input_tokens": 4,
-            "output_tokens": 2,
-            "total_tokens": 6,
-        },
-        status="resolved",
-    )
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        blackboard_generator=_BlackboardGeneratorFake((framing_result, framing_result)),
+        task_framing_outcomes=(
+            _framing_response(staged, input_tokens=4, output_tokens=2),
+            _framing_response(staged, input_tokens=4, output_tokens=2),
+        ),
     )
     append_calls = 0
     persist_calls = 0
@@ -2115,28 +2062,12 @@ async def test_append_failure_reports_safe_terminal_and_fifo_consumer_continues(
 ) -> None:
     previous = Blackboard(goal="Previous goal", completion_boundary="Previous boundary")
     staged = Blackboard(goal="Staged goal", completion_boundary="Staged boundary")
-    framing_usage = {
-        "model_calls": 1,
-        "input_tokens": 5,
-        "output_tokens": 2,
-        "total_tokens": 7,
-    }
     loop, session, _bus = _runtime(
         tmp_path,
         _Router(()),
-        blackboard_generator=_BlackboardGeneratorFake(
-            (
-                FramingResult(
-                    blackboard=staged,
-                    usage_delta=framing_usage,
-                    status="resolved",
-                ),
-                FramingResult(
-                    blackboard=None,
-                    usage_delta=None,
-                    status="model_failed",
-                ),
-            )
+        task_framing_outcomes=(
+            _framing_response(staged, input_tokens=5, output_tokens=2),
+            RuntimeError("Task Framing failed"),
         ),
     )
     session.update_metadata(
@@ -2378,8 +2309,8 @@ async def test_abort_wins_before_normal_close_finalizes_the_session(
 async def test_blank_foreground_input_performs_zero_task_framing_attempts(
     tmp_path: Path,
 ) -> None:
-    framer = DeterministicBlackboardGenerator()
-    loop, session, _bus = _runtime(tmp_path, _Router(()), blackboard_generator=framer)
+    router = TaskFramingRouterAdapter(_Router(()))
+    loop, session, _bus = _runtime(tmp_path, router, task_framing_outcomes=None)
     execution_ready = asyncio.Event()
 
     committed = await loop._execute_foreground_logged(
@@ -2391,7 +2322,7 @@ async def test_blank_foreground_input_performs_zero_task_framing_attempts(
 
     assert not committed
     assert execution_ready.is_set()
-    assert framer.calls == 0
+    assert router.framing_requests == []
     assert session.messages == []
     assert session.metadata["token_usage"] == {
         "model_calls": 0,
@@ -2518,14 +2449,9 @@ async def test_foreground_frames_once_with_exact_session_inputs_and_atomic_proje
 ) -> None:
     previous = Blackboard(goal="Previous goal", completion_boundary="Previous boundary")
     staged = Blackboard(goal="Current goal", completion_boundary="Current boundary")
-    framing_usage = {
-        "model_calls": 1,
-        "input_tokens": 5,
-        "output_tokens": 2,
-        "total_tokens": 7,
-    }
-    framer = _BlackboardGeneratorFake(
-        (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
+    router = TaskFramingRouterAdapter(
+        _Router((_response("answer"),)),
+        (_framing_response(staged, input_tokens=5, output_tokens=2),),
     )
     observed: list[Blackboard | None] = []
 
@@ -2543,9 +2469,9 @@ async def test_foreground_frames_once_with_exact_session_inputs_and_atomic_proje
 
     loop, session, _bus = _runtime(
         tmp_path,
-        _Router((_response("answer"),)),
+        router,
         context_preparer_with_blackboard=prepare,
-        blackboard_generator=framer,
+        task_framing_outcomes=None,
     )
     session.update_metadata(
         blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
@@ -2572,11 +2498,14 @@ async def test_foreground_frames_once_with_exact_session_inputs_and_atomic_proje
         await loop.close()
 
     assert terminal.metadata == {"_streamed": True}
-    assert framer.calls == [
-        (previous, "Latest complete assistant content", "raw <blackboard> input")
-    ]
+    assert len(router.framing_requests) == 1
+    framing_content = router.framing_requests[0][0]["content"]
+    assert isinstance(framing_content, str)
+    assert "raw <blackboard> input" in framing_content
+    assert "Latest complete assistant content" in framing_content
+    assert '"task_goal":"Previous goal"' in framing_content
     assert observed == [staged]
-    assert observed[0] is staged
+    assert observed[0] is not staged
     assert [message["content"] for message in session.messages if message["role"] == "user"] == [
         "raw <blackboard> input"
     ]
@@ -2604,10 +2533,6 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
         "output_tokens": 2,
         "total_tokens": 6,
     }
-    framer = _BlackboardGeneratorFake(
-        (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
-    )
-
     class ToolLoopRouter(_Router):
         def __init__(self) -> None:
             super().__init__(())
@@ -2646,6 +2571,10 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
             return replay()
 
     router = ToolLoopRouter()
+    framing_router = TaskFramingRouterAdapter(
+        router,
+        (_framing_response(staged, input_tokens=4, output_tokens=2),),
+    )
     context_calls: list[Blackboard | None] = []
     projected_blackboard = (
         f"## Task goal\n\n{staged.goal}\n\n## Completion boundary\n\n{staged.completion_boundary}"
@@ -2668,9 +2597,9 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
 
     loop, session, _bus = _runtime(
         tmp_path,
-        router,
+        framing_router,
         context_preparer_with_blackboard=prepare,
-        blackboard_generator=framer,
+        task_framing_outcomes=None,
     )
     append_calls = 0
     original_append = session.append_messages
@@ -2690,9 +2619,9 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
         await loop.close()
 
     assert terminal.metadata == {"_streamed": True}
-    assert framer.calls == [(None, "", "raw tool input")]
+    assert len(framing_router.framing_requests) == 1
     assert context_calls == [staged]
-    assert context_calls[0] is staged
+    assert context_calls[0] is not staged
     assert len(router.requests) == 2
     assert all(request[1]["content"].endswith(projected_blackboard) for request in router.requests)
     assert append_calls == 1
@@ -2717,16 +2646,10 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "usage_delta", "expected_framing_usage"),
+    ("framing_outcome", "expected_framing_usage"),
     [
         (
-            "invalid_response",
-            {
-                "model_calls": 1,
-                "input_tokens": 4,
-                "output_tokens": 1,
-                "total_tokens": 5,
-            },
+            _response("not valid task framing", input_tokens=4, output_tokens=1),
             {
                 "model_calls": 1,
                 "input_tokens": 4,
@@ -2735,27 +2658,20 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
             },
         ),
         (
-            "model_failed",
-            None,
+            RuntimeError("Task Framing failed"),
             {"model_calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
         ),
     ],
 )
 async def test_invalid_and_model_failed_framing_statuses_fail_open_and_clear_on_commit(
     tmp_path: Path,
-    status: str,
-    usage_delta: dict[str, int] | None,
+    framing_outcome: ModelResponse | BaseException,
     expected_framing_usage: dict[str, int],
 ) -> None:
     previous = Blackboard(goal="Old goal", completion_boundary="Old boundary")
-    framer = _BlackboardGeneratorFake(
-        (
-            FramingResult(
-                blackboard=None,
-                usage_delta=usage_delta,
-                status=status,  # type: ignore[arg-type]
-            ),
-        )
+    router = TaskFramingRouterAdapter(
+        _Router((_response("raw answer"),)),
+        (framing_outcome,),
     )
     observed: list[Blackboard | None] = []
 
@@ -2770,9 +2686,9 @@ async def test_invalid_and_model_failed_framing_statuses_fail_open_and_clear_on_
 
     loop, session, _bus = _runtime(
         tmp_path,
-        _Router((_response("raw answer"),)),
+        router,
         context_preparer_with_blackboard=prepare,
-        blackboard_generator=framer,
+        task_framing_outcomes=None,
     )
     session.update_metadata(
         blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
@@ -2786,7 +2702,7 @@ async def test_invalid_and_model_failed_framing_statuses_fail_open_and_clear_on_
         await loop.close()
 
     assert terminal.metadata == {"_streamed": True}
-    assert framer.calls == [(previous, "", "continue without parsed framing")]
+    assert len(router.framing_requests) == 1
     assert observed == [None]
     assert "blackboard" not in session.metadata
     assert session.metadata["token_usage"] == {
@@ -2801,11 +2717,11 @@ async def test_invalid_and_model_failed_framing_statuses_fail_open_and_clear_on_
 async def test_framing_cancellation_reclaims_first_title_task_without_commit(
     tmp_path: Path,
 ) -> None:
-    framer = BlockingBlackboardGenerator()
+    framer = BlockingTaskFramingRouterAdapter(_ConcurrentTitleRouter())
     loop, session, _bus = _runtime(
         tmp_path,
-        _ConcurrentTitleRouter(),
-        blackboard_generator=framer,
+        framer,
+        task_framing_outcomes=None,
         title_prompt="Generate a title",
     )
 
@@ -2829,50 +2745,7 @@ async def test_framing_cancellation_reclaims_first_title_task_without_commit(
         "output_tokens": 0,
         "total_tokens": 0,
     }
-    assert not loop._title_work
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("framer", "error_type", "match"),
-    [
-        (_BlackboardGeneratorFake((RuntimeError("private framing failure"),)), RuntimeError, "private"),
-        (_InvalidBlackboardGenerator(), TypeError, "invalid result"),
-    ],
-)
-async def test_framing_contract_errors_propagate_and_reclaim_first_title_task(
-    tmp_path: Path,
-    framer: _BlackboardGenerator,
-    error_type: type[Exception],
-    match: str,
-) -> None:
-    router = _ConcurrentTitleRouter()
-    loop, session, _bus = _runtime(
-        tmp_path,
-        router,
-        blackboard_generator=framer,
-        title_prompt="Generate a title",
-    )
-    before_messages = deepcopy(session.messages)
-    before_metadata = deepcopy(session.metadata)
-    execution_ready = asyncio.Event()
-
-    with pytest.raises(error_type, match=match):
-        await loop._execute_foreground(
-            InboundMessage("framing implementation error"),
-            execution_ready=execution_ready,
-        )
-
-    outbound = asyncio.create_task(_bus.get_outbound())
-    done, _ = await asyncio.wait((outbound,), timeout=0)
-    assert not done
-    outbound.cancel()
-    await asyncio.gather(outbound, return_exceptions=True)
-    assert execution_ready.is_set()
-    assert session.messages == before_messages
-    assert session.metadata == before_metadata
-    assert session.metadata["title"] == "Untitled session"
-    assert "chat" not in router.calls
+    assert framer.cancelled.is_set()
     assert not loop._title_work
 
 
@@ -2882,21 +2755,6 @@ async def test_context_failure_after_framing_preserves_previous_blackboard_and_u
 ) -> None:
     previous = Blackboard(goal="Previous goal", completion_boundary="Previous boundary")
     staged = Blackboard(goal="Staged goal", completion_boundary="Staged boundary")
-    framer = _BlackboardGeneratorFake(
-        (
-            FramingResult(
-                blackboard=staged,
-                usage_delta={
-                    "model_calls": 1,
-                    "input_tokens": 4,
-                    "output_tokens": 2,
-                    "total_tokens": 6,
-                },
-                status="resolved",
-            ),
-        )
-    )
-
     async def fail_context(
         active: Session,
         current: dict[str, Any],
@@ -2909,7 +2767,9 @@ async def test_context_failure_after_framing_preserves_previous_blackboard_and_u
         tmp_path,
         _Router(()),
         context_preparer_with_blackboard=fail_context,
-        blackboard_generator=framer,
+        task_framing_outcomes=(
+            _framing_response(staged, input_tokens=4, output_tokens=2),
+        ),
     )
     session.update_metadata(
         blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
@@ -2938,20 +2798,6 @@ async def test_context_cancellation_after_framing_preserves_previous_blackboard_
 ) -> None:
     previous = Blackboard(goal="Previous goal", completion_boundary="Previous boundary")
     staged = Blackboard(goal="Staged goal", completion_boundary="Staged boundary")
-    framer = _BlackboardGeneratorFake(
-        (
-            FramingResult(
-                blackboard=staged,
-                usage_delta={
-                    "model_calls": 1,
-                    "input_tokens": 4,
-                    "output_tokens": 2,
-                    "total_tokens": 6,
-                },
-                status="resolved",
-            ),
-        )
-    )
     started = asyncio.Event()
 
     async def block_context(
@@ -2968,7 +2814,9 @@ async def test_context_cancellation_after_framing_preserves_previous_blackboard_
         tmp_path,
         _Router(()),
         context_preparer_with_blackboard=block_context,
-        blackboard_generator=framer,
+        task_framing_outcomes=(
+            _framing_response(staged, input_tokens=4, output_tokens=2),
+        ),
     )
     session.update_metadata(
         blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
@@ -3000,20 +2848,15 @@ async def test_title_usage_is_preserved_when_title_finishes_before_foreground_co
     tmp_path: Path,
 ) -> None:
     staged = Blackboard(goal="Current goal", completion_boundary="Current boundary")
-    framing_usage = {
-        "model_calls": 1,
-        "input_tokens": 5,
-        "output_tokens": 2,
-        "total_tokens": 7,
-    }
-    framer = _BlackboardGeneratorFake(
-        (FramingResult(blackboard=staged, usage_delta=framing_usage, status="resolved"),)
-    )
     router = _ConcurrentTitleRouter()
+    framing_router = TaskFramingRouterAdapter(
+        router,
+        (_framing_response(staged, input_tokens=5, output_tokens=2),),
+    )
     loop, session, _bus = _runtime(
         tmp_path,
-        router,
-        blackboard_generator=framer,
+        framing_router,
+        task_framing_outcomes=None,
         title_prompt="Generate a title",
     )
 
@@ -3058,25 +2901,15 @@ async def test_foreground_commit_preserves_staged_framing_until_slow_title_finis
     tmp_path: Path,
 ) -> None:
     staged = Blackboard(goal="Current goal", completion_boundary="Current boundary")
-    framer = _BlackboardGeneratorFake(
-        (
-            FramingResult(
-                blackboard=staged,
-                usage_delta={
-                    "model_calls": 1,
-                    "input_tokens": 5,
-                    "output_tokens": 2,
-                    "total_tokens": 7,
-                },
-                status="resolved",
-            ),
-        )
-    )
     router = _SlowTitleLogRouter()
+    framing_router = TaskFramingRouterAdapter(
+        router,
+        (_framing_response(staged, input_tokens=5, output_tokens=2),),
+    )
     loop, session, _bus = _runtime(
         tmp_path,
-        router,
-        blackboard_generator=framer,
+        framing_router,
+        task_framing_outcomes=None,
         title_prompt="Generate a title",
     )
 
@@ -3313,7 +3146,7 @@ async def test_default_agent_loop_wiring_reduces_keep_replace_and_clear(
             )
 
     router = DefaultRouter()
-    loop, session, _bus = _runtime(tmp_path, router, use_default_blackboard_generator=True)
+    loop, session, _bus = _runtime(tmp_path, router, task_framing_outcomes=None)
     if previous is not None:
         session.update_metadata(
             blackboard={
@@ -3395,7 +3228,7 @@ async def test_default_agent_loop_wiring_skips_router_completion_for_manual_skil
     loop, session, bus = _runtime(
         tmp_path,
         router,
-        use_default_blackboard_generator=True,
+        task_framing_outcomes=None,
         skill_loader=loader,
     )
 

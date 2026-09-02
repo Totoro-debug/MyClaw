@@ -23,10 +23,10 @@ from myclaw.provider.models import AssistantModelMessage, ModelCompleted, ModelR
 from myclaw.skills.catalog import SkillMetadata
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
-    BlockingBlackboardGenerator,
-    DeterministicBlackboardGenerator,
+    BlockingTaskFramingRouterAdapter,
     ScriptedFakeProvider,
     StreamScript,
+    TaskFramingRouterAdapter,
     collect_foreground_outbound,
 )
 
@@ -193,10 +193,8 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
     )
 
     def recording_init(loop: AgentLoop, *args: Any, **kwargs: Any) -> None:
+        kwargs["model_router"] = TaskFramingRouterAdapter(kwargs["model_router"])
         original_init(loop, *args, **kwargs)
-        object.__setattr__(
-            loop, "_generate_blackboard", DeterministicBlackboardGenerator().generate
-        )
         constructed.append(loop)
 
     monkeypatch.setattr(AgentLoop, "__init__", recording_init)
@@ -264,17 +262,18 @@ async def test_cli_force_replacement_cancels_framing_without_old_session_late_wr
     configuration = _configuration(agent_home)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    blocker = BlockingBlackboardGenerator()
+    blocker: BlockingTaskFramingRouterAdapter | None = None
     constructed: list[AgentLoop] = []
     original_init = AgentLoop.__init__
 
     def recording_init(loop: AgentLoop, *args: Any, **kwargs: Any) -> None:
+        nonlocal blocker
+        if not constructed:
+            blocker = BlockingTaskFramingRouterAdapter(kwargs["model_router"])
+            kwargs["model_router"] = blocker
+        else:
+            kwargs["model_router"] = TaskFramingRouterAdapter(kwargs["model_router"])
         original_init(loop, *args, **kwargs)
-        object.__setattr__(
-            loop,
-            "_generate_blackboard",
-            blocker.generate if not constructed else DeterministicBlackboardGenerator().generate,
-        )
         constructed.append(loop)
 
     class FramingAbortApp:
@@ -294,6 +293,7 @@ async def test_cli_force_replacement_cancels_framing_without_old_session_late_wr
             self._dispatcher = management_dispatcher
 
         async def run_async(self) -> None:
+            assert blocker is not None
             old = cast(AgentLoop, self._control)
             old.session.add_message("user", "Committed before blocked framing.")
             old.session.persist()

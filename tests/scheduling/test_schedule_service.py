@@ -36,9 +36,9 @@ from myclaw.utils import scheduler as scheduler_module
 from myclaw.utils.scheduler import AsyncioSchedulerClock
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
-    DeterministicBlackboardGenerator,
     ProviderCall,
     ScriptedFakeProvider,
+    TaskFramingRouterAdapter,
     collect_foreground_outbound,
 )
 from tests.fixtures.diagnostic_capture import capture_diagnostics
@@ -341,15 +341,12 @@ def _agent_loop(
         configuration=configuration,
         bus=bus,
         schedule_service=schedule,
-        model_router=router,
+        model_router=TaskFramingRouterAdapter(router),
         memory_manager=MemoryManager(state),
         session_id=None,
         now=lambda: START,
         new_uuid=lambda: OTHER_UUID,
         monotonic_now=schedule_clock.monotonic,  # type: ignore[attr-defined]
-    )
-    object.__setattr__(
-        loop, "_generate_blackboard", DeterministicBlackboardGenerator().generate
     )
     return loop, router, schedule, bus
 

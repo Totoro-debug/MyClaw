@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 
 import pytest
 
@@ -10,13 +10,15 @@ from myclaw.agent.blackboard import (
     Blackboard,
     FramingResult,
 )
+from myclaw.agent.runner import AgentRunnerRoute
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
+    ModelContinuation,
     ModelMessages,
     ModelResponse,
-    ModelRoute,
+    ModelStreamEvent,
     ModelUsage,
 )
 from myclaw.templates import render_template
@@ -34,13 +36,26 @@ class _FakeRouter:
         self.failure = failure
         self.calls: list[dict[str, object]] = []
 
-    async def complete(
+    def stream(
         self,
-        route: ModelRoute,
+        route: AgentRunnerRoute,
         *,
         messages: ModelMessages,
         tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del route, messages, tools, continuation
+        raise AssertionError("Blackboard must use a direct completion")
+
+    async def complete(
+        self,
+        route: AgentRunnerRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[OpenAIToolSchema],
+        continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
+        del continuation
         self.calls.append(
             {
                 "route": route,

@@ -36,7 +36,7 @@ from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.core.web_fetch import JinaReaderClient
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
-from tests.fixtures import DeterministicBlackboardGenerator, collect_foreground_outbound
+from tests.fixtures import TaskFramingRouterAdapter, collect_foreground_outbound
 from tests.fixtures.provider import ProviderCall
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
@@ -180,14 +180,13 @@ def _agent_loop(
         configuration=configuration,
         bus=bus,
         schedule_service=schedule,
-        model_router=router,
+        model_router=TaskFramingRouterAdapter(router),
         memory_manager=MemoryManager(state),
         session_id=None,
         now=lambda: NOW,
         new_uuid=uuid4,
         monotonic_now=lambda: 0.0,
     )
-    object.__setattr__(loop, "_generate_blackboard", DeterministicBlackboardGenerator().generate)
     return loop, router, schedule, bus
 
 

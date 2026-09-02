@@ -15,10 +15,7 @@ from uuid import UUID
 from loguru import logger
 from tzlocal import get_localzone_name
 
-from myclaw.agent.blackboard import (
-    Blackboard,
-    FramingResult,
-)
+from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.message_bus import (
     InboundMessage,
@@ -919,13 +916,12 @@ class AgentLoop:
             previous_blackboard = Blackboard.from_dict(active_session.metadata.get("blackboard"))
             last_assistant_content = _latest_assistant_content(active_session)
             try:
-                framing_result = await self._generate_blackboard(
+                framing_result = await Blackboard.generate(
+                    self._model_router,
                     previous=previous_blackboard,
                     last_assistant_content=last_assistant_content,
                     current_user_input=inbound.content,
                 )
-                if not isinstance(framing_result, FramingResult):
-                    raise TypeError("Blackboard generation returned an invalid result")
             except asyncio.CancelledError:
                 if not self._cancel_requested:
                     raise
@@ -1028,21 +1024,6 @@ class AgentLoop:
                 pass
         await self._publish_terminal(result)
         return True
-
-    async def _generate_blackboard(
-        self,
-        *,
-        previous: Blackboard | None,
-        last_assistant_content: str,
-        current_user_input: str,
-    ) -> FramingResult:
-        """Generate one staged Blackboard without retaining the Model Router on it."""
-        return await Blackboard.generate(
-            self._model_router,
-            previous=previous,
-            last_assistant_content=last_assistant_content,
-            current_user_input=current_user_input,
-        )
 
     async def _prepare_foreground_context(
         self,

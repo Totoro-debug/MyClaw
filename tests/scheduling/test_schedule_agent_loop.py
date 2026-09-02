@@ -45,9 +45,9 @@ from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
-    DeterministicBlackboardGenerator,
     FakeClock,
     ProviderCall,
+    TaskFramingRouterAdapter,
     collect_foreground_outbound,
 )
 from tests.fixtures.diagnostic_capture import capture_diagnostics
@@ -296,15 +296,12 @@ def _agent_loop(
         configuration=configuration,
         bus=bus,
         schedule_service=schedule,
-        model_router=router,
+        model_router=TaskFramingRouterAdapter(router),
         memory_manager=memory_manager,
         session_id=None,
         now=lambda: NOW,
         new_uuid=lambda: JOB_UUID,
         monotonic_now=schedule_clock.monotonic,
-    )
-    object.__setattr__(
-        loop, "_generate_blackboard", DeterministicBlackboardGenerator().generate
     )
     dispatcher = ManagementCommandDispatcher(
         management_service(
