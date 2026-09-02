@@ -330,11 +330,11 @@ def _build_current_user_content(
             f"{_format_runtime_context(current_time=current_time, session_id=session_id)}\n\n"
             "## Skill Instructions\n\n"
             "```json\n"
-            f"{_skill_manual_json(manual_invocation)}\n"
+            f"{_markdown_safe_json({'name': manual_invocation.metadata.name, 'body': manual_invocation.body})}\n"
             "```\n\n"
             "## User Request\n\n"
             "```json\n"
-            f"{_skill_request_json(manual_invocation.request)}\n"
+            f"{_markdown_safe_json(manual_invocation.request)}\n"
             "```"
         )
     if blackboard_projection is None:
@@ -379,16 +379,18 @@ def _build_foreground_system_prompt(
     loaded_skills = tuple(skills)
     if loaded_skills:
         entries = "\n".join(
-            _skill_metadata_json(
-                name=skill.metadata.name,
-                description=skill.metadata.description,
-                path=str(skill.metadata.path),
+            _markdown_safe_json(
+                {
+                    "name": skill.metadata.name,
+                    "description": skill.metadata.description,
+                    "path": str(skill.metadata.path),
+                }
             )
             for skill in loaded_skills
         )
         sections.append(render_template("skill-catalog.md", entries=entries))
         always_entries = "\n".join(
-            _skill_always_json(name=skill.metadata.name, body=skill.document)
+            _markdown_safe_json({"name": skill.metadata.name, "body": skill.document})
             for skill in loaded_skills
             if skill.always
         )
@@ -408,39 +410,9 @@ def _project_long_term_memory(long_term_memory: str) -> str:
     return projected.replace("##", "###")
 
 
-def _skill_metadata_json(*, name: str, description: str, path: str) -> str:
-    serialized = json.dumps(
-        {"name": name, "description": description, "path": path},
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return serialized.translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
-
-
-def _skill_always_json(*, name: str, body: str) -> str:
-    serialized = json.dumps(
-        {"name": name, "body": body},
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return serialized.translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
-
-
-def _skill_manual_json(invocation: ManualSkillInvocation) -> str:
-    serialized = json.dumps(
-        {"name": invocation.metadata.name, "body": invocation.body},
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return serialized.translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
-
-
-def _skill_request_json(request: str) -> str:
+def _markdown_safe_json(value: object) -> str:
     return json.dumps(
-        request,
+        value,
         ensure_ascii=False,
         separators=(",", ":"),
         allow_nan=False,

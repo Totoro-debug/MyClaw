@@ -51,32 +51,24 @@ class ConversationSummaryManager:
         *,
         provider: SummaryModelRouter,
         memory_manager: MemoryManager,
-        route_context_window: int,
-        route_max_output: int,
         consolidation_message_threshold: int,
-        tools: tuple[OpenAIToolSchema, ...],
         now: Callable[[], datetime],
-        project_messages: SummaryProjection,
     ) -> None:
         self._provider = provider
         self._memory_manager = memory_manager
-        self._route_context_window = route_context_window
-        self._route_max_output = route_max_output
         self._message_threshold = consolidation_message_threshold
-        self._tools = tools
         self._now = now
-        self._project_messages = project_messages
 
     async def prepare(
         self,
         session: Session,
         *,
+        project_messages: SummaryProjection,
+        route_context_window: int,
+        route_max_output: int,
+        tools: Sequence[OpenAIToolSchema],
         current_user: dict[str, Any] | None = None,
         continuation: Sequence[dict[str, Any]] = (),
-        project_messages: SummaryProjection | None = None,
-        route_context_window: int | None = None,
-        route_max_output: int | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
     ) -> Session:
         with without_session_log():
             return await self._prepare(
@@ -93,27 +85,22 @@ class ConversationSummaryManager:
         self,
         session: Session,
         *,
+        project_messages: SummaryProjection,
+        route_context_window: int,
+        route_max_output: int,
+        tools: Sequence[OpenAIToolSchema],
         current_user: dict[str, Any] | None,
         continuation: Sequence[dict[str, Any]],
-        project_messages: SummaryProjection | None,
-        route_context_window: int | None,
-        route_max_output: int | None,
-        tools: Sequence[OpenAIToolSchema] | None,
     ) -> Session:
-        project = self._project_messages if project_messages is None else project_messages
-        input_window = (
-            self._route_context_window if route_context_window is None else route_context_window
-        )
-        output_limit = self._route_max_output if route_max_output is None else route_max_output
-        effective_tools = self._tools if tools is None else tuple(tools)
+        effective_tools = tuple(tools)
         short_term = _short_term_messages(
             session,
             current_user=current_user,
             continuation=continuation,
         )
         current_user_index = _last_user_message_index(short_term)
-        complete_messages = project(short_term)
-        available_input = input_window - output_limit
+        complete_messages = project_messages(short_term)
+        available_input = route_context_window - route_max_output
         system_tokens = _estimate_messages(complete_messages[:1])
         if system_tokens > available_input:
             raise ModelCallError(
@@ -123,7 +110,7 @@ class ConversationSummaryManager:
                 )
             )
         if current_user_index < len(short_term):
-            non_summarizable_messages = project(short_term[current_user_index:])
+            non_summarizable_messages = project_messages(short_term[current_user_index:])
             if _estimate_messages(non_summarizable_messages) >= available_input:
                 raise ModelCallError(
                     ErrorInfo(
@@ -143,7 +130,7 @@ class ConversationSummaryManager:
                 short_term,
                 current_user_index,
                 available_input,
-                project,
+                project_messages,
             )
         if message_triggered:
             initial_cutoff = max(

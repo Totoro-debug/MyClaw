@@ -265,12 +265,8 @@ class AgentLoop:
         summary_manager = ConversationSummaryManager(
             provider=cast(SummaryModelRouter, model_router),
             memory_manager=memory_manager,
-            route_context_window=chat_route.context_window,
-            route_max_output=chat_route.max_output,
             consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
-            tools=tuple(tool_gateway.schemas),
             now=now,
-            project_messages=self._project_foreground_summary_messages,
         )
         active_session = (
             Session.create(workspace_state, now=now, new_uuid=new_uuid)
@@ -283,9 +279,7 @@ class AgentLoop:
             )
         )
 
-        self._workspace_path = workspace_path
         self._workspace_state = workspace_state
-        self._agent_home = agent_home
         self._configuration = configuration
         self._configured_chat_model = configured_chat_model
         self._configured_chat_context_window = configured_chat_context_window
@@ -299,7 +293,6 @@ class AgentLoop:
         self._schedule_now = schedule_service.current_time
         self._tool_gateway = tool_gateway
         self._model_router = model_router
-        self._memory_manager = memory_manager
         self._runner = runner
         self._max_iterations = configuration.runtime.max_iterations
         self._bus = bus
@@ -1124,15 +1117,6 @@ class AgentLoop:
                 [*history, current_user],
                 session_id=active_session.session_id,
             )
-
-    def _project_foreground_summary_messages(
-        self,
-        messages: Sequence[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        return self._context_builder.build_foreground_messages(
-            messages,
-            session_id=self._session.session_id,
-        )
 
     def runtime_status_input(self) -> RuntimeStatusInput:
         """Return the status token input projected by this generation's Context Builder."""

@@ -1203,14 +1203,22 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
         "self",
         "provider",
         "memory_manager",
-        "route_context_window",
-        "route_max_output",
         "consolidation_message_threshold",
-        "tools",
         "now",
-        "project_messages",
     )
     assert all(default is None for default in summary_init.args.kw_defaults)
+    summary_prepare = _issue_202_direct_method(conversation_summary, "prepare")
+    assert _issue_202_parameter_names(summary_prepare) == (
+        "self",
+        "session",
+        "project_messages",
+        "route_context_window",
+        "route_max_output",
+        "tools",
+        "current_user",
+        "continuation",
+    )
+    assert summary_prepare.args.kw_defaults[:4] == [None, None, None, None]
 
     management = _issue_202_class(
         _issue_202_ast(ROOT / "myclaw" / "management" / "service.py"),

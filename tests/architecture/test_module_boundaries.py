@@ -217,8 +217,8 @@ def test_agent_loop_delegates_foreground_context_construction_to_context_builder
     assert "render_template" not in source
     assert "build_messages" not in source
     assert "_project_foreground_messages" not in source
+    assert "_project_foreground_summary_messages" not in methods
     assert calls_builder("_prepare_foreground_context", "build_foreground_messages")
-    assert calls_builder("_project_foreground_summary_messages", "build_foreground_messages")
 
 
 def test_agent_loop_delegates_schedule_context_construction_to_context_builder() -> None:
@@ -269,7 +269,6 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
     expected_builder_calls = {
         "_prepare_foreground_context": "build_foreground_messages",
         "_prepare_schedule_context": "build_schedule_messages",
-        "_project_foreground_summary_messages": "build_foreground_messages",
         "_router_stream_title": "build_title_messages",
     }
     for method_name, builder_method in expected_builder_calls.items():
@@ -282,6 +281,26 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
             and node.func.value.attr == "_context_builder"
             for node in ast.walk(method)
         )
+
+    required_summary_arguments = {
+        "project_messages",
+        "route_context_window",
+        "route_max_output",
+        "tools",
+    }
+    for method_name in ("_prepare_foreground_context", "_prepare_schedule_context"):
+        summary_call = next(
+            node
+            for node in ast.walk(methods[method_name])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "prepare"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "_summary_manager"
+        )
+        assert required_summary_arguments <= {
+            keyword.arg for keyword in summary_call.keywords
+        }
 
     assert any(
         isinstance(node, ast.Call)

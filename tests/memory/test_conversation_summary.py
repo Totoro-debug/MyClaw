@@ -123,6 +123,21 @@ def _manager(
     provider: ScriptedFakeProvider,
     memory_manager: MemoryManager,
     *,
+    threshold: int = 4,
+) -> ConversationSummaryManager:
+    return ConversationSummaryManager(
+        provider=ScriptedFakeRouter(provider),
+        memory_manager=memory_manager,
+        consolidation_message_threshold=threshold,
+        now=lambda: NOW,
+    )
+
+
+async def _prepare_summary(
+    provider: ScriptedFakeProvider,
+    memory_manager: MemoryManager,
+    session: Session,
+    *,
     context_window: int = 10_000,
     max_output: int = 1_000,
     threshold: int = 4,
@@ -132,19 +147,21 @@ def _manager(
         list[dict[str, Any]],
     ]
     | None = None,
-) -> ConversationSummaryManager:
+    tools: Sequence[OpenAIToolSchema] = (),
+    current_user: dict[str, Any] | None = None,
+    continuation: Sequence[dict[str, Any]] = (),
+) -> Session:
     projection = project_messages or (
         lambda messages: _project_messages(messages, system_prompt=system_prompt)
     )
-    return ConversationSummaryManager(
-        provider=ScriptedFakeRouter(provider),
-        memory_manager=memory_manager,
+    return await _manager(provider, memory_manager, threshold=threshold).prepare(
+        session,
+        project_messages=projection,
         route_context_window=context_window,
         route_max_output=max_output,
-        consolidation_message_threshold=threshold,
-        tools=(),
-        now=lambda: NOW,
-        project_messages=projection,
+        tools=tools,
+        current_user=current_user,
+        continuation=continuation,
     )
 
 
@@ -208,7 +225,7 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
     memory_manager = MemoryManager(state)
 
-    prepared = await _manager(provider, memory_manager).prepare(session)
+    prepared = await _prepare_summary(provider, memory_manager, session)
 
     assert prepared is session
     assert session.last_consolidated == 2
@@ -255,15 +272,18 @@ async def test_summary_candidate_includes_current_user_without_publishing_it(
     manager = ConversationSummaryManager(
         provider=ScriptedFakeRouter(provider),
         memory_manager=memory_manager,
-        route_context_window=10_000,
-        route_max_output=1_000,
         consolidation_message_threshold=4,
-        tools=(),
         now=lambda: NOW,
-        project_messages=project_messages,
     )
 
-    await manager.prepare(session, current_user={"role": "user", "content": "Current question."})
+    await manager.prepare(
+        session,
+        project_messages=project_messages,
+        route_context_window=10_000,
+        route_max_output=1_000,
+        tools=(),
+        current_user={"role": "user", "content": "Current question."},
+    )
 
     assert projected_inputs[0][-1] == {
         "role": "user",
@@ -290,13 +310,14 @@ async def test_token_budget_summarizes_roughly_half_the_available_input(
     session.add_message("user", "Current question.")
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
 
-    await _manager(
+    await _prepare_summary(
         provider,
         MemoryManager(state),
+        session,
         context_window=1_024,
         max_output=128,
         threshold=100,
-    ).prepare(session)
+    )
 
     assert session.last_consolidated == 2
     request = provider.complete_requests[0]
@@ -327,15 +348,14 @@ async def test_repeated_summary_preparation_advances_last_consolidated_once_per_
         )
     )
     memory_manager = MemoryManager(state)
-    manager = _manager(provider, memory_manager)
 
-    first = await manager.prepare(session)
+    first = await _prepare_summary(provider, memory_manager, session)
     first_position = first.last_consolidated
     _add_assistant(session, "Answer three.")
     session.add_message("user", "Question four.")
     _add_assistant(session, "Answer four.")
     session.add_message("user", "Question five.")
-    second = await manager.prepare(session)
+    second = await _prepare_summary(provider, memory_manager, session)
 
     assert first is session
     assert second is session
@@ -365,7 +385,7 @@ async def test_summary_persistence_failure_leaves_last_consolidated_unchanged(
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
 
     with pytest.raises(ModelCallError) as raised:
-        await _manager(provider, memory_manager).prepare(session)
+        await _prepare_summary(provider, memory_manager, session)
 
     assert raised.value.error.code == "persistence_error"
     assert session.last_consolidated == 0
@@ -388,14 +408,15 @@ async def test_oversized_system_prompt_fails_without_summary_or_last_consolidate
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _manager(
+        await _prepare_summary(
             provider,
             memory_manager,
+            session,
             context_window=1_024,
             max_output=128,
             threshold=100,
             system_prompt="M" * 4_000,
-        ).prepare(session)
+        )
 
     assert raised.value.error.code == "memory_context_too_large"
     assert provider.complete_requests == []
@@ -412,14 +433,15 @@ async def test_system_prompt_budget_keeps_raw_prompt_boundary(
     provider = ScriptedFakeProvider(completions=(_response("Boundary summary."),))
     memory_manager = MemoryManager(state)
 
-    await _manager(
+    await _prepare_summary(
         provider,
         memory_manager,
+        session,
         context_window=613,
         max_output=500,
         threshold=100,
         system_prompt="S" * 400,
-    ).prepare(session)
+    )
 
     assert session.last_consolidated == 4
     assert len(await _claimed_entries(memory_manager)) == 1
@@ -435,13 +457,14 @@ async def test_oversized_system_prompt_without_user_keeps_failure(
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _manager(
+        await _prepare_summary(
             provider,
             memory_manager,
+            session,
             context_window=1_024,
             max_output=128,
             system_prompt="M" * 4_000,
-        ).prepare(session)
+        )
 
     assert raised.value.error.code == "memory_context_too_large"
     assert provider.complete_requests == []
@@ -458,11 +481,12 @@ async def test_assistant_only_over_threshold_keeps_no_safe_cutoff_failure(
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _manager(
+        await _prepare_summary(
             provider,
             memory_manager,
+            session,
             threshold=1,
-        ).prepare(session)
+        )
 
     assert raised.value.error.code == "model_context_overflow"
     assert provider.complete_requests == []
@@ -480,13 +504,14 @@ async def test_context_overflow_without_old_complete_turn_keeps_current_message(
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _manager(
+        await _prepare_summary(
             provider,
             memory_manager,
+            session,
             context_window=1_024,
             max_output=128,
             threshold=100,
-        ).prepare(session)
+        )
 
     assert raised.value.error.code == "model_context_overflow"
     assert provider.complete_requests == []
@@ -509,13 +534,15 @@ async def test_oversized_current_input_does_not_summarize_earlier_history(
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _manager(
+        await _prepare_summary(
             provider,
             memory_manager,
+            session,
             context_window=1_024,
             max_output=128,
             threshold=100,
-        ).prepare(session, current_user=current_user)
+            current_user=current_user,
+        )
 
     assert raised.value.error.code == "model_context_overflow"
     assert provider.complete_requests == []
@@ -538,7 +565,7 @@ async def test_summary_provider_failure_preserves_user_visible_model_error(
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _manager(provider, memory_manager).prepare(session)
+        await _prepare_summary(provider, memory_manager, session)
 
     assert raised.value.error.code == "model_failed"
     assert raised.value.error.message == "PRIVATE FAILURE"
@@ -574,14 +601,20 @@ async def test_summary_cancellation_propagates_without_persisting_or_advancing_c
     manager = ConversationSummaryManager(
         provider=provider,
         memory_manager=memory_manager,
-        route_context_window=10_000,
-        route_max_output=1_000,
         consolidation_message_threshold=4,
-        tools=(),
         now=lambda: NOW,
-        project_messages=lambda messages: _project_messages(messages, system_prompt="CHAT SYSTEM"),
     )
-    task = asyncio.create_task(manager.prepare(session))
+    task = asyncio.create_task(
+        manager.prepare(
+            session,
+            project_messages=lambda messages: _project_messages(
+                messages, system_prompt="CHAT SYSTEM"
+            ),
+            route_context_window=10_000,
+            route_max_output=1_000,
+            tools=(),
+        )
+    )
 
     await provider.started.wait()
     task.cancel()
@@ -626,15 +659,14 @@ async def test_token_cutoff_excludes_schedule_continuation_from_history_budget(
     def project_schedule(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         return context_builder.build_schedule_messages(messages, session_id=session.session_id)
 
-    await _manager(
+    await _prepare_summary(
         provider,
         memory_manager,
+        session,
         context_window=2_500,
         max_output=500,
         threshold=100,
         project_messages=project_schedule,
-    ).prepare(
-        session,
         current_user=current_user,
         continuation=continuation,
     )
@@ -698,13 +730,14 @@ async def test_cutoff_keeps_retained_suffix_at_user_boundary(
     provider = ScriptedFakeProvider(completions=(_response("Aligned summary."),))
     memory_manager = MemoryManager(state)
 
-    await _manager(
+    await _prepare_summary(
         provider,
         memory_manager,
+        session,
         context_window=100_000,
         max_output=4_096,
         threshold=6,
-    ).prepare(session)
+    )
 
     assert session.last_consolidated == expected_position
     assert session.messages[session.last_consolidated]["content"] == first_retained
@@ -774,15 +807,17 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
     manager = ConversationSummaryManager(
         provider=provider,
         memory_manager=memory_manager,
-        route_context_window=1_024,
-        route_max_output=128,
         consolidation_message_threshold=100,
-        tools=(tool_schema,),
         now=lambda: NOW,
-        project_messages=project_messages,
     )
 
-    await manager.prepare(session)
+    await manager.prepare(
+        session,
+        project_messages=project_messages,
+        route_context_window=1_024,
+        route_max_output=128,
+        tools=(tool_schema,),
+    )
 
     assert session.last_consolidated == 4
     assert session.messages == original_messages
@@ -825,13 +860,12 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
         projected_calls.append(deepcopy(projected))
         return projected
 
-    await _manager(
+    await _prepare_summary(
         provider,
         memory_manager,
+        session,
         threshold=4,
         project_messages=project_messages,
-    ).prepare(
-        session,
         current_user={"role": "user", "content": "Incoming raw input."},
     )
 
@@ -908,15 +942,17 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
     manager = ConversationSummaryManager(
         provider=provider,
         memory_manager=memory_manager,
-        route_context_window=1_024,
-        route_max_output=128,
         consolidation_message_threshold=100,
-        tools=(tool_schema,),
         now=lambda: NOW,
-        project_messages=project_messages,
     )
 
-    await manager.prepare(session)
+    await manager.prepare(
+        session,
+        project_messages=project_messages,
+        route_context_window=1_024,
+        route_max_output=128,
+        tools=(tool_schema,),
+    )
 
     assert projection_calls
     assert [message["role"] for message in projection_calls[0][0]] == [
@@ -1010,11 +1046,12 @@ async def test_summary_projects_owned_message_shapes_without_mutating_session(
     original_messages = deepcopy(session.messages)
     provider = ScriptedFakeProvider(completions=(_response("Summary."),))
 
-    await _manager(
+    await _prepare_summary(
         provider,
         MemoryManager(state),
+        session,
         threshold=8,
-    ).prepare(session)
+    )
 
     summary_input = provider.complete_requests[0].messages[1]["content"]
     assert isinstance(summary_input, str)
@@ -1057,11 +1094,12 @@ async def test_summary_fences_escape_dynamic_markdown_delimiters_without_changin
     session.add_message("user", "Current question.")
     provider = ScriptedFakeProvider(completions=(_response("Summary."),))
 
-    await _manager(
+    await _prepare_summary(
         provider,
         MemoryManager(state),
+        session,
         threshold=2,
-    ).prepare(session)
+    )
 
     summary_input = provider.complete_requests[0].messages[1]["content"]
     assert isinstance(summary_input, str)
