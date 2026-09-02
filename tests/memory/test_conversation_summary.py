@@ -10,7 +10,6 @@ import pytest
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.loop import _project_schedule_messages
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.memory.conversation_summary import ConversationSummaryManager
@@ -178,6 +177,26 @@ def _session_with_history(state: WorkspaceState) -> Session:
     _add_assistant(session, "Second answer.")
     session.add_message("user", "Current question.")
     return session
+
+
+def _schedule_context_builder(
+    workspace: Path,
+    memory_manager: MemoryManager,
+) -> ContextBuilder:
+    agent_home = workspace.parent / "agent-home"
+    skill_loader = SkillLoader(
+        root=agent_home / "skills",
+        reserved_names=(),
+        enable_always_load=False,
+    )
+    skill_loader.load()
+    return ContextBuilder(
+        workspace,
+        "UTC",
+        agent_home=agent_home,
+        memory_manager=memory_manager,
+        skill_loader=skill_loader,
+    )
 
 
 @pytest.mark.asyncio
@@ -602,14 +621,10 @@ async def test_token_cutoff_excludes_schedule_continuation_from_history_budget(
     ]
     provider = ScriptedFakeProvider(completions=(_response("Scheduled summary."),))
     memory_manager = MemoryManager(state)
+    context_builder = _schedule_context_builder(workspace, memory_manager)
 
     def project_schedule(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-        return _project_schedule_messages(
-            messages,
-            system_prompt="SCHEDULE SYSTEM",
-            session_id=session.session_id,
-            current_time=NOW,
-        )
+        return context_builder.build_schedule_messages(messages, session_id=session.session_id)
 
     await _manager(
         provider,
@@ -749,15 +764,12 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
             )
 
     else:
+        context_builder = _schedule_context_builder(workspace, memory_manager)
 
         def project_messages(
             messages: Sequence[dict[str, Any]],
         ) -> list[dict[str, Any]]:
-            return _project_schedule_messages(
-                messages,
-                system_prompt="schedule system",
-                session_id=session.session_id,
-            )
+            return context_builder.build_schedule_messages(messages, session_id=session.session_id)
 
     manager = ConversationSummaryManager(
         provider=provider,

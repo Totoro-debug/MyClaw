@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Sequence
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -12,7 +14,6 @@ import pytest
 import myclaw.agent.context as context
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.loop import _project_schedule_messages
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.memory.manager import MemoryManager
 from myclaw.skills.catalog import (
@@ -222,6 +223,159 @@ def test_context_builder_builds_foreground_request_from_one_ordered_input(
         },
     ]
     assert messages == original_messages
+
+
+def test_context_builder_builds_schedule_request_from_one_ordered_input(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    builder = _builder(monkeypatch, workspace, "Asia/Shanghai")
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "Earlier question.", "timestamp": "old"},
+        {
+            "role": "assistant",
+            "content": "Earlier answer.",
+            "tool_calls": [],
+            "status": "completed",
+            "timestamp": "old",
+        },
+        {
+            "role": "user",
+            "content": "Current scheduled question.",
+            "timestamp": "1999-01-01T00:00:00.000+00:00",
+        },
+        {
+            "role": "assistant",
+            "content": "Current tool call.",
+            "tool_calls": [{"id": "call-1", "name": "read_file", "arguments": "{}"}],
+            "status": "completed",
+            "timestamp": "old",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "content": "Tool output.",
+            "status": "success",
+            "artifact": None,
+            "timestamp": "old",
+        },
+    ]
+    original_messages = deepcopy(messages)
+
+    projected = builder.build_schedule_messages(messages, session_id="schedule-session")
+
+    assert [message["role"] for message in projected] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert projected[0] == {
+        "role": "system",
+        "content": builder.schedule_system_prompt(),
+    }
+    assert projected[1:3] == [
+        {"role": "user", "content": "Earlier question."},
+        {"role": "assistant", "content": "Earlier answer.", "tool_calls": []},
+    ]
+    assert projected[3] == {
+        "role": "user",
+        "content": (
+            "## Runtime Context\n\n"
+            "- Current time: 2026-08-16T12:05:06.789+08:00\n"
+            "- Session ID: schedule-session\n\n"
+            "## User Input\n\n"
+            "Current scheduled question."
+        ),
+    }
+    assert projected[4:] == [
+        {
+            "role": "assistant",
+            "content": "Current tool call.",
+            "tool_calls": [{"id": "call-1", "name": "read_file", "arguments": "{}"}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "content": "Tool output.",
+        },
+    ]
+    assert messages == original_messages
+
+
+@pytest.mark.asyncio
+async def test_schedule_projection_scope_is_task_local_and_restores_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    builder = _builder(monkeypatch, workspace, "Asia/Shanghai")
+    tick = 0
+
+    class AdvancingDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> AdvancingDateTime:
+            nonlocal tick
+            current = FIXED_UTC + timedelta(milliseconds=tick)
+            tick += 1
+            if tz is None:
+                return cls.fromtimestamp(current.timestamp(), tz=UTC)
+            return cls.fromtimestamp(current.timestamp(), tz=tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(context, "datetime", AdvancingDateTime)
+
+    def runtime_time(projected: Sequence[dict[str, Any]]) -> str:
+        content = projected[-1]["content"]
+        assert isinstance(content, str)
+        current_line = next(
+            line for line in content.splitlines() if line.startswith("- Current time: ")
+        )
+        return current_line.removeprefix("- Current time: ")
+
+    async def project_twice(
+        started: asyncio.Event,
+        peer_started: asyncio.Event,
+    ) -> tuple[str, str]:
+        with builder.schedule_projection_scope():
+            first = builder.build_schedule_messages(
+                [{"role": "user", "content": "Scheduled input."}],
+                session_id="schedule-session",
+            )
+            started.set()
+            await peer_started.wait()
+            second = builder.build_schedule_messages(
+                [{"role": "user", "content": "Scheduled input."}],
+                session_id="schedule-session",
+            )
+        return runtime_time(first), runtime_time(second)
+
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    first_task, second_task = await asyncio.gather(
+        project_twice(first_started, second_started),
+        project_twice(second_started, first_started),
+    )
+
+    assert first_task[0] == first_task[1]
+    assert second_task[0] == second_task[1]
+    assert first_task[0] != second_task[0]
+
+    with pytest.raises(RuntimeError, match="scope failure"):
+        with builder.schedule_projection_scope():
+            failed_projection = builder.build_schedule_messages(
+                [{"role": "user", "content": "Scheduled input."}],
+                session_id="schedule-session",
+            )
+            raise RuntimeError("scope failure")
+    restored_projection = builder.build_schedule_messages(
+        [{"role": "user", "content": "Scheduled input."}],
+        session_id="schedule-session",
+    )
+
+    assert runtime_time(failed_projection) != runtime_time(restored_projection)
 
 
 def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt(
@@ -544,6 +698,69 @@ async def test_context_builder_reads_live_memory_and_lane_specific_skills(
     assert "```jsonl" in second_foreground
 
 
+def test_context_builder_schedule_request_excludes_foreground_skill_and_task_state(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    monkeypatch.setattr(context, "datetime", _FrozenDateTime)
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=agent_home)
+    body = "Private foreground instructions with a unique marker."
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\n"
+        "name: planner\n"
+        "description: Plan work\n"
+        "always: true\n"
+        "---\n"
+        f"{body}\n",
+        encoding="utf-8",
+    )
+    loader = SkillLoader(
+        root=agent_home / "skills",
+        reserved_names=(),
+        enable_always_load=True,
+    )
+    loader.load()
+    builder = ContextBuilder(
+        workspace,
+        "Asia/Shanghai",
+        agent_home=agent_home,
+        memory_manager=MemoryManager(state),
+        skill_loader=loader,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": "Run the scheduled work.",
+            "timestamp": "1999-01-01T00:00:00.000+00:00",
+        }
+    ]
+    original_messages = deepcopy(messages)
+
+    projected = builder.build_schedule_messages(messages, session_id="schedule-session")
+
+    system_content = projected[0]["content"]
+    current_content = projected[-1]["content"]
+    assert isinstance(system_content, str)
+    assert isinstance(current_content, str)
+    assert "planner" not in system_content
+    assert body not in system_content
+    assert "## Skill Catalog" not in system_content
+    assert "## Skill Instructions" not in current_content
+    assert "## Task goal" not in current_content
+    assert "## Completion boundary" not in current_content
+    assert "<skill_catalog>" not in system_content
+    assert "<skill_always_load>" not in system_content
+    assert current_content.startswith(
+        "## Runtime Context\n\n"
+        "- Current time: 2026-08-16T12:05:06.789+08:00\n"
+    )
+    assert messages == original_messages
+
+
 def test_context_builder_builds_title_and_status_minimal_messages(
     agent_home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -652,11 +869,7 @@ def test_runtime_lane_projections_keep_current_turn_continuation_separate(
         session_id="session-id",
         blackboard=Blackboard(goal="Current task", completion_boundary="Current boundary"),
     )
-    schedule = _project_schedule_messages(
-        messages,
-        system_prompt="schedule system",
-        session_id="session-id",
-    )
+    schedule = builder.build_schedule_messages(messages, session_id="session-id")
 
     assert [message["role"] for message in foreground] == [
         "system",
@@ -680,12 +893,15 @@ def test_runtime_lane_projections_keep_current_turn_continuation_separate(
         "assistant",
         "tool",
     ]
-    assert schedule[0] == {"role": "system", "content": "schedule system"}
+    assert schedule[0] == {
+        "role": "system",
+        "content": builder.schedule_system_prompt(),
+    }
     assert schedule[3] == {
         "role": "user",
         "content": (
             "## Runtime Context\n\n"
-            "- Current time: 2026-08-16T12:00:00.000+08:00\n"
+            "- Current time: 2026-08-16T04:05:06.789+00:00\n"
             "- Session ID: session-id\n\n"
             "## User Input\n\n"
             "Current question."

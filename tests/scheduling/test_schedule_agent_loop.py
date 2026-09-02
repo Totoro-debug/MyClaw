@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from uuid import UUID
 
 import pytest
@@ -63,6 +63,22 @@ class _FrozenContextDateTime(datetime):
         if tz is None:
             return cls.fromtimestamp(NOW.timestamp(), tz=NOW.tzinfo)
         return cls.fromtimestamp(NOW.timestamp(), tz=tz)  # type: ignore[arg-type]
+
+
+class _AdvancingContextDateTime(datetime):
+    _milliseconds: ClassVar[int] = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._milliseconds = 0
+
+    @classmethod
+    def now(cls, tz: object = None) -> _AdvancingContextDateTime:
+        current = NOW + timedelta(milliseconds=cls._milliseconds)
+        cls._milliseconds += 1
+        if tz is None:
+            return cls.fromtimestamp(current.timestamp(), tz=NOW.tzinfo)
+        return cls.fromtimestamp(current.timestamp(), tz=tz)  # type: ignore[arg-type]
 
 
 class _BlockingClock:
@@ -337,6 +353,81 @@ async def _close_components(
     await router.close()
 
 
+def _capture_summary_projections(
+    monkeypatch: pytest.MonkeyPatch,
+    projections: list[list[dict[str, Any]]],
+) -> None:
+    original_prepare = ConversationSummaryManager.prepare
+
+    async def capture_projection(
+        manager: ConversationSummaryManager,
+        session: Session,
+        *,
+        current_user: dict[str, Any] | None = None,
+        continuation: Sequence[dict[str, Any]] = (),
+        project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+        route_context_window: int | None = None,
+        route_max_output: int | None = None,
+        tools: Sequence[OpenAIToolSchema] | None = None,
+    ) -> Session:
+        if current_user is not None:
+            assert project_messages is not None
+            projections.append(
+                project_messages([*session.messages[session.last_consolidated :], current_user])
+            )
+        return await original_prepare(
+            manager,
+            session,
+            current_user=current_user,
+            continuation=continuation,
+            project_messages=project_messages,
+            route_context_window=route_context_window,
+            route_max_output=route_max_output,
+            tools=tools,
+        )
+
+    monkeypatch.setattr(ConversationSummaryManager, "prepare", capture_projection)
+
+
+def _capture_schedule_projections(
+    monkeypatch: pytest.MonkeyPatch,
+    projections: list[list[dict[str, Any]]],
+) -> None:
+    original_build_schedule = ContextBuilder.build_schedule_messages
+
+    def capture_projection(
+        builder: ContextBuilder,
+        messages: Sequence[dict[str, Any]],
+        *,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        projected = original_build_schedule(builder, messages, session_id=session_id)
+        projections.append(deepcopy(projected))
+        return projected
+
+    monkeypatch.setattr(ContextBuilder, "build_schedule_messages", capture_projection)
+
+
+def _runtime_current_times(
+    projections: Sequence[Sequence[dict[str, Any]]],
+) -> list[str]:
+    times: list[str] = []
+    for projection in projections:
+        current_users = [
+            cast(str, message["content"])
+            for message in projection
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and cast(str, message["content"]).startswith("## Runtime Context")
+        ]
+        assert len(current_users) == 1
+        current_line = next(
+            line for line in current_users[0].splitlines() if line.startswith("- Current time: ")
+        )
+        times.append(current_line.removeprefix("- Current time: "))
+    return times
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_manages_schedule_jobs_without_confirmation(
     agent_home: Path,
@@ -407,36 +498,7 @@ async def test_foreground_provider_receives_builder_complete_context_projection(
         chat_responses=(_response("First answer."), _response("Second answer.")),
     )
     projection_calls: list[list[dict[str, Any]]] = []
-    original_prepare = ConversationSummaryManager.prepare
-
-    async def capture_projection(
-        manager: ConversationSummaryManager,
-        session: Session,
-        *,
-        current_user: dict[str, Any] | None = None,
-        continuation: Sequence[dict[str, Any]] = (),
-        project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
-        route_context_window: int | None = None,
-        route_max_output: int | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
-    ) -> Session:
-        if current_user is not None:
-            assert project_messages is not None
-            projection_calls.append(
-                project_messages([*session.messages[session.last_consolidated:], current_user])
-            )
-        return await original_prepare(
-            manager,
-            session,
-            current_user=current_user,
-            continuation=continuation,
-            project_messages=project_messages,
-            route_context_window=route_context_window,
-            route_max_output=route_max_output,
-            tools=tools,
-        )
-
-    monkeypatch.setattr(ConversationSummaryManager, "prepare", capture_projection)
+    _capture_summary_projections(monkeypatch, projection_calls)
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
         agent_home,
         workspace,
@@ -474,7 +536,7 @@ async def test_foreground_provider_receives_builder_complete_context_projection(
 
 
 @pytest.mark.asyncio
-async def test_schedule_uses_its_own_complete_context_projection(
+async def test_schedule_uses_context_builder_complete_context_projection(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -491,19 +553,26 @@ async def test_schedule_uses_its_own_complete_context_projection(
         )
     )
     provider = _ScheduleProvider(schedule_responses=(_response("Background result."),))
+    projection_calls: list[list[dict[str, Any]]] = []
+    builder_projections: list[list[dict[str, Any]]] = []
 
     def fail_foreground_context(*args: object, **kwargs: object) -> list[dict[str, object]]:
         del args, kwargs
         raise AssertionError("Schedule must not use ContextBuilder")
 
+    _capture_summary_projections(monkeypatch, projection_calls)
+    _capture_schedule_projections(monkeypatch, builder_projections)
+    schedule_now = NOW + timedelta(hours=2)
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
         agent_home,
         workspace,
         provider,
-        schedule_clock=_BlockingClock(NOW),
+        schedule_clock=_BlockingClock(schedule_now),
     )
     await loop.start()
     monkeypatch.setattr(ContextBuilder, "build_foreground_messages", fail_foreground_context)
+    _AdvancingContextDateTime.reset()
+    monkeypatch.setattr(context, "datetime", _AdvancingContextDateTime)
     schedule.start()
     try:
         await _wait_until(
@@ -517,6 +586,9 @@ async def test_schedule_uses_its_own_complete_context_projection(
 
     assert len(provider.direct_complete_messages) == 1
     messages, tools = provider.direct_complete_messages[0]
+    assert projection_calls == [messages]
+    assert len(builder_projections) == 1
+    assert all(projection == messages for projection in builder_projections)
     assert messages[0]["role"] == "system"
     system_content = cast(str, messages[0]["content"])
     assert str(workspace) in system_content
@@ -539,6 +611,7 @@ async def test_schedule_uses_its_own_complete_context_projection(
             "Run this."
         ),
     }
+    assert schedule_now.isoformat(timespec="milliseconds") not in str(messages[-1]["content"])
     assert all("timestamp" not in message for message in messages)
     assert [definition["function"]["name"] for definition in tools] == [
         "read_file",
@@ -729,6 +802,7 @@ async def test_schedule_tool_loop_does_not_prepare_summary_inside_agent_run(
 async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
     agent_home: Path,
     workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_text = VALID_CONFIG.replace(
         "consolidation_message_threshold = 50",
@@ -830,6 +904,8 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
             _response("Second schedule history summary."),
         ),
     )
+    builder_projections: list[list[dict[str, Any]]] = []
+    _capture_schedule_projections(monkeypatch, builder_projections)
     clock = FakeClock(NOW)
     loop, router, schedule, dream_owner, dispatcher, _bus = _agent_loop(
         agent_home,
@@ -840,6 +916,8 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
     )
     try:
         await loop.start()
+        _AdvancingContextDateTime.reset()
+        monkeypatch.setattr(context, "datetime", _AdvancingContextDateTime)
         schedule.start()
         await _wait_until(
             lambda: (
@@ -854,6 +932,10 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
                 and schedule.status_snapshot().active_job_count == 0
             )
         )
+        first_projection_count = len(builder_projections)
+        assert first_projection_count > 1
+        first_projection_times = _runtime_current_times(builder_projections)
+        assert set(first_projection_times) == {NOW.isoformat(timespec="milliseconds")}
         summary_records = [
             json.loads(line)
             for line in (state.memory_directory / "summary.jsonl")
@@ -881,6 +963,12 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
                 and schedule.status_snapshot().active_job_count == 0
             )
         )
+        second_projection_times = _runtime_current_times(
+            builder_projections[first_projection_count:]
+        )
+        assert len(second_projection_times) > 1
+        assert len(set(second_projection_times)) == 1
+        assert second_projection_times[0] != first_projection_times[0]
         schedule_requests = [
             request for request in provider.complete_requests if _is_schedule_call(request)
         ]

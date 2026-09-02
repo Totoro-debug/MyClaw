@@ -226,8 +226,9 @@ def test_agent_loop_delegates_foreground_context_construction_to_context_builder
     assert calls_builder("_project_foreground_summary_messages", "build_foreground_messages")
 
 
-def test_issue_209_preserves_schedule_context_ownership_for_issue_210() -> None:
+def test_agent_loop_delegates_schedule_context_construction_to_context_builder() -> None:
     path = PACKAGE_ROOT / "agent" / "loop.py"
+    source = path.read_text(encoding="utf-8")
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     agent_loop = next(
         node
@@ -240,11 +241,14 @@ def test_issue_209_preserves_schedule_context_ownership_for_issue_210() -> None:
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "_prepare_schedule_context"
     )
 
-    assert not hasattr(ContextBuilder, "build_schedule_messages")
+    assert hasattr(ContextBuilder, "build_schedule_messages")
+    assert "_project_schedule_messages" not in source
     assert any(
         isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_project_schedule_messages"
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "build_schedule_messages"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "_context_builder"
         for node in ast.walk(prepare_schedule)
     )
 

@@ -26,9 +26,6 @@ from myclaw.agent.message_bus import (
     OutboundMessage,
     OutboundMessageType,
 )
-from myclaw.agent.prompts import (
-    current_user_input,
-)
 from myclaw.agent.runner import (
     AgentRunner,
     AgentRunnerResponseSegmentEnd,
@@ -54,7 +51,6 @@ from myclaw.provider.model_router import ModelRouteStatus
 from myclaw.provider.models import ModelCompleted, ReasoningDelta, TextDelta
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
-from myclaw.session.projection import _last_user_index, project_session_message
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader, SkillMetadata
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
@@ -1078,37 +1074,40 @@ class AgentLoop:
         active_session: Session,
         current_user: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        current_system_prompt = self._context_builder.schedule_system_prompt()
-        route = self._configuration.resolve_route("schedule").route
-
-        def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-            if _last_user_index(messages) == len(messages):
-                return _project_without_current_user(
-                    messages,
-                    system_prompt=current_system_prompt,
-                )
-            return _project_schedule_messages(
-                messages,
-                system_prompt=current_system_prompt,
+        with self._context_builder.schedule_projection_scope():
+            route = self._configuration.resolve_route("schedule").route
+            initial_last_consolidated = active_session.last_consolidated
+            initial_source = deepcopy(
+                [*active_session.messages[initial_last_consolidated:], current_user]
+            )
+            initial_projection = self._context_builder.build_schedule_messages(
+                initial_source,
                 session_id=active_session.session_id,
-                current_time=self._schedule_now(),
             )
 
-        await self._summary_manager.prepare(
-            active_session,
-            current_user=current_user,
-            project_messages=project_messages,
-            route_context_window=route.context_window,
-            route_max_output=route.max_output,
-            tools=self.tool_schemas,
-        )
-        history = active_session.messages[active_session.last_consolidated :]
-        return _project_schedule_messages(
-            [*history, current_user],
-            system_prompt=current_system_prompt,
-            session_id=active_session.session_id,
-            current_time=self._schedule_now(),
-        )
+            def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+                if list(messages) == initial_source:
+                    return deepcopy(initial_projection)
+                return self._context_builder.build_schedule_messages(
+                    messages,
+                    session_id=active_session.session_id,
+                )
+
+            await self._summary_manager.prepare(
+                active_session,
+                current_user=current_user,
+                project_messages=project_messages,
+                route_context_window=route.context_window,
+                route_max_output=route.max_output,
+                tools=self.tool_schemas,
+            )
+            if active_session.last_consolidated == initial_last_consolidated:
+                return initial_projection
+            history = active_session.messages[active_session.last_consolidated :]
+            return self._context_builder.build_schedule_messages(
+                [*history, current_user],
+                session_id=active_session.session_id,
+            )
 
     def _project_foreground_summary_messages(
         self,
@@ -1517,76 +1516,3 @@ def _foreground_runtime_status_input(
         context_window=context_window,
         generation_started_at=generation_started_at,
     )
-
-
-def _project_schedule_messages(
-    messages: Sequence[dict[str, Any]],
-    *,
-    system_prompt: str,
-    session_id: str,
-    current_time: datetime | None = None,
-) -> list[dict[str, Any]]:
-    """Project Schedule context without exposing foreground Skill content."""
-    history, current_user, current_user_index = _current_turn(messages, lane="Schedule")
-    projected = _project_without_current_user(history, system_prompt=system_prompt)
-    content = current_user.get("content")
-    timestamp = current_user.get("timestamp")
-    if not isinstance(content, str):
-        raise TypeError("Session user message is malformed")
-    if isinstance(timestamp, str):
-        effective_current_time = datetime.fromisoformat(timestamp)
-    elif current_time is not None:
-        effective_current_time = current_time
-    else:
-        raise TypeError("Schedule user message is missing a timestamp")
-    projected.append(
-        {
-            "role": "user",
-            "content": current_user_input(
-                content=content,
-                current_time=effective_current_time,
-                session_id=session_id,
-            ),
-        }
-    )
-    projected.extend(_project_continuation(messages, current_user_index))
-    return projected
-
-
-def _project_continuation(
-    messages: Sequence[dict[str, Any]],
-    current_user_index: int,
-) -> list[dict[str, Any]]:
-    return _project_history_messages(messages[current_user_index + 1 :])
-
-
-def _project_without_current_user(
-    messages: Sequence[dict[str, Any]],
-    *,
-    system_prompt: str,
-) -> list[dict[str, Any]]:
-    return [
-        {"role": "system", "content": system_prompt},
-        *_project_history_messages(messages),
-    ]
-
-
-def _project_history_messages(
-    messages: Sequence[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    return [
-        projected
-        for message in messages
-        if (projected := project_session_message(message)) is not None
-    ]
-
-
-def _current_turn(
-    messages: Sequence[dict[str, Any]],
-    *,
-    lane: str,
-) -> tuple[Sequence[dict[str, Any]], dict[str, Any], int]:
-    current_user_index = _last_user_index(messages)
-    if current_user_index == len(messages):
-        raise ValueError(f"{lane} context requires a current user message")
-    return messages[:current_user_index], messages[current_user_index], current_user_index

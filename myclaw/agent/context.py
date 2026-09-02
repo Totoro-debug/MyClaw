@@ -1,9 +1,12 @@
-"""Build provider-neutral context for foreground Conversation Sessions."""
+"""Build provider-neutral context for Agent Loop model requests."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,19 @@ from myclaw.agent.prompts import (
 from myclaw.memory.manager import MemoryManager
 from myclaw.session.projection import _last_user_index, project_session_message
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
+
+
+@dataclass(frozen=True, slots=True)
+class _ScheduleProjectionSnapshot:
+    builder_id: int
+    system_prompt: str
+    current_time: datetime
+
+
+_SCHEDULE_PROJECTION_SNAPSHOT: ContextVar[_ScheduleProjectionSnapshot | None] = ContextVar(
+    "schedule_projection_snapshot",
+    default=None,
+)
 
 
 class ContextBuilder:
@@ -106,10 +122,62 @@ class ContextBuilder:
             raise TypeError("Context Builder requires a Manual Skill Invocation")
         if blackboard is not None and not isinstance(blackboard, Blackboard):
             raise TypeError("value must be a Blackboard or None")
+        return self._build_messages(
+            messages,
+            system_prompt=self.foreground_system_prompt(),
+            session_id=session_id,
+            blackboard=blackboard,
+            manual_invocation=manual_invocation,
+        )
+
+    def build_schedule_messages(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        """Build the canonical initial Model Request Context for a Schedule Job."""
+        snapshot = _SCHEDULE_PROJECTION_SNAPSHOT.get()
+        if snapshot is None or snapshot.builder_id != id(self):
+            system_prompt = self.schedule_system_prompt()
+            current_time = None
+        else:
+            system_prompt = snapshot.system_prompt
+            current_time = snapshot.current_time
+        return self._build_messages(
+            messages,
+            system_prompt=system_prompt,
+            session_id=session_id,
+            current_time=current_time,
+        )
+
+    @contextmanager
+    def schedule_projection_scope(self) -> Iterator[None]:
+        """Keep one Schedule request's dynamic projection stable across budgeting."""
+        token = _SCHEDULE_PROJECTION_SNAPSHOT.set(
+            _ScheduleProjectionSnapshot(
+                builder_id=id(self),
+                system_prompt=self.schedule_system_prompt(),
+                current_time=datetime.now(self._timezone),
+            )
+        )
+        try:
+            yield
+        finally:
+            _SCHEDULE_PROJECTION_SNAPSHOT.reset(token)
+
+    def _build_messages(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        system_prompt: str,
+        session_id: str,
+        blackboard: Blackboard | None = None,
+        manual_invocation: ManualSkillInvocation | None = None,
+        current_time: datetime | None = None,
+    ) -> list[dict[str, Any]]:
         current_user_index = _last_user_index(messages)
-        projected = [
-            {"role": "system", "content": self.foreground_system_prompt()},
-        ]
+        projected = [{"role": "system", "content": system_prompt}]
         if current_user_index == len(messages):
             projected.extend(_project_history_messages(messages))
             return projected
@@ -120,7 +188,9 @@ class ContextBuilder:
                 "role": "user",
                 "content": current_user_input(
                     content=deepcopy(messages[current_user_index]["content"]),
-                    current_time=datetime.now(self._timezone),
+                    current_time=(
+                        datetime.now(self._timezone) if current_time is None else current_time
+                    ),
                     session_id=session_id,
                     blackboard_projection=(
                         None
