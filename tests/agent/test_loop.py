@@ -10,6 +10,8 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event as ThreadEvent
+from threading import Thread
 from types import TracebackType
 from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
@@ -19,7 +21,7 @@ from loguru import logger
 
 import myclaw.agent.loop as loop_module
 from myclaw.agent.blackboard import Blackboard, FramingResult
-from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
+from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, SkillContextTooLargeError
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runner import AgentRunnerResult, AgentRunnerRouter
 from myclaw.agent.workspace_state import WorkspaceState
@@ -27,6 +29,7 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log as real_session_log
+from myclaw.management.service import RuntimeStatusInput
 from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -46,6 +49,7 @@ from myclaw.skills.catalog import (
     LoadedSkill,
     ManualSkillInvocation,
     SkillLoader,
+    SkillMetadata,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -492,6 +496,8 @@ def _runtime(
     title_prompt: str | None = None,
     skill_loader: SkillLoader | None = None,
     monotonic_now: Callable[[], float] | None = None,
+    config_text: str | None = None,
+    use_default_context_preparer: bool = False,
 ) -> tuple[AgentLoop, Session, MessageBus]:
     agent_home = AgentHome(tmp_path / "agent-home")
     agent_home.initialize()
@@ -499,7 +505,10 @@ def _runtime(
     workspace.mkdir()
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home.path)
-    (agent_home.path / "config.toml").write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
+    (agent_home.path / "config.toml").write_text(
+        MINIMAL_VALID_CONFIG if config_text is None else config_text,
+        encoding="utf-8",
+    )
     configuration = ConfigLoader(agent_home).load()
 
     async def execute_user_job(job: ScheduleJob) -> None:
@@ -573,7 +582,8 @@ def _runtime(
     if skill_loader is not None:
         loop._skill_loader = skill_loader
         loop._context_builder._skill_loader = skill_loader
-    object.__setattr__(loop, "_prepare_foreground_context", prepare)
+    if not use_default_context_preparer:
+        object.__setattr__(loop, "_prepare_foreground_context", prepare)
     return loop, loop.session, bus
 
 
@@ -808,6 +818,349 @@ def test_agent_loop_exposes_public_control_seam(tmp_path: Path) -> None:
     assert loop.control is loop
     assert loop.control.has_active_run is False
     assert loop.control.has_pending_confirmation is False
+
+
+def test_agent_loop_reload_returns_the_current_loader_metadata_and_reuses_generation_state(
+    tmp_path: Path,
+) -> None:
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nold body\n",
+        encoding="utf-8",
+    )
+    loop, session, bus = _runtime(tmp_path, _Router(()))
+    loader = loop._skill_loader
+    initial_session = loop.session
+    initial_context_loader = loop._context_builder._skill_loader
+    before_messages = deepcopy(session.messages)
+    bus_operations: list[str] = []
+
+    async def record_bus_operation(name: str) -> None:
+        bus_operations.append(name)
+
+    object.__setattr__(bus, "reset", lambda: record_bus_operation("reset"))
+    object.__setattr__(
+        bus,
+        "pause_inbound_delivery",
+        lambda: record_bus_operation("pause"),
+    )
+    object.__setattr__(
+        bus,
+        "resume_inbound_delivery",
+        lambda: record_bus_operation("resume"),
+    )
+
+    instruction.write_text(
+        "---\nname: reviewer\ndescription: Review work\n---\nnew body\n",
+        encoding="utf-8",
+    )
+
+    metadata = loop.reload_skill()
+
+    assert loop is loop.control
+    assert loop.session is initial_session is session
+    assert loop._bus is bus
+    assert loop._skill_loader is loader is initial_context_loader
+    assert session.messages == before_messages
+    assert bus_operations == []
+    assert metadata == loader.metadata
+    assert tuple(item.name for item in metadata) == ("reviewer",)
+    assert loader.get("planner") is None
+    invocation = loader.resolve_manual("/reviewer request")
+    assert invocation is not None
+    assert invocation.metadata == metadata[0]
+    assert invocation.body.splitlines()[-1] == "new body"
+
+
+def test_agent_loop_reload_rejects_an_always_loaded_budget_overrun_before_publication(
+    tmp_path: Path,
+) -> None:
+    instruction = tmp_path / "agent-home" / "skills" / "always" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: always\ndescription: Always loaded\nalways: true\n---\nold body\n",
+        encoding="utf-8",
+    )
+    config = MINIMAL_VALID_CONFIG.replace(
+        "[models.providers.primary]",
+        "[runtime]\nenable_skill_always_load = true\n\n[models.providers.primary]",
+    )
+    loop, _session, _bus = _runtime(tmp_path, _Router(()), config_text=config)
+    loader = loop._skill_loader
+    before_skills = loader.skills
+    before_metadata = loader.metadata
+    before_invocation = loader.resolve_manual("/always request")
+    instruction.write_text(
+        "---\nname: always\ndescription: Always loaded\nalways: true\n---\n"
+        + ("oversized body\n" * 20_000),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillContextTooLargeError):
+        loop.reload_skill()
+
+    assert loader.skills == before_skills
+    assert loader.metadata == before_metadata
+    assert loader.get("always") is before_skills[0]
+    assert loader.resolve_manual("/always request") == before_invocation
+
+
+def test_reload_validator_candidate_projection_is_isolated_until_atomic_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\nalways: true\n---\nold body\n",
+        encoding="utf-8",
+    )
+    config = MINIMAL_VALID_CONFIG.replace(
+        "[models.providers.primary]",
+        "[runtime]\nenable_skill_always_load = true\n\n[models.providers.primary]",
+    )
+    loop, _session, _bus = _runtime(tmp_path, _Router(()), config_text=config)
+    loader = loop._skill_loader
+    before_skills = loader.skills
+    before_invocation = loader.resolve_manual("/planner request")
+    instruction.write_text(
+        "---\nname: reviewer\ndescription: Review work\nalways: true\n---\nnew body\n",
+        encoding="utf-8",
+    )
+
+    validation_started = ThreadEvent()
+    release_validation = ThreadEvent()
+    candidate_prompts: list[str] = []
+
+    def block_candidate_estimate(status_input: RuntimeStatusInput) -> int:
+        candidate_prompts.append(status_input.system_prompt)
+        validation_started.set()
+        if not release_validation.wait(timeout=5):
+            raise AssertionError("candidate validation was not released")
+        return 0
+
+    monkeypatch.setattr(loop_module, "estimate_input_tokens", block_candidate_estimate)
+    published: list[tuple[SkillMetadata, ...]] = []
+    failures: list[BaseException] = []
+
+    def reload_in_thread() -> None:
+        try:
+            published.append(loop.reload_skill())
+        except BaseException as error:
+            failures.append(error)
+
+    reload_thread = Thread(target=reload_in_thread)
+    reload_thread.start()
+    try:
+        assert validation_started.wait(timeout=5)
+        assert len(candidate_prompts) == 1
+        assert '"name":"reviewer"' in candidate_prompts[0]
+        assert '"name":"planner"' not in candidate_prompts[0]
+        assert loader.skills == before_skills
+        assert loader.resolve_manual("/planner request") == before_invocation
+        assert loader.resolve_manual("/reviewer request") is None
+
+        public_messages = loop._context_builder.build_status_messages(
+            (),
+            session_id=loop.session.session_id,
+        )
+        assert '"name":"planner"' in str(public_messages[0]["content"])
+        assert '"name":"reviewer"' not in str(public_messages[0]["content"])
+    finally:
+        release_validation.set()
+        reload_thread.join(timeout=5)
+
+    assert not reload_thread.is_alive()
+    assert failures == []
+    assert published == [loader.metadata]
+    assert tuple(item.name for item in loader.metadata) == ("reviewer",)
+    assert loader.resolve_manual("/planner request") is None
+    assert loader.resolve_manual("/reviewer request") is not None
+
+
+@pytest.mark.asyncio
+async def test_reload_during_active_run_preserves_old_request_and_updates_future_run(
+    tmp_path: Path,
+) -> None:
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nold body\n",
+        encoding="utf-8",
+    )
+
+    class ReloadBarrierRouter(_Router):
+        def __init__(self) -> None:
+            super().__init__(())
+            self.requests: list[list[dict[str, Any]]] = []
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        def stream(
+            self,
+            route: Literal["chat", "schedule"],
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[OpenAIToolSchema],
+            continuation: ModelContinuation | None = None,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            del route, tools, continuation
+            self.requests.append(deepcopy(list(messages)))
+            first = len(self.requests) == 1
+
+            async def replay() -> AsyncIterator[ModelStreamEvent]:
+                if first:
+                    self.first_started.set()
+                    await self.release_first.wait()
+                yield ModelCompleted(response=_response("completed"))
+
+            return replay()
+
+    router = ReloadBarrierRouter()
+    loop, session, bus = _runtime(
+        tmp_path,
+        router,
+        blackboard_generator=_BlackboardGeneratorFake(),
+        use_default_context_preparer=True,
+    )
+    before_messages = deepcopy(session.messages)
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("/planner first request"))
+        await asyncio.wait_for(router.first_started.wait(), timeout=1)
+        first_request = deepcopy(router.requests[0])
+
+        instruction.write_text(
+            "---\nname: reviewer\ndescription: Review work\n---\nnew body\n",
+            encoding="utf-8",
+        )
+        metadata = loop.reload_skill()
+
+        assert tuple(item.name for item in metadata) == ("reviewer",)
+        assert session.messages == before_messages
+        assert router.requests[0] == first_request
+        assert '"name":"planner"' in str(first_request[0]["content"])
+        assert '"name":"reviewer"' not in str(first_request[0]["content"])
+        assert "old body" in str(first_request[-1]["content"])
+        assert "new body" not in str(first_request[-1]["content"])
+
+        router.release_first.set()
+        await _terminals(bus, 1)
+        await bus.put_inbound(InboundMessage("/reviewer second request"))
+        await _terminals(bus, 1)
+    finally:
+        await loop.close()
+
+    assert len(router.requests) == 2
+    assert '"name":"reviewer"' in str(router.requests[1][0]["content"])
+    assert '"name":"planner"' not in str(router.requests[1][0]["content"])
+    assert "new body" in str(router.requests[1][-1]["content"])
+    assert "old body" not in str(router.requests[1][-1]["content"])
+
+
+@pytest.mark.parametrize("error_type", (RuntimeError, asyncio.CancelledError))
+def test_foreground_projection_scope_restores_published_state_after_failure(
+    tmp_path: Path,
+    error_type: type[BaseException],
+) -> None:
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nold body\n",
+        encoding="utf-8",
+    )
+    loop, _session, _bus = _runtime(tmp_path, _Router(()))
+    old_skills = loop._skill_loader.skills
+    instruction.write_text(
+        "---\nname: reviewer\ndescription: Review work\n---\nnew body\n",
+        encoding="utf-8",
+    )
+    loop.reload_skill()
+
+    with pytest.raises(error_type):
+        with loop._context_builder.foreground_projection_scope(old_skills):
+            old_prompt = loop._context_builder.foreground_system_prompt()
+            assert '"name":"planner"' in old_prompt
+            assert '"name":"reviewer"' not in old_prompt
+            raise error_type()
+
+    published_prompt = loop._context_builder.foreground_system_prompt()
+    assert '"name":"reviewer"' in published_prompt
+    assert '"name":"planner"' not in published_prompt
+
+
+@pytest.mark.asyncio
+async def test_reload_during_context_preparation_keeps_run_skill_snapshot(
+    tmp_path: Path,
+) -> None:
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Plan work\n---\nold body\n",
+        encoding="utf-8",
+    )
+
+    class ContextPreparationBarrierRouter(_Router):
+        def __init__(self) -> None:
+            super().__init__(())
+            self.requests: list[list[dict[str, Any]]] = []
+
+        def stream(
+            self,
+            route: Literal["chat", "schedule"],
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[OpenAIToolSchema],
+            continuation: ModelContinuation | None = None,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            del route, tools, continuation
+            self.requests.append(deepcopy(list(messages)))
+
+            async def replay() -> AsyncIterator[ModelStreamEvent]:
+                yield ModelCompleted(response=_response("completed"))
+
+            return replay()
+
+    router = ContextPreparationBarrierRouter()
+    loop, session, bus = _runtime(
+        tmp_path,
+        router,
+        blackboard_generator=_BlackboardGeneratorFake(),
+        use_default_context_preparer=True,
+    )
+    preparation_started = asyncio.Event()
+    release_preparation = asyncio.Event()
+    original_prepare = loop._prepare_foreground_context
+
+    async def blocked_prepare(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        preparation_started.set()
+        await release_preparation.wait()
+        return await original_prepare(*args, **kwargs)
+
+    object.__setattr__(loop, "_prepare_foreground_context", blocked_prepare)
+    before_messages = deepcopy(session.messages)
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("first request"))
+        await asyncio.wait_for(preparation_started.wait(), timeout=1)
+
+        instruction.write_text(
+            "---\nname: reviewer\ndescription: Review work\n---\nnew body\n",
+            encoding="utf-8",
+        )
+        metadata = loop.reload_skill()
+
+        assert tuple(item.name for item in metadata) == ("reviewer",)
+        assert session.messages == before_messages
+        release_preparation.set()
+        await _terminals(bus, 1)
+    finally:
+        await loop.close()
+
+    assert len(router.requests) == 1
+    assert "planner" in str(router.requests[0][0]["content"])
+    assert "reviewer" not in str(router.requests[0][0]["content"])
 
 
 @pytest.mark.asyncio

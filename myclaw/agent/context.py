@@ -23,7 +23,7 @@ from myclaw.agent.prompts import (
 )
 from myclaw.memory.manager import MemoryManager
 from myclaw.session.projection import _last_user_index, project_session_message
-from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
+from myclaw.skills.catalog import LoadedSkill, ManualSkillInvocation, SkillLoader
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,8 +33,18 @@ class _ScheduleProjectionSnapshot:
     current_time: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class _ForegroundProjectionSnapshot:
+    builder_id: int
+    skills: tuple[LoadedSkill, ...]
+
+
 _SCHEDULE_PROJECTION_SNAPSHOT: ContextVar[_ScheduleProjectionSnapshot | None] = ContextVar(
     "schedule_projection_snapshot",
+    default=None,
+)
+_FOREGROUND_PROJECTION_SNAPSHOT: ContextVar[_ForegroundProjectionSnapshot | None] = ContextVar(
+    "foreground_projection_snapshot",
     default=None,
 )
 
@@ -67,11 +77,24 @@ class ContextBuilder:
 
     def foreground_system_prompt(self) -> str:
         """Build the current foreground System Prompt from owned runtime state."""
+        snapshot = _FOREGROUND_PROJECTION_SNAPSHOT.get()
+        skills = (
+            self._skill_loader.skills
+            if snapshot is None or snapshot.builder_id != id(self)
+            else snapshot.skills
+        )
+        return self._foreground_system_prompt_for_skills(skills)
+
+    def _foreground_system_prompt_for_skills(
+        self,
+        skills: Sequence[LoadedSkill],
+    ) -> str:
+        """Build a foreground System Prompt from a staged immutable Skill state."""
         return foreground_chat_system_prompt(
             workspace=self._workspace,
             agent_home=self._agent_home,
             long_term_memory=self._memory_manager.memory_snapshot(),
-            skill_loader=self._skill_loader,
+            skills=skills,
         )
 
     def schedule_system_prompt(self) -> str:
@@ -81,6 +104,20 @@ class ContextBuilder:
             agent_home=self._agent_home,
             long_term_memory=self._memory_manager.memory_snapshot(),
         )
+
+    @contextmanager
+    def foreground_projection_scope(self, skills: Sequence[LoadedSkill]) -> Iterator[None]:
+        """Keep one foreground request's Skill projection stable across async preparation."""
+        token = _FOREGROUND_PROJECTION_SNAPSHOT.set(
+            _ForegroundProjectionSnapshot(
+                builder_id=id(self),
+                skills=tuple(skills),
+            )
+        )
+        try:
+            yield
+        finally:
+            _FOREGROUND_PROJECTION_SNAPSHOT.reset(token)
 
     def session_title_prompt(self) -> str:
         """Return the isolated versioned prompt used for Session titles."""
@@ -104,6 +141,20 @@ class ContextBuilder:
         """Build the minimum foreground request used by status and preflight."""
         return self.build_foreground_messages(
             [*history, {"role": "user", "content": ""}],
+            session_id=session_id,
+        )
+
+    def _build_status_messages_for_skills(
+        self,
+        history: Sequence[dict[str, Any]],
+        *,
+        session_id: str,
+        skills: Sequence[LoadedSkill],
+    ) -> list[dict[str, Any]]:
+        """Project the status request against a staged Skill state for validation."""
+        return self._build_messages(
+            [*history, {"role": "user", "content": ""}],
+            system_prompt=self._foreground_system_prompt_for_skills(skills),
             session_id=session_id,
         )
 

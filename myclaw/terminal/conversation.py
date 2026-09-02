@@ -47,6 +47,7 @@ from myclaw.agent.loop import (
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.management.commands import (
     MANAGEMENT_COMMANDS,
+    RELOAD_SKILL_MANAGEMENT_COMMAND,
     RESUME_MANAGEMENT_COMMAND,
     ManagementCommandDispatcher,
 )
@@ -67,6 +68,7 @@ _CONVERSATION_NAVIGATION_KEYS = frozenset({"pageup", "pagedown", "ctrl+home", "c
 _FAILURE_REASON_MAX_CHARS = 120
 _TOOL_NAME_MAX_CHARS = 80
 _GENERIC_TOOL_FAILURE_REASON = "The operation did not complete."
+_RELOAD_SKILL_MANAGEMENT_COMMAND_TOKEN = RELOAD_SKILL_MANAGEMENT_COMMAND.token
 _RESUME_MANAGEMENT_COMMAND_TOKEN = RESUME_MANAGEMENT_COMMAND.token
 _UNSAFE_TOOL_DETAIL_PATTERN = re.compile(
     r"(?:^\s*[\[{])|(?:[\"'][^\"']+[\"']\s*:)|"
@@ -2312,6 +2314,9 @@ class TerminalConversationApp(App[None]):
             selected.kind is _CompletionCandidateKind.MANAGEMENT
             and input_area.text == selected.insert_text
         )
+        if should_submit and selected.token == _RELOAD_SKILL_MANAGEMENT_COMMAND_TOKEN:
+            self.post_message(_ConversationInput.Submitted(input_area, selected.insert_text))
+            return
         self._select_command_completion(index)
         if should_submit:
             self.post_message(_ConversationInput.Submitted(input_area, selected.insert_text))
@@ -2379,6 +2384,13 @@ class TerminalConversationApp(App[None]):
 
         result = await self._management_dispatcher.dispatch(text)
         if result.handled:
+            if result.skill_metadata is not None:
+                self._skill_metadata = tuple(result.skill_metadata)
+                self._hide_command_completion()
+            elif text == _RELOAD_SKILL_MANAGEMENT_COMMAND_TOKEN:
+                message.text_area.remember_submission(text)
+                await self._mount_management_rows(text, result.output)
+                return
             message.text_area.remember_submission(text)
             message.text_area.text = ""
             if result.resume_sessions is not None:

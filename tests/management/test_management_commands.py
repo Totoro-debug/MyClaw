@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +18,8 @@ from myclaw.management.service import RuntimeStatusInput
 from myclaw.memory.dream import DreamResult
 from myclaw.memory.manager import MemoryManager
 from myclaw.session.session import Session
-from tests.fixtures.diagnostic_capture import configured_process_logging
+from myclaw.skills.catalog import SkillMetadata
+from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
 from tests.management.factories import management_service
 
 CONFIG_CONTENT = """[models.providers.primary]
@@ -44,6 +46,23 @@ class _ResultDream:
     async def run(self) -> DreamResult:
         self.calls += 1
         return self.result
+
+
+class _ReloadableLoop:
+    def __init__(
+        self,
+        metadata: tuple[SkillMetadata, ...] = (),
+        failure: BaseException | None = None,
+    ) -> None:
+        self.metadata = metadata
+        self.failure = failure
+        self.calls = 0
+
+    def reload_skill(self) -> tuple[SkillMetadata, ...]:
+        self.calls += 1
+        if self.failure is not None:
+            raise self.failure
+        return self.metadata
 
 
 REDACTED_CONFIG_CONTENT = """[models.providers.primary]
@@ -83,9 +102,117 @@ def test_management_command_catalog_owns_ordered_tokens_and_descriptions() -> No
         ("/resume", "Resume a Conversation Session"),
         ("/memory", "View Long-term Memory"),
         ("/dream", "Process pending Conversation Summaries"),
+        ("/reload_skill", "Reload Skills"),
     )
     assert all(command.token and command.description for command in MANAGEMENT_COMMANDS)
     assert any(command is RESUME_MANAGEMENT_COMMAND for command in MANAGEMENT_COMMANDS)
+
+
+@pytest.mark.asyncio
+async def test_reload_skill_command_returns_published_count_and_metadata(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    metadata = (
+        SkillMetadata(
+            name="planner",
+            description="Plan work",
+            path=(agent_home / "skills" / "planner" / "SKILL.md").resolve(),
+        ),
+        SkillMetadata(
+            name="reviewer",
+            description="Review work",
+            path=(agent_home / "skills" / "reviewer" / "SKILL.md").resolve(),
+        ),
+    )
+    loop = _ReloadableLoop(metadata)
+    dispatcher = ManagementCommandDispatcher(
+        management_service(home, current_agent_loop=lambda: loop),
+    )
+
+    result = await dispatcher.dispatch("/reload_skill")
+
+    assert result.handled is True
+    assert result.output == "Skill count: 2"
+    assert result.skill_metadata == metadata
+    assert loop.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reload_skill_command_maps_failure_to_one_safe_stable_result(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    loop = _ReloadableLoop(
+        failure=RuntimeError(
+            "SECRET-SKILL-BODY D:\\private\\skills\\planner\\SKILL.md traceback details",
+        ),
+    )
+    dispatcher = ManagementCommandDispatcher(
+        management_service(home, current_agent_loop=lambda: loop),
+    )
+
+    diagnostics = capture_diagnostics()
+    try:
+        result = await dispatcher.dispatch("/reload_skill")
+    finally:
+        diagnostics.close()
+
+    assert result.handled is True
+    assert result.output == "skill_reload_failed: Skill reload failed."
+    assert result.skill_metadata is None
+    assert "SECRET-SKILL-BODY" not in (result.output or "")
+    assert "D:\\private\\skills" not in (result.output or "")
+    assert "traceback" not in (result.output or "").casefold()
+    assert "SECRET-SKILL-BODY" not in diagnostics.event_text
+    assert "D:\\private\\skills" not in diagnostics.event_text
+    assert "traceback" not in diagnostics.event_text.casefold()
+    assert "RuntimeError" in diagnostics.event_text
+    assert loop.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reload_dispatches_are_linearized_in_call_order(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    first = (
+        SkillMetadata(
+            name="first",
+            description="First state",
+            path=(agent_home / "skills" / "first" / "SKILL.md").resolve(),
+        ),
+    )
+    second = (
+        SkillMetadata(
+            name="second",
+            description="Second state",
+            path=(agent_home / "skills" / "second" / "SKILL.md").resolve(),
+        ),
+    )
+
+    class SequencedReloadLoop(_ReloadableLoop):
+        def reload_skill(self) -> tuple[SkillMetadata, ...]:
+            metadata = (first, second)[self.calls]
+            self.calls += 1
+            return metadata
+
+    loop = SequencedReloadLoop()
+    dispatcher = ManagementCommandDispatcher(
+        management_service(home, current_agent_loop=lambda: loop),
+    )
+
+    results = await asyncio.gather(
+        dispatcher.dispatch("/reload_skill"),
+        dispatcher.dispatch("/reload_skill"),
+    )
+
+    assert tuple(result.skill_metadata for result in results) == (first, second)
+    assert tuple(result.output for result in results) == ("Skill count: 1", "Skill count: 1")
+    assert loop.calls == 2
 
 
 @pytest.mark.parametrize(
@@ -530,7 +657,10 @@ async def test_status_command_renders_actual_runtime_and_session_state(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command", ["/unknown", "/config extra", "/memory ", "/CONFIG"])
+@pytest.mark.parametrize(
+    "command",
+    ["/unknown", "/config extra", "/memory ", "/CONFIG", "/reload_skill extra"],
+)
 async def test_unknown_or_inexact_slash_command_is_left_unhandled(
     agent_home: Path,
     command: str,
@@ -545,7 +675,7 @@ async def test_unknown_or_inexact_slash_command_is_left_unhandled(
 
 
 @pytest.mark.asyncio
-async def test_config_and_memory_commands_bypass_conversation_and_provider(
+async def test_management_commands_bypass_conversation_and_provider(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -555,9 +685,11 @@ async def test_config_and_memory_commands_bypass_conversation_and_provider(
     state.initialize(agent_home_root=Path.home() / ".myclaw")
     (agent_home / "config.toml").write_text(CONFIG_CONTENT, encoding="utf-8")
     state.long_term_memory_path.write_text("current memory\n", encoding="utf-8")
+    reload_loop = _ReloadableLoop()
     dispatcher = ManagementCommandDispatcher(
         management_service(
             home,
+            current_agent_loop=lambda: reload_loop,
             workspace_state=state,
             memory_manager=MemoryManager(state),
         )
@@ -572,10 +704,12 @@ async def test_config_and_memory_commands_bypass_conversation_and_provider(
 
     config_handled = await dispatch_or_converse("/config")
     memory_handled = await dispatch_or_converse("/memory")
+    reload_handled = await dispatch_or_converse("/reload_skill")
 
-    assert (config_handled, memory_handled) == (True, True)
+    assert (config_handled, memory_handled, reload_handled) == (True, True, True)
     assert conversation.messages == []
     assert conversation.provider_calls == 0
+    assert reload_loop.calls == 1
 
     unknown_handled = await dispatch_or_converse("/ordinary-slash")
 

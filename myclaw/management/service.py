@@ -14,6 +14,7 @@ from myclaw.config.config import ConfigLoader, ConfigView
 from myclaw.errors import ErrorInfo
 from myclaw.memory.dream import DreamResult
 from myclaw.session.session import Session, SessionStoragePartition
+from myclaw.skills.catalog import SkillMetadata
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_nonnegative_int, require_nonnegative_number
@@ -29,6 +30,10 @@ class _DreamRunner(Protocol):
 
 class _StatusProjectionLoop(Protocol):
     def runtime_status_input(self) -> "RuntimeStatusInput": ...
+
+
+class _ManagementAgentLoop(_StatusProjectionLoop, Protocol):
+    def reload_skill(self) -> tuple[SkillMetadata, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,7 +220,7 @@ class ManagementViewService:
         self,
         agent_home: AgentHome,
         *,
-        current_agent_loop: Callable[[], _StatusProjectionLoop],
+        current_agent_loop: Callable[[], _ManagementAgentLoop],
         workspace_state: WorkspaceState,
         replace_agent_loop: Callable[[str, bool], Awaitable[None]],
         prepare_session_resume: Callable[[str], Awaitable[None]],
@@ -239,6 +244,26 @@ class ManagementViewService:
         self._memory_reader = memory_manager
         self._dream = dream
         self._aborted = False
+
+    async def reload_skill(self) -> tuple[SkillMetadata, ...]:
+        """Reload the current Agent Loop Skill state and return published metadata."""
+        try:
+            self._ensure_active()
+            current_agent_loop = self._current_agent_loop()
+            metadata = current_agent_loop.reload_skill()
+            if not isinstance(metadata, tuple) or not all(
+                isinstance(item, SkillMetadata) for item in metadata
+            ):
+                raise TypeError("Agent Loop Skill metadata is malformed")
+            return metadata
+        except Exception as error:
+            logger.warning(
+                "Skill reload failed type={}",
+                type(error).__name__,
+            )
+            raise ManagementError(
+                ErrorInfo("skill_reload_failed", "Skill reload failed.")
+            ) from error
 
     def deactivate(self) -> None:
         """Reject new Management work after its Runtime Generation is detached."""

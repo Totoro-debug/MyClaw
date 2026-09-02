@@ -19,6 +19,7 @@ from myclaw.management.service import (
     SessionListingReport,
 )
 from myclaw.memory.dream import DreamResult
+from myclaw.skills.catalog import SkillMetadata
 from myclaw.utils.time import format_rfc3339_milliseconds
 
 
@@ -38,12 +39,17 @@ _DREAM_COMMAND = ManagementCommandDefinition(
     "/dream",
     "Process pending Conversation Summaries",
 )
+RELOAD_SKILL_MANAGEMENT_COMMAND = ManagementCommandDefinition(
+    "/reload_skill",
+    "Reload Skills",
+)
 MANAGEMENT_COMMANDS = (
     _CONFIG_COMMAND,
     _STATUS_COMMAND,
     RESUME_MANAGEMENT_COMMAND,
     _MEMORY_COMMAND,
     _DREAM_COMMAND,
+    RELOAD_SKILL_MANAGEMENT_COMMAND,
 )
 _MANAGEMENT_COMMAND_BY_TOKEN: Mapping[str, ManagementCommandDefinition] = MappingProxyType(
     {command.token: command for command in MANAGEMENT_COMMANDS}
@@ -59,6 +65,8 @@ class ManagementPort(Protocol):
 
     async def dream(self) -> DreamResult: ...
 
+    async def reload_skill(self) -> tuple[SkillMetadata, ...]: ...
+
     async def resumable_listing(self) -> SessionListingReport: ...
 
     async def resume(self, session_id: str, *, force: bool = False) -> ResumeResult: ...
@@ -73,6 +81,7 @@ class ManagementCommandResult:
     resume_sessions: tuple[SessionListingEntry, ...] | None = None
     resumed_session_id: str | None = None
     resume_skipped_count: int = 0
+    skill_metadata: tuple[SkillMetadata, ...] | None = None
 
 
 class ManagementCommandDispatcher:
@@ -80,6 +89,13 @@ class ManagementCommandDispatcher:
 
     def __init__(self, management: ManagementPort) -> None:
         self._management = management
+
+    @staticmethod
+    def _skill_reload_failure() -> ManagementCommandResult:
+        return ManagementCommandResult(
+            handled=True,
+            output="skill_reload_failed: Skill reload failed.",
+        )
 
     async def dispatch(self, command: str) -> ManagementCommandResult:
         """Return rendered output for a recognized Management Command."""
@@ -163,6 +179,22 @@ class ManagementCommandDispatcher:
                         f"cursor: {result.cursor}"
                     )
             return ManagementCommandResult(handled=True, output=output)
+        if command is RELOAD_SKILL_MANAGEMENT_COMMAND:
+            try:
+                metadata = await management.reload_skill()
+            except ManagementError:
+                return self._skill_reload_failure()
+            except Exception as error:
+                logger.warning(
+                    "Management command failed command=/reload_skill type={}",
+                    type(error).__name__,
+                )
+                return self._skill_reload_failure()
+            return ManagementCommandResult(
+                handled=True,
+                output=f"Skill count: {len(metadata)}",
+                skill_metadata=metadata,
+            )
         if command is not _CONFIG_COMMAND:
             raise RuntimeError(f"Supported Management Command has no handler: {command}")
         try:

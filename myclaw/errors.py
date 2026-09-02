@@ -29,6 +29,7 @@ type ErrorCode = Literal[
     "tool_failed",
     "memory_task_running",
     "skill_context_too_large",
+    "skill_reload_failed",
 ]
 
 STABLE_ERROR_CODES: frozenset[str] = frozenset(
@@ -57,6 +58,7 @@ STABLE_ERROR_CODES: frozenset[str] = frozenset(
         "tool_failed",
         "memory_task_running",
         "skill_context_too_large",
+        "skill_reload_failed",
     }
 )
 

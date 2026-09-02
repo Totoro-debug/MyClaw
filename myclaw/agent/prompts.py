@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import platform
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import PurePath
 
-from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
+from myclaw.skills.catalog import LoadedSkill, ManualSkillInvocation, SkillLoader
 from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
 
@@ -104,8 +105,15 @@ def foreground_chat_system_prompt(
     agent_home: PurePath,
     long_term_memory: str,
     skill_loader: SkillLoader | None = None,
+    skills: Sequence[LoadedSkill] | None = None,
 ) -> str:
     """Compose the foreground prompt with optional Skill metadata."""
+    if skill_loader is not None and skills is not None:
+        raise TypeError("Foreground Skill state must have exactly one source")
+    if skills is None:
+        loaded_skills = () if skill_loader is None else skill_loader.skills
+    else:
+        loaded_skills = tuple(skills)
     sections = [
         chat_system_prompt(
             workspace=workspace,
@@ -113,19 +121,19 @@ def foreground_chat_system_prompt(
             long_term_memory=long_term_memory,
         )
     ]
-    if skill_loader is not None and skill_loader.skills:
+    if loaded_skills:
         entries = "\n".join(
             _skill_metadata_json(
                 name=metadata.name,
                 description=metadata.description,
                 path=str(metadata.path),
             )
-            for metadata in skill_loader.metadata
+            for metadata in (skill.metadata for skill in loaded_skills)
         )
         sections.append(render_template("skill-catalog.md", entries=entries))
         always_entries = "\n".join(
             _skill_always_json(name=skill.metadata.name, body=skill.document)
-            for skill in skill_loader.skills
+            for skill in loaded_skills
             if skill.always
         )
         if always_entries:

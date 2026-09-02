@@ -36,7 +36,11 @@ from myclaw.agent.prompts import session_title_prompt
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
-from myclaw.management.commands import ManagementCommandDispatcher, ManagementCommandResult
+from myclaw.management.commands import (
+    MANAGEMENT_COMMANDS,
+    ManagementCommandDispatcher,
+    ManagementCommandResult,
+)
 from myclaw.management.service import FatalManagementError, ManagementError
 from myclaw.memory.dream import DreamResult
 from myclaw.provider.models import (
@@ -51,6 +55,7 @@ from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.conversation import (
     TerminalConversationApp,
+    _ConversationInput,
     _format_activity_duration,
 )
 from myclaw.terminal.conversation import (
@@ -5289,7 +5294,7 @@ async def test_management_completion_keeps_the_composer_visible(
         visible_nodes = _screenshot_text_nodes(app)
         completion = app.query_one("#command-completion", OptionList)
         input_area = app.query_one("#conversation-input", TextArea)
-        assert completion.option_count == 5
+        assert completion.option_count == len(MANAGEMENT_COMMANDS)
         assert completion.virtual_size.height == completion.option_count
         assert all("\n" not in str(option.prompt) for option in completion.options)
         assert completion.region.bottom <= input_area.region.y
@@ -5379,6 +5384,7 @@ async def test_skill_completion_merges_after_management_commands_with_safe_label
             "/resume - Resume a Conversation Session",
             "/memory - View Long-term Memory",
             "/dream - Process pending Conversation Summaries",
+            "/reload_skill - Reload Skills",
             "/alpha - First line [bold] stays literal",
             "/bravo - Second line",
         ]
@@ -5426,7 +5432,7 @@ async def test_skill_completion_labels_are_single_line_at_narrow_sizes_and_stop_
         assert input_area.display
         assert app.screen.focused is input_area
 
-        await pilot.press(*(("down",) * 5))
+        await pilot.press(*(("down",) * len(MANAGEMENT_COMMANDS)))
         await pilot.pause()
         assert completion.render_line(
             completion.scrollable_content_region.height - 1
@@ -5468,7 +5474,7 @@ async def test_skill_completion_selection_inserts_only_the_skill_invocation(
         elif selection == "exact-enter":
             await pilot.press(*list("alpha"), "enter")
         else:
-            await pilot.press(*(("down",) * 5), selection)
+            await pilot.press(*(("down",) * len(MANAGEMENT_COMMANDS)), selection)
 
         input_area = app.query_one("#conversation-input", TextArea)
         completion = app.query_one("#command-completion", OptionList)
@@ -5483,7 +5489,7 @@ async def test_skill_completion_selection_inserts_only_the_skill_invocation(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("down_count", "candidate_text"),
-    ((0, "/config"), (5, "/alpha ")),
+    ((0, "/config"), (len(MANAGEMENT_COMMANDS), "/alpha ")),
 )
 async def test_completion_tab_does_not_accept_or_submit_highlighted_candidate(
     down_count: int,
@@ -5548,6 +5554,75 @@ async def test_management_error_row_preserves_later_command_interaction(
         assert "No pending summaries" in visible_text
         assert runtime.session.messages == []
         assert provider.stream_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (False, True))
+async def test_reload_skill_submission_updates_only_terminal_skill_cache_on_success(
+    failure: bool,
+) -> None:
+    initial_metadata = (
+        SkillMetadata(
+            name="initial",
+            description="Initial skill",
+            path=Path("C:/agent-home/skills/initial/SKILL.md"),
+        ),
+    )
+    target_metadata = (
+        SkillMetadata(
+            name="target",
+            description="Target skill",
+            path=Path("C:/agent-home/skills/target/SKILL.md"),
+        ),
+    )
+
+    class ReloadManagement:
+        async def reload_skill(self) -> tuple[SkillMetadata, ...]:
+            if failure:
+                raise RuntimeError(
+                    "SECRET-SKILL-BODY D:\\private\\skills\\planner\\SKILL.md traceback",
+                )
+            return target_metadata
+
+    conversation = ScriptedRunSource()
+    fake_runtime = _terminal_backend(conversation)
+    app = _terminal_app(
+        cast(Any, fake_runtime),
+        skill_metadata=initial_metadata,
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, ReloadManagement())),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("/")
+        await pilot.pause()
+        input_area = app.query_one("#conversation-input", _ConversationInput)
+        input_area.text = "/reload_skill"
+        await pilot.pause()
+        completion = app.query_one("#command-completion", OptionList)
+        before_cache = app._completion_options
+        before_options = tuple(str(option.prompt) for option in completion.options)
+        before_display = completion.display
+        before_dismissed_text = app._completion_dismissed_text
+        before_input = input_area.text
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert fake_runtime.inbound_history == []
+        assert conversation.submissions == []
+        if failure:
+            assert app._skill_metadata == initial_metadata
+            assert "skill_reload_failed: Skill reload failed." in _visible_screen_text(app)
+            assert app._completion_options == before_cache
+            assert tuple(str(option.prompt) for option in completion.options) == before_options
+            assert completion.display is before_display
+            assert app._completion_dismissed_text == before_dismissed_text
+            assert input_area.text == before_input
+        else:
+            assert app._skill_metadata == target_metadata
+            assert "Skill count: 1" in _visible_screen_text(app)
+            assert not completion.display
+            assert not completion.options
 
 
 @pytest.mark.asyncio

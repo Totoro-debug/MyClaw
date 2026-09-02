@@ -12,9 +12,13 @@ from myclaw.management.service import (
 )
 from myclaw.memory.dream import DreamResult
 from myclaw.memory.manager import MemoryManager
+from myclaw.skills.catalog import SkillMetadata
 
 
 class _DefaultLoop:
+    def reload_skill(self) -> tuple[SkillMetadata, ...]:
+        return ()
+
     def runtime_status_input(self) -> RuntimeStatusInput:
         return RuntimeStatusInput(
             system_prompt="",

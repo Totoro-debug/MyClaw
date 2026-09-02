@@ -52,7 +52,7 @@ from myclaw.provider.models import ModelCompleted, ReasoningDelta, TextDelta
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
-from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader, SkillMetadata
+from myclaw.skills.catalog import LoadedSkill, ManualSkillInvocation, SkillLoader, SkillMetadata
 from myclaw.tools.base import BaseTool, OpenAIToolSchema
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
@@ -339,6 +339,13 @@ class AgentLoop:
     def skill_metadata(self) -> tuple[SkillMetadata, ...]:
         return self._skill_loader.metadata
 
+    def reload_skill(self) -> tuple[SkillMetadata, ...]:
+        """Reload and publish Skills after validating the complete candidate state."""
+        if self._closed or self._aborted or self._closing or self._close_task is not None:
+            raise RuntimeError("Agent Loop is closed")
+        self._skill_loader.load(validate=self._validate_always_loaded_skill_budget)
+        return self._skill_loader.metadata
+
     @property
     def tool_schemas(self) -> tuple[OpenAIToolSchema, ...]:
         return tuple(self._tool_gateway.schemas)
@@ -425,27 +432,35 @@ class AgentLoop:
         if self._preflight_error is not None:
             raise self._preflight_error
         try:
-            chat_route = self._configuration.resolve_route("chat").route
-            status_input = _foreground_runtime_status_input(
-                context_builder=self._context_builder,
-                history=(),
-                session_id=self._session.session_id,
-                tool_schemas=self.tool_schemas,
-            )
-            available_input = chat_route.context_window - chat_route.max_output
-            if any(skill.always for skill in self._skill_loader.skills):
-                estimated = estimate_input_tokens(status_input)
-                if estimated > available_input:
-                    raise SkillContextTooLargeError(
-                        ErrorInfo(
-                            "skill_context_too_large",
-                            "Always-loaded Skill content exceeds the foreground chat input budget.",
-                        )
-                    )
+            self._validate_always_loaded_skill_budget(self._skill_loader.skills)
         except Exception as error:
             self._preflight_error = error
             raise
         self._preflighted = True
+
+    def _validate_always_loaded_skill_budget(
+        self,
+        skills: tuple[LoadedSkill, ...],
+    ) -> None:
+        chat_route = self._configuration.resolve_route("chat").route
+        if not any(skill.always for skill in skills):
+            return
+        status_input = _foreground_runtime_status_input(
+            context_builder=self._context_builder,
+            history=(),
+            session_id=self._session.session_id,
+            tool_schemas=self.tool_schemas,
+            skill_state=skills,
+        )
+        available_input = chat_route.context_window - chat_route.max_output
+        estimated = estimate_input_tokens(status_input)
+        if estimated > available_input:
+            raise SkillContextTooLargeError(
+                ErrorInfo(
+                    "skill_context_too_large",
+                    "Always-loaded Skill content exceeds the foreground chat input budget.",
+                )
+            )
 
     def _activate_prepared(self) -> None:
         """Sample uptime and atomically publish the preflighted Loop activation."""
@@ -841,7 +856,7 @@ class AgentLoop:
         execution_ready: asyncio.Event,
     ) -> None:
         active_session = self._session
-        manual_invocation = None
+        skill_state = self._skill_loader.skills
         manual_invocation = self._skill_loader.resolve_manual(inbound.content)
         start_title = not active_session.messages
         created_title_work = (
@@ -855,26 +870,27 @@ class AgentLoop:
             title_coordination.attach_foreground()
         committed = False
         try:
-            if title_work is None:
-                with session_log(active_session):
-                    committed = await self._execute_foreground_logged(
-                        active_session,
-                        inbound,
-                        title_work=None,
-                        manual_invocation=manual_invocation,
-                        execution_ready=execution_ready,
-                    )
-            else:
-                assert title_coordination is not None
-                await title_coordination.log_ready.wait()
-                with logger.contextualize(session_id=active_session.session_id):
-                    committed = await self._execute_foreground_logged(
-                        active_session,
-                        inbound,
-                        title_work=title_work,
-                        manual_invocation=manual_invocation,
-                        execution_ready=execution_ready,
-                    )
+            with self._context_builder.foreground_projection_scope(skill_state):
+                if title_work is None:
+                    with session_log(active_session):
+                        committed = await self._execute_foreground_logged(
+                            active_session,
+                            inbound,
+                            title_work=None,
+                            manual_invocation=manual_invocation,
+                            execution_ready=execution_ready,
+                        )
+                else:
+                    assert title_coordination is not None
+                    await title_coordination.log_ready.wait()
+                    with logger.contextualize(session_id=active_session.session_id):
+                        committed = await self._execute_foreground_logged(
+                            active_session,
+                            inbound,
+                            title_work=title_work,
+                            manual_invocation=manual_invocation,
+                            execution_ready=execution_ready,
+                        )
         finally:
             execution_ready.set()
             if title_coordination is not None:
@@ -1491,9 +1507,18 @@ def _foreground_runtime_status_input(
     chat_model: str = "",
     context_window: int = 0,
     generation_started_at: float | None = None,
+    skill_state: tuple[LoadedSkill, ...] | None = None,
 ) -> RuntimeStatusInput:
     """Project and serialize a minimum foreground request for status and preflight."""
-    projected = context_builder.build_status_messages(history, session_id=session_id)
+    projected = (
+        context_builder.build_status_messages(history, session_id=session_id)
+        if skill_state is None
+        else context_builder._build_status_messages_for_skills(
+            history,
+            session_id=session_id,
+            skills=skill_state,
+        )
+    )
     projected_system = projected[0].get("content")
     if not isinstance(projected_system, str):
         raise TypeError("Context Builder status system message is malformed")
