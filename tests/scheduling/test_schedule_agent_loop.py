@@ -18,7 +18,6 @@ import myclaw.agent.context as context
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import MessageBus
-from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -41,6 +40,7 @@ from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
+from myclaw.templates import render_template
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
@@ -145,7 +145,7 @@ class _ScheduleProvider:
     ) -> AsyncIterator[ModelStreamEvent]:
         if messages and messages[0] == {
             "role": "system",
-            "content": session_title_prompt(),
+            "content": render_template("session-title-prompt.md"),
         }:
             yield ModelCompleted(response=_response("Schedule acceptance"))
             return

@@ -104,13 +104,13 @@ D01-D18 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Fra
 
 #### 3.1.1 Skill Catalog discovery
 
-`~/.myclaw/skills/` 缺失或为空时，Skill Catalog 是空 snapshot。Catalog 只扫描其一级子目录中名为 `SKILL.md` 的 instruction file；不会把嵌套目录作为独立候选。frontmatter 必须从文件首行的独占 `---` 开始，并以之后的独占 `---` 结束；其内容使用安全 YAML mapping 解析，`name` 和 `description` 必须是字符串。原始 `name` 不做 trim，必须直接匹配 `[a-z_-][a-z0-9_-]{0,63}`；`description` trim 后必须为 1 到 1024 个 Unicode code points。
+`~/.myclaw/skills/` 缺失或为空时，Skill Catalog 是空的已发布 Skill 集合。Catalog 只扫描其一级子目录中名为 `SKILL.md` 的 instruction file；不会把嵌套目录作为独立候选。frontmatter 必须从文件首行的独占 `---` 开始，并以之后的独占 `---` 结束；其内容使用安全 YAML mapping 解析，`name` 和 `description` 必须是字符串。原始 `name` 不做 trim，必须直接匹配 `[a-z_-][a-z0-9_-]{0,63}`；`description` trim 后必须为 1 到 1024 个 Unicode code points。
 
-每个候选的 instruction path 必须是可读普通文件并在 canonical Skill root 内；每个候选都捕获一个 complete `SKILL.md` document，其 bytes 必须是 UTF-8。canonical root 外的 symlink/reparse target、缺失文件、非 UTF-8 document 和其他 malformed metadata/body 均跳过。跳过时只记录安全的 candidate path 与 reason，不记录 instruction document。候选按 canonical path 字符串升序评估；reserved Management Command names 和重复 Skill names 不进入 snapshot，同名时保留第一个有效候选。Catalog metadata 不注册 Tool。
+每个候选的 instruction path 必须是可读普通文件并在 canonical Skill root 内；每个候选都捕获一个 complete `SKILL.md` document，其 bytes 必须是 UTF-8。canonical root 外的 symlink/reparse target、缺失文件、非 UTF-8 document 和其他 malformed metadata/body 均跳过。跳过时只记录安全的 candidate path 与 reason，不记录 instruction document。候选按 canonical path 字符串升序评估；reserved Management Command names 和重复 Skill names 不进入已发布集合，同名时保留第一个有效候选。Catalog metadata 不注册 Tool。
 
-`runtime.enable_skill_always_load` 是 boolean，默认 `false`。每个 Agent Loop 构造自己的 `SkillLoader`；Loader 对每个候选只读取一次完整 UTF-8 document，以同一份 bytes 完成 frontmatter、metadata、document、canonical path 和可选 `always` 校验，然后原子保存一个 Runtime Generation-scoped immutable `SkillSnapshot`。YAML non-boolean `always` 只产生一次安全 warning 并按非 always Skill 保留；`false`、缺失或关闭配置时不进入 always-loaded subset。Generation 不暴露中间 snapshot。
+`runtime.enable_skill_always_load` 是 boolean，默认 `false`。每个 Agent Loop 构造自己的 `SkillLoader`；Loader 对每个候选只读取一次完整 UTF-8 document，以同一份 bytes 完成 frontmatter、metadata、document、canonical path 和可选 `always` 校验，然后原子发布一个由 Loader 直接拥有的 Runtime Generation-scoped immutable Skill tuple。YAML non-boolean `always` 只产生一次安全 warning 并按非 always Skill 保留；`false`、缺失或关闭配置时不进入 always-loaded subset。Generation 不暴露中间候选状态。
 
-当前 Agent Loop 的 manual Skill invocation 只能使用 SkillLoader 保存的完整 snapshot document，不再次读取磁盘：
+当前 Agent Loop 的 manual Skill invocation 只能使用 SkillLoader 保存的完整 frozen document，不再次读取磁盘：
 
 ```python
 class LoadedSkill:
@@ -118,15 +118,17 @@ class LoadedSkill:
     document: str
     always: bool
 
-class SkillSnapshot:
-    root: Path
-    skills: tuple[LoadedSkill, ...]
-
 class SkillLoader:
-    def load(self) -> SkillSnapshot: ...
+    @property
+    def root(self) -> Path: ...
+    @property
+    def skills(self) -> tuple[LoadedSkill, ...]: ...
+    @property
+    def metadata(self) -> tuple[SkillMetadata, ...]: ...
+    def load(self, *, validate: Callable[..., None] | None = None) -> None: ...
 ```
 
-`LoadedSkill.document` 逐字符保留完整 document，不剥离 opening delimiter、frontmatter、closing delimiter、正文或原始换行。`SkillSnapshot` 保存 immutable `tuple[LoadedSkill, ...]`，`SkillLoader` 只通过 `load()` 发布 snapshot；不存在可变的 `snapshot` 字段。当前 Agent Loop 内 manual invocation 和 always-loaded projection 使用 frozen document；启动或任何 `/resume` 构造新的 Agent Loop 时重新扫描。模型自主调用普通 `read_file` 仍遵守 Tool path 和实时文件读取契约。缺失、不可读、非 UTF-8、frontmatter/YAML 无效或 canonical containment 失效的单个候选被跳过并记录安全 warning；已发布 snapshot 的全局预算 preflight failure 使用稳定 `skill_context_too_large` 并终止 Terminal Conversation。
+`LoadedSkill.document` 逐字符保留完整 document，不剥离 opening delimiter、frontmatter、closing delimiter、正文或原始换行。`SkillLoader` 保存 immutable `tuple[LoadedSkill, ...]`，每次成功 `load()` 都原子替换已发布状态；不存在可变的公开 Skill 状态。当前 Agent Loop 内 manual invocation 和 always-loaded projection 使用 frozen document；启动、`/resume` 或 `/reload_skill` 会在发布前重新扫描。模型自主调用普通 `read_file` 仍遵守 Tool path 和实时文件读取契约。缺失、不可读、非 UTF-8、frontmatter/YAML 无效或 canonical containment 失效的单个候选被跳过并记录安全 warning；已发布状态的全局预算 preflight failure 使用稳定 `skill_context_too_large` 并终止 Terminal Conversation。
 
 `memory.md` 初始内容固定为：
 
@@ -676,7 +678,7 @@ backpressure lifecycle；Tool result 永不进入 Outbound。
 
 ### 10.2 Task Framing and Blackboard
 
-`AgentLoop` 在每个非空且不是 Manual Skill Invocation 的普通 foreground `InboundMessage` 主 Agent Run 准备前调用一次 `TaskFramingEvaluator`。Manual Skill Invocation、Management Command、User Schedule execution、Conversation Summary 模型调用和 Dream 不自行做 Task Framing；Conversation Summary/context preparation 使用合格普通轮已 staged 的同一 Blackboard。
+`AgentLoop` 在每个非空且不是 Manual Skill Invocation 的普通 foreground `InboundMessage` 主 Agent Run 准备前调用一次 `Blackboard.generate()`。Manual Skill Invocation、Management Command、User Schedule execution、Conversation Summary 模型调用和 Dream 不自行做 Task Framing；Conversation Summary/context preparation 使用合格普通轮已 staged 的同一 Blackboard。
 
 最小值与接口形状：
 
@@ -685,6 +687,15 @@ backpressure lifecycle；Tool result 永不进入 Outbound。
 class Blackboard:
     goal: str
     completion_boundary: str
+    @classmethod
+    async def generate(
+        cls,
+        router: TaskFramingModelRouter,
+        *,
+        previous: Blackboard | None,
+        last_assistant_content: str,
+        current_user_input: str,
+    ) -> FramingResult: ...
 
 @dataclass(frozen=True, slots=True)
 class FramingResult:
@@ -692,22 +703,14 @@ class FramingResult:
     usage_delta: dict[str, int] | None
     status: Literal["resolved", "invalid_response", "model_failed"]
 
-class TaskFramingEvaluator(Protocol):
-    async def frame(
-        self,
-        *,
-        previous: Blackboard | None,
-        last_assistant_content: str,
-        current_user_input: str,
-    ) -> FramingResult: ...
 ```
 
-Task Framing 使用 `ModelRouter.complete("chat", ..., tools=())`，因此复用 chat route 的总共五次 attempt budget、retry、default fallback 与 cancellation，但不传 Tools 或 continuation。`TaskFramer` 与 `AgentRunner` 接收并保存传给同一 `AgentLoop` 的同一个 Model Router 对象；Router 的构造、Runtime Lifetime ownership 与最终 close 仍只属于 CLI composition root。模型只接收 previous Blackboard、Session 中最新 assistant message 的完整 content 和 current raw user input 组成的 compact JSON。
+Task Framing 使用 `ModelRouter.complete("chat", ..., tools=())`，因此复用 chat route 的总共五次 attempt budget、retry、default fallback 与 cancellation，但不传 Tools 或 continuation。`Blackboard.generate()` 只在单次调用中接收 Model Router，不在 Blackboard 中保存；`AgentRunner` 继续接收并保存传给同一 `AgentLoop` 的同一个 Model Router 对象。Router 的构造、Runtime Lifetime ownership 与最终 close 仍只属于 CLI composition root。模型只接收 previous Blackboard、Session 中最新 assistant message 的完整 content 和 current raw user input 组成的 compact JSON。
 
 返回 decision 只能是：
 
 - `keep`：使用 previous Blackboard；previous 为 `None` 时该 decision 无效。
-- `replace`：提供恰好 `action`、`goal`、`completion_boundary`；两个值 trim 后必须非空。
+- `replace`：提供恰好 `action`、`task_goal`、`completion_boundary`；两个值 trim 后必须非空。
 - `clear`：清除 Blackboard，且不得附带 goal/boundary。
 
 解析器按顺序接受完整 raw JSON、一个 Markdown fenced JSON，或外层 prose 中的第一个平衡 JSON object；多个/破损 fence、多余字段、错误类型或违反 action invariant 都是 `invalid_response`。`resolved` 必须有四字段 usage，Blackboard 可为 `None`；`invalid_response` 必须有 usage 且 Blackboard 为 `None`；`model_failed` 的 Blackboard 和 usage 都为 `None`。
@@ -726,7 +729,7 @@ resolved Blackboard 被 staged 给当前 foreground Agent Run。Model-visible cu
 
 Agent Loop 只通过一次 `Session.append_messages()` 把主 Runner increment、Task Framing usage 和 `metadata.blackboard` update/removal 一起提交。正常 `failed`、`cancelled` 和 `max_iterations` 结果含有已接受且修复后的 increment，因此仍提交 staged state。Context/Summary/Runner 准备失败或取消保留 previous Blackboard；`invalid_response` 或 `model_failed` 在主 increment 成功提交时清除当前 Blackboard。
 
-Manual Skill Invocation 与以上 framing/commit 分支互斥：该轮不 decode previous Blackboard、不读取 latest assistant content 用于 Task Framing、不调用 evaluator，也不向 Context、Summary budget 或 Runner 投影 Blackboard；Task Framing usage 为 `None`，`metadata.blackboard` update/removal 均为 no-op。下一次合格普通输入才重新读取并评估此前保存的值。
+Manual Skill Invocation 与以上 framing/commit 分支互斥：该轮不读取 previous Blackboard、不读取 latest assistant content 用于 Task Framing、不调用 `Blackboard.generate()`，也不向 Context、Summary budget 或 Runner 投影 Blackboard；Task Framing usage 为 `None`，`metadata.blackboard` update/removal 均为 no-op。下一次合格普通输入才重新读取并评估此前保存的值。
 
 ### 10.3 AgentRunner
 

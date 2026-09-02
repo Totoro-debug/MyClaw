@@ -165,7 +165,6 @@ def test_manager_module_has_no_execution_dependencies() -> None:
         name.startswith(
             (
                 "myclaw.agent.runner",
-                "myclaw.agent.prompts",
                 "myclaw.provider",
                 "myclaw.tools",
                 "myclaw.schedule",

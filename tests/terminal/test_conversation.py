@@ -32,7 +32,6 @@ from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 import myclaw.terminal.cli as cli
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ForegroundConversationProjection
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
-from myclaw.agent.prompts import session_title_prompt
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
@@ -53,6 +52,7 @@ from myclaw.provider.models import (
 )
 from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillMetadata
+from myclaw.templates import render_template
 from myclaw.terminal.conversation import (
     TerminalConversationApp,
     _ConversationInput,
@@ -433,7 +433,7 @@ class CancellableProvider(_FixedCatalogProvider):
     ) -> AsyncIterator[ModelStreamEvent]:
         if messages and messages[0] == {
             "role": "system",
-            "content": session_title_prompt(),
+            "content": render_template("session-title-prompt.md"),
         }:
             async for event in super().stream(
                 messages=messages,
@@ -4156,7 +4156,9 @@ async def test_terminal_renders_reasoning_from_each_tool_loop_model_call(
             continuation: ModelContinuation | None = None,
         ) -> AsyncIterator[ModelStreamEvent]:
             if not (
-                messages and messages[0] == {"role": "system", "content": session_title_prompt()}
+                messages
+                and messages[0]
+                == {"role": "system", "content": render_template("session-title-prompt.md")}
             ):
                 yield ReasoningDelta(delta=f"Reasoning segment {len(self.stream_requests) + 1}.")
             async for event in super().stream(

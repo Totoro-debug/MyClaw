@@ -1,14 +1,23 @@
 import ast
+import importlib.util
 import inspect
 from pathlib import Path
 
 import pytest
 
 from myclaw.agent.context import ContextBuilder
-from myclaw.session import projection as session_projection
 
 PROJECT_ROOT = Path(__file__).parents[2]
 PACKAGE_ROOT = PROJECT_ROOT / "myclaw"
+
+
+def test_retired_prompt_and_session_assembly_modules_are_absent() -> None:
+    assert not (PACKAGE_ROOT / "agent" / "prompts.py").exists()
+    assert not (PACKAGE_ROOT / "session" / "projection.py").exists()
+    agent_prompt_module = ".".join(("myclaw", "agent", "prompts"))
+    session_projection_module = ".".join(("myclaw", "session", "projection"))
+    assert importlib.util.find_spec(agent_prompt_module) is None
+    assert importlib.util.find_spec(session_projection_module) is None
 
 
 def _python_files(root: Path) -> tuple[Path, ...]:
@@ -59,20 +68,6 @@ def _resolved_imports(
 
 def _is_blackboard_module(module: str) -> bool:
     return module == "myclaw.agent.blackboard" or module.startswith("myclaw.agent.blackboard.")
-
-
-def test_prompts_do_not_import_blackboard() -> None:
-    path = PACKAGE_ROOT / "agent" / "prompts.py"
-    violations = [
-        f"{path.relative_to(PROJECT_ROOT)}:{line} imports {module}"
-        for module, line in _resolved_imports(
-            path.read_text(encoding="utf-8"),
-            package=("myclaw", "agent"),
-        )
-        if _is_blackboard_module(module)
-    ]
-
-    assert violations == []
 
 
 @pytest.mark.parametrize(
@@ -253,10 +248,88 @@ def test_agent_loop_delegates_schedule_context_construction_to_context_builder()
     )
 
 
-def test_session_projection_current_turn_helper_remains_internal() -> None:
-    assert session_projection.__all__ == ["project_session_message"]
-    assert not hasattr(session_projection, "last_user_index")
-    assert hasattr(session_projection, "_last_user_index")
+def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
+    path = PACKAGE_ROOT / "agent" / "loop.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    agent_loop = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
+    )
+    methods = {
+        node.name: node
+        for node in agent_loop.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+    }
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+    }
+    expected_builder_calls = {
+        "_prepare_foreground_context": "build_foreground_messages",
+        "_prepare_schedule_context": "build_schedule_messages",
+        "_project_foreground_summary_messages": "build_foreground_messages",
+        "_router_stream_title": "build_title_messages",
+    }
+    for method_name, builder_method in expected_builder_calls.items():
+        method = methods[method_name]
+        assert any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == builder_method
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "_context_builder"
+            for node in ast.walk(method)
+        )
+
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_validate_always_loaded_skill_budget"
+        for node in ast.walk(methods["preflight"])
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_foreground_runtime_status_input"
+        for node in ast.walk(methods["_validate_always_loaded_skill_budget"])
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_foreground_runtime_status_input"
+        for node in ast.walk(methods["runtime_status_input"])
+    )
+    status_helper = functions["_foreground_runtime_status_input"]
+    status_builder_calls = {
+        node.func.attr
+        for node in ast.walk(status_helper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "context_builder"
+    }
+    assert {
+        "build_status_messages",
+        "_build_status_messages_for_skills",
+    } <= status_builder_calls
+    assert "render_template" not in path.read_text(encoding="utf-8")
+
+
+def test_runner_summary_and_dream_keep_context_builder_out_of_their_boundaries() -> None:
+    paths = (
+        PACKAGE_ROOT / "agent" / "runner.py",
+        PACKAGE_ROOT / "memory" / "conversation_summary.py",
+        PACKAGE_ROOT / "memory" / "dream.py",
+    )
+    violations = [
+        f"{path.relative_to(PROJECT_ROOT)}:{line} imports {module}"
+        for path in paths
+        for module, line in _imports(path)
+        if module == "myclaw.agent.context" or module.startswith("myclaw.agent.context.")
+    ]
+    assert violations == []
 
 
 def test_agent_modules_do_not_depend_on_terminal_presentation() -> None:

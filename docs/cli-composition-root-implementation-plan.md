@@ -25,7 +25,7 @@ CLI composition root 与 Session-scoped Agent Loop，并给出可独立开发、
 2. CLI private async root 成为唯一 composition root，并拥有全部 Runtime-Lifetime 组件的生命周期。
 3. 一个 Agent Loop 对应一个 Runtime Generation，并创建、拥有全部 Session-scoped 组件。
 4. CLI 创建并终身复用一个 Message Bus；任意 `/resume` 原子清空其 Inbound 和 Outbound。
-5. `/resume` 即使选择当前 Session，也创建新的 Agent Loop、刷新 Skill Snapshot 并执行完整切换流程。
+5. `/resume` 即使选择当前 Session，也创建新的 Agent Loop、刷新 Skill 状态并执行完整切换流程。
 6. Memory Manager 只负责持久化与内存快照；Dream 负责长期记忆的语义生成。
 7. Schedule Service 创建并持有 Schedule Store，同时调度 User Job 与内置 Dream System Job。
 8. 删除 `Workspace` 包装类和 `MemoryTaskScheduler`，分别改为直接注入绝对 `Path` 和使用
@@ -46,7 +46,7 @@ CLI composition root 与 Session-scoped Agent Loop，并给出可独立开发、
 | 生命周期 | 所有者 | 被拥有组件 |
 | --- | --- | --- |
 | Runtime Lifetime | CLI private async root | normalized Workspace `Path`、`WorkspaceState`、Message Bus、Model Router、Memory Manager、Dream、Schedule Service、Management Service/Dispatcher、Terminal application、current Agent Loop reference |
-| Runtime Generation | Agent Loop | Session、Skill Loader、immutable full Skill Snapshot、Context Builder、Conversation Summary Manager、Task Framer、Tool Gateway、Agent Runner、foreground consumer、active run、title work、confirmation state |
+| Runtime Generation | Agent Loop | Session、Skill Loader、immutable frozen Skill state、Context Builder、Conversation Summary Manager、Blackboard、Tool Gateway、Agent Runner、foreground consumer、active run、title work、confirmation state |
 | Schedule Lifetime | Schedule Service | Schedule Store、dispatcher、active User/System Job tasks、terminal commit tasks、cron/every cursors |
 | Dream Lifetime | Dream | dedicated Agent Runner、restricted Tool Gateway、run mutex、active Dream task |
 | Session Lifetime | Session | conversation history、metadata、`last_consolidated`、ordered snapshot persistence |
@@ -196,12 +196,6 @@ class LoadedSkill:
     always: bool
 
 
-@dataclass(frozen=True, slots=True)
-class SkillSnapshot:
-    root: Path
-    skills: tuple[LoadedSkill, ...]
-
-
 class SkillLoader:
     def __init__(
         self,
@@ -211,7 +205,10 @@ class SkillLoader:
         enable_always_load: bool,
     ) -> None: ...
 
-    def load(self) -> SkillSnapshot: ...
+    @property
+    def skills(self) -> tuple[LoadedSkill, ...]: ...
+
+    def load(self, *, validate: Callable[..., None] | None = None) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,12 +501,12 @@ After Terminal `run_async()` returns, the actual CLI shutdown order is `Manageme
 
 独立合并条件：该 Task 不依赖其他 Task；完成后现有 Runtime 层仍能基于 `Path` 正常工作。
 
-### T2：引入 Skill Loader 与完整 generation Snapshot
+### T2：引入 Skill Loader 与完整 generation frozen state
 
 主要范围：
 
 - 重构 `myclaw/skills/catalog.py`，必要时新增 `myclaw/skills/loader.py`。
-- 增加 `LoadedSkill`、`SkillSnapshot`、`SkillLoader`。
+- 增加 `LoadedSkill`、`SkillLoader`，由 Loader 直接拥有 frozen state。
 - 删除 Runtime-lifetime Snapshot 和 manual `read_body` seam。
 - 在迁移期间让现有 generation preparation 每次调用 Loader；T5 再把调用位置收进 Agent Loop。
 - 更新 Skill、Context、Agent Loop、Terminal completion 与 CLI error 测试。
@@ -518,17 +515,15 @@ After Terminal `run_async()` returns, the actual CLI shutdown order is `Manageme
 
 - 每个候选只打开并完整读取一次。
 - metadata/body/always/path validation 使用同一份 document。
-- Snapshot 只含 immutable tuple/frozen dataclass，不暴露 mutable name mapping。
+- Published Skill state 只含 immutable tuple/frozen dataclass，不暴露 mutable name mapping。
 - manual invocation 在 title work 之前只解析 Snapshot，不执行文件 IO。
 - invalid candidate 只记录 candidate path 和 reason，不记录正文。
 
 量化验收：
 
 - fake filesystem counter 证明每个候选在一次 Loader execution 中完整读取次数恰好为 `1`。
-- 当前 generation 中修改/删除 Skill 后，manual invocation 仍得到 frozen document；构造新 generation 后得到最新状态。
-- 同 Session `/resume` 也刷新 Snapshot。
-- `rg "RuntimeSkillSnapshot|build_runtime_skill_snapshot|SkillUnavailableError|\.read_body\(" myclaw tests`
-  返回 `0` 个匹配。
+- 当前 generation 中修改/删除 Skill 后，manual invocation 仍得到 frozen document；构造新 generation 或执行 `/reload_skill` 后得到最新状态。
+- 同 Session `/resume` 也刷新 Loader state。
 - invalid Skill 日志中 document 内容匹配数为 `0`。
 - Skill、Context、Agent Loop、CLI、Terminal completion 测试通过率 `100%`。
 

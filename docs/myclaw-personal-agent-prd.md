@@ -48,7 +48,7 @@
   `MyClaw 已取消本轮对话。` 均由 runtime contracts 定义。Provider-visible
   reasoning 只保留 Provider 返回内容；opaque continuation 只在同一 Tool loop 内传递，
   不进入 Session 或 Outbound。
-- TaskFramer 与 Agent Runner 接收传给同一 Agent Loop 的同一个 Model Router 对象；CLI composition root 继续独占 Router 构造、Runtime Lifetime ownership 与最终 close。
+- `Blackboard.generate()` 仅在一次 Task Framing 调用中接收 Model Router；Agent Runner 继续接收传给同一 Agent Loop 的同一个 Model Router 对象，CLI composition root 继续独占 Router 构造、Runtime Lifetime ownership 与最终 close。
 - Schedule Service 创建并独占 Store；CLI 向它提供 User Job 和 Dream 两条稳定 executor。
   User executor 每次解引用当前 Agent Loop，并与 foreground 共享该 generation 的 Gateway/Runner
   identity，但使用独立 Schedule Session、context、cancel 和 externalizer state；Dream executor
@@ -313,14 +313,14 @@
 
 ### Required Task Framing tests
 
-- Blackboard strict encode/decode、whitespace normalization、无长度截断与 malformed loaded metadata 按 absence 处理。
+- Blackboard `from_dict()`/`to_dict()`、whitespace normalization、无长度截断与 malformed loaded metadata 按 absence 处理。
 - keep、replace、clear 及所有非法 action/field/state combination。
 - direct JSON、单一 Markdown fence、外层 prose 的首个平衡 object，以及 malformed/multiple-fence rejection。
 - framing retry、default fallback、model failure、invalid response、cancellation 和 Runtime replacement。
 - staged Blackboard 在 Summary/context 重建中保持同一值，只投影到当前 model input，不改变 persisted raw user message。
 - accepted Runner result 的 Blackboard/usage atomic commit，以及 preparation failure/cancellation 的旧状态保留。
 - Manual Skill Invocation 的 Task Framing call、Blackboard projection 和 Task Framing usage 精确为 `0`，且已有 `metadata.blackboard` mutation 为 no-op；随后普通轮恢复正常 framing。
-- TaskFramer、AgentRunner 与 AgentLoop 保存的 Model Router 对象身份相同，且 replacement/close 不接管 Router lifecycle。
+- `Blackboard.generate()` 不保存 Model Router；AgentRunner 与 AgentLoop 保存的 Model Router 对象身份相同，且 replacement/close 不接管 Router lifecycle。
 - Management、Schedule 和 Dream 路径零 Task Framing call，Blackboard 不影响 Tool Confirmation 或授权。
 
 ### Required memory tests

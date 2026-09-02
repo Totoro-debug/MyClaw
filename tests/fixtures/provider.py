@@ -5,7 +5,6 @@ from collections.abc import AsyncIterator, Iterable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 
-from myclaw.agent.prompts import session_title_prompt
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
@@ -16,6 +15,7 @@ from myclaw.provider.models import (
     ModelStreamEvent,
     ReasoningEffort,
 )
+from myclaw.templates import render_template
 from myclaw.tools.base import OpenAIToolSchema
 
 
@@ -86,7 +86,7 @@ class ScriptedFakeProvider:
         )
         if call.messages and call.messages[0] == {
             "role": "system",
-            "content": session_title_prompt(),
+            "content": render_template("session-title-prompt.md"),
         }:
             self.unscripted_title_requests.append(call)
             raise ModelCallError(

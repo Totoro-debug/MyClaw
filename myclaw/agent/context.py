@@ -2,28 +2,30 @@
 
 from __future__ import annotations
 
+import json
+import platform
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from myclaw.agent.blackboard import Blackboard
-from myclaw.agent.prompts import (
-    chat_system_prompt,
-    current_user_input,
-    foreground_chat_system_prompt,
-)
-from myclaw.agent.prompts import (
-    session_title_prompt as render_session_title_prompt,
-)
 from myclaw.memory.manager import MemoryManager
-from myclaw.session.projection import _last_user_index, project_session_message
 from myclaw.skills.catalog import LoadedSkill, ManualSkillInvocation, SkillLoader
+from myclaw.templates import render_template
+from myclaw.utils.time import format_rfc3339_milliseconds
+
+_MARKDOWN_SAFE_JSON_TRANSLATION: dict[int, str] = {
+    ord("&"): r"\u0026",
+    ord("`"): r"\u0060",
+    ord("<"): r"\u003c",
+    ord(">"): r"\u003e",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +92,7 @@ class ContextBuilder:
         skills: Sequence[LoadedSkill],
     ) -> str:
         """Build a foreground System Prompt from a staged immutable Skill state."""
-        return foreground_chat_system_prompt(
+        return _build_foreground_system_prompt(
             workspace=self._workspace,
             agent_home=self._agent_home,
             long_term_memory=self._memory_manager.memory_snapshot(),
@@ -99,10 +101,11 @@ class ContextBuilder:
 
     def schedule_system_prompt(self) -> str:
         """Build the Schedule System Prompt without foreground Skill content."""
-        return chat_system_prompt(
+        return _build_foreground_system_prompt(
             workspace=self._workspace,
             agent_home=self._agent_home,
             long_term_memory=self._memory_manager.memory_snapshot(),
+            skills=(),
         )
 
     @contextmanager
@@ -121,7 +124,7 @@ class ContextBuilder:
 
     def session_title_prompt(self) -> str:
         """Return the isolated versioned prompt used for Session titles."""
-        return render_session_title_prompt()
+        return render_template("session-title-prompt.md")
 
     def build_title_messages(self, content: str) -> list[dict[str, Any]]:
         """Build the minimal System/User request used for a Session title."""
@@ -237,7 +240,7 @@ class ContextBuilder:
         projected.append(
             {
                 "role": "user",
-                "content": current_user_input(
+                "content": _build_current_user_content(
                     content=deepcopy(messages[current_user_index]["content"]),
                     current_time=(
                         datetime.now(self._timezone) if current_time is None else current_time
@@ -262,8 +265,186 @@ def _project_history_messages(
     return [
         projected
         for message in messages
-        if (projected := project_session_message(message)) is not None
+        if (projected := _project_history_message(message)) is not None
     ]
+
+
+def _last_user_index(messages: Sequence[dict[str, Any]]) -> int:
+    """Return the final user message index, or the sequence length if absent."""
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            return index
+    return len(messages)
+
+
+def _project_history_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Project one validated Session message without durable fields."""
+    role = message["role"]
+    if role == "user":
+        return {"role": "user", "content": deepcopy(message["content"])}
+
+    if role == "assistant":
+        content = message["content"]
+        projected_tool_calls = [
+            {
+                "id": deepcopy(tool_call["id"]),
+                "name": deepcopy(tool_call["name"]),
+                "arguments": deepcopy(tool_call["arguments"]),
+            }
+            for tool_call in message["tool_calls"]
+        ]
+        if message["status"] == "error" and not content and not projected_tool_calls:
+            return None
+        if message["status"] == "interrupted":
+            content = f"{content}\n\n[Turn interrupted by user.]"
+        return {
+            "role": "assistant",
+            "content": deepcopy(content),
+            "tool_calls": projected_tool_calls,
+        }
+
+    return {
+        "role": "tool",
+        "tool_call_id": deepcopy(message["tool_call_id"]),
+        "name": deepcopy(message["name"]),
+        "content": deepcopy(message["content"]),
+    }
+
+
+def _build_current_user_content(
+    *,
+    content: str,
+    current_time: datetime,
+    session_id: str,
+    blackboard_projection: dict[str, str] | None = None,
+    manual_invocation: ManualSkillInvocation | None = None,
+) -> str:
+    if manual_invocation is None:
+        rendered = (
+            f"{_format_runtime_context(current_time=current_time, session_id=session_id)}\n\n"
+            "## User Input\n\n"
+            f"{content}"
+        )
+    else:
+        rendered = (
+            f"{_format_runtime_context(current_time=current_time, session_id=session_id)}\n\n"
+            "## Skill Instructions\n\n"
+            "```json\n"
+            f"{_skill_manual_json(manual_invocation)}\n"
+            "```\n\n"
+            "## User Request\n\n"
+            "```json\n"
+            f"{_skill_request_json(manual_invocation.request)}\n"
+            "```"
+        )
+    if blackboard_projection is None:
+        return rendered
+    blackboard = (
+        "## Task goal\n\n"
+        f"{blackboard_projection['goal']}\n\n"
+        "## Completion boundary\n\n"
+        f"{blackboard_projection['completion_boundary']}"
+    )
+    return f"{rendered}\n\n{blackboard}"
+
+
+def _format_runtime_context(*, current_time: datetime, session_id: str) -> str:
+    return (
+        "## Runtime Context\n\n"
+        f"- Current time: {format_rfc3339_milliseconds(current_time)}\n"
+        f"- Session ID: {session_id}"
+    )
+
+
+def _build_foreground_system_prompt(
+    *,
+    workspace: PurePath,
+    agent_home: PurePath,
+    long_term_memory: str,
+    skills: Sequence[LoadedSkill],
+) -> str:
+    runtime = (
+        f"{platform.system()} "
+        f"{platform.machine()}, Python {platform.python_version()}"
+    )
+    sections = [
+        render_template(
+            "foreground-chat-system-prompt.md",
+            workspace=workspace,
+            agent_home=agent_home,
+            runtime=runtime,
+            long_term_memory=_project_long_term_memory(long_term_memory),
+        )
+    ]
+    loaded_skills = tuple(skills)
+    if loaded_skills:
+        entries = "\n".join(
+            _skill_metadata_json(
+                name=skill.metadata.name,
+                description=skill.metadata.description,
+                path=str(skill.metadata.path),
+            )
+            for skill in loaded_skills
+        )
+        sections.append(render_template("skill-catalog.md", entries=entries))
+        always_entries = "\n".join(
+            _skill_always_json(name=skill.metadata.name, body=skill.document)
+            for skill in loaded_skills
+            if skill.always
+        )
+        if always_entries:
+            sections.append(render_template("skill-always-load.md", entries=always_entries))
+    return "\n\n".join(sections)
+
+
+def _project_long_term_memory(long_term_memory: str) -> str:
+    heading = "# Long-term Memory"
+    if long_term_memory == heading:
+        projected = ""
+    elif long_term_memory.startswith(f"{heading}\n"):
+        projected = long_term_memory.removeprefix(f"{heading}\n").removeprefix("\n")
+    else:
+        projected = long_term_memory
+    return projected.replace("##", "###")
+
+
+def _skill_metadata_json(*, name: str, description: str, path: str) -> str:
+    serialized = json.dumps(
+        {"name": name, "description": description, "path": path},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return serialized.translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
+
+
+def _skill_always_json(*, name: str, body: str) -> str:
+    serialized = json.dumps(
+        {"name": name, "body": body},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return serialized.translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
+
+
+def _skill_manual_json(invocation: ManualSkillInvocation) -> str:
+    serialized = json.dumps(
+        {"name": invocation.metadata.name, "body": invocation.body},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return serialized.translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
+
+
+def _skill_request_json(request: str) -> str:
+    return json.dumps(
+        request,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).translate(_MARKDOWN_SAFE_JSON_TRANSLATION)
 
 
 __all__ = ["ContextBuilder"]

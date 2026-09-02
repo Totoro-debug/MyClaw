@@ -13,7 +13,6 @@ from loguru import logger
 
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
 from myclaw.agent.message_bus import MessageBus
-from myclaw.agent.prompts import session_title_prompt
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
@@ -32,6 +31,7 @@ from myclaw.provider.models import (
 )
 from myclaw.schedule.service import ScheduleService
 from myclaw.session.session import Session
+from myclaw.templates import render_template
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.core.web_fetch import JinaReaderClient
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -72,7 +72,7 @@ class _FixedCatalogProvider:
         )
         if request.messages and request.messages[0] == {
             "role": "system",
-            "content": session_title_prompt(),
+            "content": render_template("session-title-prompt.md"),
         }:
             yield ModelCompleted(
                 response=ModelResponse(

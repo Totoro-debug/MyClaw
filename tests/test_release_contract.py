@@ -384,7 +384,9 @@ _REFERENCE_MARKDOWN_LINK = re.compile(r"(?m)^\s*\[[^\]\n]+\]:\s*(?P<target><[^>\
 _EXPECTED_REMOVED_MARKDOWN_PATHS = frozenset(
     {
         ROOT / "myclaw" / "templates" / "blackboard.md",
+        ROOT / "myclaw" / "templates" / "conversation-summary-input.md",
         ROOT / "myclaw" / "templates" / "current-user-input.md",
+        ROOT / "myclaw" / "templates" / "interrupted-assistant-content.md",
         ROOT / "myclaw" / "templates" / "memory-task-input.md",
         ROOT / "myclaw" / "templates" / "runtime-context.md",
         ROOT / "myclaw" / "templates" / "user-input.md",
@@ -555,9 +557,11 @@ def test_clean_distributions_omit_deleted_agent_module_and_import_cleanly(
         wheel_members = {member.replace("\\", "/") for member in archive.namelist()}
 
     deleted_modules = (
+        "myclaw/agent/prompts.py",
         "myclaw/agent/runtime.py",
         "myclaw/agent/repl.py",
         "myclaw/memory/memory_task.py",
+        "myclaw/session/projection.py",
         "myclaw/terminal/repl.py",
     )
     for deleted_module in deleted_modules:
@@ -595,9 +599,11 @@ def test_clean_distributions_omit_deleted_agent_module_and_import_cleanly(
                 "import myclaw\n"
                 "import myclaw.terminal.cli\n"
                 "legacy_modules = (\n"
+                "    'myclaw.agent." + "prompts',\n"
                 "    'myclaw.agent.runtime',\n"
                 "    'myclaw.agent.repl',\n"
                 "    'myclaw.memory.memory_task',\n"
+                "    'myclaw.session." + "projection',\n"
                 "    'myclaw.terminal.repl',\n"
                 ")\n"
                 "for legacy_module in legacy_modules:\n"
@@ -804,9 +810,10 @@ def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
         "loadedskill",
         "document: str",
         "skillloader",
-        "def load(self) -> skillsnapshot",
     ):
         assert claim in current_skill_contract
+    assert "def load(" in runtime_contract
+    assert "validate" in runtime_contract
     assert "body: str" not in runtime_contract
     assert "snapshot: skillsnapshot" not in runtime_contract
 

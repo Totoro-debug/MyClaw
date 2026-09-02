@@ -90,10 +90,10 @@ def test_context_builder_builds_system_history_and_current_user_in_order(
     timezone_name: str,
     expected_time: str,
 ) -> None:
-    monkeypatch.setattr("myclaw.agent.prompts.platform.system", lambda: "Windows")
-    monkeypatch.setattr("myclaw.agent.prompts.platform.machine", lambda: "AMD64")
+    monkeypatch.setattr("myclaw.agent.context.platform.system", lambda: "Windows")
+    monkeypatch.setattr("myclaw.agent.context.platform.machine", lambda: "AMD64")
     monkeypatch.setattr(
-        "myclaw.agent.prompts.platform.python_version",
+        "myclaw.agent.context.platform.python_version",
         lambda: "3.12.13",
     )
     agent_home = workspace.parent / "agent-home"

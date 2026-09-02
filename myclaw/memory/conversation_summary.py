@@ -14,7 +14,6 @@ from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
-from myclaw.session.projection import _last_user_index
 from myclaw.session.session import Session
 from myclaw.templates import render_template
 from myclaw.tools.base import OpenAIToolSchema
@@ -112,7 +111,7 @@ class ConversationSummaryManager:
             current_user=current_user,
             continuation=continuation,
         )
-        current_user_index = _last_user_index(short_term)
+        current_user_index = _last_user_message_index(short_term)
         complete_messages = project(short_term)
         available_input = input_window - output_limit
         system_tokens = _estimate_messages(complete_messages[:1])
@@ -203,6 +202,13 @@ def _short_term_messages(
     return messages
 
 
+def _last_user_message_index(messages: Sequence[dict[str, Any]]) -> int:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            return index
+    return len(messages)
+
+
 def _aligned_cutoff(messages: list[dict[str, Any]], initial: int) -> int:
     for index in range(initial, len(messages)):
         if messages[index].get("role") == "user":
@@ -262,7 +268,7 @@ def _estimate_messages(
 
 
 def _projected_history_bytes(messages: Sequence[dict[str, Any]]) -> int:
-    current_user_index = _last_user_index(messages)
+    current_user_index = _last_user_message_index(messages)
     history_end = len(messages) if current_user_index == len(messages) else current_user_index
     return sum(
         len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
@@ -292,7 +298,7 @@ def _project_summary_message(message: dict[str, Any]) -> dict[str, Any] | None:
         if message["status"] == "error" and not content and not tool_calls:
             return None
         if message["status"] == "interrupted":
-            content = render_template("interrupted-assistant-content.md", content=content)
+            content = f"{content}\n\n[Turn interrupted by user.]"
         return {
             "role": "assistant",
             "content": deepcopy(content),

@@ -10,7 +10,6 @@ from myclaw.agent.blackboard import (
     Blackboard,
     FramingResult,
 )
-from myclaw.agent.prompts import blackboard_prompt
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -20,6 +19,7 @@ from myclaw.provider.models import (
     ModelRoute,
     ModelUsage,
 )
+from myclaw.templates import render_template
 from myclaw.tools.base import OpenAIToolSchema
 
 
@@ -315,24 +315,20 @@ async def test_generate_sends_only_one_filled_system_message_and_no_tools() -> N
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    assert call["messages"] == [
+    messages = call["messages"]
+    assert messages == [
         {
             "role": "system",
-            "content": blackboard_prompt(
-                user_input=current_user_input,
-                last_task=last_task,
-                latest_assistant_content=last_assistant_content,
+            "content": render_template(
+                "blackboard-system-prompt.md",
+                **{
+                    "User input": current_user_input,
+                    "Last Task": last_task,
+                    "Latest assistant content": last_assistant_content,
+                },
             ),
         }
     ]
-    system_content = call["messages"][0]["content"]
-    assert isinstance(system_content, str)
-    assert current_user_input in system_content
-    assert last_task in system_content
-    assert last_assistant_content in system_content
-    assert "{User input}" not in system_content
-    assert "{Last Task}" not in system_content
-    assert "{Latest assistant content}" not in system_content
 
 
 @pytest.mark.asyncio
@@ -349,14 +345,16 @@ async def test_generate_fills_empty_latest_assistant_content_without_a_user_mess
     assert result.status == "resolved"
     call = router.calls[0]
     messages = call["messages"]
-    assert isinstance(messages, Sequence)
     assert messages == [
         {
             "role": "system",
-            "content": blackboard_prompt(
-                user_input="cancel",
-                last_task="null",
-                latest_assistant_content="",
+            "content": render_template(
+                "blackboard-system-prompt.md",
+                **{
+                    "User input": "cancel",
+                    "Last Task": "null",
+                    "Latest assistant content": "",
+                },
             ),
         }
     ]
@@ -700,20 +698,3 @@ async def test_generate_rejects_wrong_public_input_types_without_coercion(
         )
 
     assert router.calls == []
-
-
-def test_blackboard_prompt_is_versioned_and_restricts_the_domain() -> None:
-    prompt = blackboard_prompt(
-        user_input="Current input",
-        last_task="null",
-        latest_assistant_content="Latest assistant content",
-    )
-
-    assert "keep" in prompt
-    assert "replace" in prompt
-    assert "clear" in prompt
-    assert "JSON" in prompt
-    assert "task_goal" in prompt
-    assert "completion_boundary" in prompt
-    assert "Current input" in prompt
-    assert "Latest assistant content" in prompt
