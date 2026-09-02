@@ -782,7 +782,6 @@ def test_agent_loop_exposes_public_control_seam(tmp_path: Path) -> None:
 
     assert loop.control is loop
     assert loop.control.has_active_run is False
-    assert loop.control.has_pending_confirmation is False
 
 
 def test_agent_loop_reload_returns_the_current_loader_metadata_and_reuses_generation_state(
@@ -1786,7 +1785,6 @@ async def test_loop_confirmation_uses_one_direct_pending_future_and_cancels_it(
 
         assert len(requests) == 1
         request = requests[0]
-        assert loop.has_pending_confirmation
         with pytest.raises(ValueError, match="late or unknown"):
             loop.respond_to_confirmation(uuid4(), "approved")
 
@@ -1798,7 +1796,6 @@ async def test_loop_confirmation_uses_one_direct_pending_future_and_cancels_it(
             "error_code": "turn_cancelled",
             "_streamed": True,
         }
-        assert not loop.has_pending_confirmation
         with pytest.raises(ValueError, match="late or unknown"):
             loop.respond_to_confirmation(request.confirmation_id, "approved")
     finally:

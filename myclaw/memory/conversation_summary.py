@@ -149,7 +149,10 @@ class ConversationSummaryManager:
         response = await self._provider.complete(
             "memory",
             messages=[
-                {"role": "system", "content": _summary_system_prompt()},
+                {
+                    "role": "system",
+                    "content": render_template("conversation-summary-system-prompt.md"),
+                },
                 {"role": "user", "content": _summary_user_context(selected)},
             ],
             tools=(),
@@ -261,10 +264,6 @@ def _projected_history_bytes(messages: Sequence[dict[str, Any]]) -> int:
         len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         for message in messages[1:history_end]
     )
-
-
-def _summary_system_prompt() -> str:
-    return render_template("conversation-summary-system-prompt.md")
 
 
 def _project_summary_message(message: dict[str, Any]) -> dict[str, Any] | None:

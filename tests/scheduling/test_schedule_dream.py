@@ -187,7 +187,7 @@ async def test_store_public_mutations_reject_the_dream_system_identity(
             status="ok",
         )
     with pytest.raises(ValueError, match="canonical UUID4"):
-        await store.remove_job("dream")
+        await store.remove_user_job("dream")
 
 
 @pytest.mark.asyncio

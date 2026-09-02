@@ -166,7 +166,7 @@ class AgentRunner:
         *,
         model: AgentRunnerModelRoute,
         tool_gateway: ToolGateway | None,
-        on_output: AgentRunnerOutputCallback,
+        on_output: AgentRunnerOutputCallback | None,
         confirmation: ConfirmationRequester | None,
         externalize_result: Callable[[ToolResult], ToolResult] | None,
         cancel_requested: Callable[[], bool] | None,
@@ -191,6 +191,8 @@ class AgentRunner:
         externalize = externalize_result or _identity_tool_result
 
         async def emit(event: AgentRunnerOutput) -> None:
+            if on_output is None:
+                return
             try:
                 await on_output(event)
             except asyncio.CancelledError as error:

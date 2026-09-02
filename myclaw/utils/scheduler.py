@@ -4,15 +4,8 @@ import asyncio
 from collections.abc import Callable
 from datetime import datetime
 from time import monotonic
-from typing import Protocol
 
 from tzlocal import get_localzone
-
-
-class SchedulerClock(Protocol):
-    def now(self) -> datetime: ...
-
-    async def sleep(self, seconds: float) -> None: ...
 
 
 class AsyncioSchedulerClock:

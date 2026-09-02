@@ -1,7 +1,6 @@
 """Command-line entry point for MyClaw."""
 
 import asyncio
-from datetime import datetime
 from pathlib import Path
 from time import monotonic
 from uuid import uuid4
@@ -37,6 +36,7 @@ from myclaw.terminal.conversation import (
     is_interactive_terminal,
 )
 from myclaw.utils.scheduler import AsyncioSchedulerClock
+from myclaw.utils.time import local_now
 
 app = typer.Typer(
     add_completion=False,
@@ -70,10 +70,6 @@ _SAFE_FATAL_MANAGEMENT_ERRORS = (
     _TARGET_SESSION_PREPARATION_ERROR,
     _RUNTIME_SESSION_REPLACEMENT_ERROR,
 )
-
-
-def _local_now() -> datetime:
-    return datetime.now().astimezone()
 
 
 def _print_error_info(error: ErrorInfo) -> None:
@@ -215,7 +211,7 @@ async def _run_cli_conversation(
 
         schedule_service = ScheduleService(
             workspace_state=workspace_state,
-            clock=AsyncioSchedulerClock(now=_local_now),
+            clock=AsyncioSchedulerClock(now=local_now),
             execute_user_job=execute_user_job,
             execute_dream=dream.run,
             timezone_name=get_localzone_name(),
@@ -232,7 +228,7 @@ async def _run_cli_conversation(
                 model_router=router,
                 memory_manager=memory_manager,
                 session_id=session_id,
-                now=_local_now,
+                now=local_now,
                 new_uuid=uuid4,
                 monotonic_now=monotonic,
             )
@@ -400,7 +396,7 @@ async def _run_cli_conversation(
             memory_manager=memory_manager,
             dream=dream,
             schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
-            now=_local_now,
+            now=local_now,
             monotonic=monotonic,
         )
         dispatcher = ManagementCommandDispatcher(management)

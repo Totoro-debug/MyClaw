@@ -142,6 +142,17 @@ def test_tool_schema_rejects_unsupported_parameter_annotations() -> None:
     with pytest.raises(TypeError, match="unsupported annotation"):
         UnsupportedTool().to_schema()
 
+    class FloatTool(BaseTool):
+        name = "float"
+        description = "Unsupported float parameter."
+        ratio: float
+
+        async def execute(self, *, ratio: float) -> str:
+            return str(ratio)
+
+    with pytest.raises(TypeError, match="unsupported annotation"):
+        FloatTool().to_schema()
+
 
 def test_tool_error_contains_only_a_public_safe_message() -> None:
     error = ToolError("The path could not be read.")

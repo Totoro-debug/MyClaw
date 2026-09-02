@@ -156,14 +156,6 @@ class WorkspaceScheduleStore:
     ) -> bool:
         return await self._remove(job_id, expected=expected, user_only=True)
 
-    async def remove_job(
-        self,
-        job_id: str,
-        *,
-        expected: ScheduleJob | None = None,
-    ) -> bool:
-        return await self._remove(job_id, expected=expected, user_only=True)
-
     async def _remove_terminal_job(
         self,
         job_id: str,

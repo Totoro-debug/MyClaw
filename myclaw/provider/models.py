@@ -16,6 +16,13 @@ type ModelMessageDictionary = dict[str, Any]
 type ModelMessages = Sequence[ModelMessageDictionary]
 
 
+def require_tool_call_sequence(value: object) -> Sequence[object]:
+    """Return a serialized assistant tool-call sequence or reject malformed input."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("assistant tool_calls must be a sequence")
+    return value
+
+
 def last_assistant_message_index(messages: ModelMessages) -> int:
     """Return the final assistant message position."""
     for index in range(len(messages) - 1, -1, -1):

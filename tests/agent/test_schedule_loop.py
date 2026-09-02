@@ -670,7 +670,6 @@ async def test_schedule_confirmation_required_tool_is_refused_without_foreground
     assert tool_message["status"] == "refused"
     assert tool_message["confirmation"]["decision"] is None
     assert confirmation_requests == []
-    assert loop.has_pending_confirmation is False
 
 
 @pytest.mark.asyncio
@@ -714,7 +713,6 @@ async def test_schedule_agent_reads_known_skill_path_via_shared_gateway(tmp_path
     assert tool_messages[0]["status"] == "success"
     assert tool_messages[0]["content"] == "---\nname: review\n---\nbody\n"
     assert confirmation_requests == []
-    assert loop.has_pending_confirmation is False
     assert router.routes == ["schedule", "schedule"]
     assert [tool_count for _, tool_count in router.requests] == [10, 10]
 

@@ -162,45 +162,6 @@ def estimate_input_tokens(status_input: RuntimeStatusInput) -> int:
     return (byte_count + 3) // 4
 
 
-class RuntimeStatusService:
-    """Build one Management Port status snapshot from a current-loop projection."""
-
-    def __init__(
-        self,
-        *,
-        current_agent_loop: Callable[[], _StatusProjectionLoop],
-        monotonic: Callable[[], float],
-        schedule_status: Callable[[], dict[str, object]] | None = None,
-        version: str = __version__,
-    ) -> None:
-        self._current_agent_loop = current_agent_loop
-        self._monotonic = monotonic
-        self._schedule_status = schedule_status
-        self._version = version
-
-    async def status(self) -> RuntimeStatus:
-        """Return all required runtime and current-session status fields."""
-        current_agent_loop = self._current_agent_loop()
-        projection = current_agent_loop.runtime_status_input()
-        estimated = estimate_input_tokens(projection)
-        if projection.context_window <= 0:
-            raise ValueError("Runtime status context window must be positive")
-        started_at = projection.generation_started_at
-        uptime = 0 if started_at is None else max(0, int(self._monotonic() - started_at))
-        return RuntimeStatus(
-            version=self._version,
-            chat_model=projection.chat_model,
-            uptime_seconds=uptime,
-            estimated_input_tokens=estimated,
-            context_window=projection.context_window,
-            context_used_percent=estimated / projection.context_window * 100,
-            session_message_count=projection.session_message_count,
-            last_consolidated=projection.last_consolidated,
-            cumulative_usage=dict(projection.cumulative_usage),
-            schedule=(None if self._schedule_status is None else dict(self._schedule_status())),
-        )
-
-
 class ManagementError(Exception):
     """A safe persistence error suitable for a Management Command."""
 
@@ -231,16 +192,13 @@ class ManagementViewService:
         monotonic: Callable[[], float],
     ) -> None:
         self._config = ConfigLoader(agent_home)
-        self._status_service = RuntimeStatusService(
-            current_agent_loop=current_agent_loop,
-            monotonic=monotonic,
-            schedule_status=schedule_status,
-        )
         self._current_agent_loop = current_agent_loop
         self._workspace_state = workspace_state
         self._replace_agent_loop = replace_agent_loop
         self._prepare_session_resume = prepare_session_resume
         self._now = now
+        self._monotonic = monotonic
+        self._schedule_status = schedule_status
         self._memory_reader = memory_manager
         self._dream = dream
         self._aborted = False
@@ -312,20 +270,33 @@ class ManagementViewService:
         return await self._dream.run()
 
     async def status(self) -> RuntimeStatus:
-        """Return the injected Runtime status snapshot."""
+        """Return all required runtime and current-session status fields."""
         self._ensure_active()
         try:
-            return await self._status_service.status()
+            projection = self._current_agent_loop().runtime_status_input()
+            estimated = estimate_input_tokens(projection)
+            if projection.context_window <= 0:
+                raise ValueError("Runtime status context window must be positive")
+            started_at = projection.generation_started_at
+            uptime = 0 if started_at is None else max(0, int(self._monotonic() - started_at))
+            return RuntimeStatus(
+                version=__version__,
+                chat_model=projection.chat_model,
+                uptime_seconds=uptime,
+                estimated_input_tokens=estimated,
+                context_window=projection.context_window,
+                context_used_percent=estimated / projection.context_window * 100,
+                session_message_count=projection.session_message_count,
+                last_consolidated=projection.last_consolidated,
+                cumulative_usage=dict(projection.cumulative_usage),
+                schedule=dict(self._schedule_status()),
+            )
         except ManagementError:
             raise
         except (OSError, UnicodeError, ValueError) as error:
             raise ManagementError(
                 ErrorInfo("persistence_error", "Runtime status could not be read.")
             ) from error
-
-    async def resumable_sessions(self) -> tuple[SessionListingEntry, ...]:
-        """Return only valid Sessions belonging to this runtime's Workspace."""
-        return (await self.resumable_listing()).sessions
 
     async def resumable_listing(self) -> SessionListingReport:
         """Return one atomic Session picker result including skipped diagnostics."""

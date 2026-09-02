@@ -186,10 +186,6 @@ class _DreamRouter(AgentRunnerMemoryRouter):
             raise
 
 
-async def _ignore_output(event: object) -> None:
-    del event
-
-
 class Dream:
     """Own one dedicated memory Agent Runner and restricted Tool Gateway."""
 
@@ -343,7 +339,7 @@ class Dream:
                 messages,
                 model="memory",
                 tool_gateway=self._tool_gateway,
-                on_output=_ignore_output,
+                on_output=None,
                 confirmation=None,
                 externalize_result=None,
                 cancel_requested=None,

@@ -1325,7 +1325,7 @@ async def test_schedule_shutdown_during_preparation_persists_user(
         route_max_output: int | None = None,
         tools: Sequence[OpenAIToolSchema] | None = None,
     ) -> Session:
-        if session.storage_partition is SessionStoragePartition.SCHEDULE:
+        if session.session_id == job.session_id:
             context_started.set()
             await context_never_completes.wait()
         return await original_prepare(
@@ -1389,7 +1389,7 @@ async def test_schedule_failure_logs_one_safe_session_warning(
         route_max_output: int | None = None,
         tools: Sequence[OpenAIToolSchema] | None = None,
     ) -> Session:
-        if session.storage_partition is SessionStoragePartition.SCHEDULE:
+        if session.session_id == job.session_id:
             failure_started.set()
             raise RuntimeError("PRIVATE_SCHEDULE_PREPARATION_BODY")
         return await original_prepare(

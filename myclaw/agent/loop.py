@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -61,27 +61,6 @@ from myclaw.tools.tool_gateway import (
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
 
 
-class ForegroundContextPreparer(Protocol):
-    """Prepare foreground context with an optional staged Blackboard."""
-
-    def __call__(
-        self,
-        session: Session,
-        current_user: dict[str, Any],
-        /,
-        blackboard: Blackboard | None = None,
-        *,
-        manual_invocation: ManualSkillInvocation | None = None,
-    ) -> Awaitable[list[dict[str, Any]]]: ...
-
-
-type ScheduleContextPreparer = Callable[
-    [Session, dict[str, Any]],
-    Awaitable[list[dict[str, Any]]],
-]
-type ResultExternalizerFactory = Callable[[Session], Callable[[ToolResult], ToolResult]]
-
-
 class SkillContextTooLargeError(Exception):
     """The frozen always-loaded Skill snapshot exceeds the chat input budget."""
 
@@ -128,9 +107,6 @@ class AgentLoopControl(Protocol):
 
     @property
     def has_active_run(self) -> bool: ...
-
-    @property
-    def has_pending_confirmation(self) -> bool: ...
 
     async def cancel_active_run(self) -> None: ...
 
@@ -346,13 +322,6 @@ class AgentLoop:
             raise RuntimeError("Agent Loop is no longer active")
         task = self._execution_task
         return task is not None and not task.done()
-
-    @property
-    def has_pending_confirmation(self) -> bool:
-        if self._aborted:
-            raise RuntimeError("Agent Loop is no longer active")
-        pending = self._pending_confirmation
-        return pending is not None and not pending.future.done()
 
     def project_foreground_conversation(self) -> ForegroundConversationProjection:
         """Return presentation data without exposing the owned Session."""
@@ -741,7 +710,7 @@ class AgentLoop:
             initial_messages,
             model="schedule",
             tool_gateway=self._tool_gateway,
-            on_output=_discard_runner_output,
+            on_output=None,
             confirmation=None,
             externalize_result=self._result_externalizer_for(session),
             cancel_requested=self._schedule_service.cancellation_requested,
@@ -1423,8 +1392,6 @@ __all__ = [
     "AgentLoopControl",
     "ConfirmationCallback",
     "ConfirmationRequestView",
-    "ForegroundContextPreparer",
-    "ScheduleContextPreparer",
     "SkillContextTooLargeError",
 ]
 
@@ -1443,10 +1410,6 @@ def _log_agent_failure(error: ErrorInfo) -> None:
         error.code,
         type(failure).__name__,
     )
-
-
-async def _discard_runner_output(event: object) -> None:
-    del event
 
 
 def _latest_assistant_content(session: Session) -> str:

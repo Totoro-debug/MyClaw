@@ -110,7 +110,6 @@ def test_create_schedule_session_uses_a_lazy_isolated_storage_partition(
     )
 
     assert session.session_id == f"schedule_{SCHEDULE_JOB_ID}"
-    assert session.storage_partition is SessionStoragePartition.SCHEDULE
     assert not state.schedule_sessions_directory.exists()
 
     session.add_message("user", "Run the scheduled task.")
@@ -119,7 +118,6 @@ def test_create_schedule_session_uses_a_lazy_isolated_storage_partition(
     assert (state.schedule_sessions_directory / f"{session.session_id}.jsonl").exists()
     assert not (state.sessions_directory / f"{session.session_id}.jsonl").exists()
     loaded = Session.load(state, session.session_id)
-    assert loaded.storage_partition is SessionStoragePartition.SCHEDULE
     assert loaded.messages == session.messages
 
 

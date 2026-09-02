@@ -568,10 +568,6 @@ class _ScriptedControl:
     def has_active_run(self) -> bool:
         return self._active
 
-    @property
-    def has_pending_confirmation(self) -> bool:
-        return self._pending_confirmation is not None
-
     def bind_confirmation_callback(
         self, callback: Callable[[ConfirmationRequestView], None]
     ) -> None:
@@ -827,10 +823,6 @@ class _DirectControl:
 
     @property
     def has_active_run(self) -> bool:
-        return False
-
-    @property
-    def has_pending_confirmation(self) -> bool:
         return False
 
     async def cancel_active_run(self) -> None:
@@ -4267,10 +4259,8 @@ async def test_direct_terminal_loop_close_cancels_the_pending_confirmation_futur
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("run it"), "enter"))
         await _wait_for_confirmation(app, pilot)
-        assert runtime.control.has_pending_confirmation
 
     await asyncio.gather(submission, return_exceptions=True)
-    assert not runtime.control.has_pending_confirmation
     assert provider.closed
 
 

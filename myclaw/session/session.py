@@ -19,7 +19,7 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.tools.base import ArtifactReference
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
-from myclaw.utils.time import format_rfc3339_milliseconds
+from myclaw.utils.time import format_rfc3339_milliseconds, local_now
 from myclaw.utils.validation import (
     require_aware_datetime,
     require_nonnegative_int,
@@ -213,10 +213,6 @@ class Session:
     @property
     def session_id(self) -> str:
         return self._session_id
-
-    @property
-    def storage_partition(self) -> SessionStoragePartition:
-        return self._storage_partition
 
     @property
     def created_at(self) -> datetime:
@@ -558,10 +554,6 @@ class Session:
         return _normalize_title(value, fallback="")
 
 
-def _local_now() -> datetime:
-    return datetime.now().astimezone()
-
-
 def _coerce_partition(value: SessionStoragePartition | str) -> SessionStoragePartition:
     if isinstance(value, SessionStoragePartition):
         return value
@@ -608,7 +600,7 @@ def _existing_sessions_directory(
 
 
 def _clock_now(now: Callable[[], datetime] | None) -> datetime:
-    return _local_now() if now is None else now()
+    return local_now() if now is None else now()
 
 
 def _make_id(created_at: datetime, session_uuid: UUID) -> str:

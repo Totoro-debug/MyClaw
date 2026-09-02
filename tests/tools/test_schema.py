@@ -13,11 +13,10 @@ def test_schema_builders_export_restricted_detached_json_schema() -> None:
         {
             "name": Schema.string(description="A name", min_length=1),
             "count": Schema.integer(default=2, minimum=0),
-            "ratio": Schema.number(nullable=True, maximum=1.0),
             "enabled": Schema.boolean(),
-            "tags": Schema.array(Schema.string(), min_items=1),
+            "details": Schema.object({"note": Schema.string(nullable=True)}),
         },
-        required=("name", "count", "enabled", "tags"),
+        required=("name", "count", "enabled", "details"),
         description="Payload",
     )
 
@@ -32,11 +31,14 @@ def test_schema_builders_export_restricted_detached_json_schema() -> None:
         "properties": {
             "name": {"type": "string", "description": "A name", "minLength": 1},
             "count": {"type": "integer", "default": 2, "minimum": 0},
-            "ratio": {"type": ["number", "null"], "maximum": 1.0},
             "enabled": {"type": "boolean"},
-            "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "details": {
+                "type": "object",
+                "properties": {"note": {"type": ["string", "null"]}},
+                "required": [],
+            },
         },
-        "required": ["name", "count", "enabled", "tags"],
+        "required": ["name", "count", "enabled", "details"],
     }
 
 
@@ -44,7 +46,7 @@ def test_schema_builders_reject_non_json_defaults_and_enum_values() -> None:
     with pytest.raises(TypeError, match=r"Schema default\.invalid must be JSON-compatible"):
         Schema.object(default={"invalid": object()})
     with pytest.raises(ValueError, match=r"Schema enum\[0\] must be JSON-compatible"):
-        Schema.number(enum=[float("nan")])
+        Schema.integer(enum=[float("nan")])
 
 
 def test_schema_cast_is_recursive_safe_and_does_not_apply_defaults() -> None:
@@ -52,8 +54,7 @@ def test_schema_cast_is_recursive_safe_and_does_not_apply_defaults() -> None:
         {
             "count": Schema.integer(default=10),
             "enabled": Schema.boolean(),
-            "values": Schema.array(Schema.integer()),
-            "nested": Schema.object({"ratio": Schema.number()}),
+            "nested": Schema.object({"limit": Schema.integer()}),
         }
     )
 
@@ -61,8 +62,7 @@ def test_schema_cast_is_recursive_safe_and_does_not_apply_defaults() -> None:
         {
             "count": "-2",
             "enabled": "TrUe",
-            "values": ["1", 2.0],
-            "nested": {"ratio": 1},
+            "nested": {"limit": 2.0},
             "unknown": {"kept": True},
         }
     )
@@ -70,8 +70,7 @@ def test_schema_cast_is_recursive_safe_and_does_not_apply_defaults() -> None:
     assert cast == {
         "count": -2,
         "enabled": True,
-        "values": [1, 2],
-        "nested": {"ratio": 1},
+        "nested": {"limit": 2},
         "unknown": {"kept": True},
     }
     assert schema.cast({}) == {}
@@ -82,62 +81,49 @@ def test_schema_validation_aggregates_stable_nested_paths() -> None:
     schema = Schema.object(
         {
             "name": Schema.string(min_length=3),
-            "items": Schema.array(
-                Schema.object(
-                    {
-                        "count": Schema.integer(minimum=1),
-                        "enabled": Schema.boolean(),
-                    },
-                    required=("count", "enabled"),
-                )
+            "details": Schema.object(
+                {
+                    "count": Schema.integer(minimum=1),
+                    "enabled": Schema.boolean(),
+                },
+                required=("count", "enabled"),
             ),
         },
-        required=("name", "items"),
+        required=("name", "details"),
     )
 
     errors = schema.validate(
         {
             "name": "x",
-            "items": [{"count": 0}, {"count": "bad", "enabled": "maybe"}],
+            "details": {"count": 0},
         }
     )
 
     assert [error.path for error in errors] == [
         "$.name",
-        "$.items[0].count",
-        "$.items[0].enabled",
-        "$.items[1].count",
-        "$.items[1].enabled",
+        "$.details.count",
+        "$.details.enabled",
     ]
     assert all(isinstance(error, SchemaError) for error in errors)
-    assert "$.items[1].enabled" in str(errors[-1])
+    assert "$.details.enabled" in str(errors[-1])
 
 
 def test_schema_rejects_boolean_as_numeric_and_only_safe_conversions_apply() -> None:
     integer = Schema.integer()
-    number = Schema.number()
 
     assert integer.cast(2.0) == 2
     assert integer.cast("2") == 2
     assert integer.cast(True) is True
-    assert number.cast("2") == "2"
     assert integer.validate(True) == [SchemaError("$", "expected integer, got boolean", "type")]
-    assert number.validate(True) == [SchemaError("$", "expected number, got boolean", "type")]
 
 
-def test_schema_validation_matches_emitted_enum_and_unique_item_semantics() -> None:
-    nullable_enum = Schema.number(nullable=True, enum=[1])
+def test_schema_validation_matches_emitted_nullable_enum_semantics() -> None:
+    nullable_enum = Schema.integer(nullable=True, enum=[1])
 
-    assert nullable_enum.validate(1.0) == []
+    assert nullable_enum.validate(1) == []
     assert nullable_enum.validate(None) == [
         SchemaError("$", "value is not one of the allowed values", "enum")
     ]
-    assert Schema.array(Schema.number(), unique_items=True).validate([1, 1.0]) == [
-        SchemaError("$", "must contain unique items", "uniqueItems")
-    ]
-    assert Schema.array(Schema.object({"value": Schema.number()}), unique_items=True).validate(
-        [{"value": 1}, {"value": 1.0}]
-    ) == [SchemaError("$", "must contain unique items", "uniqueItems")]
 
 
 def test_schema_casts_and_validates_declared_additional_properties() -> None:
@@ -159,9 +145,8 @@ def test_schema_casts_and_validates_declared_additional_properties() -> None:
     assert Schema.object({"known": Schema.integer()}).validate({"known": 1, "extra": 2}) == []
 
 
-def test_schema_multiple_of_is_exact_and_total_for_finite_numbers() -> None:
-    assert Schema.number(multiple_of=0.1).validate(0.3) == []
-    assert Schema.number(multiple_of=1).validate(1e-13) == [
-        SchemaError("$", "must be a multiple of 1", "multipleOf")
+def test_schema_integer_multiple_of_is_exact() -> None:
+    assert Schema.integer(multiple_of=2).validate(4) == []
+    assert Schema.integer(multiple_of=2).validate(3) == [
+        SchemaError("$", "must be a multiple of 2", "multipleOf")
     ]
-    assert Schema.number(multiple_of=5e-324).validate(1.0) == []

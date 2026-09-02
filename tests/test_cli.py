@@ -26,6 +26,7 @@ from myclaw.management.service import FatalManagementError, ManagementError, Man
 from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.conversation import TerminalConversationApp
+from myclaw.utils.time import local_now
 from tests.configuration.test_config import (
     EXPECTED_DEFAULT_CONFIG,
     EXPECTED_REDACTED_CONFIG,
@@ -374,7 +375,7 @@ def _invoke_cli_resume_preparation_failure(
     state.initialize(agent_home_root=home.path)
     target_session = Session.create(
         state,
-        now=lambda: cli._local_now(),
+        now=local_now,
         new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
     )
     target_session.add_message("user", "Target session")
@@ -486,10 +487,6 @@ def _invoke_cli_resume_preparation_failure(
 
         @property
         def has_active_run(self) -> bool:
-            return False
-
-        @property
-        def has_pending_confirmation(self) -> bool:
             return False
 
         async def cancel_active_run(self) -> None:

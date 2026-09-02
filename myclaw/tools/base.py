@@ -552,20 +552,6 @@ def _schema_for_annotation(
                 minimum=metadata.minimum,
                 maximum=metadata.maximum,
             )
-        if annotation is float:
-            if (
-                metadata.min_length is not None
-                or metadata.max_length is not None
-                or metadata.format is not None
-            ):
-                raise TypeError(
-                    f"Tool parameter {parameter_name} has string constraints on a non-string"
-                )
-            return Schema.number(
-                **common,
-                minimum=metadata.minimum,
-                maximum=metadata.maximum,
-            )
         if annotation is bool:
             if any(
                 value is not None

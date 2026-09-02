@@ -32,6 +32,7 @@ from myclaw.provider.models import (
     ReasoningEffort,
     TextDelta,
     last_assistant_message_index,
+    require_tool_call_sequence,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -391,7 +392,7 @@ def _message_argument(
             content.append({"type": "text", "text": message_content})
         tool_calls = message.get("tool_calls", ())
         content.extend(
-            _anthropic_tool_use(tool_call) for tool_call in _tool_call_sequence(tool_calls)
+            _anthropic_tool_use(tool_call) for tool_call in require_tool_call_sequence(tool_calls)
         )
         return {"role": "assistant", "content": content}
     if role == "tool":
@@ -428,12 +429,6 @@ def _anthropic_continuation_content(
     if not blocks:
         raise ValueError("Anthropic continuation payload must not be empty")
     return blocks
-
-
-def _tool_call_sequence(value: object) -> Sequence[object]:
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise TypeError("assistant tool_calls must be a sequence")
-    return value
 
 
 def _anthropic_tool_use(value: object) -> dict[str, object]:

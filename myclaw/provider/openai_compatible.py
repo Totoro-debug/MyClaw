@@ -24,6 +24,7 @@ from myclaw.provider.models import (
     ReasoningEffort,
     TextDelta,
     last_assistant_message_index,
+    require_tool_call_sequence,
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
@@ -422,7 +423,8 @@ def _openai_message(
         tool_calls = message.get("tool_calls")
         if tool_calls:
             result["tool_calls"] = [
-                _openai_tool_call(tool_call) for tool_call in _tool_call_sequence(tool_calls)
+                _openai_tool_call(tool_call)
+                for tool_call in require_tool_call_sequence(tool_calls)
             ]
         if continuation is not None:
             result["reasoning_content"] = _openai_continuation_content(
@@ -439,12 +441,6 @@ def _openai_message(
     if role in {"system", "user"}:
         return {"role": role, "content": content}
     raise TypeError("Model message role is unsupported")
-
-
-def _tool_call_sequence(value: object) -> Sequence[object]:
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise TypeError("assistant tool_calls must be a sequence")
-    return value
 
 
 def _openai_tool_call(value: object) -> dict[str, object]:

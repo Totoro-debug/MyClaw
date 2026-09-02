@@ -11,7 +11,6 @@ from myclaw.management.service import (
     ManagementError,
     RuntimeStatus,
     RuntimeStatusInput,
-    RuntimeStatusService,
 )
 from myclaw.memory.dream import DreamResult
 from myclaw.memory.manager import MemoryManager
@@ -335,7 +334,8 @@ async def test_status_reads_one_current_loop_projection_per_request_and_resets_u
         return current
 
     monotonic = iter((100.0, 60.0)).__next__
-    service = RuntimeStatusService(
+    service = management_service(
+        home,
         current_agent_loop=current_loop,
         monotonic=monotonic,
     )

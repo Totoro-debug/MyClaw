@@ -14,7 +14,7 @@ from typing import Literal, TypeGuard, cast
 
 from myclaw.utils.json_types import JsonObject, JsonValue
 
-type SchemaKind = Literal["string", "integer", "number", "boolean", "array", "object"]
+type SchemaKind = Literal["string", "integer", "boolean", "object"]
 
 _MISSING = object()
 _INTEGER_TEXT = re.compile(r"^[+-]?[0-9]+$")
@@ -97,12 +97,9 @@ class Schema:
         "_exclusive_maximum",
         "_exclusive_minimum",
         "_format",
-        "_items",
         "_kind",
-        "_max_items",
         "_max_length",
         "_maximum",
-        "_min_items",
         "_min_length",
         "_minimum",
         "_multiple_of",
@@ -110,7 +107,6 @@ class Schema:
         "_pattern",
         "_properties",
         "_required",
-        "_unique_items",
     )
 
     def __init__(
@@ -130,15 +126,11 @@ class Schema:
         exclusive_minimum: int | float | None = None,
         exclusive_maximum: int | float | None = None,
         multiple_of: int | float | None = None,
-        items: Schema | None = None,
-        min_items: int | None = None,
-        max_items: int | None = None,
-        unique_items: bool | None = None,
         properties: Mapping[str, Schema] | None = None,
         required: Iterable[str] = (),
         additional_properties: bool | Schema | None = None,
     ) -> None:
-        if kind not in {"string", "integer", "number", "boolean", "array", "object"}:
+        if kind not in {"string", "integer", "boolean", "object"}:
             raise ValueError(f"unsupported Schema type: {kind}")
         if not isinstance(nullable, bool):
             raise TypeError("Schema nullable must be a boolean")
@@ -181,16 +173,6 @@ class Schema:
             raise ValueError("Schema minimum cannot exceed maximum")
         if multiple_of is not None and multiple_of <= 0:
             raise ValueError("Schema multiple_of must be greater than zero")
-        if items is not None and not isinstance(items, Schema):
-            raise TypeError("Schema array items must be a Schema")
-        if min_items is not None:
-            _require_nonnegative_int(min_items, "min_items")
-        if max_items is not None:
-            _require_nonnegative_int(max_items, "max_items")
-        if min_items is not None and max_items is not None and min_items > max_items:
-            raise ValueError("Schema min_items cannot exceed max_items")
-        if unique_items is not None and not isinstance(unique_items, bool):
-            raise TypeError("Schema unique_items must be a boolean")
         if properties is not None:
             for name, property_schema in properties.items():
                 if not isinstance(name, str) or not name:
@@ -215,8 +197,6 @@ class Schema:
             additional_properties, (bool, Schema)
         ):
             raise TypeError("Schema additional_properties must be a boolean or Schema")
-        if kind == "array" and items is None:
-            raise TypeError("Schema array items are required")
         if kind == "object" and properties is None:
             property_values = ()
 
@@ -236,10 +216,6 @@ class Schema:
         self._exclusive_minimum = exclusive_minimum
         self._exclusive_maximum = exclusive_maximum
         self._multiple_of = multiple_of
-        self._items = items
-        self._min_items = min_items
-        self._max_items = max_items
-        self._unique_items = unique_items
         self._properties = property_values
         self._required = required_values
         self._additional_properties = additional_properties
@@ -302,33 +278,6 @@ class Schema:
         )
 
     @classmethod
-    def number(
-        cls,
-        *,
-        description: str | None = None,
-        default: builtins.object = _MISSING,
-        nullable: bool = False,
-        enum: Sequence[builtins.object] | None = None,
-        minimum: int | float | None = None,
-        maximum: int | float | None = None,
-        exclusive_minimum: int | float | None = None,
-        exclusive_maximum: int | float | None = None,
-        multiple_of: int | float | None = None,
-    ) -> Schema:
-        return cls(
-            "number",
-            description=description,
-            default=default,
-            nullable=nullable,
-            enum=enum,
-            minimum=minimum,
-            maximum=maximum,
-            exclusive_minimum=exclusive_minimum,
-            exclusive_maximum=exclusive_maximum,
-            multiple_of=multiple_of,
-        )
-
-    @classmethod
     def boolean(
         cls,
         *,
@@ -343,31 +292,6 @@ class Schema:
             default=default,
             nullable=nullable,
             enum=enum,
-        )
-
-    @classmethod
-    def array(
-        cls,
-        items: Schema,
-        *,
-        description: str | None = None,
-        default: builtins.object = _MISSING,
-        nullable: bool = False,
-        enum: Sequence[builtins.object] | None = None,
-        min_items: int | None = None,
-        max_items: int | None = None,
-        unique_items: bool | None = None,
-    ) -> Schema:
-        return cls(
-            "array",
-            description=description,
-            default=default,
-            nullable=nullable,
-            enum=enum,
-            items=items,
-            min_items=min_items,
-            max_items=max_items,
-            unique_items=unique_items,
         )
 
     @classmethod
@@ -440,14 +364,9 @@ class Schema:
             (self._exclusive_minimum, "exclusiveMinimum"),
             (self._exclusive_maximum, "exclusiveMaximum"),
             (self._multiple_of, "multipleOf"),
-            (self._min_items, "minItems"),
-            (self._max_items, "maxItems"),
-            (self._unique_items, "uniqueItems"),
         ):
             if attribute is not None:
                 result[keyword] = cast(JsonValue, attribute)
-        if self._items is not None:
-            result["items"] = self._items.to_json_schema()
         if self._properties:
             result["properties"] = {
                 name: property_schema.to_json_schema() for name, property_schema in self._properties
@@ -483,10 +402,6 @@ class Schema:
             if isinstance(value, str) and value.lower() in {"true", "false"}:
                 return value.lower() == "true"
             return deepcopy(value)
-        if self._kind == "array" and isinstance(value, list):
-            item_schema = self._items
-            assert item_schema is not None
-            return [item_schema.cast(item) for item in value]
         if self._kind == "object" and isinstance(value, dict):
             properties = self.properties
             additional = self._additional_properties
@@ -524,10 +439,8 @@ class Schema:
             return
         if self._kind == "string":
             self._validate_string(cast(str, value), path, errors)
-        elif self._kind in {"integer", "number"}:
+        elif self._kind == "integer":
             self._validate_number(cast(int | float, value), path, errors)
-        elif self._kind == "array":
-            self._validate_array(cast(list[builtins.object], value), path, errors)
         elif self._kind == "object":
             self._validate_object(cast(dict[str, builtins.object], value), path, errors)
 
@@ -575,24 +488,6 @@ class Schema:
                 SchemaError(path, f"must be a multiple of {self._multiple_of}", "multipleOf")
             )
 
-    def _validate_array(
-        self, value: list[builtins.object], path: str, errors: list[SchemaError]
-    ) -> None:
-        if self._min_items is not None and len(value) < self._min_items:
-            errors.append(
-                SchemaError(path, f"must contain at least {self._min_items} items", "minItems")
-            )
-        if self._max_items is not None and len(value) > self._max_items:
-            errors.append(
-                SchemaError(path, f"must contain at most {self._max_items} items", "maxItems")
-            )
-        if self._unique_items and _has_json_duplicates(value):
-            errors.append(SchemaError(path, "must contain unique items", "uniqueItems"))
-        item_schema = self._items
-        assert item_schema is not None
-        for index, item in enumerate(value):
-            item_schema._validate(item, f"{path}[{index}]", errors)
-
     def _validate_object(
         self,
         value: dict[str, builtins.object],
@@ -627,14 +522,8 @@ def _matches_kind(kind: SchemaKind, value: object) -> bool:
         return isinstance(value, str)
     if kind == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
-    if kind == "number":
-        return (isinstance(value, int) and not isinstance(value, bool)) or (
-            isinstance(value, float) and math.isfinite(value)
-        )
     if kind == "boolean":
         return isinstance(value, bool)
-    if kind == "array":
-        return isinstance(value, list)
     return isinstance(value, dict)
 
 
@@ -679,13 +568,6 @@ def _json_equal(left: object, right: object) -> bool:
             _json_equal(left[name], right[name]) for name in left
         )
     return left == right
-
-
-def _has_json_duplicates(values: Sequence[object]) -> bool:
-    return any(
-        any(_json_equal(value, previous) for previous in values[:index])
-        for index, value in enumerate(values)
-    )
 
 
 def _valid_format(format_name: str, value: str) -> bool:

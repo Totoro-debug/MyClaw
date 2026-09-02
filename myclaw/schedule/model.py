@@ -57,7 +57,7 @@ class JobSchedule:
                 raise ValueError("at Schedule must select only at_time")
             if self.cron_expr is not None or self.timezone is not None:
                 raise ValueError("at Schedule must select only at_time")
-            _require_canonical_rfc3339_milliseconds(self.at_time, field="schedule.at_time")
+            _parse_canonical_rfc3339_milliseconds(self.at_time, field="schedule.at_time")
             return
         if self.at_time is not None:
             raise ValueError(f"{self.kind} Schedule must not select at_time")
@@ -325,10 +325,6 @@ def _require_iana_timezone(value: str) -> None:
         ZoneInfo(value)
     except (ZoneInfoNotFoundError, ValueError) as error:
         raise ValueError("schedule.timezone must be a valid IANA timezone") from error
-
-
-def _require_canonical_rfc3339_milliseconds(value: str, *, field: str) -> None:
-    _parse_canonical_rfc3339_milliseconds(value, field=field)
 
 
 def _parse_canonical_rfc3339_milliseconds(value: str, *, field: str) -> datetime:

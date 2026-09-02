@@ -57,7 +57,6 @@ from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAda
 
 __all__ = [
     "TerminalConversationApp",
-    "TerminalConversationError",
     "is_interactive_terminal",
 ]
 
@@ -105,10 +104,6 @@ class _DriverLifecycleHooks(Protocol):
 
 class _ConsoleRestoreHooks(Protocol):
     _restore_console: Callable[[], None] | None
-
-
-class TerminalConversationError(RuntimeError):
-    """A Terminal Conversation cannot run with the supplied terminal streams."""
 
 
 @dataclass(slots=True)
@@ -1268,7 +1263,7 @@ class _ToolConfirmationScreen(ModalScreen[ConfirmationDecision]):
             with Vertical(id="confirmation-panel"):
                 yield Static("Tool Confirmation", id="confirmation-heading", markup=False)
                 yield Static(
-                    f"Tool: {_friendly_tool_name(self._request.tool_name)}",
+                    f"Tool: {_friendly_name(self._request.tool_name, fallback='Tool')}",
                     id="confirmation-tool",
                     markup=False,
                 )
@@ -3302,10 +3297,6 @@ def _persisted_message_timestamp(message: Mapping[str, object]) -> datetime | No
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed
-
-
-def _friendly_tool_name(tool_name: str) -> str:
-    return _friendly_name(tool_name, fallback="Tool")
 
 
 def _friendly_parameter_name(name: str) -> str:
