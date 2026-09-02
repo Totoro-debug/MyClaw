@@ -141,9 +141,9 @@
 
 - 非交互管理首版只支持 `myclaw config`。
 - 首版不要求 `myclaw --help` 作为产品能力。
-- Terminal Conversation 内置 slash commands：`/config`、`/status`、`/resume`、`/memory`、`/dream`。
+- Terminal Conversation 内置 slash commands：`/config`、`/status`、`/resume`、`/memory`、`/dream`、`/reload_skill`。
 - Only Management Commands enter the Management Port. An exact valid Skill slash invocation remains an ordinary foreground Agent Run; unknown or non-matching slash input remains ordinary input.
-- Skill names are validated exactly as authored without trimming; descriptions are trimmed. Each Agent Loop constructs a Skill Loader that reads every retained complete UTF-8 `SKILL.md` into one immutable Runtime Generation Skill Snapshot; manual and opted-in always-load invocation use that frozen document, while Session persistence retains only the raw slash input. Invalid candidates are skipped with safe diagnostics, and a later Agent Loop construction rescans the directory.
+- Skill names are validated exactly as authored without trimming; descriptions are trimmed. Each Agent Loop constructs a Skill Loader that reads every retained complete UTF-8 `SKILL.md` into one immutable Skill Snapshot; manual and opted-in always-load invocation use that frozen document, while Session persistence retains only the raw slash input. Invalid candidates are skipped with safe diagnostics. Startup and `/resume` perform an initial load; a successful `/reload_skill` atomically replaces the current Agent Loop's frozen state, while failure preserves it.
 - The shared completion surface keeps its existing Management Command Enter/click behavior. Skill Enter/click selection only fills `/<name> ` without submission, and Tab does not accept any completion candidate.
 - `/config` 完整显示配置，但脱敏 plaintext API key。
 - 配置语法错误时，`myclaw config` 显示解析错误、配置路径和原文，并对明显 API key 行做文本级脱敏。
@@ -153,6 +153,7 @@
 - `/memory` 不分页，完整读取并显示磁盘最新 `memory.md`。
 - `/dream` 前台阻塞执行 `Dream.run()`，并显示处理条数、是否更新及 cursor 状态等摘要，不显示完整 diff。
 - `/dream` 没有 pending summary 时返回 `No pending summaries`，不调用模型。
+- `/reload_skill` 直接调用当前 Agent Loop 的 Skill Loader，不重建 Agent Loop、不清理 Conversation Session，也不进入 Message Bus。已经开始的 Agent Run 保持已构造的 messages；后续请求使用新状态。成功时返回 `Skill count: N` 并同步终端补全，失败时返回稳定的 `skill_reload_failed` 且模型目录、Manual Skill 解析和终端缓存保持不变。
 
 ### Agent Home and persistence
 

@@ -15,10 +15,13 @@ from urllib.parse import unquote, urlsplit
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from myclaw.management.commands import MANAGEMENT_COMMANDS
+
 ROOT = Path(__file__).resolve().parents[1]
 
 _ACTIVE_SKILL_CONTRACTS = (
     ROOT / "CONTEXT.md",
+    ROOT / "README.md",
     ROOT / "docs" / "myclaw-personal-agent-prd.md",
     ROOT / "docs" / "myclaw-runtime-contracts.md",
     ROOT / "docs" / "terminal-conversation-ui-design.md",
@@ -51,6 +54,12 @@ _OBSOLETE_SKILL_MARKERS = (
     "exec、web 和 workspace 外部路径按具体目标执行一次性确认。",
     "解析到 workspace 外的路径请求一次性确认。",
     "exec、web 和 workspace 外部路径才使用精确绑定的一次性确认。",
+    "skill catalog 在启动时生成，因此新增、删除或修改元数据后应重启 myclaw",  # noqa: RUF001
+    "启动或任意 `/resume` 创建新的 agent loop 时会重新扫描并捕获 skill snapshot",
+    "a later agent loop construction rescans the directory",
+    "首次启动或任意 `/resume` 构造新 agent loop 时才",
+    "the five management commands",
+    "each agentloop captures one runtime generation skill snapshot",
 )
 
 _ISSUE_202_ARCHITECTURE_DOCS = (
@@ -461,10 +470,20 @@ def _adr_status(path: Path) -> object:
 
 def _markdown_section(content: str, heading: str) -> str:
     lines = content.splitlines()
-    marker = f"### {heading}"
-    start = lines.index(marker) + 1
+    marker_index, level = next(
+        (index, len(line) - len(line.lstrip("#")))
+        for index, line in enumerate(lines)
+        if line.lstrip("#") == f" {heading}"
+    )
+    start = marker_index + 1
     end = next(
-        (index for index in range(start, len(lines)) if lines[index].startswith("### ")),
+        (
+            index
+            for index in range(start, len(lines))
+            if lines[index].startswith("#")
+            and len(lines[index]) - len(lines[index].lstrip("#")) <= level
+            and lines[index].lstrip("#").startswith(" ")
+        ),
         len(lines),
     )
     return "\n".join(lines[start:end])
@@ -876,9 +895,57 @@ def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
         assert claim in schedule_contract
 
     for path in active_contracts:
-        content = path.read_text(encoding="utf-8").casefold()
-        stale = [marker for marker in _OBSOLETE_SKILL_MARKERS if marker in content]
+        content = " ".join(path.read_text(encoding="utf-8").casefold().split())
+        stale = [
+            marker
+            for marker in _OBSOLETE_SKILL_MARKERS
+            if " ".join(marker.casefold().split()) in content
+        ]
         assert stale == [], f"{path}: {stale}"
+
+
+def test_reload_skill_command_and_lifecycle_are_published_by_active_docs() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
+    runtime = (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8")
+    terminal = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(
+        encoding="utf-8"
+    )
+    release = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
+
+    command_tokens = tuple(command.token for command in MANAGEMENT_COMMANDS)
+    command_sections = {
+        "README": _markdown_section(readme, "开始对话"),
+        "PRD": _markdown_section(prd, "CLI and management"),
+        "Runtime Contracts": _markdown_section(runtime, "8.3a Shared Slash Completion"),
+        "Terminal Design": _markdown_section(terminal, "Input Area"),
+    }
+    for label, section in command_sections.items():
+        positions = tuple(section.index(token) for token in command_tokens)
+        assert positions == tuple(sorted(positions)), label
+
+    for label, content in {
+        "README": readme,
+        "PRD": prd,
+        "Runtime Contracts": runtime,
+        "Terminal Design": terminal,
+        "Release Readiness": release,
+    }.items():
+        assert "/reload_skill" in content, label
+
+    snapshot_definition = _glossary_definition(
+        (ROOT / "CONTEXT.md").read_text(encoding="utf-8"), "Skill Snapshot"
+    )
+    assert "successful reload" in snapshot_definition
+    assert "runtime generation replacement" in snapshot_definition
+
+    reload_decision = (
+        ROOT / "docs" / "adr" / "0018-centralize-model-request-context-construction.md"
+    )
+    assert _adr_status(reload_decision) == "accepted"
+    decision = reload_decision.read_text(encoding="utf-8").casefold()
+    for claim in ("/reload_skill", "failure preserves", "without rebuilding the agent loop"):
+        assert claim in decision
 
 
 def test_superseded_adrs_remain_historical_and_link_the_current_authority() -> None:
@@ -1336,7 +1403,8 @@ def test_issue_202_authoritative_documents_identify_one_current_composition_boun
     ):
         assert stale_claim not in readme
     assert "| CLI composition root |" in readme
-    assert "Runtime Generation Skill Snapshot" in readme
+    assert "| Skill Snapshot | Skill Loader" in readme
+    assert "每次成功加载" in readme
     assert "Dream System Job" in readme
     assert "创建或校正 `schedule.json`" in readme
     assert (

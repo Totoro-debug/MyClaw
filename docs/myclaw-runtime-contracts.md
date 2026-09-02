@@ -128,7 +128,7 @@ class SkillLoader:
     def load(self, *, validate: Callable[..., None] | None = None) -> None: ...
 ```
 
-`LoadedSkill.document` 逐字符保留完整 document，不剥离 opening delimiter、frontmatter、closing delimiter、正文或原始换行。`SkillLoader` 保存 immutable `tuple[LoadedSkill, ...]`，每次成功 `load()` 都原子替换已发布状态；不存在可变的公开 Skill 状态。当前 Agent Loop 内 manual invocation 和 always-loaded projection 使用 frozen document；启动、`/resume` 或 `/reload_skill` 会在发布前重新扫描。模型自主调用普通 `read_file` 仍遵守 Tool path 和实时文件读取契约。缺失、不可读、非 UTF-8、frontmatter/YAML 无效或 canonical containment 失效的单个候选被跳过并记录安全 warning；已发布状态的全局预算 preflight failure 使用稳定 `skill_context_too_large` 并终止 Terminal Conversation。
+`LoadedSkill.document` 逐字符保留完整 document，不剥离 opening delimiter、frontmatter、closing delimiter、正文或原始换行。`SkillLoader` 保存 immutable `tuple[LoadedSkill, ...]`，每次成功 `load()` 都原子替换已发布状态；不存在可变的公开 Skill 状态。当前 Agent Loop 内 manual invocation 和 always-loaded projection 使用 frozen document；启动、`/resume` 或 `/reload_skill` 会在发布前重新扫描。模型自主调用普通 `read_file` 仍遵守 Tool path 和实时文件读取契约。缺失、不可读、非 UTF-8、frontmatter/YAML 无效或 canonical containment 失效的单个候选被跳过并记录安全 warning。初始启动或 `/resume` 的全局预算 preflight failure 使用稳定 `skill_context_too_large` 并终止 Terminal Conversation；`/reload_skill` 的扫描、验证或预算失败映射为稳定 `skill_reload_failed`，且不替换已发布状态。
 
 `memory.md` 初始内容固定为：
 
@@ -461,7 +461,7 @@ chat 和 schedule 的共有 system-level context 按以下固定顺序组装：
 
 User Configuration 不得插入或替换 identity/system prompt。缓存的 OpenAI-format Tool schema snapshots 通过 provider 的结构化 tools 字段发送，不把 JSON schema 重复拼入自然语言 guidance。
 
-Foreground chat 在上述共有部分之后按当前 Runtime Generation Skill Snapshot order 追加一个 `## Skill Catalog` Markdown section 和 fenced JSONL block。每个 Skill 是独占一行的 compact JSON object，字段顺序固定为 name、description、path；JSON 文本中的反引号以及 `&`、`<`、`>` 使用 Unicode escape，确保 metadata 不能产生 literal block delimiter。该 block 只指导模型使用普通 `read_file` 读取已知 canonical absolute path；模型需要更多内容时可按 `offset`/`limit` 继续分页，不需要证明 EOF。
+Foreground chat 在上述共有部分之后按当前 Skill Snapshot order 追加一个 `## Skill Catalog` Markdown section 和 fenced JSONL block。每个 Skill 是独占一行的 compact JSON object，字段顺序固定为 name、description、path；JSON 文本中的反引号以及 `&`、`<`、`>` 使用 Unicode escape，确保 metadata 不能产生 literal block delimiter。该 block 只指导模型使用普通 `read_file` 读取已知 canonical absolute path；模型需要更多内容时可按 `offset`/`limit` 继续分页，不需要证明 EOF。
 
 当 Skill Snapshot 的 always-loaded subset 非空时，Foreground chat 随后按相同 Snapshot order 追加一个 `## Always-loaded Skills` Markdown section 和 fenced JSONL block。每个 opted-in Skill 是一行 compact JSON object，字段顺序固定为 name、body；body 字段承载逐字符一致的完整 `SKILL.md` document。document 的 frontmatter、换行、引号、反斜杠及任意文字均由 JSON 字符串编码承载，反引号以及 `&`、`<`、`>` 使用 Unicode escape。Runtime 不做 raw interpolation，也不截断 document。Foreground consolidation/budget projection 与最终 chat request 使用完全相同的编码后 prompt。该 always document 只进入 Foreground chat：Schedule、Session title、Task Framing、实际 Conversation Summary provider 和 Dream 均接收 `0` 个 Skill document；Summary 的 foreground budget projection 可包含同一完整 foreground prompt，但不把 document 发送给 Summary provider。Schedule prompt 不追加 Skill metadata 或 document。
 
@@ -472,9 +472,10 @@ Foreground System Prompt 不包含 Blackboard guidance。Blackboard 只通过合
 手动 Skill invocation 是独立的 foreground projection path：只有 raw input 在字符 `0` 以 `/` 开始、且第一个
 Unicode whitespace 之前的 token 与 Catalog 中的 Skill name 完全一致（区分大小写）时才匹配。无 delimiter
 时 request 为空；匹配 delimiter 只移除一个，其后的空格、换行和其它字符逐字保留。匹配后 Agent Loop
-直接读取当前 Runtime Generation 的 immutable Skill Snapshot 中已经验证并冻结的完整 document，不再次访问文件系统。
-磁盘上的 Skill 在当前 Session 中发生删除、修改或失效不会改变本次 projection；首次启动或任意 `/resume`
-构造新 Agent Loop 时才由新的 Skill Loader 重新发现、完整读取并校验候选。
+直接读取当前 immutable Skill Snapshot 中已经验证并冻结的完整 document，不再次访问文件系统。
+磁盘上的 Skill 发生删除、修改或失效不会改变已经构造的 projection。初始启动、任意 `/resume` 或
+`/reload_skill` 都会重新发现、完整读取并校验候选；成功 reload 后的后续请求使用新状态，已经开始的
+Agent Run 保持其 messages，失败 reload 则完整保留先前状态。
 
 ### 8.2 当前 user input 的 Runtime Context
 
@@ -504,7 +505,7 @@ Report the findings
 string。body 字段承载逐字符一致的完整 `SKILL.md` document；document、request 的换行、引号、反斜杠及 Markdown fence 内容均由 JSON 编码承载，反引号以及 `&`、`<`、`>`
 使用 Unicode escape。该 ephemeral projection 只存在于本次
 foreground user message，Skill body 不进入 System Prompt；raw slash input 仍是唯一持久化的 Session user
-message。若同一 Skill 已在当前 Runtime Generation Skill Snapshot 中属于 always-loaded subset，它仍按 always System contract 出现，manual user
+message。若同一 Skill 已在当前 Skill Snapshot 中属于 always-loaded subset，它仍按 always System contract 出现，manual user
 projection 不会去重、覆盖或额外修改该既有 block。
 
 - session JSONL 只保存 raw user content，不保存上述 wrapper。
@@ -529,11 +530,12 @@ prompt 文本存放在独立、可版本追踪的 package resources；测试断�
 
 Terminal Conversation reuses one presentation-only completion surface for Management Commands
 and Skill metadata. It shows candidates only when the composer text starts with `/` at character
-zero and contains no character for which `str.isspace()` is true. The five Management Commands
+zero and contains no character for which `str.isspace()` is true. The six Management Commands
 remain first in their fixed order, with these stable labels and descriptions: `/config - View User
 Configuration`, `/status - View Runtime Status`, `/resume - Resume a Conversation Session`,
-`/memory - View Long-term Memory`, and `/dream - Process pending Conversation Summaries`. Valid
-Skills follow in the current Runtime Generation Skill Snapshot order and use `/name - description`.
+`/memory - View Long-term Memory`, `/dream - Process pending Conversation Summaries`, and
+`/reload_skill - Reload Skills`. Valid Skills follow in the current Skill Snapshot order and use
+`/name - description`.
 
 The display label is independent from the insertion value. Skill descriptions are user-controlled:
 their whitespace runs are folded to one ASCII space for a markup-disabled, single-line OptionList
@@ -545,9 +547,11 @@ closes the popup, restores input focus, and creates zero Message Bus inbound mes
 submits or dispatches the Skill. Tab is not intercepted by the completion surface and does not
 accept, replace, or submit any highlighted candidate. A Management prefix selection only
 completes the composer. The current Agent Loop supplies only an ordered
-`tuple[SkillMetadata, ...]` presentation projection; generation rebind replaces that UI projection
-and clears old candidate state after the replacement Agent Loop has built and preflighted a new
-Skill Snapshot.
+`tuple[SkillMetadata, ...]` presentation projection. Generation rebind replaces that UI projection
+after the replacement Agent Loop has built and preflighted its initial Skill state. A successful
+`/reload_skill` atomically replaces the projection with the metadata returned by the same load and
+closes the completion surface; failure displays stable `skill_reload_failed` output while retaining
+the previous Skill metadata, composer text, and completion state.
 
 ### 8.4 Context budget 与 consolidation
 
@@ -842,12 +846,13 @@ Service/Dispatcher、Terminal application 和可替换的 current Agent Loop ref
 只完成参数/配置边界并进入该 async root；Terminal application 不启动或关闭业务组件。代码中不得存在
 `RuntimeHost`、`PreparedRuntime`、`RuntimeBindings`、`prepare_runtime` 或承担相同聚合职责的改名容器。
 
-一个 Runtime Generation 恰好是一个 Agent Loop。Agent Loop 同步构造 Session、Skill Loader、immutable
-full Skill Snapshot、Context Builder、Conversation Summary Manager、Task Framer、Tool Gateway、Agent Runner
-及其他 Session 内 task；它只接收并使用 CLI-owned outer objects/ports。构造完成后处于 prepared/unstarted
-状态，并在启动 task 前完成同步 preflight。Skill Loader 在每个 generation 重新发现目录、完整读取/校验正文，
-丢弃并安全记录无效候选，再保存包含 metadata 和全部正文的 immutable Snapshot；同一 generation 的 manual
-和 always projection 都只使用 frozen document。普通模型主动调用 `read_file` 仍保持实时 Tool 语义。
+一个 Runtime Generation 恰好是一个 Agent Loop。Agent Loop 同步构造 Session、Skill Loader、Context Builder、
+Conversation Summary Manager、Tool Gateway、Agent Runner 及其他 Session 内 task；Blackboard 自身负责 Task
+Framing。Agent Loop 只接收并使用 CLI-owned outer objects/ports，构造完成后处于 prepared/unstarted 状态，
+并在启动 task 前完成同步 preflight。Skill Loader 初始加载时重新发现目录、完整读取/校验正文，丢弃并安全记录
+无效候选，再保存包含 metadata 和全部正文的 immutable tuple。成功 `/reload_skill` 可在同一 generation 内原子
+替换该冻结状态；manual 和 always projection 使用各自请求开始时捕获的状态。普通模型主动调用 `read_file` 仍保持
+实时 Tool 语义。
 
 The final linearization refinement formed during later implementation review is recorded here; it is not a restatement of the original parent issue wording. In this contract, target preparation is a precondition and includes target construction plus synchronous `preflight()` before destructive cutover. For a successful target, the exact source-backed sequence is:
 
@@ -1076,7 +1081,7 @@ ErrorInfo(
 | `schedule_state_error` | Schedule state 损坏或不安全 | 否 |
 | `skill_context_too_large` | always-loaded Skill document 的最小真实 Foreground request projection 超出 `context_window - max_output` | 否 |
 
-CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 Terminal Conversation 继续时不退出进程。首次启动或任意 `/resume` 的 Agent Loop 构造/同步 preflight failure 必须由 CLI composition root 捕获，终止 Terminal Conversation，并只通过 `_print_error_info` 输出稳定 code/message，不输出 traceback、底层异常、Skill 正文或敏感路径。
+CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 Terminal Conversation 继续时不退出进程。首次启动或任意 `/resume` 的 Agent Loop 构造/同步 preflight failure 必须由 CLI composition root 捕获，终止 Terminal Conversation，并只通过 `_print_error_info` 输出稳定 code/message，不输出 traceback、底层异常、Skill 正文或敏感路径。`/reload_skill` failure 不是 CLI fatal error；Terminal Conversation 保持运行并只显示稳定 `skill_reload_failed`。
 
 ## 14. `/status` 契约
 
@@ -1194,7 +1199,7 @@ Schema casting、参数校验、安全检查和结果截断/Artifact 写入属�
 - MessageBus sparse outbound schema、terminal marker 以及 AgentLoop control/Future 语义。
 - Blackboard/FramingResult strict shape、Task Framing decision table、current-input-only projection、usage/metadata atomic commit 和非前台路径排除。
 - Model Provider scripted transcript：text deltas、tool call deltas、usage、retry-after、timeout、cancellation。
-- 固定 Catalog、generation-scoped full Skill Snapshot/manual frozen projection、foreground-only metadata projection、BaseTool preparation order、file path boundary、Exec/Web confirmation 和 WebFetch redirect/IP cases。
+- 固定 Catalog、可原子重载的 frozen Skill state、manual request snapshot、foreground-only metadata projection、`/reload_skill` rollback/cache synchronization、BaseTool preparation order、file path boundary、Exec/Web confirmation 和 WebFetch redirect/IP cases。
 - CLI composition ownership、Agent Loop session ownership、initial/resume preflight failure、same-Session replacement、stable Message Bus identity 和 atomic inbound/outbound reset。
 - Dream System Job registration/reconciliation、direct Dream dispatch、User Job current-loop dispatch、replacement pause/cancel/await/rebind/resume 顺序和 no-Schedule-Session invariant。
 - complete atomic JSONL replacement、缺少 trailing newline、middle corruption、旧 schema rejection，以及 Summary/`last_consolidated` crash divergence。

@@ -11,7 +11,7 @@ MyClaw 不是多租户 Agent 平台，也不是后台常驻服务。每次运行
 - **多模型路由**：支持 `openai-compatible` 和 `anthropic` Provider，并可为聊天、记忆和定时任务分别配置模型。
 - **固定工具目录**：内置文件操作、目录检索、命令执行、Web 搜索、Web 获取和定时任务等十项 Tool，通过统一的 Tool Gateway 执行校验与授权。
 - **三层记忆系统**：由 Short-term Memory、Conversation Summary 和 Long-term Memory 组成。
-- **Skill 发现与渐进使用**：从 Agent Home 捕获 Runtime Generation 级完整 Skill Snapshot，支持手动斜杠调用、模型自主读取和可选的 System Prompt 投影。
+- **Skill 发现与渐进使用**：从 Agent Home 捕获可原子重载的冻结 Skill Snapshot，支持手动斜杠调用、模型自主读取和可选的 System Prompt 投影。
 - **任务连续性**：在普通前台输入之前执行 Task Framing，用隐藏 Blackboard 维护当前目标和完成边界。
 - **Workspace 隔离**：每个启动目录拥有独立的 Session、Memory、Schedule、Artifact 和 Session Log。
 
@@ -141,6 +141,9 @@ myclaw
 | `/resume` | 列出并恢复当前 Workspace 的 Conversation Session |
 | `/memory` | 查看当前 Long-term Memory |
 | `/dream` | 立即处理尚未消费的 Conversation Summary |
+| `/reload_skill` | 原子重载当前 Agent Loop 的 Skill |
+
+`/reload_skill` 不进入 Message Bus 或 Conversation Session。成功后，后续 Agent Run、手动 Skill 调用和终端补全共同使用新状态；已经开始的 Agent Run 继续使用其已构造的消息。失败时显示稳定错误，并完整保留先前状态。
 
 其他常用操作：
 
@@ -185,8 +188,8 @@ description: 将复杂需求整理为清晰、可执行的计划
 - `name` 和 `description` 为必填字符串。
 - `name` 长度为 1～64 个字符，首字符只能是小写字母、下划线或连字符，后续还可使用数字。
 - `description` 去除首尾空白后长度为 1～1024 个字符。
-- Skill 名不能与 `/config`、`/status`、`/resume`、`/memory`、`/dream` 等管理命令冲突。
-- MyClaw 只扫描 `~/.myclaw/skills` 的直接子目录；Skill Catalog 在启动时生成，因此新增、删除或修改元数据后应重启 MyClaw。
+- Skill 名不能与 `/config`、`/status`、`/resume`、`/memory`、`/dream`、`/reload_skill` 等管理命令冲突。
+- MyClaw 只扫描 `~/.myclaw/skills` 的直接子目录；初始启动、任意 `/resume` 或成功的 `/reload_skill` 会重新扫描。磁盘修改在下一次成功加载前不会改变当前冻结状态。
 
 ### 手动调用
 
@@ -221,7 +224,7 @@ always: true
 enable_skill_always_load = true
 ```
 
-启动时加载的完整内容在当前 Runtime Generation 内保持冻结；启动或任意 `/resume` 创建新的 Agent Loop 时会重新扫描并捕获 Skill Snapshot。此模式没有固定的 Skill 文件大小上限，但内容仍受聊天模型输入预算约束；超出预算时该 Agent Loop 的同步 preflight 会以 `skill_context_too_large` 终止 Terminal Conversation。
+每次成功加载的完整内容保持冻结，直到成功执行 `/reload_skill` 或创建新的 Agent Loop。`/reload_skill` 会先扫描、校验并检查输入预算，再一次性发布新状态；失败不会替换当前状态。此模式没有固定的 Skill 文件大小上限，但内容仍受聊天模型输入预算约束；初始启动或 `/resume` 的同步 preflight 超出预算时会以 `skill_context_too_large` 终止 Terminal Conversation。
 
 ## 项目架构
 
@@ -257,7 +260,7 @@ myclaw/
 | Tool Gateway | Tool 调用的唯一公共入口，负责解析、校验、授权、执行和结果归一化 |
 | Memory Manager 与 Dream | 管理 Summary/Cursor/Long-term Memory 状态，并通过独立 Dream Runner 处理长期记忆 |
 | Schedule Service | 保存、触发和取消 Schedule Job；User Job 调用当前 Agent Loop，Dream System Job 直接调用 Dream |
-| Skill Snapshot | 每个 Agent Loop 创建时完整读取并冻结有效 Skill 文档，对模型按用途投影元数据或正文 |
+| Skill Snapshot | Skill Loader 在每次成功加载时完整读取并冻结有效 Skill 文档，对模型按用途投影元数据或正文 |
 
 ### 固定 Tool Catalog
 
@@ -286,7 +289,7 @@ CLI
   → 以当前目录建立 Workspace
   → 初始化 <workspace>/.myclaw/
   → 组合 Runtime Lifetime 级 Message Bus、Model Router、Memory Manager、Dream 与 Schedule Service
-  → 创建并 preflight 初始 Agent Loop，同时捕获 Runtime Generation Skill Snapshot
+  → 创建并 preflight 初始 Agent Loop，同时捕获初始 Skill Snapshot
   → 注册或校正 Dream System Job，并创建或校正 schedule.json
   → 启动 Terminal Conversation
 ```

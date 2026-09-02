@@ -88,6 +88,10 @@ _Avoid_: User instruction, Long-term Memory, Session message
 The stable system-level context that establishes Personal Agent identity, memory, and capability guidance for a model call.
 _Avoid_: Runtime Context, user message, Conversation Summary
 
+**Model Request Context**:
+The provider-neutral ordered messages assembled for one model call, including its System Prompt, Runtime Context, projected conversational messages, and any model-visible execution continuation.
+_Avoid_: Prompt, Conversation Session, raw Session transcript, Provider request payload
+
 **Skill**:
 A named, discoverable instruction package that guides an Agent Run through existing capabilities without registering Tools or expanding permissions.
 _Avoid_: Tool, Plugin, Management Command, capability extension
@@ -97,7 +101,7 @@ The ordered set of valid Skill metadata available for discovery without loading 
 _Avoid_: Tool Catalog, command list, loaded Skill content
 
 **Skill Snapshot**:
-The immutable set of validated Skill metadata and complete instructions captured for one Runtime Generation.
+The immutable set of validated Skill metadata and complete instructions captured and exposed by the Skill Loader at one successful load, retained until another successful reload or Runtime Generation replacement.
 _Avoid_: live Skill directory, Tool Catalog, Runtime Lifetime cache
 
 **Skill Invocation**:
