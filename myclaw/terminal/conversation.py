@@ -377,10 +377,6 @@ class _ReasoningEffortSelector(Static):
     def selected_effort(self) -> ReasoningEffort:
         return REASONING_EFFORT_LEVELS[self._selected_index]
 
-    @property
-    def selected_index(self) -> int:
-        return self._selected_index
-
     def set_effort(self, effort: ReasoningEffort) -> None:
         self._selected_index = REASONING_EFFORT_LEVELS.index(effort)
         self._refresh_content()
@@ -396,18 +392,16 @@ class _ReasoningEffortSelector(Static):
                 content.append(effort)
         self.update(content)
 
-    def _move(self, direction: int) -> None:
-        self._selected_index = max(
-            0,
-            min(len(REASONING_EFFORT_LEVELS) - 1, self._selected_index + direction),
-        )
-        self._refresh_content()
-
     async def _on_key(self, event: Key) -> None:
         if event.key in {"left", "right"}:
             event.stop()
             event.prevent_default()
-            self._move(-1 if event.key == "left" else 1)
+            direction = -1 if event.key == "left" else 1
+            self._selected_index = max(
+                0,
+                min(len(REASONING_EFFORT_LEVELS) - 1, self._selected_index + direction),
+            )
+            self._refresh_content()
             return
         if event.key == "enter":
             event.stop()

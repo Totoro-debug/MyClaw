@@ -618,9 +618,7 @@ class ConfigLoader:
 
         candidate_content = tomlkit.dumps(source_document)
         candidate = tomllib.loads(candidate_content)
-        configuration = _parse_configuration(_table(candidate, "configuration"))
-        if "default" not in configuration.models.routes:
-            raise _missing_default_route_error()
+        _parse_configuration(_table(candidate, "configuration"))
         HOST_FILESYSTEM.atomic_replace_text(self.path, candidate_content)
 
     def view(self) -> ConfigView:

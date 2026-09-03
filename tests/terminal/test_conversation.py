@@ -5848,17 +5848,13 @@ async def test_effort_selector_clamps_navigation_at_both_boundaries() -> None:
 
         await pilot.press("left", "left", "left", "left", "left")
         assert selector.selected_effort == "low"
-        assert selector.selected_index == 0
         await pilot.press("left")
         assert selector.selected_effort == "low"
-        assert selector.selected_index == 0
 
         await pilot.press("right", "right", "right", "right", "right")
         assert selector.selected_effort == "max"
-        assert selector.selected_index == 4
         await pilot.press("right")
         assert selector.selected_effort == "max"
-        assert selector.selected_index == 4
 
         await pilot.press("escape")
         await pilot.pause()
