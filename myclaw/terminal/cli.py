@@ -398,6 +398,7 @@ async def _run_cli_conversation(
             schedule_status=lambda: schedule_service.status_snapshot().to_dict(),
             now=local_now,
             monotonic=monotonic,
+            reasoning_effort_control=router,
         )
         dispatcher = ManagementCommandDispatcher(management)
         terminal_app = TerminalConversationApp(

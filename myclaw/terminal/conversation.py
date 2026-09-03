@@ -52,6 +52,7 @@ from myclaw.management.commands import (
     ManagementCommandDispatcher,
 )
 from myclaw.management.service import FatalManagementError, SessionListingEntry
+from myclaw.provider.models import REASONING_EFFORT_LEVELS, ReasoningEffort
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.keyboard import EnhancedKeyboardAction, EnhancedKeyboardAdapter
 
@@ -350,6 +351,73 @@ class _CommandCompletion(OptionList):
             event.stop()
             event.prevent_default()
             self.post_message(self.Dismissed())
+            return
+        await super()._on_key(event)
+
+
+class _ReasoningEffortSelector(Static):
+    """Focused horizontal selector for the Runtime-Lifetime Reasoning Effort."""
+
+    can_focus = True
+
+    class Confirmed(Message):
+        def __init__(self, selector: _ReasoningEffortSelector) -> None:
+            super().__init__()
+            self.effort = selector.selected_effort
+
+    class Cancelled(Message):
+        pass
+
+    def __init__(self, effort: ReasoningEffort = "medium", *, id: str | None = None) -> None:
+        super().__init__("", id=id, markup=False)
+        self._selected_index = 0
+        self.set_effort(effort)
+
+    @property
+    def selected_effort(self) -> ReasoningEffort:
+        return REASONING_EFFORT_LEVELS[self._selected_index]
+
+    @property
+    def selected_index(self) -> int:
+        return self._selected_index
+
+    def set_effort(self, effort: ReasoningEffort) -> None:
+        self._selected_index = REASONING_EFFORT_LEVELS.index(effort)
+        self._refresh_content()
+
+    def _refresh_content(self) -> None:
+        content = Text()
+        for index, effort in enumerate(REASONING_EFFORT_LEVELS):
+            if index:
+                content.append("  ")
+            if index == self._selected_index:
+                content.append(effort, style="reverse bold")
+            else:
+                content.append(effort)
+        self.update(content)
+
+    def _move(self, direction: int) -> None:
+        self._selected_index = max(
+            0,
+            min(len(REASONING_EFFORT_LEVELS) - 1, self._selected_index + direction),
+        )
+        self._refresh_content()
+
+    async def _on_key(self, event: Key) -> None:
+        if event.key in {"left", "right"}:
+            event.stop()
+            event.prevent_default()
+            self._move(-1 if event.key == "left" else 1)
+            return
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Confirmed(self))
+            return
+        if event.key in {"escape", "ctrl+c"}:
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Cancelled())
             return
         await super()._on_key(event)
 
@@ -1644,6 +1712,20 @@ class TerminalConversationApp(App[None]):
         background: transparent;
     }
 
+    #reasoning-effort-selector {
+        display: none;
+        height: 3;
+        min-height: 3;
+        width: 100%;
+        border-top: solid $panel;
+        padding: 0 1;
+        overflow-x: auto;
+        text-wrap: nowrap;
+        content-align: center middle;
+        text-align: center;
+        background: transparent;
+    }
+
     .message {
         width: 72%;
         max-width: 100%;
@@ -1708,9 +1790,9 @@ class TerminalConversationApp(App[None]):
     #command-completion {
         display: none;
         overlay: screen;
-        offset: 0 -7;
+        offset: 0 -8;
         width: 100%;
-        max-height: 7;
+        max-height: 8;
         text-wrap: nowrap;
         text-overflow: ellipsis;
         background: transparent;
@@ -1949,6 +2031,7 @@ class TerminalConversationApp(App[None]):
             Static("New content below", id="new-content", markup=False),
             Static("", id="pending-queue", markup=False),
             Static("Working", id="turn-status", markup=False),
+            _ReasoningEffortSelector(id="reasoning-effort-selector"),
             _ConversationInput(id="conversation-input", placeholder="Message MyClaw"),
             id="conversation-input-region",
         )
@@ -2218,6 +2301,26 @@ class TerminalConversationApp(App[None]):
         message.stop()
         self.dismiss_command_completion()
 
+    @on(_ReasoningEffortSelector.Confirmed)
+    async def _reasoning_effort_confirmed(
+        self,
+        message: _ReasoningEffortSelector.Confirmed,
+    ) -> None:
+        message.stop()
+        self._close_reasoning_effort_selector()
+        try:
+            result = await self._management_dispatcher.update_reasoning_effort(message.effort)
+        except Exception as error:
+            self._handle_exception(error)
+            return
+        if result.output is not None:
+            await self._mount_management_rows("/effort", result.output)
+
+    @on(_ReasoningEffortSelector.Cancelled)
+    def _reasoning_effort_cancelled(self, message: _ReasoningEffortSelector.Cancelled) -> None:
+        message.stop()
+        self._close_reasoning_effort_selector()
+
     @on(_ActivityGroupHeading.Clicked)
     def _activity_group_clicked(self, message: _ActivityGroupHeading.Clicked) -> None:
         message.stop()
@@ -2279,7 +2382,11 @@ class TerminalConversationApp(App[None]):
         if len(self.screen_stack) != 1:
             return
         with suppress(Exception):
-            self.query_one(_ConversationInput).focus()
+            selector = self.query_one("#reasoning-effort-selector", _ReasoningEffortSelector)
+            if selector.display:
+                selector.focus()
+            else:
+                self.query_one(_ConversationInput).focus()
 
     def move_command_completion(self, direction: int) -> None:
         if not self._completion_options:
@@ -2354,6 +2461,27 @@ class TerminalConversationApp(App[None]):
             completion.set_options(())
             completion.display = False
 
+    def _open_reasoning_effort_selector(
+        self,
+        effort: ReasoningEffort,
+        input_area: _ConversationInput,
+    ) -> None:
+        selector = self.query_one("#reasoning-effort-selector", _ReasoningEffortSelector)
+        self._hide_command_completion()
+        selector.set_effort(effort)
+        input_area.text = ""
+        input_area.display = False
+        selector.display = True
+        selector.focus()
+
+    def _close_reasoning_effort_selector(self) -> None:
+        selector = self.query_one("#reasoning-effort-selector", _ReasoningEffortSelector)
+        input_area = self.query_one("#conversation-input", _ConversationInput)
+        selector.display = False
+        input_area.display = True
+        input_area.text = ""
+        input_area.focus()
+
     @on(_ConversationDisplay.Resized)
     def _display_resized(self, message: _ConversationDisplay.Resized) -> None:
         compact = message.width <= _COMPACT_MESSAGE_MAX_WIDTH
@@ -2379,6 +2507,10 @@ class TerminalConversationApp(App[None]):
 
         result = await self._management_dispatcher.dispatch(text)
         if result.handled:
+            if result.effort_selection is not None:
+                message.text_area.remember_submission(text)
+                self._open_reasoning_effort_selector(result.effort_selection, message.text_area)
+                return
             if result.skill_metadata is not None:
                 self._skill_metadata = tuple(result.skill_metadata)
                 self._hide_command_completion()

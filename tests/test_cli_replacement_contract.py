@@ -171,6 +171,7 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     constructed: list[AgentLoop] = []
+    routers: list[object] = []
     original_init = AgentLoop.__init__
     provider = ScriptedFakeProvider(
         streams=(
@@ -193,6 +194,7 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
     )
 
     def recording_init(loop: AgentLoop, *args: Any, **kwargs: Any) -> None:
+        routers.append(kwargs["model_router"])
         kwargs["model_router"] = TaskFramingRouterAdapter(kwargs["model_router"])
         original_init(loop, *args, **kwargs)
         constructed.append(loop)
@@ -201,6 +203,8 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
     monkeypatch.setattr(cli, "create_provider", lambda _configuration: provider)
 
     def update_skills(old: AgentLoop) -> None:
+        assert routers
+        cast(Any, routers[0]).set_reasoning_effort("max")
         assert [metadata.name for metadata in old.skill_metadata] == ["current", "removed"]
         assert [(metadata.name, metadata.description) for metadata in old.skill_metadata] == [
             ("current", "Original"),
@@ -224,6 +228,7 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
         messages = await collect_foreground_outbound(bus, "Inspect refreshed Skills.")
         assert any(message.content == "Fresh Skill prompt observed." for message in messages)
         assert len(provider.stream_requests) == 1
+        assert provider.stream_requests[0].reasoning_effort == "max"
         system_prompt = provider.stream_requests[0].messages[0]["content"]
         assert isinstance(system_prompt, str)
         assert '"name":"added"' in system_prompt
@@ -251,6 +256,8 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
     ]
     assert len(constructed) == 2
     assert constructed == [constructed[0], target]
+    assert len(routers) == 2
+    assert routers == [routers[0], routers[0]]
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ from myclaw.management.service import (
 )
 from myclaw.memory.dream import DreamResult
 from myclaw.memory.manager import MemoryManager
+from myclaw.provider.models import ReasoningEffort
 from myclaw.session.session import Session
 from tests.management.factories import management_service
 
@@ -98,6 +99,33 @@ class _DreamRunner:
             memory_updated=True,
             cursor=1,
         )
+
+
+class _ReasoningEffortControl:
+    def __init__(self, effort: ReasoningEffort = "medium") -> None:
+        self.effort = effort
+
+    @property
+    def reasoning_effort(self) -> ReasoningEffort:
+        return self.effort
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        self.effort = effort
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_service_publishes_and_reads_runtime_value(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    control = _ReasoningEffortControl("high")
+    service = management_service(home, reasoning_effort_control=control)
+
+    assert await service.reasoning_effort() == "high"
+    assert await service.update_reasoning_effort("xhigh") == "xhigh"
+    assert control.effort == "xhigh"
+    assert await service.reasoning_effort() == "xhigh"
 
 
 @pytest.mark.asyncio
@@ -261,6 +289,7 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
     assert status == RuntimeStatus(
         version="0.1.0",
         chat_model="primary/model-id",
+        chat_reasoning_effort="medium",
         uptime_seconds=12,
         estimated_input_tokens=4,
         context_window=10,
@@ -275,6 +304,21 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
         },
         schedule={"status": "available", "active_job_count": 0},
     )
+
+
+@pytest.mark.asyncio
+async def test_status_projects_the_current_runtime_reasoning_effort(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    control = _ReasoningEffortControl("xhigh")
+    service = management_service(home, reasoning_effort_control=control)
+
+    status = await service.status()
+
+    assert status.chat_reasoning_effort == "xhigh"
+    assert status.to_dict()["chat_reasoning_effort"] == "xhigh"
 
 
 @pytest.mark.asyncio

@@ -1304,6 +1304,7 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
         "schedule_status",
         "now",
         "monotonic",
+        "reasoning_effort_control",
     )
     assert management_init.args.defaults == []
     assert all(default is None for default in management_init.args.kw_defaults)

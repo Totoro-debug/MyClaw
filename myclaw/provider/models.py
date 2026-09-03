@@ -2,7 +2,7 @@
 
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar, Literal, Protocol
+from typing import Any, ClassVar, Final, Literal, Protocol
 
 from myclaw.provider.errors import EmptyModelResponseError
 from myclaw.tools.base import OpenAIToolSchema
@@ -11,6 +11,13 @@ from myclaw.utils.validation import require_nonnegative_int
 
 type ModelRoute = Literal["default", "chat", "memory", "schedule"]
 type ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
+REASONING_EFFORT_LEVELS: Final[tuple[ReasoningEffort, ...]] = (
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
 type FinishReason = Literal["stop", "tool_calls", "length", "cancelled"]
 type ModelMessageDictionary = dict[str, Any]
 type ModelMessages = Sequence[ModelMessageDictionary]

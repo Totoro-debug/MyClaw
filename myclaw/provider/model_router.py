@@ -1,22 +1,24 @@
 """Model Route resolution and one shared Provider attempt budget."""
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from loguru import logger
 
 from myclaw.config.config import ProviderConfiguration, ResolvedModelRoute, UserConfiguration
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
+    REASONING_EFFORT_LEVELS,
     ModelContinuation,
     ModelMessages,
     ModelProvider,
     ModelResponse,
     ModelRoute,
     ModelStreamEvent,
+    ReasoningEffort,
 )
 from myclaw.tools.base import OpenAIToolSchema
 
@@ -66,6 +68,7 @@ class ModelRouter:
         self._current_call_statuses: ContextVar[dict[ModelRoute, ModelRouteStatus] | None] = (
             ContextVar("myclaw_model_router_call_statuses", default=None)
         )
+        self._reasoning_effort_override: ReasoningEffort | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._detached_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._aborted = False
@@ -86,6 +89,21 @@ class ModelRouter:
         statuses = self._current_call_statuses.get()
         return None if statuses is None else statuses.get(requested_route)
 
+    @property
+    def reasoning_effort(self) -> ReasoningEffort:
+        """Return the effective chat Reasoning Effort for this Runtime Lifetime."""
+        override = self._reasoning_effort_override
+        if override is not None:
+            return override
+        resolved = self._configuration.resolve_route("chat")
+        return resolved.route.reasoning_effort
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        """Publish the Runtime-Lifetime Reasoning Effort override."""
+        if effort not in REASONING_EFFORT_LEVELS:
+            raise ValueError(f"Unsupported Reasoning Effort: {effort}")
+        self._reasoning_effort_override = effort
+
     def stream(
         self,
         route: ModelRoute,
@@ -94,22 +112,24 @@ class ModelRouter:
         tools: Sequence[OpenAIToolSchema],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
+        resolved, reasoning_effort = self._begin_call(route, continuation=continuation)
         return self._stream_direct(
-            route,
+            resolved,
             messages=messages,
             tools=tools,
             continuation=continuation,
+            reasoning_effort=reasoning_effort,
         )
 
     async def _stream_direct(
         self,
-        route: ModelRoute,
+        resolved: ResolvedModelRoute,
         *,
         messages: ModelMessages,
         tools: Sequence[OpenAIToolSchema],
         continuation: ModelContinuation | None,
+        reasoning_effort: ReasoningEffort | None,
     ) -> AsyncIterator[ModelStreamEvent]:
-        resolved = self._begin_call(route, continuation=continuation)
         if continuation is not None and continuation.provider_id != resolved.provider.provider_id:
             continuation = None
 
@@ -139,32 +159,39 @@ class ModelRouter:
             except ModelCallError as failure:
                 if emitted:
                     raise
-                resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
+                resolved = await self._recover_attempt(
+                    resolved,
+                    failure,
+                    attempt=attempt,
+                    reasoning_effort=reasoning_effort,
+                )
 
-    async def complete(
+    def complete(
         self,
         route: ModelRoute,
         *,
         messages: ModelMessages,
         tools: Sequence[OpenAIToolSchema],
         continuation: ModelContinuation | None = None,
-    ) -> ModelResponse:
-        return await self._complete_direct(
-            route,
+    ) -> Coroutine[Any, Any, ModelResponse]:
+        resolved, reasoning_effort = self._begin_call(route, continuation=continuation)
+        return self._complete_direct(
+            resolved,
             messages=messages,
             tools=tools,
             continuation=continuation,
+            reasoning_effort=reasoning_effort,
         )
 
     async def _complete_direct(
         self,
-        route: ModelRoute,
+        resolved: ResolvedModelRoute,
         *,
         messages: ModelMessages,
         tools: Sequence[OpenAIToolSchema],
         continuation: ModelContinuation | None,
+        reasoning_effort: ReasoningEffort | None,
     ) -> ModelResponse:
-        resolved = self._begin_call(route, continuation=continuation)
         if continuation is not None and continuation.provider_id != resolved.provider.provider_id:
             continuation = None
 
@@ -187,7 +214,12 @@ class ModelRouter:
                     ),
                 )
             except ModelCallError as failure:
-                resolved = await self._recover_attempt(resolved, failure, attempt=attempt)
+                resolved = await self._recover_attempt(
+                    resolved,
+                    failure,
+                    attempt=attempt,
+                    reasoning_effort=reasoning_effort,
+                )
 
         raise AssertionError("Provider attempt budget exhausted without a terminal result")
 
@@ -265,6 +297,7 @@ class ModelRouter:
         failure: ModelCallError,
         *,
         attempt: int,
+        reasoning_effort: ReasoningEffort | None,
     ) -> ResolvedModelRoute:
         if attempt == _MAX_ATTEMPTS:
             raise failure
@@ -287,13 +320,17 @@ class ModelRouter:
         if current.selected_route == "default" or not allows_fallback:
             raise failure
         fallback = self._configuration.resolve_route("default")
-        if fallback.provider == current.provider and fallback.route == current.route:
-            raise failure
         requested_route = cast(ModelRoute, current.requested_route)
+        fallback_route = fallback.route
+        if reasoning_effort is not None:
+            fallback_route = replace(fallback_route, reasoning_effort=reasoning_effort)
+        if fallback.provider == current.provider and fallback_route == current.route:
+            raise failure
         fallback = replace(
             fallback,
             requested_route=requested_route,
             used_default=True,
+            route=fallback_route,
         )
         status = _route_status(requested_route, fallback)
         self._route_statuses[requested_route] = status
@@ -315,10 +352,16 @@ class ModelRouter:
         requested_route: ModelRoute,
         *,
         continuation: ModelContinuation | None,
-    ) -> ResolvedModelRoute:
+    ) -> tuple[ResolvedModelRoute, ReasoningEffort | None]:
+        reasoning_effort = self._reasoning_effort_override
         resolved = self._continuation_route(requested_route, continuation)
         if resolved is None:
             resolved = self._configuration.resolve_route(requested_route)
+        if reasoning_effort is not None and resolved.selected_route in {"default", "chat"}:
+            resolved = replace(
+                resolved,
+                route=replace(resolved.route, reasoning_effort=reasoning_effort),
+            )
         status = _route_status(requested_route, resolved)
         self._route_statuses[requested_route] = status
         self._remember_current_call_status(requested_route, status)
@@ -331,7 +374,7 @@ class ModelRouter:
                 resolved.selected_route,
                 resolved.route.model,
             )
-        return resolved
+        return resolved, reasoning_effort
 
     def _continuation_route(
         self,

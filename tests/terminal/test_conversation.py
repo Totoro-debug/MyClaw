@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -5207,6 +5208,7 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
                 (
                     "/config - ",
                     "/status - ",
+                    "/effort - ",
                     "/resume - ",
                     "/memory - ",
                     "/dream - ",
@@ -5216,6 +5218,7 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
         assert visible_commands == [
             "/config - View User Configuration",
             "/status - View Runtime Status",
+            "/effort - Set Chat Reasoning Effort",
             "/resume - Resume a Conversation Session",
             "/memory - View Long-term Memory",
             "/dream - Process pending Conversation Summaries",
@@ -5244,6 +5247,7 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
                 (
                     "/config - ",
                     "/status - ",
+                    "/effort - ",
                     "/resume - ",
                     "/memory - ",
                     "/dream - ",
@@ -5263,6 +5267,7 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
                 (
                     "/config - ",
                     "/status - ",
+                    "/effort - ",
                     "/resume - ",
                     "/memory - ",
                     "/dream - ",
@@ -5297,6 +5302,7 @@ async def test_management_completion_keeps_the_composer_visible(
                     (
                         "/config - ",
                         "/status - ",
+                        "/effort - ",
                         "/resume - ",
                         "/memory - ",
                         "/dream - ",
@@ -5305,6 +5311,7 @@ async def test_management_completion_keeps_the_composer_visible(
             ] == [
                 "/config - View User Configuration",
                 "/status - View Runtime Status",
+                "/effort - Set Chat Reasoning Effort",
                 "/resume - Resume a Conversation Session",
                 "/memory - View Long-term Memory",
                 "/dream - Process pending Conversation Summaries",
@@ -5371,6 +5378,7 @@ async def test_skill_completion_merges_after_management_commands_with_safe_label
         assert [str(option.prompt) for option in completion.options] == [
             "/config - View User Configuration",
             "/status - View Runtime Status",
+            "/effort - Set Chat Reasoning Effort",
             "/resume - Resume a Conversation Session",
             "/memory - View Long-term Memory",
             "/dream - Process pending Conversation Summaries",
@@ -5684,3 +5692,173 @@ async def test_completion_ctrl_c_closes_completion_before_idle_draft_behavior() 
         await pilot.press("ctrl+c")
         await pilot.pause()
         assert not app.is_running
+
+
+class _EffortManagement:
+    def __init__(self, effort: str) -> None:
+        self.effort = effort
+        self.updated: list[str] = []
+
+    async def reasoning_effort(self) -> str:
+        return self.effort
+
+    async def update_reasoning_effort(self, effort: str) -> str:
+        self.updated.append(effort)
+        self.effort = effort
+        return effort
+
+
+class _BlockingEffortManagement(_EffortManagement):
+    def __init__(self, effort: str) -> None:
+        super().__init__(effort)
+        self.update_started = asyncio.Event()
+        self.release_update = asyncio.Event()
+
+    async def update_reasoning_effort(self, effort: str) -> str:
+        self.updated.append(effort)
+        self.update_started.set()
+        await self.release_update.wait()
+        self.effort = effort
+        return effort
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial", ("low", "medium", "high", "xhigh", "max"))
+@pytest.mark.parametrize("cancel_key", ("escape", "ctrl+c"))
+async def test_effort_selector_cancels_without_rows_or_runtime_updates(
+    initial: str,
+    cancel_key: str,
+) -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    management = _EffortManagement(initial)
+    app = _terminal_app(
+        cast(Any, runtime),
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/effort"), "enter")
+        await pilot.pause()
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        selector = app.query_one("#reasoning-effort-selector", Static)
+        selector_state = cast(Any, selector)
+        assert not input_area.display
+        assert selector.display
+        assert selector_state.selected_effort == initial
+        assert app.screen.focused is selector
+        visible_text = _visible_screen_text(app)
+        assert all(
+            re.search(rf"(?<![a-z]){level}(?![a-z])", visible_text) is not None
+            for level in ("low", "medium", "high", "xhigh", "max")
+        )
+
+        await pilot.press("right", cancel_key)
+        await pilot.pause()
+
+        assert management.updated == []
+        assert input_area.display
+        assert not selector.display
+        assert input_area.text == ""
+        assert app.screen.focused is input_area
+        assert len(app.query(".management-row")) == 0
+        assert runtime.inbound_history == []
+        assert conversation.submissions == []
+
+        await pilot.press("up")
+        assert input_area.text == "/effort"
+
+
+@pytest.mark.asyncio
+async def test_effort_selector_commits_selected_value_and_restores_composer() -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    management = _EffortManagement("medium")
+    app = _terminal_app(
+        cast(Any, runtime),
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/effort"), "enter")
+        await pilot.pause()
+        await pilot.press("right", "right", "enter")
+        await pilot.pause()
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        selector = app.query_one("#reasoning-effort-selector", Static)
+        assert management.updated == ["xhigh"]
+        assert input_area.display
+        assert not selector.display
+        assert input_area.text == ""
+        assert app.screen.focused is input_area
+        assert "Command: /effort" in _visible_screen_text(app)
+        assert _visible_screen_text(app).count("Chat reasoning effort: xhigh") == 1
+        assert len(app.query(".management-row")) == 2
+
+
+@pytest.mark.asyncio
+async def test_effort_selector_accepts_only_one_confirm_while_update_is_pending() -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    management = _BlockingEffortManagement("medium")
+    app = _terminal_app(
+        cast(Any, runtime),
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/effort"), "enter")
+        await pilot.pause()
+        confirm = asyncio.create_task(pilot.press("right", "enter"))
+        await management.update_started.wait()
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        selector = app.query_one("#reasoning-effort-selector", Static)
+        assert input_area.display
+        assert not selector.display
+
+        duplicate = asyncio.create_task(pilot.press("enter"))
+        await asyncio.sleep(0)
+        management.release_update.set()
+        await asyncio.gather(confirm, duplicate)
+        await pilot.pause()
+
+        assert management.updated == ["high"]
+        assert _visible_screen_text(app).count("Chat reasoning effort: high") == 1
+        assert len(app.query(".management-row")) == 2
+
+
+@pytest.mark.asyncio
+async def test_effort_selector_clamps_navigation_at_both_boundaries() -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    management = _EffortManagement("medium")
+    app = _terminal_app(
+        cast(Any, runtime),
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/effort"), "enter")
+        await pilot.pause()
+        selector = cast(Any, app.query_one("#reasoning-effort-selector", Static))
+
+        await pilot.press("left", "left", "left", "left", "left")
+        assert selector.selected_effort == "low"
+        assert selector.selected_index == 0
+        await pilot.press("left")
+        assert selector.selected_effort == "low"
+        assert selector.selected_index == 0
+
+        await pilot.press("right", "right", "right", "right", "right")
+        assert selector.selected_effort == "max"
+        assert selector.selected_index == 4
+        await pilot.press("right")
+        assert selector.selected_effort == "max"
+        assert selector.selected_index == 4
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert management.updated == []

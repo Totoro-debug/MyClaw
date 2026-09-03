@@ -13,6 +13,7 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, ConfigView
 from myclaw.errors import ErrorInfo
 from myclaw.memory.dream import DreamResult
+from myclaw.provider.models import REASONING_EFFORT_LEVELS, ReasoningEffort
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
@@ -26,6 +27,13 @@ class _MemoryReader(Protocol):
 
 class _DreamRunner(Protocol):
     async def run(self) -> DreamResult: ...
+
+
+class _ReasoningEffortControl(Protocol):
+    @property
+    def reasoning_effort(self) -> ReasoningEffort: ...
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None: ...
 
 
 class _StatusProjectionLoop(Protocol):
@@ -106,6 +114,7 @@ class RuntimeStatus:
 
     version: str
     chat_model: str
+    chat_reasoning_effort: ReasoningEffort
     uptime_seconds: int
     estimated_input_tokens: int
     context_window: int
@@ -127,6 +136,7 @@ class RuntimeStatus:
         result: dict[str, object] = {
             "version": self.version,
             "chat_model": self.chat_model,
+            "chat_reasoning_effort": self.chat_reasoning_effort,
             "uptime_seconds": self.uptime_seconds,
             "estimated_input_tokens": self.estimated_input_tokens,
             "context_window": self.context_window,
@@ -190,6 +200,7 @@ class ManagementViewService:
         schedule_status: Callable[[], dict[str, object]],
         now: Callable[[], datetime],
         monotonic: Callable[[], float],
+        reasoning_effort_control: _ReasoningEffortControl,
     ) -> None:
         self._config = ConfigLoader(agent_home)
         self._current_agent_loop = current_agent_loop
@@ -201,6 +212,7 @@ class ManagementViewService:
         self._schedule_status = schedule_status
         self._memory_reader = memory_manager
         self._dream = dream
+        self._reasoning_effort_control = reasoning_effort_control
         self._aborted = False
 
     async def reload_skill(self) -> tuple[SkillMetadata, ...]:
@@ -269,11 +281,32 @@ class ManagementViewService:
         self._ensure_current_generation()
         return await self._dream.run()
 
+    async def reasoning_effort(self) -> ReasoningEffort:
+        """Return the current Runtime-Lifetime chat Reasoning Effort."""
+        self._ensure_active()
+        effort = self._reasoning_effort_control.reasoning_effort
+        if effort not in REASONING_EFFORT_LEVELS:
+            raise ManagementError(
+                ErrorInfo("config_invalid", "Runtime Reasoning Effort is invalid.")
+            )
+        return effort
+
+    async def update_reasoning_effort(self, effort: ReasoningEffort) -> ReasoningEffort:
+        """Publish one validated Runtime-Lifetime chat Reasoning Effort."""
+        self._ensure_active()
+        if effort not in REASONING_EFFORT_LEVELS:
+            raise ManagementError(
+                ErrorInfo("config_invalid", "Runtime Reasoning Effort is invalid.")
+            )
+        self._reasoning_effort_control.set_reasoning_effort(effort)
+        return await self.reasoning_effort()
+
     async def status(self) -> RuntimeStatus:
         """Return all required runtime and current-session status fields."""
         self._ensure_active()
         try:
             projection = self._current_agent_loop().runtime_status_input()
+            chat_reasoning_effort = await self.reasoning_effort()
             estimated = estimate_input_tokens(projection)
             if projection.context_window <= 0:
                 raise ValueError("Runtime status context window must be positive")
@@ -282,6 +315,7 @@ class ManagementViewService:
             return RuntimeStatus(
                 version=__version__,
                 chat_model=projection.chat_model,
+                chat_reasoning_effort=chat_reasoning_effort,
                 uptime_seconds=uptime,
                 estimated_input_tokens=estimated,
                 context_window=projection.context_window,

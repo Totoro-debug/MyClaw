@@ -530,12 +530,12 @@ prompt 文本存放在独立、可版本追踪的 package resources；测试断�
 
 Terminal Conversation reuses one presentation-only completion surface for Management Commands
 and Skill metadata. It shows candidates only when the composer text starts with `/` at character
-zero and contains no character for which `str.isspace()` is true. The six Management Commands
+zero and contains no character for which `str.isspace()` is true. The seven Management Commands
 remain first in their fixed order, with these stable labels and descriptions: `/config - View User
-Configuration`, `/status - View Runtime Status`, `/resume - Resume a Conversation Session`,
-`/memory - View Long-term Memory`, `/dream - Process pending Conversation Summaries`, and
-`/reload_skill - Reload Skills`. Valid Skills follow in the current Skill Snapshot order and use
-`/name - description`.
+Configuration`, `/status - View Runtime Status`, `/effort - Set Chat Reasoning Effort`, `/resume -
+Resume a Conversation Session`, `/memory - View Long-term Memory`, `/dream - Process pending
+Conversation Summaries`, and `/reload_skill - Reload Skills`. Valid Skills follow in the current
+Skill Snapshot order and use `/name - description`.
 
 The display label is independent from the insertion value. Skill descriptions are user-controlled:
 their whitespace runs are folded to one ASCII space for a markup-disabled, single-line OptionList
@@ -552,6 +552,14 @@ after the replacement Agent Loop has built and preflighted its initial Skill sta
 `/reload_skill` atomically replaces the projection with the metadata returned by the same load and
 closes the completion surface; failure displays stable `skill_reload_failed` output while retaining
 the previous Skill metadata, composer text, and completion state.
+
+Only the exact `/effort` token opens the Reasoning Effort selector; parameterized, differently cased,
+or whitespace-variant input remains ordinary foreground input. The selector replaces the composer,
+starts at the current effective `chat` value, and orders `low`, `medium`, `high`, `xhigh`, `max` from
+left to right with clamped navigation. `Enter` commits and emits exactly one neutral
+`Chat reasoning effort: <level>` result; `Esc` and `Ctrl+C` cancel without a conversation row or
+runtime update. Both paths restore an empty focused composer, and the submitted `/effort` remains in
+Runtime-Lifetime input history.
 
 ### 8.4 Context budget 与 consolidation
 
@@ -580,6 +588,14 @@ logical purpose -> requested route -> usable route config -> provider adapter
 - chat request 必须调用 streaming provider contract；memory/schedule 可调用 complete contract。
 - requested route 与 default 指向同一配置时只尝试一次。
 - default 不可用时 runtime startup 失败。
+- 一个 Runtime Lifetime 只创建一个共享 `ModelRouter`；它持有 `/effort` 发布的单一运行时 override，
+  并在 `/resume` 替换 Agent Loop 时保持同一对象 identity。
+- override 应用于解析后的 `default` 与 `chat` route。显式 `memory`、`schedule` route 仍使用各自配置；
+  缺失并解析到 `default` 的请求使用 override。
+- `ModelRouter.stream()` 与 `complete()` 在同步入口为每个逻辑请求捕获一次 override；该请求的
+  continuation、retry 与 Provider fallback 复用同一快照。更新后创建的下一请求（包括 active Agent Run
+  的下一轮 Tool loop）读取新值，已经构造的请求不变化。
+- `/status.chat_reasoning_effort` 来自共享 Router 的当前有效 `chat` 值，而不是启动时配置快照。
 
 固定失败/fallback 顺序：
 

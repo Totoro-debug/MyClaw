@@ -1,11 +1,13 @@
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from myclaw.agent.runner import AgentRunner
 from myclaw.config.config import (
     MemoryConfiguration,
     ModelsConfiguration,
@@ -28,6 +30,7 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
+from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
 from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
@@ -1222,3 +1225,324 @@ async def test_model_router_abort_owns_and_safely_consumes_detached_provider_cle
     assert owned == set()
     assert "Detached Model Provider cleanup failed" in capture.event_text
     assert "PRIVATE DETACHED PROVIDER FAILURE" not in capture.text
+
+
+@pytest.mark.asyncio
+async def test_model_router_runtime_effort_updates_chat_and_default_routes() -> None:
+    chat_provider = ScriptedFakeProvider(completions=(response("chat"),))
+    default_provider = ScriptedFakeProvider(completions=(response("default"),))
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+    )
+
+    assert router.reasoning_effort == "high"
+    router.set_reasoning_effort("max")
+
+    assert cast(str, router.reasoning_effort) == "max"
+    await router.complete("chat", **request())
+    await router.complete("default", **request())
+
+    assert chat_provider.complete_requests[0].reasoning_effort == "max"
+    assert default_provider.complete_requests[0].reasoning_effort == "max"
+
+
+@pytest.mark.asyncio
+async def test_model_router_runtime_effort_is_snapshotted_when_request_is_created() -> None:
+    provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(completed("stream"),)),),
+        completions=(response("complete"),),
+    )
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda _: provider,
+        clock=FakeClock(NOW),
+    )
+
+    router.set_reasoning_effort("high")
+    stream = router.stream("chat", **request())
+    completion = router.complete("chat", **request(stream=False))
+    router.set_reasoning_effort("max")
+
+    assert await collect(stream) == [completed("stream")]
+    assert await completion == response("complete")
+    assert provider.stream_requests[0].reasoning_effort == "high"
+    assert provider.complete_requests[0].reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_model_router_runtime_effort_keeps_explicit_routes_independent() -> None:
+    base = memory_configuration()
+    schedule_provider = ProviderConfiguration(
+        provider_id="schedule-provider",
+        protocol="anthropic",
+        base_url="https://schedule.example/v1",
+        api_key="schedule-secret",
+        models=("schedule-model",),
+    )
+    schedule_route = RouteConfiguration(
+        provider_id=schedule_provider.provider_id,
+        model="schedule-model",
+        context_window=70_000,
+        max_output=1024,
+        temperature=0.2,
+        reasoning_effort="xhigh",
+        timeout=45,
+    )
+    configuration_with_schedule = UserConfiguration(
+        runtime=base.runtime,
+        memory=base.memory,
+        models=ModelsConfiguration(
+            providers={**base.models.providers, schedule_provider.provider_id: schedule_provider},
+            routes={**base.models.routes, "schedule": schedule_route},
+        ),
+    )
+    memory_provider = ScriptedFakeProvider(completions=(response("memory"),))
+    schedule_provider_fake = ScriptedFakeProvider(completions=(response("schedule"),))
+    default_provider = ScriptedFakeProvider(completions=(response("fallback"),))
+    providers = {
+        "memory-provider": memory_provider,
+        "schedule-provider": schedule_provider_fake,
+        "default-provider": default_provider,
+    }
+    router = ModelRouter(
+        configuration=configuration_with_schedule,
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+    )
+
+    router.set_reasoning_effort("max")
+    await router.complete("memory", **request())
+    await router.complete("schedule", **request())
+    await router.complete("default", **request())
+
+    assert memory_provider.complete_requests[0].reasoning_effort == "low"
+    assert schedule_provider_fake.complete_requests[0].reasoning_effort == "xhigh"
+    assert default_provider.complete_requests[0].reasoning_effort == "max"
+
+
+@pytest.mark.asyncio
+async def test_model_router_runtime_effort_reaches_routes_inheriting_default() -> None:
+    provider = ScriptedFakeProvider(
+        completions=(response("memory"), response("schedule")),
+    )
+    router = ModelRouter(
+        configuration=configuration(),
+        provider_factory=lambda _: provider,
+        clock=FakeClock(NOW),
+    )
+
+    router.set_reasoning_effort("xhigh")
+    await router.complete("memory", **request())
+    await router.complete("schedule", **request())
+
+    assert [call.reasoning_effort for call in provider.complete_requests] == ["xhigh", "xhigh"]
+    assert router.route_status("memory").selected_route == "default"
+    assert router.route_status("schedule").selected_route == "default"
+
+
+@pytest.mark.asyncio
+async def test_model_router_runtime_effort_is_snapshotted_across_retry() -> None:
+    class BlockingClock:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.sleeps: list[float] = []
+
+        async def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+            self.started.set()
+            await self.release.wait()
+
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(events=(), error=retryable_timeout()),
+            StreamScript(events=(completed("retried"),)),
+            StreamScript(events=(completed("next"),)),
+        )
+    )
+    clock = BlockingClock()
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda _: provider,
+        clock=clock,
+        jitter=None,
+    )
+
+    pending = asyncio.create_task(collect(router.stream("chat", **request())))
+    await clock.started.wait()
+    router.set_reasoning_effort("max")
+    clock.release.set()
+
+    assert await pending == [completed("retried")]
+    await collect(router.stream("chat", **request()))
+
+    assert [call.reasoning_effort for call in provider.stream_requests] == [
+        "high",
+        "high",
+        "max",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_router_runtime_effort_is_kept_across_stream_fallback() -> None:
+    chat_provider = ScriptedFakeProvider(streams=(StreamScript(events=(), error=permanent_failure()),))
+    default_provider = ScriptedFakeProvider(streams=(StreamScript(events=(completed("fallback"),)),))
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+
+    router.set_reasoning_effort("xhigh")
+    assert await collect(router.stream("chat", **request())) == [completed("fallback")]
+
+    assert chat_provider.stream_requests[0].reasoning_effort == "xhigh"
+    assert default_provider.stream_requests[0].reasoning_effort == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_model_router_runtime_effort_is_snapshotted_across_complete_fallback() -> None:
+    class BlockingClock:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def sleep(self, seconds: float) -> None:
+            del seconds
+            self.started.set()
+            await self.release.wait()
+
+    chat_provider = ScriptedFakeProvider(
+        completions=(retryable_timeout(), permanent_failure()),
+    )
+    default_provider = ScriptedFakeProvider(completions=(response("fallback"),))
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    clock = BlockingClock()
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=clock,
+        jitter=None,
+    )
+
+    router.set_reasoning_effort("high")
+    pending = asyncio.create_task(router.complete("chat", **request(stream=False)))
+    await clock.started.wait()
+    router.set_reasoning_effort("max")
+    clock.release.set()
+
+    assert await pending == response("fallback")
+    assert [call.reasoning_effort for call in chat_provider.complete_requests] == [
+        "high",
+        "high",
+    ]
+    assert default_provider.complete_requests[0].reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_model_router_runtime_effort_does_not_repeat_an_effectively_identical_fallback() -> None:
+    base = configuration()
+    default_route = base.models.routes["default"]
+    configuration_with_same_route = UserConfiguration(
+        runtime=base.runtime,
+        memory=base.memory,
+        models=ModelsConfiguration(
+            providers=base.models.providers,
+            routes={
+                **base.models.routes,
+                "chat": replace(default_route, reasoning_effort="high"),
+            },
+        ),
+    )
+    provider = ScriptedFakeProvider(streams=(StreamScript(events=(), error=permanent_failure()),))
+    router = ModelRouter(
+        configuration=configuration_with_same_route,
+        provider_factory=lambda _: provider,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+
+    router.set_reasoning_effort("max")
+    with pytest.raises(ModelCallError):
+        await collect(router.stream("chat", **request()))
+
+    assert len(provider.stream_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_runner_next_tool_loop_request_reads_latest_runtime_effort() -> None:
+    tool_call = ModelToolCall(id="call-1", name="work", arguments="{}")
+    continuation = ModelContinuation(provider_id="chat-provider", payload={"state": "opaque"})
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(
+                                content="Working",
+                                tool_calls=(tool_call,),
+                            ),
+                            usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
+                            finish_reason="tool_calls",
+                            continuation=continuation,
+                        )
+                    ),
+                )
+            ),
+            StreamScript(events=(completed("Done"),)),
+        )
+    )
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda _: provider,
+        clock=FakeClock(NOW),
+    )
+
+    class UpdatingGateway:
+        def __init__(self) -> None:
+            self.schemas: list[dict[str, object]] = []
+
+        async def call(
+            self,
+            observed: ModelToolCall,
+            *,
+            confirmation: object = None,
+        ) -> ToolResult:
+            del confirmation
+            router.set_reasoning_effort("max")
+            return ToolResult(
+                tool_call_id=observed.id,
+                name=observed.name,
+                status="success",
+                content="updated",
+            )
+
+    result = await AgentRunner(router).run(
+        [{"role": "user", "content": "Run work."}],
+        model="chat",
+        tool_gateway=cast(Any, UpdatingGateway()),
+        on_output=None,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+    )
+
+    assert result.final_content == "Done"
+    assert [call.reasoning_effort for call in provider.stream_requests] == ["high", "max"]
+    assert provider.stream_requests[1].continuation == continuation

@@ -141,14 +141,16 @@
 
 - 非交互管理首版只支持 `myclaw config`。
 - 首版不要求 `myclaw --help` 作为产品能力。
-- Terminal Conversation 内置 slash commands：`/config`、`/status`、`/resume`、`/memory`、`/dream`、`/reload_skill`。
+- Terminal Conversation 内置 slash commands：`/config`、`/status`、`/effort`、`/resume`、`/memory`、`/dream`、`/reload_skill`。
 - Only Management Commands enter the Management Port. An exact valid Skill slash invocation remains an ordinary foreground Agent Run; unknown or non-matching slash input remains ordinary input.
 - Skill names are validated exactly as authored without trimming; descriptions are trimmed. Each Agent Loop constructs a Skill Loader that reads every retained complete UTF-8 `SKILL.md` into one immutable Skill Snapshot; manual and opted-in always-load invocation use that frozen document, while Session persistence retains only the raw slash input. Invalid candidates are skipped with safe diagnostics. Startup and `/resume` perform an initial load; a successful `/reload_skill` atomically replaces the current Agent Loop's frozen state, while failure preserves it.
 - The shared completion surface keeps its existing Management Command Enter/click behavior. Skill Enter/click selection only fills `/<name> ` without submission, and Tab does not accept any completion candidate.
 - `/config` 完整显示配置，但脱敏 plaintext API key。
 - 配置语法错误时，`myclaw config` 显示解析错误、配置路径和原文，并对明显 API key 行做文本级脱敏。
-- `/status` 显示版本、chat model、当前 Agent Loop/Session uptime、估算 token 状态、当前 Session 消息数、`last_consolidated`、当前 Session 累计 model usage 和 Schedule 健康状态。
+- `/status` 显示版本、chat model、当前有效 chat Reasoning Effort、当前 Agent Loop/Session uptime、估算 token 状态、当前 Session 消息数、`last_consolidated`、当前 Session 累计 model usage 和 Schedule 健康状态。
 - `/status` 的 provider-neutral token estimate 使用 `ceil(UTF-8 byte length / 4)`，展示估算输入 token、context window 和占比；实际 cumulative usage 不混入估算值。
+- 只有精确 `/effort` 打开替换输入框的五档横向 selector；带参数、大小写不同或含额外空白的形式仍是普通前台输入。selector 以当前有效 `chat` 值开始，左右键按 `low`、`medium`、`high`、`xhigh`、`max` 移动且不循环，`Enter` 确认，`Esc` 或 `Ctrl+C` 取消。
+- `/effort` 取消不产生 conversation row 或运行时更新，并恢复空输入框和焦点；确认产生一个中性 `Chat reasoning effort: <level>` 结果。提交过的 `/effort` 在两种路径都保留于当前 Runtime Lifetime 的输入历史。
 - `/resume` 只展示当前 Workspace 的 sessions；选择任一 Session（包括当前 Session）都重建 Agent Loop、刷新 Skill Snapshot 并原子清空 Message Bus。原 Session 使用 `abandon()`，不做 final save；active run 仍需 force confirmation。
 - `/memory` 不分页，完整读取并显示磁盘最新 `memory.md`。
 - `/dream` 前台阻塞执行 `Dream.run()`，并显示处理条数、是否更新及 cursor 状态等摘要，不显示完整 diff。
@@ -240,6 +242,12 @@
 - `default` 不可用时，Terminal Conversation 启动失败。
 - 每个 route 配置 provider_id、model、context_window、max_output、temperature、reasoning_effort、timeout。
 - provider adapter 对不支持的 reasoning_effort 静默忽略。
+- 每个 Runtime Lifetime 的共享 `ModelRouter` 是 `/effort` 的运行时 authority。确认一次选择后，解析为
+  `chat` 或 `default` 的请求使用同一 override；显式 `memory` 与 `schedule` route 保留自身值，缺失并
+  fallback 到 `default` 时使用 override。
+- 每个逻辑 `ModelRouter.stream()` / `complete()` 请求在同步入口只捕获一次当前 override。同一请求的
+  continuation、retry 和 Provider fallback 保持该快照；之后新建的请求（包括 active Agent Run 的下一轮
+  Tool loop）立即读取新值。`/resume` 替换 Agent Loop 时复用同一 Router，因此跨 Conversation Session 保持。
 - 每个逻辑 model call 最多执行 5 个 provider attempts，不是首次调用后再重试 5 次；requested route 与 default fallback 共享该 attempt budget。
 - 临时 provider 错误在当前 route 的剩余 attempt budget 内指数退避并尊重 retry-after；具体 route 缺失、配置不可用或返回永久 route/provider 不可用错误时使用 default 的剩余 budget，context overflow、invalid request 和 cancellation 不 fallback。
 - Model Provider 配置包含 kebab-case provider_id、protocol、required base_url、plaintext api_key 和 model ID 列表。

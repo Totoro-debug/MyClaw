@@ -12,6 +12,7 @@ from myclaw.management.service import (
 )
 from myclaw.memory.dream import DreamResult
 from myclaw.memory.manager import MemoryManager
+from myclaw.provider.models import ReasoningEffort
 from myclaw.skills.catalog import SkillMetadata
 
 
@@ -40,6 +41,18 @@ class _DefaultDream:
         )
 
 
+class _DefaultReasoningEffortControl:
+    def __init__(self, effort: ReasoningEffort = "medium") -> None:
+        self.effort = effort
+
+    @property
+    def reasoning_effort(self) -> ReasoningEffort:
+        return self.effort
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        self.effort = effort
+
+
 async def _replace_agent_loop(_session_id: str, _force: bool) -> None:
     return None
 
@@ -57,6 +70,7 @@ def management_service(
     prepare_session_resume: Callable[[str], Awaitable[None]] = _prepare_session_resume,
     memory_manager: Any | None = None,
     dream: Any | None = None,
+    reasoning_effort_control: Any | None = None,
     schedule_status: Callable[[], dict[str, object]] = lambda: {
         "status": "available",
         "active_job_count": 0,
@@ -78,6 +92,7 @@ def management_service(
         prepare_session_resume=prepare_session_resume,
         memory_manager=memory_manager or MemoryManager(state),
         dream=dream or _DefaultDream(),
+        reasoning_effort_control=reasoning_effort_control or _DefaultReasoningEffortControl(),
         schedule_status=schedule_status,
         now=now,
         monotonic=monotonic,

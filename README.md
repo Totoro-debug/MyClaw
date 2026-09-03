@@ -138,10 +138,15 @@ myclaw
 | --- | --- |
 | `/config` | 查看脱敏后的 User Configuration |
 | `/status` | 查看 Runtime、模型、Token 和 Session 状态 |
+| `/effort` | 选择当前 Runtime Lifetime 的 chat Reasoning Effort |
 | `/resume` | 列出并恢复当前 Workspace 的 Conversation Session |
 | `/memory` | 查看当前 Long-term Memory |
 | `/dream` | 立即处理尚未消费的 Conversation Summary |
 | `/reload_skill` | 原子重载当前 Agent Loop 的 Skill |
+
+精确提交 `/effort` 会用五档横向 selector 替换输入框；确认后，当前 Runtime Lifetime 的
+`chat` 与 `default` 请求立即使用所选值，显式 `memory` 与 `schedule` route 保持独立。
+切换 Conversation Session 不会重置该值。
 
 `/reload_skill` 不进入 Message Bus 或 Conversation Session。成功后，后续 Agent Run、手动 Skill 调用和终端补全共同使用新状态；已经开始的 Agent Run 继续使用其已构造的消息。失败时显示稳定错误，并完整保留先前状态。
 

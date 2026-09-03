@@ -19,6 +19,7 @@ from myclaw.management.service import (
     SessionListingReport,
 )
 from myclaw.memory.dream import DreamResult
+from myclaw.provider.models import ReasoningEffort
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.utils.time import format_rfc3339_milliseconds
 
@@ -33,6 +34,7 @@ class ManagementCommandDefinition:
 
 _CONFIG_COMMAND = ManagementCommandDefinition("/config", "View User Configuration")
 _STATUS_COMMAND = ManagementCommandDefinition("/status", "View Runtime Status")
+_EFFORT_COMMAND = ManagementCommandDefinition("/effort", "Set Chat Reasoning Effort")
 RESUME_MANAGEMENT_COMMAND = ManagementCommandDefinition("/resume", "Resume a Conversation Session")
 _MEMORY_COMMAND = ManagementCommandDefinition("/memory", "View Long-term Memory")
 _DREAM_COMMAND = ManagementCommandDefinition(
@@ -46,6 +48,7 @@ RELOAD_SKILL_MANAGEMENT_COMMAND = ManagementCommandDefinition(
 MANAGEMENT_COMMANDS = (
     _CONFIG_COMMAND,
     _STATUS_COMMAND,
+    _EFFORT_COMMAND,
     RESUME_MANAGEMENT_COMMAND,
     _MEMORY_COMMAND,
     _DREAM_COMMAND,
@@ -60,6 +63,10 @@ class ManagementPort(Protocol):
     async def config_view(self) -> ConfigView: ...
 
     async def status(self) -> RuntimeStatus: ...
+
+    async def reasoning_effort(self) -> ReasoningEffort: ...
+
+    async def update_reasoning_effort(self, effort: ReasoningEffort) -> ReasoningEffort: ...
 
     async def memory_view(self) -> str: ...
 
@@ -78,6 +85,7 @@ class ManagementCommandResult:
 
     handled: bool
     output: str | None
+    effort_selection: ReasoningEffort | None = None
     resume_sessions: tuple[SessionListingEntry, ...] | None = None
     resumed_session_id: str | None = None
     resume_skipped_count: int = 0
@@ -110,6 +118,19 @@ class ManagementCommandDispatcher:
         command: ManagementCommandDefinition,
         management: ManagementPort,
     ) -> ManagementCommandResult:
+        if command is _EFFORT_COMMAND:
+            try:
+                effort = await management.reasoning_effort()
+            except ManagementError as management_error:
+                return ManagementCommandResult(
+                    handled=True,
+                    output=f"{management_error.error.code}: {management_error.error.message}",
+                )
+            return ManagementCommandResult(
+                handled=True,
+                output=None,
+                effort_selection=effort,
+            )
         if command is RESUME_MANAGEMENT_COMMAND:
             try:
                 listing = await management.resumable_listing()
@@ -211,6 +232,24 @@ class ManagementCommandDispatcher:
             handled=True,
             output=f"{prefix}{view.redacted_content}",
         )
+
+    async def update_reasoning_effort(
+        self,
+        effort: ReasoningEffort,
+    ) -> ManagementCommandResult:
+        """Commit a selected Runtime-Lifetime Reasoning Effort."""
+        with without_session_log():
+            try:
+                published = await self._management.update_reasoning_effort(effort)
+            except ManagementError as management_error:
+                return ManagementCommandResult(
+                    handled=True,
+                    output=f"{management_error.error.code}: {management_error.error.message}",
+                )
+            return ManagementCommandResult(
+                handled=True,
+                output=f"Chat reasoning effort: {published}",
+            )
 
     async def resume(self, session_id: str, *, force: bool = False) -> ManagementCommandResult:
         with without_session_log():

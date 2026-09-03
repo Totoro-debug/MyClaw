@@ -2,6 +2,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -99,6 +100,7 @@ def test_management_command_catalog_owns_ordered_tokens_and_descriptions() -> No
     assert tuple((command.token, command.description) for command in MANAGEMENT_COMMANDS) == (
         ("/config", "View User Configuration"),
         ("/status", "View Runtime Status"),
+        ("/effort", "Set Chat Reasoning Effort"),
         ("/resume", "Resume a Conversation Session"),
         ("/memory", "View Long-term Memory"),
         ("/dream", "Process pending Conversation Summaries"),
@@ -106,6 +108,37 @@ def test_management_command_catalog_owns_ordered_tokens_and_descriptions() -> No
     )
     assert all(command.token and command.description for command in MANAGEMENT_COMMANDS)
     assert any(command is RESUME_MANAGEMENT_COMMAND for command in MANAGEMENT_COMMANDS)
+
+
+class _EffortManagement:
+    def __init__(self, effort: str = "medium") -> None:
+        self.effort = effort
+        self.updated: list[str] = []
+
+    async def reasoning_effort(self) -> str:
+        return self.effort
+
+    async def update_reasoning_effort(self, effort: str) -> str:
+        self.updated.append(effort)
+        self.effort = effort
+        return effort
+
+
+@pytest.mark.asyncio
+async def test_effort_command_returns_current_selection_and_commits_a_neutral_result() -> None:
+    management = _EffortManagement("high")
+    dispatcher = ManagementCommandDispatcher(cast(Any, management))
+
+    selection = await dispatcher.dispatch("/effort")
+    committed = await dispatcher.update_reasoning_effort("xhigh")
+
+    assert selection.handled is True
+    assert selection.output is None
+    assert selection.effort_selection == "high"
+    assert committed.handled is True
+    assert committed.output == "Chat reasoning effort: xhigh"
+    assert committed.effort_selection is None
+    assert management.updated == ["xhigh"]
 
 
 @pytest.mark.asyncio
@@ -640,6 +673,7 @@ async def test_status_command_renders_actual_runtime_and_session_state(
     assert json.loads(result.output or "") == {
         "version": "0.1.0",
         "chat_model": "fallback/chat-model",
+        "chat_reasoning_effort": "medium",
         "uptime_seconds": 65,
         "estimated_input_tokens": 1,
         "context_window": 8,
@@ -659,7 +693,16 @@ async def test_status_command_renders_actual_runtime_and_session_state(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "command",
-    ["/unknown", "/config extra", "/memory ", "/CONFIG", "/reload_skill extra"],
+    [
+        "/unknown",
+        "/config extra",
+        "/memory ",
+        "/CONFIG",
+        "/reload_skill extra",
+        "/effort high",
+        "/effort ",
+        "/EFFORT",
+    ],
 )
 async def test_unknown_or_inexact_slash_command_is_left_unhandled(
     agent_home: Path,
