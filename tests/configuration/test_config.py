@@ -5,6 +5,7 @@ import pytest
 
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 EXPECTED_DEFAULT_CONFIG = """[runtime]
 max_tool_result_chars = 4096
@@ -481,6 +482,22 @@ def test_valid_configuration_loads_as_typed_values(agent_home: Path) -> None:
     ) == (60000, 50, 12, "15 * * * *", ("claude-model",), "medium", 120)
 
 
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_all_reasoning_effort_levels_load_as_route_values(
+    agent_home: Path, effort: str
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(
+        VALID_CONFIG.replace('reasoning_effort = "medium"', f'reasoning_effort = "{effort}"'),
+        encoding="utf-8",
+    )
+
+    configuration = loader.load()
+
+    assert configuration.models.routes["default"].reasoning_effort == effort
+
+
 def test_explicit_always_load_setting_loads_as_a_boolean(agent_home: Path) -> None:
     loader = ConfigLoader(AgentHome(agent_home))
     loader.ensure_default()
@@ -501,10 +518,29 @@ def test_generated_configuration_disables_always_load_by_default(agent_home: Pat
     assert "enable_skill_always_load = false" in loader.path.read_text(encoding="utf-8")
 
 
-def test_omitted_defaulted_configuration_fields_use_accepted_defaults(agent_home: Path) -> None:
+def test_omitted_defaulted_configuration_fields_use_accepted_defaults(
+    agent_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     loader = ConfigLoader(AgentHome(agent_home))
     loader.ensure_default()
     loader.path.write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
+    before_load = loader.path.read_text(encoding="utf-8")
+    write_operations: list[str] = []
+
+    def record_path_write(*_args: object, **_kwargs: object) -> int:
+        write_operations.append("path")
+        return 0
+
+    def record_atomic_create(*_args: object, **_kwargs: object) -> bool:
+        write_operations.append("atomic_create")
+        return False
+
+    def record_atomic_replace(*_args: object, **_kwargs: object) -> None:
+        write_operations.append("atomic_replace")
+
+    monkeypatch.setattr(Path, "write_text", record_path_write)
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_create_text", record_atomic_create)
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_text", record_atomic_replace)
 
     configuration = loader.load()
 
@@ -515,7 +551,9 @@ def test_omitted_defaulted_configuration_fields_use_accepted_defaults(agent_home
         configuration.memory.schedule,
         configuration.models.routes["default"].reasoning_effort,
         configuration.runtime.enable_skill_always_load,
-    ) == (4096, 40, 10, "0 * * * *", None, False)
+    ) == (4096, 40, 10, "0 * * * *", "medium", False)
+    assert write_operations == []
+    assert loader.path.read_text(encoding="utf-8") == before_load
 
 
 def test_config_view_redacts_nonempty_provider_keys_and_preserves_complete_content(
@@ -877,6 +915,14 @@ def test_config_view_reports_undefined_fields(
         ),
         (
             VALID_CONFIG.replace('reasoning_effort = "medium"', 'reasoning_effort = "extreme"'),
+            "models.routes.default.reasoning_effort",
+        ),
+        (
+            VALID_CONFIG.replace('reasoning_effort = "medium"', "reasoning_effort = 1"),
+            "models.routes.default.reasoning_effort",
+        ),
+        (
+            VALID_CONFIG.replace('reasoning_effort = "medium"', 'reasoning_effort = ""'),
             "models.routes.default.reasoning_effort",
         ),
         (

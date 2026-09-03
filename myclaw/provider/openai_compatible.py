@@ -6,7 +6,8 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import import_module
 from math import isfinite
-from typing import Protocol, cast
+from types import MappingProxyType
+from typing import Final, Protocol, cast
 
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorCode, ErrorInfo
@@ -28,6 +29,16 @@ from myclaw.provider.models import (
 )
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
+
+_REASONING_EFFORT_MAP: Final[Mapping[ReasoningEffort, str]] = MappingProxyType(
+    {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+    }
+)
 
 
 class _Completions(Protocol):
@@ -357,7 +368,7 @@ def _request_arguments(
         "tools": list(tools),
     }
     if reasoning_effort is not None:
-        arguments["reasoning_effort"] = reasoning_effort
+        arguments["reasoning_effort"] = _REASONING_EFFORT_MAP[reasoning_effort]
     if stream:
         arguments["stream_options"] = {"include_usage": True}
     return arguments

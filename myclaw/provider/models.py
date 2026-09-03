@@ -10,7 +10,7 @@ from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.validation import require_nonnegative_int
 
 type ModelRoute = Literal["default", "chat", "memory", "schedule"]
-type ReasoningEffort = Literal["low", "medium", "high"]
+type ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
 type FinishReason = Literal["stop", "tool_calls", "length", "cancelled"]
 type ModelMessageDictionary = dict[str, Any]
 type ModelMessages = Sequence[ModelMessageDictionary]

@@ -20,7 +20,7 @@ from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 DEFAULT_CONFIG_TEMPLATE: Final = load_template("default-config.md")
 
-type ReasoningEffort = Literal["low", "medium", "high"]
+type ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
 
 _PROVIDER_ID_PATTERN: Final = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _ROUTE_NAMES: Final = frozenset({"default", "chat", "memory", "schedule"})
@@ -103,7 +103,7 @@ class RouteConfiguration:
     context_window: int
     max_output: int
     temperature: float
-    reasoning_effort: ReasoningEffort | None
+    reasoning_effort: ReasoningEffort
     timeout: int
 
 
@@ -408,11 +408,14 @@ def _parse_route(route_name: str, value: object) -> RouteConfiguration:
     if max_output >= context_window:
         _invalid(f"{prefix}.max_output", "must be less than context_window")
     reasoning_value = table.get("reasoning_effort")
-    reasoning_effort: ReasoningEffort | None = None
+    reasoning_effort: ReasoningEffort = "medium"
     if reasoning_value is not None:
         reasoning = _string(reasoning_value, f"{prefix}.reasoning_effort")
-        if reasoning not in {"low", "medium", "high"}:
-            _invalid(f"{prefix}.reasoning_effort", "must be low, medium, or high")
+        if reasoning not in {"low", "medium", "high", "xhigh", "max"}:
+            _invalid(
+                f"{prefix}.reasoning_effort",
+                "must be low, medium, high, xhigh, or max",
+            )
         reasoning_effort = cast(ReasoningEffort, reasoning)
     return RouteConfiguration(
         provider_id=provider_id,

@@ -222,6 +222,85 @@ async def test_stream_translates_text_and_usage_through_official_sdk_boundary() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max", None])
+async def test_stream_maps_or_omits_each_reasoning_effort(
+    effort: str | None,
+) -> None:
+    stream = FakeOpenAIStream(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="Done", tool_calls=None),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, tool_calls=None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        ),
+    )
+    client = FakeOpenAIClient(stream)
+    provider = OpenAICompatibleProvider(
+        configuration(),
+        client_factory=FakeOpenAIClientFactory(client),
+    )
+
+    events = [event async for event in provider.stream(**{**request(), "reasoning_effort": effort})]
+
+    assert isinstance(events[-1], ModelCompleted)
+    reasoning_arguments = {
+        key: value
+        for key, value in client.chat.completions.calls[0].items()
+        if key in {"reasoning_effort", "output_config"}
+    }
+    assert reasoning_arguments == ({} if effort is None else {"reasoning_effort": effort})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max", None])
+async def test_complete_maps_or_omits_each_reasoning_effort(
+    effort: str | None,
+) -> None:
+    sdk_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="Done", tool_calls=None),
+                finish_reason="stop",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+    client = FakeOpenAIClient(sdk_response)
+    provider = OpenAICompatibleProvider(
+        configuration(),
+        client_factory=FakeOpenAIClientFactory(client),
+    )
+
+    response = await provider.complete(
+        **{**request(stream=False), "reasoning_effort": effort}
+    )
+
+    assert response.message.content == "Done"
+    reasoning_arguments = {
+        key: value
+        for key, value in client.chat.completions.calls[0].items()
+        if key in {"reasoning_effort", "output_config"}
+    }
+    assert reasoning_arguments == ({} if effort is None else {"reasoning_effort": effort})
+
+
+@pytest.mark.asyncio
 async def test_stream_aggregates_fragmented_tool_calls_with_mixed_content() -> None:
     stream = FakeOpenAIStream(
         SimpleNamespace(

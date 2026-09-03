@@ -6,7 +6,8 @@ import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from math import isfinite
-from typing import Protocol, cast
+from types import MappingProxyType
+from typing import Final, Protocol, cast
 
 from anthropic import (
     APIConnectionError,
@@ -37,6 +38,16 @@ from myclaw.provider.models import (
 from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.json_types import JsonObject, JsonValue
+
+_REASONING_EFFORT_MAP: Final[Mapping[ReasoningEffort, str]] = MappingProxyType(
+    {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+    }
+)
 
 
 class AnthropicMessages(Protocol):
@@ -154,7 +165,6 @@ class AnthropicProvider:
         timeout: int,
         continuation: ModelContinuation | None,
     ) -> AsyncIterator[ModelStreamEvent]:
-        del reasoning_effort
         sdk_stream = await self._client.messages.create(
             **_request_arguments(
                 messages=messages,
@@ -162,6 +172,7 @@ class AnthropicProvider:
                 model=model,
                 max_output=max_output,
                 temperature=temperature,
+                reasoning_effort=reasoning_effort,
                 timeout=timeout,
                 stream=True,
                 provider_id=self._provider_id,
@@ -302,6 +313,7 @@ class AnthropicProvider:
                     model=model,
                     max_output=max_output,
                     temperature=temperature,
+                    reasoning_effort=reasoning_effort,
                     timeout=timeout,
                     stream=False,
                     provider_id=self._provider_id,
@@ -327,6 +339,7 @@ def _request_arguments(
     model: str,
     max_output: int,
     temperature: float,
+    reasoning_effort: ReasoningEffort | None,
     timeout: int,
     stream: bool,
     provider_id: str,
@@ -368,6 +381,8 @@ def _request_arguments(
     }
     if system is not None:
         arguments["system"] = system
+    if reasoning_effort is not None:
+        arguments["output_config"] = {"effort": _REASONING_EFFORT_MAP[reasoning_effort]}
     return arguments
 
 
