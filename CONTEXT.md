@@ -192,6 +192,10 @@ _Avoid_: Tool switch, safety flag, enablement
 A named model purpose that resolves a model request without exposing Provider selection to its caller.
 _Avoid_: Model string, provider selection, backend, ad hoc route
 
+**Reasoning Effort**:
+A five-level intent attached to one Model Route that asks its Model Provider to trade response capability and thoroughness against latency and cost for each request. Its built-in level is `medium` when User Configuration omits it.
+_Avoid_: Thinking level, token budget, Conversation Session override
+
 **Model Provider**:
 A configured backend that implements model calls for one or more Model Routes.
 _Avoid_: Model Route, model string, gateway

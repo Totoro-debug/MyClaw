@@ -241,7 +241,12 @@
 - 具体 route 缺失或不可用时总是 fallback 到 `default`。
 - `default` 不可用时，Terminal Conversation 启动失败。
 - 每个 route 配置 provider_id、model、context_window、max_output、temperature、reasoning_effort、timeout。
-- provider adapter 对不支持的 reasoning_effort 静默忽略。
+- `reasoning_effort` 仅接受 `low`、`medium`、`high`、`xhigh`、`max`；省略时在内存中使用
+  `medium`，读取配置不回写文件。
+- Anthropic adapter 将非空 Reasoning Effort 映射到 `output_config.effort`；OpenAI-compatible
+  adapter 将其映射到顶层 `reasoning_effort`。
+- adapter 不维护具体模型的 Reasoning Effort capability、不本地拒绝或降级；Provider 拒绝时继续使用
+  既有 error、retry、fallback 和 Terminal failure 流程。
 - 每个 Runtime Lifetime 的共享 `ModelRouter` 是 `/effort` 的运行时 authority。确认一次选择后，解析为
   `chat` 或 `default` 的请求使用同一 override；显式 `memory` 与 `schedule` route 保留自身值，缺失并
   fallback 到 `default` 时使用 override。

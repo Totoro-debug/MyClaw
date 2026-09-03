@@ -230,7 +230,8 @@ temperature = 0.2
 timeout = 120
 ```
 
-`models.routes.chat`、`models.routes.memory` 和 `models.routes.schedule` 均可省略，省略时使用 default。`reasoning_effort` 可省略。
+`models.routes.chat`、`models.routes.memory` 和 `models.routes.schedule` 均可省略，省略时使用 default。
+`reasoning_effort` 可省略；省略时仅在内存中解释为 `medium`，启动和普通读取不改写配置文件。
 
 ### 4.2 字段规则
 
@@ -253,7 +254,7 @@ timeout = 120
 | `context_window` | integer，`1024..10000000` | 必填 |
 | `max_output` | integer，`1..context_window-1` | 必填 |
 | `temperature` | number，`0..2` | 必填 |
-| `reasoning_effort` | `low`、`medium`、`high` | 可省略；不支持时 adapter 静默忽略 |
+| `reasoning_effort` | `low`、`medium`、`high`、`xhigh`、`max` | 可省略；内存默认 `medium` |
 | `timeout` | integer seconds，`1..600` | 必填 |
 
 启动时将未知顶层 table、未知字段和未知 route table 投影掉；`myclaw config` 仍报告这些未定义字段。未知 protocol provider 按 canonical 要求忽略；如果 default 因此不可用，Terminal Conversation 启动失败。Tool Catalog 不接受用户配置的 enablement 或 replacement。
@@ -631,7 +632,7 @@ class ModelProvider(Protocol):
         model: str,
         max_output: int,
         temperature: float,
-        reasoning_effort: Literal["low", "medium", "high"] | None,
+        reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None,
         timeout: int,
     ) -> AsyncIterator[ModelStreamEvent]: ...
 
@@ -643,12 +644,18 @@ class ModelProvider(Protocol):
         model: str,
         max_output: int,
         temperature: float,
-        reasoning_effort: Literal["low", "medium", "high"] | None,
+        reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None,
         timeout: int,
     ) -> ModelResponse: ...
 ```
 
 Router 只在调用边界接收逻辑 route、message dictionaries 和 Tool schemas，并负责 route resolution；具体 Provider 只接收上面列出的已解析字段。调用方通过 `stream` 或 `complete` 方法选择同步/流式语义，不携带请求 ID，也不把 route 传给 concrete Provider。`OpenAIToolSchema` 是由 Tool Catalog 缓存的 OpenAI Function Calling 格式快照。OpenAI-compatible adapter 直接传递该格式；Anthropic adapter 在内部转换字段。Provider adapter 不自行 fallback、不读取 User Configuration、不处理 Session。
+
+User Configuration 解析后的 Model Route 始终携带非空 Reasoning Effort；省略配置得到 `medium`。直接调用
+Provider 的窄 seam 仍允许 `None`，此时不发送协议字段。非空值由 Anthropic adapter 映射到
+`output_config.effort`，由 OpenAI-compatible adapter 映射到顶层 `reasoning_effort`。两个 adapter 均不维护
+具体模型 capability、不本地拒绝或降级；Provider/API 拒绝继续进入既有错误规范化、retry、fallback 和
+Terminal failure 流程。
 
 ### 9.3 统一响应与 streaming
 
