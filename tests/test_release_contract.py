@@ -1431,8 +1431,8 @@ def test_issue_202_authoritative_documents_identify_one_current_composition_boun
     current_gates = release_readiness.split("## Verification Gates", maxsplit=1)[1].split(
         "\n## ", maxsplit=1
     )[0]
-    assert "1,412 passed" in current_gates
-    assert "1,422 nodes total" in current_gates
+    assert "1,537 passed" in current_gates
+    assert "1,547 nodes total" in current_gates
     assert "1,407 passed" not in current_gates
 
     assert _adr_status(adr_0017_path) == "accepted"

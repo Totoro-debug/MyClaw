@@ -269,6 +269,19 @@ timeout = 120
 - exception、Rich renderable、测试 snapshot 和日志替代输出都不得包含未脱敏 key。
 - 首版不支持环境变量引用或系统密钥链。
 
+### 4.5 Runtime-Lifetime 设置持久化
+
+`/effort` 的确认顺序是先通过共享 `ModelRouter` 发布 Runtime Lifetime 内存值，再尝试持久化 User
+Configuration。`ConfigLoader.update_reasoning_effort(effort)` 每次重读最新的 `config.toml`，使用
+保留注释、table order 和无关字段的 TOML round-trip，只更新
+`models.routes.default.reasoning_effort`，并且只在 `models.routes.chat` 显式存在时同步更新；缺失的
+`chat` table 不得被物化。
+
+完整候选配置必须在发布前通过现有配置解析和校验，成功后恰好执行一次同目录 atomic replacement。TOML
+语法/UTF-8、缺失 `default`、候选校验或 atomic replacement 失败都不得产生部分候选发布。Management
+捕获持久化异常后只记录一次不含异常正文、配置正文、API key 或 traceback 的安全诊断事件，返回已发布的
+成功值且不回滚；运行时值与磁盘值在失败后暂时不同是可接受的。
+
 ## 5. Conversation Session 契约
 
 ### 5.1 Header and state
@@ -802,6 +815,8 @@ combined with another marker.
 class ManagementPort(Protocol):
     async def config_view(self) -> ConfigView: ...
     async def status(self) -> RuntimeStatus: ...
+    async def reasoning_effort(self) -> ReasoningEffort: ...
+    async def update_reasoning_effort(self, effort: ReasoningEffort) -> ReasoningEffort: ...
     async def resumable_listing(self) -> SessionListingReport: ...
     async def resume(self, session_id: str, *, force: bool = False) -> ResumeResult: ...
     async def memory_view(self) -> str: ...
@@ -810,6 +825,8 @@ class ManagementPort(Protocol):
 
 - `resumable_listing` 的 `sessions` 仅包含当前 Workspace 的 id、title、created_at、
   updated_at、message_count，并用 `skipped_count` 汇总损坏或不可读项。
+- `update_reasoning_effort` 先提交共享 Router 的内存值，再执行 best-effort User Configuration 持久化；
+  持久化失败不回滚、不返回用户可见错误，也不取消 active Agent Run。
 - `resume` 再次验证 session 属于当前 Workspace，不信任 UI 传入值；`force` 仅由
   Terminal 在确认 active foreground replacement 后传入，Management 不构造 Runtime。
 - `config_view` 已脱敏；Management Port 永不返回 plaintext API key。

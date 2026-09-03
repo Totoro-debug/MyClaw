@@ -68,6 +68,7 @@ from myclaw.tools.tool_gateway import (
     ConfirmationRequest,
     ModelToolCall,
 )
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.json_types import JsonObject
 from tests.agent.test_fixed_catalog import _agent_loop as _direct_agent_loop
 from tests.agent.test_fixed_catalog import _FixedCatalogProvider, _response
@@ -5862,3 +5863,66 @@ async def test_effort_selector_clamps_navigation_at_both_boundaries() -> None:
         await pilot.press("escape")
         await pilot.pause()
         assert management.updated == []
+
+
+@pytest.mark.asyncio
+async def test_effort_persistence_failure_does_not_interrupt_active_run_or_next_call(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = CancellableProvider()
+    config_path = agent_home / "config.toml"
+    original_replace = HOST_FILESYSTEM.atomic_replace_text
+
+    def fail_config_replace(target: Path, content: str) -> None:
+        if target == config_path:
+            raise OSError("injected config replacement failure")
+        original_replace(target, content)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_text", fail_config_replace)
+
+    async def scenario(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
+        initial = cast(AgentLoop, app._control)
+        submission = asyncio.create_task(pilot.press(*list("active work"), "enter"))
+        await asyncio.wait_for(provider.first_delta_emitted.wait(), timeout=2)
+        assert initial.control.has_active_run
+
+        await pilot.press(*list("/effort"), "enter")
+        await pilot.pause()
+        selector = app.query_one("#reasoning-effort-selector", Static)
+        assert selector.display
+        await pilot.press("right", "enter")
+        await pilot.pause()
+
+        assert initial.control.has_active_run
+        assert _visible_screen_text(app).count("Chat reasoning effort: high") == 1
+
+        await pilot.press(*list("/status"), "enter")
+        await pilot.pause()
+        assert any(
+            '"chat_reasoning_effort": "high"' in str(cast(Static, row).content)
+            for row in app.query(".management-row")
+        )
+        assert initial.control.has_active_run
+
+        await pilot.press("ctrl+c")
+        await asyncio.wait_for(submission, timeout=2)
+        await _wait_for_turn(app)
+
+        await pilot.press(*list("next"), "enter")
+        await _wait_for_turn(app)
+
+        assert [request.reasoning_effort for request in provider.stream_requests] == [
+            "medium",
+            "high",
+        ]
+        assert app._control is initial
+
+    await _run_cli_terminal_case(
+        agent_home=agent_home,
+        workspace=workspace,
+        monkeypatch=monkeypatch,
+        scenario=scenario,
+        provider=provider,
+    )

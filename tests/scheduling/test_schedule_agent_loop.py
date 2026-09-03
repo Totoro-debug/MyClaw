@@ -372,6 +372,10 @@ def _capture_summary_projections(
             projections.append(
                 project_messages([*session.messages[session.last_consolidated :], current_user])
             )
+        assert project_messages is not None
+        assert route_context_window is not None
+        assert route_max_output is not None
+        assert tools is not None
         return await original_prepare(
             manager,
             session,
@@ -1328,6 +1332,10 @@ async def test_schedule_shutdown_during_preparation_persists_user(
         if session.session_id == job.session_id:
             context_started.set()
             await context_never_completes.wait()
+        assert project_messages is not None
+        assert route_context_window is not None
+        assert route_max_output is not None
+        assert tools is not None
         return await original_prepare(
             manager,
             session,
@@ -1392,6 +1400,10 @@ async def test_schedule_failure_logs_one_safe_session_warning(
         if session.session_id == job.session_id:
             failure_started.set()
             raise RuntimeError("PRIVATE_SCHEDULE_PREPARATION_BODY")
+        assert project_messages is not None
+        assert route_context_window is not None
+        assert route_max_output is not None
+        assert tools is not None
         return await original_prepare(
             manager,
             session,

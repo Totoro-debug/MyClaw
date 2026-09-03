@@ -299,6 +299,12 @@ class ManagementViewService:
                 ErrorInfo("config_invalid", "Runtime Reasoning Effort is invalid.")
             )
         self._reasoning_effort_control.set_reasoning_effort(effort)
+        try:
+            self._config.update_reasoning_effort(effort)
+        except Exception as error:
+            logger.warning(
+                "Reasoning Effort persistence failed type={}", type(error).__name__
+            )
         return await self.reasoning_effort()
 
     async def status(self) -> RuntimeStatus:

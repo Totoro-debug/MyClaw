@@ -1063,3 +1063,218 @@ def test_missing_default_model_route_names_the_required_configuration_table(
     assert raised.value.error.message == (
         "Default Model Route is missing. Add [models.routes.default] to User Configuration."
     )
+
+
+def test_update_reasoning_effort_reopens_latest_document_and_preserves_unrelated_content(
+    agent_home: Path,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    content = """# Keep this comment and every unrelated route.
+[runtime]
+max_tool_result_chars = 60000
+
+[models.providers.primary]
+protocol = "openai-compatible"
+base_url = "https://models.example/v1"
+api_key = "latest-secret"
+models = ["chat-model", "memory-model"]
+
+[models.routes.default]
+provider_id = "primary"
+model = "chat-model"
+context_window = 8192
+max_output = 1024
+temperature = 0
+reasoning_effort = "low"
+timeout = 30
+
+[models.routes.chat]
+provider_id = "primary"
+model = "chat-model"
+context_window = 8192
+max_output = 1024
+temperature = 0.2
+reasoning_effort = "high"
+timeout = 45
+
+[models.routes.memory]
+provider_id = "primary"
+model = "memory-model"
+context_window = 8192
+max_output = 1024
+temperature = 0.1
+reasoning_effort = "max"
+timeout = 60
+"""
+    loader.path.write_text(content, encoding="utf-8")
+
+    loader.update_reasoning_effort("xhigh")
+
+    updated = loader.path.read_text(encoding="utf-8")
+    assert "# Keep this comment and every unrelated route." in updated
+    assert 'api_key = "latest-secret"' in updated
+    assert 'model = "memory-model"' in updated
+    assert updated.count('reasoning_effort = "xhigh"') == 2
+    assert 'reasoning_effort = "max"' in updated
+
+
+def test_update_reasoning_effort_keeps_external_edits_and_inherited_chat_absent(
+    agent_home: Path,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
+    loader.load()
+
+    latest_content = MINIMAL_VALID_CONFIG.replace(
+        "max_output = 1024", "max_output = 2048"
+    ).replace(
+        "timeout = 30", "timeout = 45\n\n# Added by an external editor."
+    )
+    loader.path.write_text(latest_content, encoding="utf-8")
+
+    loader.update_reasoning_effort("max")
+
+    updated = loader.path.read_text(encoding="utf-8")
+    assert "[models.routes.chat]" not in updated
+    assert "# Added by an external editor." in updated
+    assert 'reasoning_effort = "max"' in updated
+    restarted = ConfigLoader(AgentHome(agent_home)).load_for_startup()
+    assert restarted.models.routes["default"].reasoning_effort == "max"
+    assert restarted.models.routes["default"].max_output == 2048
+
+
+@pytest.mark.parametrize(
+    ("raw_content", "write_bytes"),
+    [
+        ("[models.routes.default\nreasoning_effort = \"low\"\n", False),
+        (b'[models.routes.default]\nreasoning_effort = "low"\n\xff', True),
+    ],
+    ids=("malformed-toml", "invalid-utf8"),
+)
+def test_update_reasoning_effort_rejects_unreadable_source_before_replacement(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_content: str | bytes,
+    write_bytes: bool,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    if write_bytes:
+        assert isinstance(raw_content, bytes)
+        loader.path.write_bytes(raw_content)
+    else:
+        assert isinstance(raw_content, str)
+        loader.path.write_text(raw_content, encoding="utf-8")
+    replacement_calls: list[object] = []
+
+    def record_replacement(*_args: object, **_kwargs: object) -> None:
+        replacement_calls.append(None)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_text", record_replacement)
+
+    with pytest.raises(ConfigError) as raised:
+        loader.update_reasoning_effort("high")
+
+    assert raised.value.error.code == "config_parse_error"
+    if write_bytes:
+        assert isinstance(raw_content, bytes)
+        assert loader.path.read_bytes() == raw_content
+    else:
+        assert isinstance(raw_content, str)
+        assert loader.path.read_text(encoding="utf-8") == raw_content
+    assert replacement_calls == []
+
+
+def test_update_reasoning_effort_rejects_missing_default_before_replacement(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    content_without_routes = VALID_CONFIG.partition("\n[models.routes.default]")[0] + "\n"
+    loader.path.write_text(content_without_routes, encoding="utf-8")
+    replacement_calls: list[object] = []
+    monkeypatch.setattr(
+        HOST_FILESYSTEM,
+        "atomic_replace_text",
+        lambda *_args, **_kwargs: replacement_calls.append(None),
+    )
+
+    with pytest.raises(ConfigError) as raised:
+        loader.update_reasoning_effort("high")
+
+    assert raised.value.error.code == "route_unavailable"
+    assert loader.path.read_text(encoding="utf-8") == content_without_routes
+    assert replacement_calls == []
+
+
+def test_update_reasoning_effort_validates_candidate_before_replacement(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    invalid_content = VALID_CONFIG.replace("max_output = 8192", "max_output = 200000")
+    loader.path.write_text(invalid_content, encoding="utf-8")
+    replacement_calls: list[object] = []
+    monkeypatch.setattr(
+        HOST_FILESYSTEM,
+        "atomic_replace_text",
+        lambda *_args, **_kwargs: replacement_calls.append(None),
+    )
+
+    with pytest.raises(ConfigError) as raised:
+        loader.update_reasoning_effort("high")
+
+    assert raised.value.error.code == "config_invalid"
+    assert loader.path.read_text(encoding="utf-8") == invalid_content
+    assert replacement_calls == []
+
+
+def test_update_reasoning_effort_propagates_atomic_replacement_failure_without_partial_write(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(VALID_CONFIG, encoding="utf-8")
+    original = loader.path.read_text(encoding="utf-8")
+    replacement_calls: list[object] = []
+
+    def fail_replacement(*_args: object, **_kwargs: object) -> None:
+        replacement_calls.append(None)
+        raise OSError("injected replacement failure")
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_text", fail_replacement)
+
+    with pytest.raises(OSError, match="injected replacement failure"):
+        loader.update_reasoning_effort("high")
+
+    assert replacement_calls == [None]
+    assert loader.path.read_text(encoding="utf-8") == original
+
+
+def test_update_reasoning_effort_publishes_a_valid_candidate_once(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
+    replacement_calls: list[tuple[Path, str]] = []
+    original_replace = HOST_FILESYSTEM.atomic_replace_text
+
+    def record_replacement(target: Path, content: str) -> None:
+        replacement_calls.append((target, content))
+        original_replace(target, content)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_text", record_replacement)
+
+    loader.update_reasoning_effort("medium")
+
+    assert len(replacement_calls) == 1
+    target, candidate = replacement_calls[0]
+    assert target == loader.path
+    assert candidate == loader.path.read_text(encoding="utf-8")

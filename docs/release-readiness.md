@@ -24,14 +24,24 @@ contracts, current test locations, current verification results, and present rel
 
 | Gate | Command | Current result |
 | --- | --- | --- |
-| Full behavior suite | `python -m pytest -q` | Passed: 1,412 passed and 10 conditionally skipped on Windows; 1,422 nodes total |
+| Full behavior suite | `python -m pytest -q` | Passed: 1,537 passed and 10 conditionally skipped on Windows; 1,547 nodes total |
 | Lint | `python -m ruff check .` | Passed: 0 violations |
 | Format | `python -m ruff format --check .` | Baseline check remains informational; no unrelated bulk formatting is made |
-| Types | `python -m mypy` | Passed: 164 source files checked |
+| Types | `python -m mypy myclaw tests` | Passed: 162 source files checked |
 | Distribution build | `python -m build --no-isolation` | Passed: one sdist and one `myclaw-0.1.0-py3-none-any.whl` built |
-| Tracked Markdown local links and active-design stale checks | `python -m pytest -q tests/test_release_contract.py` | Passed: 25 tests; 42 tracked Markdown files, no unresolved local inline/reference targets, and no stale structural findings |
+| Tracked Markdown local links and active-design stale checks | `python -m pytest -q tests/test_release_contract.py` | Passed: 28 tests; 37 tracked Markdown files, no unresolved local inline/reference targets, and no stale structural findings |
 
-Current full-suite evidence: 1,412 passed and 10 conditionally skipped on Windows; 1,422 nodes total. Release contract tests: 25 passed; 42 tracked Markdown files. Mapped owner-node execution: 14 passed after 14 nodes were collected. `git diff --check` returned `0` for the current patch; the earlier staged prospective patch check also returned `0`.
+Current full-suite evidence: 1,537 passed and 10 conditionally skipped on Windows; 1,547 nodes total. Release contract tests: 28 passed; 37 tracked Markdown files after the Issue #216 patch is staged. Mapped owner-node execution: 14 passed after 14 nodes were collected. `git diff --check` returned `0` for the current patch.
+
+## Issue #216 Persistence Evidence
+
+Issue #216 adds the `ConfigLoader` latest-document writer and the Management memory-first,
+best-effort persistence boundary for `/effort`. Focused configuration, Management, and
+active-run Terminal Reasoning Effort tests passed with `84` tests. The full behavior suite
+ran on Windows on 2026-09-03 with `1,537` passed and `10` conditionally skipped; the skips
+are existing symlink-privilege and `termios/pty` capability gates. `python -m ruff check .`,
+strict `python -m mypy myclaw tests`, `python -m build --no-isolation`, and
+`git diff --check` all returned `0`.
 
 ## Spec Remediation Verification
 
@@ -192,6 +202,7 @@ Verification executed on Windows x64 on 2026-08-28:
 - [Runtime contracts](myclaw-runtime-contracts.md)
 - [ADR-0017: CLI composition root and Session-scoped Agent Loop](adr/0017-use-cli-composition-root-and-session-scoped-agent-loop.md)
 - [ADR-0018: Centralized Model Request Context construction](adr/0018-centralize-model-request-context-construction.md)
+- [ADR-0019: Runtime Reasoning Effort best-effort persistence](adr/0019-persist-runtime-reasoning-effort-best-effort.md)
 - [CLI composition root implementation plan](cli-composition-root-implementation-plan.md)
 - [Terminal Conversation design](terminal-conversation-ui-design.md)
 - [Security and fault review](security-fault-review.md)

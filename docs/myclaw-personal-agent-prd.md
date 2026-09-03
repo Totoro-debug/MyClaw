@@ -248,6 +248,10 @@
 - 每个逻辑 `ModelRouter.stream()` / `complete()` 请求在同步入口只捕获一次当前 override。同一请求的
   continuation、retry 和 Provider fallback 保持该快照；之后新建的请求（包括 active Agent Run 的下一轮
   Tool loop）立即读取新值。`/resume` 替换 Agent Loop 时复用同一 Router，因此跨 Conversation Session 保持。
+- `/effort` 确认先发布 Runtime Lifetime 内存值，再由 Management 尽力持久化 User Configuration。持久化每次
+  重读最新文件，只更新 `default` 以及已显式存在的 `chat` route，保留注释、无关字段、Provider credentials
+  和 table structure；完整候选配置验证通过后只做一次 atomic replacement。失败只写不含配置正文、凭据或
+  traceback 的安全诊断日志，不回滚运行时值、不改变成功结果；因此 `/status` 与磁盘配置可暂时不同。
 - 每个逻辑 model call 最多执行 5 个 provider attempts，不是首次调用后再重试 5 次；requested route 与 default fallback 共享该 attempt budget。
 - 临时 provider 错误在当前 route 的剩余 attempt budget 内指数退避并尊重 retry-after；具体 route 缺失、配置不可用或返回永久 route/provider 不可用错误时使用 default 的剩余 budget，context overflow、invalid request 和 cancellation 不 fallback。
 - Model Provider 配置包含 kebab-case provider_id、protocol、required base_url、plaintext api_key 和 model ID 列表。

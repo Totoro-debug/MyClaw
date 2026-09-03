@@ -203,6 +203,16 @@ def _route_unavailable_error(models: ModelsConfiguration) -> ConfigError:
     return ConfigError(ErrorInfo("route_unavailable", message))
 
 
+def _missing_default_route_error() -> ConfigError:
+    return ConfigError(
+        ErrorInfo(
+            "route_unavailable",
+            "Default Model Route is missing. "
+            "Add [models.routes.default] to User Configuration.",
+        )
+    )
+
+
 def _string(value: object, field: str, *, nonempty: bool = False) -> str:
     if not isinstance(value, str):
         _invalid(field, "must be a string")
@@ -560,13 +570,7 @@ class ConfigLoader:
                 )
             configuration = self.load()
             if "default" not in configuration.models.routes:
-                raise ConfigError(
-                    ErrorInfo(
-                        "route_unavailable",
-                        "Default Model Route is missing. "
-                        "Add [models.routes.default] to User Configuration.",
-                    )
-                )
+                raise _missing_default_route_error()
             return configuration
         except OSError as error:
             raise ConfigError(
@@ -575,6 +579,49 @@ class ConfigLoader:
                     "User Configuration could not be read or written.",
                 )
             ) from error
+
+    def update_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        """Persist a Runtime-Lifetime Reasoning Effort in the latest configuration."""
+        if effort not in {"low", "medium", "high", "xhigh", "max"}:
+            _invalid(
+                "models.routes.default.reasoning_effort",
+                "must be low, medium, high, xhigh, or max",
+            )
+
+        try:
+            content = self.path.read_text(encoding="utf-8")
+            source_document = tomlkit.parse(content)
+        except (tomlkit.exceptions.ParseError, UnicodeDecodeError) as error:
+            raise ConfigError(
+                ErrorInfo(
+                    "config_parse_error",
+                    "User Configuration TOML could not be parsed.",
+                )
+            ) from error
+
+        models = source_document.get("models", {})
+        if not isinstance(models, Mapping):
+            _invalid("models", "must be a table")
+        routes = models.get("routes", {})
+        if not isinstance(routes, MutableMapping):
+            _invalid("models.routes", "must be a table")
+        if "default" not in routes:
+            raise _missing_default_route_error()
+        default = routes["default"]
+        if not isinstance(default, MutableMapping):
+            _invalid("models.routes.default", "must be a table")
+        default["reasoning_effort"] = effort
+
+        chat = routes.get("chat")
+        if isinstance(chat, MutableMapping):
+            chat["reasoning_effort"] = effort
+
+        candidate_content = tomlkit.dumps(source_document)
+        candidate = tomllib.loads(candidate_content)
+        configuration = _parse_configuration(_table(candidate, "configuration"))
+        if "default" not in configuration.models.routes:
+            raise _missing_default_route_error()
+        HOST_FILESYSTEM.atomic_replace_text(self.path, candidate_content)
 
     def view(self) -> ConfigView:
         """Return complete User Configuration text with plaintext API keys redacted."""

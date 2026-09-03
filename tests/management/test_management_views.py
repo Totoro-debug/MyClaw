@@ -16,6 +16,8 @@ from myclaw.memory.dream import DreamResult
 from myclaw.memory.manager import MemoryManager
 from myclaw.provider.models import ReasoningEffort
 from myclaw.session.session import Session
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
+from tests.fixtures.diagnostic_capture import capture_diagnostics
 from tests.management.factories import management_service
 
 CONFIG_WITH_PLAINTEXT_KEYS = """# User Configuration remains source-preserved.
@@ -102,14 +104,22 @@ class _DreamRunner:
 
 
 class _ReasoningEffortControl:
-    def __init__(self, effort: ReasoningEffort = "medium") -> None:
+    def __init__(
+        self,
+        effort: ReasoningEffort = "medium",
+        *,
+        events: list[str] | None = None,
+    ) -> None:
         self.effort = effort
+        self.events = events
 
     @property
     def reasoning_effort(self) -> ReasoningEffort:
         return self.effort
 
     def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        if self.events is not None:
+            self.events.append("runtime")
         self.effort = effort
 
 
@@ -126,6 +136,152 @@ async def test_reasoning_effort_service_publishes_and_reads_runtime_value(
     assert await service.update_reasoning_effort("xhigh") == "xhigh"
     assert control.effort == "xhigh"
     assert await service.reasoning_effort() == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_update_publishes_before_persisting_latest_configuration(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    config_path = agent_home / "config.toml"
+    config_path.write_text(CONFIG_WITH_PLAINTEXT_KEYS, encoding="utf-8")
+    events: list[str] = []
+    control = _ReasoningEffortControl(events=events)
+    service = management_service(home, reasoning_effort_control=control)
+    original_replace = HOST_FILESYSTEM.atomic_replace_text
+
+    def record_replace(target: Path, content: str) -> None:
+        events.append("persistence")
+        original_replace(target, content)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_text", record_replace)
+
+    result = await service.update_reasoning_effort("xhigh")
+
+    assert result == "xhigh"
+    assert events == ["runtime", "persistence"]
+    assert 'reasoning_effort = "xhigh"' in config_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_persistence_failure_keeps_success_and_logs_safely(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    config_path = agent_home / "config.toml"
+    config_path.write_text(CONFIG_WITH_PLAINTEXT_KEYS, encoding="utf-8")
+    original = config_path.read_text(encoding="utf-8")
+    control = _ReasoningEffortControl()
+    service = management_service(home, reasoning_effort_control=control)
+
+    def fail_replace(*_args: object, **_kwargs: object) -> None:
+        raise OSError("replacement failed for first-plaintext-key")
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_text", fail_replace)
+    diagnostics = capture_diagnostics()
+    try:
+        result = await service.update_reasoning_effort("max")
+    finally:
+        diagnostics.close()
+
+    assert result == "max"
+    assert await service.reasoning_effort() == "max"
+    assert config_path.read_text(encoding="utf-8") == original
+    assert diagnostics.event_text.splitlines() == [
+        "Reasoning Effort persistence failed type=OSError"
+    ]
+    assert "first-plaintext-key" not in diagnostics.text
+    assert "models.providers.primary" not in diagnostics.text
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_configuration_failure_keeps_runtime_success_and_safe_log(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    config_path = agent_home / "config.toml"
+    config_path.write_text(
+        'api_key = "management-secret"\n[models.routes.default\n',
+        encoding="utf-8",
+    )
+    control = _ReasoningEffortControl()
+    service = management_service(home, reasoning_effort_control=control)
+    diagnostics = capture_diagnostics()
+    try:
+        result = await service.update_reasoning_effort("high")
+    finally:
+        diagnostics.close()
+
+    assert result == "high"
+    assert await service.reasoning_effort() == "high"
+    assert diagnostics.event_text.splitlines() == [
+        "Reasoning Effort persistence failed type=ConfigError"
+    ]
+    assert "management-secret" not in diagnostics.text
+    assert "models.routes.default" not in diagnostics.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "as_bytes", "effort"),
+    [
+        (
+            b'api_key = "management-secret"\xff',
+            True,
+            "high",
+        ),
+        (
+            CONFIG_WITH_PLAINTEXT_KEYS.partition("\n[models.routes.default]")[0] + "\n",
+            False,
+            "xhigh",
+        ),
+        (
+            CONFIG_WITH_PLAINTEXT_KEYS.replace("max_output = 512", "max_output = 4096"),
+            False,
+            "max",
+        ),
+    ],
+    ids=("invalid-utf8", "missing-default", "candidate-validation"),
+)
+async def test_reasoning_effort_failure_keeps_runtime_status_and_disk_unchanged(
+    agent_home: Path,
+    content: str | bytes,
+    as_bytes: bool,
+    effort: ReasoningEffort,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    config_path = agent_home / "config.toml"
+    if as_bytes:
+        assert isinstance(content, bytes)
+        config_path.write_bytes(content)
+        original = content
+    else:
+        assert isinstance(content, str)
+        config_path.write_text(content, encoding="utf-8")
+        original = config_path.read_bytes()
+    control = _ReasoningEffortControl()
+    service = management_service(home, reasoning_effort_control=control)
+    diagnostics = capture_diagnostics()
+    try:
+        result = await service.update_reasoning_effort(effort)
+    finally:
+        diagnostics.close()
+
+    assert result == effort
+    assert await service.reasoning_effort() == effort
+    assert (await service.status()).chat_reasoning_effort == effort
+    assert config_path.read_bytes() == original
+    assert diagnostics.event_text.splitlines() == [
+        "Reasoning Effort persistence failed type=ConfigError"
+    ]
+    assert "management-secret" not in diagnostics.text
+    assert "models.routes.default" not in diagnostics.text
 
 
 @pytest.mark.asyncio
