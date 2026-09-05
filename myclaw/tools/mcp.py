@@ -128,6 +128,23 @@ class MCPTool(BaseTool):
         """Whether a closed MCP session was observed during a Tool call."""
         return self._unavailable
 
+    def with_model_name(self, model_name: str) -> MCPTool:
+        """Return the same remote Tool with a different model-facing name."""
+        if not isinstance(model_name, str) or not model_name:
+            raise ValueError("MCP Tool model name must be a non-empty string")
+        return type(self)(
+            MCPToolSpec(
+                server_name=self.server_name,
+                remote_name=self.remote_name,
+                model_name=model_name,
+                description=self.description,
+                parameters=self.parameters,
+            ),
+            self._session,
+            call_timeout=self._call_timeout,
+            on_closed=self._on_closed,
+        )
+
     async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Forward the complete argument object without local schema processing."""
         return deepcopy(arguments)
