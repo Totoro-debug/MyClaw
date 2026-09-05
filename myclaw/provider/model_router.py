@@ -20,7 +20,6 @@ from myclaw.provider.models import (
     ModelStreamEvent,
     ReasoningEffort,
 )
-from myclaw.tools.base import OpenAIToolSchema
 
 _MAX_ATTEMPTS = 5
 _RETRYABLE_CODES = frozenset({"provider_rate_limited", "provider_timeout", "provider_unavailable"})
@@ -109,7 +108,7 @@ class ModelRouter:
         route: ModelRoute,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         resolved, reasoning_effort = self._begin_call(route, continuation=continuation)
@@ -126,7 +125,7 @@ class ModelRouter:
         resolved: ResolvedModelRoute,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None,
         reasoning_effort: ReasoningEffort | None,
     ) -> AsyncIterator[ModelStreamEvent]:
@@ -171,7 +170,7 @@ class ModelRouter:
         route: ModelRoute,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> Coroutine[Any, Any, ModelResponse]:
         resolved, reasoning_effort = self._begin_call(route, continuation=continuation)
@@ -188,7 +187,7 @@ class ModelRouter:
         resolved: ResolvedModelRoute,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None,
         reasoning_effort: ReasoningEffort | None,
     ) -> ModelResponse:

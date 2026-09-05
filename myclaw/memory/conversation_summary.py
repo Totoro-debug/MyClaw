@@ -16,7 +16,6 @@ from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
 from myclaw.session.session import Session
 from myclaw.templates import render_template
-from myclaw.tools.base import OpenAIToolSchema
 
 type SummaryProjection = Callable[
     [Sequence[dict[str, Any]]],
@@ -39,7 +38,7 @@ class SummaryModelRouter(Protocol):
         route: ModelRoute,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
     ) -> ModelResponse: ...
 
 
@@ -66,7 +65,7 @@ class ConversationSummaryManager:
         project_messages: SummaryProjection,
         route_context_window: int,
         route_max_output: int,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         current_user: dict[str, Any] | None = None,
         continuation: Sequence[dict[str, Any]] = (),
     ) -> Session:
@@ -88,7 +87,7 @@ class ConversationSummaryManager:
         project_messages: SummaryProjection,
         route_context_window: int,
         route_max_output: int,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         current_user: dict[str, Any] | None,
         continuation: Sequence[dict[str, Any]],
     ) -> Session:
@@ -231,7 +230,7 @@ def _token_cutoff(
 def _estimate_messages(
     messages: Sequence[dict[str, Any]],
     *,
-    tools: Sequence[OpenAIToolSchema] = (),
+    tools: Sequence[dict[str, Any]] = (),
 ) -> int:
     system_prompt = ""
     retained = messages

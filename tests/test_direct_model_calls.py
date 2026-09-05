@@ -33,9 +33,8 @@ from myclaw.provider.models import (
     ReasoningEffort,
 )
 from myclaw.provider.openai_compatible import OpenAICompatibleProvider
-from myclaw.tools.base import OpenAIToolSchema
 
-READ_FILE_SCHEMA: OpenAIToolSchema = {
+READ_FILE_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "read_file",
@@ -85,7 +84,7 @@ class _DirectProvider:
         self,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -114,7 +113,7 @@ class _DirectProvider:
         self,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,

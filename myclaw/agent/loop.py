@@ -50,7 +50,7 @@ from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import LoadedSkill, ManualSkillInvocation, SkillLoader, SkillMetadata
-from myclaw.tools.base import BaseTool, OpenAIToolSchema
+from myclaw.tools.base import BaseTool
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
@@ -313,7 +313,7 @@ class AgentLoop:
         return self._skill_loader.metadata
 
     @property
-    def tool_schemas(self) -> tuple[OpenAIToolSchema, ...]:
+    def tool_schemas(self) -> tuple[dict[str, Any], ...]:
         return tuple(self._tool_gateway.schemas)
 
     @property
@@ -1427,7 +1427,7 @@ def _foreground_runtime_status_input(
     context_builder: ContextBuilder,
     history: Sequence[dict[str, Any]],
     session_id: str,
-    tool_schemas: tuple[OpenAIToolSchema, ...],
+    tool_schemas: tuple[dict[str, Any], ...],
     session_title: str = "",
     session_message_count: int = 0,
     last_consolidated: int = 0,

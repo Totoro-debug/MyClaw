@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Iterable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from typing import Any
 
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorInfo
@@ -16,7 +17,6 @@ from myclaw.provider.models import (
     ReasoningEffort,
 )
 from myclaw.templates import render_template
-from myclaw.tools.base import OpenAIToolSchema
 
 
 def unexpected_provider_factory(configuration: ProviderConfiguration) -> ModelProvider:
@@ -37,7 +37,7 @@ class ProviderCall:
     """Arguments captured from one direct keyword-only provider call."""
 
     messages: list[dict[str, object]]
-    tools: tuple[OpenAIToolSchema, ...]
+    tools: tuple[dict[str, Any], ...]
     model: str
     max_output: int
     temperature: float
@@ -66,7 +66,7 @@ class ScriptedFakeProvider:
         self,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str = "test-model",
         max_output: int = 1024,
         temperature: float = 0.2,
@@ -106,7 +106,7 @@ class ScriptedFakeProvider:
         self,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str = "test-model",
         max_output: int = 1024,
         temperature: float = 0.2,
@@ -149,7 +149,7 @@ class ScriptedFakeRouter:
         route: str,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route
@@ -169,7 +169,7 @@ class ScriptedFakeRouter:
         route: str,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del route
@@ -191,7 +191,7 @@ class ScriptedFakeRouter:
 def _provider_call(
     *,
     messages: Sequence[dict[str, object]],
-    tools: Sequence[OpenAIToolSchema],
+    tools: Sequence[dict[str, Any]],
     model: str,
     max_output: int,
     temperature: float,

@@ -29,7 +29,7 @@ from myclaw.memory.manager import (
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelContinuation, ModelMessages, ModelResponse
 from myclaw.templates import render_template
-from myclaw.tools.base import BaseTool, OpenAIToolSchema, ToolError, ToolParam
+from myclaw.tools.base import BaseTool, ToolError, ToolParam
 from myclaw.tools.tool_gateway import ToolGateway
 from myclaw.utils.validation import require_nonnegative_int
 
@@ -138,7 +138,7 @@ class DreamModelRouter(Protocol):
         route: Literal["memory"],
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
     ) -> ModelResponse: ...
 
 
@@ -164,7 +164,7 @@ class _DreamRouter(AgentRunnerMemoryRouter):
         route: Literal["memory"],
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         if route != "memory":

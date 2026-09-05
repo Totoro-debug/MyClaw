@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, ClassVar, cast
+from unittest.mock import patch
 
 import pytest
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.service import ScheduleService
+from myclaw.tools.base import BaseTool
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
@@ -233,3 +235,131 @@ async def test_unexpected_core_tool_failure_is_redacted(
     assert result.status == "error"
     assert result.content == "read_file could not complete the request."
     assert "secret implementation detail" not in result.content
+
+
+def test_gateway_rebuilds_schemas_for_each_access() -> None:
+    class CountingTool(BaseTool):
+        name = "counting"
+        description = "Count schema projections."
+        value: str
+
+        async def execute(self, *, value: str) -> str:
+            return value
+
+    tool = CountingTool()
+    gateway = ToolGateway._for_memory((tool,))
+    project_schema = BaseTool.to_schema
+
+    with patch.object(
+        BaseTool, "to_schema", autospec=True, side_effect=project_schema
+    ) as projection:
+        assert projection.call_count == 0
+        assert gateway.schemas[0]["function"]["name"] == "counting"
+        assert gateway.schemas[0]["function"]["name"] == "counting"
+        assert gateway.schemas[0]["function"]["name"] == "counting"
+        assert projection.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_gateway_executes_every_tool_through_execute_prepared() -> None:
+    class PreparedTool(BaseTool):
+        name = "prepared"
+        description = "Execute through the prepared seam."
+        required = ("value",)
+        value: str
+
+        async def execute(self, *, value: str) -> str:
+            del value
+            raise AssertionError("Gateway must not call execute directly")
+
+        async def execute_prepared(self, arguments: dict[str, Any]) -> str:
+            assert arguments == {"value": "payload"}
+            return "prepared result"
+
+    result = await ToolGateway._for_memory((PreparedTool(),)).call(
+        ModelToolCall(id="call-prepared", name="prepared", arguments='{"value":"payload"}')
+    )
+
+    assert result.status == "success"
+    assert result.content == "prepared result"
+
+
+@pytest.mark.asyncio
+async def test_gateway_default_prepared_execution_expands_builtin_arguments_three_times() -> None:
+    class BuiltinTool(BaseTool):
+        name = "builtin"
+        description = "Use the default prepared execution."
+        required = ("value",)
+        value: str
+
+        async def execute(self, *, value: str) -> str:
+            return f"builtin:{value}"
+
+    gateway = ToolGateway._for_memory((BuiltinTool(),))
+
+    first = await gateway.call(
+        ModelToolCall(id="call-builtin-1", name="builtin", arguments='{"value":"one"}')
+    )
+    second = await gateway.call(
+        ModelToolCall(id="call-builtin-2", name="builtin", arguments='{"value":"two"}')
+    )
+    third = await gateway.call(
+        ModelToolCall(id="call-builtin-3", name="builtin", arguments='{"value":"three"}')
+    )
+
+    assert (first.status, first.content) == ("success", "builtin:one")
+    assert (second.status, second.content) == ("success", "builtin:two")
+    assert (third.status, third.content) == ("success", "builtin:three")
+
+
+@pytest.mark.asyncio
+async def test_gateway_forwards_complete_object_arguments_three_times() -> None:
+    observed: list[dict[str, Any]] = []
+
+    class ObjectTool(BaseTool):
+        name = "object"
+        description = "Forward a complete object."
+        parameters: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+        }
+
+        async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+            return dict(arguments)
+
+        async def execute_prepared(self, arguments: dict[str, Any]) -> str:
+            observed.append(arguments)
+            return f"object:{arguments['value']}"
+
+    gateway = ToolGateway._for_memory((ObjectTool(),))
+
+    first = await gateway.call(
+        ModelToolCall(
+            id="call-object-1",
+            name="object",
+            arguments='{"value":"one","extra":{"nested":1}}',
+        )
+    )
+    second = await gateway.call(
+        ModelToolCall(
+            id="call-object-2",
+            name="object",
+            arguments='{"value":"two","extra":{"nested":2}}',
+        )
+    )
+    third = await gateway.call(
+        ModelToolCall(
+            id="call-object-3",
+            name="object",
+            arguments='{"value":"three","extra":{"nested":3}}',
+        )
+    )
+
+    assert (first.status, first.content) == ("success", "object:one")
+    assert (second.status, second.content) == ("success", "object:two")
+    assert (third.status, third.content) == ("success", "object:three")
+    assert observed == [
+        {"value": "one", "extra": {"nested": 1}},
+        {"value": "two", "extra": {"nested": 2}},
+        {"value": "three", "extra": {"nested": 3}},
+    ]

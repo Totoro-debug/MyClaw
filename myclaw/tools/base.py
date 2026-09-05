@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import re
-from abc import ABC, abstractmethod, update_abstractmethods
+from abc import ABC, ABCMeta, update_abstractmethods
 from collections.abc import Callable, Collection
 from copy import deepcopy
 from dataclasses import dataclass
@@ -12,12 +12,9 @@ from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 from types import NoneType, UnionType
 from typing import (
-    TYPE_CHECKING,
     Annotated,
     Any,
     ClassVar,
-    Literal,
-    TypedDict,
     Union,
     cast,
     final,
@@ -30,7 +27,6 @@ from uuid import uuid4
 from loguru import logger
 
 from myclaw.tools.schema import Schema, ToolParam
-from myclaw.utils.json_types import JsonObject, JsonValue
 from myclaw.utils.validation import require_nonnegative_int
 
 _METADATA_NAMES = frozenset({"name", "description", "required", "parameters"})
@@ -44,21 +40,6 @@ _ARTIFACT_WRITE_FAILURE_MARKER = "\n\n...[artifact write failed; full result was
 _EXTERNAL_PATH_SAFETY_REASON = (
     "The requested path resolves outside the Workspace and requires confirmation."
 )
-
-
-class OpenAIFunctionSchema(TypedDict):
-    """The function member of an OpenAI Function Calling Tool schema."""
-
-    name: str
-    description: str
-    parameters: JsonObject
-
-
-class OpenAIToolSchema(TypedDict):
-    """An OpenAI Function Calling schema."""
-
-    type: Literal["function"]
-    function: OpenAIFunctionSchema
 
 
 class ToolError(Exception):
@@ -127,14 +108,6 @@ def is_public_ip(value: str) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedToolCall:
-    """The normalized arguments and optional safety reason for one Tool call."""
-
-    arguments: JsonObject
-    safety_reason: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class ArtifactReference:
     """A Workspace-relative reference to one persisted Tool Artifact."""
 
@@ -190,11 +163,42 @@ def truncate_text(content: str, *, limit: int, marker: str = _DEFAULT_TRUNCATION
     return content[: limit - len(marker)] + marker
 
 
-class BaseTool(ABC):
+class _BaseToolMeta(ABCMeta):
+    """Keep incomplete Tool declarations abstract while supporting prepared-only Tools."""
+
+    def __new__(
+        mcls,
+        name: str,
+        bases: tuple[type, ...],
+        namespace: dict[str, Any],
+        **kwargs: Any,
+    ) -> type:
+        tool_type = super().__new__(mcls, name, bases, namespace, **kwargs)
+        if any(isinstance(base, _BaseToolMeta) for base in bases):
+            base_tool = globals().get("BaseTool")
+            default_execute = getattr(base_tool, "execute", None)
+            default_execute_prepared = getattr(base_tool, "execute_prepared", None)
+            resolved_execute = getattr(tool_type, "execute", None)
+            resolved_execute_prepared = getattr(tool_type, "execute_prepared", None)
+            has_execution = (
+                callable(resolved_execute) and resolved_execute is not default_execute
+            ) or (
+                callable(resolved_execute_prepared)
+                and resolved_execute_prepared is not default_execute_prepared
+            )
+            if not has_execution:
+                tool_type.__abstractmethods__ = frozenset(
+                    {*tool_type.__abstractmethods__, "execute"}
+                )
+        return tool_type
+
+
+class BaseTool(ABC, metaclass=_BaseToolMeta):
     """Declare one Tool and expose its model-visible parameter contract."""
 
-    name: ClassVar[str]
-    description: ClassVar[str]
+    name: str
+    description: str
+    parameters: ClassVar[dict[str, Any]]
     required: ClassVar[tuple[str, ...]] = ()
 
     def __init_subclass__(cls, **kwargs: object) -> None:
@@ -202,34 +206,30 @@ class BaseTool(ABC):
         if "to_schema" in cls.__dict__:
             raise TypeError("Concrete Tools cannot override BaseTool.to_schema()")
         execute = cls.__dict__.get("execute")
+        execute_prepared = cls.__dict__.get("execute_prepared")
         if execute is not None:
             _validate_execute(execute)
+        if execute_prepared is not None:
+            _validate_execute_prepared(execute_prepared)
         if "parameters" not in cls.__dict__:
             try:
                 legacy = _schema_from_class(cls, execute)
             except (TypeError, ValueError):
                 # Keep declaration errors at the public to_schema boundary for the bridge.
                 if _has_legacy_declaration(cls, execute):
-                    cast(Any, cls).parameters = Schema.object({})
+                    cast(Any, cls).parameters = {}
                     cast(Any, cls).__schema_declaration_invalid__ = True
             else:
-                cast(Any, cls).parameters = legacy
+                cast(Any, cls).parameters = legacy.to_json_schema()
         update_abstractmethods(cls)
 
-    if TYPE_CHECKING:
-        parameters: ClassVar[Schema]
-    else:
-
-        @property
-        @abstractmethod
-        def parameters(self) -> Schema:
-            """Return the root object Schema for this Tool's arguments."""
-            raise NotImplementedError
-
-    @abstractmethod
     async def execute(self, *args: Any, **kwargs: Any) -> str:
         """Execute one already prepared Tool invocation and return text."""
         raise NotImplementedError
+
+    async def execute_prepared(self, arguments: dict[str, Any]) -> str:
+        """Execute one prepared argument dictionary through the Built-in Tool seam."""
+        return await self.execute(**deepcopy(arguments))
 
     @final
     def resolve_path_argument(
@@ -327,22 +327,16 @@ class BaseTool(ABC):
         )
 
     @final
-    async def prepare(self, arguments: JsonObject) -> PreparedToolCall:
-        """Return the final asynchronous cast, validation, and safety pipeline."""
-        casted = self.parameters.cast(arguments)
-        if not isinstance(casted, dict):
-            raise ToolError("Tool arguments must be an object.")
-        normalized: JsonObject = {}
-        for name, schema in self.parameters.properties.items():
-            if name in casted:
-                normalized[name] = cast(JsonValue, deepcopy(casted[name]))
-            elif schema.has_default:
-                normalized[name] = cast(JsonValue, schema.default)
-        errors = self.parameters.validate(normalized)
-        if errors:
-            raise ToolError("; ".join(str(error) for error in errors))
+    async def prepare(
+        self,
+        arguments: dict[str, Any],
+    ) -> tuple[dict[str, Any], str | None]:
+        """Return the final asynchronous preparation, validation, and safety pipeline."""
+        prepared_arguments = await self.prepare_arguments(arguments)
+        if not isinstance(prepared_arguments, dict):
+            raise TypeError("Tool argument preparation must return a dictionary")
 
-        validation = self.validate_arguments(**deepcopy(normalized))
+        validation = self.validate_arguments(**deepcopy(prepared_arguments))
         if inspect.isawaitable(validation):
             validation = await validation
         if isinstance(validation, str):
@@ -350,15 +344,33 @@ class BaseTool(ABC):
         if validation is False:
             raise ToolError("Tool arguments are invalid.")
 
-        safety: object = self.check_safety(**deepcopy(normalized))
+        safety: object = self.check_safety(**deepcopy(prepared_arguments))
         if inspect.isawaitable(safety):
             safety = await safety
         if safety is not None and not isinstance(safety, str):
             raise TypeError("Tool safety checks must return a string reason or None")
-        return PreparedToolCall(
-            arguments=normalized,
-            safety_reason=safety if isinstance(safety, str) else None,
-        )
+        return prepared_arguments, safety if isinstance(safety, str) else None
+
+    async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Cast, default, filter, and validate one Built-in Tool argument object."""
+        schema = self._build_preparation_schema()
+        casted = schema.cast(arguments)
+        if not isinstance(casted, dict):
+            raise ToolError("Tool arguments must be an object.")
+        prepared_arguments: dict[str, Any] = {}
+        for name, property_schema in schema.properties.items():
+            if name in casted:
+                prepared_arguments[name] = deepcopy(casted[name])
+            elif property_schema.has_default:
+                prepared_arguments[name] = property_schema.default
+        errors = schema.validate(prepared_arguments)
+        if errors:
+            raise ToolError("; ".join(str(error) for error in errors))
+        return prepared_arguments
+
+    def _build_preparation_schema(self) -> Schema:
+        """Build the temporary restricted Schema used by Built-in preparation."""
+        return _schema_from_class(type(self), getattr(type(self), "execute", None))
 
     def validate_arguments(self, **arguments: Any) -> Any:
         """Validate normalized Tool-specific arguments before safety checks.
@@ -375,30 +387,28 @@ class BaseTool(ABC):
         return None
 
     @final
-    def to_schema(self) -> OpenAIToolSchema:
+    def to_schema(self) -> dict[str, Any]:
         """Generate a detached OpenAI Function Calling schema."""
-        tool_type = type(self)
-        name = getattr(tool_type, "name", None)
-        description = getattr(tool_type, "description", None)
+        name = getattr(self, "name", None)
+        description = getattr(self, "description", None)
         if not isinstance(name, str) or not name:
             raise TypeError("Tool name must be a non-empty string")
         if not isinstance(description, str) or not description:
             raise TypeError("Tool description must be a non-empty string")
+        tool_type = type(self)
         if getattr(tool_type, _INVALID_SCHEMA_MARKER, False):
             _schema_from_class(tool_type, getattr(tool_type, "execute", None))
-        inferred_schema = getattr(tool_type, "parameters", _MISSING)
-        if isinstance(inferred_schema, Schema):
-            schema = inferred_schema
-        else:
-            schema = _schema_from_class(tool_type, getattr(tool_type, "execute", None))
-        if schema.kind != "object":
+        parameters = getattr(self, "parameters", _MISSING)
+        if not isinstance(parameters, dict):
+            raise TypeError("Tool parameters must be a dictionary")
+        if parameters.get("type") != "object":
             raise TypeError("Tool parameters must use an object root Schema")
         return {
             "type": "function",
             "function": {
                 "name": name,
                 "description": description,
-                "parameters": schema.to_json_schema(),
+                "parameters": deepcopy(parameters),
             },
         }
 
@@ -427,6 +437,32 @@ def _validate_execute(execute: object) -> None:
         ) from error
     if return_annotation is not str:
         raise TypeError("Concrete Tool execute() must declare a string return")
+
+
+def _validate_execute_prepared(execute_prepared: object) -> None:
+    if not inspect.iscoroutinefunction(execute_prepared):
+        raise TypeError("Concrete Tool execute_prepared() must be asynchronous")
+    parameters = tuple(inspect.signature(cast(Any, execute_prepared)).parameters.values())
+    if (
+        len(parameters) != 2
+        or parameters[0].name != "self"
+        or parameters[0].kind
+        not in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+        or parameters[1].name != "arguments"
+        or parameters[1].kind
+        not in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+    ):
+        raise TypeError(
+            "Concrete Tool execute_prepared() must accept self and one arguments parameter"
+        )
+    try:
+        return_annotation = get_type_hints(cast(Any, execute_prepared)).get("return")
+    except (NameError, TypeError) as error:
+        raise TypeError(
+            "Concrete Tool execute_prepared() return annotation could not be resolved"
+        ) from error
+    if return_annotation is not str:
+        raise TypeError("Concrete Tool execute_prepared() must declare a string return")
 
 
 def _schema_from_class(tool_type: type[object], execute: object) -> Schema:
@@ -574,9 +610,6 @@ __all__ = [
     "ArtifactReference",
     "ArtifactWriter",
     "BaseTool",
-    "OpenAIFunctionSchema",
-    "OpenAIToolSchema",
-    "PreparedToolCall",
     "Schema",
     "ToolError",
     "ToolParam",

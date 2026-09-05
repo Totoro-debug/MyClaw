@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -32,7 +33,6 @@ from myclaw.provider.models import (
 from myclaw.schedule.service import ScheduleService
 from myclaw.session.session import Session
 from myclaw.templates import render_template
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.core.web_fetch import JinaReaderClient
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
@@ -53,7 +53,7 @@ class _FixedCatalogProvider:
         self,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -96,7 +96,7 @@ class _FixedCatalogProvider:
         self,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,

@@ -62,7 +62,6 @@ from myclaw.terminal.conversation import (
 from myclaw.terminal.conversation import (
     _MessageBusRunProjection as _AgentRunProjection,
 )
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -425,7 +424,7 @@ class CancellableProvider(_FixedCatalogProvider):
         self,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -4139,7 +4138,7 @@ async def test_terminal_renders_reasoning_from_each_tool_loop_model_call(
             self,
             *,
             messages: Sequence[dict[str, object]],
-            tools: Sequence[OpenAIToolSchema],
+            tools: Sequence[dict[str, Any]],
             model: str,
             max_output: int,
             temperature: float,

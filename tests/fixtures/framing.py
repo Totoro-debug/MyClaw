@@ -16,7 +16,6 @@ from myclaw.provider.models import (
     ModelRoute,
     ModelStreamEvent,
 )
-from myclaw.tools.base import OpenAIToolSchema
 
 
 class TaskFramingRouterAdapter:
@@ -36,7 +35,7 @@ class TaskFramingRouterAdapter:
         route: AgentRunnerRoute,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         return self._delegate.stream(
@@ -51,7 +50,7 @@ class TaskFramingRouterAdapter:
         route: ModelRoute,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         if _is_task_framing_request(route, messages=messages, tools=tools):
@@ -98,7 +97,7 @@ def _is_task_framing_request(
     route: ModelRoute,
     *,
     messages: ModelMessages,
-    tools: Sequence[OpenAIToolSchema],
+    tools: Sequence[dict[str, Any]],
 ) -> bool:
     return (
         route == "chat"

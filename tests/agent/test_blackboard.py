@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
+from typing import Any
 
 import pytest
 
@@ -22,7 +23,6 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from myclaw.templates import render_template
-from myclaw.tools.base import OpenAIToolSchema
 
 
 class _FakeRouter:
@@ -41,7 +41,7 @@ class _FakeRouter:
         route: AgentRunnerRoute,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, messages, tools, continuation
@@ -52,7 +52,7 @@ class _FakeRouter:
         route: AgentRunnerRoute,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del continuation

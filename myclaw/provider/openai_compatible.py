@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from importlib import import_module
 from math import isfinite
 from types import MappingProxyType
-from typing import Final, Protocol, cast
+from typing import Any, Final, Protocol, cast
 
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorCode, ErrorInfo
@@ -27,7 +27,6 @@ from myclaw.provider.models import (
     last_assistant_message_index,
     require_tool_call_sequence,
 )
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 
 _REASONING_EFFORT_MAP: Final[Mapping[ReasoningEffort, str]] = MappingProxyType(
@@ -115,7 +114,7 @@ class OpenAICompatibleProvider:
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -138,7 +137,7 @@ class OpenAICompatibleProvider:
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -167,7 +166,7 @@ class OpenAICompatibleProvider:
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -253,7 +252,7 @@ class OpenAICompatibleProvider:
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -281,7 +280,7 @@ class OpenAICompatibleProvider:
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -338,7 +337,7 @@ class OpenAICompatibleProvider:
 def _request_arguments(
     *,
     messages: ModelMessages,
-    tools: Sequence[OpenAIToolSchema],
+    tools: Sequence[dict[str, Any]],
     model: str,
     max_output: int,
     temperature: float,

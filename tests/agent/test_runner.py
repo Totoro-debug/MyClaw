@@ -26,7 +26,7 @@ from myclaw.provider.models import (
     ReasoningDelta,
     TextDelta,
 )
-from myclaw.tools.base import ArtifactReference, OpenAIToolSchema
+from myclaw.tools.base import ArtifactReference
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -59,7 +59,7 @@ class _ClosingRouter:
         route: str,
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: object = None,
     ) -> AsyncIterator[object]:
         del route, messages, tools, continuation
@@ -77,7 +77,7 @@ class _ClosingRouter:
         route: str,
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: object = None,
     ) -> ModelResponse:
         del route, messages, tools, continuation
@@ -93,7 +93,7 @@ class _ConcurrentRouter:
         route: str,
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: object = None,
     ) -> AsyncIterator[object]:
         del route, tools
@@ -132,7 +132,7 @@ class _ConcurrentRouter:
         route: str,
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: object = None,
     ) -> ModelResponse:
         del route, messages, tools, continuation
@@ -141,7 +141,7 @@ class _ConcurrentRouter:
 
 class _DirectGateway:
     def __init__(self, order: list[str], results: Sequence[ToolResult] = ()) -> None:
-        self.schemas: list[OpenAIToolSchema] = []
+        self.schemas: list[dict[str, Any]] = []
         self._order = order
         self._results = list(results)
         self.confirmations: list[object] = []
@@ -171,7 +171,7 @@ class _RetryingRouter:
         route: str,
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelCompleted]:
         del route, messages, tools, continuation
@@ -198,7 +198,7 @@ class _RetryingRouter:
         route: str,
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del route, messages, tools, continuation
@@ -1357,7 +1357,7 @@ async def test_noncooperative_task_cancellation_propagates_after_iterator_close(
         route: str,
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: object = None,
     ) -> AsyncIterator[object]:
         del route, messages, tools, continuation

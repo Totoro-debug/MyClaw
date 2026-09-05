@@ -26,7 +26,6 @@ from myclaw.provider.models import (
 from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillLoader
 from myclaw.templates import render_template
-from myclaw.tools.base import OpenAIToolSchema
 from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -43,7 +42,7 @@ class _DirectSummaryProvider:
         route: ModelRoute,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
     ) -> ModelResponse:
         self.calls.append({"route": route, "messages": messages, "tools": tools})
         return self.response
@@ -147,7 +146,7 @@ async def _prepare_summary(
         list[dict[str, Any]],
     ]
     | None = None,
-    tools: Sequence[OpenAIToolSchema] = (),
+    tools: Sequence[dict[str, Any]] = (),
     current_user: dict[str, Any] | None = None,
     continuation: Sequence[dict[str, Any]] = (),
 ) -> Session:
@@ -590,7 +589,7 @@ async def test_summary_cancellation_propagates_without_persisting_or_advancing_c
             route: ModelRoute,
             *,
             messages: ModelMessages,
-            tools: Sequence[OpenAIToolSchema],
+            tools: Sequence[dict[str, Any]],
         ) -> ModelResponse:
             del route, messages, tools
             self.started.set()
@@ -765,7 +764,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
     original_messages = deepcopy(session.messages)
     provider = _DirectSummaryProvider(_response("Lane summary."))
     memory_manager = MemoryManager(state)
-    tool_schema: OpenAIToolSchema = {
+    tool_schema: dict[str, Any] = {
         "type": "function",
         "function": {
             "name": "read_file",
@@ -916,7 +915,7 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
     provider = _DirectSummaryProvider(_response("Projected summary."))
     memory_manager = MemoryManager(state)
     projection_calls: list[tuple[Sequence[dict[str, Any]], dict[str, Any]]] = []
-    tool_schema: OpenAIToolSchema = {
+    tool_schema: dict[str, Any] = {
         "type": "function",
         "function": {
             "name": "read_file",

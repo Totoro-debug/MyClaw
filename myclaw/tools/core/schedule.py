@@ -6,14 +6,13 @@ import json
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from datetime import UTC, datetime
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 from uuid import UUID, uuid4
 
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleService, ScheduleStaleRemovalError
 from myclaw.tools.base import BaseTool, ToolError
 from myclaw.tools.schema import Schema
-from myclaw.utils.json_types import JsonObject
 from myclaw.utils.validation import require_uuid4_string
 
 _INVALID_ARGUMENTS = "Invalid arguments for schedule."
@@ -101,7 +100,7 @@ class ScheduleTool(BaseTool):
 
     name = "schedule"
     description = "Manage one-time and recurring Schedule Jobs."
-    parameters = _ScheduleArgumentsSchema()
+    parameters = _ScheduleArgumentsSchema().to_json_schema()
     _in_schedule_job: ClassVar[ContextVar[bool]] = ContextVar(
         "myclaw_schedule_tool_in_schedule_job",
         default=False,
@@ -119,6 +118,9 @@ class ScheduleTool(BaseTool):
         self._schedule_service = schedule_service
         self._now: Callable[[], datetime] = (lambda: datetime.now(UTC)) if now is None else now
         self._new_uuid: Callable[[], UUID] = uuid4 if new_uuid is None else new_uuid
+
+    def _build_preparation_schema(self) -> Schema:
+        return _ScheduleArgumentsSchema()
 
     def validate_arguments(  # type: ignore[override]
         self,
@@ -290,7 +292,7 @@ class ScheduleTool(BaseTool):
         return next((job for job in jobs if job.job_id == job_id), None)
 
 
-def _public_schedule(schedule: JobSchedule) -> JsonObject:
+def _public_schedule(schedule: JobSchedule) -> dict[str, Any]:
     if schedule.kind == "at":
         return {"type": "at", "at_time": cast(str, schedule.at_time)}
     if schedule.kind == "every":
@@ -302,7 +304,7 @@ def _public_schedule(schedule: JobSchedule) -> JsonObject:
     }
 
 
-def _public_job(job: ScheduleJob) -> JsonObject:
+def _public_job(job: ScheduleJob) -> dict[str, Any]:
     return {
         "job_id": job.job_id,
         "message": job.message,

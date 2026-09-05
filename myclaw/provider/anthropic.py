@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from math import isfinite
 from types import MappingProxyType
-from typing import Final, Protocol, cast
+from typing import Any, Final, Protocol, cast
 
 from anthropic import (
     APIConnectionError,
@@ -35,7 +35,6 @@ from myclaw.provider.models import (
     last_assistant_message_index,
     require_tool_call_sequence,
 )
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.json_types import JsonObject, JsonValue
 
@@ -103,7 +102,7 @@ class AnthropicProvider:
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -126,7 +125,7 @@ class AnthropicProvider:
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -157,7 +156,7 @@ class AnthropicProvider:
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -297,7 +296,7 @@ class AnthropicProvider:
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -335,7 +334,7 @@ class AnthropicProvider:
 def _request_arguments(
     *,
     messages: ModelMessages,
-    tools: Sequence[OpenAIToolSchema],
+    tools: Sequence[dict[str, Any]],
     model: str,
     max_output: int,
     temperature: float,

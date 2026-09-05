@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Final, Literal, Protocol
 
 from myclaw.provider.errors import EmptyModelResponseError
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from myclaw.utils.validation import require_nonnegative_int
 
@@ -169,7 +168,7 @@ class ModelProvider(Protocol):
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -182,7 +181,7 @@ class ModelProvider(Protocol):
         self,
         *,
         messages: ModelMessages,
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,

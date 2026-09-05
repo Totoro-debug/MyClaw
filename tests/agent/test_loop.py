@@ -51,7 +51,6 @@ from myclaw.skills.catalog import (
     SkillLoader,
     SkillMetadata,
 )
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import (
@@ -83,7 +82,7 @@ class _Router:
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, tools, continuation
@@ -103,7 +102,7 @@ class _Router:
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del route, messages, tools, continuation
@@ -119,7 +118,7 @@ class _MaxRouter(_Router):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, tools, continuation
@@ -146,7 +145,7 @@ class _BlockingRouter(_Router):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, messages, tools, continuation
@@ -173,7 +172,7 @@ class _ConcurrentTitleRouter(_Router):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, tools, continuation
@@ -203,7 +202,7 @@ class _SlowTitleLogRouter(_Router):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, tools, continuation
@@ -233,7 +232,7 @@ class _EventRouter(_Router):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, tools, continuation
@@ -270,7 +269,7 @@ class _TitleBehaviorRouter(_Router):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, tools, continuation
@@ -966,7 +965,7 @@ async def test_reload_during_active_run_preserves_old_request_and_updates_future
             route: Literal["chat", "schedule"],
             *,
             messages: Sequence[dict[str, Any]],
-            tools: Sequence[OpenAIToolSchema],
+            tools: Sequence[dict[str, Any]],
             continuation: ModelContinuation | None = None,
         ) -> AsyncIterator[ModelStreamEvent]:
             del route, tools, continuation
@@ -1074,7 +1073,7 @@ async def test_reload_during_context_preparation_keeps_run_skill_snapshot(
             route: Literal["chat", "schedule"],
             *,
             messages: Sequence[dict[str, Any]],
-            tools: Sequence[OpenAIToolSchema],
+            tools: Sequence[dict[str, Any]],
             continuation: ModelContinuation | None = None,
         ) -> AsyncIterator[ModelStreamEvent]:
             del route, tools, continuation
@@ -1957,7 +1956,7 @@ async def test_title_request_uses_context_builder_messages_without_loop_override
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, tools, continuation
@@ -2555,7 +2554,7 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
             route: Literal["chat", "schedule"],
             *,
             messages: Sequence[dict[str, Any]],
-            tools: Sequence[OpenAIToolSchema],
+            tools: Sequence[dict[str, Any]],
             continuation: ModelContinuation | None = None,
         ) -> AsyncIterator[ModelStreamEvent]:
             del route, tools, continuation
@@ -3123,7 +3122,7 @@ async def test_default_agent_loop_wiring_reduces_keep_replace_and_clear(
         def __init__(self) -> None:
             super().__init__((_response("main answer"),))
             self.direct_calls: list[
-                tuple[str, Sequence[dict[str, Any]], Sequence[OpenAIToolSchema]]
+                tuple[str, Sequence[dict[str, Any]], Sequence[dict[str, Any]]]
             ] = []
 
         async def complete(
@@ -3131,7 +3130,7 @@ async def test_default_agent_loop_wiring_reduces_keep_replace_and_clear(
             route: Literal["chat", "schedule"],
             *,
             messages: Sequence[dict[str, Any]],
-            tools: Sequence[OpenAIToolSchema],
+            tools: Sequence[dict[str, Any]],
             continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             del continuation
@@ -3213,7 +3212,7 @@ async def test_default_agent_loop_wiring_skips_router_completion_for_manual_skil
             route: Literal["chat", "schedule"],
             *,
             messages: Sequence[dict[str, Any]],
-            tools: Sequence[OpenAIToolSchema],
+            tools: Sequence[dict[str, Any]],
             continuation: ModelContinuation | None = None,
         ) -> ModelResponse:
             del tools, continuation

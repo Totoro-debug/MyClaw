@@ -32,7 +32,7 @@ from myclaw.schedule.model import DREAM_JOB_ID, JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
-from myclaw.tools.base import BaseTool, OpenAIToolSchema
+from myclaw.tools.base import BaseTool
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
@@ -53,7 +53,7 @@ class _ScheduleRouter:
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del tools, continuation
@@ -70,7 +70,7 @@ class _ScheduleRouter:
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del continuation
@@ -96,7 +96,7 @@ class _MaxScheduleRouter(_ScheduleRouter):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del continuation
@@ -131,7 +131,7 @@ class _OverlapRouter(_ScheduleRouter):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, messages, tools, continuation
@@ -148,7 +148,7 @@ class _OverlapRouter(_ScheduleRouter):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del route, messages, tools, continuation
@@ -171,7 +171,7 @@ class _ScheduleToolOverlapRouter(_ScheduleRouter):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         del route, messages, tools, continuation
@@ -200,7 +200,7 @@ class _ScheduleToolOverlapRouter(_ScheduleRouter):
         route: Literal["chat", "schedule"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse:
         del route, messages, tools, continuation

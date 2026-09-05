@@ -10,9 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from fractions import Fraction
 from json import dumps
-from typing import Literal, TypeGuard, cast
-
-from myclaw.utils.json_types import JsonObject, JsonValue
+from typing import Any, Literal, TypeGuard, cast
 
 type SchemaKind = Literal["string", "integer", "boolean", "object"]
 
@@ -342,18 +340,18 @@ class Schema:
     def properties(self) -> dict[str, Schema]:
         return {name: schema for name, schema in self._properties}
 
-    def to_json_schema(self) -> JsonObject:
+    def to_json_schema(self) -> dict[str, Any]:
         """Return a detached JSON-compatible schema fragment."""
         type_value: str | list[str] = self._kind
         if self._nullable:
             type_value = [self._kind, "null"]
-        result: JsonObject = {"type": cast(JsonValue, type_value)}
+        result: dict[str, Any] = {"type": type_value}
         if self._description is not None:
             result["description"] = self._description
         if self.has_default:
-            result["default"] = cast(JsonValue, deepcopy(self._default))
+            result["default"] = deepcopy(self._default)
         if self._enum is not None:
-            result["enum"] = cast(JsonValue, [deepcopy(value) for value in self._enum])
+            result["enum"] = [deepcopy(value) for value in self._enum]
         for attribute, keyword in (
             (self._min_length, "minLength"),
             (self._max_length, "maxLength"),
@@ -366,7 +364,7 @@ class Schema:
             (self._multiple_of, "multipleOf"),
         ):
             if attribute is not None:
-                result[keyword] = cast(JsonValue, attribute)
+                result[keyword] = attribute
         if self._properties:
             result["properties"] = {
                 name: property_schema.to_json_schema() for name, property_schema in self._properties

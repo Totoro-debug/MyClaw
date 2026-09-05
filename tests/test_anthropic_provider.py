@@ -30,10 +30,9 @@ from myclaw.provider.models import (
     ReasoningDelta,
     TextDelta,
 )
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 
-READ_FILE_SCHEMA: OpenAIToolSchema = {
+READ_FILE_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "read_file",

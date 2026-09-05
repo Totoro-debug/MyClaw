@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from myclaw.tools.schema import Schema, SchemaError
-from myclaw.utils.json_types import JsonObject, JsonValue
 
 
 def test_schema_builders_export_restricted_detached_json_schema() -> None:
@@ -21,9 +20,9 @@ def test_schema_builders_export_restricted_detached_json_schema() -> None:
     )
 
     first = schema.to_json_schema()
-    first_properties = cast(JsonObject, first["properties"])
-    cast(JsonObject, first_properties["name"])["description"] = "mutated"
-    cast(list[JsonValue], first["required"]).append("other")
+    first_properties = cast(dict[str, Any], first["properties"])
+    cast(dict[str, Any], first_properties["name"])["description"] = "mutated"
+    cast(list[Any], first["required"]).append("other")
 
     assert schema.to_json_schema() == {
         "type": "object",

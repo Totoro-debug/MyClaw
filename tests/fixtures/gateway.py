@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Any
 
-from myclaw.tools.base import BaseTool, OpenAIToolSchema
+from myclaw.tools.base import BaseTool
 from myclaw.tools.tool_gateway import (
     ConfirmationRequester,
     ModelToolCall,
@@ -26,7 +27,7 @@ class SingleToolGateway(ToolGateway):
         self._confirmation = confirmation
 
     @property
-    def schemas(self) -> list[OpenAIToolSchema]:
+    def schemas(self) -> list[dict[str, Any]]:
         return self._gateway.schemas
 
     async def call(

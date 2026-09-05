@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from loguru import logger
@@ -17,8 +17,6 @@ from myclaw.schedule.service import ScheduleService
 from myclaw.tools.base import (
     ArtifactReference,
     BaseTool,
-    OpenAIToolSchema,
-    PreparedToolCall,
     ToolError,
 )
 from myclaw.tools.core.edit_file import EditFileTool
@@ -31,7 +29,6 @@ from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.core.web_fetch import WebFetchTool
 from myclaw.tools.core.web_search import WebSearchTool
 from myclaw.tools.core.write_file import WriteFileTool
-from myclaw.utils.json_types import JsonObject, JsonValue
 from myclaw.utils.validation import require_uuid4
 
 type ConfirmationDecision = Literal["approved", "declined"]
@@ -49,7 +46,7 @@ class ConfirmationRequest:
     tool_name: str
     reason: str
     summary: str
-    _details: JsonObject = field(repr=False)
+    _details: dict[str, Any] = field(repr=False)
     warnings: tuple[str, ...] = ()
 
     def __init__(
@@ -58,7 +55,7 @@ class ConfirmationRequest:
         tool_call_id: str,
         tool_name: str,
         summary: str,
-        details: JsonObject,
+        details: dict[str, Any],
         warnings: tuple[str, ...] = (),
         *,
         reason: str = "",
@@ -87,7 +84,7 @@ class ConfirmationRequest:
         object.__setattr__(self, "warnings", tuple(warnings))
 
     @property
-    def details(self) -> JsonObject:
+    def details(self) -> dict[str, Any]:
         """Return a detached view of the normalized operation details."""
         return deepcopy(self._details)
 
@@ -189,8 +186,8 @@ class ToolGateway:
             WebFetchTool(),
             ScheduleTool(schedule_service=schedule_service),
         )
+        self._catalog = tools
         self._tools = {tool.name: tool for tool in tools}
-        self._schemas = [tool.to_schema() for tool in tools]
         self._failure_observer: Callable[[Exception], None] | None = None
 
     @classmethod
@@ -205,15 +202,15 @@ class ToolGateway:
             raise ValueError("Memory Tool names must be unique and non-empty")
         gateway = object.__new__(cls)
         catalog: tuple[BaseTool, ...] = tools
+        gateway._catalog = catalog
         gateway._tools = {tool.name: tool for tool in catalog}
-        gateway._schemas = [tool.to_schema() for tool in catalog]
         gateway._failure_observer = on_failure
         return gateway
 
     @property
-    def schemas(self) -> list[OpenAIToolSchema]:
-        """Return a detached JSON list in fixed Catalog order."""
-        return deepcopy(self._schemas)
+    def schemas(self) -> list[dict[str, Any]]:
+        """Build a detached schema list from each Tool in fixed Catalog order."""
+        return [deepcopy(tool.to_schema()) for tool in self._catalog]
 
     async def call(
         self,
@@ -237,8 +234,13 @@ class ToolGateway:
             return _result(tool_call, "error", "The requested tool is not available.")
 
         try:
-            preparation = await tool.prepare(cast(JsonObject, parsed))
-            if not isinstance(preparation, PreparedToolCall):
+            preparation = await tool.prepare(cast(dict[str, Any], parsed))
+            if (
+                not isinstance(preparation, tuple)
+                or len(preparation) != 2
+                or not isinstance(preparation[0], dict)
+                or (preparation[1] is not None and not isinstance(preparation[1], str))
+            ):
                 raise TypeError("Tool preparation returned an invalid value")
         except asyncio.CancelledError:
             raise
@@ -248,9 +250,9 @@ class ToolGateway:
             self._record_unexpected_failure(tool, error)
             return _result(tool_call, "error", _generic_tool_failure(tool.name))
 
-        normalized = preparation.arguments
+        prepared_arguments, safety_reason = preparation
         try:
-            refusal = self._refusal_reason(tool, normalized)
+            refusal = self._refusal_reason(tool, prepared_arguments)
         except asyncio.CancelledError:
             raise
         except ToolError as error:
@@ -261,19 +263,21 @@ class ToolGateway:
         if refusal is not None:
             return _result(tool_call, "refused", refusal)
 
-        if preparation.safety_reason is None:
-            return await self._execute(tool_call, tool, normalized, confirmation=None)
+        if safety_reason is None:
+            return await self._execute(tool_call, tool, prepared_arguments, confirmation=None)
 
         try:
-            confirmation_details = cast(JsonObject, _project_confirmation_details(normalized))
+            confirmation_details = cast(
+                dict[str, Any], _project_confirmation_details(prepared_arguments)
+            )
             if tool.name == "exec":
                 for name in ("command", "cwd", "timeout"):
-                    confirmation_details[name] = deepcopy(normalized[name])
+                    confirmation_details[name] = deepcopy(prepared_arguments[name])
             request = ConfirmationRequest(
                 confirmation_id=uuid4(),
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
-                reason=preparation.safety_reason,
+                reason=safety_reason,
                 summary=f"Confirm {tool.name}"[:240],
                 details=confirmation_details,
             )
@@ -320,14 +324,14 @@ class ToolGateway:
                 "Tool confirmation was declined.",
                 confirmation=metadata,
             )
-        return await self._execute(tool_call, tool, normalized, confirmation=metadata)
+        return await self._execute(tool_call, tool, prepared_arguments, confirmation=metadata)
 
     @staticmethod
-    def _refusal_reason(tool: BaseTool, normalized: JsonObject) -> str | None:
+    def _refusal_reason(tool: BaseTool, prepared_arguments: dict[str, Any]) -> str | None:
         refusal = getattr(tool, "refusal_reason", None)
         if refusal is None:
             return None
-        reason = cast(Callable[..., object], refusal)(**deepcopy(normalized))
+        reason = cast(Callable[..., object], refusal)(**deepcopy(prepared_arguments))
         if reason is not None and not isinstance(reason, str):
             raise TypeError("Tool refusal checks must return a string reason or None")
         return reason
@@ -336,12 +340,12 @@ class ToolGateway:
         self,
         tool_call: ModelToolCall,
         tool: BaseTool,
-        normalized: JsonObject,
+        prepared_arguments: dict[str, Any],
         *,
         confirmation: ToolConfirmationMetadata | None,
     ) -> ToolResult:
         try:
-            content = await tool.execute(**_declared_arguments(tool, normalized))
+            content = await tool.execute_prepared(deepcopy(prepared_arguments))
             if not isinstance(content, str):
                 raise TypeError("Tool execution must return a string")
         except asyncio.CancelledError:
@@ -371,13 +375,7 @@ class ToolGateway:
         self._failure_observer(error)
 
 
-def _declared_arguments(tool: BaseTool, arguments: JsonObject) -> JsonObject:
-    return {
-        name: deepcopy(arguments[name]) for name in tool.parameters.properties if name in arguments
-    }
-
-
-def _project_confirmation_details(value: JsonValue) -> JsonValue:
+def _project_confirmation_details(value: Any) -> Any:
     if isinstance(value, str):
         if len(value) <= 256:
             return value

@@ -41,7 +41,6 @@ from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.templates import render_template
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
@@ -127,7 +126,7 @@ class _ScheduleProvider:
         self.stream_requests: list[ProviderCall] = []
         self.complete_requests: list[ProviderCall] = []
         self.direct_complete_messages: list[
-            tuple[list[dict[str, object]], list[OpenAIToolSchema]]
+            tuple[list[dict[str, object]], list[dict[str, Any]]]
         ] = []
         self.closed = False
 
@@ -135,7 +134,7 @@ class _ScheduleProvider:
         self,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -171,7 +170,7 @@ class _ScheduleProvider:
         self,
         *,
         messages: Sequence[dict[str, object]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         model: str,
         max_output: int,
         temperature: float,
@@ -365,7 +364,7 @@ def _capture_summary_projections(
         project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
         route_context_window: int | None = None,
         route_max_output: int | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
+        tools: Sequence[dict[str, Any]] | None = None,
     ) -> Session:
         if current_user is not None:
             assert project_messages is not None
@@ -1327,7 +1326,7 @@ async def test_schedule_shutdown_during_preparation_persists_user(
         project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
         route_context_window: int | None = None,
         route_max_output: int | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
+        tools: Sequence[dict[str, Any]] | None = None,
     ) -> Session:
         if session.session_id == job.session_id:
             context_started.set()
@@ -1395,7 +1394,7 @@ async def test_schedule_failure_logs_one_safe_session_warning(
         project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
         route_context_window: int | None = None,
         route_max_output: int | None = None,
-        tools: Sequence[OpenAIToolSchema] | None = None,
+        tools: Sequence[dict[str, Any]] | None = None,
     ) -> Session:
         if session.session_id == job.session_id:
             failure_started.set()

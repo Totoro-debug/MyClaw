@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, cast
@@ -7,7 +8,7 @@ from uuid import UUID
 
 import pytest
 
-from myclaw.tools.base import BaseTool, PreparedToolCall, ToolError, ToolParam
+from myclaw.tools.base import BaseTool, ToolError, ToolParam
 
 
 class _RepresentativeTool(BaseTool):
@@ -190,14 +191,282 @@ async def test_base_tool_prepare_returns_normalized_arguments_and_safety_reason(
 
     prepared = await PreparingTool().prepare({"count": "3"})
 
-    assert prepared == PreparedToolCall(
-        arguments={"count": 3, "enabled": False},
-        safety_reason="Confirmation is required.",
+    assert prepared == (
+        {"count": 3, "enabled": False},
+        "Confirmation is required.",
     )
     assert observed == [
         ("validation", 3, False),
         ("safety", 3, False),
     ]
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_casts_integer_text() -> None:
+    class IntegerTool(BaseTool):
+        name = "integer"
+        description = "Cast an integer."
+        required = ("count",)
+        count: int
+
+        async def execute(self, *, count: int) -> str:
+            return str(count)
+
+    prepared, safety_reason = await IntegerTool().prepare({"count": "7"})
+
+    assert prepared == {"count": 7}
+    assert safety_reason is None
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_casts_boolean_text() -> None:
+    class BooleanTool(BaseTool):
+        name = "boolean"
+        description = "Cast a boolean."
+        required = ("enabled",)
+        enabled: bool
+
+        async def execute(self, *, enabled: bool) -> str:
+            return str(enabled)
+
+    prepared, _ = await BooleanTool().prepare({"enabled": "true"})
+
+    assert prepared == {"enabled": True}
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_applies_declared_defaults() -> None:
+    class DefaultTool(BaseTool):
+        name = "default"
+        description = "Apply a default."
+        value: str = "fallback"
+
+        async def execute(self, *, value: str) -> str:
+            return value
+
+    prepared, _ = await DefaultTool().prepare({})
+
+    assert prepared == {"value": "fallback"}
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_filters_unknown_fields() -> None:
+    class FilterTool(BaseTool):
+        name = "filter"
+        description = "Filter unknown fields."
+        value: str
+
+        async def execute(self, *, value: str) -> str:
+            return value
+
+    prepared, _ = await FilterTool().prepare({"value": "kept", "extra": "removed"})
+
+    assert prepared == {"value": "kept"}
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_rejects_missing_required_argument() -> None:
+    class RequiredTool(BaseTool):
+        name = "required"
+        description = "Require a value."
+        required = ("value",)
+        value: str
+
+        async def execute(self, *, value: str) -> str:
+            return value
+
+    with pytest.raises(ToolError, match="value"):
+        await RequiredTool().prepare({})
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_rejects_invalid_integer() -> None:
+    class IntegerTool(BaseTool):
+        name = "invalid_integer"
+        description = "Reject an invalid integer."
+        required = ("count",)
+        count: int
+
+        async def execute(self, *, count: int) -> str:
+            return str(count)
+
+    with pytest.raises(ToolError, match="integer"):
+        await IntegerTool().prepare({"count": "not-an-integer"})
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_rejects_schema_constraints() -> None:
+    class BoundedTool(BaseTool):
+        name = "bounded"
+        description = "Enforce a lower bound."
+        count: Annotated[int, ToolParam(minimum=1)]
+
+        async def execute(self, *, count: int) -> str:
+            return str(count)
+
+    with pytest.raises(ToolError, match="greater than or equal to 1"):
+        await BoundedTool().prepare({"count": 0})
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_rejects_string_constraints() -> None:
+    class NamedTool(BaseTool):
+        name = "named"
+        description = "Enforce a minimum name length."
+        value: Annotated[str, ToolParam(min_length=2)]
+
+        async def execute(self, *, value: str) -> str:
+            return value
+
+    with pytest.raises(ToolError, match="at least 2 characters"):
+        await NamedTool().prepare({"value": "x"})
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_runs_validation_after_cast() -> None:
+    observed: list[int] = []
+
+    class ValidatingTool(BaseTool):
+        name = "validating"
+        description = "Observe normalized validation."
+        required = ("count",)
+        count: int
+
+        def validate_arguments(self, *, count: int) -> None:  # type: ignore[override]
+            observed.append(count)
+
+        async def execute(self, *, count: int) -> str:
+            return str(count)
+
+    await ValidatingTool().prepare({"count": "9"})
+
+    assert observed == [9]
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_runs_safety_after_validation() -> None:
+    observed: list[tuple[str, int]] = []
+
+    class SafeTool(BaseTool):
+        name = "safe"
+        description = "Observe safety ordering."
+        required = ("count",)
+        count: int
+
+        def validate_arguments(self, *, count: int) -> None:  # type: ignore[override]
+            observed.append(("validate", count))
+
+        async def check_safety(self, *, count: int) -> str | None:  # type: ignore[override]
+            observed.append(("safety", count))
+            return None
+
+        async def execute(self, *, count: int) -> str:
+            return str(count)
+
+    await SafeTool().prepare({"count": "4"})
+
+    assert observed == [("validate", 4), ("safety", 4)]
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_propagates_cancellation_from_argument_preparation() -> None:
+    class CancelledPreparationTool(BaseTool):
+        name = "cancelled_preparation"
+        description = "Cancel while preparing."
+
+        async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+            del arguments
+            raise asyncio.CancelledError
+
+        async def execute(self) -> str:
+            return "unreachable"
+
+    with pytest.raises(asyncio.CancelledError):
+        await CancelledPreparationTool().prepare({})
+
+
+@pytest.mark.asyncio
+async def test_base_tool_prepare_propagates_cancellation_from_safety() -> None:
+    class CancelledSafetyTool(BaseTool):
+        name = "cancelled_safety"
+        description = "Cancel while checking safety."
+
+        async def check_safety(self) -> str | None:  # type: ignore[override]
+            raise asyncio.CancelledError
+
+        async def execute(self) -> str:
+            return "unreachable"
+
+    with pytest.raises(asyncio.CancelledError):
+        await CancelledSafetyTool().prepare({})
+
+
+@pytest.mark.asyncio
+async def test_default_execute_prepared_expands_prepared_keywords() -> None:
+    class KeywordTool(BaseTool):
+        name = "keyword"
+        description = "Expand prepared keywords."
+        required = ("value",)
+        value: str
+
+        async def execute(self, *, value: str) -> str:
+            return f"received:{value}"
+
+    result = await KeywordTool().execute_prepared({"value": "payload"})
+
+    assert result == "received:payload"
+
+
+@pytest.mark.asyncio
+async def test_default_execute_prepared_expands_multiple_keywords() -> None:
+    class MultipleKeywordTool(BaseTool):
+        name = "multiple_keyword"
+        description = "Expand multiple prepared keywords."
+        left: str
+        right: int
+
+        async def execute(self, *, left: str, right: int) -> str:
+            return f"{left}:{right}"
+
+    result = await MultipleKeywordTool().execute_prepared({"left": "left", "right": 3})
+
+    assert result == "left:3"
+
+
+@pytest.mark.asyncio
+async def test_default_execute_prepared_propagates_execute_result() -> None:
+    class ResultTool(BaseTool):
+        name = "result"
+        description = "Return the prepared execution result."
+        required = ("value",)
+        value: str
+
+        async def execute(self, *, value: str) -> str:
+            return f"complete:{value}"
+
+    result = await ResultTool().execute_prepared({"value": "payload"})
+
+    assert result == "complete:payload"
+
+
+@pytest.mark.asyncio
+async def test_tool_with_only_execute_prepared_is_concrete() -> None:
+    class PreparedOnlyTool(BaseTool):
+        name = "prepared_only"
+        description = "Implement only prepared execution."
+        parameters: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        }
+
+        async def execute_prepared(self, arguments: dict[str, Any]) -> str:
+            assert arguments == {}
+            return "prepared only"
+
+    tool = PreparedOnlyTool()
+
+    assert await tool.execute_prepared({}) == "prepared only"
 
 
 def test_tool_without_a_declaration_or_execution_remains_abstract() -> None:
@@ -217,6 +486,41 @@ def test_tool_with_parameters_but_without_execution_remains_abstract() -> None:
     assert inspect.isabstract(ParametersOnlyTool)
     with pytest.raises(TypeError, match="abstract method 'execute'"):
         cast(Any, ParametersOnlyTool)()
+
+
+def test_tool_with_plain_mixin_but_without_execution_remains_abstract() -> None:
+    class PlainMixin:
+        pass
+
+    class IncompleteTool(BaseTool, PlainMixin):
+        name = "incomplete_mixin"
+        description = "A Tool whose mixin does not provide execution."
+        parameters: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+        }
+
+    assert inspect.isabstract(IncompleteTool)
+    with pytest.raises(TypeError, match="abstract method 'execute'"):
+        cast(Any, IncompleteTool)()
+
+
+def test_tool_cannot_override_schema_projection() -> None:
+    with pytest.raises(TypeError, match="cannot override"):
+
+        class CustomSchemaTool(BaseTool):
+            name = "custom_schema"
+            description = "Attempt to override schema projection."
+            parameters: ClassVar[dict[str, Any]] = {
+                "type": "object",
+                "properties": {},
+            }
+
+            def to_schema(self) -> dict[str, Any]:  # type: ignore[misc]
+                return {}
+
+            async def execute(self) -> str:
+                return "unreachable"
 
 
 def test_base_tool_result_handler_writes_a_bounded_workspace_artifact(

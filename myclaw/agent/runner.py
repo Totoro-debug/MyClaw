@@ -22,7 +22,6 @@ from myclaw.provider.models import (
     ReasoningDelta,
     TextDelta,
 )
-from myclaw.tools.base import OpenAIToolSchema
 from myclaw.tools.tool_gateway import (
     ConfirmationRequester,
     ModelToolCall,
@@ -73,7 +72,7 @@ class AgentRunnerRouter(Protocol):
         route: AgentRunnerRoute,
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]: ...
 
@@ -82,7 +81,7 @@ class AgentRunnerRouter(Protocol):
         route: AgentRunnerRoute,
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse: ...
 
@@ -96,7 +95,7 @@ class AgentRunnerMemoryRouter(ABC):
         route: Literal["memory"],
         *,
         messages: Sequence[dict[str, Any]],
-        tools: Sequence[OpenAIToolSchema],
+        tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> ModelResponse: ...
 
