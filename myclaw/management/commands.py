@@ -225,7 +225,7 @@ class ManagementCommandDispatcher:
                 handled=True,
                 output=f"{management_error.error.code}: {management_error.error.message}",
             )
-        prefix = f"Path: {view.path}\n"
+        prefix = f"{view.diagnostics_text()}Path: {view.path}\n"
         if view.error is not None:
             prefix = f"{view.error.code}: {view.error.message}\n{prefix}"
         return ManagementCommandResult(

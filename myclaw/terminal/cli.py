@@ -558,6 +558,14 @@ def config_command() -> None:
     if view.error is not None:
         _print_error(view.error, view.path)
     else:
+        if view.diagnostics:
+            console.print(
+                view.diagnostics_text(),
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+                end="",
+            )
         console.print(
             f"Path: {view.path}",
             markup=False,

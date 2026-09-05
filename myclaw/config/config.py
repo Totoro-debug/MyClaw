@@ -3,7 +3,7 @@
 import re
 import tomllib
 from collections.abc import Mapping, MutableMapping, MutableSequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
@@ -21,9 +21,15 @@ from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 DEFAULT_CONFIG_TEMPLATE: Final = load_template("default-config.md")
 
 type ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
+type MCPTransport = Literal["stdio", "streamable-http"]
 
 _PROVIDER_ID_PATTERN: Final = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_MCP_NAME_PATTERN: Final = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _ROUTE_NAMES: Final = frozenset({"default", "chat", "memory", "schedule"})
+_MCP_TRANSPORTS: Final = frozenset({"stdio", "streamable-http"})
+_MCP_DEFAULT_CONNECT_TIMEOUT: Final = 30
+_MCP_DEFAULT_CALL_TIMEOUT: Final = 60
+_MCP_MAX_TIMEOUT: Final = 600
 _API_KEY_FIELD_PATTERN: Final = re.compile(r"api[-_]?key", flags=re.IGNORECASE)
 _TOML_KEY_SEGMENT_PATTERN: Final = r"""(?:[a-z0-9_-]+|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*')"""
 
@@ -32,6 +38,10 @@ def _toml_basic_key_character_pattern(character: str) -> str:
     codepoints = sorted({ord(character.lower()), ord(character.upper())})
     escaped = "|".join(rf"\\(?:u{codepoint:04x}|U{codepoint:08x})" for codepoint in codepoints)
     return rf"(?:{re.escape(character)}|{escaped})"
+
+
+def _toml_basic_key_word_pattern(word: str) -> str:
+    return "".join(_toml_basic_key_character_pattern(character) for character in word)
 
 
 _TOML_BASIC_API_KEY_NAME_PATTERN: Final = (
@@ -70,6 +80,22 @@ _API_KEY_UNSAFE_REMAINDER_PATTERN: Final = re.compile(
     rf"(?!\s*[\"']{re.escape(_REDACTED_API_KEY)}[\"'])"
     r"(?P<spacing>\s*).*\Z",
     flags=re.DOTALL | re.IGNORECASE,
+)
+_SENSITIVE_CONFIGURATION_FIELDS: Final = frozenset({"headers", "env", "secret_env"})
+_TOML_BASIC_SENSITIVE_FIELD_PATTERN: Final = "|".join(
+    _toml_basic_key_word_pattern(field) for field in sorted(_SENSITIVE_CONFIGURATION_FIELDS)
+)
+_SENSITIVE_FIELD_REFERENCE_PATTERN: Final = re.compile(
+    rf"(?<![a-z0-9_-])(?:{_TOML_BASIC_SENSITIVE_FIELD_PATTERN})(?![a-z0-9_-])",
+    flags=re.IGNORECASE,
+)
+_TOML_DOTTED_KEY_PATTERN: Final = (
+    rf"{_TOML_KEY_SEGMENT_PATTERN}(?:\s*\.\s*{_TOML_KEY_SEGMENT_PATTERN})*"
+)
+_TOML_ASSIGNMENT_PATTERN: Final = re.compile(
+    rf"^(?P<prefix>\s*(?P<key>{_TOML_DOTTED_KEY_PATTERN})\s*=\s*)"
+    r"(?P<value>[^\r\n]*)(?P<newline>\r?\n)?\Z",
+    flags=re.IGNORECASE,
 )
 
 
@@ -123,10 +149,37 @@ class ResolvedModelRoute:
 
 
 @dataclass(frozen=True, slots=True)
+class MCPServerConfiguration:
+    """One validated, user-selected MCP Server configuration."""
+
+    mcp_name: str
+    enabled: bool
+    transport: MCPTransport
+    command: str | None = None
+    args: tuple[str, ...] = ()
+    cwd: Path | None = None
+    url: str | None = None
+    headers: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    connect_timeout: int = _MCP_DEFAULT_CONNECT_TIMEOUT
+    call_timeout: int = _MCP_DEFAULT_CALL_TIMEOUT
+
+    def resolve_cwd(self, workspace: Path) -> Path:
+        """Resolve a stdio cwd against the active Workspace."""
+        if self.cwd is None or self.cwd.is_absolute():
+            return self.cwd if self.cwd is not None else workspace
+        return workspace / self.cwd
+
+
+def _empty_mcp_servers() -> Mapping[str, MCPServerConfiguration]:
+    return MappingProxyType({})
+
+
+@dataclass(frozen=True, slots=True)
 class UserConfiguration:
     runtime: RuntimeConfiguration
     memory: MemoryConfiguration
     models: ModelsConfiguration
+    mcp: Mapping[str, MCPServerConfiguration] = field(default_factory=_empty_mcp_servers)
 
     def resolve_route(self, requested_route: str) -> ResolvedModelRoute:
         """Resolve a Model Route, falling back to a usable default when permitted."""
@@ -150,12 +203,28 @@ class UserConfiguration:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfigurationDiagnostic:
+    """A safe diagnostic for one ignored MCP Server configuration."""
+
+    mcp_name: str
+    reason: str
+
+    @property
+    def message(self) -> str:
+        return f"MCP Server {self.mcp_name!a} ignored: {self.reason}"
+
+
+@dataclass(frozen=True, slots=True)
 class ConfigView:
-    """A configuration path, redacted content, and optional safe parse error."""
+    """A configuration path, redacted content, parse error, and safe diagnostics."""
 
     path: Path
     redacted_content: str
     error: ErrorInfo | None
+    diagnostics: tuple[ConfigurationDiagnostic, ...] = ()
+
+    def diagnostics_text(self) -> str:
+        return "".join(f"{diagnostic.message}\n" for diagnostic in self.diagnostics)
 
 
 class ConfigError(Exception):
@@ -298,9 +367,23 @@ def _redact_api_key_fields(value: object) -> None:
         return
     if not isinstance(value, MutableMapping):
         return
-    for field, item in value.items():
-        if isinstance(field, str) and _API_KEY_FIELD_PATTERN.fullmatch(field) and item != "":
-            value[field] = _REDACTED_API_KEY
+    for field_name, item in tuple(value.items()):
+        if (
+            isinstance(field_name, str)
+            and _API_KEY_FIELD_PATTERN.fullmatch(field_name)
+            and item != ""
+        ):
+            value[field_name] = _REDACTED_API_KEY
+            continue
+        if (
+            isinstance(field_name, str)
+            and field_name.lower() in _SENSITIVE_CONFIGURATION_FIELDS
+        ):
+            if isinstance(item, MutableMapping):
+                for header_name in tuple(item):
+                    item[header_name] = _REDACTED_API_KEY
+            else:
+                value[field_name] = _REDACTED_API_KEY
             continue
         _redact_api_key_fields(item)
 
@@ -321,7 +404,122 @@ def _redact_unparsed_content(content: str) -> str:
         redact_remainder,
         without_string_keys,
     )
-    return _API_KEY_LINE_PATTERN.sub(redact_line, without_unsafe_remainder)
+    without_api_keys = _API_KEY_LINE_PATTERN.sub(redact_line, without_unsafe_remainder)
+    return _redact_sensitive_content(without_api_keys)
+
+
+def _single_line_safe_text(value: str) -> str:
+    return "".join(character if character.isprintable() else ascii(character)[1:-1] for character in value)
+
+
+def _contains_sensitive_configuration_field(value: object) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            (
+                isinstance(field_name, str)
+                and field_name.lower() in _SENSITIVE_CONFIGURATION_FIELDS
+            )
+            or _contains_sensitive_configuration_field(item)
+            for field_name, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_sensitive_configuration_field(item) for item in value)
+    return False
+
+
+def _split_ignorable_prefix(value: str) -> tuple[str, str]:
+    index = 0
+    while index < len(value) and (value[index].isspace() or not value[index].isprintable()):
+        index += 1
+    return value[:index], value[index:]
+
+
+def _sensitive_table_header(line: str) -> bool | None:
+    _, candidate = _split_ignorable_prefix(line)
+    if not candidate.startswith("["):
+        return None
+    try:
+        document = tomllib.loads(candidate)
+    except tomllib.TOMLDecodeError:
+        return _SENSITIVE_FIELD_REFERENCE_PATTERN.search(candidate) is not None
+    return _contains_sensitive_configuration_field(document)
+
+
+def _sensitive_assignment(match: re.Match[str]) -> bool:
+    assignment = f'{match.group("key")} = {match.group("value")}'
+    try:
+        document = tomllib.loads(assignment)
+    except tomllib.TOMLDecodeError:
+        return _SENSITIVE_FIELD_REFERENCE_PATTERN.search(assignment) is not None
+    return _contains_sensitive_configuration_field(document)
+
+
+def _complete_toml_value(value: str) -> bool:
+    try:
+        tomllib.loads(f"value = {value}")
+    except tomllib.TOMLDecodeError:
+        return False
+    return True
+
+
+def _redacted_line(line: str) -> str:
+    newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+    return f'"{_REDACTED_API_KEY}"{newline}'
+
+
+def _redact_sensitive_content(content: str) -> str:
+    lines: list[str] = []
+    sensitive_table = False
+    pending_sensitive_value: list[str] | None = None
+    for line in content.splitlines(keepends=True):
+        if pending_sensitive_value is not None:
+            pending_sensitive_value.append(line)
+            lines.append(_redacted_line(line))
+            if _complete_toml_value("".join(pending_sensitive_value)):
+                pending_sensitive_value = None
+            continue
+
+        table_header = _sensitive_table_header(line)
+        if table_header is not None:
+            sensitive_table = table_header
+            lines.append(line)
+            continue
+        ignorable_prefix, assignment_line = _split_ignorable_prefix(line)
+        if not sensitive_table or not line.strip() or line.lstrip().startswith("#"):
+            assignment = _TOML_ASSIGNMENT_PATTERN.fullmatch(assignment_line)
+            if assignment is None:
+                if (
+                    "=" in assignment_line
+                    and _SENSITIVE_FIELD_REFERENCE_PATTERN.search(assignment_line) is not None
+                ):
+                    lines.append(_redacted_line(line))
+                    pending_sensitive_value = [assignment_line]
+                    continue
+                lines.append(line)
+                continue
+            if not _sensitive_assignment(assignment):
+                lines.append(line)
+                continue
+            lines.append(
+                f'{ignorable_prefix}{assignment.group("prefix")}"{_REDACTED_API_KEY}"'
+                f'{assignment.group("newline") or ""}'
+            )
+            if not _complete_toml_value(assignment.group("value")):
+                pending_sensitive_value = [
+                    assignment.group("value"),
+                    assignment.group("newline") or "",
+                ]
+            continue
+
+        assignment = _TOML_ASSIGNMENT_PATTERN.fullmatch(assignment_line)
+        if assignment is None:
+            lines.append(_redacted_line(line))
+            continue
+        lines.append(
+            f'{ignorable_prefix}{assignment.group("prefix")}"{_REDACTED_API_KEY}"'
+            f'{assignment.group("newline") or ""}'
+        )
+    return "".join(lines)
 
 
 def _parse_runtime(document: Mapping[str, object]) -> RuntimeConfiguration:
@@ -472,17 +670,158 @@ def _parse_models(document: Mapping[str, object]) -> ModelsConfiguration:
     )
 
 
-def _parse_configuration(document: dict[str, object]) -> UserConfiguration:
+def _parse_string_array(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        _invalid(field, "must be an array of strings")
+    items = cast(list[object], value)
+    return tuple(_string(item, field) for item in items)
+
+
+def _parse_mcp_headers(value: object, field: str) -> Mapping[str, str]:
+    table = _table(value, field)
+    headers: dict[str, str] = {}
+    for header_name, header_value in table.items():
+        if not isinstance(header_name, str) or not header_name or header_name != header_name.strip():
+            _invalid(field, "must contain nonempty header names without surrounding whitespace")
+        headers[header_name] = _string(header_value, f"{field}.{header_name}")
+    return MappingProxyType(headers)
+
+
+def _parse_mcp_server(mcp_name: str, value: object) -> MCPServerConfiguration:
+    valid_name = _MCP_NAME_PATTERN.fullmatch(mcp_name) is not None
+    prefix = f"mcp.servers.{mcp_name if valid_name else ascii(mcp_name)}"
+    if not valid_name:
+        _invalid(prefix, "must use a lowercase name with up to 64 letters, digits, '_' or '-'")
+    table = _table(value, prefix)
+    _reject_unknown(
+        table,
+        {
+            "enabled",
+            "transport",
+            "command",
+            "args",
+            "cwd",
+            "url",
+            "headers",
+            "connect_timeout",
+            "call_timeout",
+        },
+        prefix,
+    )
+    transport = _string(
+        _required(table, "transport", f"{prefix}.transport"),
+        f"{prefix}.transport",
+    )
+    if transport not in _MCP_TRANSPORTS:
+        _invalid(
+            f"{prefix}.transport",
+            "must be either 'stdio' or 'streamable-http'",
+        )
+    enabled = _boolean(table.get("enabled", False), f"{prefix}.enabled")
+    connect_timeout = _integer(
+        table.get("connect_timeout", _MCP_DEFAULT_CONNECT_TIMEOUT),
+        f"{prefix}.connect_timeout",
+        1,
+        _MCP_MAX_TIMEOUT,
+    )
+    call_timeout = _integer(
+        table.get("call_timeout", _MCP_DEFAULT_CALL_TIMEOUT),
+        f"{prefix}.call_timeout",
+        1,
+        _MCP_MAX_TIMEOUT,
+    )
+
+    if transport == "stdio":
+        for field_name in ("url", "headers"):
+            if field_name in table:
+                _invalid(
+                    f"{prefix}.{field_name}",
+                    "is only valid for the streamable-http transport",
+                )
+        args_value = table.get("args", [])
+        cwd_value = table.get("cwd")
+        return MCPServerConfiguration(
+            mcp_name=mcp_name,
+            enabled=enabled,
+            transport="stdio",
+            command=_string(
+                _required(table, "command", f"{prefix}.command"),
+                f"{prefix}.command",
+                nonempty=True,
+            ),
+            args=_parse_string_array(args_value, f"{prefix}.args"),
+            cwd=(
+                Path(_string(cwd_value, f"{prefix}.cwd", nonempty=True))
+                if cwd_value is not None
+                else None
+            ),
+            connect_timeout=connect_timeout,
+            call_timeout=call_timeout,
+        )
+
+    for field_name in ("command", "args", "cwd"):
+        if field_name in table:
+            _invalid(
+                f"{prefix}.{field_name}",
+                "is only valid for the stdio transport",
+            )
+    url = _string(_required(table, "url", f"{prefix}.url"), f"{prefix}.url", nonempty=True)
+    if not _has_absolute_http_url(url):
+        _invalid(f"{prefix}.url", "must be an absolute HTTP or HTTPS URL")
+    return MCPServerConfiguration(
+        mcp_name=mcp_name,
+        enabled=enabled,
+        transport="streamable-http",
+        url=url,
+        headers=_parse_mcp_headers(
+            table.get("headers", {}),
+            f"{prefix}.headers",
+        ),
+        connect_timeout=connect_timeout,
+        call_timeout=call_timeout,
+    )
+
+
+def _parse_mcp(
+    document: Mapping[str, object],
+    *,
+    diagnostics: list[ConfigurationDiagnostic] | None = None,
+) -> Mapping[str, MCPServerConfiguration]:
+    table = _table(document.get("mcp", {}), "mcp")
+    _reject_unknown(table, {"servers"}, "mcp")
+    servers = _table(table.get("servers", {}), "mcp.servers")
+    parsed: dict[str, MCPServerConfiguration] = {}
+    for mcp_name, value in servers.items():
+        try:
+            parsed[mcp_name] = _parse_mcp_server(mcp_name, value)
+        except ConfigError as error:
+            if diagnostics is None:
+                raise
+            diagnostics.append(
+                ConfigurationDiagnostic(
+                    mcp_name=mcp_name,
+                    reason=_single_line_safe_text(error.error.message),
+                )
+            )
+    return MappingProxyType(parsed)
+
+
+def _parse_configuration(
+    document: dict[str, object],
+    *,
+    diagnostics: list[ConfigurationDiagnostic] | None = None,
+) -> UserConfiguration:
     return UserConfiguration(
         runtime=_parse_runtime(document),
         memory=_parse_memory(document),
         models=_parse_models(document),
+        mcp=_parse_mcp(document, diagnostics=diagnostics),
     )
 
 
 def _validate_defined_fields(document: Mapping[str, object]) -> None:
     """Preserve strict config-inspection diagnostics without changing startup projection."""
-    _reject_unknown(document, {"runtime", "memory", "models"}, "")
+    _reject_unknown(document, {"runtime", "memory", "models", "mcp"}, "")
 
     runtime = _table(document.get("runtime", {}), "runtime")
     _reject_unknown(
@@ -528,24 +867,36 @@ def _validate_defined_fields(document: Mapping[str, object]) -> None:
             prefix,
         )
 
+    mcp = _table(document.get("mcp", {}), "mcp")
+    _reject_unknown(mcp, {"servers"}, "mcp")
+    _table(mcp.get("servers", {}), "mcp.servers")
+
 
 class ConfigLoader:
     """Access User Configuration beneath an injected fixed Agent Home."""
 
     def __init__(self, agent_home: AgentHome) -> None:
         self.agent_home = agent_home
+        self._diagnostics: tuple[ConfigurationDiagnostic, ...] = ()
 
     @property
     def path(self) -> Path:
         return self.agent_home.path / "config.toml"
 
+    @property
+    def diagnostics(self) -> tuple[ConfigurationDiagnostic, ...]:
+        """Return diagnostics from the most recent successful configuration parse."""
+        return self._diagnostics
+
     def ensure_default(self) -> bool:
         """Create the accepted default template when missing."""
+        self._diagnostics = ()
         self.agent_home.initialize()
         return HOST_FILESYSTEM.atomic_create_text(self.path, DEFAULT_CONFIG_TEMPLATE)
 
     def load(self) -> UserConfiguration:
         """Load User Configuration as immutable typed values."""
+        self._diagnostics = ()
         try:
             loaded: object = tomllib.loads(self.path.read_text(encoding="utf-8"))
         except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
@@ -556,7 +907,10 @@ class ConfigLoader:
                 )
             ) from error
         document = _table(loaded, "configuration")
-        return _parse_configuration(document)
+        diagnostics: list[ConfigurationDiagnostic] = []
+        configuration = _parse_configuration(document, diagnostics=diagnostics)
+        self._diagnostics = tuple(diagnostics)
+        return configuration
 
     def load_for_startup(self) -> UserConfiguration:
         """Generate missing configuration or return a startup-usable configuration."""
@@ -618,11 +972,17 @@ class ConfigLoader:
 
         candidate_content = tomlkit.dumps(source_document)
         candidate = tomllib.loads(candidate_content)
-        _parse_configuration(_table(candidate, "configuration"))
+        candidate_diagnostics: list[ConfigurationDiagnostic] = []
+        _parse_configuration(
+            _table(candidate, "configuration"),
+            diagnostics=candidate_diagnostics,
+        )
         HOST_FILESYSTEM.atomic_replace_text(self.path, candidate_content)
+        self._diagnostics = tuple(candidate_diagnostics)
 
     def view(self) -> ConfigView:
         """Return complete User Configuration text with plaintext API keys redacted."""
+        self._diagnostics = ()
         content = self.path.read_text(encoding="utf-8")
         try:
             loaded: object = tomllib.loads(content)
@@ -637,13 +997,17 @@ class ConfigLoader:
             )
         document = _table(loaded, "configuration")
         error: ErrorInfo | None = None
+        diagnostics: list[ConfigurationDiagnostic] = []
         try:
             _validate_defined_fields(document)
-            _parse_configuration(document)
+            _parse_configuration(document, diagnostics=diagnostics)
         except ConfigError as config_error:
             error = config_error.error
+        else:
+            self._diagnostics = tuple(diagnostics)
         return ConfigView(
             path=self.path,
             redacted_content=_redact_parsed_content(content),
             error=error,
+            diagnostics=tuple(diagnostics),
         )

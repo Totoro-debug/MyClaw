@@ -32,6 +32,7 @@ from tests.configuration.test_config import (
     EXPECTED_REDACTED_CONFIG,
     EXPECTED_REDACTED_MALFORMED_CONFIG,
     MALFORMED_CONFIG,
+    MINIMAL_VALID_CONFIG,
     REDACTION_CONFIG,
     VALID_CONFIG,
 )
@@ -2099,6 +2100,41 @@ def test_installed_config_command_redacts_valid_configuration(
     assert not (workspace / ".myclaw").exists()
 
 
+def test_installed_config_command_reports_mcp_diagnostics_without_secrets(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    agent_home.mkdir(parents=True)
+    (agent_home / "config.toml").write_text(
+        MINIMAL_VALID_CONFIG
+        + """
+[mcp.servers.invalid]
+enabled = true
+transport = "stdio"
+command = "uvx"
+env = { API_TOKEN = "installed-env-secret" }
+
+[mcp.servers.http]
+enabled = true
+transport = "streamable-http"
+url = "https://mcp.example.test/service"
+headers = { Authorization = "Bearer installed-header-secret" }
+""",
+        encoding="utf-8",
+    )
+
+    result = run_installed_myclaw(agent_home, "config", workspace=workspace)
+
+    visible = result.stdout + result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "MCP Server 'invalid' ignored" in visible
+    assert "installed-env-secret" not in visible
+    assert "installed-header-secret" not in visible
+    assert "***REDACTED***" in visible
+    assert not (agent_home / "logs").exists()
+    assert not (workspace / ".myclaw").exists()
+
+
 def test_installed_config_command_shows_safe_malformed_configuration(
     agent_home: Path,
     workspace: Path,
@@ -2110,7 +2146,7 @@ def test_installed_config_command_shows_safe_malformed_configuration(
 
     assert result.returncode == 2
     assert result.stdout.count("config_parse_error") == 1
-    assert f"Path: {agent_home / 'config.toml'}" in result.stdout
+    assert result.stdout.count(f"Path: {agent_home / 'config.toml'}") == 1
     assert EXPECTED_REDACTED_MALFORMED_CONFIG in result.stdout
     assert result.stderr == ""
     assert_plaintext_absent(

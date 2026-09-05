@@ -8,6 +8,26 @@ consolidation_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
+# Configure a trusted local MCP Server by uncommenting and editing one item.
+# [mcp.servers.filesystem]
+# enabled = true
+# transport = "stdio"
+# command = "uvx"
+# args = ["mcp-server-filesystem", "."]
+# cwd = "."
+# connect_timeout = 30
+# call_timeout = 60
+
+# Configure a trusted Streamable HTTP MCP Server with optional static headers.
+# [mcp.servers.search]
+# enabled = true
+# transport = "streamable-http"
+# url = "https://example.com/mcp"
+# connect_timeout = 30
+# call_timeout = 60
+# [mcp.servers.search.headers]
+# Authorization = "Bearer replace-with-a-token"
+
 [models.providers.openai-local]
 protocol = "openai-compatible"
 base_url = ""
