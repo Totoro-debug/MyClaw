@@ -183,6 +183,7 @@ class AgentLoop:
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
         monotonic_now: Callable[[], float],
+        mcp_tools: Sequence[BaseTool] = (),
     ) -> None:
         if not isinstance(workspace_path, Path):
             raise TypeError("Agent Loop requires a Workspace Path")
@@ -233,6 +234,7 @@ class AgentLoop:
             workspace=workspace_path,
             schedule_service=schedule_service,
             skill_root=skill_loader.root,
+            additional_tools=tuple(mcp_tools),
         )
         runner = AgentRunner(model_router)
         summary_manager = ConversationSummaryManager(

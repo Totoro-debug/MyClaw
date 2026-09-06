@@ -4,7 +4,7 @@ status: accepted
 
 # Use an Agent Home Skill Catalog with Progressive Loading
 
-> Runtime-Lifetime snapshot ownership and on-demand manual Skill body loading in this ADR are superseded by [ADR-0017](0017-use-cli-composition-root-and-session-scoped-agent-loop.md). Skill discovery rules, path permissions, and prompt-safety constraints remain accepted. This historical decision and its consequences are immutable; the superseded scope is not an active Skill contract.
+> Runtime-Lifetime snapshot ownership and on-demand manual Skill body loading in this ADR are superseded by [ADR-0017](0017-use-cli-composition-root-and-session-scoped-agent-loop.md). Skill discovery rules, path permissions, and prompt-safety constraints remain accepted. The fixed ten-Tool Catalog assumption is superseded by [ADR-0020](0020-expose-configured-mcp-tools-through-tool-gateway.md). This historical decision and its consequences are immutable; the superseded scope is not an active Skill contract.
 
 MyClaw discovers Skills from the direct child directories of `~/.myclaw/skills`, keeps only valid YAML-frontmatter metadata in a Runtime Lifetime catalog, and exposes every retained Skill's name, description, and absolute `SKILL.md` path to foreground model calls and the existing command-completion surface. Skill names are validated without trimming, descriptions are trimmed before validation, canonical path order makes the first valid duplicate win, and Management Command names remain reserved. Skills guide existing capabilities without registering Tools or expanding their authority.
 

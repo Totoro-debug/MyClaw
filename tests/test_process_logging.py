@@ -2,12 +2,20 @@
 
 import sys
 from collections.abc import Iterator
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from loguru import logger
 
+from myclaw.config.config import MCPServerConfiguration
 from myclaw.logging.process import configure_process_logging
 from myclaw.terminal.process_entry import run
+from myclaw.tools.mcp import MCPTool
+from myclaw.tools.mcp_runtime import MCPRuntimeManager
+
+if TYPE_CHECKING:
+    from loguru import Record
 
 
 @pytest.fixture(autouse=True)
@@ -62,6 +70,81 @@ def test_process_logging_configuration_is_repeatable_without_duplicate_output(
     logger.error("One diagnostic")
 
     assert capsys.readouterr().err == "One diagnostic\n"
+
+
+@pytest.mark.asyncio
+async def test_mcp_process_logging_exposes_only_sanitized_failure_metadata(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    records: list[Record] = []
+
+    class FailingConnection:
+        tools: tuple[MCPTool, ...] = ()
+        unavailable = False
+
+        async def connect(self) -> tuple[MCPTool, ...]:
+            raise RuntimeError("raw-exception-secret")
+
+        async def close(self) -> None:
+            pass
+
+    configurations = {
+        "local": MCPServerConfiguration(
+            mcp_name="local",
+            enabled=True,
+            transport="stdio",
+            command="secret-command",
+            args=("secret-argument",),
+        ),
+        "remote": MCPServerConfiguration(
+            mcp_name="remote",
+            enabled=True,
+            transport="streamable-http",
+            url="https://secret.example/mcp",
+            headers={"Authorization": "Bearer header-secret"},
+        ),
+    }
+    manager = MCPRuntimeManager(
+        tmp_path,
+        connection_factory=lambda configuration, workspace: FailingConnection(),
+    )
+    configure_process_logging()
+    capture_id = logger.add(
+        lambda message: records.append(message.record),
+        level="ERROR",
+        format=lambda _record: "{message}\n",
+        backtrace=False,
+        diagnose=False,
+    )
+    try:
+        report = await manager.start(configurations)
+    finally:
+        logger.remove(capture_id)
+        await manager.close()
+
+    process_output = capsys.readouterr().err
+    assert sorted(process_output.splitlines()) == [
+        "MCP Server failure mcp_name=local phase=connect type=RuntimeError",
+        "MCP Server failure mcp_name=remote phase=connect type=RuntimeError",
+    ]
+    assert report.failed_servers == ("local", "remote")
+    assert len(records) == 2
+    for record in records:
+        exception = record["exception"]
+        assert exception is not None
+        assert exception.type is RuntimeError
+        assert exception.traceback is not None
+    for forbidden in (
+        "secret-command",
+        "secret-argument",
+        "https://secret.example/mcp",
+        "Authorization",
+        "Bearer header-secret",
+        "raw-exception-secret",
+    ):
+        assert forbidden not in process_output
+        assert all(forbidden not in record["message"] for record in records)
 
 
 def test_process_entry_configures_logging_on_eager_help_path(

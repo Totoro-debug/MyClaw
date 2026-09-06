@@ -7,11 +7,13 @@ from typing import Any, ClassVar, cast
 from unittest.mock import patch
 
 import pytest
+from mcp.types import CallToolResult
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.service import ScheduleService
 from myclaw.tools.base import BaseTool
 from myclaw.tools.core.schedule import ScheduleTool
+from myclaw.tools.mcp import MCPTool, MCPToolSpec
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -179,6 +181,57 @@ async def test_fixed_gateway_calls_core_tool_and_returns_unified_result(
         "content": "hello\r\n",
         "artifact": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_generation_tools_share_gateway_schema_and_trusted_execution_boundary(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    observed: list[dict[str, Any]] = []
+
+    class Session:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+            assert name == "echo"
+            observed.append(arguments)
+            return CallToolResult(content=[])
+
+    remote = MCPTool(
+        MCPToolSpec(
+            server_name="remote",
+            remote_name="echo",
+            model_name="mcp_remote_echo",
+            description="Echo remote arguments.",
+            parameters={"type": "object", "properties": {}},
+        ),
+        Session(),
+    )
+    state = WorkspaceState(workspace)
+    state.initialize(agent_home_root=agent_home)
+    gateway = ToolGateway(
+        workspace=workspace,
+        schedule_service=ScheduleService(
+            workspace_state=state,
+            clock=_Clock(),
+            execute_user_job=_noop,
+            execute_dream=_noop,
+        ),
+        additional_tools=(remote,),
+    )
+
+    assert _names(gateway)[-1] == "mcp_remote_echo"
+    result = await gateway.call(
+        ModelToolCall(
+            id="call_remote",
+            name="mcp_remote_echo",
+            arguments=json.dumps({"nested": {"value": 1}, "extra": [None]}),
+        ),
+        confirmation=lambda request: pytest.fail(f"unexpected confirmation: {request}"),
+    )
+
+    assert result.status == "success"
+    assert result.content == "(no output)"
+    assert observed == [{"nested": {"value": 1}, "extra": [None]}]
 
 
 @pytest.mark.asyncio

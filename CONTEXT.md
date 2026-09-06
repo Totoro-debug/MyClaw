@@ -160,6 +160,30 @@ _Avoid_: Permission Policy, model approval, chat reply, persistent approval
 The ordered set of concrete capabilities available through a Tool Gateway.
 _Avoid_: Plugin list, command list, model tools, subagent registry, MCP registry
 
+**Built-in Tool**:
+A Tool capability shipped as part of the Personal Agent runtime rather than discovered from an MCP Server.
+_Avoid_: MCP Tool, Plugin, Management Command
+
+**MCP Server**:
+An external capability provider explicitly selected by the user through User Configuration and accessed by the Personal Agent through the Model Context Protocol.
+_Avoid_: Model Provider, Plugin, Tool Catalog, MCP endpoint
+
+**MCP Server Configuration**:
+The single User Configuration item keyed by `mcp_name` that declares one enabled MCP Server's transport and connection settings.
+_Avoid_: MCP endpoint, MCP profile, Server Tool
+
+**MCP Runtime Manager**:
+The CLI-owned Runtime Lifetime component that connects configured MCP Servers, retains healthy clients, prepares per-generation MCP Tool Snapshots, and closes the clients during shutdown.
+_Avoid_: Tool Gateway, MCP registry, Agent Loop
+
+**MCP Tool**:
+A Tool capability discovered from an MCP Server and exposed through the Tool Catalog with the same model-facing invocation semantics as a Built-in Tool, while retaining its external origin.
+_Avoid_: Built-in Tool, Plugin Tool, direct MCP call
+
+**MCP Tool Snapshot**:
+The immutable ordered set of MCP Tools successfully discovered for one Runtime Generation.
+_Avoid_: live MCP registry, mutable Tool Catalog, MCP Server list
+
 **Tool Artifact**:
 A durable external representation of an oversized successful Tool result associated with one Conversation Session.
 _Avoid_: Tool result, attachment, memory entry

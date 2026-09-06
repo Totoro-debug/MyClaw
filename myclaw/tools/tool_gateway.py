@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +35,19 @@ type ConfirmationDecision = Literal["approved", "declined"]
 type ConfirmationOutcome = ConfirmationDecision | None
 type ToolResultStatus = Literal["success", "error", "refused"]
 type ConfirmationRequester = Callable[["ConfirmationRequest"], Awaitable[ConfirmationDecision]]
+
+BUILT_IN_TOOL_NAMES: tuple[str, ...] = (
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "glob",
+    "grep",
+    "exec",
+    "web_search",
+    "web_fetch",
+    "schedule",
+)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -160,7 +173,7 @@ class ToolResult:
 
 
 class ToolGateway:
-    """Create and invoke the fixed ten-Tool Catalog."""
+    """Create and invoke the Built-in Tool Catalog."""
 
     def __init__(
         self,
@@ -168,12 +181,16 @@ class ToolGateway:
         workspace: Path,
         schedule_service: ScheduleService,
         skill_root: Path | None = None,
+        additional_tools: Sequence[BaseTool] = (),
     ) -> None:
         if not isinstance(workspace, Path):
             raise TypeError("Tool Gateway requires a Path")
         if not isinstance(schedule_service, ScheduleService):
             raise TypeError("Tool Gateway requires a ScheduleService")
 
+        generation_tools = tuple(additional_tools)
+        if any(not isinstance(tool, BaseTool) for tool in generation_tools):
+            raise TypeError("Additional Tools must be BaseTool instances")
         tools: tuple[BaseTool, ...] = (
             ReadFileTool(workspace=workspace, skill_root=skill_root),
             WriteFileTool(workspace=workspace),
@@ -185,7 +202,10 @@ class ToolGateway:
             WebSearchTool(),
             WebFetchTool(),
             ScheduleTool(schedule_service=schedule_service),
+            *generation_tools,
         )
+        if len({tool.name for tool in tools}) != len(tools):
+            raise ValueError("Tool names must be unique")
         self._catalog = tools
         self._tools = {tool.name: tool for tool in tools}
         self._failure_observer: Callable[[Exception], None] | None = None
@@ -423,6 +443,7 @@ def _result(
 
 
 __all__ = [
+    "BUILT_IN_TOOL_NAMES",
     "ConfirmationDecision",
     "ConfirmationRequest",
     "ConfirmationRequester",

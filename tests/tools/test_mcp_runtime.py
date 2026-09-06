@@ -45,6 +45,7 @@ class _FakeConnection:
         self.connect_calls = 0
         self.close_calls = 0
         self.unavailable = False
+        self.skipped_tool_count = 0
         self.fail_connect: BaseException | None = None
         self.fail_close: BaseException | None = None
 
@@ -85,6 +86,34 @@ class _BlockingConnection(_FakeConnection):
         except asyncio.CancelledError:
             self.connect_cancelled = True
             raise
+
+
+class _ConcurrentConnection(_FakeConnection):
+    def __init__(
+        self,
+        configuration: MCPServerConfiguration,
+        started: asyncio.Event,
+        release: asyncio.Event,
+        *,
+        completed: asyncio.Event | None = None,
+        failure: BaseException | None = None,
+    ) -> None:
+        super().__init__(configuration)
+        self._started = started
+        self._release = release
+        self._completed = completed
+        self._failure = failure
+
+    async def connect(self) -> tuple[MCPTool, ...]:
+        self.connect_calls += 1
+        self._started.set()
+        await self._release.wait()
+        if self._failure is not None:
+            raise self._failure
+        self.unavailable = False
+        if self._completed is not None:
+            self._completed.set()
+        return self._tools
 
 
 class _DelayedCloseConnection(_FakeConnection):
@@ -205,6 +234,63 @@ async def test_runtime_snapshot_orders_builtins_servers_and_remote_tools(
 
 
 @pytest.mark.asyncio
+async def test_runtime_connects_two_servers_without_waiting_for_a_third_server_timeout() -> None:
+    success_release = asyncio.Event()
+    timeout_release = asyncio.Event()
+    alpha_started = asyncio.Event()
+    beta_started = asyncio.Event()
+    zulu_started = asyncio.Event()
+    alpha_completed = asyncio.Event()
+    beta_completed = asyncio.Event()
+    configurations = {
+        name: _configuration(name) for name in ("alpha", "beta", "zulu")
+    }
+    connections = {
+        "alpha": _ConcurrentConnection(
+            configurations["alpha"],
+            alpha_started,
+            success_release,
+            completed=alpha_completed,
+        ),
+        "beta": _ConcurrentConnection(
+            configurations["beta"],
+            beta_started,
+            success_release,
+            completed=beta_completed,
+        ),
+        "zulu": _ConcurrentConnection(
+            configurations["zulu"],
+            zulu_started,
+            timeout_release,
+            failure=TimeoutError("sensitive timeout detail"),
+        ),
+    }
+    manager = _manager(connections)
+
+    start_task = asyncio.create_task(manager.start(configurations))
+    await asyncio.gather(
+        alpha_started.wait(),
+        beta_started.wait(),
+        zulu_started.wait(),
+    )
+
+    assert start_task.done() is False
+    success_release.set()
+    await asyncio.wait_for(
+        asyncio.gather(alpha_completed.wait(), beta_completed.wait()),
+        timeout=1,
+    )
+    assert start_task.done() is False
+
+    timeout_release.set()
+    report = await start_task
+
+    assert report.connected_servers == ("alpha", "beta")
+    assert report.failed_servers == ("zulu",)
+    assert all(connection.connect_calls == 1 for connection in connections.values())
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("remote_name", "expected_name"),
     [
@@ -286,6 +372,18 @@ async def test_runtime_snapshot_skips_collision_with_a_builtin_tool() -> None:
 
     assert report.snapshot == ()
     assert manager.catalog == (builtin,)
+
+
+@pytest.mark.asyncio
+async def test_runtime_reports_skipped_tool_counts() -> None:
+    configuration = _configuration("alpha")
+    connection = _FakeConnection(configuration, (_tool("alpha", "echo"),))
+    connection.skipped_tool_count = 2
+    manager = _manager({"alpha": connection})
+
+    report = await manager.start({"alpha": configuration})
+
+    assert report.skipped_tool_counts == (("alpha", 2),)
 
 
 @pytest.mark.asyncio

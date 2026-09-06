@@ -11,6 +11,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
+from loguru import logger
+
 from myclaw.config.config import MCPServerConfiguration
 from myclaw.tools.base import BaseTool
 from myclaw.tools.mcp import MCPServerConnection, MCPTool
@@ -20,6 +22,15 @@ _MAX_MODEL_TOOL_NAME_LENGTH = 64
 _MODEL_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 type MCPToolSnapshot = tuple[MCPTool, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MCPServerFailure:
+    """Safe metadata for one failed MCP Server lifecycle attempt."""
+
+    mcp_name: str
+    phase: str
+    exception_type: str
 
 
 class MCPConnectionAdapter(Protocol):
@@ -40,12 +51,20 @@ type MCPConnectionFactory = Callable[[MCPServerConfiguration, Path], MCPConnecti
 
 
 @dataclass(frozen=True, slots=True)
+class _ConnectionAttempt:
+    tools: tuple[MCPTool, ...] | None
+    failure: MCPServerFailure | None
+
+
+@dataclass(frozen=True, slots=True)
 class MCPStartupReport:
     """The initial generation's connected Servers and MCP Tool Snapshot."""
 
     snapshot: MCPToolSnapshot
     connected_servers: tuple[str, ...]
     failed_servers: tuple[str, ...]
+    failures: tuple[MCPServerFailure, ...] = ()
+    skipped_tool_counts: tuple[tuple[str, int], ...] = ()
 
     @property
     def tools(self) -> MCPToolSnapshot:
@@ -61,6 +80,8 @@ class MCPSnapshotReport:
     reused_servers: tuple[str, ...]
     retried_servers: tuple[str, ...]
     failed_servers: tuple[str, ...]
+    failures: tuple[MCPServerFailure, ...] = ()
+    skipped_tool_counts: tuple[tuple[str, int], ...] = ()
 
     @property
     def tools(self) -> MCPToolSnapshot:
@@ -83,6 +104,47 @@ def allocate_mcp_tool_name(mcp_name: str, remote_name: str) -> str | None:
     preferred = f"mcp_{mcp_name}_{remote_name}"
     candidate = f"mcp_{remote_name}" if len(preferred) > _MAX_MODEL_TOOL_NAME_LENGTH else preferred
     return candidate if _MODEL_TOOL_NAME_PATTERN.fullmatch(candidate) else None
+
+
+def _record_server_failure(
+    mcp_name: str,
+    *,
+    phase: str,
+    error: Exception,
+) -> MCPServerFailure:
+    failure = MCPServerFailure(
+        mcp_name=mcp_name,
+        phase=phase,
+        exception_type=type(error).__name__,
+    )
+    logger.opt(exception=error).error(
+        "MCP Server failure mcp_name={} phase={} type={}",
+        failure.mcp_name,
+        failure.phase,
+        failure.exception_type,
+    )
+    return failure
+
+
+def _log_skipped_tool(
+    mcp_name: str,
+    *,
+    phase: str,
+    exception_type: str,
+) -> None:
+    logger.error(
+        "MCP Tool skipped mcp_name={} phase={} type={}",
+        mcp_name,
+        phase,
+        exception_type,
+    )
+
+
+def _skipped_tool_count(connection: MCPConnectionAdapter) -> int:
+    count = getattr(connection, "skipped_tool_count", 0)
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+        return count
+    return 0
 
 
 class MCPRuntimeManager:
@@ -110,6 +172,8 @@ class MCPRuntimeManager:
         self._discovered_tools: dict[str, tuple[MCPTool, ...]] = {}
         self._connected_servers: set[str] = set()
         self._failed_servers: set[str] = set()
+        self._failures: dict[str, MCPServerFailure] = {}
+        self._skipped_tool_counts: dict[str, int] = {}
         self._snapshot: MCPToolSnapshot = ()
         self._pending_report: MCPSnapshotReport | None = None
         self._started = False
@@ -166,6 +230,7 @@ class MCPRuntimeManager:
 
         connections: dict[str, MCPConnectionAdapter] = {}
         failed: set[str] = set()
+        failures: dict[str, MCPServerFailure] = {}
         for mcp_name, server_configuration in normalized.items():
             if not server_configuration.enabled:
                 continue
@@ -176,8 +241,13 @@ class MCPRuntimeManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
                 failed.add(mcp_name)
+                failures[mcp_name] = _record_server_failure(
+                    mcp_name,
+                    phase="factory",
+                    error=error,
+                )
 
         try:
             attempts = await self._connect_many(connections)
@@ -187,11 +257,13 @@ class MCPRuntimeManager:
 
         discovered: dict[str, tuple[MCPTool, ...]] = {}
         connected: set[str] = set()
-        for mcp_name, tools in attempts.items():
-            if tools is None:
+        for mcp_name, attempt in attempts.items():
+            if attempt.tools is None:
                 failed.add(mcp_name)
+                if attempt.failure is not None:
+                    failures[mcp_name] = attempt.failure
                 continue
-            discovered[mcp_name] = tools
+            discovered[mcp_name] = attempt.tools
             connected.add(mcp_name)
 
         self._configuration = normalized
@@ -199,12 +271,15 @@ class MCPRuntimeManager:
         self._discovered_tools = discovered
         self._connected_servers = connected
         self._failed_servers = failed
+        self._failures = failures
         self._started = True
         self._snapshot = self._build_snapshot()
         return MCPStartupReport(
             snapshot=self._snapshot,
             connected_servers=tuple(sorted(connected)),
             failed_servers=self.failed_servers,
+            failures=self._failure_report(),
+            skipped_tool_counts=self._skipped_tool_report(),
         )
 
     async def prepare_generation(self) -> MCPSnapshotReport:
@@ -222,6 +297,7 @@ class MCPRuntimeManager:
         self._sync_unavailable_servers()
         retry_names = tuple(sorted(self._failed_servers))
         retry_connections: dict[str, MCPConnectionAdapter] = {}
+        retry_failures: dict[str, MCPServerFailure] = {}
         for mcp_name in retry_names:
             connection = self._connections.get(mcp_name)
             if connection is not None:
@@ -232,7 +308,12 @@ class MCPRuntimeManager:
                 connection = self._connection_factory(server_configuration, self._workspace)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
+                retry_failures[mcp_name] = _record_server_failure(
+                    mcp_name,
+                    phase="factory",
+                    error=error,
+                )
                 continue
             self._connections[mcp_name] = connection
             retry_connections[mcp_name] = connection
@@ -240,13 +321,19 @@ class MCPRuntimeManager:
         attempts = await self._connect_many(retry_connections)
 
         for mcp_name in retry_names:
-            tools = attempts.get(mcp_name)
-            if tools is None:
+            attempt = attempts.get(mcp_name)
+            if attempt is None or attempt.tools is None:
                 self._failed_servers.add(mcp_name)
+                failure = retry_failures.get(mcp_name)
+                if attempt is not None:
+                    failure = attempt.failure or failure
+                if failure is not None:
+                    self._failures[mcp_name] = failure
                 continue
             self._failed_servers.discard(mcp_name)
+            self._failures.pop(mcp_name, None)
             self._connected_servers.add(mcp_name)
-            self._discovered_tools[mcp_name] = tools
+            self._discovered_tools[mcp_name] = attempt.tools
 
         candidate = self._build_snapshot()
         reused = tuple(
@@ -261,6 +348,12 @@ class MCPRuntimeManager:
             reused_servers=reused,
             retried_servers=retry_names,
             failed_servers=self.failed_servers,
+            failures=self._failure_report(),
+            skipped_tool_counts=tuple(
+                (mcp_name, count)
+                for mcp_name, count in self._skipped_tool_report()
+                if mcp_name in retry_names
+            ),
         )
         self._pending_report = report
         return report
@@ -290,6 +383,8 @@ class MCPRuntimeManager:
         self._discovered_tools = {}
         self._connected_servers = set()
         self._failed_servers = set()
+        self._failures = {}
+        self._skipped_tool_counts = {}
         self._snapshot = ()
         self._pending_report = None
         self._started = False
@@ -298,22 +393,29 @@ class MCPRuntimeManager:
     async def _connect_many(
         self,
         connections: Mapping[str, MCPConnectionAdapter],
-    ) -> dict[str, tuple[MCPTool, ...] | None]:
+    ) -> dict[str, _ConnectionAttempt]:
         async def connect_one(
             mcp_name: str,
             connection: MCPConnectionAdapter,
-        ) -> tuple[str, tuple[MCPTool, ...] | None]:
+        ) -> tuple[str, _ConnectionAttempt]:
             try:
                 tools = await connection.connect()
                 if not isinstance(tools, (tuple, list)):
                     raise TypeError("MCP Server connection returned an invalid Tool collection")
                 if connection.unavailable:
                     raise RuntimeError("MCP Server connection became unavailable during connect")
-                return mcp_name, tuple(tools)
+                return mcp_name, _ConnectionAttempt(tools=tuple(tools), failure=None)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                return mcp_name, None
+            except Exception as error:
+                return mcp_name, _ConnectionAttempt(
+                    tools=None,
+                    failure=_record_server_failure(
+                        mcp_name,
+                        phase="connect",
+                        error=error,
+                    ),
+                )
 
         tasks = tuple(
             asyncio.create_task(connect_one(mcp_name, connections[mcp_name]))
@@ -336,6 +438,7 @@ class MCPRuntimeManager:
     def _build_snapshot(self) -> MCPToolSnapshot:
         used_names = set(self._built_in_names)
         snapshot: list[MCPTool] = []
+        skipped_tool_counts: dict[str, int] = {}
         for mcp_name in sorted(self._configuration):
             configuration = self._configuration[mcp_name]
             if not configuration.enabled or mcp_name in self._failed_servers:
@@ -344,20 +447,51 @@ class MCPRuntimeManager:
             if connection is None or connection.unavailable:
                 continue
             named_tools: list[MCPTool] = []
+            skipped_count = _skipped_tool_count(connection)
             for tool in _sorted_tools(self._discovered_tools.get(mcp_name, ())):
                 if tool.unavailable:
+                    skipped_count += 1
+                    _log_skipped_tool(mcp_name, phase="tool", exception_type="MCPConnectionError")
                     continue
                 model_name = allocate_mcp_tool_name(mcp_name, tool.remote_name)
                 if model_name is None:
+                    skipped_count += 1
+                    _log_skipped_tool(
+                        mcp_name,
+                        phase="tool_name",
+                        exception_type="MCPToolSchemaError",
+                    )
                     continue
                 named_tool = tool if tool.name == model_name else tool.with_model_name(model_name)
                 named_tools.append(named_tool)
                 if model_name in used_names:
+                    skipped_count += 1
+                    _log_skipped_tool(
+                        mcp_name,
+                        phase="tool_name",
+                        exception_type="ToolNameCollision",
+                    )
                     continue
                 used_names.add(model_name)
                 snapshot.append(named_tool)
             self._discovered_tools[mcp_name] = tuple(named_tools)
+            if skipped_count:
+                skipped_tool_counts[mcp_name] = skipped_count
+        self._skipped_tool_counts = skipped_tool_counts
         return tuple(snapshot)
+
+    def _failure_report(self) -> tuple[MCPServerFailure, ...]:
+        return tuple(
+            self._failures[mcp_name]
+            for mcp_name in sorted(self._failed_servers)
+            if mcp_name in self._failures
+        )
+
+    def _skipped_tool_report(self) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (mcp_name, self._skipped_tool_counts[mcp_name])
+            for mcp_name in sorted(self._skipped_tool_counts)
+        )
 
 
 def _default_connection_factory(
@@ -449,6 +583,7 @@ __all__ = [
     "MCPConnectionAdapter",
     "MCPConnectionFactory",
     "MCPRuntimeManager",
+    "MCPServerFailure",
     "MCPSnapshotReport",
     "MCPStartupReport",
     "MCPToolSnapshot",

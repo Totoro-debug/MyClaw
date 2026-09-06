@@ -306,6 +306,7 @@ def test_agent_loop_constructor_is_the_generation_composition_boundary() -> None
         "now",
         "new_uuid",
         "monotonic_now",
+        "mcp_tools",
     )
     assert tuple(inspect.signature(AgentLoop.close).parameters) == ("self",)
 

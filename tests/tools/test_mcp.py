@@ -281,6 +281,7 @@ async def test_discovery_stops_on_repeated_cursor_after_processing_page() -> Non
 
 @pytest.mark.asyncio
 async def test_discovery_skips_invalid_tools_without_dropping_valid_tools() -> None:
+    skipped: list[None] = []
     session = _PageSession(
         {
             None: (
@@ -293,9 +294,14 @@ async def test_discovery_skips_invalid_tools_without_dropping_valid_tools() -> N
         }
     )
 
-    specs = await discover_mcp_tool_specs(session, server_name="remote")
+    specs = await discover_mcp_tool_specs(
+        session,
+        server_name="remote",
+        on_tool_skipped=lambda: skipped.append(None),
+    )
 
     assert [spec.remote_name for spec in specs] == ["valid-first"]
+    assert len(skipped) == 1
 
 
 def _tool_for_session(
@@ -577,6 +583,7 @@ class _ConnectionSession:
         self.entered = False
         self.closed = False
         self.initialized = False
+        self.tools: list[object] = [_remote("echo")]
 
     async def __aenter__(self) -> _ConnectionSession:
         self.entered = True
@@ -592,7 +599,7 @@ class _ConnectionSession:
 
     async def list_tools(self, *, params: types.PaginatedRequestParams | None = None) -> object:
         del params
-        return {"tools": [_remote("echo")], "nextCursor": None}
+        return {"tools": self.tools, "nextCursor": None}
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
         del name, arguments
@@ -625,6 +632,30 @@ async def test_server_connection_initializes_discovers_and_closes_one_session() 
     assert transport.closed is True
     assert connection.session is None
     assert connection.tools == ()
+
+
+@pytest.mark.asyncio
+async def test_server_connection_counts_invalid_discovered_tools() -> None:
+    transport = _AsyncTransport()
+    session = _ConnectionSession()
+    session.tools = [
+        _remote("valid"),
+        {"name": "invalid", "inputSchema": {"type": "string"}},
+    ]
+    connection = MCPServerConnection(
+        _server_configuration(),
+        Path("."),
+        transport_factory=lambda configuration, workspace: transport,
+        session_factory=lambda read_stream, write_stream: session,
+        model_name_for=lambda remote_name: f"mcp_remote_{remote_name}",
+    )
+
+    tools = await connection.connect()
+
+    assert [tool.name for tool in tools] == ["mcp_remote_valid"]
+    assert connection.skipped_tool_count == 1
+
+    await connection.close()
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,14 @@ from myclaw.management.service import (
     ManagementError,
     ManagementViewService,
 )
+from myclaw.mcp_runtime import (
+    BUILT_IN_TOOL_NAMES,
+    MCPRuntimeManager,
+    MCPServerFailure,
+    MCPSnapshotReport,
+    MCPStartupReport,
+    MCPToolSnapshot,
+)
 from myclaw.memory.dream import Dream
 from myclaw.memory.manager import MemoryManager
 from myclaw.provider.factory import create_provider
@@ -57,6 +65,10 @@ _TARGET_SESSION_PREPARATION_ERROR = ErrorInfo(
     "persistence_error",
     "Conversation Session could not be prepared.",
 )
+_MCP_GENERATION_PREPARATION_ERROR = ErrorInfo(
+    "persistence_error",
+    "MCP Tool Generation could not be prepared.",
+)
 _RUNTIME_SESSION_REPLACEMENT_ERROR = ErrorInfo(
     "persistence_error",
     "Runtime Session replacement could not be completed.",
@@ -84,6 +96,39 @@ def _print_error_info(error: ErrorInfo) -> None:
 def _print_error(error: ErrorInfo, path: object) -> None:
     _print_error_info(error)
     console.print(f"Path: {path}", markup=False, highlight=False, soft_wrap=True)
+
+
+def _print_mcp_notice(message: str) -> None:
+    console.print(message, markup=False, highlight=False, soft_wrap=True)
+
+
+def _report_mcp_generation(
+    report: MCPStartupReport | MCPSnapshotReport,
+) -> None:
+    """Present only safe MCP lifecycle metadata to the terminal."""
+    failures_by_server = {
+        failure.mcp_name: failure for failure in getattr(report, "failures", ())
+    }
+    for mcp_name in getattr(report, "failed_servers", ()):
+        failures_by_server.setdefault(
+            mcp_name,
+            MCPServerFailure(
+                mcp_name=mcp_name,
+                phase="connect",
+                exception_type="MCPConnectionError",
+            ),
+        )
+    for failure in sorted(failures_by_server.values(), key=lambda item: item.mcp_name):
+        _print_mcp_notice(
+            f"MCP Server {failure.mcp_name!r} unavailable during {failure.phase} "
+            f"({failure.exception_type})."
+        )
+
+    for mcp_name, count in getattr(report, "skipped_tool_counts", ()):
+        if count < 1:
+            continue
+        noun = "Tool" if count == 1 else "Tools"
+        _print_mcp_notice(f"MCP Server {mcp_name!r} skipped {count} invalid MCP {noun}.")
 
 
 def _approved_error_info(
@@ -123,12 +168,14 @@ async def _run_cli_conversation(
     router: ModelRouter | None = None
     dream: Dream | None = None
     schedule_service: ScheduleService | None = None
+    mcp_manager: MCPRuntimeManager | None = None
     active_loop: AgentLoop | None = None
     current_loop: AgentLoop | None = None
     bus: MessageBus | None = None
     management: ManagementViewService | None = None
     terminal_app: TerminalConversationApp | None = None
     pending_target: AgentLoop | None = None
+    active_mcp_snapshot: MCPToolSnapshot = ()
     replacement_lock = asyncio.Lock()
     aborted_loops: list[AgentLoop] = []
     closed_loops: list[AgentLoop] = []
@@ -166,6 +213,14 @@ async def _run_cli_conversation(
         workspace_path = normalize_workspace_path(workspace)
         workspace_state = WorkspaceState(workspace_path)
         workspace_state.initialize(agent_home_root=agent_home.path)
+
+        mcp_manager = MCPRuntimeManager(
+            workspace_path,
+            built_in_names=BUILT_IN_TOOL_NAMES,
+        )
+        startup_report = await mcp_manager.start(getattr(configuration, "mcp", {}))
+        active_mcp_snapshot = startup_report.snapshot
+        _report_mcp_generation(startup_report)
 
         bus = MessageBus()
         router = ModelRouter(
@@ -217,7 +272,14 @@ async def _run_cli_conversation(
             timezone_name=get_localzone_name(),
         )
 
-        def create_agent_loop(session_id: str | None) -> AgentLoop:
+        def create_agent_loop(
+            session_id: str | None,
+            *,
+            mcp_snapshot: MCPToolSnapshot | None = None,
+        ) -> AgentLoop:
+            selected_mcp_snapshot = (
+                active_mcp_snapshot if mcp_snapshot is None else mcp_snapshot
+            )
             return AgentLoop(
                 workspace_path=workspace_path,
                 workspace_state=workspace_state,
@@ -231,6 +293,7 @@ async def _run_cli_conversation(
                 now=local_now,
                 new_uuid=uuid4,
                 monotonic_now=monotonic,
+                mcp_tools=selected_mcp_snapshot,
             )
 
         def current_agent_loop() -> AgentLoop:
@@ -241,7 +304,8 @@ async def _run_cli_conversation(
             return current_loop
 
         async def replace_agent_loop(session_id: str, force: bool) -> None:
-            nonlocal active_loop, current_loop, pending_target, replacement_failed_closed
+            nonlocal active_loop, active_mcp_snapshot, current_loop, pending_target
+            nonlocal replacement_failed_closed
             async with replacement_lock:
                 old_loop = current_loop
                 if old_loop is None:
@@ -252,6 +316,17 @@ async def _run_cli_conversation(
                 target: AgentLoop | None = None
                 replacement_barrier_held = False
                 destructive_started = False
+                if mcp_manager is None:
+                    raise ManagementError(
+                        ErrorInfo("route_unavailable", "MCP Runtime Manager is unavailable.")
+                    )
+                try:
+                    candidate_report = await mcp_manager.prepare_generation()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    raise ManagementError(_MCP_GENERATION_PREPARATION_ERROR) from error
+                _report_mcp_generation(candidate_report)
 
                 async def release_replacement_barrier(*, resume_inbound: bool) -> None:
                     nonlocal replacement_barrier_held
@@ -287,7 +362,10 @@ async def _run_cli_conversation(
                     ) from error
 
                 try:
-                    target = create_agent_loop(session_id)
+                    target = create_agent_loop(
+                        session_id,
+                        mcp_snapshot=candidate_report.snapshot,
+                    )
                     pending_target = target
                     target.preflight()
                 except asyncio.CancelledError as cancellation:
@@ -355,6 +433,8 @@ async def _run_cli_conversation(
                         session_projection=target.project_foreground_conversation(),
                     )
                     await target.start()
+                    mcp_manager.activate_generation(candidate_report)
+                    active_mcp_snapshot = candidate_report.snapshot
                     current_loop = target
                     active_loop = target
                     pending_target = None
@@ -449,6 +529,12 @@ async def _run_cli_conversation(
             except BaseException as error:
                 cleanup_errors.append(error)
 
+        if mcp_manager is not None:
+            try:
+                await mcp_manager.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+
         if dream is not None:
             try:
                 await dream.close()
@@ -506,6 +592,14 @@ def main(context: typer.Context) -> None:
             )
         )
         raise typer.Exit(code=2)
+    if loader.diagnostics:
+        console.print(
+            "".join(f"{diagnostic.message}\n" for diagnostic in loader.diagnostics),
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+            end="",
+        )
     try:
         asyncio.run(
             _run_cli_conversation(

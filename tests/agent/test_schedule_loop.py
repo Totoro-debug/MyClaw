@@ -34,9 +34,10 @@ from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
 from myclaw.tools.base import BaseTool
 from myclaw.tools.core.schedule import ScheduleTool
+from myclaw.tools.mcp import MCPTool, MCPToolSpec
 from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
-from tests.fixtures import TaskFramingRouterAdapter
+from tests.fixtures import TaskFramingRouterAdapter, collect_foreground_outbound
 
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
 JOB_ID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -46,6 +47,7 @@ class _ScheduleRouter:
     def __init__(self, *outcomes: ModelResponse | BaseException) -> None:
         self.routes: list[str] = []
         self.requests: list[tuple[list[dict[str, Any]], int]] = []
+        self.tool_requests: list[tuple[str, tuple[str, ...]]] = []
         self._outcomes = list(outcomes)
 
     def stream(
@@ -56,10 +58,12 @@ class _ScheduleRouter:
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
-        del tools, continuation
+        tool_names = tuple(schema["function"]["name"] for schema in tools)
+        del continuation
 
         async def replay() -> AsyncIterator[ModelStreamEvent]:
             self.routes.append(route)
+            self.tool_requests.append((route, tool_names))
             self.requests.append((list(messages), 0))
             yield ModelCompleted(response=self._response())
 
@@ -75,6 +79,9 @@ class _ScheduleRouter:
     ) -> ModelResponse:
         del continuation
         self.routes.append(route)
+        self.tool_requests.append(
+            (route, tuple(schema["function"]["name"] for schema in tools))
+        )
         self.requests.append((list(messages), len(tools)))
         outcome = self._outcomes.pop(0) if self._outcomes else self._response()
         if isinstance(outcome, BaseException):
@@ -265,6 +272,7 @@ def _loop(
     ] = _schedule_context,
     externalize_result_for: Callable[[Session], Callable[[ToolResult], ToolResult]] | None = None,
     task_framing_router: TaskFramingRouterAdapter | None = None,
+    mcp_tools: Sequence[BaseTool] = (),
 ) -> tuple[AgentLoop, WorkspaceState, ScheduleService, MessageBus]:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
@@ -301,6 +309,7 @@ def _loop(
         now=lambda: NOW,
         new_uuid=lambda: JOB_ID,
         monotonic_now=lambda: 0.0,
+        mcp_tools=mcp_tools,
     )
     if skill_loader is not None:
         loop._skill_loader = skill_loader
@@ -374,6 +383,45 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
     assert router.routes == ["schedule"]
     assert router.requests[0][1] == 10
     assert framing_router.framing_requests == []
+
+
+@pytest.mark.asyncio
+async def test_foreground_and_user_schedule_runs_share_generation_mcp_tool_snapshot(
+    tmp_path: Path,
+) -> None:
+    class UnusedMCPSession:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+            del name, arguments
+            raise AssertionError("MCP Tool must not execute in this schema projection test")
+
+    mcp_tool = MCPTool(
+        MCPToolSpec(
+            server_name="alpha",
+            remote_name="echo",
+            model_name="mcp_alpha_echo",
+            description="Echo arguments.",
+            parameters={"type": "object"},
+        ),
+        UnusedMCPSession(),
+    )
+    router = _ScheduleRouter()
+    loop, _state, _service, bus = _loop(tmp_path, router, mcp_tools=(mcp_tool,))
+
+    await loop.start()
+    try:
+        await collect_foreground_outbound(bus, "foreground input")
+        await loop.run_schedule_job(_job())
+    finally:
+        await loop.close()
+
+    generation_requests = [
+        (route, tool_names)
+        for route, tool_names in router.tool_requests
+        if "mcp_alpha_echo" in tool_names
+    ]
+    assert [route for route, _tool_names in generation_requests] == ["chat", "schedule"]
+    assert generation_requests[0][1] == generation_requests[1][1]
+    assert generation_requests[0][1].count("mcp_alpha_echo") == 1
 
 
 @pytest.mark.asyncio

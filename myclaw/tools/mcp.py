@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Protocol, cast
 
 import mcp.types as types
+from loguru import logger
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import (  # type: ignore[attr-defined]
@@ -247,6 +248,7 @@ async def discover_mcp_tool_specs(
     server_name: str,
     model_name_for: Callable[[str], str] | None = None,
     timeout: float | None = None,
+    on_tool_skipped: Callable[[], None] | None = None,
 ) -> tuple[MCPToolSpec, ...]:
     """Discover every page of Tools, stopping safely on a repeated cursor."""
     if not isinstance(server_name, str) or not server_name:
@@ -280,6 +282,8 @@ async def discover_mcp_tool_specs(
                         )
                     )
                 except MCPToolSchemaError:
+                    if on_tool_skipped is not None:
+                        on_tool_skipped()
                     continue
 
             next_cursor = _field(page, "next_cursor", "nextCursor")
@@ -309,6 +313,7 @@ async def discover_mcp_tools(
     call_timeout: float = 60,
     timeout: float | None = None,
     on_closed: Callable[[], None] | None = None,
+    on_tool_skipped: Callable[[], None] | None = None,
 ) -> tuple[MCPTool, ...]:
     """Discover and wrap one Server's valid Tools."""
     specs = await discover_mcp_tool_specs(
@@ -316,6 +321,7 @@ async def discover_mcp_tools(
         server_name=server_name,
         model_name_for=model_name_for,
         timeout=timeout,
+        on_tool_skipped=on_tool_skipped,
     )
     return tuple(
         MCPTool(spec, session, call_timeout=call_timeout, on_closed=on_closed) for spec in specs
@@ -350,6 +356,7 @@ class MCPServerConnection:
         self._session: MCPClientSession | None = None
         self._tools: tuple[MCPTool, ...] = ()
         self._unavailable = False
+        self._skipped_tool_count = 0
 
     @property
     def session(self) -> MCPClientSession | None:
@@ -363,6 +370,11 @@ class MCPServerConnection:
     def unavailable(self) -> bool:
         return self._unavailable
 
+    @property
+    def skipped_tool_count(self) -> int:
+        """Return the number of invalid remote Tools skipped during discovery."""
+        return self._skipped_tool_count
+
     async def connect(self) -> tuple[MCPTool, ...]:
         """Open transport/session, initialize, and discover a deterministic Tool set."""
         if not self.configuration.enabled:
@@ -370,6 +382,7 @@ class MCPServerConnection:
             return ()
         await self.close()
         self._unavailable = False
+        self._skipped_tool_count = 0
         stack = AsyncExitStack()
         self._stack = stack
         try:
@@ -387,6 +400,7 @@ class MCPServerConnection:
                     model_name_for=self._model_name_for,
                     call_timeout=self.configuration.call_timeout,
                     on_closed=self._mark_unavailable,
+                    on_tool_skipped=self._record_tool_skip,
                 )
         except BaseException:
             self._session = None
@@ -407,6 +421,13 @@ class MCPServerConnection:
 
     def _mark_unavailable(self) -> None:
         self._unavailable = True
+
+    def _record_tool_skip(self) -> None:
+        self._skipped_tool_count += 1
+        logger.error(
+            "MCP Tool skipped mcp_name={} phase=discovery type=MCPToolSchemaError",
+            self.configuration.mcp_name,
+        )
 
 
 MCPServerAdapter = MCPServerConnection

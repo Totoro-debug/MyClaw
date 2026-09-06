@@ -4,6 +4,11 @@ status: accepted
 
 # Fix the Tool Catalog and BaseTool Boundaries
 
+> The fixed-Catalog and no-MCP portions of this historical decision are superseded by
+> [ADR-0020](0020-expose-configured-mcp-tools-through-tool-gateway.md). The Tool Gateway,
+> Built-in Tool, confirmation, result, and artifact boundaries remain accepted wherever
+> ADR-0020 does not say otherwise.
+
 The main Tool Catalog is fixed in this order: Read File, Write File, Edit File, List Dir, Glob, Grep, Exec, Web Search, Web Fetch, and Schedule. User Configuration cannot enable, disable, register, or replace these capabilities, and the product has no plugin, MCP, subagent, generic retry, or per-invocation Tool-plan surface.
 
 `ToolGateway.call()` is the sole public invocation boundary. It parses raw Provider arguments, resolves a Tool, and delegates the final cast, restricted Schema validation, concrete argument validation, safety evaluation, one-shot confirmation, execution, and normalized result pipeline to `BaseTool` and the concrete capability.

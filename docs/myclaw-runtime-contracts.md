@@ -10,7 +10,7 @@
 
 本文把已确认的产品行为细化为当前实现的类型、文件 schema 和代码边界。后续产品或架构变更必须先更新本契约及受影响的 PRD/ADR。
 
-本文不新增 one-shot、daemon、HTTP/IPC、MCP、subagent、跨进程协调、用户可配置安全策略或用户自定义 identity。
+本文不新增 one-shot、daemon、HTTP/IPC、subagent、跨进程协调、用户可配置安全策略或用户自定义 identity。MCP Tool 支持及其 Runtime Lifetime/Generation 边界由 [ADR-0020](adr/0020-expose-configured-mcp-tools-through-tool-gateway.md) 定义；本文早期关于“无 MCP”或固定 Tool Catalog 的表述仅描述 Built-in Tool 基线，并在 MCP 范围内由该 ADR supersede。
 
 ## 1. 契约通则
 
@@ -69,7 +69,7 @@
 | D17 | 每个非空且不是 Manual Skill Invocation 的普通前台输入在 Agent Run 前做 Task Framing，Blackboard 与 usage 只随已接受 increment 提交；手动 Skill 轮为 metadata no-op | 在跨输入保留一个明确任务边界，不引入计划或执行控制产品 |
 | D18 | CLI 是唯一 Runtime composition root；一个 Session-scoped Agent Loop 承担一个 Runtime Generation | 让创建位置、生命周期与真实 ownership 一致，不保留代理所有组件的 Runtime 聚合层 |
 
-D01-D18 均为当前实现契约；精确持久化、Tool、Runtime 和 Task Framing 边界由本文后续章节与对应 ADR 定义。
+D01-D18 均为当前实现契约；精确持久化、Built-in Tool、MCP、Runtime 和 Task Framing 边界由本文后续章节与对应 ADR 定义。
 
 ## 3. Agent Home 与 Workspace
 
@@ -1248,4 +1248,4 @@ Schema casting、参数校验、安全检查和结果截断/Artifact 写入属�
 
 ## 17. 确认记录
 
-D01-D18、Session snapshot、固定 Tool Catalog、CLI composition root、Message Bus/Agent Loop/Agent Runner、Dream System Job 以及 Session Blackboard Task Framing 均为当前已接受契约。本文 `TOOL_SCHEMA` 与各持久化 schema 是 Python 类型、实现和 contract fixtures 的直接输入。
+D01-D18、Session snapshot、Built-in Tool Catalog、MCP Tool Snapshot、CLI composition root、Message Bus/Agent Loop/Agent Runner、Dream System Job 以及 Session Blackboard Task Framing 均为当前已接受契约。本文 `TOOL_SCHEMA` 与各持久化 schema 是 Python 类型、实现和 contract fixtures 的直接输入。

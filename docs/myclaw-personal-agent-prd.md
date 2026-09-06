@@ -22,6 +22,8 @@
 
 以下是当前实现与发布验收使用的边界：
 
+MCP Tool 支持已由 [ADR-0020](adr/0020-expose-configured-mcp-tools-through-tool-gateway.md) 接受；本 PRD 中早期“首版不支持 MCP”、固定十工具或无 MCP Tool Gateway 的表述属于历史基线，在 MCP 配置、Runtime Lifetime 和 Runtime Generation 范围内以该 ADR 为准。
+
 - 一个 Runtime Lifetime 拥有一个无界 FIFO Message Bus，当前 Agent Loop 只使用它。公开操作包括
   `inbound_snapshot()`、`put_inbound()`、`get_inbound()`、`drain_inbound()`、
   `pause_inbound_delivery()`、`resume_inbound_delivery()`、`put_outbound()`、`get_outbound()` 和原子清空 Inbound/Outbound 的 `reset()`；同步 public callback operations 是
@@ -117,7 +119,7 @@
 45. 作为开发者，我想 Tool Gateway 统一解析、prepare、拒绝、单次执行和结果封装，所以工具行为保持一致。
 46. 作为开发者，我想 provider adapter 使用官方 SDK，所以 streaming、tool calls 和错误语义更可控。
 47. 作为开发者，我想用 fake provider 和 fake tool 测试，所以自动化测试不依赖真实 API。
-48. 作为开发者，我想首版不支持 MCP 和 subagent，所以能先稳定核心 runtime 边界。
+48. 作为开发者，我想首版不支持 MCP 和 subagent，所以能先稳定核心 runtime 边界。（历史基线；MCP 已由 ADR-0020 接受。）
 49. 作为个人用户，我想 Agent 在连续输入中保持一个隐藏的当前任务目标和完成边界，所以追加、修正、替换或取消请求能被稳定解释而不需要可见任务管理器。
 
 ## Implementation Decisions
@@ -273,7 +275,7 @@
 - TOML 顶层围绕 runtime、models、memory 组织；Tool Catalog 不进入 User Configuration。
 - Provider 使用 `[models.providers.<provider_id>]`。
 - Route 使用 `[models.routes.<route>]`。
-- User Configuration 不控制 Tool enablement；固定十工具 Catalog 始终可用。
+- User Configuration 不控制 Built-in Tool enablement；固定十工具 Built-in Catalog 始终可用，配置的 MCP Tool Snapshot 按 ADR-0020 注入当前 Runtime Generation。
 - Runtime loading 投影掉未知顶层 table、未知字段和未知 route；`myclaw config` 报告这些未定义字段，未知 protocol provider 仍按既定规则忽略。
 - 配置缺失时，只创建一个 ID 为 `openai-local` 的 OpenAI-compatible provider 模板（base URL、API key 和 model list 为空），并为 `default`、`chat`、`memory`、`schedule` 创建显式但不可用的 route 待填写段；四个 route 初始都引用 `openai-local`。随后退出并提示用户替换 Provider、model 和模型限制，或删除不需要定制的具体 route 以回退到 default；旧配置完全缺少 default route 时，错误消息必须指出 `[models.routes.default]`。
 - OpenAI-compatible provider 模板的 base_url 为空；所有 provider 的有效配置都要求 base_url。
@@ -283,9 +285,9 @@
 
 ### Tool Gateway and fail-closed security
 
-- 所有 capability 都是具体 `BaseTool`；Agent Loop 在初始化时创建固定十工具 Catalog 和共享 Tool Gateway，Schedule Service 只拥有 Schedule Store/management boundary。
+- 所有 capability 都是具体 `BaseTool`；Agent Loop 在初始化时创建固定十工具 Built-in Catalog 与按 ADR-0020 注入的 MCP Tool Snapshot，共享同一 Tool Gateway，Schedule Service 只拥有 Schedule Store/management boundary。
 - `BaseTool.to_schema()` 从直接公开注解、显式 required、默认值和 `ToolParam` 生成 OpenAI Function Calling schema；Model Request 保存缓存的 typed snapshot，Anthropic adapter 在内部转换。
-- `ToolGateway.call()` 是唯一公开入口，负责 raw JSON 解析、调用 BaseTool 固定 cast/Schema/参数/安全管线、一次性 Tool Confirmation、执行和扁平 Tool Result 封装；没有 dynamic registration、plugin/MCP、generic retry、per-call execution context 或 approval flag。
+- `ToolGateway.call()` 是唯一公开入口，负责 raw JSON 解析、调用 BaseTool 固定 cast/Schema/参数/安全管线、一次性 Tool Confirmation、执行和扁平 Tool Result 封装；没有 plugin、generic retry、per-call execution context 或 approval flag，MCP Tool 仅通过 ADR-0020 的 CLI-owned Snapshot 进入该入口。
 - `ModelToolCall.arguments` 保留原始 JSON string；Tool Result 仅含 call ID、name、status、content 和可选 artifact/confirmation metadata，不含 nested error。
 - Tool 执行不重试，取消继续向上传播；Tool Gateway 不设置统一 timeout、不持久化结果、不持有 Workspace。
 - 没有独立 `Security` 模块；公共路径、DNS、截断和 Artifact 能力由 BaseTool 或共享 helper 提供，capability-specific 规则保留在具体 Tool。
@@ -395,7 +397,7 @@
 - detached daemon、系统服务、HTTP 或 IPC server。
 - 多 Terminal Conversation、同 session、Dream、Schedule Job 的跨进程协调或锁。
 - 微服务拆分。
-- MCP 工具扩展。
+- MCP 工具扩展（历史基线，已由 ADR-0020 supersede）。
 - subagent/spawn 或多 Agent 编排。
 - 可见任务列表、计划器、workflow/progress tracker 或由 Blackboard 控制执行。
 - 用户可配置 identity/system prompt。
