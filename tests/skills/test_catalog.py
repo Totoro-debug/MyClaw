@@ -185,9 +185,7 @@ def test_valid_entries_follow_canonical_path_order(agent_home: Path) -> None:
     earlier = agent_home / "skills" / "a-candidate" / "SKILL.md"
     for instruction, name in ((later, "later"), (earlier, "earlier")):
         instruction.parent.mkdir(parents=True)
-        instruction.write_bytes(
-            f"---\nname: {name}\ndescription: Valid metadata\n---\n".encode()
-        )
+        instruction.write_bytes(f"---\nname: {name}\ndescription: Valid metadata\n---\n".encode())
 
     loader = _loader(agent_home=agent_home)
 
@@ -199,9 +197,7 @@ def test_only_direct_child_skill_directories_are_scanned(agent_home: Path) -> No
     nested = agent_home / "skills" / "container" / "nested" / "SKILL.md"
     for instruction, name in ((direct, "direct"), (nested, "nested")):
         instruction.parent.mkdir(parents=True)
-        instruction.write_bytes(
-            f"---\nname: {name}\ndescription: Valid metadata\n---\n".encode()
-        )
+        instruction.write_bytes(f"---\nname: {name}\ndescription: Valid metadata\n---\n".encode())
 
     loader = _loader(agent_home=agent_home)
 
@@ -320,8 +316,7 @@ def test_invalid_candidate_diagnostic_contains_path_and_reason_but_not_document(
     instruction = agent_home / "skills" / "invalid" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(
-        b"---\nname: invalid\ndescription: missing closing delimiter\n"
-        b"SECRET-SKILL-BODY\n"
+        b"---\nname: invalid\ndescription: missing closing delimiter\nSECRET-SKILL-BODY\n"
     )
     diagnostics = StringIO()
     handler = logger.add(diagnostics, format="{message}", level="WARNING")
@@ -388,9 +383,7 @@ def test_loader_reads_each_candidate_once_as_one_complete_bytes_read(
 
     assert tuple(skill.metadata.name for skill in loader.skills) == ("shared",)
     assert opens == len(documents)
-    assert [(path.parent.name, size) for path, size in reads] == [
-        (name, -1) for name in documents
-    ]
+    assert [(path.parent.name, size) for path, size in reads] == [(name, -1) for name in documents]
 
 
 def test_loader_published_state_is_immutable_and_manual_resolution_does_not_read_disk(
@@ -498,9 +491,7 @@ def test_non_opted_in_skill_is_not_always_loaded(agent_home: Path, always_field:
     instruction.parent.mkdir(parents=True)
     instruction.write_bytes(
         (
-            "---\nname: metadata-only\ndescription: Metadata only\n"
-            + always_field
-            + "---\nbody\n"
+            "---\nname: metadata-only\ndescription: Metadata only\n" + always_field + "---\nbody\n"
         ).encode()
     )
 

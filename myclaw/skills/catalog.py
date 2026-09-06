@@ -66,9 +66,7 @@ class SkillLoader:
         if not isinstance(enable_always_load, bool):
             raise TypeError("Skill Loader always-load flag must be a boolean")
         self._root = root.resolve()
-        self._reserved_names = frozenset(
-            name.removeprefix("/") for name in reserved_names
-        )
+        self._reserved_names = frozenset(name.removeprefix("/") for name in reserved_names)
         self._enable_always_load = enable_always_load
         self._skills: tuple[LoadedSkill, ...] = ()
 
@@ -137,7 +135,9 @@ class SkillLoader:
             try:
                 children = tuple(root.iterdir())
             except (OSError, RuntimeError):
-                logger.warning("Skill discovery failed path={} reason=Skill root is unavailable", root)
+                logger.warning(
+                    "Skill discovery failed path={} reason=Skill root is unavailable", root
+                )
                 raise
 
             candidates: list[tuple[Path, Path]] = []

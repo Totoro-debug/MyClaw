@@ -242,9 +242,7 @@ async def test_runtime_connects_two_servers_without_waiting_for_a_third_server_t
     zulu_started = asyncio.Event()
     alpha_completed = asyncio.Event()
     beta_completed = asyncio.Event()
-    configurations = {
-        name: _configuration(name) for name in ("alpha", "beta", "zulu")
-    }
+    configurations = {name: _configuration(name) for name in ("alpha", "beta", "zulu")}
     connections = {
         "alpha": _ConcurrentConnection(
             configurations["alpha"],

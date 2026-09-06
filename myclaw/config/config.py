@@ -276,8 +276,7 @@ def _missing_default_route_error() -> ConfigError:
     return ConfigError(
         ErrorInfo(
             "route_unavailable",
-            "Default Model Route is missing. "
-            "Add [models.routes.default] to User Configuration.",
+            "Default Model Route is missing. Add [models.routes.default] to User Configuration.",
         )
     )
 
@@ -375,10 +374,7 @@ def _redact_api_key_fields(value: object) -> None:
         ):
             value[field_name] = _REDACTED_API_KEY
             continue
-        if (
-            isinstance(field_name, str)
-            and field_name.lower() in _SENSITIVE_CONFIGURATION_FIELDS
-        ):
+        if isinstance(field_name, str) and field_name.lower() in _SENSITIVE_CONFIGURATION_FIELDS:
             if isinstance(item, MutableMapping):
                 for header_name in tuple(item):
                     item[header_name] = _REDACTED_API_KEY
@@ -409,16 +405,15 @@ def _redact_unparsed_content(content: str) -> str:
 
 
 def _single_line_safe_text(value: str) -> str:
-    return "".join(character if character.isprintable() else ascii(character)[1:-1] for character in value)
+    return "".join(
+        character if character.isprintable() else ascii(character)[1:-1] for character in value
+    )
 
 
 def _contains_sensitive_configuration_field(value: object) -> bool:
     if isinstance(value, Mapping):
         return any(
-            (
-                isinstance(field_name, str)
-                and field_name.lower() in _SENSITIVE_CONFIGURATION_FIELDS
-            )
+            (isinstance(field_name, str) and field_name.lower() in _SENSITIVE_CONFIGURATION_FIELDS)
             or _contains_sensitive_configuration_field(item)
             for field_name, item in value.items()
         )
@@ -446,7 +441,7 @@ def _sensitive_table_header(line: str) -> bool | None:
 
 
 def _sensitive_assignment(match: re.Match[str]) -> bool:
-    assignment = f'{match.group("key")} = {match.group("value")}'
+    assignment = f"{match.group('key')} = {match.group('value')}"
     try:
         document = tomllib.loads(assignment)
     except tomllib.TOMLDecodeError:
@@ -502,7 +497,7 @@ def _redact_sensitive_content(content: str) -> str:
                 continue
             lines.append(
                 f'{ignorable_prefix}{assignment.group("prefix")}"{_REDACTED_API_KEY}"'
-                f'{assignment.group("newline") or ""}'
+                f"{assignment.group('newline') or ''}"
             )
             if not _complete_toml_value(assignment.group("value")):
                 pending_sensitive_value = [
@@ -517,7 +512,7 @@ def _redact_sensitive_content(content: str) -> str:
             continue
         lines.append(
             f'{ignorable_prefix}{assignment.group("prefix")}"{_REDACTED_API_KEY}"'
-            f'{assignment.group("newline") or ""}'
+            f"{assignment.group('newline') or ''}"
         )
     return "".join(lines)
 
@@ -681,7 +676,11 @@ def _parse_mcp_headers(value: object, field: str) -> Mapping[str, str]:
     table = _table(value, field)
     headers: dict[str, str] = {}
     for header_name, header_value in table.items():
-        if not isinstance(header_name, str) or not header_name or header_name != header_name.strip():
+        if (
+            not isinstance(header_name, str)
+            or not header_name
+            or header_name != header_name.strip()
+        ):
             _invalid(field, "must contain nonempty header names without surrounding whitespace")
         headers[header_name] = _string(header_value, f"{field}.{header_name}")
     return MappingProxyType(headers)

@@ -34,9 +34,7 @@ class _Clock:
 
 class _AdvancingClock:
     def __init__(self, start: datetime | None = None) -> None:
-        self.current = (
-            datetime(2026, 8, 7, 12, 0, tzinfo=UTC) if start is None else start
-        )
+        self.current = datetime(2026, 8, 7, 12, 0, tzinfo=UTC) if start is None else start
         self.elapsed = 0.0
         self.wait_started = asyncio.Event()
         self._waiters: list[tuple[float, asyncio.Future[None]]] = []
@@ -335,15 +333,61 @@ async def test_dream_reconcile_recomputes_next_cron_occurrence_for_timezone_and_
 @pytest.mark.parametrize(
     ("job_id", "source", "schedule"),
     [
-        ("dream", "user", {"kind": "cron", "at_time": None, "every_seconds": None, "cron_expr": "0 * * * *", "timezone": "UTC"}),
+        (
+            "dream",
+            "user",
+            {
+                "kind": "cron",
+                "at_time": None,
+                "every_seconds": None,
+                "cron_expr": "0 * * * *",
+                "timezone": "UTC",
+            },
+        ),
         (
             "550e8400-e29b-41d4-a716-446655440000",
             "system",
-            {"kind": "cron", "at_time": None, "every_seconds": None, "cron_expr": "0 * * * *", "timezone": "UTC"},
+            {
+                "kind": "cron",
+                "at_time": None,
+                "every_seconds": None,
+                "cron_expr": "0 * * * *",
+                "timezone": "UTC",
+            },
         ),
-        ("unknown", "system", {"kind": "cron", "at_time": None, "every_seconds": None, "cron_expr": "0 * * * *", "timezone": "UTC"}),
-        ("dream", "system", {"kind": "cron", "at_time": None, "every_seconds": None, "cron_expr": "0 * * * *", "timezone": "Not/A_Timezone"}),
-        ("dream", "system", {"kind": "at", "at_time": "2026-08-07T12:00:00.000+00:00", "every_seconds": None, "cron_expr": None, "timezone": None}),
+        (
+            "unknown",
+            "system",
+            {
+                "kind": "cron",
+                "at_time": None,
+                "every_seconds": None,
+                "cron_expr": "0 * * * *",
+                "timezone": "UTC",
+            },
+        ),
+        (
+            "dream",
+            "system",
+            {
+                "kind": "cron",
+                "at_time": None,
+                "every_seconds": None,
+                "cron_expr": "0 * * * *",
+                "timezone": "Not/A_Timezone",
+            },
+        ),
+        (
+            "dream",
+            "system",
+            {
+                "kind": "at",
+                "at_time": "2026-08-07T12:00:00.000+00:00",
+                "every_seconds": None,
+                "cron_expr": None,
+                "timezone": None,
+            },
+        ),
     ],
 )
 def test_schedule_store_rejects_corrupt_or_conflicting_system_state(
@@ -653,8 +697,7 @@ async def test_pause_and_drain_cancels_user_and_dream_then_resume_keeps_progress
     assert user_calls == 1
     assert dream_calls == 1
     assert all(
-        job.state == ScheduleJobState()
-        for job in await WorkspaceScheduleStore(state).snapshot()
+        job.state == ScheduleJobState() for job in await WorkspaceScheduleStore(state).snapshot()
     )
 
     clock.advance(600)
@@ -665,18 +708,13 @@ async def test_pause_and_drain_cancels_user_and_dream_then_resume_keeps_progress
 
     service.resume()
     for _ in range(100):
-        if (
-            user_calls == 2
-            and dream_calls == 2
-            and service.status_snapshot().active_job_count == 0
-        ):
+        if user_calls == 2 and dream_calls == 2 and service.status_snapshot().active_job_count == 0:
             break
         await asyncio.sleep(0)
     assert user_calls == 2
     assert dream_calls == 2
     assert all(
-        job.state.last_status == "ok"
-        for job in await WorkspaceScheduleStore(state).snapshot()
+        job.state.last_status == "ok" for job in await WorkspaceScheduleStore(state).snapshot()
     )
     await service.close()
 
@@ -2056,15 +2094,16 @@ async def test_schedule_service_runs_dream_silently_without_a_foreground_session
     )
     await service.register_dream_job(schedule=JobSchedule.every(60))
 
-    foreground_session_id = (
-        "20260827-120000-000000_550e8400-e29b-41d4-a716-446655440000"
-    )
+    foreground_session_id = "20260827-120000-000000_550e8400-e29b-41d4-a716-446655440000"
     with session_log(state, foreground_session_id):
         service.start()
         await clock.wait_started.wait()
         clock.advance(60)
         for _ in range(100):
-            if len(provider.complete_requests) == 1 and service.status_snapshot().active_job_count == 0:
+            if (
+                len(provider.complete_requests) == 1
+                and service.status_snapshot().active_job_count == 0
+            ):
                 break
             await asyncio.sleep(0)
 

@@ -9,7 +9,7 @@ status: accepted
 > Built-in Tool, confirmation, result, and artifact boundaries remain accepted wherever
 > ADR-0020 does not say otherwise.
 
-The main Tool Catalog is fixed in this order: Read File, Write File, Edit File, List Dir, Glob, Grep, Exec, Web Search, Web Fetch, and Schedule. User Configuration cannot enable, disable, register, or replace these capabilities, and the product has no plugin, MCP, subagent, generic retry, or per-invocation Tool-plan surface.
+The Built-in Tool Catalog is fixed in this order: Read File, Write File, Edit File, List Dir, Glob, Grep, Exec, Web Search, Web Fetch, and Schedule. User Configuration cannot enable, disable, register, or replace these Built-in capabilities. Configured MCP Tools are the separate Runtime Generation extension defined by ADR-0020; this historical decision does not restrict that MCP Tool Snapshot.
 
 `ToolGateway.call()` is the sole public invocation boundary. It parses raw Provider arguments, resolves a Tool, and delegates the final cast, restricted Schema validation, concrete argument validation, safety evaluation, one-shot confirmation, execution, and normalized result pipeline to `BaseTool` and the concrete capability.
 

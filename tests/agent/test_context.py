@@ -211,9 +211,7 @@ def test_context_builder_builds_foreground_request_from_one_ordered_input(
         {
             "role": "assistant",
             "content": "Current tool call.",
-            "tool_calls": [
-                {"id": "call-1", "name": "read_file", "arguments": "{}"}
-            ],
+            "tool_calls": [{"id": "call-1", "name": "read_file", "arguments": "{}"}],
         },
         {
             "role": "tool",
@@ -521,16 +519,16 @@ def test_context_builder_projects_markdown_blackboard_only_into_current_user(
     assert messages[1:] == [
         {"role": "user", "content": "Earlier"},
         {"role": "assistant", "content": "Earlier answer", "tool_calls": []},
-            {
-                "role": "user",
-                "content": (
-                    "## Runtime Context\n\n"
-                    "- Current time: 2026-08-16T04:05:06.789+00:00\n"
-                    "- Session ID: session-id\n\n"
-                    "## User Input\n\n"
-                    "Current\n\n"
-                    "## Task goal\n\n"
-                    'Keep "quotes" and <tag> text.\n\n'
+        {
+            "role": "user",
+            "content": (
+                "## Runtime Context\n\n"
+                "- Current time: 2026-08-16T04:05:06.789+00:00\n"
+                "- Session ID: session-id\n\n"
+                "## User Input\n\n"
+                "Current\n\n"
+                "## Task goal\n\n"
+                'Keep "quotes" and <tag> text.\n\n'
                 "## Completion boundary\n\n"
                 "Finish on C:\\tmp\\done.\n完成。"
             ),
@@ -587,9 +585,7 @@ def test_context_builder_projects_manual_skill_and_request_as_safe_distinct_bloc
     skill_block = current_content.split("## Skill Instructions\n\n```json\n", 1)[1].split(
         "\n```", 1
     )[0]
-    request_block = current_content.split("## User Request\n\n```json\n", 1)[1].split(
-        "\n```", 1
-    )[0]
+    request_block = current_content.split("## User Request\n\n```json\n", 1)[1].split("\n```", 1)[0]
     assert json.loads(skill_block) == {"name": "planner", "body": body}
     assert json.loads(request_block) == request
     assert r"\u0060\u0060\u0060" in skill_block
@@ -710,12 +706,7 @@ def test_context_builder_schedule_request_excludes_foreground_skill_and_task_sta
     instruction = agent_home / "skills" / "planner" / "SKILL.md"
     instruction.parent.mkdir(parents=True)
     instruction.write_text(
-        "---\n"
-        "name: planner\n"
-        "description: Plan work\n"
-        "always: true\n"
-        "---\n"
-        f"{body}\n",
+        f"---\nname: planner\ndescription: Plan work\nalways: true\n---\n{body}\n",
         encoding="utf-8",
     )
     loader = SkillLoader(
@@ -755,8 +746,7 @@ def test_context_builder_schedule_request_excludes_foreground_skill_and_task_sta
     assert "<skill_catalog>" not in system_content
     assert "<skill_always_load>" not in system_content
     assert current_content.startswith(
-        "## Runtime Context\n\n"
-        "- Current time: 2026-08-16T12:05:06.789+08:00\n"
+        "## Runtime Context\n\n- Current time: 2026-08-16T12:05:06.789+08:00\n"
     )
     assert messages == original_messages
 

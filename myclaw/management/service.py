@@ -302,9 +302,7 @@ class ManagementViewService:
         try:
             self._config.update_reasoning_effort(effort)
         except Exception as error:
-            logger.warning(
-                "Reasoning Effort persistence failed type={}", type(error).__name__
-            )
+            logger.warning("Reasoning Effort persistence failed type={}", type(error).__name__)
         return await self.reasoning_effort()
 
     async def status(self) -> RuntimeStatus:

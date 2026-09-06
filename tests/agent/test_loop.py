@@ -345,8 +345,7 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
         "persist": 0,
     }
     constructor_args: dict[str, list[tuple[Any, ...]]] = {
-        name: []
-        for name in ("context_builder", "summary_manager", "tool_gateway", "runner")
+        name: [] for name in ("context_builder", "summary_manager", "tool_gateway", "runner")
     }
 
     original_create = Session.create
@@ -552,11 +551,13 @@ def _runtime(
         mcp_tools=mcp_tools,
     )
     if title_prompt is None:
+
         def disable_title(_session: Session, _content: str) -> None:
             return None
 
         object.__setattr__(loop, "_start_title_if_needed", disable_title)
     else:
+
         def build_title_messages(content: str) -> list[dict[str, Any]]:
             return [
                 {"role": "system", "content": title_prompt},
@@ -621,9 +622,9 @@ async def test_agent_loop_status_projection_starts_uptime_only_after_activation(
 def test_agent_loop_preflight_reserves_the_complete_tool_catalog_without_skills(
     tmp_path: Path,
 ) -> None:
-    config = MINIMAL_VALID_CONFIG.replace("context_window = 200000", "context_window = 1024").replace(
-        "max_output = 8192", "max_output = 128"
-    )
+    config = MINIMAL_VALID_CONFIG.replace(
+        "context_window = 200000", "context_window = 1024"
+    ).replace("max_output = 8192", "max_output = 128")
     loop, _session, _bus = _runtime(
         tmp_path,
         _Router(()),
@@ -1592,9 +1593,7 @@ async def test_loop_commits_failed_runner_result_once_before_one_safe_terminal(
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        task_framing_outcomes=(
-            _framing_response(staged, input_tokens=4, output_tokens=2),
-        ),
+        task_framing_outcomes=(_framing_response(staged, input_tokens=4, output_tokens=2),),
     )
     append_calls = 0
     persist_calls = 0
@@ -1657,9 +1656,7 @@ async def test_loop_commits_max_iteration_repair_once_before_safe_terminal(
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        task_framing_outcomes=(
-            _framing_response(staged, input_tokens=4, output_tokens=2),
-        ),
+        task_framing_outcomes=(_framing_response(staged, input_tokens=4, output_tokens=2),),
     )
     append_calls = 0
     persist_calls = 0
@@ -2571,6 +2568,7 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
         "output_tokens": 2,
         "total_tokens": 6,
     }
+
     class ToolLoopRouter(_Router):
         def __init__(self) -> None:
             super().__init__(())
@@ -2793,6 +2791,7 @@ async def test_context_failure_after_framing_preserves_previous_blackboard_and_u
 ) -> None:
     previous = Blackboard(goal="Previous goal", completion_boundary="Previous boundary")
     staged = Blackboard(goal="Staged goal", completion_boundary="Staged boundary")
+
     async def fail_context(
         active: Session,
         current: dict[str, Any],
@@ -2805,9 +2804,7 @@ async def test_context_failure_after_framing_preserves_previous_blackboard_and_u
         tmp_path,
         _Router(()),
         context_preparer_with_blackboard=fail_context,
-        task_framing_outcomes=(
-            _framing_response(staged, input_tokens=4, output_tokens=2),
-        ),
+        task_framing_outcomes=(_framing_response(staged, input_tokens=4, output_tokens=2),),
     )
     session.update_metadata(
         blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
@@ -2852,9 +2849,7 @@ async def test_context_cancellation_after_framing_preserves_previous_blackboard_
         tmp_path,
         _Router(()),
         context_preparer_with_blackboard=block_context,
-        task_framing_outcomes=(
-            _framing_response(staged, input_tokens=4, output_tokens=2),
-        ),
+        task_framing_outcomes=(_framing_response(staged, input_tokens=4, output_tokens=2),),
     )
     session.update_metadata(
         blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}

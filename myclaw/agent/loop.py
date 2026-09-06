@@ -1380,9 +1380,7 @@ class AgentLoop:
         return title, usage_delta
 
     def _router_stream_title(self, content: str) -> Any:
-        messages = self._context_builder.build_title_messages(
-            Session._normalize_title(content)
-        )
+        messages = self._context_builder.build_title_messages(Session._normalize_title(content))
         return self._model_router.stream(
             "chat",
             messages=messages,

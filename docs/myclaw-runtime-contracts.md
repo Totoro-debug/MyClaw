@@ -184,6 +184,23 @@ consolidation_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
+[mcp.servers.filesystem]
+enabled = true
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-filesystem", "."]
+cwd = "."
+connect_timeout = 30
+call_timeout = 60
+
+[mcp.servers.search]
+enabled = true
+transport = "streamable-http"
+url = "https://example.com/mcp"
+headers = { Authorization = "Bearer replace-with-a-token" }
+connect_timeout = 30
+call_timeout = 60
+
 [models.providers.anthropic-default]
 protocol = "anthropic"
 base_url = "https://api.anthropic.com"
@@ -257,7 +274,7 @@ timeout = 120
 | `reasoning_effort` | `low`、`medium`、`high`、`xhigh`、`max` | 可省略；内存默认 `medium` |
 | `timeout` | integer seconds，`1..600` | 必填 |
 
-启动时将未知顶层 table、未知字段和未知 route table 投影掉；`myclaw config` 仍报告这些未定义字段。未知 protocol provider 按 canonical 要求忽略；如果 default 因此不可用，Terminal Conversation 启动失败。Tool Catalog 不接受用户配置的 enablement 或 replacement。
+启动时将未知顶层 table、未知字段和未知 route table 投影掉；`myclaw config` 仍报告这些未定义字段。未知 protocol provider 按 canonical 要求忽略；如果 default 因此不可用，Terminal Conversation 启动失败。Built-in Tool Catalog 不接受用户配置的 enablement 或 replacement；MCP Tool 只通过下述 `mcp.servers` 配置进入当前 Runtime Generation。
 
 ### 4.3 首次生成模板
 
@@ -282,6 +299,22 @@ Configuration。`ConfigLoader.update_reasoning_effort(effort)` 每次重读最�
 语法/UTF-8、缺失 `default`、候选校验或 atomic replacement 失败都不得产生部分候选发布。Management
 捕获持久化异常后只记录一次不含异常正文、配置正文、API key 或 traceback 的安全诊断事件，返回已发布的
 成功值且不回滚；运行时值与磁盘值在失败后暂时不同是可接受的。
+
+### 4.6 MCP Server Configuration
+
+每个 MCP Server 只有一个 `[mcp.servers.<mcp_name>]` item，`mcp_name` 必须匹配
+`[a-z0-9][a-z0-9_-]{0,63}`。配置使用官方 MCP Python SDK v2，package constraint 为
+`mcp>=2,<3`。Server item 支持 `enabled`、`transport`、`connect_timeout` 和 `call_timeout`；
+`transport = "stdio"` 时还必须有 `command` 和 `args`，可选 `cwd`；stdio 直接继承 MyClaw
+进程环境，不接受 `env` 或 `secret_env`。`transport = "streamable-http"` 时必须有绝对 HTTP(S)
+`url`，可选静态 `headers` 字典，不支持 OAuth。
+
+stdio 的 `cwd` 省略时为 Workspace，相对路径相对 Workspace，绝对路径按原值使用。两个 timeout
+均为 `1..600` 秒。合法 TOML 中单个字段错误、未知字段或 transport 不适用字段只跳过对应
+Server，并生成不含 command、URL、headers、secret 或异常正文的诊断；整个 TOML 语法错误仍使用
+`config_parse_error` 阻止加载。连接、初始化或 Tools discovery 失败不会阻塞 startup，会在终端给出
+一行脱敏 notice，并保留 `mcp_name`、阶段和异常类型供 process log 诊断；`myclaw config` 与
+`/config` 显示 headers 的脱敏投影。
 
 ## 5. Conversation Session 契约
 
@@ -909,7 +942,22 @@ Cron cursor，因此二者都只在下一个正常 occurrence 执行。已经完
 保持其 persisted state 与完成时刻 cadence。直接调用 `ScheduleService.close()` 仍等待已开始的 terminal
 commit 而不取消；CLI shutdown 先调用 `pause_and_drain()`，因此使用 pause 的取消语义。
 
-After Terminal `run_async()` returns, the actual CLI shutdown call chain is `Management deactivate -> Schedule pause_and_drain + close -> pending/active Agent Loop abort or close -> Dream close -> Model Router close`. Terminal exit/unmount cleanup has already run at the first boundary; the CLI does not call a separate Terminal business-component close. Accepted Tool/Artifact/Memory/Schedule side effects are not rolled back.
+After Terminal `run_async()` returns, the actual CLI shutdown call chain is `Management deactivate -> Schedule pause_and_drain + close -> pending/active Agent Loop abort or close -> MCP Runtime Manager close -> Dream close -> Model Router close`. Terminal exit/unmount cleanup has already run at the first boundary; the CLI does not call a separate Terminal business-component close. Accepted Tool/Artifact/Memory/Schedule side effects are not rolled back.
+
+### 10.8 MCP Runtime Lifetime and Generation Boundary
+
+CLI composition root 在初始 Agent Loop 之前并发连接所有合法 enabled MCP Server，并把成功 discovery
+的 Tool 按 `mcp_name`、远程 Tool 名称稳定排序后冻结为 immutable MCP Tool Snapshot。Built-in
+Tool 总在前面；无效 schema、非法 provider name 或名称冲突的 MCP Tool 被跳过。Runtime Lifetime
+持有连接和发现定义，Agent Loop 只接收当前 generation 的 `tuple[MCPTool, ...]`。
+
+`/resume` 在暂停旧 Generation 前调用 MCP Runtime Manager 准备候选 Snapshot：健康连接与其 Tool
+定义复用，只有失败 Server 或 SDK-confirmed closed session/transport 才重连。候选准备失败不改变旧
+Generation；成功切换后才激活候选 Snapshot。timeout 或 `isError` Tool result 不把 Server 加入失败
+集合。没有 live list subscription 或 MCP reload command；配置和健康 Tool 列表的变化通过后续进程
+启动获取。每个 Server 的 SDK transport/session context 由同一个 per-Server lifecycle task 进入和退出，
+以满足 SDK 的 task-local cancel-scope 约束；Tool 调用仍可通过共享 Session 并发执行。关闭时 Agent Loop
+完成后先关闭 MCP clients，再关闭 Dream 和 Model Router。
 
 ## TOOL_SCHEMA：Tool Gateway 契约
 
@@ -918,7 +966,7 @@ After Terminal `run_async()` returns, the actual CLI shutdown call chain is `Man
 ```python
 OpenAIToolSchema = {
     "type": "function",
-    "function": {"name": str, "description": str, "parameters": JsonObject},
+    "function": {"name": str, "description": str, "parameters": dict[str, Any]},
 }
 
 ModelToolCall(id: str, name: str, arguments: str)  # arguments 是原始 JSON 文本
@@ -933,11 +981,11 @@ ToolResult(
 )
 ```
 
-`BaseTool.to_schema()` 从具体 Tool 的固定 `parameters` Schema 生成 detached OpenAI Function Calling schema，具体 Tool 不得覆盖；普通 Tool 的 Schema 由公开注解、显式 `required`、默认值和 `ToolParam` 派生，复杂的固定 Schema 可由 Tool 显式提供。`ToolGateway.call()` 是唯一公开调用入口，顺序固定为：parse raw JSON -> resolve -> final BaseTool cast/Schema validation/argument validation/safety check -> one-shot confirmation when required -> execute -> normalize。未声明参数被忽略；只允许规格定义的 string-to-integer、integral-float-to-integer 和 string-to-boolean 转换。Tool 不重试，解析、准备、确认和拒绝也不重试；取消继续向上传播。
+`BaseTool.to_schema()` 从具体 Tool 的 `parameters` 生成 detached OpenAI Function Calling schema，普通 Tool 的 Schema 由公开注解、显式 `required`、默认值和 `ToolParam` 派生，MCP Tool 保留 discovery 时完成 nullable normalization 的 `dict[str, Any]`。每次 Model Request 都重新调用当前 Catalog 中每个 Tool 的 `to_schema()`，构造新的 `list[dict[str, Any]]`，不缓存 Gateway 聚合 schema。具体 Tool 不覆盖 `to_schema()`。`ToolGateway.call()` 是唯一公开调用入口，顺序固定为：parse raw JSON -> resolve -> final BaseTool preparation/safety pipeline -> one-shot confirmation when required -> `execute_prepared(arguments)` -> normalize。Built-in Tool 的 preparation 执行 cast、临时 Schema validation、argument validation 并忽略未声明参数，只允许规格定义的 string-to-integer、integral-float-to-integer 和 string-to-boolean 转换；MCP Tool 的 preparation 则完整复制参数字典，不做这些本地处理。Tool 不重试，解析、准备、确认和拒绝也不重试；取消继续向上传播。
 
 ### 11.2 Catalog 与依赖所有权
 
-- Agent Loop 在初始化时以规范化绝对 Workspace `Path`、Schedule Service 和 canonical Agent Home Skill root 构造一个共享 `ToolGateway`；不存在 `Workspace` wrapper class。Gateway 自己一次性构造固定十工具 Catalog，不暴露注册入口。Schedule Service 自己创建并持有 Store/Job management ownership，Gateway 不接受第二套 Schedule Gateway。
+- Agent Loop 在初始化时以规范化绝对 Workspace `Path`、Schedule Service、canonical Agent Home Skill root 和当前 generation 的 MCP Tool Snapshot 构造一个共享 `ToolGateway`；不存在 `Workspace` wrapper class。Gateway 构造固定十工具 Built-in Catalog 后追加该 generation 的 MCP Tools，不暴露 live registration 或 reload 入口。Schedule Service 自己创建并持有 Store/Job management ownership，Gateway 不接受第二套 Schedule Gateway。
 - Tool 调用不接收 session ID、Agent Home、lane、approval flag 或通用 execution context。
 - 没有独立 `Security` 模块；公共路径、DNS、截断和 Artifact 边界由 BaseTool 或共享小 helper 提供，具体 Tool 保留 capability-specific 规则。
 - Dream 使用合法且独立的专用 Tool Gateway，只注册 Long-term Memory read/edit Tool；
@@ -945,6 +993,21 @@ ToolResult(
   `memory` lane，但复用统一的 `AgentRunner.run()` bounded ReAct implementation。
 - Tool Gateway 不在前台/后台之间加全局执行锁。
 - Tool Gateway 不设置统一 timeout、持久化 Tool Result 或持有 Workspace；Artifact 写入由 BaseTool 的结果处理能力完成。
+
+### 11.8 MCP Tool
+
+MCP Tool 是 `BaseTool` 的具体实现，模型名称优先使用
+`mcp_<mcp_name>_<remote_tool_name>`；若超过 64 个字符才尝试
+`mcp_<remote_tool_name>`，不替换字符或截断。最终名称必须匹配 `[A-Za-z0-9_-]{1,64}`，并与
+Built-in 或更早的 MCP Tool 唯一；冲突项跳过。缺失 description 时使用远程 Tool 名称。
+
+发现时只接受 JSON-serializable、根 `type == "object"` 的 `inputSchema`，递归移除 `nullable` 并
+按 OpenAI-compatible 形式加入 `null`；调用时不根据该 schema 做 cast、validation 或额外字段过滤。
+Provider 的原始 JSON arguments 解析为完整 `dict[str, Any]` 后交给 `call_tool`，MCP Tool 不请求
+额外 Tool Confirmation。结果只读取 `CallToolResult.content`：按顺序连接 TextContent，中间以换行
+分隔；其他 block 使用 `str(block)`；空 content 为 `(no output)`，不读取 `structured_content` 或
+`outputSchema`。`isError` 与 timeout 转为 `ToolError`；closed session/transport 转为连接不可用的
+`ToolError` 并标记 Server；其他异常由 Gateway 转成通用失败，`CancelledError` 原样传播。
 
 ### 11.3 内置 file tools
 

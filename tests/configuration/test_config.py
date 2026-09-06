@@ -503,9 +503,7 @@ def test_valid_configuration_loads_as_typed_values(agent_home: Path) -> None:
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
-def test_all_reasoning_effort_levels_load_as_route_values(
-    agent_home: Path, effort: str
-) -> None:
+def test_all_reasoning_effort_levels_load_as_route_values(agent_home: Path, effort: str) -> None:
     loader = ConfigLoader(AgentHome(agent_home))
     loader.ensure_default()
     loader.path.write_text(
@@ -1147,9 +1145,7 @@ def test_update_reasoning_effort_keeps_external_edits_and_inherited_chat_absent(
     loader.path.write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
     loader.load()
 
-    latest_content = MINIMAL_VALID_CONFIG.replace(
-        "max_output = 1024", "max_output = 2048"
-    ).replace(
+    latest_content = MINIMAL_VALID_CONFIG.replace("max_output = 1024", "max_output = 2048").replace(
         "timeout = 30", "timeout = 45\n\n# Added by an external editor."
     )
     loader.path.write_text(latest_content, encoding="utf-8")
@@ -1168,7 +1164,7 @@ def test_update_reasoning_effort_keeps_external_edits_and_inherited_chat_absent(
 @pytest.mark.parametrize(
     ("raw_content", "write_bytes"),
     [
-        ("[models.routes.default\nreasoning_effort = \"low\"\n", False),
+        ('[models.routes.default\nreasoning_effort = "low"\n', False),
         (b'[models.routes.default]\nreasoning_effort = "low"\n\xff', True),
     ],
     ids=("malformed-toml", "invalid-utf8"),

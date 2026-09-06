@@ -9,7 +9,7 @@ MyClaw 不是多租户 Agent 平台，也不是后台常驻服务。每次运行
 - **全屏终端对话**：基于 Textual 和 Rich，支持流式回复、推理与工具活动展示。
 - **本地优先持久化**：配置、会话、记忆、日志、定时任务和工具产物均保存为本地文件。
 - **多模型路由**：支持 `openai-compatible` 和 `anthropic` Provider，并可为聊天、记忆和定时任务分别配置模型。
-- **固定工具目录**：内置文件操作、目录检索、命令执行、Web 搜索、Web 获取和定时任务等十项 Tool，通过统一的 Tool Gateway 执行校验与授权。
+- **统一工具目录**：十项 Built-in Tool 与 User Configuration 中配置的 MCP Tool 通过同一个 Tool Gateway 执行校验、授权和结果处理。
 - **三层记忆系统**：由 Short-term Memory、Conversation Summary 和 Long-term Memory 组成。
 - **Skill 发现与渐进使用**：从 Agent Home 捕获可原子重载的冻结 Skill Snapshot，支持手动斜杠调用、模型自主读取和可选的 System Prompt 投影。
 - **任务连续性**：在普通前台输入之前执行 Task Framing，用隐藏 Blackboard 维护当前目标和完成边界。
@@ -113,6 +113,35 @@ Model Route 按用途选择模型：
 只配置 `default` 即可启动。删除某个用途专用的 Route 后，该用途会回退到 `default`。每个 Route 的 `model` 必须同时出现在对应 Provider 的 `models` 数组中。
 
 `api_key` 以明文保存在 `config.toml`。配置查看和面向用户的错误会隐藏 Key，但当前版本不支持环境变量引用或操作系统 Keychain。建议使用权限最小化的专用 Key，并保护 AgentHome 的文件权限。
+
+### 配置 MCP Server
+
+MCP Server 是由 User Configuration 明确信任的外部 Tool 来源。每个 `mcp_name` 只能有一个配置项；启用后，发现到的 MCP Tool 会冻结为当前 Runtime Generation 的 MCP Tool Snapshot，并追加到十项 Built-in Tool 之后形成 Tool Catalog。
+
+```toml
+[mcp.servers.filesystem]
+enabled = true
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-filesystem", "."]
+cwd = "."
+connect_timeout = 30
+call_timeout = 60
+
+[mcp.servers.search]
+enabled = true
+transport = "streamable-http"
+url = "https://example.com/mcp"
+headers = { Authorization = "Bearer replace-with-a-token" }
+connect_timeout = 30
+call_timeout = 60
+```
+
+stdio Server 继承 MyClaw 进程环境；`cwd` 省略时使用 Workspace，相对路径也相对 Workspace。MCP 配置不支持 `env` 或 `secret_env`。Streamable HTTP Server 可声明静态 `headers`。`connect_timeout` 与 `call_timeout` 的范围为 1–600 秒。
+
+无效的单个 MCP Server、连接失败或发现失败只会跳过该 Server，并通过脱敏诊断和一行终端提示报告；整个 TOML 无法解析仍是 fatal configuration error。`myclaw config` 和 `/config` 会显示脱敏后的 MCP 诊断，headers 值不会显示。
+
+MCP Tool 通过正常 Model request 的 `tools` 字段提供，不写入 System Prompt；它们是已配置的 trusted capability，不额外请求 Tool Confirmation。MCP 参数完整转发给 Server，结果沿用 Tool Gateway 的 text-only Tool Result 边界。没有 MCP reload command；`/resume` 只为已不可用的 Server 准备下一代 Snapshot，健康连接与已发现定义继续复用。
 
 查看脱敏后的当前配置：
 
@@ -405,7 +434,7 @@ Agent Home 固定为当前账户的 `~/.myclaw/`，不能通过配置切换：
 - 日志保留按 Session 独立计算（per-session retention），Workspace 的日志总量没有全局上限。
 - 旧版 Agent Home Runtime Log 文件保持原样（legacy Agent Home Runtime Log files remain untouched）；升级不会读取、移动、删除、截断或更新它们。
 - 普通后台 Session 保存失败没有用户确认或失败日志；崩溃后 Conversation Summary 与`last_consolidated` 可能暂时不一致。
-- 当前版本没有 daemon、HTTP/IPC 服务、MCP、subagent runtime、profiles、跨进程状态协调、Keychain 集成或环境变量 API Key。
+- 当前版本没有 daemon、HTTP/IPC 服务、subagent runtime、profiles、跨进程状态协调、Keychain 集成或环境变量 API Key；MCP 仅通过上述配置的 Runtime Lifetime 集成提供。
 
 ## License
 

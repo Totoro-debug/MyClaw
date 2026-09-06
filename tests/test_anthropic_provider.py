@@ -230,9 +230,7 @@ async def test_stream_maps_or_omits_each_reasoning_effort(
         for key, value in client.messages.calls[0].items()
         if key in {"output_config", "reasoning_effort"}
     }
-    assert reasoning_arguments == (
-        {} if effort is None else {"output_config": {"effort": effort}}
-    )
+    assert reasoning_arguments == ({} if effort is None else {"output_config": {"effort": effort}})
 
 
 @pytest.mark.asyncio
@@ -256,9 +254,7 @@ async def test_complete_maps_or_omits_each_reasoning_effort(
         for key, value in client.messages.calls[0].items()
         if key in {"output_config", "reasoning_effort"}
     }
-    assert reasoning_arguments == (
-        {} if effort is None else {"output_config": {"effort": effort}}
-    )
+    assert reasoning_arguments == ({} if effort is None else {"output_config": {"effort": effort}})
 
 
 @pytest.mark.asyncio

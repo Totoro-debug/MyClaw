@@ -192,9 +192,7 @@ async def test_cancelling_a_waiting_getter_does_not_consume_the_next_message(lan
     bus = MessageBus()
     condition = _ControlledCondition(expected_waiters=1)
     bus._condition = condition
-    getter = asyncio.create_task(
-        bus.get_inbound() if lane == "inbound" else bus.get_outbound()
-    )
+    getter = asyncio.create_task(bus.get_inbound() if lane == "inbound" else bus.get_outbound())
     await condition.all_waiters_waiting.wait()
 
     getter.cancel()
@@ -345,7 +343,9 @@ async def test_put_before_reset_is_cleared_without_a_late_inbound_callback(lane:
     condition = _ControlledCondition()
     bus._condition = condition
     callbacks: list[tuple[InboundMessage, ...]] = []
-    reset_observations: list[tuple[tuple[InboundMessage, ...], tuple[OutboundMessage, ...], bool]] = []
+    reset_observations: list[
+        tuple[tuple[InboundMessage, ...], tuple[OutboundMessage, ...], bool]
+    ] = []
 
     def observe(snapshot: tuple[InboundMessage, ...]) -> None:
         callbacks.append(snapshot)
@@ -361,9 +361,7 @@ async def test_put_before_reset_is_cleared_without_a_late_inbound_callback(lane:
     await condition.acquire()
     condition.acquire_attempted.clear()
     put_before_task = asyncio.create_task(
-        bus.put_inbound(before_inbound)
-        if lane == "inbound"
-        else bus.put_outbound(before_outbound)
+        bus.put_inbound(before_inbound) if lane == "inbound" else bus.put_outbound(before_outbound)
     )
     await _wait_for_acquisition(condition)
     reset_before_task = asyncio.create_task(bus.reset())
@@ -386,7 +384,9 @@ async def test_put_after_reset_is_retained_without_a_half_cleared_observation(la
     condition = _ControlledCondition()
     bus._condition = condition
     callbacks: list[tuple[InboundMessage, ...]] = []
-    reset_observations: list[tuple[tuple[InboundMessage, ...], tuple[OutboundMessage, ...], bool]] = []
+    reset_observations: list[
+        tuple[tuple[InboundMessage, ...], tuple[OutboundMessage, ...], bool]
+    ] = []
 
     def observe(snapshot: tuple[InboundMessage, ...]) -> None:
         callbacks.append(snapshot)
@@ -406,9 +406,7 @@ async def test_put_after_reset_is_retained_without_a_half_cleared_observation(la
     reset_after_task = asyncio.create_task(bus.reset())
     await _wait_for_acquisition(condition)
     put_after_task = asyncio.create_task(
-        bus.put_inbound(after_inbound)
-        if lane == "inbound"
-        else bus.put_outbound(after_outbound)
+        bus.put_inbound(after_inbound) if lane == "inbound" else bus.put_outbound(after_outbound)
     )
     await _wait_for_acquisition(condition)
     condition.release()

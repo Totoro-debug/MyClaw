@@ -363,10 +363,7 @@ def _build_foreground_system_prompt(
     long_term_memory: str,
     skills: Sequence[LoadedSkill],
 ) -> str:
-    runtime = (
-        f"{platform.system()} "
-        f"{platform.machine()}, Python {platform.python_version()}"
-    )
+    runtime = f"{platform.system()} {platform.machine()}, Python {platform.python_version()}"
     sections = [
         render_template(
             "foreground-chat-system-prompt.md",

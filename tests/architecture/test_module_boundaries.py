@@ -193,9 +193,7 @@ def test_agent_loop_delegates_foreground_context_construction_to_context_builder
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
     agent_loop = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
     )
     methods = {
         node.name: node
@@ -226,9 +224,7 @@ def test_agent_loop_delegates_schedule_context_construction_to_context_builder()
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     agent_loop = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
     )
     prepare_schedule = next(
         node
@@ -252,9 +248,7 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
     path = PACKAGE_ROOT / "agent" / "loop.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     agent_loop = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
     )
     methods = {
         node.name: node
@@ -298,9 +292,7 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
             and isinstance(node.func.value, ast.Attribute)
             and node.func.value.attr == "_summary_manager"
         )
-        assert required_summary_arguments <= {
-            keyword.arg for keyword in summary_call.keywords
-        }
+        assert required_summary_arguments <= {keyword.arg for keyword in summary_call.keywords}
 
     assert any(
         isinstance(node, ast.Call)

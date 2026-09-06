@@ -47,6 +47,15 @@ _SUPERSEDED_ADRS = (
     ROOT / "docs" / "adr" / "0014-use-message-bus-agent-loop-and-agent-runner.md",
     ROOT / "docs" / "adr" / "0016-use-agent-home-skill-catalog-and-progressive-loading.md",
 )
+_MCP_AUTHORITATIVE_DOCS = (
+    ROOT / "README.md",
+    ROOT / "CONTEXT.md",
+    ROOT / "docs" / "myclaw-personal-agent-prd.md",
+    ROOT / "docs" / "myclaw-runtime-contracts.md",
+    ROOT / "docs" / "adr" / "0010-fixed-tool-catalog-and-base-tool-boundaries.md",
+    ROOT / "docs" / "adr" / "0020-expose-configured-mcp-tools-through-tool-gateway.md",
+    ROOT / "docs" / "mcp-tool-support-implementation-plan.md",
+)
 _OBSOLETE_SKILL_MARKERS = (
     "adr-0016 proposes",
     "只有内置 slash commands 进入 management port",
@@ -788,6 +797,112 @@ def test_current_adrs_have_unique_numbers_and_accepted_status() -> None:
     assert all(_adr_status(path) == "accepted" for path in decisions)
 
 
+def test_mcp_contract_is_published_across_authoritative_documents() -> None:
+    documents = {path.name: path.read_text(encoding="utf-8") for path in _MCP_AUTHORITATIVE_DOCS}
+    context = documents["CONTEXT.md"]
+    for term, claims in {
+        "MCP Server": ("User Configuration", "Model Context Protocol"),
+        "MCP Server Configuration": ("mcp_name", "MCP Server"),
+        "MCP Runtime Manager": ("Runtime Lifetime", "MCP Tool Snapshots"),
+        "MCP Tool": ("Tool Catalog", "Built-in Tool"),
+        "MCP Tool Snapshot": ("immutable ordered set", "Runtime Generation"),
+    }.items():
+        definition = _glossary_definition(context, term)
+        assert all(claim.casefold() in definition for claim in claims), term
+
+    prd = documents["myclaw-personal-agent-prd.md"]
+    runtime = documents["myclaw-runtime-contracts.md"]
+    adr_0010 = documents["0010-fixed-tool-catalog-and-base-tool-boundaries.md"]
+    adr_0020 = documents["0020-expose-configured-mcp-tools-through-tool-gateway.md"]
+    plan = documents["mcp-tool-support-implementation-plan.md"]
+    readme = documents["README.md"]
+
+    for document in (prd, runtime, adr_0020, plan):
+        for claim in (
+            "mcp_name",
+            "streamable-http",
+            "MCP Tool Snapshot",
+            "model_context_overflow",
+            "Model request context exceeds the available input budget.",
+        ):
+            assert claim.casefold() in document.casefold(), claim
+
+    for document in (prd, runtime, adr_0020):
+        for claim in (
+            "mcp>=2,<3",
+            "call_tool",
+            "Tool Confirmation",
+            "/resume",
+            "structured_content",
+        ):
+            assert claim.casefold() in document.casefold(), claim
+
+    assert "superseded by" in adr_0010.casefold()
+    assert "ADR-0020" in adr_0010
+    assert "[mcp.servers.<mcp_name>]" in prd
+    assert "[mcp.servers.<mcp_name>]" in runtime
+    assert "Implementation status: T1-T7 complete after final verification" in plan
+    assert "MCP Tool Snapshot" in readme
+    assert "当前版本没有 daemon、HTTP/IPC 服务、MCP" not in readme
+    assert "Model Request 保存缓存的 typed snapshot" not in prd
+    assert "固定十个结构化 Tool schemas" not in runtime
+    assert (
+        "Agent Loop abort or close -> MCP Runtime Manager close -> Dream close -> Model Router close"
+        in runtime
+    )
+    assert "final BaseTool cast/Schema validation" not in runtime
+
+
+def test_mcp_release_evidence_publishes_local_transports_and_quality_gates() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    release = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
+    mcp_tests = (ROOT / "tests" / "tools" / "test_mcp.py").read_text(encoding="utf-8")
+    cli_mcp_tests = (ROOT / "tests" / "test_cli_mcp_lifecycle.py").read_text(encoding="utf-8")
+
+    assert "mcp>=2,<3" in project["dependencies"]
+    test_urls = re.findall(r"https?://[^\"']+", mcp_tests)
+    assert test_urls
+    assert all(urlsplit(url).hostname in {"127.0.0.1", "localhost"} for url in test_urls)
+    for test_name in (
+        "test_stdio_transport_connects_to_a_local_real_mcp_server",
+        "test_streamable_http_transport_connects_to_a_local_real_mcp_server",
+    ):
+        assert test_name in mcp_tests
+
+    for claim in (
+        "Issue #224",
+        "mcp>=2,<3",
+        "test_stdio_transport_connects_to_a_local_real_mcp_server",
+        "test_streamable_http_transport_connects_to_a_local_real_mcp_server",
+        "python -m pytest -q",
+        "python -m mypy myclaw tests",
+        "python -m ruff check .",
+        "python -m ruff format --check .",
+        "model_context_overflow",
+        "no public-network access",
+    ):
+        assert claim.casefold() in release.casefold(), claim
+    full_flow_test = "test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes"
+    assert full_flow_test in cli_mcp_tests
+    assert full_flow_test in release
+
+
+def test_mcp_release_contract_excludes_out_of_scope_runtime_surfaces() -> None:
+    production = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted((ROOT / "myclaw").rglob("*.py"))
+    )
+    gateway = (ROOT / "myclaw" / "tools" / "tool_gateway.py").read_text(encoding="utf-8")
+
+    for removed_name in (
+        "PreparedToolCall",
+        "memory_context_too_large",
+        "skill_context_too_large",
+    ):
+        assert removed_name not in production
+    assert "self._schemas" not in gateway
+    assert all("mcp" not in command.token.casefold() for command in MANAGEMENT_COMMANDS)
+
+
 def test_tracked_markdown_local_links_resolve() -> None:
     tracked = _tracked_markdown_paths()
 
@@ -908,9 +1023,7 @@ def test_reload_skill_command_and_lifecycle_are_published_by_active_docs() -> No
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
     runtime = (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8")
-    terminal = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(
-        encoding="utf-8"
-    )
+    terminal = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(encoding="utf-8")
     release = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
 
     command_tokens = tuple(command.token for command in MANAGEMENT_COMMANDS)
@@ -1431,9 +1544,9 @@ def test_issue_202_authoritative_documents_identify_one_current_composition_boun
     current_gates = release_readiness.split("## Verification Gates", maxsplit=1)[1].split(
         "\n## ", maxsplit=1
     )[0]
-    assert "1,537 passed" in current_gates
-    assert "1,547 nodes total" in current_gates
-    assert "1,407 passed" not in current_gates
+    assert "1,736 passed" in current_gates
+    assert "1,746 nodes total" in current_gates
+    assert "1,734 passed" not in current_gates
 
     assert _adr_status(adr_0017_path) == "accepted"
     assert "superseded by [ADR-0017]" in adr_0014

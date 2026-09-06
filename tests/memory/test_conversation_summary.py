@@ -414,9 +414,7 @@ async def test_repeated_summary_preparation_advances_last_consolidated_once_per_
     assert second is session
     assert first_position == 2
     assert second.last_consolidated == 4
-    assert [
-        (entry.index, entry.content) for entry in await _claimed_entries(memory_manager)
-    ] == [
+    assert [(entry.index, entry.content) for entry in await _claimed_entries(memory_manager)] == [
         (1, "Summary one."),
         (2, "Summary two."),
     ]
@@ -1247,9 +1245,7 @@ async def test_summary_projects_owned_message_shapes_without_mutating_session(
         {
             "role": "assistant",
             "content": "Calling tool.",
-            "tool_calls": [
-                {"id": "call-1", "name": "read_file", "arguments": '{"path":"x"}'}
-            ],
+            "tool_calls": [{"id": "call-1", "name": "read_file", "arguments": '{"path":"x"}'}],
         },
         {
             "role": "tool",

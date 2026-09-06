@@ -79,9 +79,7 @@ class _ScheduleRouter:
     ) -> ModelResponse:
         del continuation
         self.routes.append(route)
-        self.tool_requests.append(
-            (route, tuple(schema["function"]["name"] for schema in tools))
-        )
+        self.tool_requests.append((route, tuple(schema["function"]["name"] for schema in tools)))
         self.requests.append((list(messages), len(tools)))
         outcome = self._outcomes.pop(0) if self._outcomes else self._response()
         if isinstance(outcome, BaseException):

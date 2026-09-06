@@ -1,6 +1,6 @@
 # MyClaw Release Readiness
 
-Status: **Issues #194, #195, #199, #201, and #202 verified through `7c84fcb8a05e015f8ffcbb530b7c801de19a4a70` on 2026-08-28; no release was uploaded**
+Status: **Issues #194, #195, #199, #201, and #202 verified through `7c84fcb8a05e015f8ffcbb530b7c801de19a4a70` on 2026-08-28; Issue #224 MCP delivery verification ran on 2026-09-06 from clean base `5c00e291ae5e25c229f4e62dc353d509b1caec29`; no release was uploaded**
 
 This document is the evidence index for the current implementation. It records active
 contracts, current test locations, current verification results, and present release risks.
@@ -27,14 +27,56 @@ baseline.
 
 | Gate | Command | Current result |
 | --- | --- | --- |
-| Full behavior suite | `python -m pytest -q` | Passed: 1,537 passed and 10 conditionally skipped on Windows; 1,547 nodes total |
+| Full behavior suite | `python -m pytest -q` | Passed: 1,736 passed and 10 conditionally skipped on Windows; 1,746 nodes total |
 | Lint | `python -m ruff check .` | Passed: 0 violations |
-| Format | `python -m ruff format --check .` | Baseline check remains informational; no unrelated bulk formatting is made |
-| Types | `python -m mypy myclaw tests` | Passed: 162 source files checked |
+| Format | `python -m ruff format --check .` | Passed: 169 files already formatted |
+| Types | `python -m mypy myclaw tests` | Passed: no issues found in 169 source files |
 | Distribution build | `python -m build --no-isolation` | Passed: one sdist and one `myclaw-0.1.0-py3-none-any.whl` built |
-| Tracked Markdown local links and active-design stale checks | `python -m pytest -q tests/test_release_contract.py` | Passed: 28 tests; 37 tracked Markdown files, no unresolved local inline/reference targets, and no stale structural findings |
+| Tracked Markdown local links and active-design stale checks | `python -m pytest -q tests/test_release_contract.py` | Passed: 31 tests; 37 tracked Markdown files, no unresolved local inline/reference targets, and no stale structural findings |
 
-Current full-suite evidence: 1,537 passed and 10 conditionally skipped on Windows; 1,547 nodes total. Release contract tests: 28 passed; 37 tracked Markdown files after the Issue #216 patch is staged. Mapped owner-node execution: 14 passed after 14 nodes were collected. `git diff --check` returned `0` for the current patch.
+Current full-suite evidence: 1,736 tests passed with 10 conditional Windows skips across 1,746 nodes. Release contract tests: 31 passed; 37 tracked Markdown files. Mapped owner-node execution: 14 passed after 14 nodes were collected. `git diff --check` returned `0` for the current patch.
+
+## Issue #224 MCP Tool Delivery Evidence
+
+Issue #224 records the MCP Tool integration gate for parent issue #217. The approved contract is
+published across `CONTEXT.md`, the PRD, Runtime Contracts, ADR-0010's supersession note, ADR-0020,
+the MCP implementation plan, and the README. The package metadata declares `mcp>=2,<3`; configured
+stdio and `streamable-http` Servers enter an immutable per-generation MCP Tool Snapshot, share the
+Tool Gateway, bypass extra Tool Confirmation as trusted capabilities, and preserve the documented
+full-argument, text-only result, closed-session, timeout, cancellation, `/resume`, shutdown, and
+`model_context_overflow` semantics.
+
+The MCP behavior evidence is split across configuration isolation and redaction tests in
+`tests/configuration/test_mcp_config.py`, adapter and local transport tests in
+`tests/tools/test_mcp.py`, naming/reuse/Snapshot tests in `tests/tools/test_mcp_runtime.py`,
+foreground lifecycle and shutdown tests in `tests/test_cli_mcp_lifecycle.py`, and the release
+contract checks in `tests/test_release_contract.py`. The real transport nodes are
+`test_stdio_transport_connects_to_a_local_real_mcp_server` and
+`test_streamable_http_transport_connects_to_a_local_real_mcp_server`; both use local fixtures and
+perform no public-network access. The full delivery node
+`test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes` starts a real local stdio
+Server through the CLI composition root, exposes its schema to Agent Runner model requests,
+executes the Tool, persists Session Tool Results, reuses the healthy connection across `/resume`,
+and closes the SDK transport/session context in its owning lifecycle task during shutdown.
+
+The final #224 gate commands were executed on 2026-09-06 against clean base
+`5c00e291ae5e25c229f4e62dc353d509b1caec29` plus the #224 candidate patch:
+
+| Gate | Result |
+| --- | --- |
+| `python -m pytest -q` | Passed: `1,736 passed, 10 skipped` |
+| `python -m mypy myclaw tests` | Passed: no issues found in 169 source files |
+| `python -m ruff check .` | Passed: 0 violations |
+| `python -m ruff format --check .` | Passed: 169 files already formatted |
+| `python -m build --no-isolation` | Passed: one sdist and one host-neutral wheel |
+| `git diff --check` | Passed: exit 0 |
+
+All repository gates are green. The review fixed the inherited 65-file Ruff formatting baseline
+and a real SDK shutdown defect exposed by the new full delivery node: connection contexts are now
+entered and exited by the same per-Server lifecycle task. The two transport nodes and the full CLI
+flow passed as part of the suite, while the release contract test checks the SDK dependency, local
+fixture source, absence of public-network access, forbidden runtime surfaces, and authoritative
+document consistency.
 
 ## Issue #216 Persistence Evidence
 

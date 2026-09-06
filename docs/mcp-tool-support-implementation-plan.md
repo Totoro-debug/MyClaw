@@ -6,8 +6,8 @@ status: accepted
 
 ## 文档状态
 
-- 架构状态：已完成 grilling，待实施评审
-- Implementation status：未开始；本方案评审通过前不得修改生产实现
+- 架构状态：已完成 grilling，并按 #224 完成实施验证
+- Implementation status: T1-T7 complete after final verification
 - 决策来源：[ADR-0020](adr/0020-expose-configured-mcp-tools-through-tool-gateway.md)
 - 产品行为来源：[PRD](myclaw-personal-agent-prd.md)
 - 运行时契约来源：[Runtime Contracts](myclaw-runtime-contracts.md)
@@ -347,4 +347,10 @@ Task 之间通过清晰接口衔接；每个 Task 都能独立提交、独立运
 
 ## 7. 评审门槛
 
-在用户明确确认本方案后，才能开始 T1；任何生产代码 Task 开始前都必须先提交并评审对应测试矩阵。若实现中需要改变本 ADR 的配置字段、生命周期、信任边界、结果投影或错误映射，必须停止编码、更新 ADR 和本方案并重新评审。
+本方案已按已接受的 ADR-0020 与 #224 完成 T1-T7。任何后续实现若需要改变本 ADR 的配置字段、生命周期、信任边界、结果投影或错误映射，必须停止编码、更新 ADR 和本方案并重新评审。
+
+## 8. T7 最终验证记录
+
+- 验证基线：clean `5c00e291ae5e25c229f4e62dc353d509b1caec29` 加 #224 候选改动，日期为 2026-09-06。
+- 全部命令、计数和本地 fixture 证据以 [Release Readiness](release-readiness.md#issue-224-mcp-tool-delivery-evidence) 为唯一明细来源。
+- #224 的 pytest、strict mypy、Ruff lint/format、distribution build 和 diff whitespace 门禁均通过；真实 stdio、Streamable HTTP 与 CLI 全链测试只使用本地 fixture。

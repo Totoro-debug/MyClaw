@@ -433,8 +433,7 @@ def _openai_message(
         tool_calls = message.get("tool_calls")
         if tool_calls:
             result["tool_calls"] = [
-                _openai_tool_call(tool_call)
-                for tool_call in require_tool_call_sequence(tool_calls)
+                _openai_tool_call(tool_call) for tool_call in require_tool_call_sequence(tool_calls)
             ]
         if continuation is not None:
             result["reasoning_content"] = _openai_continuation_content(

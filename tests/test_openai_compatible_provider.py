@@ -286,9 +286,7 @@ async def test_complete_maps_or_omits_each_reasoning_effort(
         client_factory=FakeOpenAIClientFactory(client),
     )
 
-    response = await provider.complete(
-        **{**request(stream=False), "reasoning_effort": effort}
-    )
+    response = await provider.complete(**{**request(stream=False), "reasoning_effort": effort})
 
     assert response.message.content == "Done"
     reasoning_arguments = {

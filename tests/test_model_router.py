@@ -1391,8 +1391,12 @@ async def test_model_router_runtime_effort_is_snapshotted_across_retry() -> None
 
 @pytest.mark.asyncio
 async def test_model_router_runtime_effort_is_kept_across_stream_fallback() -> None:
-    chat_provider = ScriptedFakeProvider(streams=(StreamScript(events=(), error=permanent_failure()),))
-    default_provider = ScriptedFakeProvider(streams=(StreamScript(events=(completed("fallback"),)),))
+    chat_provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(), error=permanent_failure()),)
+    )
+    default_provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(completed("fallback"),)),)
+    )
     providers = {
         "chat-provider": chat_provider,
         "default-provider": default_provider,
@@ -1454,7 +1458,9 @@ async def test_model_router_runtime_effort_is_snapshotted_across_complete_fallba
 
 
 @pytest.mark.asyncio
-async def test_model_router_runtime_effort_does_not_repeat_an_effectively_identical_fallback() -> None:
+async def test_model_router_runtime_effort_does_not_repeat_an_effectively_identical_fallback() -> (
+    None
+):
     base = configuration()
     default_route = base.models.routes["default"]
     configuration_with_same_route = UserConfiguration(

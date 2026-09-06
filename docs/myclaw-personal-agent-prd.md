@@ -272,10 +272,14 @@ MCP Tool 支持已由 [ADR-0020](adr/0020-expose-configured-mcp-tools-through-to
 
 ### User Configuration
 
-- TOML 顶层围绕 runtime、models、memory 组织；Tool Catalog 不进入 User Configuration。
+- TOML 顶层围绕 runtime、models、memory、mcp 组织；Tool Catalog 本身不进入 User Configuration。
 - Provider 使用 `[models.providers.<provider_id>]`。
 - Route 使用 `[models.routes.<route>]`。
 - User Configuration 不控制 Built-in Tool enablement；固定十工具 Built-in Catalog 始终可用，配置的 MCP Tool Snapshot 按 ADR-0020 注入当前 Runtime Generation。
+- MCP Server 使用唯一的 `[mcp.servers.<mcp_name>]` 配置项；`mcp_name` 必须匹配 `[a-z0-9][a-z0-9_-]{0,63}`。
+- MCP Server 支持 `stdio` 与 `streamable-http`。stdio 使用 `command`、`args` 和可选 `cwd`，继承 MyClaw 进程环境；Streamable HTTP 使用 `url` 和可选静态 `headers`。两种 transport 都支持 `enabled`、`connect_timeout` 与 `call_timeout`，不支持 `env`、`secret_env` 或 OAuth。
+- `cwd` 缺省为 Workspace，相对 `cwd` 也相对 Workspace；绝对路径按原值使用。timeout 必须在 `1..600` 秒。
+- 有效 TOML 中的单个无效 MCP Server、连接/初始化/发现失败只跳过对应 Server；startup、`myclaw config` 和 `/config` 使用不含 command、URL、header、secret 或异常正文的脱敏诊断。整个 TOML 解析失败仍按 `config_parse_error` 阻止启动。
 - Runtime loading 投影掉未知顶层 table、未知字段和未知 route；`myclaw config` 报告这些未定义字段，未知 protocol provider 仍按既定规则忽略。
 - 配置缺失时，只创建一个 ID 为 `openai-local` 的 OpenAI-compatible provider 模板（base URL、API key 和 model list 为空），并为 `default`、`chat`、`memory`、`schedule` 创建显式但不可用的 route 待填写段；四个 route 初始都引用 `openai-local`。随后退出并提示用户替换 Provider、model 和模型限制，或删除不需要定制的具体 route 以回退到 default；旧配置完全缺少 default route 时，错误消息必须指出 `[models.routes.default]`。
 - OpenAI-compatible provider 模板的 base_url 为空；所有 provider 的有效配置都要求 base_url。
@@ -283,10 +287,21 @@ MCP Tool 支持已由 [ADR-0020](adr/0020-expose-configured-mcp-tools-through-to
 - 配置无法解析、模型配置不完整或 default route 不可用时，`myclaw` 启动 Terminal Conversation 直接退出并显示用户可见错误。
 - 不支持 Agent profile、session override、per-chat settings 或用户配置 identity/system prompt。
 
+### MCP Tool support
+
+- MCP integration uses the official MCP Python SDK v2 with package constraint `mcp>=2,<3`。
+- CLI composition root 在初始 Agent Loop 创建前并发连接所有合法 enabled MCP Server。每个 Runtime Generation 接收一个 immutable MCP Tool Snapshot，只包含连接成功、发现成功、schema 合法、名称唯一的 MCP Tool；Built-in Tool 保持在前面，MCP Server 与远程 Tool 按名称稳定排序。
+- Runtime Lifetime 持有 MCP client。`/resume` 在暂停旧 Generation 前只重连已失败或已确认 closed 的 Server，先构造候选 Snapshot，再执行既有 replacement transaction；候选准备失败不改变旧 Generation。健康连接和已发现 Tool 定义跨 `/resume` 复用，没有 MCP reload command 或 live list subscription。
+- MCP Tool 与 Built-in Tool 共享 `BaseTool`、Tool Gateway、Model request `tools` 字段、`execute_prepared()`、Tool Result 和 Artifact 边界。每次 Model request 重新调用当前 Catalog 中每个 Tool 的 `to_schema()`，不保留聚合 schema cache，也不把 MCP description 写入 System Prompt。
+- MCP Tool 是 User Configuration 明确信任的 capability，foreground 与 User Schedule Agent Run 不请求额外 Tool Confirmation；Dream 继续使用受限 Tool Catalog。只有 SDK-confirmed session/transport closure 才将 Server 放入下一代重连集合，timeout 和 `isError` 不改变可用性。
+- MCP Tool 在加载时只接受可 JSON 序列化且根 `type` 为 `object` 的 `inputSchema`，并递归规范化 `nullable`。调用时通过 `call_tool` 完整转发 `dict[str, Any]`，不做本地 casting、validation 或 additional-field filtering；只读取 `CallToolResult.content`，按顺序连接 text block、以 `str(block)` 转换其他 block，空结果使用 `(no output)`，不读取 `structured_content` 或 `outputSchema`。
+- `isError` 与 timeout 映射为 `ToolError`；closed session 映射为连接不可用的 `ToolError` 并标记 Server；其他异常进入 Gateway 通用失败路径，取消原样传播。MCP 描述缺失时使用远程 Tool 名称。
+- MCP 相关的 Model request、compression、startup 和 `/resume` preflight 均把 System Prompt、全部 messages 与全部 Tool schemas 纳入预算；本地上下文超限统一使用 `model_context_overflow` 和 `Model request context exceeds the available input budget.`。`/status` 保持既有字段形状，不增加 MCP 专属字段，但估算值包含活动 Tool schemas。
+
 ### Tool Gateway and fail-closed security
 
 - 所有 capability 都是具体 `BaseTool`；Agent Loop 在初始化时创建固定十工具 Built-in Catalog 与按 ADR-0020 注入的 MCP Tool Snapshot，共享同一 Tool Gateway，Schedule Service 只拥有 Schedule Store/management boundary。
-- `BaseTool.to_schema()` 从直接公开注解、显式 required、默认值和 `ToolParam` 生成 OpenAI Function Calling schema；Model Request 保存缓存的 typed snapshot，Anthropic adapter 在内部转换。
+- `BaseTool.to_schema()` 从直接公开注解、显式 required、默认值和 `ToolParam` 生成 OpenAI Function Calling schema；每次 Model Request 都从当前 Catalog 重新构造 detached `list[dict[str, Any]]`，Anthropic adapter 在内部转换。
 - `ToolGateway.call()` 是唯一公开入口，负责 raw JSON 解析、调用 BaseTool 固定 cast/Schema/参数/安全管线、一次性 Tool Confirmation、执行和扁平 Tool Result 封装；没有 plugin、generic retry、per-call execution context 或 approval flag，MCP Tool 仅通过 ADR-0020 的 CLI-owned Snapshot 进入该入口。
 - `ModelToolCall.arguments` 保留原始 JSON string；Tool Result 仅含 call ID、name、status、content 和可选 artifact/confirmation metadata，不含 nested error。
 - Tool 执行不重试，取消继续向上传播；Tool Gateway 不设置统一 timeout、不持久化结果、不持有 Workspace。

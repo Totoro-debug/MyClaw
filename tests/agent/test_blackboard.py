@@ -227,9 +227,10 @@ def test_blackboard_owns_strict_persistence_conversion() -> None:
 
     assert value.to_dict() == {"goal": "Goal", "completion_boundary": "Boundary"}
     assert Blackboard.from_dict(value.to_dict()) == value
-    assert Blackboard.from_dict(
-        {"goal": "Goal", "completion_boundary": "Boundary", "extra": "reject"}
-    ) is None
+    assert (
+        Blackboard.from_dict({"goal": "Goal", "completion_boundary": "Boundary", "extra": "reject"})
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -263,12 +264,15 @@ async def test_blackboard_generate_assembles_one_safe_direct_request() -> None:
     assert isinstance(system_content, str)
     assert "### User input\nCurrent input\nwith a newline" in system_content
     assert "### Last Task\n```json\n" in system_content
-    assert json.dumps(
-        {"task_goal": "Old goal", "completion_boundary": "Old boundary"},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ) in system_content
-    assert "### Latest assistant content\nAssistant {answer} with \"quotes\"" in system_content
+    assert (
+        json.dumps(
+            {"task_goal": "Old goal", "completion_boundary": "Old boundary"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        in system_content
+    )
+    assert '### Latest assistant content\nAssistant {answer} with "quotes"' in system_content
     assert "<user_input>" not in system_content
     assert "<last_task>" not in system_content
 
@@ -304,7 +308,8 @@ async def test_generate_sends_only_one_filled_system_message_and_no_tools() -> N
     current_user_input = "继续: 保留换行\n以及非 ASCII 内容。"
     router = _FakeRouter(_response(_decision("replace", "New goal", "New boundary")))
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=previous,
         last_assistant_content=last_assistant_content,
         current_user_input=current_user_input,
@@ -350,7 +355,8 @@ async def test_generate_sends_only_one_filled_system_message_and_no_tools() -> N
 async def test_generate_fills_empty_latest_assistant_content_without_a_user_message() -> None:
     router = _FakeRouter(_response(_decision("clear", None, None)))
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=None,
         last_assistant_content="",
         current_user_input="cancel",
@@ -404,7 +410,8 @@ async def test_generate_reduces_keep_replace_and_clear_with_or_without_previous(
     boundary = None if action != "replace" else "New boundary"
     router = _FakeRouter(_response(_decision(action, task_goal, boundary)))
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=previous,
         last_assistant_content="Last answer",
         current_user_input="Current input",
@@ -428,7 +435,8 @@ async def test_generate_accepts_raw_fenced_and_prose_surrounded_json(
 ) -> None:
     router = _FakeRouter(_response(response_content))
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=None,
         last_assistant_content="Last answer",
         current_user_input="Current input",
@@ -455,7 +463,8 @@ async def test_balanced_scan_handles_quoted_braces_escaped_quotes_and_backslashe
     )
     router = _FakeRouter(_response(response_content))
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=None,
         last_assistant_content="Last answer",
         current_user_input="Current input",
@@ -477,7 +486,8 @@ async def test_balanced_scan_ignores_an_unmatched_quote_before_the_first_object(
         )
     )
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
         last_assistant_content="Last answer",
         current_user_input="Current input",
@@ -502,7 +512,8 @@ async def test_balanced_scan_does_not_skip_an_earlier_braced_prose_fragment() ->
         )
     )
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
         last_assistant_content="Last answer",
         current_user_input="Current input",
@@ -546,8 +557,7 @@ async def test_balanced_scan_does_not_skip_an_earlier_braced_prose_fragment() ->
         '{"action":"replace","task_goal":"first","task_goal":"second",'
         '"completion_boundary":"boundary"}',
         '{"action":"replace","task_goal":"goal"}',
-        '{"action":"replace","task_goal":"goal","completion_boundary":"boundary",'
-        '"extra":true}',
+        '{"action":"replace","task_goal":"goal","completion_boundary":"boundary","extra":true}',
         '{"task":"replace","task_goal":"goal","completion_boundary":"boundary"}',
         '{"action":"replace","task_goal":"goal"} prose '
         '{"action":"clear","task_goal":null,"completion_boundary":null}',
@@ -561,7 +571,8 @@ async def test_generate_rejects_repairs_guesses_and_ambiguous_or_invalid_decisio
 ) -> None:
     router = _FakeRouter(_response(response_content))
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
         last_assistant_content="Last answer",
         current_user_input="Current input",
@@ -605,7 +616,8 @@ async def test_generate_uses_first_balanced_object_and_preserves_usage(
 ) -> None:
     router = _FakeRouter(_response(f"prefix {first}{trailing}"))
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
         last_assistant_content="Last answer",
         current_user_input="Current input",
@@ -629,7 +641,8 @@ async def test_generate_rejects_a_later_valid_object_when_the_first_is_invalid()
     )
     router = _FakeRouter(_response(response_content))
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
         last_assistant_content="Last answer",
         current_user_input="Current input",
@@ -650,7 +663,8 @@ async def test_generate_model_call_error_is_fail_open_without_usage() -> None:
     failure = ModelCallError(ErrorInfo("model_failed", "The framing model failed."))
     router = _FakeRouter(failure=failure)
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
         last_assistant_content="Last answer",
         current_user_input="Current input",
@@ -666,7 +680,8 @@ async def test_generate_cancelled_model_call_propagates_unchanged() -> None:
     router = _FakeRouter(failure=asyncio.CancelledError())
 
     with pytest.raises(asyncio.CancelledError):
-        await Blackboard.generate(router,
+        await Blackboard.generate(
+            router,
             previous=None,
             last_assistant_content="Last answer",
             current_user_input="Current input",
@@ -677,7 +692,8 @@ async def test_generate_cancelled_model_call_propagates_unchanged() -> None:
 async def test_generate_ordinary_model_exception_is_fail_open_without_usage() -> None:
     router = _FakeRouter(failure=RuntimeError("provider implementation failed"))
 
-    result = await Blackboard.generate(router,
+    result = await Blackboard.generate(
+        router,
         previous=Blackboard(goal="Old", completion_boundary="Old boundary"),
         last_assistant_content="Last answer",
         current_user_input="Current input",
@@ -706,7 +722,8 @@ async def test_generate_rejects_wrong_public_input_types_without_coercion(
     router = _FakeRouter(_response(_decision("clear", None, None)))
 
     with pytest.raises(TypeError):
-        await Blackboard.generate(router,
+        await Blackboard.generate(
+            router,
             previous=previous,  # type: ignore[arg-type]
             last_assistant_content=last_assistant_content,  # type: ignore[arg-type]
             current_user_input=current_user_input,  # type: ignore[arg-type]

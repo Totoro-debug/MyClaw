@@ -100,8 +100,5 @@ def _is_task_framing_request(
     tools: Sequence[dict[str, Any]],
 ) -> bool:
     return (
-        route == "chat"
-        and not tools
-        and len(messages) == 1
-        and messages[0].get("role") == "system"
+        route == "chat" and not tools and len(messages) == 1 and messages[0].get("role") == "system"
     )

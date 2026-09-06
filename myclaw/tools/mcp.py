@@ -25,6 +25,7 @@ from mcp.shared.exceptions import MCPError
 
 from myclaw.config.config import MCPServerConfiguration
 from myclaw.tools.base import BaseTool, ToolError
+from myclaw.utils.async_tasks import await_task_preserving_cancellation
 
 _MISSING = object()
 _NO_OUTPUT = "(no output)"
@@ -352,7 +353,8 @@ class MCPServerConnection:
         self._transport_factory = transport_factory or _transport_for
         self._session_factory = session_factory or _new_client_session
         self._model_name_for = model_name_for
-        self._stack: AsyncExitStack | None = None
+        self._lifecycle_task: asyncio.Task[None] | None = None
+        self._close_requested: asyncio.Event | None = None
         self._session: MCPClientSession | None = None
         self._tools: tuple[MCPTool, ...] = ()
         self._unavailable = False
@@ -383,8 +385,49 @@ class MCPServerConnection:
         await self.close()
         self._unavailable = False
         self._skipped_tool_count = 0
+        ready: asyncio.Future[tuple[MCPTool, ...]] = asyncio.get_running_loop().create_future()
+        close_requested = asyncio.Event()
+        lifecycle_task = asyncio.create_task(self._run_lifecycle(ready, close_requested))
+        self._lifecycle_task = lifecycle_task
+        self._close_requested = close_requested
+        try:
+            return await asyncio.shield(ready)
+        except asyncio.CancelledError as cancellation:
+            lifecycle_task.cancel()
+            try:
+                await await_task_preserving_cancellation(lifecycle_task)
+            except BaseException as cleanup_error:
+                raise cancellation from cleanup_error
+            raise
+        except BaseException as error:
+            try:
+                await await_task_preserving_cancellation(lifecycle_task)
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+        finally:
+            if lifecycle_task.done() and self._lifecycle_task is lifecycle_task:
+                self._lifecycle_task = None
+                self._close_requested = None
+
+    async def close(self) -> None:
+        """Close the session and transport, releasing all SDK resources."""
+        lifecycle_task = self._lifecycle_task
+        close_requested = self._close_requested
+        self._lifecycle_task = None
+        self._close_requested = None
+        if lifecycle_task is None:
+            return
+        if close_requested is not None:
+            close_requested.set()
+        await await_task_preserving_cancellation(lifecycle_task)
+
+    async def _run_lifecycle(
+        self,
+        ready: asyncio.Future[tuple[MCPTool, ...]],
+        close_requested: asyncio.Event,
+    ) -> None:
         stack = AsyncExitStack()
-        self._stack = stack
         try:
             async with asyncio.timeout(float(self.configuration.connect_timeout)):
                 transport = self._transport_factory(self.configuration, self.workspace)
@@ -402,21 +445,21 @@ class MCPServerConnection:
                     on_closed=self._mark_unavailable,
                     on_tool_skipped=self._record_tool_skip,
                 )
-        except BaseException:
+            ready.set_result(self._tools)
+            await close_requested.wait()
+        except asyncio.CancelledError:
+            if not ready.done():
+                ready.cancel()
+            else:
+                raise
+        except BaseException as error:
+            if not ready.done():
+                ready.set_exception(error)
+            else:
+                raise
+        finally:
             self._session = None
             self._tools = ()
-            await stack.aclose()
-            self._stack = None
-            raise
-        return self._tools
-
-    async def close(self) -> None:
-        """Close the session and transport, releasing all SDK resources."""
-        stack = self._stack
-        self._stack = None
-        self._session = None
-        self._tools = ()
-        if stack is not None:
             await stack.aclose()
 
     def _mark_unavailable(self) -> None:

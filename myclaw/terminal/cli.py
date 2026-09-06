@@ -106,9 +106,7 @@ def _report_mcp_generation(
     report: MCPStartupReport | MCPSnapshotReport,
 ) -> None:
     """Present only safe MCP lifecycle metadata to the terminal."""
-    failures_by_server = {
-        failure.mcp_name: failure for failure in getattr(report, "failures", ())
-    }
+    failures_by_server = {failure.mcp_name: failure for failure in getattr(report, "failures", ())}
     for mcp_name in getattr(report, "failed_servers", ()):
         failures_by_server.setdefault(
             mcp_name,
@@ -277,9 +275,7 @@ async def _run_cli_conversation(
             *,
             mcp_snapshot: MCPToolSnapshot | None = None,
         ) -> AgentLoop:
-            selected_mcp_snapshot = (
-                active_mcp_snapshot if mcp_snapshot is None else mcp_snapshot
-            )
+            selected_mcp_snapshot = active_mcp_snapshot if mcp_snapshot is None else mcp_snapshot
             return AgentLoop(
                 workspace_path=workspace_path,
                 workspace_state=workspace_state,

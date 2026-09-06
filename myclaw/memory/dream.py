@@ -215,9 +215,7 @@ class Dream:
             ),
             on_failure=self._capture_terminal_failure,
         )
-        self._runner = AgentRunner(
-            _DreamRouter(model_router, self._capture_terminal_failure)
-        )
+        self._runner = AgentRunner(_DreamRouter(model_router, self._capture_terminal_failure))
         self._running = False
         self._running_cursor = 0
         self._task: asyncio.Task[DreamResult | None] | None = None
@@ -318,8 +316,7 @@ class Dream:
             {
                 "role": "system",
                 "content": render_template(
-                    "memory-task-prompt.md",
-                    long_term_path=self._memory_manager.long_term_path
+                    "memory-task-prompt.md", long_term_path=self._memory_manager.long_term_path
                 ),
             },
             {
@@ -372,8 +369,7 @@ class Dream:
             processed_count=0,
             memory_updated=memory_updated,
             cursor=claim.cursor,
-            error=result.error
-            or ErrorInfo("model_failed", "The model request failed."),
+            error=result.error or ErrorInfo("model_failed", "The model request failed."),
         )
 
     def _capture_terminal_failure(self, error: Exception) -> None:
