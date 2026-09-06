@@ -17,7 +17,6 @@ type ErrorCode = Literal[
     "provider_unavailable",
     "model_invalid_request",
     "model_context_overflow",
-    "memory_context_too_large",
     "interactive_terminal_required",
     "model_failed",
     "agent_iteration_limit",
@@ -28,9 +27,10 @@ type ErrorCode = Literal[
     "tool_refused",
     "tool_failed",
     "memory_task_running",
-    "skill_context_too_large",
     "skill_reload_failed",
 ]
+
+MODEL_CONTEXT_OVERFLOW_MESSAGE = "Model request context exceeds the available input budget."
 
 STABLE_ERROR_CODES: frozenset[str] = frozenset(
     {
@@ -46,7 +46,6 @@ STABLE_ERROR_CODES: frozenset[str] = frozenset(
         "provider_unavailable",
         "model_invalid_request",
         "model_context_overflow",
-        "memory_context_too_large",
         "interactive_terminal_required",
         "model_failed",
         "agent_iteration_limit",
@@ -57,7 +56,6 @@ STABLE_ERROR_CODES: frozenset[str] = frozenset(
         "tool_refused",
         "tool_failed",
         "memory_task_running",
-        "skill_context_too_large",
         "skill_reload_failed",
     }
 )

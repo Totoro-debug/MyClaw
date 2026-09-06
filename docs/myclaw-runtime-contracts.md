@@ -128,7 +128,7 @@ class SkillLoader:
     def load(self, *, validate: Callable[..., None] | None = None) -> None: ...
 ```
 
-`LoadedSkill.document` 逐字符保留完整 document，不剥离 opening delimiter、frontmatter、closing delimiter、正文或原始换行。`SkillLoader` 保存 immutable `tuple[LoadedSkill, ...]`，每次成功 `load()` 都原子替换已发布状态；不存在可变的公开 Skill 状态。当前 Agent Loop 内 manual invocation 和 always-loaded projection 使用 frozen document；启动、`/resume` 或 `/reload_skill` 会在发布前重新扫描。模型自主调用普通 `read_file` 仍遵守 Tool path 和实时文件读取契约。缺失、不可读、非 UTF-8、frontmatter/YAML 无效或 canonical containment 失效的单个候选被跳过并记录安全 warning。初始启动或 `/resume` 的全局预算 preflight failure 使用稳定 `skill_context_too_large` 并终止 Terminal Conversation；`/reload_skill` 的扫描、验证或预算失败映射为稳定 `skill_reload_failed`，且不替换已发布状态。
+`LoadedSkill.document` 逐字符保留完整 document，不剥离 opening delimiter、frontmatter、closing delimiter、正文或原始换行。`SkillLoader` 保存 immutable `tuple[LoadedSkill, ...]`，每次成功 `load()` 都原子替换已发布状态；不存在可变的公开 Skill 状态。当前 Agent Loop 内 manual invocation 和 always-loaded projection 使用 frozen document；启动、`/resume` 或 `/reload_skill` 会在发布前重新扫描。模型自主调用普通 `read_file` 仍遵守 Tool path 和实时文件读取契约。缺失、不可读、非 UTF-8、frontmatter/YAML 无效或 canonical containment 失效的单个候选被跳过并记录安全 warning。初始启动或 `/resume` 的全局预算 preflight failure 使用稳定 `model_context_overflow` 并终止 Terminal Conversation；`/reload_skill` 的扫描、验证或预算失败映射为稳定 `skill_reload_failed`，且不替换已发布状态。
 
 `memory.md` 初始内容固定为：
 
@@ -414,7 +414,7 @@ is accepted by ADR-0009 and does not provide cross-process coordination.
 - chat 和 user Schedule Job 的 System Prompt 使用该 snapshot。
 - `/memory` 和 Dream 每次通过 Memory Manager 读取磁盘最新文件。
 - Dream 成功编辑后由 Memory Manager 刷新 snapshot；正在运行的 Agent Run 保持启动时快照。
-- system-level prompt 超过 route context budget 时返回 `memory_context_too_large`，不得裁剪 Long-term Memory。
+- system-level prompt 超过 route context budget 时返回 `model_context_overflow`，不得裁剪 Long-term Memory。
 
 ## 7. Schedule 契约
 
@@ -578,14 +578,14 @@ Runtime-Lifetime input history.
 ### 8.4 Context budget 与 consolidation
 
 - 可用输入预算为已解析 chat route 的 `context_window - max_output`。
-- Agent Loop 同步构造在读取当前 Long-term Memory、构造 Skill Loader/Snapshot、`ContextBuilder`、固定 Tool schemas 和其他会话内组件之后，但在启动任何 task 前执行 Skill budget preflight。它以空 history 和空 current user content 调用 `ContextBuilder.build_status_messages()`，并与 `/status` 共享 compact JSON 序列化 seam，将真实 System Prompt、当前 user Runtime Context wrapper 和固定十个结构化 Tool schemas 投影为 `RuntimeStatusInput`，再调用现有 `estimate_input_tokens`（所有 UTF-8 bytes 合计后向上取整 `/ 4`）。`estimated == available` 允许，`estimated > available` 抛出独立 `SkillContextTooLargeError`，稳定 code 为 `skill_context_too_large`，document 不截断。每次启动或 `/resume` 都重扫完整 Skill documents 并对新 Snapshot 做 preflight；Session retained history 不参与该 startup configuration check。
+- Agent Loop 同步构造在读取当前 Long-term Memory、构造 Skill Loader/Snapshot、`ContextBuilder`、完整 Tool Catalog 和其他会话内组件之后，但在启动任何 task 前执行 Model request context preflight。它以空 history 和空 current user content 调用 `ContextBuilder.build_status_messages()`，并与 `/status` 共享 compact JSON 序列化 seam，将真实 System Prompt、当前 user Runtime Context wrapper 和完整结构化 Tool schemas 投影为 `RuntimeStatusInput`，再调用现有 `estimate_input_tokens`（所有 UTF-8 bytes 合计后向上取整 `/ 4`）。`estimated == available` 允许，`estimated > available` 抛出 `ModelContextOverflowError`，稳定 code 为 `model_context_overflow`，消息为 `Model request context exceeds the available input budget.`，document 不截断。每次启动或 `/resume` 都重扫完整 Skill documents 并对新 Snapshot 做 preflight；Session retained history 不参与该 startup configuration check。
 - 估算对象包含 system prompt、retained session messages、当前 Runtime Context、user input 和结构化 tool definitions。
 - foreground manual invocation 的 body/request 通过 transient typed projection 计入 retained-current budget 与 cutoff；实际 Summary provider 仍只接收选中的 raw historical Session records，不接收手动 Skill instructions 或 request。
 - 在每次 chat route model call 前检查预算和 `consolidation_message_threshold`，包括一个 tool loop 中后续的 chat model call。
 - consolidation 只能选择当前 turn 之前的早期消息，不得拆走正在执行的 assistant/tool call chain。
 - token 触发先选择约输入预算一半的早期消息；message threshold 触发先选择约 threshold 一半的早期消息，再按 canonical 规则把 retained suffix 对齐到 user message。
-- System Prompt 自身超过预算时直接返回 `memory_context_too_large` 或相应配置错误，不裁剪 Long-term Memory。
-- 没有足够的完整历史 turn 可供 consolidation 时返回 `model_context_overflow`，不得丢弃当前 user message或 tool chain。
+- System Prompt 自身超过预算时直接返回 `model_context_overflow`，不裁剪 Long-term Memory。
+- 没有足够的完整历史 turn 可供 consolidation 时返回 `model_context_overflow`，消息为 `Model request context exceeds the available input budget.`，不得丢弃当前 user message或 tool chain。
 
 ## 9. Model Contracts
 
@@ -1109,7 +1109,6 @@ ErrorInfo(
 | `provider_unavailable` | 网络/服务临时不可用 | 是 |
 | `model_invalid_request` | provider 拒绝请求 | 否 |
 | `model_context_overflow` | request 超 context | 否 |
-| `memory_context_too_large` | system prompt/Long-term Memory 超预算 | 否 |
 | `model_failed` | 无更具体映射的最终失败 | 否 |
 | `turn_cancelled` | Ctrl+C 或 shutdown cancellation | 否 |
 | `tool_not_found` | 未注册工具 | 否 |
@@ -1119,7 +1118,6 @@ ErrorInfo(
 | `tool_failed` | 工具执行失败 | 否 |
 | `memory_task_running` | Dream 不重入（保留既有稳定 code） | 否 |
 | `schedule_state_error` | Schedule state 损坏或不安全 | 否 |
-| `skill_context_too_large` | always-loaded Skill document 的最小真实 Foreground request projection 超出 `context_window - max_output` | 否 |
 
 CLI exit code：成功 `0`，配置/用法 `2`，runtime startup/persistence `1`，Ctrl+C 结束当前 turn 但 Terminal Conversation 继续时不退出进程。首次启动或任意 `/resume` 的 Agent Loop 构造/同步 preflight failure 必须由 CLI composition root 捕获，终止 Terminal Conversation，并只通过 `_print_error_info` 输出稳定 code/message，不输出 traceback、底层异常、Skill 正文或敏感路径。`/reload_skill` failure 不是 CLI fatal error；Terminal Conversation 保持运行并只显示稳定 `skill_reload_failed`。
 

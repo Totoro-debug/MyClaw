@@ -34,7 +34,11 @@ from myclaw.agent.runner import (
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import UserConfiguration
-from myclaw.errors import TURN_CANCELLED_MESSAGE, ErrorInfo
+from myclaw.errors import (
+    MODEL_CONTEXT_OVERFLOW_MESSAGE,
+    TURN_CANCELLED_MESSAGE,
+    ErrorInfo,
+)
 from myclaw.logging.session import session_log
 from myclaw.management.commands import MANAGEMENT_COMMANDS
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
@@ -61,8 +65,8 @@ from myclaw.tools.tool_gateway import (
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
 
 
-class SkillContextTooLargeError(Exception):
-    """The frozen always-loaded Skill snapshot exceeds the chat input budget."""
+class ModelContextOverflowError(Exception):
+    """The complete Model request exceeds the chat input budget."""
 
     def __init__(self, error: ErrorInfo) -> None:
         self.error = error
@@ -311,7 +315,7 @@ class AgentLoop:
         """Reload and publish Skills after validating the complete candidate state."""
         if self._closed or self._aborted or self._closing or self._close_task is not None:
             raise RuntimeError("Agent Loop is closed")
-        self._skill_loader.load(validate=self._validate_always_loaded_skill_budget)
+        self._skill_loader.load(validate=self._validate_model_context_budget)
         return self._skill_loader.metadata
 
     @property
@@ -393,19 +397,17 @@ class AgentLoop:
         if self._preflight_error is not None:
             raise self._preflight_error
         try:
-            self._validate_always_loaded_skill_budget(self._skill_loader.skills)
+            self._validate_model_context_budget(self._skill_loader.skills)
         except Exception as error:
             self._preflight_error = error
             raise
         self._preflighted = True
 
-    def _validate_always_loaded_skill_budget(
+    def _validate_model_context_budget(
         self,
         skills: tuple[LoadedSkill, ...],
     ) -> None:
         chat_route = self._configuration.resolve_route("chat").route
-        if not any(skill.always for skill in skills):
-            return
         status_input = _foreground_runtime_status_input(
             context_builder=self._context_builder,
             history=(),
@@ -416,10 +418,10 @@ class AgentLoop:
         available_input = chat_route.context_window - chat_route.max_output
         estimated = estimate_input_tokens(status_input)
         if estimated > available_input:
-            raise SkillContextTooLargeError(
+            raise ModelContextOverflowError(
                 ErrorInfo(
-                    "skill_context_too_large",
-                    "Always-loaded Skill content exceeds the foreground chat input budget.",
+                    "model_context_overflow",
+                    MODEL_CONTEXT_OVERFLOW_MESSAGE,
                 )
             )
 
@@ -1394,7 +1396,7 @@ __all__ = [
     "AgentLoopControl",
     "ConfirmationCallback",
     "ConfirmationRequestView",
-    "SkillContextTooLargeError",
+    "ModelContextOverflowError",
 ]
 
 

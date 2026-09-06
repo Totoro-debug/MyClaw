@@ -172,7 +172,7 @@ code = "model_context_overflow"
 message = "Model request context exceeds the available input budget."
 ```
 
-删除 `memory_context_too_large` 与 `skill_context_too_large`；`/status` 保持既有字段形状，但估算值包含活动 Generation 的完整 Tool schema，不增加 MCP 专属字段。
+所有本地上下文超限统一为 `model_context_overflow`；`/status` 保持既有字段形状，但估算值包含活动 Generation 的完整 Tool schema，不增加 MCP 专属字段。
 
 ## 3. 架构影响与接口定义
 
@@ -321,7 +321,7 @@ Task 之间通过清晰接口衔接；每个 Task 都能独立提交、独立运
 
 - System Prompt、历史消息、当前消息、Tool schema 四项分别增大时，预算估算均单调增加；每项至少 3 个测试。
 - 压缩 trigger、不可压缩检查和 cutoff 各至少 3 个测试，均为完整 Tool schema 预留预算。
-- `model_context_overflow` 是唯一上下文超限 code；`memory_context_too_large`、`skill_context_too_large` 在代码、文档和测试引用数均为 0。
+- `model_context_overflow` 是唯一上下文超限 code，在代码、文档和测试中的引用均符合统一契约。
 - 所有本地超限路径使用完全相同 message；Provider 现有错误映射回归测试通过。
 
 ### T7：契约文档与全回归

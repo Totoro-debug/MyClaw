@@ -9,7 +9,7 @@ import typer
 from rich.console import Console
 from tzlocal import get_localzone_name
 
-from myclaw.agent.loop import AgentLoop, SkillContextTooLargeError
+from myclaw.agent.loop import AgentLoop, ModelContextOverflowError
 from myclaw.agent.message_bus import MessageBus
 from myclaw.agent.workspace_state import (
     WorkspaceState,
@@ -18,7 +18,7 @@ from myclaw.agent.workspace_state import (
 )
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigError, ConfigLoader, UserConfiguration
-from myclaw.errors import ErrorInfo
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import (
     FatalManagementError,
@@ -53,9 +53,9 @@ app = typer.Typer(
 )
 console = Console()
 
-_SKILL_CONTEXT_TOO_LARGE_ERROR = ErrorInfo(
-    "skill_context_too_large",
-    "Always-loaded Skill content exceeds the foreground chat input budget.",
+_MODEL_CONTEXT_OVERFLOW_ERROR = ErrorInfo(
+    "model_context_overflow",
+    MODEL_CONTEXT_OVERFLOW_MESSAGE,
 )
 _WORKSPACE_STATE_INITIALIZATION_ERROR = ErrorInfo(
     "persistence_error",
@@ -78,7 +78,7 @@ _RUNTIME_STARTUP_ERROR = ErrorInfo(
     "MyClaw runtime could not be started.",
 )
 _SAFE_FATAL_MANAGEMENT_ERRORS = (
-    _SKILL_CONTEXT_TOO_LARGE_ERROR,
+    _MODEL_CONTEXT_OVERFLOW_ERROR,
     _TARGET_SESSION_PREPARATION_ERROR,
     _RUNTIME_SESSION_REPLACEMENT_ERROR,
 )
@@ -146,11 +146,11 @@ def _approved_error_info(
 
 def _fatal_target_preparation_error(error: Exception) -> FatalManagementError:
     """Map only an established safe domain error across the fatal boundary."""
-    if isinstance(error, SkillContextTooLargeError):
+    if isinstance(error, ModelContextOverflowError):
         return FatalManagementError(
             _approved_error_info(
                 error,
-                approved=(_SKILL_CONTEXT_TOO_LARGE_ERROR,),
+                approved=(_MODEL_CONTEXT_OVERFLOW_ERROR,),
                 fallback=_TARGET_SESSION_PREPARATION_ERROR,
             )
         )
@@ -611,11 +611,11 @@ def main(context: typer.Context) -> None:
     except WorkspaceStateError:
         _print_error_info(_WORKSPACE_STATE_INITIALIZATION_ERROR)
         raise typer.Exit(code=1) from None
-    except SkillContextTooLargeError as skill_error:
+    except ModelContextOverflowError as context_error:
         _print_error_info(
             _approved_error_info(
-                skill_error,
-                approved=(_SKILL_CONTEXT_TOO_LARGE_ERROR,),
+                context_error,
+                approved=(_MODEL_CONTEXT_OVERFLOW_ERROR,),
                 fallback=_RUNTIME_STARTUP_ERROR,
             )
         )

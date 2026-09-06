@@ -229,7 +229,7 @@ always: true
 enable_skill_always_load = true
 ```
 
-每次成功加载的完整内容保持冻结，直到成功执行 `/reload_skill` 或创建新的 Agent Loop。`/reload_skill` 会先扫描、校验并检查输入预算，再一次性发布新状态；失败不会替换当前状态。此模式没有固定的 Skill 文件大小上限，但内容仍受聊天模型输入预算约束；初始启动或 `/resume` 的同步 preflight 超出预算时会以 `skill_context_too_large` 终止 Terminal Conversation。
+每次成功加载的完整内容保持冻结，直到成功执行 `/reload_skill` 或创建新的 Agent Loop。`/reload_skill` 会先扫描、校验并检查输入预算，再一次性发布新状态；失败不会替换当前状态。此模式没有固定的 Skill 文件大小上限，但内容仍受聊天模型输入预算约束；初始启动或 `/resume` 的同步 preflight 超出完整 Model request 预算时会以 `model_context_overflow` 终止 Terminal Conversation。
 
 ## 项目架构
 

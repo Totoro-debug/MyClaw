@@ -16,11 +16,11 @@ import pytest
 from typer.testing import CliRunner
 
 import myclaw.terminal.cli as cli
-from myclaw.agent.loop import SkillContextTooLargeError, TerminalAgentLoopControl
+from myclaw.agent.loop import ModelContextOverflowError, TerminalAgentLoopControl
 from myclaw.agent.message_bus import MessageBus
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
-from myclaw.errors import ErrorInfo
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.management.service import FatalManagementError, ManagementError, ManagementViewService
 from myclaw.session.session import Session
@@ -362,10 +362,7 @@ def _invoke_cli_resume_preparation_failure(
     target_secret = (
         "sk-target-secret C:\\sensitive\\skill\\SKILL.md Skill body: never print these instructions"
     )
-    safe_preflight_error = ErrorInfo(
-        "skill_context_too_large",
-        "Always-loaded Skill content exceeds the foreground chat input budget.",
-    )
+    safe_preflight_error = ErrorInfo("model_context_overflow", MODEL_CONTEXT_OVERFLOW_MESSAGE)
 
     home = AgentHome(tmp_path / "agent-home")
     home.initialize()
@@ -536,8 +533,8 @@ def _invoke_cli_resume_preparation_failure(
             else:
                 events.append("target_init")
                 if failure_kind == "constructor":
-                    raise SkillContextTooLargeError(
-                        ErrorInfo("skill_context_too_large", target_secret)
+                    raise ModelContextOverflowError(
+                        ErrorInfo("model_context_overflow", target_secret)
                     )
 
         def preflight(self) -> None:
@@ -549,7 +546,7 @@ def _invoke_cli_resume_preparation_failure(
                 try:
                     raise RuntimeError(target_secret)
                 except RuntimeError as cause:
-                    raise SkillContextTooLargeError(safe_preflight_error) from cause
+                    raise ModelContextOverflowError(safe_preflight_error) from cause
 
         async def start(self) -> None:
             events.append("target_start" if self.is_target else "old_start")
@@ -812,8 +809,7 @@ def test_cli_resume_preflight_failure_terminates_safely(
     _assert_fatal_resume_preparation(
         probe,
         safe_error=(
-            "skill_context_too_large: Always-loaded Skill content exceeds the "
-            "foreground chat input budget."
+            "model_context_overflow: Model request context exceeds the available input budget."
         ),
         target_abort_count=1,
     )
@@ -1730,7 +1726,7 @@ def test_cli_reports_unexpected_startup_failure_without_raw_exception_output(
 
     failures = (
         ErrorCarryingFailure(),
-        SkillContextTooLargeError(ErrorInfo("skill_context_too_large", secret)),
+        ModelContextOverflowError(ErrorInfo("model_context_overflow", secret)),
         FatalManagementError(ErrorInfo("persistence_error", secret)),
     )
     for failure in failures:
@@ -1812,18 +1808,18 @@ def test_cli_reports_fatal_replacement_failure_once_without_raw_exception_output
     ("failure", "expected_code", "secret"),
     (
         (
-            SkillContextTooLargeError(
+            ModelContextOverflowError(
                 ErrorInfo(
-                    "skill_context_too_large",
-                    "Always-loaded Skill content exceeds the foreground chat input budget.",
+                    "model_context_overflow",
+                    MODEL_CONTEXT_OVERFLOW_MESSAGE,
                 )
             ),
-            "skill_context_too_large",
+            "model_context_overflow",
             "C:\\sensitive\\skill\\SKILL.md",
         ),
     ),
 )
-def test_cli_reports_runtime_skill_startup_failures_without_starting_conversation(
+def test_cli_reports_runtime_context_startup_failures_without_starting_conversation(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import Event as ThreadEvent
 from threading import Thread
 from types import TracebackType
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 from uuid import uuid4
 
 import pytest
@@ -21,13 +21,13 @@ from loguru import logger
 
 import myclaw.agent.loop as loop_module
 from myclaw.agent.blackboard import Blackboard
-from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, SkillContextTooLargeError
+from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ModelContextOverflowError
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runner import AgentRunnerResult, AgentRunnerRouter
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.errors import ErrorInfo
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.logging.session import session_log as real_session_log
 from myclaw.management.service import RuntimeStatusInput
 from myclaw.memory.manager import MemoryManager
@@ -51,6 +51,7 @@ from myclaw.skills.catalog import (
     SkillLoader,
     SkillMetadata,
 )
+from myclaw.tools.base import BaseTool
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import (
@@ -107,6 +108,23 @@ class _Router:
     ) -> ModelResponse:
         del route, messages, tools, continuation
         raise AssertionError("unexpected direct completion")
+
+
+class _LargeSchemaTool(BaseTool):
+    name = "large_schema"
+    description = "A test Tool with a deliberately large request schema."
+    parameters: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "properties": {
+            "value": {
+                "type": "string",
+                "description": "x" * 20_000,
+            }
+        },
+    }
+
+    async def execute(self) -> str:
+        return "ok"
 
 
 class _MaxRouter(_Router):
@@ -461,6 +479,7 @@ def _runtime(
     monotonic_now: Callable[[], float] | None = None,
     config_text: str | None = None,
     use_default_context_preparer: bool = False,
+    mcp_tools: Sequence[BaseTool] = (),
 ) -> tuple[AgentLoop, Session, MessageBus]:
     agent_home = AgentHome(tmp_path / "agent-home")
     agent_home.initialize()
@@ -530,6 +549,7 @@ def _runtime(
         now=_Clock().now,
         new_uuid=uuid4,
         monotonic_now=(lambda: 0.0) if monotonic_now is None else monotonic_now,
+        mcp_tools=mcp_tools,
     )
     if title_prompt is None:
         def disable_title(_session: Session, _content: str) -> None:
@@ -596,6 +616,27 @@ async def test_agent_loop_status_projection_starts_uptime_only_after_activation(
     await loop.start()
     assert monotonic_calls == 1
     await loop.close()
+
+
+def test_agent_loop_preflight_reserves_the_complete_tool_catalog_without_skills(
+    tmp_path: Path,
+) -> None:
+    config = MINIMAL_VALID_CONFIG.replace("context_window = 200000", "context_window = 1024").replace(
+        "max_output = 8192", "max_output = 128"
+    )
+    loop, _session, _bus = _runtime(
+        tmp_path,
+        _Router(()),
+        config_text=config,
+        mcp_tools=(_LargeSchemaTool(),),
+    )
+
+    with pytest.raises(ModelContextOverflowError) as raised:
+        loop.preflight()
+
+    assert raised.value.error.code == "model_context_overflow"
+    assert raised.value.error.message == MODEL_CONTEXT_OVERFLOW_MESSAGE
+    assert loop.runtime_status_input().tool_definitions
 
 
 @pytest.mark.asyncio
@@ -861,7 +902,7 @@ def test_agent_loop_reload_rejects_an_always_loaded_budget_overrun_before_public
         encoding="utf-8",
     )
 
-    with pytest.raises(SkillContextTooLargeError):
+    with pytest.raises(ModelContextOverflowError):
         loop.reload_skill()
 
     assert loader.skills == before_skills

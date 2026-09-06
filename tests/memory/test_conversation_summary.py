@@ -11,7 +11,7 @@ import pytest
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.errors import ErrorInfo
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.memory.conversation_summary import ConversationSummaryManager
 from myclaw.memory.manager import MemoryManager
 from myclaw.memory.records import SummaryEntry
@@ -162,6 +162,60 @@ async def _prepare_summary(
         current_user=current_user,
         continuation=continuation,
     )
+
+
+def _complete_tool_schemas(
+    shape: str,
+    *,
+    payload_size: int,
+) -> tuple[dict[str, Any], ...]:
+    if shape == "description":
+        return (
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp_large",
+                    "description": "x" * payload_size,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        )
+    if shape == "parameters":
+        return (
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp_large",
+                    "description": "Tool with a nested parameter schema.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "type": "string",
+                                "description": "x" * payload_size,
+                            }
+                        },
+                    },
+                },
+            },
+        )
+    if shape == "catalog":
+        first_size = payload_size // 2
+        return tuple(
+            {
+                "type": "function",
+                "function": {
+                    "name": f"mcp_large_{index}",
+                    "description": "x" * size,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for index, size in enumerate(
+                (first_size, payload_size - first_size),
+                start=1,
+            )
+        )
+    raise AssertionError(f"Unknown Tool schema test shape: {shape}")
 
 
 async def _claimed_entries(memory_manager: MemoryManager) -> tuple[SummaryEntry, ...]:
@@ -417,7 +471,8 @@ async def test_oversized_system_prompt_fails_without_summary_or_last_consolidate
             system_prompt="M" * 4_000,
         )
 
-    assert raised.value.error.code == "memory_context_too_large"
+    assert raised.value.error.code == "model_context_overflow"
+    assert raised.value.error.message == "Model request context exceeds the available input budget."
     assert provider.complete_requests == []
     assert session.last_consolidated == 0
     assert not (state.memory_directory / "summary.jsonl").exists()
@@ -465,7 +520,8 @@ async def test_oversized_system_prompt_without_user_keeps_failure(
             system_prompt="M" * 4_000,
         )
 
-    assert raised.value.error.code == "memory_context_too_large"
+    assert raised.value.error.code == "model_context_overflow"
+    assert raised.value.error.message == "Model request context exceeds the available input budget."
     assert provider.complete_requests == []
 
 
@@ -551,6 +607,132 @@ async def test_oversized_current_input_does_not_summarize_earlier_history(
         "Earlier answer.",
     ]
     assert not (state.memory_directory / "summary.jsonl").exists()
+
+
+@pytest.mark.parametrize("schema_shape", ("description", "parameters", "catalog"))
+@pytest.mark.asyncio
+async def test_complete_tool_schema_cost_triggers_summary_compression(
+    workspace: Path,
+    schema_shape: str,
+) -> None:
+    state = _state(workspace)
+    plain_session = Session.create(state)
+    tool_session = Session.create(state)
+    for session in (plain_session, tool_session):
+        session.add_message("user", "Question: " + "u" * 300)
+        _add_assistant(session, "Answer: " + "a" * 300)
+        session.add_message("user", "Current question.")
+    provider = ScriptedFakeProvider(completions=(_response("Tool-aware summary."),))
+
+    await _prepare_summary(
+        provider,
+        MemoryManager(state),
+        plain_session,
+        context_window=512,
+        max_output=128,
+        threshold=100,
+    )
+    assert plain_session.last_consolidated == 0
+    assert provider.complete_requests == []
+
+    await _prepare_summary(
+        provider,
+        MemoryManager(state),
+        tool_session,
+        context_window=512,
+        max_output=128,
+        threshold=100,
+        tools=_complete_tool_schemas(schema_shape, payload_size=700),
+    )
+
+    assert tool_session.last_consolidated == 2
+    assert provider.complete_requests
+
+
+@pytest.mark.parametrize("schema_shape", ("description", "parameters", "catalog"))
+@pytest.mark.asyncio
+async def test_complete_tool_schema_cost_rejects_an_oversized_current_turn(
+    workspace: Path,
+    schema_shape: str,
+) -> None:
+    state = _state(workspace)
+    plain_session = Session.create(state)
+    tool_session = Session.create(state)
+    for session in (plain_session, tool_session):
+        session.add_message("user", "Earlier question.")
+    provider = ScriptedFakeProvider()
+    current_user = {"role": "user", "content": "c" * 250}
+
+    await _prepare_summary(
+        provider,
+        MemoryManager(state),
+        plain_session,
+        context_window=512,
+        max_output=128,
+        threshold=100,
+        system_prompt="",
+        current_user=current_user,
+    )
+    assert plain_session.last_consolidated == 0
+
+    with pytest.raises(ModelCallError) as raised:
+        await _prepare_summary(
+            provider,
+            MemoryManager(state),
+            tool_session,
+            context_window=512,
+            max_output=128,
+            threshold=100,
+            system_prompt="",
+            tools=_complete_tool_schemas(schema_shape, payload_size=1_250),
+            current_user=current_user,
+        )
+
+    assert raised.value.error.code == "model_context_overflow"
+    assert raised.value.error.message == MODEL_CONTEXT_OVERFLOW_MESSAGE
+    assert provider.complete_requests == []
+    assert tool_session.last_consolidated == 0
+
+
+@pytest.mark.parametrize("schema_shape", ("description", "parameters", "catalog"))
+@pytest.mark.asyncio
+async def test_complete_tool_schema_cost_is_reserved_when_selecting_cutoff(
+    workspace: Path,
+    schema_shape: str,
+) -> None:
+    state = _state(workspace)
+    plain_session = Session.create(state)
+    tool_session = Session.create(state)
+    for session in (plain_session, tool_session):
+        for index in range(3):
+            session.add_message("user", f"Question {index}: " + "u" * 300)
+            _add_assistant(session, f"Answer {index}: " + "a" * 300)
+        session.add_message("user", "Current question.")
+    provider = ScriptedFakeProvider(
+        completions=(_response("Plain summary."), _response("Tool summary."))
+    )
+    memory_manager = MemoryManager(state)
+
+    await _prepare_summary(
+        provider,
+        memory_manager,
+        plain_session,
+        context_window=512,
+        max_output=128,
+        threshold=100,
+    )
+    await _prepare_summary(
+        provider,
+        memory_manager,
+        tool_session,
+        context_window=512,
+        max_output=128,
+        threshold=100,
+        tools=_complete_tool_schemas(schema_shape, payload_size=700),
+    )
+
+    assert plain_session.last_consolidated == 4
+    assert tool_session.last_consolidated == 2
 
 
 @pytest.mark.asyncio
@@ -768,7 +950,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "x" * 5_000,
+            "description": "x" * 700,
             "parameters": {"type": "object", "properties": {}},
         },
     }
@@ -806,7 +988,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
     manager = ConversationSummaryManager(
         provider=provider,
         memory_manager=memory_manager,
-        consolidation_message_threshold=100,
+        consolidation_message_threshold=4,
         now=lambda: NOW,
     )
 
@@ -919,7 +1101,7 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "x" * 5_000,
+            "description": "x" * 700,
             "parameters": {"type": "object", "properties": {}},
         },
     }
@@ -941,7 +1123,7 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
     manager = ConversationSummaryManager(
         provider=provider,
         memory_manager=memory_manager,
-        consolidation_message_threshold=100,
+        consolidation_message_threshold=4,
         now=lambda: NOW,
     )
 
@@ -967,7 +1149,7 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
     assert [message["content"] for message in projection_calls[0][0] if message["role"] == "user"][
         -1
     ] == "Current question."
-    assert session.last_consolidated == 4
+    assert session.last_consolidated == 2
     assert provider.calls[0]["route"] == "memory"
     messages = provider.calls[0]["messages"]
     assert isinstance(messages, list)
@@ -994,8 +1176,6 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
     assert json.loads(summary_input[len(prefix) : -len(suffix)]) == [
         {"role": "user", "content": "First question."},
         {"role": "assistant", "content": "First answer.", "tool_calls": []},
-        {"role": "user", "content": "Second question."},
-        {"role": "assistant", "content": "Second answer.", "tool_calls": []},
     ]
     assert provider.calls[0]["tools"] == ()
 

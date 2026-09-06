@@ -305,14 +305,14 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
     assert any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_validate_always_loaded_skill_budget"
+        and node.func.attr == "_validate_model_context_budget"
         for node in ast.walk(methods["preflight"])
     )
     assert any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "_foreground_runtime_status_input"
-        for node in ast.walk(methods["_validate_always_loaded_skill_budget"])
+        for node in ast.walk(methods["_validate_model_context_budget"])
     )
     assert any(
         isinstance(node, ast.Call)

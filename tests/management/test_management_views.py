@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
@@ -11,6 +12,7 @@ from myclaw.management.service import (
     ManagementError,
     RuntimeStatus,
     RuntimeStatusInput,
+    estimate_input_tokens,
 )
 from myclaw.memory.dream import DreamResult
 from myclaw.memory.manager import MemoryManager
@@ -63,6 +65,36 @@ max_output = 512
 temperature = 0
 timeout = 60
 """
+
+
+@pytest.mark.parametrize("component", ("system", "history", "current", "tools"))
+@pytest.mark.parametrize("previous_size,size", ((0, 1), (1, 32), (32, 256)))
+def test_input_estimate_increases_for_each_complete_request_component(
+    component: str,
+    previous_size: int,
+    size: int,
+) -> None:
+    baseline = RuntimeStatusInput(
+        system_prompt="",
+        retained_messages=(),
+        tool_definitions=(),
+        runtime_context="",
+    )
+
+    def with_component_size(component_size: int) -> RuntimeStatusInput:
+        value = "x" * component_size
+        if component == "system":
+            return replace(baseline, system_prompt=value)
+        if component == "history":
+            return replace(baseline, retained_messages=(value,))
+        if component == "current":
+            return replace(baseline, runtime_context=value)
+        return replace(baseline, tool_definitions=(value,))
+
+    assert estimate_input_tokens(with_component_size(size)) > estimate_input_tokens(
+        with_component_size(previous_size)
+    )
+
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 CREATED_AT = datetime(2026, 7, 11, 15, 30, 12, 123456, tzinfo=LOCAL_OFFSET)

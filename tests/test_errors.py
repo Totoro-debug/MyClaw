@@ -3,6 +3,7 @@ from typing import cast
 import pytest
 
 from myclaw.errors import (
+    MODEL_CONTEXT_OVERFLOW_MESSAGE,
     STABLE_ERROR_CODES,
     TURN_CANCELLED_MESSAGE,
     ErrorCode,
@@ -29,7 +30,6 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
             "provider_unavailable",
             "model_invalid_request",
             "model_context_overflow",
-            "memory_context_too_large",
             "interactive_terminal_required",
             "model_failed",
             "agent_iteration_limit",
@@ -40,9 +40,11 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
             "tool_refused",
             "tool_failed",
             "memory_task_running",
-            "skill_context_too_large",
             "skill_reload_failed",
         }
+    )
+    assert MODEL_CONTEXT_OVERFLOW_MESSAGE == (
+        "Model request context exceeds the available input budget."
     )
     error = ErrorInfo(
         code="provider_rate_limited",

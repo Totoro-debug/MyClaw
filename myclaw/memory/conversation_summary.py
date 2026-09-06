@@ -8,7 +8,7 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any, Protocol
 
-from myclaw.errors import ErrorInfo
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.manager import MemoryManager
@@ -100,23 +100,19 @@ class ConversationSummaryManager:
         current_user_index = _last_user_message_index(short_term)
         complete_messages = project_messages(short_term)
         available_input = route_context_window - route_max_output
-        system_tokens = _estimate_messages(complete_messages[:1])
-        if system_tokens > available_input:
-            raise ModelCallError(
-                ErrorInfo(
-                    code="memory_context_too_large",
-                    message="Long-term Memory and system context exceed the chat input budget.",
-                )
-            )
+        fixed_request_tokens = _estimate_messages(
+            complete_messages[:1],
+            tools=effective_tools,
+        )
+        if fixed_request_tokens > available_input:
+            raise _model_context_overflow()
         if current_user_index < len(short_term):
             non_summarizable_messages = project_messages(short_term[current_user_index:])
-            if _estimate_messages(non_summarizable_messages) >= available_input:
-                raise ModelCallError(
-                    ErrorInfo(
-                        code="model_context_overflow",
-                        message="System context and current input exceed the model input budget.",
-                    )
-                )
+            if (
+                _estimate_messages(non_summarizable_messages, tools=effective_tools)
+                >= available_input
+            ):
+                raise _model_context_overflow()
         token_triggered = (
             _estimate_messages(complete_messages, tools=effective_tools) >= available_input
         )
@@ -130,6 +126,7 @@ class ConversationSummaryManager:
                 current_user_index,
                 available_input,
                 project_messages,
+                tools=effective_tools,
             )
         if message_triggered:
             initial_cutoff = max(
@@ -138,12 +135,7 @@ class ConversationSummaryManager:
             )
         cutoff = _aligned_cutoff(short_term, initial_cutoff)
         if cutoff == 0:
-            raise ModelCallError(
-                ErrorInfo(
-                    code="model_context_overflow",
-                    message="No complete earlier conversation turn can be summarized safely.",
-                )
-            )
+            raise _model_context_overflow()
         selected = short_term[:cutoff]
         response = await self._provider.complete(
             "memory",
@@ -213,12 +205,14 @@ def _token_cutoff(
     current_user_index: int,
     input_budget: int,
     project_messages: SummaryProjection,
+    tools: Sequence[dict[str, Any]],
 ) -> int:
-    target_bytes = input_budget // 2 * 4
     if current_user_index == len(messages):
         return len(messages)
     current_user = messages[current_user_index]
     continuation = messages[current_user_index + 1 :]
+    tool_tokens = _estimate_messages((), tools=tools)
+    target_bytes = max(input_budget - tool_tokens, 0) // 2 * 4
     for index in range(current_user_index):
         projected = project_messages([*messages[: index + 1], current_user, *continuation])
         selected_bytes = _projected_history_bytes(projected)
@@ -252,6 +246,15 @@ def _estimate_messages(
             retained_messages=retained_messages,
             tool_definitions=tool_definitions,
             runtime_context="",
+        )
+    )
+
+
+def _model_context_overflow() -> ModelCallError:
+    return ModelCallError(
+        ErrorInfo(
+            code="model_context_overflow",
+            message=MODEL_CONTEXT_OVERFLOW_MESSAGE,
         )
     )
 
