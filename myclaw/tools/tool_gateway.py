@@ -230,7 +230,7 @@ class ToolGateway:
     @property
     def schemas(self) -> list[dict[str, Any]]:
         """Build a detached schema list from each Tool in fixed Catalog order."""
-        return [deepcopy(tool.to_schema()) for tool in self._catalog]
+        return [tool.to_schema() for tool in self._catalog]
 
     async def call(
         self,

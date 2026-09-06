@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -10,6 +11,7 @@ from typing import Any, cast
 import pytest
 
 import myclaw.terminal.cli as cli
+import myclaw.tools.mcp as mcp_adapter
 import myclaw.tools.mcp_runtime as mcp_runtime
 from myclaw.agent.runner import AgentRunner
 from myclaw.agent.workspace_state import WorkspaceState
@@ -650,15 +652,28 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
     }
 
     connections: list[MCPServerConnection] = []
+    transport_events: list[str] = []
     loops: list[Any] = []
     schema_requests: list[tuple[dict[str, Any], ...]] = []
     replace_callback: Callable[[str, bool], Any] | None = None
+    default_connection_factory = mcp_runtime._default_connection_factory
+    stdio_transport = mcp_adapter.stdio_transport
+
+    @asynccontextmanager
+    async def observed_transport(
+        server_configuration: MCPServerConfiguration,
+        server_workspace: Path,
+    ) -> AsyncIterator[object]:
+        async with stdio_transport(server_configuration, server_workspace) as streams:
+            transport_events.append("entered")
+            yield streams
+        transport_events.append("closed")
 
     def connection_factory(
         server_configuration: MCPServerConfiguration,
         server_workspace: Path,
     ) -> MCPServerConnection:
-        connection = MCPServerConnection(server_configuration, server_workspace)
+        connection = default_connection_factory(server_configuration, server_workspace)
         connections.append(connection)
         return connection
 
@@ -845,6 +860,7 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
             del kwargs
 
     monkeypatch.setattr(mcp_runtime, "_default_connection_factory", connection_factory)
+    monkeypatch.setattr(mcp_adapter, "stdio_transport", observed_transport)
     monkeypatch.setattr(cli, "ModelRouter", FakeRouter)
     monkeypatch.setattr(cli, "MemoryManager", FakeMemoryManager)
     monkeypatch.setattr(cli, "Dream", FakeDream)
@@ -871,5 +887,4 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
         "generation-1:inherited",
         "generation-2:inherited",
     ]
-    assert connections[0].session is None
-    assert connections[0].tools == ()
+    assert transport_events == ["entered", "closed"]

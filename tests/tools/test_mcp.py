@@ -162,6 +162,41 @@ def test_mcp_tool_loading_rejects_non_object_input_schema(schema: object) -> Non
 
 
 @pytest.mark.parametrize(
+    ("schema", "description", "message"),
+    [
+        (None, 42, "MCP Tool inputSchema must be a dictionary"),
+        (
+            {"type": "string", "default": object()},
+            42,
+            "MCP Tool inputSchema must be JSON serializable",
+        ),
+        ({"type": "string"}, 42, "MCP Tool inputSchema must use an object root"),
+        (
+            {"type": "object", "nullable": True},
+            None,
+            "MCP Tool inputSchema must use an object root",
+        ),
+        ({"type": "object", "nullable": True}, 42, "MCP Tool inputSchema must use an object root"),
+        ({"type": "object"}, 42, "MCP Tool description must be a string"),
+    ],
+)
+def test_mcp_tool_loading_preserves_validation_error_order(
+    schema: object,
+    description: object,
+    message: str,
+) -> None:
+    with pytest.raises(MCPToolSchemaError) as raised:
+        mcp_tool_spec_from_remote(
+            {"name": "invalid", "inputSchema": schema, "description": description},
+            server_name="remote",
+            model_name="mcp_remote_invalid",
+        )
+
+    assert type(raised.value) is MCPToolSchemaError
+    assert str(raised.value) == message
+
+
+@pytest.mark.parametrize(
     ("schema", "expected"),
     [
         ({"type": "string", "nullable": True}, {"type": ["string", "null"]}),
@@ -378,18 +413,31 @@ async def test_mcp_empty_result_has_explicit_output_marker() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_error_result_preserves_server_content_as_tool_error() -> None:
+@pytest.mark.parametrize(
+    ("error_fields", "status"),
+    [
+        ({"is_error": True}, "error"),
+        ({"isError": True}, "error"),
+        ({"is_error": False}, "success"),
+        ({"isError": False}, "success"),
+        ({"isError": 1}, "success"),
+        ({"isError": "true"}, "success"),
+        ({"is_error": False, "isError": True}, "success"),
+    ],
+)
+async def test_mcp_result_preserves_content_and_requires_an_explicit_error_flag(
+    error_fields: dict[str, object],
+    status: str,
+) -> None:
     tool = _tool_for_session(
-        _ResultSession(
-            CallToolResult(content=[TextContent(text="server rejected it")], is_error=True)
-        )
+        _ResultSession({"content": [TextContent(text="server result")], **error_fields})
     )
 
     result = await ToolGateway._for_memory((tool,)).call(
         ModelToolCall(id="call-error-result", name=tool.name, arguments="{}")
     )
 
-    assert (result.status, result.content) == ("error", "server rejected it")
+    assert (result.status, result.content) == (status, "server result")
     assert tool.unavailable is False
 
 
@@ -621,17 +669,17 @@ async def test_server_connection_initializes_discovers_and_closes_one_session() 
     tools = await connection.connect()
 
     assert transport.entered is True
+    assert session.entered is True
     assert session.initialized is True
     assert [tool.name for tool in tools] == ["mcp_remote_echo"]
-    assert connection.tools == tools
-    assert connection.session is session
+    assert await tools[0].execute_prepared({}) == "connected"
+    assert session.closed is False
+    assert transport.closed is False
 
     await connection.close()
 
     assert session.closed is True
     assert transport.closed is True
-    assert connection.session is None
-    assert connection.tools == ()
 
 
 @pytest.mark.asyncio
@@ -655,6 +703,54 @@ async def test_server_connection_counts_invalid_discovered_tools() -> None:
     assert [tool.name for tool in tools] == ["mcp_remote_valid"]
     assert connection.skipped_tool_count == 1
 
+    await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["initialize", "list_tools"])
+async def test_connection_timeout_covers_initialization_and_discovery_and_closes_resources(
+    phase: str,
+) -> None:
+    transport = _AsyncTransport()
+    hung = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class HangingSession(_ConnectionSession):
+        async def initialize(self) -> object:
+            if phase == "initialize":
+                hung.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            return await super().initialize()
+
+        async def list_tools(self, *, params: types.PaginatedRequestParams | None = None) -> object:
+            assert self.initialized is True
+            hung.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+            raise AssertionError("discovery unexpectedly resumed")
+
+    session = HangingSession()
+    connection = MCPServerConnection(
+        _server_configuration(connect_timeout=0.01),
+        Path("."),
+        transport_factory=lambda configuration, workspace: transport,
+        session_factory=lambda read_stream, write_stream: session,
+    )
+
+    with pytest.raises(TimeoutError):
+        await connection.connect()
+
+    assert hung.is_set()
+    assert cancelled.is_set()
+    assert session.entered is True
+    assert session.initialized is (phase == "list_tools")
+    assert session.closed is True
+    assert transport.closed is True
     await connection.close()
 
 

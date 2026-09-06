@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 import mcp.types as types
 import pytest
 from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, TextContent
 
+import myclaw.tools.mcp as mcp_adapter
 from myclaw.config.config import MCPServerConfiguration
-from myclaw.tools.base import BaseTool
 from myclaw.tools.mcp import MCPTool, MCPToolSpec
-from myclaw.tools.mcp_runtime import MCPRuntimeManager, allocate_mcp_tool_name
+from myclaw.tools.mcp_runtime import MCPRuntimeManager, MCPToolSnapshot, allocate_mcp_tool_name
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 
 
@@ -139,15 +140,6 @@ class _DelayedCloseConnection(_FakeConnection):
         self.close_completed = True
 
 
-class _BuiltInTool(BaseTool):
-    name = "builtin_read"
-    description = "Read a local file."
-    parameters: ClassVar[dict[str, Any]] = {"type": "object"}
-
-    async def execute(self) -> str:
-        return "built-in"
-
-
 def _configuration(name: str) -> MCPServerConfiguration:
     return MCPServerConfiguration(
         mcp_name=name,
@@ -164,13 +156,14 @@ def _tool(
     description: str | None = None,
     session: _ResultSession | None = None,
     on_closed: Callable[[], None] | None = None,
-    model_name: str | None = None,
 ) -> MCPTool:
+    model_name = allocate_mcp_tool_name(server_name, remote_name)
+    assert model_name is not None
     return MCPTool(
         MCPToolSpec(
             server_name=server_name,
             remote_name=remote_name,
-            model_name=model_name or remote_name,
+            model_name=model_name,
             description=description or remote_name,
             parameters={"type": "object"},
         ),
@@ -179,58 +172,22 @@ def _tool(
     )
 
 
+class _ObservedManager(MCPRuntimeManager):
+    @property
+    def snapshot(self) -> MCPToolSnapshot:
+        return self._snapshot
+
+
 def _manager(
     connections: Mapping[str, _FakeConnection],
     *,
-    built_in_tools: tuple[BaseTool, ...] = (),
-) -> MCPRuntimeManager:
-    return MCPRuntimeManager(
+    built_in_names: tuple[str, ...] = (),
+) -> _ObservedManager:
+    return _ObservedManager(
         Path("."),
-        built_in_tools=built_in_tools,
+        built_in_names=built_in_names,
         connection_factory=lambda configuration, workspace: connections[configuration.mcp_name],
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("server_order", "alpha_order", "zulu_order"),
-    [
-        (("zulu", "alpha"), ("b-tool", "a-tool"), ("z-tool", "a-tool")),
-        (("alpha", "zulu"), ("a-tool", "b-tool"), ("a-tool", "z-tool")),
-        (("zulu", "alpha"), ("a-tool", "b-tool"), ("z-tool", "a-tool")),
-    ],
-)
-async def test_runtime_snapshot_orders_builtins_servers_and_remote_tools(
-    server_order: tuple[str, str],
-    alpha_order: tuple[str, str],
-    zulu_order: tuple[str, str],
-) -> None:
-    alpha = _configuration("alpha")
-    zulu = _configuration("zulu")
-    connections = {
-        "zulu": _FakeConnection(
-            zulu,
-            tuple(_tool("zulu", remote_name) for remote_name in zulu_order),
-        ),
-        "alpha": _FakeConnection(
-            alpha,
-            tuple(_tool("alpha", remote_name) for remote_name in alpha_order),
-        ),
-    }
-    builtin = _BuiltInTool()
-
-    manager = _manager(connections, built_in_tools=(builtin,))
-    configured = {name: {"alpha": alpha, "zulu": zulu}[name] for name in server_order}
-    report = await manager.start(configured)
-
-    assert isinstance(report.snapshot, tuple)
-    assert [tool.name for tool in manager.catalog] == [
-        "builtin_read",
-        "mcp_alpha_a-tool",
-        "mcp_alpha_b-tool",
-        "mcp_zulu_a-tool",
-        "mcp_zulu_z-tool",
-    ]
 
 
 @pytest.mark.asyncio
@@ -299,17 +256,65 @@ async def test_runtime_connects_two_servers_without_waiting_for_a_third_server_t
         ("bad.tool", None),
     ],
 )
-async def test_runtime_snapshot_allocates_provider_safe_names(
+async def test_default_connection_discovers_provider_safe_names_and_reuses_tools(
+    monkeypatch: pytest.MonkeyPatch,
     remote_name: str,
     expected_name: str | None,
 ) -> None:
     configuration = _configuration("alpha")
-    connection = _FakeConnection(configuration, (_tool("alpha", remote_name),))
-    report = await _manager({"alpha": connection}).start({"alpha": configuration})
+    lifecycle: list[str] = []
 
-    assert [tool.name for tool in report.snapshot] == (
-        [] if expected_name is None else [expected_name]
-    )
+    @asynccontextmanager
+    async def transport(
+        configuration: MCPServerConfiguration, workspace: Path
+    ) -> AsyncIterator[object]:
+        lifecycle.append("transport_entered")
+        yield ("read", "write")
+        lifecycle.append("transport_closed")
+
+    class Session(_ResultSession):
+        list_calls = 0
+
+        async def __aenter__(self) -> Session:
+            lifecycle.append("session_entered")
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            lifecycle.append("session_closed")
+
+        async def initialize(self) -> object:
+            lifecycle.append("initialized")
+            return None
+
+        async def list_tools(self, *, params: types.PaginatedRequestParams | None = None) -> object:
+            assert params is None
+            self.list_calls += 1
+            return {"tools": [{"name": remote_name, "inputSchema": {"type": "object"}}]}
+
+    session = Session()
+    monkeypatch.setattr(mcp_adapter, "_transport_for", transport)
+    monkeypatch.setattr(mcp_adapter, "_new_client_session", lambda read, write: session)
+    manager = MCPRuntimeManager(Path("."))
+    try:
+        report = await manager.start({"alpha": configuration})
+
+        assert report.connected_servers == ("alpha",)
+        assert [tool.name for tool in report.snapshot] == (
+            [] if expected_name is None else [expected_name]
+        )
+        assert report.skipped_tool_counts == ((("alpha", 1),) if expected_name is None else ())
+        candidate = await manager.prepare_generation()
+        assert candidate.reused_servers == ("alpha",)
+        assert candidate.retried_servers == ()
+        assert candidate.snapshot == report.snapshot
+        if expected_name is not None:
+            assert candidate.snapshot[0] is report.snapshot[0]
+            assert await candidate.snapshot[0].execute_prepared({}) == "ok"
+        assert session.list_calls == 1
+        assert lifecycle == ["transport_entered", "session_entered", "initialized"]
+    finally:
+        await manager.close()
+    assert lifecycle[-2:] == ["session_closed", "transport_closed"]
 
 
 @pytest.mark.parametrize(
@@ -337,8 +342,6 @@ async def test_runtime_snapshot_skips_builtin_and_fallback_collisions_determinis
     zulu = _configuration("zulu")
     alpha_connection = _FakeConnection(alpha, (_tool("alpha", long_remote_name),))
     zulu_connection = _FakeConnection(zulu, (_tool("zulu", long_remote_name),))
-    builtin = _BuiltInTool()
-    builtin.name = "mcp_alpha_echo"
 
     projections: list[tuple[tuple[str, str], ...]] = []
     for _ in range(3):
@@ -346,30 +349,24 @@ async def test_runtime_snapshot_skips_builtin_and_fallback_collisions_determinis
         zulu_connection._tools = (_tool("zulu", long_remote_name),)
         manager = _manager(
             {"alpha": alpha_connection, "zulu": zulu_connection},
-            built_in_tools=(builtin,),
+            built_in_names=("mcp_alpha_echo",),
         )
         report = await manager.start({"zulu": zulu, "alpha": alpha})
         projections.append(tuple((tool.name, tool.description) for tool in report.snapshot))
 
     assert projections == [(("mcp_" + long_remote_name, long_remote_name),)] * 3
-    assert [tool.name for tool in manager.catalog] == [
-        "mcp_alpha_echo",
-        "mcp_" + long_remote_name,
-    ]
+    assert report.skipped_tool_counts == (("zulu", 1),)
 
 
 @pytest.mark.asyncio
 async def test_runtime_snapshot_skips_collision_with_a_builtin_tool() -> None:
     configuration = _configuration("alpha")
     connection = _FakeConnection(configuration, (_tool("alpha", "echo"),))
-    builtin = _BuiltInTool()
-    builtin.name = "mcp_alpha_echo"
-
-    manager = _manager({"alpha": connection}, built_in_tools=(builtin,))
+    manager = _manager({"alpha": connection}, built_in_names=("mcp_alpha_echo",))
     report = await manager.start({"alpha": configuration})
 
     assert report.snapshot == ()
-    assert manager.catalog == (builtin,)
+    assert report.skipped_tool_counts == (("alpha", 1),)
 
 
 @pytest.mark.asyncio
@@ -400,7 +397,36 @@ async def test_rebuilding_same_configuration_keeps_snapshot_schema_deterministic
         report = await _manager({"alpha": connection}).start({"alpha": configuration})
         projections.append(tuple((tool.name, tool.to_schema()) for tool in report.snapshot))
 
-    assert all(projection == projections[0] for projection in projections)
+    assert (
+        projections
+        == [
+            (
+                (
+                    "mcp_alpha_first",
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "mcp_alpha_first",
+                            "description": "First",
+                            "parameters": {"type": "object"},
+                        },
+                    },
+                ),
+                (
+                    "mcp_alpha_second",
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "mcp_alpha_second",
+                            "description": "Second",
+                            "parameters": {"type": "object"},
+                        },
+                    },
+                ),
+            )
+        ]
+        * 100
+    )
 
 
 @pytest.mark.asyncio
@@ -416,9 +442,10 @@ async def test_prepare_generation_reuses_healthy_connection_and_discovered_tools
     assert connection.connect_calls == 1
     assert candidate.snapshot == initial.snapshot
     assert candidate.snapshot[0] is initial.snapshot[0]
-    assert manager.snapshot == initial.snapshot
+    assert initial.snapshot[0] is tool
     assert candidate.reused_servers == ("alpha",)
     assert candidate.retried_servers == ()
+    assert manager.activate_generation(candidate) is candidate.snapshot
 
 
 @pytest.mark.asyncio
@@ -563,7 +590,6 @@ async def test_activate_generation_replaces_snapshot_only_after_candidate_is_sel
     activated = manager.activate_generation(candidate)
 
     assert activated == candidate.snapshot
-    assert manager.snapshot == candidate.snapshot
 
 
 @pytest.mark.asyncio
@@ -639,14 +665,13 @@ async def test_activate_generation_rejects_a_candidate_from_another_manager() ->
     first_manager = _manager({"alpha": first_connection})
     second_manager = _manager({"alpha": second_connection})
     await first_manager.start({"alpha": configuration})
-    await second_manager.start({"alpha": configuration})
+    initial = await second_manager.start({"alpha": configuration})
     foreign_candidate = await first_manager.prepare_generation()
-    active_snapshot = second_manager.snapshot
 
     with pytest.raises(ValueError, match="current prepared candidate"):
         second_manager.activate_generation(foreign_candidate)
 
-    assert second_manager.snapshot == active_snapshot
+    assert second_manager.snapshot is initial.snapshot
 
 
 @pytest.mark.asyncio
@@ -654,15 +679,14 @@ async def test_activate_generation_rejects_a_superseded_candidate() -> None:
     configuration = _configuration("alpha")
     connection = _FakeConnection(configuration, (_tool("alpha", "echo"),))
     manager = _manager({"alpha": connection})
-    await manager.start({"alpha": configuration})
+    initial = await manager.start({"alpha": configuration})
     stale_candidate = await manager.prepare_generation()
     current_candidate = await manager.prepare_generation()
-    active_snapshot = manager.snapshot
 
     with pytest.raises(ValueError, match="current prepared candidate"):
         manager.activate_generation(stale_candidate)
 
-    assert manager.snapshot == active_snapshot
+    assert manager.snapshot is initial.snapshot
     assert manager.activate_generation(current_candidate) == current_candidate.snapshot
 
 

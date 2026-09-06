@@ -10,10 +10,12 @@ import pytest
 from mcp.types import CallToolResult
 
 from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.config.config import MCPServerConfiguration
 from myclaw.schedule.service import ScheduleService
 from myclaw.tools.base import BaseTool
 from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.mcp import MCPTool, MCPToolSpec
+from myclaw.tools.mcp_runtime import MCPRuntimeManager, allocate_mcp_tool_name
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -38,6 +40,7 @@ def _gateway(
     agent_home: Path,
     *,
     skill_root: Path | None = None,
+    additional_tools: tuple[MCPTool, ...] = (),
 ) -> ToolGateway:
     identity = workspace
     state = WorkspaceState(identity)
@@ -51,6 +54,7 @@ def _gateway(
             execute_dream=_noop,
         ),
         skill_root=skill_root,
+        additional_tools=additional_tools,
     )
 
 
@@ -81,6 +85,10 @@ def test_fixed_catalog_order_and_detached_definitions(
         "schedule",
     ]
     definitions = gateway.schemas
+    next_definitions = gateway.schemas
+    assert definitions == next_definitions
+    assert definitions is not next_definitions
+    assert definitions[0] is not next_definitions[0]
     assert isinstance(definitions, list)
     function = cast(dict[str, object], definitions[0]["function"])
     function["name"] = "changed"
@@ -88,6 +96,13 @@ def test_fixed_catalog_order_and_detached_definitions(
     properties = cast(dict[str, object], parameters["properties"])
     path = cast(dict[str, object], properties["path"])
     path["description"] = "changed"
+    definitions[0]["type"] = "changed"
+    assert next_definitions[0]["type"] == "function"
+    assert next_definitions[0]["function"]["name"] == "read_file"
+    assert (
+        next_definitions[0]["function"]["parameters"]["properties"]["path"]["description"]
+        != "changed"
+    )
     assert _names(gateway)[0] == "read_file"
     current_function = cast(dict[str, object], gateway.schemas[0]["function"])
     current_parameters = cast(dict[str, object], current_function["parameters"])
@@ -97,6 +112,81 @@ def test_fixed_catalog_order_and_detached_definitions(
     assert not hasattr(gateway, "register_tools")
     assert not hasattr(gateway, "for_run")
     assert not any(name in vars(gateway) for name in ("workspace", "schedule_store"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_order", "alpha_order", "zulu_order"),
+    [
+        (("zulu", "alpha"), ("b-tool", "a-tool"), ("z-tool", "a-tool")),
+        (("alpha", "zulu"), ("a-tool", "b-tool"), ("a-tool", "z-tool")),
+        (("zulu", "alpha"), ("a-tool", "b-tool"), ("z-tool", "a-tool")),
+    ],
+)
+async def test_catalog_orders_builtins_servers_and_remote_tools(
+    workspace: Path,
+    agent_home: Path,
+    server_order: tuple[str, str],
+    alpha_order: tuple[str, str],
+    zulu_order: tuple[str, str],
+) -> None:
+    class Session:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+            return CallToolResult(content=[])
+
+    class Connection:
+        unavailable = False
+
+        def __init__(self, configuration: MCPServerConfiguration, workspace: Path) -> None:
+            self.name = configuration.mcp_name
+
+        async def connect(self) -> tuple[MCPTool, ...]:
+            return tuple(
+                MCPTool(
+                    MCPToolSpec(
+                        server_name=self.name,
+                        remote_name=name,
+                        model_name=allocate_mcp_tool_name(self.name, name) or "",
+                        description=name,
+                        parameters={"type": "object"},
+                    ),
+                    Session(),
+                )
+                for name in {"alpha": alpha_order, "zulu": zulu_order}[self.name]
+            )
+
+        async def close(self) -> None:
+            pass
+
+    manager = MCPRuntimeManager(workspace, connection_factory=Connection)
+    report = await manager.start(
+        {
+            name: MCPServerConfiguration(
+                mcp_name=name, enabled=True, transport="stdio", command="mcp-server"
+            )
+            for name in server_order
+        }
+    )
+    gateway = _gateway(workspace, agent_home, additional_tools=report.snapshot)
+
+    assert isinstance(report.snapshot, tuple)
+    assert _names(gateway) == [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "glob",
+        "grep",
+        "exec",
+        "web_search",
+        "web_fetch",
+        "schedule",
+        "mcp_alpha_a-tool",
+        "mcp_alpha_b-tool",
+        "mcp_zulu_a-tool",
+        "mcp_zulu_z-tool",
+    ]
+    await manager.close()
 
 
 @pytest.mark.asyncio

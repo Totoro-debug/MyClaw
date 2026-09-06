@@ -8,13 +8,11 @@ import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Protocol
 
 from loguru import logger
 
 from myclaw.config.config import MCPServerConfiguration
-from myclaw.tools.base import BaseTool
 from myclaw.tools.mcp import MCPServerConnection, MCPTool
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
 
@@ -37,12 +35,11 @@ class MCPConnectionAdapter(Protocol):
     """The connection seam owned by the MCP Runtime Manager."""
 
     @property
-    def tools(self) -> tuple[MCPTool, ...]: ...
-
-    @property
     def unavailable(self) -> bool: ...
 
-    async def connect(self) -> tuple[MCPTool, ...]: ...
+    async def connect(self) -> tuple[MCPTool, ...]:
+        """Return discovered Tools already named with allocate_mcp_tool_name()."""
+        ...
 
     async def close(self) -> None: ...
 
@@ -66,11 +63,6 @@ class MCPStartupReport:
     failures: tuple[MCPServerFailure, ...] = ()
     skipped_tool_counts: tuple[tuple[str, int], ...] = ()
 
-    @property
-    def tools(self) -> MCPToolSnapshot:
-        """Return the generation's MCP Tool Snapshot."""
-        return self.snapshot
-
 
 @dataclass(frozen=True, slots=True)
 class MCPSnapshotReport:
@@ -82,11 +74,6 @@ class MCPSnapshotReport:
     failed_servers: tuple[str, ...]
     failures: tuple[MCPServerFailure, ...] = ()
     skipped_tool_counts: tuple[tuple[str, int], ...] = ()
-
-    @property
-    def tools(self) -> MCPToolSnapshot:
-        """Return the candidate generation's MCP Tool Snapshot."""
-        return self.snapshot
 
 
 def allocate_mcp_tool_name(mcp_name: str, remote_name: str) -> str | None:
@@ -155,18 +142,18 @@ class MCPRuntimeManager:
         workspace: Path,
         *,
         connection_factory: MCPConnectionFactory | None = None,
-        built_in_tools: Sequence[BaseTool] = (),
         built_in_names: Iterable[str] = (),
     ) -> None:
         if not isinstance(workspace, Path):
             raise TypeError("MCP Runtime Manager requires a Path workspace")
         self._workspace = workspace
         self._connection_factory = connection_factory or _default_connection_factory
-        self._built_in_tools = tuple(built_in_tools)
-        self._built_in_names = _validate_built_in_names(
-            self._built_in_tools,
-            built_in_names,
-        )
+        names = list(built_in_names)
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("Built-in Tool names must be non-empty strings")
+        if len(set(names)) != len(names):
+            raise ValueError("Built-in Tool names must be unique")
+        self._built_in_names = frozenset(names)
         self._configuration: dict[str, MCPServerConfiguration] = {}
         self._connections: dict[str, MCPConnectionAdapter] = {}
         self._discovered_tools: dict[str, tuple[MCPTool, ...]] = {}
@@ -179,44 +166,9 @@ class MCPRuntimeManager:
         self._started = False
 
     @property
-    def snapshot(self) -> MCPToolSnapshot:
-        """Return the active generation's immutable MCP Tool Snapshot."""
-        return self._snapshot
-
-    @property
-    def mcp_snapshot(self) -> MCPToolSnapshot:
-        """Alias for callers that distinguish the MCP snapshot from a full catalog."""
-        return self._snapshot
-
-    @property
-    def catalog(self) -> tuple[BaseTool, ...]:
-        """Return Built-in Tools followed by the active MCP Tool Snapshot."""
-        return self._built_in_tools + self._snapshot
-
-    @property
-    def configuration(self) -> Mapping[str, MCPServerConfiguration]:
-        """Return the configured Server table without exposing mutable manager state."""
-        return MappingProxyType(dict(self._configuration))
-
-    @property
-    def connections(self) -> Mapping[str, MCPConnectionAdapter]:
-        """Return the Runtime-Lifetime connection table as a read-only mapping."""
-        return MappingProxyType(dict(self._connections))
-
-    @property
     def failed_servers(self) -> tuple[str, ...]:
         """Return Servers selected for retry, in deterministic order."""
         return tuple(sorted(self._failed_servers))
-
-    @property
-    def healthy_servers(self) -> tuple[str, ...]:
-        """Return connected Servers not selected for retry, in deterministic order."""
-        return tuple(sorted(self._connected_servers - self._failed_servers))
-
-    @property
-    def started(self) -> bool:
-        """Whether the Manager owns a started Runtime Lifetime state."""
-        return self._started
 
     async def start(
         self,
@@ -373,8 +325,6 @@ class MCPRuntimeManager:
         self._pending_report = None
         return self._snapshot
 
-    commit_generation = activate_generation
-
     async def close(self) -> None:
         """Close all Runtime-Lifetime MCP connections and clear Manager state."""
         connections = tuple(self._connections.values())
@@ -453,18 +403,8 @@ class MCPRuntimeManager:
                     skipped_count += 1
                     _log_skipped_tool(mcp_name, phase="tool", exception_type="MCPConnectionError")
                     continue
-                model_name = allocate_mcp_tool_name(mcp_name, tool.remote_name)
-                if model_name is None:
-                    skipped_count += 1
-                    _log_skipped_tool(
-                        mcp_name,
-                        phase="tool_name",
-                        exception_type="MCPToolSchemaError",
-                    )
-                    continue
-                named_tool = tool if tool.name == model_name else tool.with_model_name(model_name)
-                named_tools.append(named_tool)
-                if model_name in used_names:
+                named_tools.append(tool)
+                if tool.name in used_names:
                     skipped_count += 1
                     _log_skipped_tool(
                         mcp_name,
@@ -472,8 +412,8 @@ class MCPRuntimeManager:
                         exception_type="ToolNameCollision",
                     )
                     continue
-                used_names.add(model_name)
-                snapshot.append(named_tool)
+                used_names.add(tool.name)
+                snapshot.append(tool)
             self._discovered_tools[mcp_name] = tuple(named_tools)
             if skipped_count:
                 skipped_tool_counts[mcp_name] = skipped_count
@@ -527,25 +467,6 @@ def _normalize_configuration(
             raise ValueError(f"Duplicate MCP Server name: {mcp_name}")
         normalized[mcp_name] = server_configuration
     return normalized
-
-
-def _validate_built_in_names(
-    built_in_tools: tuple[BaseTool, ...],
-    built_in_names: Iterable[str],
-) -> frozenset[str]:
-    names = list(built_in_names)
-    if any(not isinstance(name, str) or not name for name in names):
-        raise ValueError("Built-in Tool names must be non-empty strings")
-    for tool in built_in_tools:
-        if not isinstance(tool, BaseTool):
-            raise TypeError("MCP Runtime Manager built-in Tools must be BaseTool instances")
-        name = getattr(tool, "name", None)
-        if not isinstance(name, str) or not name:
-            raise ValueError("Built-in Tool names must be non-empty strings")
-        names.append(name)
-    if len(set(names)) != len(names):
-        raise ValueError("Built-in Tool names must be unique")
-    return frozenset(names)
 
 
 def _sorted_tools(tools: Sequence[MCPTool]) -> tuple[MCPTool, ...]:

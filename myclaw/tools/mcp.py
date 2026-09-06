@@ -106,46 +106,10 @@ class MCPTool(BaseTool):
         self._on_closed = on_closed
         self._unavailable = False
 
-    @classmethod
-    def from_remote_tool(
-        cls,
-        remote_tool: object,
-        *,
-        server_name: str,
-        model_name: str,
-        session: MCPToolSession,
-        call_timeout: float = 60,
-        on_closed: Callable[[], None] | None = None,
-    ) -> MCPTool:
-        """Build a Tool from one SDK Tool after validating its input schema."""
-        spec = mcp_tool_spec_from_remote(
-            remote_tool,
-            server_name=server_name,
-            model_name=model_name,
-        )
-        return cls(spec, session, call_timeout=call_timeout, on_closed=on_closed)
-
     @property
     def unavailable(self) -> bool:
         """Whether a closed MCP session was observed during a Tool call."""
         return self._unavailable
-
-    def with_model_name(self, model_name: str) -> MCPTool:
-        """Return the same remote Tool with a different model-facing name."""
-        if not isinstance(model_name, str) or not model_name:
-            raise ValueError("MCP Tool model name must be a non-empty string")
-        return type(self)(
-            MCPToolSpec(
-                server_name=self.server_name,
-                remote_name=self.remote_name,
-                model_name=model_name,
-                description=self.description,
-                parameters=self.parameters,
-            ),
-            self._session,
-            call_timeout=self._call_timeout,
-            on_closed=self._on_closed,
-        )
 
     async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Forward the complete argument object without local schema processing."""
@@ -161,13 +125,13 @@ class MCPTool(BaseTool):
         except TimeoutError as error:
             raise ToolError(_TIMEOUT_TEMPLATE.format(timeout=self._call_timeout)) from error
         except Exception as error:
-            if _is_closed_session_error(error):
+            if isinstance(error, MCPError) and error.code == types.CONNECTION_CLOSED:
                 self._mark_unavailable()
                 raise ToolError(_CONNECTION_UNAVAILABLE) from error
             raise
 
         content = _content_text(result)
-        if _result_is_error(result):
+        if _field(result, "is_error", "isError") is True:
             raise ToolError(content)
         return content
 
@@ -217,16 +181,11 @@ def mcp_tool_spec_from_remote(
         raise MCPToolSchemaError("MCP Tool name must be a non-empty string")
 
     input_schema = _field(remote_tool, "input_schema", "inputSchema")
-    if not isinstance(input_schema, dict):
-        raise MCPToolSchemaError("MCP Tool inputSchema must be a dictionary")
-    _validate_json_serializable(input_schema)
-    if input_schema.get("type") != "object":
-        raise MCPToolSchemaError("MCP Tool inputSchema must use an object root")
+    _validate_input_schema(input_schema)
 
     normalized = normalize_nullable(input_schema)
     if not isinstance(normalized, dict) or normalized.get("type") != "object":
         raise MCPToolSchemaError("MCP Tool inputSchema must use an object root")
-    _validate_json_serializable(normalized)
 
     description = _field(remote_tool, "description")
     if description is _MISSING or description is None or description == "":
@@ -248,62 +207,53 @@ async def discover_mcp_tool_specs(
     *,
     server_name: str,
     model_name_for: Callable[[str], str] | None = None,
-    timeout: float | None = None,
     on_tool_skipped: Callable[[], None] | None = None,
 ) -> tuple[MCPToolSpec, ...]:
     """Discover every page of Tools, stopping safely on a repeated cursor."""
     if not isinstance(server_name, str) or not server_name:
         raise ValueError("MCP server_name must be a non-empty string")
-    if timeout is not None:
-        _validate_timeout(timeout, field="timeout")
-
-    async def collect() -> tuple[MCPToolSpec, ...]:
-        cursor: str | None = None
-        seen_cursors: set[str] = set()
-        specs: list[MCPToolSpec] = []
-        while True:
-            page = await _list_tools_page(session, cursor)
-            tools = _field(page, "tools")
-            if not isinstance(tools, (list, tuple)):
-                raise TypeError("MCP tools/list returned an invalid tools collection")
-            for remote_tool in tools:
-                try:
-                    remote_name = _field(remote_tool, "name")
-                    if not isinstance(remote_name, str) or not remote_name:
-                        raise MCPToolSchemaError("MCP Tool name must be a non-empty string")
-                    allocator = model_name_for or (lambda name: name)
-                    model_name = allocator(remote_name)
-                    if not isinstance(model_name, str) or not model_name:
-                        raise MCPToolSchemaError("MCP Tool model name must be a non-empty string")
-                    specs.append(
-                        mcp_tool_spec_from_remote(
-                            remote_tool,
-                            server_name=server_name,
-                            model_name=model_name,
-                        )
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    specs: list[MCPToolSpec] = []
+    while True:
+        params = None if cursor is None else types.PaginatedRequestParams(cursor=cursor)
+        page = await session.list_tools(params=params)
+        tools = _field(page, "tools")
+        if not isinstance(tools, (list, tuple)):
+            raise TypeError("MCP tools/list returned an invalid tools collection")
+        for remote_tool in tools:
+            try:
+                remote_name = _field(remote_tool, "name")
+                if not isinstance(remote_name, str) or not remote_name:
+                    raise MCPToolSchemaError("MCP Tool name must be a non-empty string")
+                allocator = model_name_for or (lambda name: name)
+                model_name = allocator(remote_name)
+                if not isinstance(model_name, str) or not model_name:
+                    raise MCPToolSchemaError("MCP Tool model name must be a non-empty string")
+                specs.append(
+                    mcp_tool_spec_from_remote(
+                        remote_tool,
+                        server_name=server_name,
+                        model_name=model_name,
                     )
-                except MCPToolSchemaError:
-                    if on_tool_skipped is not None:
-                        on_tool_skipped()
-                    continue
+                )
+            except MCPToolSchemaError:
+                if on_tool_skipped is not None:
+                    on_tool_skipped()
+                continue
 
-            next_cursor = _field(page, "next_cursor", "nextCursor")
-            if next_cursor is _MISSING or next_cursor is None:
-                break
-            if not isinstance(next_cursor, str):
-                raise TypeError("MCP tools/list returned an invalid cursor")
-            if next_cursor in seen_cursors:
-                break
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
+        next_cursor = _field(page, "next_cursor", "nextCursor")
+        if next_cursor is _MISSING or next_cursor is None:
+            break
+        if not isinstance(next_cursor, str):
+            raise TypeError("MCP tools/list returned an invalid cursor")
+        if next_cursor in seen_cursors:
+            break
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
 
-        specs.sort(key=lambda item: item.remote_name)
-        return tuple(specs)
-
-    if timeout is None:
-        return await collect()
-    async with asyncio.timeout(float(timeout)):
-        return await collect()
+    specs.sort(key=lambda item: item.remote_name)
+    return tuple(specs)
 
 
 async def discover_mcp_tools(
@@ -312,7 +262,6 @@ async def discover_mcp_tools(
     server_name: str,
     model_name_for: Callable[[str], str] | None = None,
     call_timeout: float = 60,
-    timeout: float | None = None,
     on_closed: Callable[[], None] | None = None,
     on_tool_skipped: Callable[[], None] | None = None,
 ) -> tuple[MCPTool, ...]:
@@ -321,7 +270,6 @@ async def discover_mcp_tools(
         session,
         server_name=server_name,
         model_name_for=model_name_for,
-        timeout=timeout,
         on_tool_skipped=on_tool_skipped,
     )
     return tuple(
@@ -359,14 +307,6 @@ class MCPServerConnection:
         self._tools: tuple[MCPTool, ...] = ()
         self._unavailable = False
         self._skipped_tool_count = 0
-
-    @property
-    def session(self) -> MCPClientSession | None:
-        return self._session
-
-    @property
-    def tools(self) -> tuple[MCPTool, ...]:
-        return self._tools
 
     @property
     def unavailable(self) -> bool:
@@ -473,9 +413,6 @@ class MCPServerConnection:
         )
 
 
-MCPServerAdapter = MCPServerConnection
-
-
 @asynccontextmanager
 async def stdio_transport(
     configuration: MCPServerConfiguration,
@@ -527,11 +464,6 @@ def _transport_for(
 def _new_client_session(read_stream: object, write_stream: object) -> MCPClientSession:
     client_session = cast(Any, ClientSession)
     return cast(MCPClientSession, client_session(read_stream, write_stream))
-
-
-async def _list_tools_page(session: MCPDiscoverySession, cursor: str | None) -> object:
-    params = None if cursor is None else types.PaginatedRequestParams(cursor=cursor)
-    return await session.list_tools(params=params)
 
 
 def _transport_streams(streams: object) -> tuple[object, object]:
@@ -588,19 +520,9 @@ def _content_text(result: object) -> str:
     return "\n".join(parts) or _NO_OUTPUT
 
 
-def _result_is_error(result: object) -> bool:
-    value = _field(result, "is_error", "isError")
-    return value is True
-
-
-def _is_closed_session_error(error: Exception) -> bool:
-    return isinstance(error, MCPError) and error.code == types.CONNECTION_CLOSED
-
-
 __all__ = [
     "MCPClientSession",
     "MCPDiscoverySession",
-    "MCPServerAdapter",
     "MCPServerConnection",
     "MCPTool",
     "MCPToolSchemaError",
