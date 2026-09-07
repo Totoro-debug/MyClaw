@@ -39,7 +39,7 @@ Current full-suite evidence: 1,736 tests passed with 10 conditional Windows skip
 ## Issue #224 MCP Tool Delivery Evidence
 
 Issue #224 records the MCP Tool integration gate for parent issue #217. The approved contract is
-published across `CONTEXT.md`, the PRD, Runtime Contracts, ADR-0010's supersession note, ADR-0020,
+published across `CONTEXT.md`, the PRD, ADR-0010's supersession note, ADR-0020,
 the MCP implementation plan, and the README. The package metadata declares `mcp>=2,<3`; configured
 stdio and `streamable-http` Servers enter an immutable per-generation MCP Tool Snapshot, share the
 Tool Gateway, bypass extra Tool Confirmation as trusted capabilities, and preserve the documented
@@ -111,7 +111,7 @@ implementation plan are tracked authoritative documents in that tree. The active
 contains no separate Skill module implementation plan.
 
 The prospective patch adopts these deferred architecture documents: `CONTEXT.md`,
-`docs/myclaw-personal-agent-prd.md`, `docs/myclaw-runtime-contracts.md`, the superseded
+`docs/myclaw-personal-agent-prd.md`, the superseded
 notes in `docs/adr/0014-use-message-bus-agent-loop-and-agent-runner.md` and
 `docs/adr/0016-use-agent-home-skill-catalog-and-progressive-loading.md`, the full
 `docs/adr/0017-use-cli-composition-root-and-session-scoped-agent-loop.md`, and the full
@@ -244,7 +244,6 @@ Verification executed on Windows x64 on 2026-08-28:
 
 - [Domain language](../CONTEXT.md)
 - [Product requirements](myclaw-personal-agent-prd.md)
-- [Runtime contracts](myclaw-runtime-contracts.md)
 - [ADR-0017: CLI composition root and Session-scoped Agent Loop](adr/0017-use-cli-composition-root-and-session-scoped-agent-loop.md)
 - [ADR-0018: Centralized Model Request Context construction](adr/0018-centralize-model-request-context-construction.md)
 - [ADR-0019: Runtime Reasoning Effort best-effort persistence](adr/0019-persist-runtime-reasoning-effort-best-effort.md)

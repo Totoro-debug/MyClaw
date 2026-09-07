@@ -23,7 +23,6 @@ _ACTIVE_SKILL_CONTRACTS = (
     ROOT / "CONTEXT.md",
     ROOT / "README.md",
     ROOT / "docs" / "myclaw-personal-agent-prd.md",
-    ROOT / "docs" / "myclaw-runtime-contracts.md",
     ROOT / "docs" / "terminal-conversation-ui-design.md",
     ROOT / "docs" / "release-readiness.md",
 )
@@ -51,7 +50,6 @@ _MCP_AUTHORITATIVE_DOCS = (
     ROOT / "README.md",
     ROOT / "CONTEXT.md",
     ROOT / "docs" / "myclaw-personal-agent-prd.md",
-    ROOT / "docs" / "myclaw-runtime-contracts.md",
     ROOT / "docs" / "adr" / "0010-fixed-tool-catalog-and-base-tool-boundaries.md",
     ROOT / "docs" / "adr" / "0020-expose-configured-mcp-tools-through-tool-gateway.md",
     ROOT / "docs" / "mcp-tool-support-implementation-plan.md",
@@ -74,7 +72,6 @@ _OBSOLETE_SKILL_MARKERS = (
 _ISSUE_202_ARCHITECTURE_DOCS = (
     ROOT / "CONTEXT.md",
     ROOT / "docs" / "myclaw-personal-agent-prd.md",
-    ROOT / "docs" / "myclaw-runtime-contracts.md",
     ROOT / "docs" / "adr" / "0014-use-message-bus-agent-loop-and-agent-runner.md",
     ROOT / "docs" / "adr" / "0016-use-agent-home-skill-catalog-and-progressive-loading.md",
     ROOT / "docs" / "adr" / "0017-use-cli-composition-root-and-session-scoped-agent-loop.md",
@@ -695,7 +692,6 @@ def test_user_and_release_docs_publish_the_session_log_risk_contract() -> None:
 def test_active_contract_docs_do_not_claim_the_removed_runtime_log_implementation() -> None:
     active_contracts = (
         ROOT / "CONTEXT.md",
-        ROOT / "docs" / "myclaw-runtime-contracts.md",
         ROOT / "docs" / "release-readiness.md",
         ROOT / "docs" / "adr" / "0007-use-host-adapters.md",
     )
@@ -754,7 +750,6 @@ def test_active_support_contract_matches_host_neutral_release_evidence() -> None
     active_paths = (
         ROOT / "CONTEXT.md",
         ROOT / "README.md",
-        ROOT / "docs" / "myclaw-runtime-contracts.md",
         ROOT / "docs" / "release-readiness.md",
     )
     support = "\n".join(path.read_text(encoding="utf-8").lower() for path in active_paths)
@@ -811,13 +806,12 @@ def test_mcp_contract_is_published_across_authoritative_documents() -> None:
         assert all(claim.casefold() in definition for claim in claims), term
 
     prd = documents["myclaw-personal-agent-prd.md"]
-    runtime = documents["myclaw-runtime-contracts.md"]
     adr_0010 = documents["0010-fixed-tool-catalog-and-base-tool-boundaries.md"]
     adr_0020 = documents["0020-expose-configured-mcp-tools-through-tool-gateway.md"]
     plan = documents["mcp-tool-support-implementation-plan.md"]
     readme = documents["README.md"]
 
-    for document in (prd, runtime, adr_0020, plan):
+    for document in (prd, adr_0020, plan):
         for claim in (
             "mcp_name",
             "streamable-http",
@@ -827,7 +821,7 @@ def test_mcp_contract_is_published_across_authoritative_documents() -> None:
         ):
             assert claim.casefold() in document.casefold(), claim
 
-    for document in (prd, runtime, adr_0020):
+    for document in (prd, adr_0020):
         for claim in (
             "mcp>=2,<3",
             "call_tool",
@@ -840,17 +834,10 @@ def test_mcp_contract_is_published_across_authoritative_documents() -> None:
     assert "superseded by" in adr_0010.casefold()
     assert "ADR-0020" in adr_0010
     assert "[mcp.servers.<mcp_name>]" in prd
-    assert "[mcp.servers.<mcp_name>]" in runtime
     assert "Implementation status: T1-T7 complete after final verification" in plan
     assert "MCP Tool Snapshot" in readme
     assert "当前版本没有 daemon、HTTP/IPC 服务、MCP" not in readme
     assert "Model Request 保存缓存的 typed snapshot" not in prd
-    assert "固定十个结构化 Tool schemas" not in runtime
-    assert (
-        "Agent Loop abort or close -> MCP Runtime Manager close -> Dream close -> Model Router close"
-        in runtime
-    )
-    assert "final BaseTool cast/Schema validation" not in runtime
 
 
 def test_mcp_release_evidence_publishes_local_transports_and_quality_gates() -> None:
@@ -933,24 +920,6 @@ def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
     assert set(_SUPERSEDED_ADRS).isdisjoint(_ACTIVE_ADRS)
     assert _adr_status(skill_adr) == "accepted"
 
-    adr = skill_adr.read_text(encoding="utf-8").casefold()
-    runtime_contract = (
-        (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8").casefold()
-    )
-    current_skill_contract = f"{adr}\n{runtime_contract}"
-    for claim in (
-        "complete `skill.md` document",
-        "只读取一次完整 utf-8 document",
-        "loadedskill",
-        "document: str",
-        "skillloader",
-    ):
-        assert claim in current_skill_contract
-    assert "def load(" in runtime_contract
-    assert "validate" in runtime_contract
-    assert "body: str" not in runtime_contract
-    assert "snapshot: skillsnapshot" not in runtime_contract
-
     context = (ROOT / "CONTEXT.md").read_text(encoding="utf-8")
     glossary_contract = {
         "Skill": (
@@ -971,15 +940,6 @@ def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
     for term, claims in glossary_contract.items():
         definition = _glossary_definition(context, term)
         assert all(claim in definition for claim in claims), term
-
-    runtime_contract = (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8")
-    for claim in (
-        "原始 `name` 不做 trim",
-        "完整结构化 Tool schemas",
-        "Tab is not intercepted",
-    ):
-        assert claim in runtime_contract
-    assert "always_body" not in runtime_contract
 
     prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
     management_contract = _markdown_section(prd, "CLI and management").casefold()
@@ -1022,7 +982,6 @@ def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
 def test_reload_skill_command_and_lifecycle_are_published_by_active_docs() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
-    runtime = (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8")
     terminal = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(encoding="utf-8")
     release = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
 
@@ -1030,7 +989,6 @@ def test_reload_skill_command_and_lifecycle_are_published_by_active_docs() -> No
     command_sections = {
         "README": _markdown_section(readme, "开始对话"),
         "PRD": _markdown_section(prd, "CLI and management"),
-        "Runtime Contracts": _markdown_section(runtime, "8.3a Shared Slash Completion"),
         "Terminal Design": _markdown_section(terminal, "Input Area"),
     }
     for label, section in command_sections.items():
@@ -1040,7 +998,6 @@ def test_reload_skill_command_and_lifecycle_are_published_by_active_docs() -> No
     for label, content in {
         "README": readme,
         "PRD": prd,
-        "Runtime Contracts": runtime,
         "Terminal Design": terminal,
         "Release Readiness": release,
     }.items():
@@ -1464,15 +1421,11 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
     terminal_design = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(
         encoding="utf-8"
     )
-    runtime_contracts = (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8")
     release_readiness = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
     implementation_plan = (ROOT / "docs" / "cli-composition-root-implementation-plan.md").read_text(
         encoding="utf-8"
     )
     assert "run_repl" not in terminal_design
-    assert "run_repl" not in runtime_contracts
-    assert "class SummaryStore" not in runtime_contracts
-    assert "class MemoryStore" not in runtime_contracts
     assert "tests/memory/test_memory_task.py" not in release_readiness
     assert "ManagementDispatcher" not in implementation_plan
     assert "current_memory_manager" not in implementation_plan
@@ -1496,7 +1449,6 @@ def test_issue_202_authoritative_documents_identify_one_current_composition_boun
     adr_0017 = adr_0017_path.read_text(encoding="utf-8")
     context = (ROOT / "CONTEXT.md").read_text(encoding="utf-8")
     prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
-    runtime_contract = (ROOT / "docs" / "myclaw-runtime-contracts.md").read_text(encoding="utf-8")
     terminal_design = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(
         encoding="utf-8"
     )
@@ -1554,8 +1506,7 @@ def test_issue_202_authoritative_documents_identify_one_current_composition_boun
     assert all(marker in adr_0017 for marker in ("CLI", "Agent Loop", "Runtime Generation"))
     assert all(marker in context for marker in ("Runtime Generation", "Dream"))
     assert all(marker in prd for marker in ("Message Bus", "Dream", "Agent Loop"))
-    assert all(marker in runtime_contract for marker in ("D18", "Dream", "Runtime Generation"))
-    for document in (adr_0017, prd, runtime_contract, plan):
+    for document in (adr_0017, prd, plan):
         assert "final linearization refinement" in document
         assert "target preparation is a precondition" in document
         assert "quiesce_for_rebind -> pause_and_drain -> current unavailable" in document

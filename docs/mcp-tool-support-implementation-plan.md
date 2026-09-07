@@ -10,7 +10,6 @@ status: accepted
 - Implementation status: T1-T7 complete after final verification
 - 决策来源：[ADR-0020](adr/0020-expose-configured-mcp-tools-through-tool-gateway.md)
 - 产品行为来源：[PRD](myclaw-personal-agent-prd.md)
-- 运行时契约来源：[Runtime Contracts](myclaw-runtime-contracts.md)
 - 领域语言来源：[CONTEXT.md](../CONTEXT.md)
 
 本文把已确认的“用 `MCPTool` 将 MCP Tool 包装为内置 Tool”拆成可独立开发、独立测试、独立合并的 Task。实现顺序允许在每个 Task 合并后保持仓库可测试；不得在实施中重新引入动态注册、Tool 重载命令或另一套 Agent runtime。
@@ -326,11 +325,11 @@ Task 之间通过清晰接口衔接；每个 Task 都能独立提交、独立运
 
 ### T7：契约文档与全回归
 
-**边界**：更新 PRD、Runtime Contracts、ADR-0010 supersession、默认 README/开发依赖说明，并执行全套质量门禁；MCP SDK 依赖已由 T3 引入，本 Task 只核对其存在和解析结果。
+**边界**：更新 PRD、ADR-0010 supersession、默认 README/开发依赖说明，并执行全套质量门禁；MCP SDK 依赖已由 T3 引入，本 Task 只核对其存在和解析结果。
 
 **验收**：
 
-- PRD、Runtime Contracts、ADR 和 CONTEXT 对 MCP 名称、配置、生命周期、错误、结果和安全语义无互相矛盾条目。
+- PRD、ADR 和 CONTEXT 对 MCP 名称、配置、生命周期、错误、结果和安全语义无互相矛盾条目。
 - `mcp>=2,<3` 已由 T3 加入 package metadata，且安装解析成功。
 - `pytest` 全量通过；`mypy`、`ruff check`、`ruff format --check` 全量通过。
 - 新增 MCP 测试全部不访问公网；真实 transport 测试仅使用本地 stdio/HTTP fixture。

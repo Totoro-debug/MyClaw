@@ -6,11 +6,7 @@ complete. The review follows the repository's RED -> GREEN TDD practice: injecte
 or reproduced boundary failures were first observed through public interfaces,
 then the same tests were made green with the smallest scoped correction.
 
-The governing contracts are [TOOL_SCHEMA](myclaw-runtime-contracts.md#tool_schema-tool-gateway),
-[Tool Artifacts](myclaw-runtime-contracts.md#117-tool-artifact), the
-[fail-closed capability matrix](myclaw-runtime-contracts.md#12-fail-closed-capability-矩阵), and the
-[Error Contract](myclaw-runtime-contracts.md#13-error-contract). Persistence and
-sandbox boundaries are further defined by
+Persistence and sandbox boundaries are defined by
 [ADR-0001](adr/0001-file-first-local-persistence.md),
 [ADR-0002](adr/0002-fixed-agent-home.md), and
 [ADR-0010](adr/0010-fixed-tool-catalog-and-base-tool-boundaries.md), with active Session

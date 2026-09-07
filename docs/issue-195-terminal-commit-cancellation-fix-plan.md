@@ -1,6 +1,6 @@
 # Issue #195 Terminal Commit Cancellation Fix Plan
 
-状态：已完成。修复已由 commit `7c84fcb8a05e015f8ffcbb530b7c801de19a4a70` 交付；本文保留经评审的实施方案与修复前事实基线，当前行为以 Runtime Contracts 和实现为准。
+状态：已完成。修复已由 commit `7c84fcb8a05e015f8ffcbb530b7c801de19a4a70` 交付；本文保留经评审的实施方案与修复前事实基线，当前行为以实现为准。
 
 ## 1. 问题与事实依据
 
@@ -116,7 +116,7 @@ def resume(self) -> None: ...
 
 CLI 正常 shutdown 当前先调用 `pause_and_drain()` 再 `close()`，因此 CLI shutdown 也会使用 pause 的取消
 语义；未提交的 `at` Job 会留在 Store，供下次启动执行。这是改变 pause Interface 后的明确影响，需由
-回归测试和运行时契约记录，不能隐式忽略。
+回归测试和发布证据记录，不能隐式忽略。
 
 #### B. 取消并 drain 动态 terminal task
 
@@ -261,7 +261,6 @@ commit、但恢复后重复 recurring occurrence”的不可接受中间版本�
 候选文件：
 
 - `tests/test_cli.py` 或既有 replacement contract test（仅在能使用真实 Schedule public Interface 时增加）
-- `docs/myclaw-runtime-contracts.md`
 - `docs/release-readiness.md`
 
 原则：不要用一个只会记录调用的 FakeScheduleService 宣称证明了 terminal cancellation；CLI 轴只需证明它在
@@ -306,7 +305,7 @@ occurrence tests 保留，作为零回归集合。
 | `every` commit 取消导致立即重复 | deadline 只在 Store operation 正常完成后发布；取消时保留 reservation cursor |
 | Store commit 与 cancel 同时发生 | 以 Store atomic publication 为线性化点；已提交则保留，未提交则按取消恢复 |
 | caller 取消破坏共享 pause barrier | 继续使用 `await_task_preserving_cancellation()` |
-| 正常 shutdown 行为被 pause 改变 | 增加 shutdown/next-start contract 并更新 runtime contracts |
+| 正常 shutdown 行为被 pause 改变 | 增加 shutdown/next-start contract 并更新发布证据 |
 | 为测试暴露新 Interface | 禁止新增公开 hook/port；使用现有 private test Seam 与公开生命周期驱动 |
 | 协程吞掉 `CancelledError` | 生产 Store operation 不吞取消；不以 timeout 脱离 owned task。第三方/未来 adapter 必须遵守取消契约 |
 | 已进入同步 filesystem atomic replace 后操作系统阻塞 | asyncio cancellation 无法抢占不 yield 的同步 I/O；本修复保证 cooperative async wait 可取消，不承诺 hard real-time deadline。若需解决 OS-level hang，应另立 I/O execution/timeout 方案，不扩入本 finding |
@@ -327,7 +326,7 @@ T2 为契约与证据更新，可独立反向提交；不得通过把失败测�
 - T1 所有量化验收通过，且 `/resume` 不再等待一个 cooperative blocked terminal operation 自行释放。
 - T2 全量验证与发布证据通过。
 - 改动范围仅包含实现当前 finding 必需的 Schedule implementation、tests 和契约文档。
-- Issue #188/#195、ADR-0017、runtime contracts 与实际 `pause_and_drain()` 行为之间不存在未记录冲突。
+- Issue #188/#195、ADR-0017 与实际 `pause_and_drain()` 行为之间不存在未记录冲突。
 
 ## 10. 完成证据
 

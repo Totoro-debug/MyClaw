@@ -7,7 +7,6 @@
 - 适用版本：MyClaw `v0.1`
 - 决策来源：[ADR-0017](adr/0017-use-cli-composition-root-and-session-scoped-agent-loop.md)
 - 产品行为来源：[PRD](myclaw-personal-agent-prd.md)
-- 运行时契约来源：[Runtime Contracts](myclaw-runtime-contracts.md)
 - 领域语言来源：[CONTEXT.md](../CONTEXT.md)
 
 本文是 ADR-0017 的可执行实施方案。它不改变已经确认的产品行为，而是把代码层 Runtime 聚合层迁移为
@@ -468,13 +467,13 @@ After Terminal `run_async()` returns, the actual CLI shutdown order is `Manageme
 - 更新 `CONTEXT.md`。
 - 新增 ADR-0017。
 - 在 ADR-0014、ADR-0016 标记被取代的决定。
-- 更新 PRD 与 Runtime Contracts。
+- 更新 PRD。
 
 验收：
 
 - `git diff --check` exit code 为 `0`。
 - 实现代码和测试文件变更数为 `0`。
-- ADR、PRD、Runtime Contracts 对 ownership、Dream、Skill Snapshot、Schedule Job 和 `/resume` 的描述一致。
+- ADR、PRD 对 ownership、Dream、Skill Snapshot、Schedule Job 和 `/resume` 的描述一致。
 
 ### T1：移除 Workspace 包装类
 
@@ -700,7 +699,7 @@ After Terminal `run_async()` returns, the actual CLI shutdown order is `Manageme
 
 - 删除已经没有引用的 test fixtures、compatibility aliases 和 stale exports。
 - 更新 `docs/release-readiness.md`，使其只描述已经落地并验证的实现。
-- 对 ADR/PRD/Runtime Contracts/本计划执行最终一致性检查。
+- 对 ADR/PRD/本计划执行最终一致性检查。
 - 执行全量 test、lint、type-check 和 package build。
 
 量化验收：

@@ -414,5 +414,5 @@ The equation balances exactly: `1448 - 30 - 1 - 10 - 6 + 6 + 5 + 3 + 1 + 1 = 141
 
 The original Issue #201 migration did not edit its protected architecture
 authorities. This convergence addendum makes only factual final-interface and
-evidence updates to Runtime Contracts, Terminal design, release readiness, and
+evidence updates to Terminal design, release readiness, and
 the implementation plan; it does not change ADR-0017's accepted ownership model.

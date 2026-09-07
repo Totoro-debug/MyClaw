@@ -46,8 +46,8 @@ MCP Tool 支持已由 [ADR-0020](adr/0020-expose-configured-mcp-tools-through-to
   iteration 是一次 model call 加该响应的全部顺序 Tool calls，Provider retry 不计数；
   default/minimum `runtime.max_iterations` 为 50。第 50 次完成全部 Tools；若此时没有请求
   normal cancellation，则返回 `agent_iteration_limit` 且不发起第 51 次 model call，取消
-  请求优先。`agent_iteration_limit` 与最大循环固定中文文案、`turn_cancelled` 与
-  `MyClaw 已取消本轮对话。` 均由 runtime contracts 定义。Provider-visible
+  请求优先。`agent_iteration_limit` 使用最大循环固定中文文案；`turn_cancelled` 使用
+  `MyClaw 已取消本轮对话。`。Provider-visible
   reasoning 只保留 Provider 返回内容；opaque continuation 只在同一 Tool loop 内传递，
   不进入 Session 或 Outbound。
 - `Blackboard.generate()` 仅在一次 Task Framing 调用中接收 Model Router；Agent Runner 继续接收传给同一 Agent Loop 的同一个 Model Router 对象，CLI composition root 继续独占 Router 构造、Runtime Lifetime ownership 与最终 close。
@@ -438,6 +438,5 @@ MCP Tool 支持已由 [ADR-0020](adr/0020-expose-configured-mcp-tools-through-to
 - ADR-0010 记录 Exec 的 Workspace cwd、destructive/DNS 确认边界及首版不提供 OS 级 sandbox；Exec 没有 allowlist，已知风险形状请求一次性确认。
 - ADR-0014 记录仍有效的 Message Bus、Agent Loop 和可复用 bounded Agent Runner 边界；ADR-0017 取代其 Runtime Generation ownership/replacement 决定及封闭的 `chat`/`schedule` route 枚举，并取代 ADR-0016 的 Runtime-Lifetime Skill loading scope。
 - ADR-0015 记录 Session Blackboard 与 foreground Task Framing 边界。
-- `docs/myclaw-runtime-contracts.md` 是已接受的首版 schema、Port、事件和错误契约。
 - `CONTEXT.md` 是最终 canonical language；本 PRD 的实现术语应与其保持一致。
 - GitHub issue：<https://github.com/Totoro-debug/myclaw/issues/1>；本文件仍是需求的本地 canonical source。
