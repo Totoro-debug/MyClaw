@@ -47,11 +47,20 @@ def test_legacy_runtime_module_is_not_discoverable() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("close_fails", "terminal_fails"),
+    [(False, False), (True, False), (True, True)],
+    ids=["normal", "close-error", "primary-and-close-error"],
+)
 async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    close_fails: bool,
+    terminal_fails: bool,
 ) -> None:
     events: list[str] = []
+    close_error = RuntimeError("loop close failed")
+    primary_error = RuntimeError("terminal failed")
 
     class FakeWorkspaceState:
         def __init__(self, workspace_path: Path) -> None:
@@ -61,6 +70,19 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
         def initialize(self, *, agent_home_root: Path) -> None:
             del agent_home_root
             events.append("workspace_initialize")
+
+    class FakeMCPRuntimeManager:
+        def __init__(self, workspace: Path, **kwargs: object) -> None:
+            del workspace, kwargs
+            events.append("mcp_init")
+
+        async def start(self, configuration: object) -> object:
+            del configuration
+            events.append("mcp_start")
+            return SimpleNamespace(snapshot=())
+
+        async def close(self) -> None:
+            events.append("mcp_close")
 
     class FakeMessageBus:
         def __init__(self) -> None:
@@ -129,6 +151,8 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
 
         async def close(self) -> None:
             events.append("loop_close")
+            if close_fails:
+                raise close_error
 
         async def abort(self) -> None:
             events.append("loop_abort")
@@ -142,7 +166,7 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
             events.append("management_init")
 
         def deactivate(self) -> None:
-            return None
+            events.append("management_deactivate")
 
     class FakeDispatcher:
         def __init__(self, management: object) -> None:
@@ -156,8 +180,14 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
 
         async def run_async(self) -> None:
             events.append("app_run")
+            try:
+                if terminal_fails:
+                    raise primary_error
+            finally:
+                events.append("terminal_restore")
 
     monkeypatch.setattr(cli, "WorkspaceState", FakeWorkspaceState)
+    monkeypatch.setattr(cli, "MCPRuntimeManager", FakeMCPRuntimeManager)
     monkeypatch.setattr(cli, "MessageBus", FakeMessageBus)
     monkeypatch.setattr(cli, "ModelRouter", FakeRouter)
     monkeypatch.setattr(cli, "MemoryManager", FakeMemoryManager)
@@ -177,15 +207,31 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
     source = Path(cli.__file__).read_text(encoding="utf-8")
     assert "async def _run_cli_conversation" in source
 
-    await cli._run_cli_conversation(
-        agent_home=home,
-        workspace=tmp_path / "workspace",
-        configuration=configuration,
-    )
+    if close_fails:
+        with pytest.raises(RuntimeError) as raised:
+            await cli._run_cli_conversation(
+                agent_home=home,
+                workspace=tmp_path / "workspace",
+                configuration=configuration,
+            )
+        if terminal_fails:
+            assert raised.value is primary_error
+            assert raised.value.__cause__ is close_error
+        else:
+            assert raised.value is close_error
+            assert raised.value.__cause__ is None
+    else:
+        await cli._run_cli_conversation(
+            agent_home=home,
+            workspace=tmp_path / "workspace",
+            configuration=configuration,
+        )
 
     assert events == [
         "workspace_init",
         "workspace_initialize",
+        "mcp_init",
+        "mcp_start",
         "bus_init",
         "router_init",
         "memory_init",
@@ -201,9 +247,12 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
         "loop_start",
         "schedule_start",
         "app_run",
+        "terminal_restore",
+        "management_deactivate",
         "schedule_pause",
         "schedule_close",
         "loop_close",
+        "mcp_close",
         "dream_close",
         "router_close",
     ]

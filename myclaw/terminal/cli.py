@@ -176,7 +176,6 @@ async def _run_cli_conversation(
     active_mcp_snapshot: MCPToolSnapshot = ()
     replacement_lock = asyncio.Lock()
     aborted_loops: list[AgentLoop] = []
-    closed_loops: list[AgentLoop] = []
     replacement_failed_closed = False
     started = False
     primary_error: BaseException | None = None
@@ -187,12 +186,6 @@ async def _run_cli_conversation(
             return
         aborted_loops.append(loop)
         await loop.abort()
-
-    async def close_loop_once(loop: AgentLoop) -> None:
-        if any(loop is existing for existing in closed_loops):
-            return
-        closed_loops.append(loop)
-        await loop.close()
 
     async def abort_target_for_management(target: AgentLoop) -> None:
         try:
@@ -519,7 +512,7 @@ async def _run_cli_conversation(
         if active_loop is not None:
             try:
                 if started and active_loop is current_loop and not replacement_failed_closed:
-                    await close_loop_once(active_loop)
+                    await active_loop.close()
                 else:
                     await abort_loop_once(active_loop)
             except BaseException as error:

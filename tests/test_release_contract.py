@@ -53,7 +53,7 @@ _ISSUE_202_PERSISTENCE_EVIDENCE = {
     ),
 }
 _ISSUE_202_ARCHITECTURE_EVIDENCE = (
-    "tests/test_cli.py::test_cli_async_root_owns_lifetime_components_and_async_shutdown",
+    "tests/test_cli.py::test_cli_async_root_owns_lifetime_components_and_async_shutdown[normal]",
     "tests/agent/test_loop.py::"
     "test_agent_loop_constructs_each_generation_collaborator_once_without_side_effects",
     "tests/agent/test_message_bus.py::"
@@ -899,15 +899,28 @@ def test_issue_202_cli_source_records_cutover_and_shutdown_order() -> None:
     assert min(preflight_lines) < cutover[0]
     assert cutover == tuple(sorted(cutover))
 
+    conversation = _issue_202_function(cli_tree, "_run_cli_conversation")
     shutdown = next(
-        node for node in ast.walk(cli_tree) if isinstance(node, ast.Try) and node.finalbody
+        node for node in conversation.body if isinstance(node, ast.Try) and node.finalbody
     )
     final_tree = ast.Module(body=shutdown.finalbody, type_ignores=[])
+    close_lines = _issue_202_attribute_call_lines(final_tree, "active_loop", "close")
+    assert len(close_lines) == 1
+    assert _issue_202_attribute_call_lines(conversation, "active_loop", "close") == close_lines
+    abort_lines = _issue_202_named_call_lines(final_tree, {"abort_loop_once"})
+    assert abort_lines
+    schedule_close_line = min(
+        _issue_202_attribute_call_lines(final_tree, "schedule_service", "close")
+    )
+    mcp_close_line = min(_issue_202_attribute_call_lines(final_tree, "mcp_manager", "close"))
+    assert all(
+        schedule_close_line < line < mcp_close_line for line in (*close_lines, *abort_lines)
+    )
     shutdown_events = (
         min(_issue_202_attribute_call_lines(final_tree, "management", "deactivate")),
         min(_issue_202_attribute_call_lines(final_tree, "schedule_service", "pause_and_drain")),
-        min(_issue_202_attribute_call_lines(final_tree, "schedule_service", "close")),
-        min(_issue_202_named_call_lines(final_tree, {"abort_loop_once", "close_loop_once"})),
+        schedule_close_line,
+        mcp_close_line,
         min(_issue_202_attribute_call_lines(final_tree, "dream", "close")),
         min(_issue_202_attribute_call_lines(final_tree, "router", "close")),
     )
