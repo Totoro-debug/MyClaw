@@ -187,19 +187,6 @@ async def _run_cli_conversation(
         aborted_loops.append(loop)
         await loop.abort()
 
-    async def abort_target_for_management(target: AgentLoop) -> None:
-        try:
-            await abort_loop_once(target)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            raise ManagementError(
-                ErrorInfo(
-                    "persistence_error",
-                    "Conversation Session could not be prepared.",
-                )
-            ) from error
-
     try:
         workspace_path = normalize_workspace_path(workspace)
         workspace_state = WorkspaceState(workspace_path)
@@ -327,7 +314,16 @@ async def _run_cli_conversation(
                 async def reject_prepared_target(target: AgentLoop) -> None:
                     nonlocal pending_target
                     try:
-                        await abort_target_for_management(target)
+                        await abort_loop_once(target)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        raise ManagementError(
+                            ErrorInfo(
+                                "persistence_error",
+                                "Conversation Session could not be prepared.",
+                            )
+                        ) from error
                     finally:
                         pending_target = None
                         await release_replacement_barrier(resume_inbound=True)

@@ -22,7 +22,12 @@ from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.management.commands import ManagementCommandDispatcher
-from myclaw.management.service import FatalManagementError, ManagementError, ManagementViewService
+from myclaw.management.service import (
+    FatalManagementError,
+    ManagementError,
+    ManagementViewService,
+    ResumeResult,
+)
 from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.conversation import TerminalConversationApp
@@ -1164,15 +1169,25 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("abort_outcome", ["success", "error", "cancel"])
 async def test_cli_resume_active_requires_force_before_replacing_the_generation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    abort_outcome: Literal["success", "error", "cancel"],
 ) -> None:
     events: list[str] = []
     current_callback: Callable[[], object] | None = None
     replace_callback: Callable[[str, bool], Awaitable[None]] | None = None
     initial_loop: object | None = None
     target_loop: object | None = None
+    user_executor: Callable[[object], Awaitable[None]] | None = None
+    management_errors: list[ManagementError] = []
+    abort_entered = asyncio.Event()
+    release_abort = asyncio.Event()
+    secret = "private-candidate-abort-detail"
+    abort_error = RuntimeError(secret)
+    target_id = "20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000"
+    rejection_event = "replacement_cancelled" if abort_outcome == "cancel" else "management_error"
 
     class FakeSession:
         session_id = "old-session"
@@ -1217,7 +1232,11 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
 
     class FakeScheduleService:
         def __init__(self, **kwargs: object) -> None:
-            del kwargs
+            nonlocal user_executor
+            user_executor = cast(
+                Callable[[object], Awaitable[None]],
+                kwargs["execute_user_job"],
+            )
 
         def context_timezone_name(self) -> str:
             return "Asia/Shanghai"
@@ -1246,12 +1265,17 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
     class FakeAgentLoop:
         def __init__(self, **kwargs: object) -> None:
             nonlocal initial_loop, target_loop
+            loop_instances.append(self)
             session_id = kwargs["session_id"]
             self.session = FakeSession()
             self.control = (
                 FakeControl() if session_id is None else SimpleNamespace(has_active_run=False)
             )
             self.skill_metadata = ()
+            self.start_calls = 0
+            self.close_calls = 0
+            self.abort_calls = 0
+            self.replacement_barrier_held = False
             if session_id is None:
                 initial_loop = self
                 events.append("old_init")
@@ -1263,22 +1287,45 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
             events.append("old_preflight" if self is initial_loop else "target_preflight")
 
         async def start(self) -> None:
+            self.start_calls += 1
             events.append("old_start" if self is initial_loop else "target_start")
 
         async def close(self) -> None:
-            events.append("old_close")
+            self.close_calls += 1
+            events.append("old_close" if self is initial_loop else "target_close")
 
         async def abort(self) -> None:
+            self.abort_calls += 1
             events.append("target_abort" if self is not initial_loop else "old_abort")
+            if self is loop_instances[1]:
+                if abort_outcome == "error":
+                    raise abort_error
+                if abort_outcome == "cancel":
+                    abort_entered.set()
+                    await release_abort.wait()
 
         async def _pause_for_replacement(self) -> None:
-            return None
+            assert not self.replacement_barrier_held
+            self.replacement_barrier_held = True
+            events.append("replacement_barrier_pause")
 
         async def _release_replacement_barrier(self, *, resume_inbound: bool) -> None:
-            del resume_inbound
+            assert self.replacement_barrier_held
+            self.replacement_barrier_held = False
+            events.append(f"replacement_barrier_release:{resume_inbound}")
+
+        async def run_schedule_job(self, job: object) -> None:
+            del job
+            assert current_callback is not None
+            assert current_callback() is self
+            assert not self.replacement_barrier_held
+            assert self.abort_calls == self.close_calls == 0
+            events.append("old_schedule_job" if self is initial_loop else "target_schedule_job")
 
         def project_foreground_conversation(self) -> object:
-            return SimpleNamespace(session_id="target", messages=())
+            return SimpleNamespace(session_id=target_id, messages=())
+
+    loop_instances: list[FakeAgentLoop] = []
 
     class FakeManagementService:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -1293,25 +1340,78 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
         def deactivate(self) -> None:
             return None
 
-    class FakeDispatcher:
-        def __init__(self, management: object) -> None:
-            del management
+        async def resume(self, session_id: str, *, force: bool = False) -> ResumeResult:
+            assert replace_callback is not None
+            try:
+                await replace_callback(session_id, force)
+            except ManagementError as error:
+                management_errors.append(error)
+                raise
+            return ResumeResult(session_id=session_id)
 
     class FakeApp:
         def __init__(self, **kwargs: object) -> None:
-            del kwargs
+            self.dispatcher = cast(ManagementCommandDispatcher, kwargs["management_dispatcher"])
 
         async def run_async(self) -> None:
-            assert replace_callback is not None
-            try:
-                await replace_callback("target", False)
-            except ManagementError as error:
-                assert error.error.code == "model_invalid_request"
-                events.append("management_error")
+            if abort_outcome == "cancel":
+                replacement = asyncio.create_task(self.dispatcher.resume(target_id))
+                try:
+                    await asyncio.wait_for(abort_entered.wait(), timeout=1)
+                    assert not replacement.done()
+                    replacement.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(replacement, timeout=1)
+                    assert replacement.cancelled()
+                finally:
+                    if not replacement.done():
+                        replacement.cancel()
+                    await asyncio.wait_for(
+                        asyncio.gather(replacement, return_exceptions=True), timeout=1
+                    )
+                assert management_errors == []
+            else:
+                result = await self.dispatcher.resume(target_id)
+                assert result.handled
+                assert result.resumed_session_id is None
+                assert len(management_errors) == 1
+                error = management_errors[0]
+                if abort_outcome == "error":
+                    assert error.error.code == "persistence_error"
+                    assert error.error.message == "Conversation Session could not be prepared."
+                    assert error.__cause__ is abort_error
+                    assert result.output == (
+                        "persistence_error: Conversation Session could not be prepared."
+                    )
+                else:
+                    assert error.error.code == "model_invalid_request"
+                    assert result.output == (
+                        "model_invalid_request: An active foreground run must be confirmed "
+                        "before switching Sessions."
+                    )
+                assert result.output is not None
+                assert secret not in result.output
+            events.append(rejection_event)
             assert current_callback is not None
             assert current_callback() is initial_loop
-            await replace_callback("target", True)
+            old, rejected = loop_instances
+            assert not old.replacement_barrier_held
+            assert events.count("replacement_barrier_release:True") == 1
+            assert "replacement_barrier_release:False" not in events
+            assert old.abort_calls == old.close_calls == 0
+            assert rejected.abort_calls == 1
+            assert rejected.start_calls == rejected.close_calls == 0
+            for destructive_event in (
+                "quiesce", "schedule_pause", "old_abort", "bus_reset", "rebind", "target_start"
+            ):
+                assert destructive_event not in events
+            assert user_executor is not None
+            await user_executor(object())
+            result = await self.dispatcher.resume(target_id, force=True)
+            assert result.resumed_session_id == target_id
             assert current_callback() is target_loop
+            assert target_loop is not rejected
+            await user_executor(object())
 
         async def quiesce_for_rebind(self) -> None:
             events.append("quiesce")
@@ -1328,7 +1428,6 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
     monkeypatch.setattr(cli, "ScheduleService", FakeScheduleService)
     monkeypatch.setattr(cli, "AgentLoop", FakeAgentLoop)
     monkeypatch.setattr(cli, "ManagementViewService", FakeManagementService)
-    monkeypatch.setattr(cli, "ManagementCommandDispatcher", FakeDispatcher)
     monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
 
     home = AgentHome(tmp_path / "agent-home")
@@ -1344,8 +1443,9 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
     )
 
     assert events.index("target_preflight") < events.index("target_abort")
-    assert events.index("target_abort") < events.index("management_error")
-    assert events.index("management_error") < events.index("old_abort")
+    assert events.index("target_abort") < events.index(rejection_event)
+    assert events.index(rejection_event) < events.index("old_schedule_job")
+    assert events.index("old_schedule_job") < events.index("old_abort")
     assert events.index("old_abort") < events.index("bus_reset")
     assert events.index("bus_reset") < events.index("rebind")
     assert events.index("rebind") < events.index("target_start")
@@ -1353,6 +1453,16 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
     assert events.count("target_init") == 2
     assert events.count("target_abort") == 1
     assert events.count("old_abort") == 1
+    assert events.count("replacement_barrier_pause") == 2
+    assert events.count("replacement_barrier_release:True") == 2
+    assert events.count("old_schedule_job") == events.count("target_schedule_job") == 1
+    old, rejected, replacement_loop = loop_instances
+    assert old.abort_calls == 1
+    assert old.close_calls == 0
+    assert rejected.abort_calls == 1
+    assert rejected.start_calls == rejected.close_calls == 0
+    assert replacement_loop.start_calls == replacement_loop.close_calls == 1
+    assert replacement_loop.abort_calls == 0
 
 
 @pytest.mark.asyncio
