@@ -45,6 +45,13 @@ class _RepresentativeTool(BaseTool):
         return f"{text}:{empty_text}:{count}:{enabled}"
 
 
+@pytest.mark.asyncio
+async def test_default_hooks_accept_a_property_named_self() -> None:
+    tool = _RepresentativeTool()
+    assert tool.validate_arguments(**{"self": "ok"}) is None
+    assert await tool.check_safety(**{"self": "ok"}) is None
+
+
 def test_base_tool_generates_complete_openai_function_calling_schema() -> None:
     assert _RepresentativeTool().to_schema() == {
         "type": "function",

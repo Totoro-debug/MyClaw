@@ -372,7 +372,7 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
         """Build the temporary restricted Schema used by Built-in preparation."""
         return _schema_from_class(type(self), getattr(type(self), "execute", None))
 
-    def validate_arguments(self, **arguments: Any) -> Any:
+    def validate_arguments(self, /, **arguments: Any) -> Any:
         """Validate normalized Tool-specific arguments before safety checks.
 
         Concrete Tools may raise ``ToolError`` with a model-safe domain message.  The
@@ -381,7 +381,7 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
         """
         del arguments
 
-    async def check_safety(self, **arguments: Any) -> str | None:
+    async def check_safety(self, /, **arguments: Any) -> str | None:
         """Return a confirmation reason for an unsafe normalized invocation."""
         del arguments
         return None

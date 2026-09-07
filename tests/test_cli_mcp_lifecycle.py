@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -29,6 +30,7 @@ from myclaw.session.session import Session
 from myclaw.tools.mcp import MCPServerConnection
 from myclaw.tools.mcp_runtime import MCPServerFailure, MCPStartupReport
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
+from tests.fixtures.mcp_wire import ObservedLifetimes, stdio_wire_configuration, wire_tool
 
 
 def _configuration() -> Any:
@@ -619,10 +621,14 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("closed_before_resume", [False, True])
 async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    closed_before_resume: bool,
 ) -> None:
+    observed = ObservedLifetimes(monkeypatch)
+    tasks_before = asyncio.all_tasks()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setenv("MYCLAW_MCP_FLOW_TEST", "inherited")
@@ -824,7 +830,9 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
             self.session.close()
 
         async def _pause_for_replacement(self) -> None:
-            pass
+            assert not connections[0].unavailable
+            assert len(observed.processes) == (2 if closed_before_resume else 1)
+            assert len(loops) == 1
 
         async def _release_replacement_barrier(self, *, resume_inbound: bool) -> None:
             del resume_inbound
@@ -851,6 +859,9 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
 
         async def run_async(self) -> None:
             assert replace_callback is not None
+            if closed_before_resume:
+                await observed.stop(0)
+                assert connections[0].unavailable
             await replace_callback(loops[0].session.session_id, False)
 
         async def quiesce_for_rebind(self) -> None:
@@ -880,11 +891,43 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
 
     assert len(connections) == 1
     assert len(loops) == 2
-    assert loops[0].mcp_tools[0] is loops[1].mcp_tools[0]
+    assert (loops[0].mcp_tools[0] is loops[1].mcp_tools[0]) is not closed_before_resume
     assert len(schema_requests) == 4
     persisted = Session.load(loops[0].session.workspace_state, loops[0].session.session_id)
     assert [message["content"] for message in persisted.messages if message["role"] == "tool"] == [
         "generation-1:inherited",
         "generation-2:inherited",
     ]
-    assert transport_events == ["entered", "closed"]
+    assert transport_events == ["entered", "closed"] * (2 if closed_before_resume else 1)
+    observed.assert_closed()
+    assert asyncio.all_tasks() - tasks_before == set()
+
+
+@pytest.mark.asyncio
+async def test_cli_real_wire_discovery_emits_one_aggregate_notice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[str] = []
+    monkeypatch.setattr(cli, "_print_mcp_notice", notices.append)
+    scenario = {
+        "pages": {
+            "": {
+                "tools": [
+                    wire_tool(),
+                    {"name": "private-array", "inputSchema": []},
+                    {"name": "private-missing"},
+                    wire_tool("private-root", inputSchema={"type": "string"}),
+                ]
+            }
+        }
+    }
+    manager = mcp_runtime.MCPRuntimeManager(tmp_path)
+    try:
+        report = await manager.start({"remote": stdio_wire_configuration(tmp_path, scenario)})
+        assert report.connected_servers == ("remote",)
+        cli._report_mcp_generation(report)
+        assert notices == ["MCP Server 'remote' skipped 3 invalid MCP Tools."]
+        assert await report.snapshot[0].execute_prepared({}) == "wire text"
+    finally:
+        await manager.close()

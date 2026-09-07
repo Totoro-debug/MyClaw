@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +15,220 @@ from mcp.types import CallToolResult, TextContent
 
 import myclaw.tools.mcp as mcp_adapter
 from myclaw.config.config import MCPServerConfiguration
-from myclaw.tools.mcp import MCPTool, MCPToolSpec
+from myclaw.tools.mcp import MCPServerConnection, MCPTool, MCPToolSpec
 from myclaw.tools.mcp_runtime import MCPRuntimeManager, MCPToolSnapshot, allocate_mcp_tool_name
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
+from tests.fixtures.mcp_wire import (
+    ObservedLifetimes,
+    http_wire_server,
+    stdio_requests,
+    stdio_wire_configuration,
+    wire_result,
+)
+
+
+@pytest.mark.asyncio
+async def test_real_idle_stdio_eof_reconnects_on_first_generation_and_ignores_old_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = ObservedLifetimes(monkeypatch)
+    manager = MCPRuntimeManager(tmp_path)
+    configuration = stdio_wire_configuration(tmp_path, {})
+    tasks_before = asyncio.all_tasks()
+    try:
+        initial = await manager.start({"remote": configuration})
+        assert initial.connected_servers == ("remote",)
+        original_schemas = [tool.to_schema() for tool in initial.snapshot]
+        assert all(r["method"] != "tools/call" for r in stdio_requests(tmp_path))
+        await observed.stop(0)
+        candidate = await manager.prepare_generation()
+        assert candidate.retried_servers == ("remote",)
+        assert candidate.failed_servers == ()
+        assert [tool.to_schema() for tool in initial.snapshot] == original_schemas
+        assert candidate.snapshot[0] is not initial.snapshot[0]
+        assert await candidate.snapshot[0].execute_prepared({}) == "wire text"
+        old_result = await ToolGateway._for_memory(initial.snapshot).call(
+            ModelToolCall(id="late", name=initial.snapshot[0].name, arguments="{}")
+        )
+        assert old_result.content == "MCP Server connection is unavailable."
+        manager.activate_generation(candidate)
+        next_candidate = await manager.prepare_generation()
+        assert next_candidate.retried_servers == ()
+        assert next_candidate.reused_servers == ("remote",)
+        assert await next_candidate.snapshot[0].execute_prepared({}) == "wire text"
+        methods = [r["method"] for r in stdio_requests(tmp_path)]
+        assert methods.count("initialize") == methods.count("tools/list") == 2
+    finally:
+        async with asyncio.timeout(10):
+            await manager.close()
+    observed.assert_closed()
+    assert manager.failed_servers == ()
+    assert asyncio.all_tasks() - tasks_before == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_reconnect", [False, True])
+async def test_real_reconnect_reuses_healthy_server_and_preserves_old_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_reconnect: bool,
+) -> None:
+    observed = ObservedLifetimes(monkeypatch)
+    async with http_wire_server({}) as (healthy, http_configuration):
+        healthy_configuration = MCPServerConfiguration(
+            mcp_name="healthy",
+            enabled=True,
+            transport="streamable-http",
+            url=http_configuration.url,
+            connect_timeout=10,
+            call_timeout=5,
+        )
+        manager = MCPRuntimeManager(tmp_path)
+        try:
+            initial = await manager.start(
+                {
+                    "remote": stdio_wire_configuration(tmp_path, {}),
+                    "healthy": healthy_configuration,
+                }
+            )
+            assert initial.connected_servers == ("healthy", "remote")
+            schemas = [tool.to_schema() for tool in initial.snapshot]
+            if fail_reconnect:
+                (tmp_path / "remote.json").write_text(json.dumps({"pages": {"": {}}}))
+            await observed.stop(0)
+            candidate = await manager.prepare_generation()
+            assert candidate.retried_servers == ("remote",)
+            assert candidate.reused_servers == ("healthy",)
+            assert candidate.failed_servers == (("remote",) if fail_reconnect else ())
+            assert candidate.snapshot[0] is initial.snapshot[0]
+            assert [tool.to_schema() for tool in initial.snapshot] == schemas
+            assert len(candidate.snapshot) == (1 if fail_reconnect else 2)
+            for tool in candidate.snapshot:
+                assert await tool.execute_prepared({}) == "wire text"
+            remote_methods = [r["method"] for r in stdio_requests(tmp_path)]
+            healthy_methods = [r["method"] for r in healthy.requests]
+            assert remote_methods.count("initialize") == remote_methods.count("tools/list") == 2
+            assert healthy_methods.count("initialize") == healthy_methods.count("tools/list") == 1
+        finally:
+            async with asyncio.timeout(10):
+                await manager.close()
+    observed.assert_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page", [{}, {"tools": {}}, {"tools": [], "nextCursor": 42}])
+async def test_real_wire_envelope_failure_is_isolated_to_one_server(
+    tmp_path: Path,
+    page: dict[str, Any],
+) -> None:
+    async with http_wire_server({}) as (healthy, http_configuration):
+        manager = MCPRuntimeManager(tmp_path)
+        try:
+            report = await manager.start(
+                {
+                    "remote": http_configuration,
+                    "broken": stdio_wire_configuration(
+                        tmp_path, {"pages": {"": page}}, name="broken"
+                    ),
+                }
+            )
+            assert report.connected_servers == ("remote",)
+            assert report.failed_servers == ("broken",)
+            assert len(report.failures) == 1
+            assert report.skipped_tool_counts == ()
+            assert await report.snapshot[0].execute_prepared({}) == "wire text"
+            assert [r["method"] for r in stdio_requests(tmp_path, "broken")].count(
+                "tools/list"
+            ) == 1
+            assert [r["method"] for r in healthy.requests].count("tools/list") == 1
+        finally:
+            await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "is_error", "protocol_error", "cancel"])
+async def test_real_sdk_call_failures_do_not_reconnect_healthy_http_session(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    scenario = {"results": {"echo": wire_result(isError=True)}} if failure == "is_error" else {}
+    async with http_wire_server(scenario) as (server, configuration):
+        if failure == "timeout":
+            configuration = replace(configuration, call_timeout=1)
+        manager = MCPRuntimeManager(tmp_path)
+        try:
+            report = await manager.start({"remote": configuration})
+            tool = report.snapshot[0]
+            arguments = (
+                {"hang": True}
+                if failure in {"timeout", "cancel"}
+                else {"error": failure == "protocol_error"}
+            )
+            task = asyncio.create_task(
+                ToolGateway._for_memory((tool,)).call(
+                    ModelToolCall(id="failure", name=tool.name, arguments=json.dumps(arguments))
+                )
+            )
+            try:
+                await server.wait_for("tools/call")
+                if failure == "cancel":
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    async with asyncio.timeout(10):
+                        result = await task
+                    assert result.status == "error"
+                if failure == "cancel":
+                    await server.wait_for("notifications/cancelled")
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            candidate = await manager.prepare_generation()
+            assert candidate.retried_servers == ()
+            assert candidate.reused_servers == ("remote",)
+            assert candidate.snapshot == report.snapshot
+            assert not tool.unavailable
+            assert [r["method"] for r in server.requests].count("initialize") == 1
+            assert [r["method"] for r in server.requests].count("tools/list") == 1
+        finally:
+            await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_real_http_sse_rebuild_is_healthy_but_sdk_read_eof_requires_reconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = ObservedLifetimes(monkeypatch)
+    streams_seen: list[Any] = []
+
+    @asynccontextmanager
+    async def observed_transport(configuration: MCPServerConfiguration, workspace: Path) -> Any:
+        async with mcp_adapter.streamable_http_transport(configuration, workspace) as streams:
+            streams_seen.append(streams)
+            yield streams
+
+    async with http_wire_server({}) as (server, configuration):
+        connection = MCPServerConnection(
+            configuration, tmp_path, transport_factory=observed_transport
+        )
+        try:
+            tools = await connection.connect()
+            async with asyncio.timeout(10):
+                await server.sse_reconnected.wait()
+            assert not connection.unavailable
+            assert not observed.closed[0].is_set()
+            assert await tools[0].execute_prepared({}) == "wire text"
+            await streams_seen[0][0].aclose()
+            async with asyncio.timeout(10):
+                await observed.closed[0].wait()
+            assert connection.unavailable
+        finally:
+            await connection.close()
+    observed.assert_closed()
 
 
 class _ResultSession:
@@ -293,7 +506,7 @@ async def test_default_connection_discovers_provider_safe_names_and_reuses_tools
 
     session = Session()
     monkeypatch.setattr(mcp_adapter, "_transport_for", transport)
-    monkeypatch.setattr(mcp_adapter, "_new_client_session", lambda read, write: session)
+    monkeypatch.setattr(mcp_adapter, "_new_client_session", lambda read, write, **kwargs: session)
     manager = MCPRuntimeManager(Path("."))
     try:
         report = await manager.start({"alpha": configuration})

@@ -13,6 +13,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, ClassVar, Protocol, cast
 
+import anyio
 import mcp.types as types
 from loguru import logger
 from mcp import ClientSession
@@ -21,7 +22,11 @@ from mcp.client.streamable_http import (  # type: ignore[attr-defined]
     create_mcp_http_client,
     streamable_http_client,
 )
+from mcp.shared.dispatcher import CallOptions, OnNotify, OnNotifyIntercept, OnRequest
 from mcp.shared.exceptions import MCPError
+from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
+from mcp_types.methods import validate_server_result
+from pydantic import ValidationError
 
 from myclaw.config.config import MCPServerConfiguration
 from myclaw.tools.base import BaseTool, ToolError
@@ -144,12 +149,42 @@ class MCPTool(BaseTool):
 
 
 def normalize_nullable(value: Any) -> Any:
-    """Normalize the MCP ``nullable`` extension recursively for model schemas."""
+    """Normalize nullable at Schema positions, preserving names and JSON data."""
     if isinstance(value, dict):
         nullable = value.get("nullable") is True
-        normalized: dict[Any, Any] = {
-            key: normalize_nullable(item) for key, item in value.items() if key != "nullable"
-        }
+        normalized = deepcopy(value)
+        normalized.pop("nullable", None)
+        for key, item in value.items():
+            if key in {
+                "properties",
+                "patternProperties",
+                "$defs",
+                "definitions",
+                "dependentSchemas",
+                "dependencies",
+            } and isinstance(item, dict):
+                normalized[key] = {
+                    name: normalize_nullable(schema) for name, schema in item.items()
+                }
+            elif key in {
+                "additionalProperties",
+                "unevaluatedProperties",
+                "propertyNames",
+                "contains",
+                "additionalItems",
+                "unevaluatedItems",
+                "not",
+                "if",
+                "then",
+                "else",
+                "contentSchema",
+            }:
+                normalized[key] = normalize_nullable(item)
+            elif key == "items" or key in {"allOf", "anyOf", "oneOf", "prefixItems"}:
+                if isinstance(item, list):
+                    normalized[key] = [normalize_nullable(schema) for schema in item]
+                elif key == "items":
+                    normalized[key] = normalize_nullable(item)
         if not nullable:
             return normalized
 
@@ -164,8 +199,6 @@ def normalize_nullable(value: Any) -> Any:
         if type_value is _MISSING:
             return {"anyOf": [normalized, {"type": "null"}]}
         return normalized
-    if isinstance(value, list):
-        return [normalize_nullable(item) for item in value]
     return deepcopy(value)
 
 
@@ -299,7 +332,7 @@ class MCPServerConnection:
         self.configuration = configuration
         self.workspace = workspace
         self._transport_factory = transport_factory or _transport_for
-        self._session_factory = session_factory or _new_client_session
+        self._session_factory = session_factory
         self._model_name_for = model_name_for
         self._lifecycle_task: asyncio.Task[None] | None = None
         self._close_requested: asyncio.Event | None = None
@@ -368,12 +401,26 @@ class MCPServerConnection:
         close_requested: asyncio.Event,
     ) -> None:
         stack = AsyncExitStack()
+
+        def on_closed() -> None:
+            if self._close_requested is close_requested:
+                self._unavailable = True
+
         try:
             async with asyncio.timeout(float(self.configuration.connect_timeout)):
                 transport = self._transport_factory(self.configuration, self.workspace)
                 streams = await stack.enter_async_context(transport)
                 read_stream, write_stream = _transport_streams(streams)
-                session = self._session_factory(read_stream, write_stream)
+                session = (
+                    self._session_factory(read_stream, write_stream)
+                    if self._session_factory is not None
+                    else _new_client_session(
+                        read_stream,
+                        write_stream,
+                        on_closed=on_closed,
+                        on_tool_skipped=self._record_tool_skip,
+                    )
+                )
                 entered_session = await stack.enter_async_context(cast(Any, session))
                 self._session = cast(MCPClientSession, entered_session)
                 await self._session.initialize()
@@ -382,7 +429,7 @@ class MCPServerConnection:
                     server_name=self.configuration.mcp_name,
                     model_name_for=self._model_name_for,
                     call_timeout=self.configuration.call_timeout,
-                    on_closed=self._mark_unavailable,
+                    on_closed=on_closed,
                     on_tool_skipped=self._record_tool_skip,
                 )
             ready.set_result(self._tools)
@@ -401,9 +448,6 @@ class MCPServerConnection:
             self._session = None
             self._tools = ()
             await stack.aclose()
-
-    def _mark_unavailable(self) -> None:
-        self._unavailable = True
 
     def _record_tool_skip(self) -> None:
         self._skipped_tool_count += 1
@@ -461,9 +505,90 @@ def _transport_for(
     raise ValueError(f"Unsupported MCP transport: {configuration.transport}")
 
 
-def _new_client_session(read_stream: object, write_stream: object) -> MCPClientSession:
-    client_session = cast(Any, ClientSession)
-    return cast(MCPClientSession, client_session(read_stream, write_stream))
+class _MCPClientSession(ClientSession):
+    async def validate_tool_result(self, name: str, result: types.CallToolResult) -> None:
+        # ADR-0020 projects content only, without outputSchema validation or discovery.
+        pass
+
+
+class _MCPDispatcher(JSONRPCDispatcher[Any]):
+    def __init__(
+        self,
+        read_stream: object,
+        write_stream: object,
+        *,
+        on_closed: Callable[[], None],
+        on_tool_skipped: Callable[[], None],
+        protocol_version: Callable[[], str | None],
+    ) -> None:
+        super().__init__(cast(Any, read_stream), cast(Any, write_stream))
+        self._on_closed = on_closed
+        self._on_tool_skipped = on_tool_skipped
+        self._protocol_version = protocol_version
+
+    async def send_raw_request(
+        self,
+        method: str,
+        params: Mapping[str, Any] | None,
+        opts: CallOptions | None = None,
+        *,
+        _related_request_id: types.RequestId | None = None,
+    ) -> dict[str, Any]:
+        result = await super().send_raw_request(
+            method, params, opts, _related_request_id=_related_request_id
+        )
+        if method != "tools/list" or not isinstance(result.get("tools"), list):
+            return result
+        version = self._protocol_version()
+        if version is not None:
+            try:
+                validate_server_result("tools/list", version, {**result, "tools": []})
+            except ValidationError:
+                return result
+        tools = []
+        for tool in result["tools"]:
+            try:
+                # The version-free Tool model is looser than the negotiated wire schema.
+                if version is not None:
+                    validate_server_result("tools/list", version, {**result, "tools": [tool]})
+                types.Tool.model_validate(tool, by_name=False)
+            except ValidationError:
+                self._on_tool_skipped()
+            else:
+                tools.append(tool)
+        return {**result, "tools": tools}
+
+    async def run(
+        self,
+        on_request: OnRequest,
+        on_notify: OnNotify,
+        on_notify_intercept: OnNotifyIntercept | None = None,
+        *,
+        task_status: anyio.abc.TaskStatus[None] = anyio.TASK_STATUS_IGNORED,
+    ) -> None:
+        try:
+            await super().run(on_request, on_notify, on_notify_intercept, task_status=task_status)
+        finally:
+            self._on_closed()
+
+
+def _new_client_session(
+    read_stream: object,
+    write_stream: object,
+    *,
+    on_closed: Callable[[], None],
+    on_tool_skipped: Callable[[], None],
+) -> MCPClientSession:
+    session = _MCPClientSession(
+        dispatcher=_MCPDispatcher(
+            read_stream,
+            write_stream,
+            on_closed=on_closed,
+            on_tool_skipped=on_tool_skipped,
+            protocol_version=lambda: session.protocol_version,
+        )
+    )
+    return session
 
 
 def _transport_streams(streams: object) -> tuple[object, object]:

@@ -5,14 +5,18 @@ import json
 import os
 import sys
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import mcp.types as types
 import pytest
+from loguru import logger
+from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters
 from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, ImageContent, TextContent, Tool
+from pydantic import ValidationError
 
 import myclaw.tools.mcp as mcp_adapter
 from myclaw.config.config import MCPServerConfiguration
@@ -27,6 +31,14 @@ from myclaw.tools.mcp import (
     normalize_nullable,
 )
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
+from tests.fixtures.gateway import SingleToolGateway
+from tests.fixtures.mcp_wire import (
+    http_wire_server,
+    stdio_requests,
+    stdio_wire_configuration,
+    wire_result,
+    wire_tool,
+)
 
 
 class _Session:
@@ -75,6 +87,10 @@ async def test_mcp_tool_forwards_the_complete_argument_object_through_gateway() 
         {"nullable": None},
         {"additional": {"kept": "as-is"}},
         {"undeclared": "forwarded"},
+        {"self": "ok"},
+        {"arguments": "ok"},
+        {"not-a-python-name": "ok"},
+        {"\u53c2\u6570": "ok"},
     ],
 )
 async def test_mcp_tool_forwards_each_complete_argument_shape(
@@ -92,12 +108,33 @@ async def test_mcp_tool_forwards_each_complete_argument_shape(
         session,
     )
 
-    result = await ToolGateway._for_memory((tool,)).call(
-        ModelToolCall(id="call-forward", name=tool.name, arguments=json.dumps(arguments))
-    )
+    result = await SingleToolGateway(
+        (tool,), confirmation=lambda request: pytest.fail("unexpected confirmation")
+    ).call(ModelToolCall(id="call-forward", name=tool.name, arguments=json.dumps(arguments)))
 
     assert result.status == "success"
     assert session.calls == [("echo", arguments)]
+
+
+@pytest.mark.asyncio
+async def test_mcp_preparation_and_remote_mutation_preserve_original_arguments() -> None:
+    received: list[dict[str, Any]] = []
+
+    class MutatingSession:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+            received.append(deepcopy(arguments))
+            arguments["nested"]["value"] = "changed"
+            return CallToolResult(content=[TextContent(text="ok")])
+
+    tool = _tool_for_session(MutatingSession())
+    arguments = {"self": "ok", "nested": {"value": "before"}, "extra": "42"}
+    original = deepcopy(arguments)
+    prepared, safety = await tool.prepare(arguments)
+    assert safety is None
+    assert prepared == original
+    assert await tool.execute_prepared(prepared) == "ok"
+    assert received == [original]
+    assert arguments == prepared == original
 
 
 def test_mcp_tool_schema_uses_remote_name_when_description_is_missing() -> None:
@@ -223,7 +260,7 @@ def test_mcp_tool_loading_preserves_validation_error_order(
         ),
         (
             {"type": "object", "properties": {"items": [{"nullable": True}]}},
-            {"type": "object", "properties": {"items": [{"anyOf": [{}, {"type": "null"}]}]}},
+            {"type": "object", "properties": {"items": [{"nullable": True}]}},
         ),
         (
             {"anyOf": [{"type": "string"}, {"type": "integer"}], "nullable": True},
@@ -242,11 +279,128 @@ def test_mcp_tool_loading_preserves_validation_error_order(
             {"$ref": "#/definitions/value", "nullable": True},
             {"anyOf": [{"$ref": "#/definitions/value"}, {"type": "null"}]},
         ),
+        ({"type": "string", "nullable": False}, {"type": "string"}),
     ],
 )
 def test_normalize_nullable_golden_cases(schema: dict[str, Any], expected: dict[str, Any]) -> None:
+    original = deepcopy(schema)
     assert normalize_nullable(schema) == expected
-    assert "nullable" not in json.dumps(normalize_nullable(schema))
+    assert schema == original
+    assert normalize_nullable(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "keyword", ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]
+)
+def test_nullable_preserves_names_in_schema_maps(keyword: str) -> None:
+    schema = {
+        keyword: {"nullable": {"type": "string", "nullable": True}, "boolean": False},
+        "required": ["nullable"],
+        "$ref": f"#/{keyword}/nullable",
+    }
+    original = deepcopy(schema)
+    expected = deepcopy(schema)
+    expected[keyword]["nullable"] = {"type": ["string", "null"]}  # type: ignore[index]
+    assert normalize_nullable(schema) == expected
+    assert schema == original
+    assert normalize_nullable(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    ["default", "const", "enum", "examples", "required", "dependentRequired", "x-extension"],
+)
+def test_nullable_preserves_json_data(keyword: str) -> None:
+    data = {"nullable": {"nullable": True, "type": "string"}, "nested": [{"nullable": True}]}
+    schema = {"type": "object", keyword: [data] if keyword in {"enum", "examples"} else data}
+    original = deepcopy(schema)
+    normalized = normalize_nullable(schema)
+    assert normalized == original
+    assert normalize_nullable(normalized) == original
+    normalized[keyword].clear()
+    assert schema == original
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "propertyNames",
+        "contains",
+        "additionalItems",
+        "unevaluatedItems",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contentSchema",
+        "items",
+    ],
+)
+@pytest.mark.parametrize("child", [{"type": "string", "nullable": True}, False, True, [1]])
+def test_nullable_visits_only_single_schema_values(keyword: str, child: object) -> None:
+    schema = {keyword: child}
+    original = deepcopy(schema)
+    expected = {keyword: {"type": ["string", "null"]} if isinstance(child, dict) else child}
+    assert normalize_nullable(schema) == expected
+    assert normalize_nullable(expected) == expected
+    assert schema == original
+
+
+@pytest.mark.parametrize("keyword", ["allOf", "anyOf", "oneOf", "prefixItems", "items"])
+def test_nullable_visits_schema_arrays(keyword: str) -> None:
+    schema = {keyword: [{"nullable": True}, False, [{"nullable": True}]]}
+    original = deepcopy(schema)
+    expected = {keyword: [{"anyOf": [{}, {"type": "null"}]}, False, [{"nullable": True}]]}
+    assert normalize_nullable(schema) == expected
+    assert normalize_nullable(expected) == expected
+    assert schema == original
+
+
+def test_nullable_handles_legacy_dependencies_without_changing_property_arrays() -> None:
+    schema = {
+        "dependencies": {
+            "nullable": {"type": "object", "nullable": True},
+            "required": ["nullable"],
+            "boolean": False,
+        }
+    }
+    original = deepcopy(schema)
+    expected = {
+        "dependencies": {
+            "nullable": {"type": ["object", "null"]},
+            "required": ["nullable"],
+            "boolean": False,
+        }
+    }
+    assert normalize_nullable(schema) == expected
+    assert normalize_nullable(expected) == expected
+    assert schema == original
+
+
+def test_nullable_parameter_name_and_default_reach_gateway_schema() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "nullable": {
+                "type": "object",
+                "nullable": True,
+                "default": {"nullable": {"type": "string", "nullable": True}},
+            }
+        },
+        "required": ["nullable"],
+    }
+    original = deepcopy(schema)
+    spec = mcp_tool_spec_from_remote(
+        {"name": "echo", "inputSchema": schema}, server_name="remote", model_name="mcp_remote_echo"
+    )
+    projected = SingleToolGateway((MCPTool(spec, _Session()),)).schemas[0]["function"]["parameters"]
+    expected = deepcopy(schema)
+    expected["properties"]["nullable"].pop("nullable")  # type: ignore[index]
+    expected["properties"]["nullable"]["type"] = ["object", "null"]  # type: ignore[index]
+    assert projected == expected
+    assert schema == original
 
 
 class _PageSession:
@@ -955,3 +1109,224 @@ async def test_streamable_http_transport_connects_to_a_local_real_mcp_server() -
         except TimeoutError:
             process.kill()
             await process.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["stdio", "http"])
+@pytest.mark.parametrize("case", ["missing", "mismatch", "invalid_schema", "valid", "error"])
+async def test_real_sdk_projects_content_without_output_schema_validation(
+    tmp_path: Path,
+    transport: str,
+    case: str,
+) -> None:
+    output_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {"value": {"type": "integer"}},
+        "required": ["value"],
+    }
+    if case == "invalid_schema":
+        output_schema["properties"]["value"]["type"] = "not-a-json-schema-type"
+    fields: dict[str, Any] = {}
+    if case != "missing":
+        fields["structuredContent"] = {"value": 42 if case == "valid" else "wrong"}
+    if case == "error":
+        fields["isError"] = True
+    response = wire_result(**fields)
+    response["content"].append({"type": "text", "text": "second block"})
+    scenario = {
+        "pages": {"": {"tools": [wire_tool(outputSchema=output_schema)]}},
+        "results": {"echo": response},
+    }
+
+    async def check(configuration: MCPServerConfiguration) -> None:
+        connection = MCPServerConnection(configuration, tmp_path)
+        try:
+            tools = await connection.connect()
+            assert len(tools) == 1
+            gateway = SingleToolGateway(tools)
+            for index in range(2):
+                result = await gateway.call(
+                    ModelToolCall(id=str(index), name="echo", arguments="{}")
+                )
+                assert (result.status, result.content) == (
+                    "error" if case == "error" else "success",
+                    "wire text\nsecond block",
+                )
+            assert not connection.unavailable
+        finally:
+            await connection.close()
+
+    if transport == "stdio":
+        await check(stdio_wire_configuration(tmp_path, scenario))
+        requests = stdio_requests(tmp_path)
+    else:
+        async with http_wire_server(scenario) as (server, configuration):
+            await check(configuration)
+            requests = server.requests
+    assert [r["method"] for r in requests].count("tools/list") == 1
+    assert [r["method"] for r in requests].count("tools/call") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["stdio", "http"])
+@pytest.mark.parametrize("pagination", [False, True, "all_invalid"])
+async def test_real_sdk_isolates_invalid_wire_tools(
+    tmp_path: Path,
+    transport: str,
+    pagination: bool | str,
+) -> None:
+    invalid = [
+        {"name": "private-array", "inputSchema": []},
+        {"name": "private-missing"},
+        wire_tool("private-root", inputSchema={"type": "string"}),
+    ]
+    first = invalid if pagination == "all_invalid" else [wire_tool("zulu"), *invalid]
+    pages: dict[str, Any] = {"": {"tools": first}}
+    if pagination is True:
+        pages[""]["nextCursor"] = "second"
+        pages["second"] = {"tools": invalid, "nextCursor": "third", "_meta": {"kept": True}}
+        pages["third"] = {"tools": [wire_tool("alpha")]}
+    scenario = {"pages": pages}
+    records: list[str] = []
+    sink = logger.add(lambda message: records.append(str(message)), format="{message}")
+
+    async def check(configuration: MCPServerConfiguration) -> None:
+        connection = MCPServerConnection(configuration, tmp_path)
+        try:
+            tools = await connection.connect()
+            expected = (
+                []
+                if pagination == "all_invalid"
+                else (["alpha", "zulu"] if pagination is True else ["zulu"])
+            )
+            assert [tool.name for tool in tools] == expected
+            assert connection.skipped_tool_count == (6 if pagination is True else 3)
+            for tool in tools:
+                assert await tool.execute_prepared({}) == "wire text"
+            assert not connection.unavailable
+        finally:
+            await connection.close()
+
+    try:
+        if transport == "stdio":
+            await check(stdio_wire_configuration(tmp_path, scenario))
+            requests = stdio_requests(tmp_path)
+        else:
+            async with http_wire_server(scenario) as (server, configuration):
+                await check(configuration)
+                requests = server.requests
+        cursors = [
+            r.get("params", {}).get("cursor") for r in requests if r["method"] == "tools/list"
+        ]
+        assert cursors == ([None, "second", "third"] if pagination is True else [None])
+        skipped = [record for record in records if "MCP Tool skipped" in record]
+        assert len(skipped) == (6 if pagination is True else 3)
+        assert all("mcp_name=remote phase=discovery type=MCPToolSchemaError" in r for r in skipped)
+        assert "private-" not in "".join(records)
+        assert "inputSchema" not in "".join(records)
+    finally:
+        logger.remove(sink)
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_preserves_concurrent_request_correlation_and_progress(
+    tmp_path: Path,
+) -> None:
+    configuration = stdio_wire_configuration(tmp_path, {})
+    closed: list[bool] = []
+    progress_events: list[tuple[float, float | None, str | None]] = []
+
+    async def on_progress(progress: float, total: float | None, message: str | None) -> None:
+        progress_events.append((progress, total, message))
+
+    async with mcp_adapter.stdio_transport(configuration, tmp_path) as streams:
+        read, write = cast(tuple[object, object], streams)
+        session = cast(
+            ClientSession,
+            mcp_adapter._new_client_session(
+                read,
+                write,
+                on_closed=lambda: closed.append(True),
+                on_tool_skipped=lambda: pytest.fail("unexpected skipped tool"),
+            ),
+        )
+        async with session:
+            await session.initialize()
+            await session.list_tools()
+            async with asyncio.timeout(10):
+                results = await asyncio.gather(
+                    *(
+                        session.call_tool(
+                            "echo", {"value": str(index)}, progress_callback=on_progress
+                        )
+                        for index in range(8)
+                    )
+                )
+            assert [result.content[0] for result in results] == [
+                TextContent(text=str(index)) for index in range(8)
+            ]
+            assert progress_events == [(1, 1, None)] * 8
+            assert closed == []
+    assert closed == [True]
+    calls = [r for r in stdio_requests(tmp_path) if r["method"] == "tools/call"]
+    assert len({r["id"] for r in calls}) == 8
+    assert all(r["id"] == r["params"]["_meta"]["progressToken"] for r in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [{"content": "invalid"}, {"content": [{"type": "text"}]}])
+async def test_real_sdk_rejects_malformed_protocol_results(
+    tmp_path: Path,
+    response: dict[str, Any],
+) -> None:
+    async with http_wire_server({"results": {"echo": response}}) as (_, configuration):
+        connection = MCPServerConnection(configuration, tmp_path)
+        try:
+            tools = await connection.connect()
+            with pytest.raises(ValidationError):
+                await tools[0].execute_prepared({})
+            assert not connection.unavailable
+        finally:
+            await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_keeps_unsupported_input_required_result_rejection(tmp_path: Path) -> None:
+    response = types.InputRequiredResult(request_state="next").model_dump(
+        by_alias=True, exclude_none=True
+    )
+    scenario = {
+        "results": {"echo": response},
+        "pages": {
+            "": {
+                "tools": [wire_tool()],
+                "resultType": "complete",
+                "cacheScope": "private",
+                "ttlMs": 0,
+            }
+        },
+    }
+    async with http_wire_server(scenario) as (_, configuration):
+        async with mcp_adapter.streamable_http_transport(configuration, tmp_path) as streams:
+            read, write = cast(tuple[object, object], streams)[:2]
+            session = cast(
+                ClientSession,
+                mcp_adapter._new_client_session(
+                    read,
+                    write,
+                    on_closed=lambda: None,
+                    on_tool_skipped=lambda: None,
+                ),
+            )
+            async with session:
+                await session.initialize()
+                session.adopt(
+                    types.DiscoverResult(
+                        supported_versions=[types.LATEST_PROTOCOL_VERSION],
+                        capabilities=types.ServerCapabilities(tools=types.ToolsCapability()),
+                    )
+                )
+                listing = await session.list_tools()
+                assert [tool.name for tool in listing.tools] == ["echo"]
+                with pytest.raises(RuntimeError, match="InputRequiredResult"):
+                    await session.call_tool("echo", {})
