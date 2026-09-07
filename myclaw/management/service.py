@@ -36,11 +36,9 @@ class _ReasoningEffortControl(Protocol):
     def set_reasoning_effort(self, effort: ReasoningEffort) -> None: ...
 
 
-class _StatusProjectionLoop(Protocol):
+class _ManagementAgentLoop(Protocol):
     def runtime_status_input(self) -> "RuntimeStatusInput": ...
 
-
-class _ManagementAgentLoop(_StatusProjectionLoop, Protocol):
     def reload_skill(self) -> tuple[SkillMetadata, ...]: ...
 
 
