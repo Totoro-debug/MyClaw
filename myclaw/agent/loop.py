@@ -409,13 +409,14 @@ class AgentLoop:
         skills: tuple[LoadedSkill, ...],
     ) -> None:
         chat_route = self._configuration.resolve_route("chat").route
-        status_input = _foreground_runtime_status_input(
-            context_builder=self._context_builder,
-            history=(),
-            session_id=self._session.session_id,
-            tool_schemas=self.tool_schemas,
-            skill_state=skills,
-        )
+        tool_schemas = self.tool_schemas
+        with self._context_builder.foreground_projection_scope(skills):
+            status_input = _foreground_runtime_status_input(
+                context_builder=self._context_builder,
+                history=(),
+                session_id=self._session.session_id,
+                tool_schemas=tool_schemas,
+            )
         available_input = chat_route.context_window - chat_route.max_output
         estimated = estimate_input_tokens(status_input)
         if estimated > available_input:
@@ -1447,18 +1448,9 @@ def _foreground_runtime_status_input(
     chat_model: str = "",
     context_window: int = 0,
     generation_started_at: float | None = None,
-    skill_state: tuple[LoadedSkill, ...] | None = None,
 ) -> RuntimeStatusInput:
     """Project and serialize a minimum foreground request for status and preflight."""
-    projected = (
-        context_builder.build_status_messages(history, session_id=session_id)
-        if skill_state is None
-        else context_builder._build_status_messages_for_skills(
-            history,
-            session_id=session_id,
-            skills=skill_state,
-        )
-    )
+    projected = context_builder.build_status_messages(history, session_id=session_id)
     projected_system = projected[0].get("content")
     if not isinstance(projected_system, str):
         raise TypeError("Context Builder status system message is malformed")

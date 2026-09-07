@@ -7,7 +7,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event as ThreadEvent
@@ -29,7 +29,7 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.logging.session import session_log as real_session_log
-from myclaw.management.service import RuntimeStatusInput
+from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -53,6 +53,7 @@ from myclaw.skills.catalog import (
 )
 from myclaw.tools.base import BaseTool
 from myclaw.tools.tool_gateway import ModelToolCall
+from tests.agent.test_context import _FrozenDateTime
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import (
     BlockingTaskFramingRouterAdapter,
@@ -1063,6 +1064,192 @@ def test_reload_candidate_validation_restores_the_active_skill_snapshot(
     expected_name = "published" if over_budget else "candidate"
     assert f'"name":"{expected_name}"' in public_messages[0]["content"]
     assert '"name":"active"' not in public_messages[0]["content"]
+
+
+@pytest.mark.parametrize("operation", ["preflight", "reload"])
+@pytest.mark.parametrize("empty_candidate", [False, True], ids=["skills", "empty"])
+@pytest.mark.parametrize("over_budget", [False, True], ids=["at-budget", "over-budget"])
+def test_skill_budget_uses_public_status_projection_and_complete_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    empty_candidate: bool,
+    over_budget: bool,
+) -> None:
+    monkeypatch.setattr("myclaw.agent.context.datetime", _FrozenDateTime)
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: active\ndescription: Active snapshot\n---\nactive body\n",
+        encoding="utf-8",
+    )
+    config = MINIMAL_VALID_CONFIG.replace(
+        "[models.providers.primary]",
+        "[runtime]\nenable_skill_always_load = true\n\n[models.providers.primary]",
+    )
+    mcp_tool = _LargeSchemaTool()
+    loop, session, _bus = _runtime(
+        tmp_path, _Router(()), config_text=config, mcp_tools=(mcp_tool,)
+    )
+    builder = loop._context_builder
+    loader = loop._skill_loader
+    active_skills = loader.skills
+    if empty_candidate:
+        instruction.unlink()
+    else:
+        instruction.write_text(
+            "---\nname: candidate\ndescription: Candidate snapshot\nalways: true\n---\n"
+            "candidate instructions\n",
+            encoding="utf-8",
+        )
+    if operation == "preflight":
+        loader.load()
+    published_skills = loader.skills
+    expected_tools = loop.tool_schemas
+    assert len(expected_tools) > 1
+    original_build_status = builder.build_status_messages
+    original_schema = mcp_tool.to_schema
+    public_projections: list[list[dict[str, Any]]] = []
+    estimated_inputs: list[RuntimeStatusInput] = []
+    schema_prompts: list[str] = []
+    chat_route = loop._configuration.resolve_route("chat").route
+    available_input = chat_route.context_window - chat_route.max_output
+
+    def observe_public_status(
+        history: Sequence[dict[str, Any]], *, session_id: str
+    ) -> list[dict[str, Any]]:
+        assert tuple(history) == ()
+        assert session_id == session.session_id
+        assert loader.skills == published_skills
+        projected = original_build_status(history, session_id=session_id)
+        public_projections.append(projected)
+        return projected
+
+    def observe_schema() -> dict[str, Any]:
+        projected = original_build_status((), session_id=session.session_id)
+        schema_prompts.append(projected[0]["content"])
+        return original_schema()
+
+    def observe_estimate(status_input: RuntimeStatusInput) -> int:
+        estimated_inputs.append(status_input)
+        projected = original_build_status((), session_id=session.session_id)
+        assert '"name":"active"' in projected[0]["content"]
+        assert '"name":"candidate"' not in projected[0]["content"]
+        assert loader.skills == published_skills
+        return available_input + int(over_budget)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builder, "build_status_messages", observe_public_status)
+        patch.setattr(mcp_tool, "to_schema", observe_schema)
+        patch.setattr(loop_module, "estimate_input_tokens", observe_estimate)
+        with builder.foreground_projection_scope(active_skills):
+            validate = loop.preflight if operation == "preflight" else loop.reload_skill
+            if over_budget:
+                with pytest.raises(ModelContextOverflowError) as raised:
+                    validate()
+                assert raised.value.error.code == "model_context_overflow"
+                assert raised.value.error.message == MODEL_CONTEXT_OVERFLOW_MESSAGE
+                assert loader.skills == published_skills
+            else:
+                validate()
+                expected_names = () if empty_candidate else ("candidate",)
+                assert tuple(item.name for item in loader.metadata) == expected_names
+            restored = original_build_status((), session_id=session.session_id)
+            assert '"name":"active"' in restored[0]["content"]
+            assert '"name":"candidate"' not in restored[0]["content"]
+
+    assert len(public_projections) == len(estimated_inputs) == len(schema_prompts) == 1
+    assert '"name":"active"' in schema_prompts[0]
+    assert '"name":"candidate"' not in schema_prompts[0]
+    budget_input = estimated_inputs[0]
+    assert '"name":"active"' not in budget_input.system_prompt
+    assert ('"name":"candidate"' in budget_input.system_prompt) is not empty_candidate
+    assert ("candidate instructions" in budget_input.system_prompt) is not empty_candidate
+    assert [
+        {"role": "system", "content": budget_input.system_prompt},
+        *(json.loads(message) for message in budget_input.retained_messages),
+    ] == public_projections[0]
+    assert tuple(json.loads(schema) for schema in budget_input.tool_definitions) == expected_tools
+    assert estimate_input_tokens(budget_input) > estimate_input_tokens(
+        replace(budget_input, tool_definitions=())
+    )
+    if not over_budget:
+        ordinary_status = loop.runtime_status_input()
+        assert ordinary_status.system_prompt == budget_input.system_prompt
+        assert ordinary_status.retained_messages == budget_input.retained_messages
+        assert ordinary_status.tool_definitions == budget_input.tool_definitions
+        assert estimate_input_tokens(ordinary_status) == estimate_input_tokens(budget_input)
+
+
+@pytest.mark.parametrize("error_type", [ValueError, asyncio.CancelledError])
+def test_reload_public_projection_failure_restores_scope_without_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[BaseException],
+) -> None:
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: active\ndescription: Active snapshot\n---\nactive body\n",
+        encoding="utf-8",
+    )
+    loop, session, _bus = _runtime(tmp_path, _Router(()))
+    builder = loop._context_builder
+    loader = loop._skill_loader
+    active_skills = loader.skills
+    instruction.write_text(
+        "---\nname: published\ndescription: Published snapshot\n---\npublished body\n",
+        encoding="utf-8",
+    )
+    loader.load()
+    published_skills = loader.skills
+    published_metadata = loader.metadata
+    published_invocation = loader.resolve_manual("/published request")
+    instruction.write_text(
+        "---\nname: candidate\ndescription: Candidate snapshot\n---\ncandidate body\n",
+        encoding="utf-8",
+    )
+    original_build_status = builder.build_status_messages
+    projected_prompts: list[str] = []
+    estimated_inputs: list[RuntimeStatusInput] = []
+    error = error_type("candidate projection failed")
+
+    def fail_public_status(
+        history: Sequence[dict[str, Any]], *, session_id: str
+    ) -> list[dict[str, Any]]:
+        projected = original_build_status(history, session_id=session_id)
+        projected_prompts.append(projected[0]["content"])
+        raise error
+
+    def observe_estimate(status_input: RuntimeStatusInput) -> int:
+        estimated_inputs.append(status_input)
+        return 0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builder, "build_status_messages", fail_public_status)
+        patch.setattr(loop_module, "estimate_input_tokens", observe_estimate)
+        with builder.foreground_projection_scope(active_skills):
+            with pytest.raises(error_type) as raised:
+                loop.reload_skill()
+            assert raised.value is error
+            restored = original_build_status((), session_id=session.session_id)
+            assert '"name":"active"' in restored[0]["content"]
+            assert '"name":"candidate"' not in restored[0]["content"]
+            assert '"name":"published"' not in restored[0]["content"]
+
+    assert len(projected_prompts) == 1
+    assert '"name":"candidate"' in projected_prompts[0]
+    assert '"name":"active"' not in projected_prompts[0]
+    assert '"name":"published"' not in projected_prompts[0]
+    assert estimated_inputs == []
+    assert loader.skills == published_skills
+    assert loader.metadata == published_metadata
+    assert loader.resolve_manual("/published request") == published_invocation
+    assert loader.resolve_manual("/candidate request") is None
+    restored = builder.build_status_messages((), session_id=session.session_id)
+    assert '"name":"published"' in restored[0]["content"]
+    assert '"name":"active"' not in restored[0]["content"]
+    assert '"name":"candidate"' not in restored[0]["content"]
 
 
 @pytest.mark.asyncio

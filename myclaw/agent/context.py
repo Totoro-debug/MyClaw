@@ -85,13 +85,6 @@ class ContextBuilder:
             if snapshot is None or snapshot.builder_id != id(self)
             else snapshot.skills
         )
-        return self._foreground_system_prompt_for_skills(skills)
-
-    def _foreground_system_prompt_for_skills(
-        self,
-        skills: Sequence[LoadedSkill],
-    ) -> str:
-        """Build a foreground System Prompt from a staged immutable Skill state."""
         return _build_foreground_system_prompt(
             workspace=self._workspace,
             agent_home=self._agent_home,
@@ -144,20 +137,6 @@ class ContextBuilder:
         """Build the minimum foreground request used by status and preflight."""
         return self.build_foreground_messages(
             [*history, {"role": "user", "content": ""}],
-            session_id=session_id,
-        )
-
-    def _build_status_messages_for_skills(
-        self,
-        history: Sequence[dict[str, Any]],
-        *,
-        session_id: str,
-        skills: Sequence[LoadedSkill],
-    ) -> list[dict[str, Any]]:
-        """Project the status request against a staged Skill state for validation."""
-        return self._build_messages(
-            [*history, {"role": "user", "content": ""}],
-            system_prompt=self._foreground_system_prompt_for_skills(skills),
             session_id=session_id,
         )
 

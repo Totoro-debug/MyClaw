@@ -321,10 +321,19 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "context_builder"
     }
-    assert {
-        "build_status_messages",
+    assert "build_status_messages" in status_builder_calls
+    removed_builder_methods = {
         "_build_status_messages_for_skills",
-    } <= status_builder_calls
+        "_foreground_system_prompt_for_skills",
+    }
+    assert all(not hasattr(ContextBuilder, name) for name in removed_builder_methods)
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in removed_builder_methods
+        for node in ast.walk(tree)
+    )
+    assert "skill_state" not in {argument.arg for argument in status_helper.args.kwonlyargs}
     assert "render_template" not in path.read_text(encoding="utf-8")
 
 
