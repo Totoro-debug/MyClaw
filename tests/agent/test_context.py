@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Sequence
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -374,6 +375,111 @@ async def test_schedule_projection_scope_is_task_local_and_restores_after_failur
     )
 
     assert runtime_time(failed_projection) != runtime_time(restored_projection)
+
+
+@pytest.mark.parametrize(
+    "exit_error",
+    [None, ValueError, asyncio.CancelledError],
+    ids=["normal", "exception", "cancelled"],
+)
+def test_foreground_projection_scope_restores_nested_and_published_skills(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+    exit_error: type[BaseException] | None,
+) -> None:
+    monkeypatch.setattr(context, "datetime", _FrozenDateTime)
+    memory_manager, loader = _context_dependencies(workspace, agent_home)
+    builder = ContextBuilder(
+        workspace,
+        "UTC",
+        agent_home=agent_home,
+        memory_manager=memory_manager,
+        skill_loader=loader,
+    )
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    snapshots = []
+    projections = []
+    for description in ("Snapshot A", "Snapshot B", "Published C"):
+        instruction.write_text(
+            f"---\nname: planner\ndescription: {description}\n---\nInstructions.\n",
+            encoding="utf-8",
+        )
+        loader.load()
+        snapshots.append(loader.skills)
+        projected = builder.build_status_messages([], session_id="session-id")
+        assert description in projected[0]["content"]
+        projections.append(projected)
+
+    with builder.foreground_projection_scope(snapshots[0]):
+        assert builder.build_status_messages([], session_id="session-id") == projections[0]
+        with (
+            pytest.raises(exit_error, match="inner scope exit")
+            if exit_error is not None
+            else nullcontext()
+        ):
+            with builder.foreground_projection_scope(snapshots[1]):
+                assert (
+                    builder.build_status_messages([], session_id="session-id") == projections[1]
+                )
+                if exit_error is not None:
+                    raise exit_error("inner scope exit")
+
+        assert builder.build_status_messages([], session_id="session-id") == projections[0]
+        assert loader.skills == snapshots[2]
+
+    assert builder.build_status_messages([], session_id="session-id") == projections[2]
+
+
+def test_foreground_projection_scope_isolates_different_context_builders(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    monkeypatch.setattr(context, "datetime", _FrozenDateTime)
+    memory_manager, loader = _context_dependencies(workspace, agent_home)
+    first_builder = ContextBuilder(
+        workspace,
+        "UTC",
+        agent_home=agent_home,
+        memory_manager=memory_manager,
+        skill_loader=loader,
+    )
+    second_builder = ContextBuilder(
+        workspace,
+        "UTC",
+        agent_home=agent_home,
+        memory_manager=memory_manager,
+        skill_loader=loader,
+    )
+    instruction = agent_home / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: planner\ndescription: Scoped skills\n---\nInstructions.\n",
+        encoding="utf-8",
+    )
+    loader.load()
+    scoped_skills = loader.skills
+    scoped_projection = first_builder.build_status_messages([], session_id="session-id")
+    instruction.write_text(
+        "---\nname: planner\ndescription: Published skills\n---\nInstructions.\n",
+        encoding="utf-8",
+    )
+    loader.load()
+    published_projection = second_builder.build_status_messages([], session_id="session-id")
+    assert scoped_projection != published_projection
+
+    with first_builder.foreground_projection_scope(scoped_skills):
+        assert (
+            first_builder.build_status_messages([], session_id="session-id") == scoped_projection
+        )
+        assert (
+            second_builder.build_status_messages([], session_id="session-id")
+            == published_projection
+        )
+
+    assert first_builder.build_status_messages([], session_id="session-id") == published_projection
 
 
 def test_context_builder_advertises_catalog_metadata_in_foreground_system_prompt(

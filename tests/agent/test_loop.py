@@ -941,6 +941,11 @@ def test_reload_validator_candidate_projection_is_isolated_until_atomic_publish(
 
     def block_candidate_estimate(status_input: RuntimeStatusInput) -> int:
         candidate_prompts.append(status_input.system_prompt)
+        public_messages = loop._context_builder.build_status_messages(
+            (), session_id=loop.session.session_id
+        )
+        assert '"name":"planner"' in public_messages[0]["content"]
+        assert '"name":"reviewer"' not in public_messages[0]["content"]
         validation_started.set()
         if not release_validation.wait(timeout=5):
             raise AssertionError("candidate validation was not released")
@@ -983,6 +988,81 @@ def test_reload_validator_candidate_projection_is_isolated_until_atomic_publish(
     assert tuple(item.name for item in loader.metadata) == ("reviewer",)
     assert loader.resolve_manual("/planner request") is None
     assert loader.resolve_manual("/reviewer request") is not None
+
+
+@pytest.mark.parametrize("over_budget", [False, True], ids=["published", "rejected"])
+def test_reload_candidate_validation_restores_the_active_skill_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    over_budget: bool,
+) -> None:
+    instruction = tmp_path / "agent-home" / "skills" / "planner" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: active\ndescription: Active snapshot\n---\nactive body\n",
+        encoding="utf-8",
+    )
+    loop, session, _bus = _runtime(tmp_path, _Router(()))
+    loader = loop._skill_loader
+    builder = loop._context_builder
+    active_skills = loader.skills
+    instruction.write_text(
+        "---\nname: published\ndescription: Published snapshot\n---\npublished body\n",
+        encoding="utf-8",
+    )
+    loader.load()
+    published_skills = loader.skills
+    published_metadata = loader.metadata
+    published_invocation = loader.resolve_manual("/published request")
+    candidate_document = (
+        "---\nname: candidate\ndescription: Candidate snapshot\n---\ncandidate body\n"
+    )
+    instruction.write_text(candidate_document, encoding="utf-8", newline="")
+    candidate_prompts: list[str] = []
+    chat_route = loop._configuration.resolve_route("chat").route
+    available_input = chat_route.context_window - chat_route.max_output
+
+    def estimate_candidate(status_input: RuntimeStatusInput) -> int:
+        candidate_prompts.append(status_input.system_prompt)
+        assert loader.skills == published_skills
+        public_messages = builder.build_status_messages((), session_id=session.session_id)
+        assert '"name":"active"' in public_messages[0]["content"]
+        assert '"name":"candidate"' not in public_messages[0]["content"]
+        assert '"name":"published"' not in public_messages[0]["content"]
+        return available_input + int(over_budget)
+
+    monkeypatch.setattr(loop_module, "estimate_input_tokens", estimate_candidate)
+    with builder.foreground_projection_scope(active_skills):
+        if over_budget:
+            with pytest.raises(ModelContextOverflowError) as raised:
+                loop.reload_skill()
+            assert raised.value.error.code == "model_context_overflow"
+            assert raised.value.error.message == MODEL_CONTEXT_OVERFLOW_MESSAGE
+            assert loader.skills == published_skills
+            assert loader.metadata == published_metadata
+            assert loader.resolve_manual("/published request") == published_invocation
+            assert loader.resolve_manual("/candidate request") is None
+        else:
+            assert loop.reload_skill() == loader.metadata
+            assert tuple(item.name for item in loader.metadata) == ("candidate",)
+            invocation = loader.resolve_manual("/candidate request")
+            assert invocation is not None
+            assert invocation.body == candidate_document
+            assert loader.resolve_manual("/published request") is None
+
+        assert len(candidate_prompts) == 1
+        assert '"name":"candidate"' in candidate_prompts[0]
+        assert '"name":"active"' not in candidate_prompts[0]
+        assert '"name":"published"' not in candidate_prompts[0]
+        public_messages = builder.build_status_messages((), session_id=session.session_id)
+        assert '"name":"active"' in public_messages[0]["content"]
+        assert '"name":"candidate"' not in public_messages[0]["content"]
+        assert '"name":"published"' not in public_messages[0]["content"]
+
+    public_messages = builder.build_status_messages((), session_id=session.session_id)
+    expected_name = "published" if over_budget else "candidate"
+    assert f'"name":"{expected_name}"' in public_messages[0]["content"]
+    assert '"name":"active"' not in public_messages[0]["content"]
 
 
 @pytest.mark.asyncio
