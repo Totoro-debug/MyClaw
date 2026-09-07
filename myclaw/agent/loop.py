@@ -28,6 +28,7 @@ from myclaw.agent.runner import (
     AgentRunnerResponseSegmentEnd,
     AgentRunnerResult,
     AgentRunnerRouter,
+    AgentRunnerToolCallFinished,
     AgentRunnerToolCallStarted,
     _build_assistant_repair_message,
 )
@@ -1181,6 +1182,15 @@ class AgentLoop:
                         "tool_call_id": event.tool_call_id,
                         "arguments": event.arguments,
                     },
+                )
+            )
+            return
+        if isinstance(event, AgentRunnerToolCallFinished):
+            await self._bus.put_outbound(
+                OutboundMessage(
+                    "tool_call",
+                    event.tool_name,
+                    {"tool_call_id": event.tool_call_id, "status": event.status},
                 )
             )
             return

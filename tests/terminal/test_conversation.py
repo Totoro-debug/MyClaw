@@ -186,6 +186,9 @@ class ToolActivityRunSource(_ScriptedSource):
         yield _tool_call("call-read-file", "read_file", self._start_summary)
         self.tool_started.set()
         await self.complete_tool.wait()
+        yield OutboundMessage(
+            "tool_call", "read_file", {"tool_call_id": "call-read-file", "status": "success"}
+        )
         yield _completed_response()
 
 
@@ -2679,7 +2682,7 @@ async def test_tool_start_reclassifies_a_streamed_candidate_without_model_comple
         group = app.query_one(".agent-run-activity-group")
         activity_content = group.query_one(".agent-run-activity-content")
         assert activity_content.query_one(Markdown).source == "Unclassified candidate."
-        assert _tool_row_texts(app) == ["Running: read_file\nArguments: Running read_file"]
+        assert _tool_row_texts(app) == ["Status unavailable: read_file"]
         assert app.query("#conversation-display > .assistant-row").first().query_one(
             Markdown
         ).source == ("Final answer.")
@@ -2720,7 +2723,7 @@ async def test_first_terminal_event_finishes_without_waiting_for_more_events() -
         group = app.query_one(".agent-run-activity-group")
         assert not group.query_one(".agent-run-activity-content").display
         assert "final response" in _visible_screen_text(app)
-        assert _tool_row_texts(app) == ["Running: read_file\nArguments: Running read_file"]
+        assert _tool_row_texts(app) == ["Status unavailable: read_file"]
 
 
 @pytest.mark.asyncio
@@ -2761,7 +2764,7 @@ async def test_duplicate_or_late_model_completion_reconciles_grouped_candidate(
 
         content = app.query_one(".agent-run-activity-content")
         assert [markdown.source for markdown in content.query(Markdown)] == ["process activity"]
-        assert _tool_row_texts(app) == ["Running: read_file\nArguments: Running read_file"]
+        assert _tool_row_texts(app) == ["Status unavailable: read_file"]
 
 
 @pytest.mark.asyncio
@@ -2869,7 +2872,7 @@ async def test_event_stream_failure_groups_candidate_and_finishes_unfinished_too
         activity_content = group.query_one(".agent-run-activity-content")
         assert activity_content.display
         assert activity_content.query_one(Markdown).source == "Unconfirmed candidate."
-        assert _tool_row_texts(app) == ["Running: read_file\nArguments: Running read_file"]
+        assert _tool_row_texts(app) == ["Status unavailable: read_file"]
         assert "event stream failed" in _visible_screen_text(app)
         assert "Unconfirmed candidate." in _visible_screen_text(app)
         assert not list(app.query("#conversation-display > .assistant-row"))
@@ -3446,6 +3449,66 @@ async def test_application_teardown_cancels_an_open_confirmation_without_a_decis
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("success", "Completed: work"), ("error", "Failed: work"), ("refused", "Rejected: work")],
+)
+async def test_tool_completion_updates_only_its_row_without_showing_results(
+    status: str,
+    expected: str,
+) -> None:
+    conversation = ToolMessageSequenceRunSource(
+        (
+            _tool_call("first", "work", "{}"),
+            OutboundMessage("tool_call", "work", {"tool_call_id": "first", "status": status}),
+            OutboundMessage("tool_call", "work", {"tool_call_id": "first", "status": "success"}),
+            _tool_call("second", "work", "{}"),
+            OutboundMessage("tool_call", "work", {"tool_call_id": "second", "status": "success"}),
+            _response_delta("Final answer."),
+            _completed_response(),
+        )
+    )
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("go"), "enter")
+        await _wait_for_turn(app)
+        rows = _tool_row_texts(app)
+        assert len(rows) == 2
+        assert rows[0].startswith(expected)
+        assert rows[1] == "Completed: work"
+        assert all("Running:" not in row and "Arguments:" not in row for row in rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_unfinished_tool_row_does_not_claim_success_after_run_termination(
+    cancelled: bool,
+) -> None:
+    conversation = ToolMessageSequenceRunSource(
+        (
+            _tool_call("finished", "first", "{}"),
+            OutboundMessage(
+                "tool_call", "first", {"tool_call_id": "finished", "status": "success"}
+            ),
+            _tool_call("unfinished", "second", "{}"),
+            OutboundMessage(
+                "system_control",
+                "Turn stopped.",
+                {"_streamed": True, "finish_reason": "cancelled" if cancelled else "failed"},
+            ),
+        )
+    )
+    app = _terminal_app(cast(Any, _terminal_backend(conversation)))
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("go"), "enter")
+        await _wait_for_turn(app)
+        assert _tool_row_texts(app) == [
+            "Completed: first",
+            "Cancelled: second" if cancelled else "Status unavailable: second",
+        ]
+
+
+@pytest.mark.asyncio
 async def test_tool_activity_renders_raw_arguments_until_terminal_marker() -> None:
     conversation = ToolActivityRunSource(
         start_summary='Running read_file {"arguments":{"path":"C:/private.txt"}}',
@@ -3484,9 +3547,7 @@ async def test_tool_activity_renders_raw_arguments_until_terminal_marker() -> No
 
         final_text = _visible_screen_text(app)
         assert "Running: read_file" not in final_text
-        assert str(row.content) == (
-            'Running: read_file\nArguments: Running read_file {"arguments":{"path":"C:/private.txt"}}'
-        )
+        assert str(row.content) == "Completed: read_file"
         assert not row.parent.display
         assert "Completed with no response." in final_text
 
@@ -3512,18 +3573,18 @@ async def test_tool_rows_isolate_calls_and_turns_without_tool_result_projection(
         await pilot.press(*list("first"), "enter")
         await _wait_for_turn(app)
         assert _tool_row_texts(app) == [
-            "Running: glob\nArguments: Running glob",
-            "Running: read_file\nArguments: Running read_file",
-            "Running: write_file\nArguments: Running write_file",
+            "Status unavailable: glob",
+            "Status unavailable: read_file",
+            "Status unavailable: write_file",
         ]
 
         await pilot.press(*list("second"), "enter")
         await _wait_for_turn(app)
         assert _tool_row_texts(app) == [
-            "Running: glob\nArguments: Running glob",
-            "Running: read_file\nArguments: Running read_file",
-            "Running: write_file\nArguments: Running write_file",
-            "Running: read_file\nArguments: Running read_file",
+            "Status unavailable: glob",
+            "Status unavailable: read_file",
+            "Status unavailable: write_file",
+            "Status unavailable: read_file",
         ]
         assert "completion-first" not in _visible_screen_text(app)
         assert "shared-call" not in _visible_screen_text(app)
@@ -3648,7 +3709,7 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
                 1: [],
                 2: ["Running: read_file\nArguments: Running read_file"],
                 3: ["Running: read_file\nArguments: Running read_file"],
-                4: ["Running: read_file\nArguments: Running read_file"],
+                4: ["Status unavailable: read_file"],
             }
             for previous_event, next_event in zip(range(4), range(1, 5), strict=True):
                 conversation.continue_after(1, previous_event)

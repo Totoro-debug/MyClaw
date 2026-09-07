@@ -92,7 +92,7 @@ _TERMINAL_MODE_RESETS: Final = (
 )
 type _ControlAction = Literal["cancel_active_turn", "clear_draft", "drain_pending", "exit"]
 type ConfirmationDecision = Literal["approved", "declined"]
-type _ToolRowStatus = Literal["running", "success", "error", "refused"]
+type _ToolRowStatus = Literal["running", "success", "error", "refused", "cancelled", "unknown"]
 type _TerminalOutcome = Literal["completed", "cancelled", "failed"]
 
 
@@ -1432,6 +1432,27 @@ class _MessageBusRunProjection:
                 await self._fail_sparse_protocol()
                 return
             tool_call_id = outbound.metadata.get("tool_call_id")
+            if "status" in outbound.metadata:
+                status = outbound.metadata["status"]
+                if (
+                    not isinstance(tool_call_id, str)
+                    or not isinstance(status, str)
+                    or status not in {"success", "error", "refused"}
+                    or set(outbound.metadata) != {"tool_call_id", "status"}
+                ):
+                    await self._fail_sparse_protocol()
+                    return
+                tool_row = self._tool_rows.get(tool_call_id)
+                if tool_row is None or tool_row.tool_name != outbound.content:
+                    await self._fail_sparse_protocol()
+                    return
+                if tool_row.status == "running":
+                    tool_row.status = cast(_ToolRowStatus, status)
+                    tool_row.widget.update(
+                        _tool_row_content(tool_row.status, tool_row.tool_name, "")
+                    )
+                    self._app._scroll_to_latest()
+                return
             arguments = outbound.metadata.get("arguments")
             if not isinstance(tool_call_id, str) or not isinstance(arguments, str):
                 await self._fail_sparse_protocol()
@@ -1550,6 +1571,10 @@ class _MessageBusRunProjection:
     async def _reconcile_terminal(self) -> None:
         if self._app._closing or self._app._presentation_quiesced:
             return
+        for row in self._tool_rows.values():
+            if row.status == "running":
+                row.status = "cancelled" if self._outcome == "cancelled" else "unknown"
+                row.widget.update(_tool_row_content(row.status, row.tool_name, ""))
         if self._outcome == "completed":
             if self._terminal_content:
                 if self._assistant is None:
@@ -3554,6 +3579,10 @@ def _tool_row_content(
         return f"Completed: {display_name}"
     if status == "refused":
         return f"Rejected: {display_name}"
+    if status == "cancelled":
+        return f"Cancelled: {display_name}"
+    if status == "unknown":
+        return f"Status unavailable: {display_name}"
     return f"Failed: {display_name} - {_safe_failure_reason(summary, display_name)}"
 
 

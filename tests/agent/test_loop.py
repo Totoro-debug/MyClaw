@@ -2436,6 +2436,11 @@ async def test_loop_publishes_the_exact_sparse_outbound_protocol_without_tool_re
                 "unknown_tool",
                 {"tool_call_id": "call_sparse", "arguments": raw_arguments},
             ),
+            (
+                "tool_call",
+                "unknown_tool",
+                {"tool_call_id": "call_sparse", "status": "error"},
+            ),
             ("model_response", "done", {"_stream_delta": True}),
             ("model_response", "", {"_stream_end": True}),
             ("model_response", "", {"_streamed": True}),

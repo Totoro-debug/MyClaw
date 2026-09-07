@@ -35,7 +35,11 @@ type AgentRunnerModelRoute = Literal["chat", "schedule", "memory"]
 type AgentRunnerSegment = Literal["reasoning", "response"]
 type AgentRunnerFinishReason = Literal["completed", "failed", "cancelled", "max_iterations"]
 type AgentRunnerOutput = (
-    ReasoningDelta | TextDelta | AgentRunnerResponseSegmentEnd | AgentRunnerToolCallStarted
+    ReasoningDelta
+    | TextDelta
+    | AgentRunnerResponseSegmentEnd
+    | AgentRunnerToolCallStarted
+    | AgentRunnerToolCallFinished
 )
 
 _MAX_ITERATIONS_MESSAGE = (
@@ -60,6 +64,16 @@ class AgentRunnerToolCallStarted:
     tool_call_id: str
     tool_name: str
     arguments: str
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRunnerToolCallFinished:
+    """The observed Tool outcome without its result content or artifact."""
+
+    type: ClassVar[Literal["tool_call_finished"]] = "tool_call_finished"
+    tool_call_id: str
+    tool_name: str
+    status: Literal["success", "error", "refused"]
 
 
 class AgentRunnerOutputCallback(Protocol):
@@ -369,6 +383,13 @@ class AgentRunner:
                     result = _externalize_tool_result(result, externalize)
                     _append_run_message(runtime_messages, increment, _tool_run_message(result))
                     pending_tool_calls.pop(0)
+                    await emit(
+                        AgentRunnerToolCallFinished(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            status=result.status,
+                        )
+                    )
                     if stop_on_tool_error and result.status != "success":
                         return AgentRunnerResult(
                             messages=increment,
@@ -702,6 +723,7 @@ __all__ = [
     "AgentRunnerRoute",
     "AgentRunnerRouter",
     "AgentRunnerSegment",
+    "AgentRunnerToolCallFinished",
     "AgentRunnerToolCallStarted",
 ]
 

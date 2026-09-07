@@ -13,6 +13,7 @@ from myclaw.agent.runner import (
     AgentRunner,
     AgentRunnerResponseSegmentEnd,
     AgentRunnerResult,
+    AgentRunnerToolCallFinished,
     AgentRunnerToolCallStarted,
 )
 from myclaw.errors import ErrorInfo
@@ -548,7 +549,7 @@ async def test_runner_passes_confirmation_requester_directly_before_tool_call() 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ("error", "refused"))
+@pytest.mark.parametrize("status", ("success", "error", "refused"))
 async def test_runner_continues_after_provider_valid_tool_result_status(
     status: str,
 ) -> None:
@@ -586,12 +587,13 @@ async def test_runner_continues_after_provider_valid_tool_result_status(
         content=f"{status} result",
     )
     gateway = _DirectGateway([], (tool_result,))
+    observed: list[object] = []
 
     result = await AgentRunner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Continue."}],
         model="chat",
         tool_gateway=gateway,  # type: ignore[arg-type]
-        on_output=_ignore_output,
+        on_output=lambda event: _observe(observed, event),
         confirmation=None,
         externalize_result=None,
         cancel_requested=None,
@@ -601,6 +603,14 @@ async def test_runner_continues_after_provider_valid_tool_result_status(
     assert result.finish_reason == "completed"
     assert result.messages[1]["status"] == status
     assert result.final_content == "Done"
+    finished = [event for event in observed if isinstance(event, AgentRunnerToolCallFinished)]
+    assert len(finished) == 1
+    assert (finished[0].tool_call_id, finished[0].tool_name, finished[0].status) == (
+        call.id,
+        call.name,
+        status,
+    )
+    assert tool_result.content not in repr(observed)
 
 
 @pytest.mark.asyncio
