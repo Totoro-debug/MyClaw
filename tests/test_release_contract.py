@@ -19,66 +19,6 @@ from myclaw.management.commands import MANAGEMENT_COMMANDS
 
 ROOT = Path(__file__).resolve().parents[1]
 
-_ACTIVE_SKILL_CONTRACTS = (
-    ROOT / "CONTEXT.md",
-    ROOT / "README.md",
-    ROOT / "docs" / "myclaw-personal-agent-prd.md",
-    ROOT / "docs" / "terminal-conversation-ui-design.md",
-    ROOT / "docs" / "release-readiness.md",
-)
-_ACTIVE_ADRS = tuple(
-    ROOT / "docs" / "adr" / name
-    for name in (
-        "0001-file-first-local-persistence.md",
-        "0002-fixed-agent-home.md",
-        "0005-store-workspace-state-in-workspace.md",
-        "0007-use-host-adapters.md",
-        "0008-use-workspace-session-log.md",
-        "0009-active-session-snapshot-persistence.md",
-        "0010-fixed-tool-catalog-and-base-tool-boundaries.md",
-        "0011-use-full-screen-terminal-conversation.md",
-        "0012-use-textual-for-terminal-conversation.md",
-        "0015-use-session-blackboard-task-framing.md",
-        "0017-use-cli-composition-root-and-session-scoped-agent-loop.md",
-    )
-)
-_SUPERSEDED_ADRS = (
-    ROOT / "docs" / "adr" / "0014-use-message-bus-agent-loop-and-agent-runner.md",
-    ROOT / "docs" / "adr" / "0016-use-agent-home-skill-catalog-and-progressive-loading.md",
-)
-_MCP_AUTHORITATIVE_DOCS = (
-    ROOT / "README.md",
-    ROOT / "CONTEXT.md",
-    ROOT / "docs" / "myclaw-personal-agent-prd.md",
-    ROOT / "docs" / "adr" / "0010-fixed-tool-catalog-and-base-tool-boundaries.md",
-    ROOT / "docs" / "adr" / "0020-expose-configured-mcp-tools-through-tool-gateway.md",
-    ROOT / "docs" / "mcp-tool-support-implementation-plan.md",
-)
-_OBSOLETE_SKILL_MARKERS = (
-    "adr-0016 proposes",
-    "只有内置 slash commands 进入 management port",
-    "其它 `/` 开头文本作为普通用户消息发送给模型",
-    "exec、web 和 workspace 外部路径按具体目标执行一次性确认。",
-    "解析到 workspace 外的路径请求一次性确认。",
-    "exec、web 和 workspace 外部路径才使用精确绑定的一次性确认。",
-    "skill catalog 在启动时生成，因此新增、删除或修改元数据后应重启 myclaw",  # noqa: RUF001
-    "启动或任意 `/resume` 创建新的 agent loop 时会重新扫描并捕获 skill snapshot",
-    "a later agent loop construction rescans the directory",
-    "首次启动或任意 `/resume` 构造新 agent loop 时才",
-    "the five management commands",
-    "each agentloop captures one runtime generation skill snapshot",
-)
-
-_ISSUE_202_ARCHITECTURE_DOCS = (
-    ROOT / "CONTEXT.md",
-    ROOT / "docs" / "myclaw-personal-agent-prd.md",
-    ROOT / "docs" / "adr" / "0014-use-message-bus-agent-loop-and-agent-runner.md",
-    ROOT / "docs" / "adr" / "0016-use-agent-home-skill-catalog-and-progressive-loading.md",
-    ROOT / "docs" / "adr" / "0017-use-cli-composition-root-and-session-scoped-agent-loop.md",
-    ROOT / "docs" / "cli-composition-root-implementation-plan.md",
-)
-_ISSUE_202_INTERIM_STATUS = "Implementation status: T1-T8 verification in progress"
-_ISSUE_202_FINAL_STATUS = "Implementation status: T1-T8 complete after final verification"
 _ISSUE_202_PERSISTENCE_EVIDENCE = {
     "Session": (
         "tests/sessions/test_session.py::"
@@ -398,6 +338,15 @@ _INLINE_MARKDOWN_LINK = re.compile(
 _REFERENCE_MARKDOWN_LINK = re.compile(r"(?m)^\s*\[[^\]\n]+\]:\s*(?P<target><[^>\n]+>|\S+)")
 _EXPECTED_REMOVED_MARKDOWN_PATHS = frozenset(
     {
+        ROOT / "docs" / "cli-composition-root-implementation-plan.md",
+        ROOT / "docs" / "issue-195-terminal-commit-cancellation-fix-plan.md",
+        ROOT / "docs" / "issue-201-test-migration-ledger.md",
+        ROOT / "docs" / "mcp-tool-support-implementation-plan.md",
+        ROOT / "docs" / "mcp-tool-support-spec.md",
+        ROOT / "docs" / "myclaw-personal-agent-prd.md",
+        ROOT / "docs" / "release-readiness.md",
+        ROOT / "docs" / "security-fault-review.md",
+        ROOT / "docs" / "terminal-conversation-ui-design.md",
         ROOT / "myclaw" / "templates" / "blackboard.md",
         ROOT / "myclaw" / "templates" / "conversation-summary-input.md",
         ROOT / "myclaw" / "templates" / "current-user-input.md",
@@ -472,36 +421,6 @@ def _adr_status(path: Path) -> object:
     frontmatter = yaml.safe_load("\n".join(lines[1:closing]))
     assert isinstance(frontmatter, dict), path
     return frontmatter.get("status")
-
-
-def _markdown_section(content: str, heading: str) -> str:
-    lines = content.splitlines()
-    marker_index, level = next(
-        (index, len(line) - len(line.lstrip("#")))
-        for index, line in enumerate(lines)
-        if line.lstrip("#") == f" {heading}"
-    )
-    start = marker_index + 1
-    end = next(
-        (
-            index
-            for index in range(start, len(lines))
-            if lines[index].startswith("#")
-            and len(lines[index]) - len(lines[index].lstrip("#")) <= level
-            and lines[index].lstrip("#").startswith(" ")
-        ),
-        len(lines),
-    )
-    return "\n".join(lines[start:end])
-
-
-def _glossary_definition(content: str, term: str) -> str:
-    marker = f"**{term}**:\n"
-    _before, found, remainder = content.partition(marker)
-    assert found, term
-    definition, found, _after = remainder.partition("\n_Avoid_:")
-    assert found, term
-    return " ".join(definition.casefold().split())
 
 
 def test_distribution_declares_supported_loguru_release_range() -> None:
@@ -672,7 +591,7 @@ def test_obsolete_runtime_log_contract_surface_is_absent() -> None:
     assert not [path for path in obsolete_paths if path.exists()]
 
 
-def test_user_and_release_docs_publish_the_session_log_risk_contract() -> None:
+def test_readme_publishes_the_session_log_risk_contract() -> None:
     required_contract = (
         "same-session concurrency is unsupported",
         "unbounded queue",
@@ -684,7 +603,7 @@ def test_user_and_release_docs_publish_the_session_log_risk_contract() -> None:
         "legacy agent home runtime log files remain untouched",
     )
 
-    for path in (ROOT / "README.md", ROOT / "docs" / "release-readiness.md"):
+    for path in (ROOT / "README.md",):
         content = path.read_text(encoding="utf-8").lower()
         assert all(statement in content for statement in required_contract), path
 
@@ -692,7 +611,6 @@ def test_user_and_release_docs_publish_the_session_log_risk_contract() -> None:
 def test_active_contract_docs_do_not_claim_the_removed_runtime_log_implementation() -> None:
     active_contracts = (
         ROOT / "CONTEXT.md",
-        ROOT / "docs" / "release-readiness.md",
         ROOT / "docs" / "adr" / "0007-use-host-adapters.md",
     )
     obsolete_claims = (
@@ -750,7 +668,6 @@ def test_active_support_contract_matches_host_neutral_release_evidence() -> None
     active_paths = (
         ROOT / "CONTEXT.md",
         ROOT / "README.md",
-        ROOT / "docs" / "release-readiness.md",
     )
     support = "\n".join(path.read_text(encoding="utf-8").lower() for path in active_paths)
     for claim in (
@@ -792,57 +709,8 @@ def test_current_adrs_have_unique_numbers_and_accepted_status() -> None:
     assert all(_adr_status(path) == "accepted" for path in decisions)
 
 
-def test_mcp_contract_is_published_across_authoritative_documents() -> None:
-    documents = {path.name: path.read_text(encoding="utf-8") for path in _MCP_AUTHORITATIVE_DOCS}
-    context = documents["CONTEXT.md"]
-    for term, claims in {
-        "MCP Server": ("User Configuration", "Model Context Protocol"),
-        "MCP Server Configuration": ("mcp_name", "MCP Server"),
-        "MCP Runtime Manager": ("Runtime Lifetime", "MCP Tool Snapshots"),
-        "MCP Tool": ("Tool Catalog", "Built-in Tool"),
-        "MCP Tool Snapshot": ("immutable ordered set", "Runtime Generation"),
-    }.items():
-        definition = _glossary_definition(context, term)
-        assert all(claim.casefold() in definition for claim in claims), term
-
-    prd = documents["myclaw-personal-agent-prd.md"]
-    adr_0010 = documents["0010-fixed-tool-catalog-and-base-tool-boundaries.md"]
-    adr_0020 = documents["0020-expose-configured-mcp-tools-through-tool-gateway.md"]
-    plan = documents["mcp-tool-support-implementation-plan.md"]
-    readme = documents["README.md"]
-
-    for document in (prd, adr_0020, plan):
-        for claim in (
-            "mcp_name",
-            "streamable-http",
-            "MCP Tool Snapshot",
-            "model_context_overflow",
-            "Model request context exceeds the available input budget.",
-        ):
-            assert claim.casefold() in document.casefold(), claim
-
-    for document in (prd, adr_0020):
-        for claim in (
-            "mcp>=2,<3",
-            "call_tool",
-            "Tool Confirmation",
-            "/resume",
-            "structured_content",
-        ):
-            assert claim.casefold() in document.casefold(), claim
-
-    assert "superseded by" in adr_0010.casefold()
-    assert "ADR-0020" in adr_0010
-    assert "[mcp.servers.<mcp_name>]" in prd
-    assert "Implementation status: T1-T7 complete after final verification" in plan
-    assert "MCP Tool Snapshot" in readme
-    assert "当前版本没有 daemon、HTTP/IPC 服务、MCP" not in readme
-    assert "Model Request 保存缓存的 typed snapshot" not in prd
-
-
-def test_mcp_release_evidence_publishes_local_transports_and_quality_gates() -> None:
+def test_mcp_transport_evidence_uses_local_fixtures() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
-    release = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
     mcp_tests = (ROOT / "tests" / "tools" / "test_mcp.py").read_text(encoding="utf-8")
     cli_mcp_tests = (ROOT / "tests" / "test_cli_mcp_lifecycle.py").read_text(encoding="utf-8")
 
@@ -856,22 +724,8 @@ def test_mcp_release_evidence_publishes_local_transports_and_quality_gates() -> 
     ):
         assert test_name in mcp_tests
 
-    for claim in (
-        "Issue #224",
-        "mcp>=2,<3",
-        "test_stdio_transport_connects_to_a_local_real_mcp_server",
-        "test_streamable_http_transport_connects_to_a_local_real_mcp_server",
-        "python -m pytest -q",
-        "python -m mypy myclaw tests",
-        "python -m ruff check .",
-        "python -m ruff format --check .",
-        "model_context_overflow",
-        "no public-network access",
-    ):
-        assert claim.casefold() in release.casefold(), claim
     full_flow_test = "test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes"
     assert full_flow_test in cli_mcp_tests
-    assert full_flow_test in release
 
 
 def test_mcp_release_contract_excludes_out_of_scope_runtime_surfaces() -> None:
@@ -909,145 +763,6 @@ def test_tracked_markdown_local_links_resolve() -> None:
                 missing.append(f"{source.relative_to(ROOT)}: {target} -> {candidate}")
 
     assert missing == []
-
-
-def test_active_skill_docs_publish_the_accepted_routing_contract() -> None:
-    skill_adr = _ACTIVE_ADRS[-1]
-    active_contracts = (*_ACTIVE_SKILL_CONTRACTS, *_ACTIVE_ADRS)
-    tracked = set(_tracked_markdown_paths())
-
-    assert not [path for path in active_contracts if path not in tracked]
-    assert set(_SUPERSEDED_ADRS).isdisjoint(_ACTIVE_ADRS)
-    assert _adr_status(skill_adr) == "accepted"
-
-    context = (ROOT / "CONTEXT.md").read_text(encoding="utf-8")
-    glossary_contract = {
-        "Skill": (
-            "named, discoverable instruction package",
-            "existing capabilities",
-            "without registering tools or expanding permissions",
-        ),
-        "Skill Catalog": (
-            "ordered set of valid skill metadata",
-            "without loading the corresponding skill instructions",
-        ),
-        "Skill Invocation": (
-            "selection and application",
-            "foreground agent run",
-            "explicitly by the user or autonomously by the model",
-        ),
-    }
-    for term, claims in glossary_contract.items():
-        definition = _glossary_definition(context, term)
-        assert all(claim in definition for claim in claims), term
-
-    prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
-    management_contract = _markdown_section(prd, "CLI and management").casefold()
-    for claim in (
-        "only management commands enter the management port",
-        "exact valid skill slash invocation remains an ordinary foreground agent run",
-        "unknown or non-matching slash input remains ordinary input",
-    ):
-        assert claim in management_contract
-
-    tool_gateway_contract = _markdown_section(
-        prd, "Tool Gateway and fail-closed security"
-    ).casefold()
-    for claim in (
-        "`read_file`",
-        "canonical agent home skill root",
-        "无需 tool confirmation",
-        "resolved escape",
-        "仍请求一次性确认",
-    ):
-        assert claim in tool_gateway_contract
-
-    schedule_contract = _markdown_section(prd, "Schedule").casefold()
-    for claim in (
-        "generic `read_file` path exemption",
-        "不获得 skill discovery 或 invocation interface",
-    ):
-        assert claim in schedule_contract
-
-    for path in active_contracts:
-        content = " ".join(path.read_text(encoding="utf-8").casefold().split())
-        stale = [
-            marker
-            for marker in _OBSOLETE_SKILL_MARKERS
-            if " ".join(marker.casefold().split()) in content
-        ]
-        assert stale == [], f"{path}: {stale}"
-
-
-def test_reload_skill_command_and_lifecycle_are_published_by_active_docs() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
-    terminal = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(encoding="utf-8")
-    release = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
-
-    command_tokens = tuple(command.token for command in MANAGEMENT_COMMANDS)
-    command_sections = {
-        "README": _markdown_section(readme, "开始对话"),
-        "PRD": _markdown_section(prd, "CLI and management"),
-        "Terminal Design": _markdown_section(terminal, "Input Area"),
-    }
-    for label, section in command_sections.items():
-        positions = tuple(section.index(token) for token in command_tokens)
-        assert positions == tuple(sorted(positions)), label
-
-    for label, content in {
-        "README": readme,
-        "PRD": prd,
-        "Terminal Design": terminal,
-        "Release Readiness": release,
-    }.items():
-        assert "/reload_skill" in content, label
-
-    snapshot_definition = _glossary_definition(
-        (ROOT / "CONTEXT.md").read_text(encoding="utf-8"), "Skill Snapshot"
-    )
-    assert "successful reload" in snapshot_definition
-    assert "runtime generation replacement" in snapshot_definition
-
-    reload_decision = (
-        ROOT / "docs" / "adr" / "0018-centralize-model-request-context-construction.md"
-    )
-    assert _adr_status(reload_decision) == "accepted"
-    decision = reload_decision.read_text(encoding="utf-8").casefold()
-    for claim in ("/reload_skill", "failure preserves", "without rebuilding the agent loop"):
-        assert claim in decision
-
-
-def test_superseded_adrs_remain_historical_and_link_the_current_authority() -> None:
-    for path in _SUPERSEDED_ADRS:
-        content = path.read_text(encoding="utf-8")
-        assert _adr_status(path) == "accepted"
-        assert "superseded by [ADR-0017]" in content
-        assert "0017-use-cli-composition-root-and-session-scoped-agent-loop.md" in content
-
-    current = (
-        ROOT / "docs" / "adr" / "0017-use-cli-composition-root-and-session-scoped-agent-loop.md"
-    ).read_text(encoding="utf-8")
-    assert "final linearization refinement" in current
-    assert "target preparation is a precondition" in current
-
-
-def test_issue_202_release_closure_requires_tracked_authoritative_documents() -> None:
-    tracked = {path.relative_to(ROOT).as_posix() for path in _tracked_markdown_paths()}
-    required = {path.relative_to(ROOT).as_posix() for path in _ISSUE_202_ARCHITECTURE_DOCS}
-
-    assert required <= tracked
-
-    release = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
-    assert "docs/skill-module-implementation-plan.md" not in release
-    for relative_path in required:
-        assert relative_path in release
-
-    plan = (ROOT / "docs" / "cli-composition-root-implementation-plan.md").read_text(
-        encoding="utf-8"
-    )
-    assert _ISSUE_202_INTERIM_STATUS in plan or _ISSUE_202_FINAL_STATUS in plan
-    assert "\u672a\u5f00\u59cb" not in plan
 
 
 def test_issue_202_architecture_claims_match_source_ast_contracts() -> None:
@@ -1202,8 +917,6 @@ def test_issue_202_cli_source_records_cutover_and_shutdown_order() -> None:
 def test_issue_202_release_closure_maps_real_persistence_and_architecture_nodes(
     tmp_path: Path,
 ) -> None:
-    release = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
-    normalized_release = " ".join(release.split())
     evidence_nodes = _ISSUE_202_OWNER_NODES
 
     assert len(evidence_nodes) == 14
@@ -1238,20 +951,6 @@ def test_issue_202_release_closure_maps_real_persistence_and_architecture_nodes(
         f"stdout:\n{execution.stdout}\nstderr:\n{execution.stderr}"
     )
 
-    assert all(node in release for node in evidence_nodes)
-
-    required_claims = (
-        "The Dream System Job is the only intentionally new persisted record type.",
-        "The six compatibility persistence surfaces keep their current exact schemas.",
-        "Dream registration creates no foreground Session or Schedule Session.",
-        "tests/test_cli.py::test_cli_resume_constructor_failure_terminates_safely",
-        "tests/test_cli.py::test_cli_resume_preflight_failure_terminates_safely",
-        "target preparation is a precondition",
-        "quiesce_for_rebind -> pause_and_drain -> current unavailable -> old abort/drain",
-        "Management deactivate -> Schedule pause_and_drain + close -> Loop close/abort",
-    )
-    assert all(claim in normalized_release for claim in required_claims)
-
 
 def test_issue_202_active_stale_symbol_scan_is_precise_and_empty() -> None:
     active_sources = [
@@ -1283,11 +982,6 @@ def test_issue_202_active_stale_symbol_scan_is_precise_and_empty() -> None:
         "stale_fixture.py",
     )
     assert len(stale_fixture_findings) == 8
-
-    release = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
-    for symbol in (*_ISSUE_202_FORBIDDEN_RUNTIME_NAMES, "read_body"):
-        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])", release):
-            violations.append(f"docs/release-readiness.md: {symbol}")
 
     assert violations == []
     assert not (ROOT / "myclaw" / "agent" / "runtime.py").exists()
@@ -1417,123 +1111,3 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
         "self",
         "candidate",
     )
-
-    terminal_design = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(
-        encoding="utf-8"
-    )
-    release_readiness = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
-    implementation_plan = (ROOT / "docs" / "cli-composition-root-implementation-plan.md").read_text(
-        encoding="utf-8"
-    )
-    assert "run_repl" not in terminal_design
-    assert "tests/memory/test_memory_task.py" not in release_readiness
-    assert "ManagementDispatcher" not in implementation_plan
-    assert "current_memory_manager" not in implementation_plan
-    assert "current_dream" not in implementation_plan
-
-
-def test_issue_202_authoritative_documents_identify_one_current_composition_boundary() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    workspace_state_adr = (
-        ROOT / "docs" / "adr" / "0005-store-workspace-state-in-workspace.md"
-    ).read_text(encoding="utf-8")
-    adr_0014 = (
-        ROOT / "docs" / "adr" / "0014-use-message-bus-agent-loop-and-agent-runner.md"
-    ).read_text(encoding="utf-8")
-    adr_0016 = (
-        ROOT / "docs" / "adr" / "0016-use-agent-home-skill-catalog-and-progressive-loading.md"
-    ).read_text(encoding="utf-8")
-    adr_0017_path = (
-        ROOT / "docs" / "adr" / "0017-use-cli-composition-root-and-session-scoped-agent-loop.md"
-    )
-    adr_0017 = adr_0017_path.read_text(encoding="utf-8")
-    context = (ROOT / "CONTEXT.md").read_text(encoding="utf-8")
-    prd = (ROOT / "docs" / "myclaw-personal-agent-prd.md").read_text(encoding="utf-8")
-    terminal_design = (ROOT / "docs" / "terminal-conversation-ui-design.md").read_text(
-        encoding="utf-8"
-    )
-    issue_195_plan = (
-        ROOT / "docs" / "issue-195-terminal-commit-cancellation-fix-plan.md"
-    ).read_text(encoding="utf-8")
-    release_readiness = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
-    plan = (ROOT / "docs" / "cli-composition-root-implementation-plan.md").read_text(
-        encoding="utf-8"
-    )
-
-    for stale_claim in (
-        "Runtime Host",
-        "Memory Task",
-        "重新校验并读取完整 `SKILL.md`",
-        "每个 Schedule Job 使用独立 Schedule Session",
-        "<encoded_tool_call_id>",
-    ):
-        assert stale_claim not in readme
-    assert "| CLI composition root |" in readme
-    assert "| Skill Snapshot | Skill Loader" in readme
-    assert "每次成功加载" in readme
-    assert "Dream System Job" in readme
-    assert "创建或校正 `schedule.json`" in readme
-    assert (
-        "Registration of the Dream System Job also creates or reconciles `schedule.json`"
-        in workspace_state_adr
-    )
-
-    assert "`Tab` is not intercepted" in terminal_design
-    assert (
-        "Selecting any Conversation Session, including the already active Session"
-        in terminal_design
-    )
-    assert "shared Runtime-Lifetime Message Bus" in terminal_design
-    assert "Target construction or preflight failure is fatal" in terminal_design
-    assert "already active Session is a no-op" not in terminal_design
-
-    issue_195_status = issue_195_plan.splitlines()[2]
-    assert "已完成" in issue_195_status
-    assert "修复前实现事实" in issue_195_plan
-    assert "待评审" not in issue_195_status
-    assert "相比当前实现" not in plan
-
-    current_gates = release_readiness.split("## Verification Gates", maxsplit=1)[1].split(
-        "\n## ", maxsplit=1
-    )[0]
-    assert "1,736 passed" in current_gates
-    assert "1,746 nodes total" in current_gates
-    assert "1,734 passed" not in current_gates
-
-    assert _adr_status(adr_0017_path) == "accepted"
-    assert "superseded by [ADR-0017]" in adr_0014
-    assert "superseded by [ADR-0017]" in adr_0016
-    assert all(marker in adr_0017 for marker in ("CLI", "Agent Loop", "Runtime Generation"))
-    assert all(marker in context for marker in ("Runtime Generation", "Dream"))
-    assert all(marker in prd for marker in ("Message Bus", "Dream", "Agent Loop"))
-    for document in (adr_0017, prd, plan):
-        assert "final linearization refinement" in document
-        assert "target preparation is a precondition" in document
-        assert "quiesce_for_rebind -> pause_and_drain -> current unavailable" in document
-        assert "target.start() -> publish current -> schedule_service.resume()" in document
-
-
-def test_issue_202_plan_records_final_verification_only_after_all_gates() -> None:
-    plan = (ROOT / "docs" / "cli-composition-root-implementation-plan.md").read_text(
-        encoding="utf-8"
-    )
-
-    assert (_ISSUE_202_INTERIM_STATUS in plan) ^ (_ISSUE_202_FINAL_STATUS in plan)
-    if _ISSUE_202_INTERIM_STATUS in plan:
-        return
-
-    for command in (
-        "python -m pytest",
-        "python -m ruff check .",
-        "python -m mypy",
-        "python -m build",
-        "git diff --check",
-    ):
-        assert command in plan
-    assert "docs/release-readiness.md" in plan
-    assert "Verification base: clean `d60b96d1beed98b4325d2913b674be32d669adb3`" in plan
-
-    release = (ROOT / "docs" / "release-readiness.md").read_text(encoding="utf-8")
-    assert "clean `d60b96d1beed98b4325d2913b674be32d669adb3`" in release
-    assert "Mapped owner-node execution: 14 passed" in release
-    assert "Release contract tests: " in release

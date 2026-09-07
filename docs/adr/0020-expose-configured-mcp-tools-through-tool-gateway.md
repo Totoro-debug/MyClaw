@@ -23,4 +23,8 @@ Tool cancellation follows the Built-in Tool contract and propagates unchanged. R
 
 Every context-budget decision measures the complete content of the corresponding Model request: System Prompt, all messages, and every Tool schema. Compression trigger and cutoff calculations therefore reserve the complete Tool schema cost, and startup or `/resume` preflight uses the complete generation Tool Catalog. All local and Provider context-overflow paths use the single stable `model_context_overflow` code, and local budget failures use the single message `Model request context exceeds the available input budget.`
 
-This decision supersedes the fixed-ten-Tool and no-MCP portions of ADR-0010 while retaining its Tool Gateway, Built-in Tool, confirmation, result, and artifact boundaries where this ADR does not say otherwise.
+MCP names use `mcp_<mcp_name>_<remote_name>`, falling back to `mcp_<remote_name>` only if the preferred name exceeds 64 characters. The selected name must match `[A-Za-z0-9_-]{1,64}` without truncation or character replacement. Built-in names are reserved. Servers are ordered by name, and remote Tools by remote name with deterministic definition tie-breakers; the first valid collision wins. The resulting MCP Tools follow the Built-in Tools in the generation Catalog.
+
+Nullable normalization traverses JSON Schema nodes only. It preserves property names and literal data under keywords such as `default`, `enum`, and `examples`, including data keys named `nullable`. It does not recursively rewrite arbitrary JSON objects as schemas. MCP `isError` results retain projected remote text as Tool Error content; sanitized configuration and connection diagnostics do not imply sanitization of model-visible Tool Results.
+
+The shared Built-in Tool and result boundaries follow [ADR-0010](0010-fixed-tool-catalog-and-base-tool-boundaries.md). Requirements: [MCP Tool support](https://github.com/Totoro-debug/myclaw/issues/217).

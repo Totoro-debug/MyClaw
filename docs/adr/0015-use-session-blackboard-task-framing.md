@@ -4,14 +4,9 @@ status: accepted
 
 # Use Session Blackboard Task Framing Before Foreground Agent Runs
 
-## Context
-
 A user's task can be continued, narrowed, expanded, replaced, or cancelled across
-successive inputs. The foreground Agent currently receives raw conversation context but
-has no compact, explicit statement of the one task it is trying to finish or the boundary
-that makes the task complete. Putting this state in a visible task manager, updating it
-inside the ReAct loop, or letting it control execution would add a workflow product that
-MyClaw does not need.
+successive inputs. Blackboard provides one compact goal and completion boundary for
+interpreting that continuity without introducing workflow control or a visible task manager.
 
 ## Decision
 
@@ -64,25 +59,6 @@ state. Preparation cancellation or failure retains the previous state. A complet
 Framing call whose response is invalid clears the state if the main increment commits;
 a Task Framing model failure also degrades to no Blackboard and the raw input. Task
 Framing is excluded from Schedule and Memory execution.
-
-## Considered Options
-
-- **A visible task store or Blackboard Tool** was rejected because the state is an
-  internal interpretation aid, not a user-managed task product.
-- **Updating Blackboard during Agent Runner iterations** was rejected because intermediate
-  reasoning and Tool results must not turn passive state into workflow control or cause
-  task drift within one Agent Run.
-- **A Workspace-level task ledger** was rejected because the state follows one Conversation
-  Session and only annotates that Session's foreground runs.
-- **Full Session history as framing input** was rejected in favor of the previous state,
-  latest assistant content, and new input, which are the minimum facts needed to interpret
-  task continuity.
-- **Persisting the enriched User Message** was rejected because it would misrepresent
-  Runtime-generated state as the user's original words and expose the mechanism on resume.
-- **Running Task Framing during a Manual Skill Invocation** was rejected because the
-  explicitly selected Skill and the hidden task interpretation would compete within one
-  Agent Run. Preserving the stored Blackboard without using it keeps the manual run
-  isolated without adding a destructive state transition.
 
 ## Consequences
 

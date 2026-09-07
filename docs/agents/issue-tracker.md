@@ -1,10 +1,10 @@
 # Issue tracker: GitHub
 
-Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
+Issues and PRDs for this repo live as [GitHub issues](https://github.com/Totoro-debug/myclaw/issues), the authoritative source for product requirements and accepted discussion decisions. Local documentation contains current domain vocabulary, architectural decisions, and usage guidance; Git and GitHub retain design and implementation history. Use the `gh` CLI for issue operations.
 
 ## Conventions
 
-- **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
+- **Create an issue**: `gh issue create --title "..." --body "..."`. For multi-line bodies, use a UTF-8 temporary file with `--body-file`.
 - **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
 - **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
 - **Comment on an issue**: `gh issue comment <number> --body "..."`

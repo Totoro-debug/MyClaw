@@ -4,6 +4,8 @@ status: accepted
 
 # Persist Runtime Reasoning Effort Best-Effort After Memory Commit
 
+Reasoning Effort has five levels: `low`, `medium`, `high`, `xhigh`, and `max`, with `medium` as the configuration default. Runtime selection applies to `chat` and `default` requests and survives Session replacement; explicitly configured `memory` and `schedule` routes retain their own values.
+
 The shared `ModelRouter` remains the Runtime Lifetime authority for the current Reasoning Effort. A successful
 `/effort` update publishes that in-memory value before it performs any User Configuration I/O. The Management
 Port owns this ordering, so a configuration failure cannot prevent the next logical model request from using the
@@ -24,3 +26,5 @@ successful update or process restart.
 This decision does not add configuration locks, a general mutation framework, rollback transactions, or a global
 mutable User Configuration aggregate. Provider retry/fallback behavior, Session state, and Agent Loop ownership are
 unchanged.
+
+Requirements: [Reasoning Effort selection](https://github.com/Totoro-debug/myclaw/issues/213), [best-effort persistence](https://github.com/Totoro-debug/myclaw/issues/216).

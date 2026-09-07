@@ -4,7 +4,7 @@ status: accepted
 
 # Store Workspace State in the Workspace
 
-All persistent state except global User Configuration belongs to `<workspace>/.myclaw/`. Workspace identity is the normalized absolute startup directory; MyClaw does not infer a Git root, search ancestors, or fall back to Agent Home or ephemeral storage when Workspace State cannot be initialized safely.
+All persistent runtime state belongs to `<workspace>/.myclaw/`; global User Configuration and user-authored Skills belong to Agent Home. Workspace identity is the normalized absolute startup directory; MyClaw does not infer a Git root, search ancestors, or fall back to Agent Home or ephemeral storage when Workspace State cannot be initialized safely.
 
 The current layout is:
 

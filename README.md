@@ -176,6 +176,7 @@ myclaw
 精确提交 `/effort` 会用五档横向 selector 替换输入框；确认后，当前 Runtime Lifetime 的
 `chat` 与 `default` 请求立即使用所选值，显式 `memory` 与 `schedule` route 保持独立。
 切换 Conversation Session 不会重置该值。
+选择成功后还会尽力写回磁盘上的 `default` 和已显式配置的 `chat` Route；写入失败不撤销已经生效的运行时选择。
 
 `/reload_skill` 不进入 Message Bus 或 Conversation Session。成功后，后续 Agent Run、手动 Skill 调用和终端补全共同使用新状态；已经开始的 Agent Run 继续使用其已构造的消息。失败时显示稳定错误，并完整保留先前状态。
 
@@ -233,7 +234,7 @@ description: 将复杂需求整理为清晰、可执行的计划
 /planner 为下周的发布工作制定计划
 ```
 
-MyClaw 使用当前 Runtime Generation 创建时已经完整读取、校验并冻结的 `SKILL.md`，把 Skill 文档和 `/planner` 后面的请求一起提供给当前前台 Agent Run；手动调用不会再次访问磁盘。Conversation Session 只持久化用户输入的原始斜杠命令。
+MyClaw 使用最近一次成功加载或重载时完整读取、校验并冻结的 `SKILL.md`，把 Skill 文档和 `/planner` 后面的请求一起提供给当前前台 Agent Run；手动调用不会再次访问磁盘。Conversation Session 只持久化用户输入的原始斜杠命令。
 
 未知的斜杠输入、大小写不匹配的名称或不完整名称不会触发 Skill，而是作为普通输入处理。
 
@@ -270,7 +271,7 @@ myclaw/
 ├── management/     管理命令分发及只读/受控管理视图
 ├── agent/          Message Bus、Agent Loop、Agent Runner 与上下文构建
 ├── provider/       Model Router、Provider 工厂及协议适配器
-├── tools/          Tool Gateway、权限策略和固定 Tool 实现
+├── tools/          Tool Gateway、权限策略、Built-in Tool 与 MCP 集成
 ├── session/        Conversation Session 及模型消息投影
 ├── memory/         Conversation Summary、Long-term Memory、Memory Manager 与 Dream
 ├── schedule/       Schedule Job、Schedule Service 与 Workspace 存储
@@ -291,14 +292,15 @@ myclaw/
 | Agent Loop | 串行处理前台输入，管理 Session、Task Framing、Tool 和结果持久化 |
 | Agent Runner | 执行一次有迭代上限的 ReAct 模型与 Tool 循环 |
 | Model Router | 按逻辑 Route 解析 Provider 和模型，并处理限定重试与回退 |
+| MCP Runtime Manager | 管理 Runtime Lifetime 的 MCP 连接，为各 Agent Loop 提供冻结的 MCP Tool Snapshot |
 | Tool Gateway | Tool 调用的唯一公共入口，负责解析、校验、授权、执行和结果归一化 |
 | Memory Manager 与 Dream | 管理 Summary/Cursor/Long-term Memory 状态，并通过独立 Dream Runner 处理长期记忆 |
 | Schedule Service | 保存、触发和取消 Schedule Job；User Job 调用当前 Agent Loop，Dream System Job 直接调用 Dream |
 | Skill Snapshot | Skill Loader 在每次成功加载时完整读取并冻结有效 Skill 文档，对模型按用途投影元数据或正文 |
 
-### 固定 Tool Catalog
+### Tool Catalog
 
-Tool Catalog 不能通过配置增删或替换，固定包含：
+以下十项 Built-in Tool 固定提供，不能通过配置增删或替换；已配置的 MCP Tool 追加到其后：
 
 1. Read File
 2. Write File
@@ -322,6 +324,7 @@ CLI
   → 读取 ~/.myclaw/config.toml
   → 以当前目录建立 Workspace
   → 初始化 <workspace>/.myclaw/
+  → 连接已配置的 MCP Server，捕获初始 MCP Tool Snapshot
   → 组合 Runtime Lifetime 级 Message Bus、Model Router、Memory Manager、Dream 与 Schedule Service
   → 创建并 preflight 初始 Agent Loop，同时捕获初始 Skill Snapshot
   → 注册或校正 Dream System Job，并创建或校正 schedule.json
@@ -337,15 +340,17 @@ CLI
   → 拼装 System Prompt、Runtime Context、Memory、Skill 与短期历史
   → Agent Loop 调用 Agent Runner
   → Model Router 调用 chat Route
-  → Tool Call 经 Tool Gateway 校验、授权并执行
+  → Tool Call 经 Tool Gateway 校验、授权并执行，终端更新工具行状态
   → Tool Result 返回模型，直至生成最终回复或达到迭代上限
   → 更新 Conversation Session、Token 用量和持久化请求
   → Outbound Message 交给 Terminal Conversation 渲染
 ```
 
-每个普通前台输入会额外触发一次无 Tool 的 Task Framing 调用。Blackboard 只包含当前
+未命中管理命令或手动 Skill 的普通前台输入会额外触发一次无 Tool 的 Task Framing 调用。Blackboard 只包含当前
 `goal` 和 `completion_boundary`，用于帮助模型理解任务连续性；它不能授权执行、
 绕过 Tool Confirmation 或控制工作流。
+
+工具行从 Running 更新为成功、失败或拒绝；取消时仍未完成的工具行显示取消，缺失完成通知时显示状态未知。终端不展示 Tool Result 正文或 Artifact 引用，结果仍提供给模型并按现有规则持久化。
 
 ### Memory
 
@@ -354,12 +359,13 @@ CLI
   → Conversation Summary
   → <workspace>/.myclaw/memory/summary.jsonl
   → Dream System Job 或 /dream 触发 Dream
+  → 领取 Summary 批次并预先推进 Summary Cursor
   → memory Route 判断并更新 memory.md
-  → 推进 Summary Cursor
 ```
 
 Short-term Memory 是 Session 中尚未被摘要覆盖的后缀；Conversation Summary 是按序
 保存的摘要流；Long-term Memory 是跨 Conversation Session 生效的稳定信息。
+Dream 失败或取消不回退已推进的 Cursor，也不自动重试该批次；已完成的记忆编辑不会回滚。
 
 ### Schedule
 
@@ -417,11 +423,12 @@ Agent Home 固定为当前账户的 `~/.myclaw/`，不能通过配置切换：
 ## 权限与安全边界
 
 - Workspace 内的文件操作仍受操作系统账户权限限制。
-- Workspace 外部文件路径，以及未通过具体安全检查的 Exec/Web 目标，会请求绑定到该次调用的一次性 Tool Confirmation。
+- Built-in Tool 访问 Workspace 外部文件路径时会请求一次性 Tool Confirmation；`read_file` 读取 Agent Home 内 `skills` 子目录的规范路径除外，Agent Home 的其他路径不享有该豁免。未通过具体安全检查的 Exec/Web 目标也需要逐次确认。
 - Schedule Agent Run 没有交互式确认能力，因此拒绝所有需要确认的操作。
 - Exec 不是操作系统沙箱。命令继承当前用户权限，可能影响 Workspace 之外的系统资源。
 - Web Tool 会执行 URL、DNS、重定向及目标地址检查，但这不等同于完整网络隔离。
 - Tool、Skill 和 Blackboard 都不能扩大 Permission Policy 允许的权限。
+- 已配置的 MCP Server 是明确授权的外部能力，不附加上述 Built-in Tool 的逐次确认；它们的进程、网络和文件权限由 Server 与宿主系统决定。
 - Artifact 没有自动清理策略，Long-term Memory 也没有自动大小上限。
 
 ## 运行限制
@@ -435,6 +442,20 @@ Agent Home 固定为当前账户的 `~/.myclaw/`，不能通过配置切换：
 - 旧版 Agent Home Runtime Log 文件保持原样（legacy Agent Home Runtime Log files remain untouched）；升级不会读取、移动、删除、截断或更新它们。
 - 普通后台 Session 保存失败没有用户确认或失败日志；崩溃后 Conversation Summary 与`last_consolidated` 可能暂时不一致。
 - 当前版本没有 daemon、HTTP/IPC 服务、subagent runtime、profiles、跨进程状态协调、Keychain 集成或环境变量 API Key；MCP 仅通过上述配置的 Runtime Lifetime 集成提供。
+
+## 开发文档
+
+产品需求与讨论以 [GitHub Issues](https://github.com/Totoro-debug/myclaw/issues) 为准；本地保留[领域词汇](CONTEXT.md)、[现行 ADR](docs/adr/)和[文档维护约定](docs/agents/domain.md)。旧方案、已完成计划和历史验收记录通过 Git 与 GitHub 追溯。
+
+安装开发依赖后，运行以下检查：
+
+```text
+python -m pip install -e .[dev]
+python -m pytest -q
+python -m ruff check .
+python -m ruff format --check .
+python -m mypy
+```
 
 ## License
 

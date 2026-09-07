@@ -21,7 +21,7 @@ Persistent Personal Agent state owned by exactly one Workspace rather than by th
 _Avoid_: Agent Home, project source, global state, cache
 
 **Message Bus**:
-The transient pair of Inbound and Outbound queues shared by one Command-line Conversation and its current Agent Loop for foreground conversation flow. Its public async operations are snapshot, put/get, pause/resume delivery, drain, and reset; its only synchronous operations bind and unbind the Inbound-changed callback. Its contents are cleared whenever the conversation resumes a Conversation Session, including its current one.
+The transient pair of Inbound and Outbound queues shared by one Command-line Conversation and its current Agent Loop for foreground conversation flow.
 _Avoid_: persistent event log, broadcast bus, Schedule queue
 
 **Inbound Message**:
@@ -97,7 +97,7 @@ A named, discoverable instruction package that guides an Agent Run through exist
 _Avoid_: Tool, Plugin, Management Command, capability extension
 
 **Skill Catalog**:
-The ordered set of valid Skill metadata available for discovery without loading the corresponding Skill instructions.
+The ordered set of valid Skill metadata presented for discovery without exposing the corresponding instructions in that catalog.
 _Avoid_: Tool Catalog, command list, loaded Skill content
 
 **Skill Snapshot**:
@@ -109,7 +109,7 @@ The selection and application of one Skill's instructions to a foreground Agent 
 _Avoid_: Management Command, Tool capability, Skill discovery
 
 **Manual Skill Invocation**:
-A Skill Invocation initiated explicitly when the user names an available Skill in the foreground input.
+A Skill Invocation initiated by an exact available Skill slash name at the beginning of foreground input, optionally followed by whitespace and a request.
 _Avoid_: Autonomous Skill Invocation, always-loaded Skill, Management Command
 
 **Conversation Session**:
@@ -169,7 +169,7 @@ An external capability provider explicitly selected by the user through User Con
 _Avoid_: Model Provider, Plugin, Tool Catalog, MCP endpoint
 
 **MCP Server Configuration**:
-The single User Configuration item keyed by `mcp_name` that declares one enabled MCP Server's transport and connection settings.
+The single User Configuration item keyed by `mcp_name` that declares an MCP Server's enablement, transport, and connection settings.
 _Avoid_: MCP endpoint, MCP profile, Server Tool
 
 **MCP Runtime Manager**:
@@ -217,7 +217,7 @@ A named model purpose that resolves a model request without exposing Provider se
 _Avoid_: Model string, provider selection, backend, ad hoc route
 
 **Reasoning Effort**:
-A five-level intent attached to one Model Route that asks its Model Provider to trade response capability and thoroughness against latency and cost for each request. Its built-in level is `medium` when User Configuration omits it.
+A five-level intent attached to one Model Route that asks its Model Provider to trade response capability and thoroughness against latency and cost for each request.
 _Avoid_: Thinking level, token budget, Conversation Session override
 
 **Model Provider**:
