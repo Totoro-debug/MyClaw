@@ -1,6 +1,8 @@
 import ast
 import importlib.util
 import inspect
+import subprocess
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +14,7 @@ from myclaw.agent.context import ContextBuilder
 PROJECT_ROOT = Path(__file__).parents[2]
 PACKAGE_ROOT = PROJECT_ROOT / "myclaw"
 _CLI_PATH = Path("myclaw/terminal/cli.py")
-_CANDIDATE_CLI_TOOL_IMPORTS = frozenset(
+_CLI_TOOL_IMPORTS = frozenset(
     {
         ("myclaw.tools.mcp_runtime", "MCPRuntimeManager"),
         ("myclaw.tools.mcp_runtime", "MCPServerFailure"),
@@ -111,7 +113,7 @@ def _resolved_static_imports(
     return tuple(imports)
 
 
-def _is_tools_dependency(reference: _StaticImport) -> bool:
+def _imported_module_names(reference: _StaticImport) -> tuple[str, ...]:
     modules = [reference.source_module]
     if reference.form == "from" and reference.symbol is not None:
         modules.append(
@@ -119,7 +121,14 @@ def _is_tools_dependency(reference: _StaticImport) -> bool:
             if reference.source_module
             else reference.symbol
         )
-    return any(module == "myclaw.tools" or module.startswith("myclaw.tools.") for module in modules)
+    return tuple(modules)
+
+
+def _is_tools_dependency(reference: _StaticImport) -> bool:
+    return any(
+        module == "myclaw.tools" or module.startswith("myclaw.tools.")
+        for module in _imported_module_names(reference)
+    )
 
 
 def _terminal_tool_import_violations(
@@ -147,6 +156,23 @@ def _terminal_tool_import_violations(
             if reference.form == "from" and reference.symbol is not None:
                 imported = f"{imported}.{reference.symbol}" if imported else reference.symbol
             violations.append(f"{path}:{reference.line} imports {imported}")
+    return tuple(violations)
+
+
+def _retired_mcp_runtime_import_violations(sources: Mapping[Path, str]) -> tuple[str, ...]:
+    violations: list[str] = []
+    for path in sorted(sources, key=str):
+        for reference in _resolved_static_imports(
+            sources[path],
+            package=tuple(path.parent.parts),
+        ):
+            imported_modules = _imported_module_names(reference)
+            if not any(
+                module == "myclaw.mcp_runtime" or module.startswith("myclaw.mcp_runtime.")
+                for module in imported_modules
+            ):
+                continue
+            violations.append(f"{path}:{reference.line} imports {imported_modules[-1]}")
     return tuple(violations)
 
 
@@ -217,19 +243,22 @@ def test_terminal_depends_on_ports_instead_of_tool_implementations() -> None:
         for path in _python_files(PACKAGE_ROOT / "terminal")
     }
 
-    violations = _terminal_tool_import_violations(sources, allowed_symbols={})
+    violations = _terminal_tool_import_violations(
+        sources,
+        allowed_symbols={_CLI_PATH: _CLI_TOOL_IMPORTS},
+    )
 
     assert violations == ()
 
 
-@pytest.mark.parametrize(("module", "symbol"), sorted(_CANDIDATE_CLI_TOOL_IMPORTS))
-def test_terminal_tool_import_checker_allows_each_candidate_cli_symbol(
+@pytest.mark.parametrize(("module", "symbol"), sorted(_CLI_TOOL_IMPORTS))
+def test_terminal_tool_import_checker_allows_each_cli_symbol(
     module: str,
     symbol: str,
 ) -> None:
     violations = _terminal_tool_import_violations(
         {_CLI_PATH: f"from {module} import {symbol}"},
-        allowed_symbols={_CLI_PATH: _CANDIDATE_CLI_TOOL_IMPORTS},
+        allowed_symbols={_CLI_PATH: _CLI_TOOL_IMPORTS},
     )
 
     assert violations == ()
@@ -248,7 +277,7 @@ def test_terminal_tool_import_checker_resolves_allowed_aliases_and_relative_impo
 ) -> None:
     violations = _terminal_tool_import_violations(
         {_CLI_PATH: source},
-        allowed_symbols={_CLI_PATH: _CANDIDATE_CLI_TOOL_IMPORTS},
+        allowed_symbols={_CLI_PATH: _CLI_TOOL_IMPORTS},
     )
 
     assert violations == ()
@@ -273,10 +302,10 @@ def test_terminal_tool_import_checker_retains_original_symbol_form_and_line() ->
         Path("myclaw/terminal/internal/loader.py"),
     ],
 )
-def test_terminal_tool_import_checker_rejects_candidate_symbols_outside_cli(path: Path) -> None:
+def test_terminal_tool_import_checker_rejects_cli_symbols_outside_cli(path: Path) -> None:
     violations = _terminal_tool_import_violations(
         {path: "from myclaw.tools.mcp_runtime import MCPRuntimeManager"},
-        allowed_symbols={_CLI_PATH: _CANDIDATE_CLI_TOOL_IMPORTS},
+        allowed_symbols={_CLI_PATH: _CLI_TOOL_IMPORTS},
     )
 
     assert violations
@@ -301,7 +330,7 @@ def test_terminal_tool_import_checker_rejects_candidate_symbols_outside_cli(path
 def test_terminal_tool_import_checker_rejects_unapproved_tool_imports(source: str) -> None:
     violations = _terminal_tool_import_violations(
         {_CLI_PATH: source},
-        allowed_symbols={_CLI_PATH: _CANDIDATE_CLI_TOOL_IMPORTS},
+        allowed_symbols={_CLI_PATH: _CLI_TOOL_IMPORTS},
     )
 
     assert violations
@@ -318,8 +347,53 @@ def test_terminal_tool_import_checker_rejects_unapproved_tool_imports(source: st
 def test_terminal_tool_import_checker_allows_non_tool_dependencies(source: str) -> None:
     violations = _terminal_tool_import_violations(
         {_CLI_PATH: source},
-        allowed_symbols={_CLI_PATH: _CANDIDATE_CLI_TOOL_IMPORTS},
+        allowed_symbols={_CLI_PATH: _CLI_TOOL_IMPORTS},
     )
+
+    assert violations == ()
+
+
+def test_retired_mcp_runtime_export_is_absent() -> None:
+    assert not (PACKAGE_ROOT / "mcp_runtime.py").exists()
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import importlib.util; print(importlib.util.find_spec('myclaw.mcp_runtime'))",
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert probe.stdout.strip() == "None"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import myclaw.mcp_runtime",
+        "from myclaw.mcp_runtime import MCPRuntimeManager",
+        "from myclaw import mcp_runtime",
+        "from ..mcp_runtime import MCPRuntimeManager",
+        "from .. import mcp_runtime",
+    ],
+)
+def test_retired_mcp_runtime_import_checker_covers_import_forms(source: str) -> None:
+    violations = _retired_mcp_runtime_import_violations({_CLI_PATH: source})
+
+    assert violations
+
+
+def test_production_code_does_not_import_retired_mcp_runtime_export() -> None:
+    sources = {
+        path.relative_to(PROJECT_ROOT): path.read_text(encoding="utf-8")
+        for path in _python_files(PACKAGE_ROOT)
+    }
+
+    violations = _retired_mcp_runtime_import_violations(sources)
 
     assert violations == ()
 

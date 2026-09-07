@@ -25,14 +25,6 @@ from myclaw.management.service import (
     ManagementError,
     ManagementViewService,
 )
-from myclaw.mcp_runtime import (
-    BUILT_IN_TOOL_NAMES,
-    MCPRuntimeManager,
-    MCPServerFailure,
-    MCPSnapshotReport,
-    MCPStartupReport,
-    MCPToolSnapshot,
-)
 from myclaw.memory.dream import Dream
 from myclaw.memory.manager import MemoryManager
 from myclaw.provider.factory import create_provider
@@ -43,6 +35,14 @@ from myclaw.terminal.conversation import (
     TerminalConversationApp,
     is_interactive_terminal,
 )
+from myclaw.tools.mcp_runtime import (
+    MCPRuntimeManager,
+    MCPServerFailure,
+    MCPSnapshotReport,
+    MCPStartupReport,
+    MCPToolSnapshot,
+)
+from myclaw.tools.tool_gateway import BUILT_IN_TOOL_NAMES
 from myclaw.utils.scheduler import AsyncioSchedulerClock
 from myclaw.utils.time import local_now
 

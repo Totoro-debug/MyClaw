@@ -8,6 +8,8 @@ The CLI asynchronous root is the sole composition root. It owns the Workspace pa
 
 The MCP Runtime Manager connects configured Servers before the first Agent Loop is created and supplies an immutable MCP Tool Snapshot for each generation. The Skill Loader instead publishes atomically replaceable frozen Skill state within a generation. Both participate in complete request preflight; their separate refresh rules follow [ADR-0016](0016-use-agent-home-skill-catalog-and-progressive-loading.md) and [ADR-0020](0020-expose-configured-mcp-tools-through-tool-gateway.md).
 
+As the composition root, `myclaw/terminal/cli.py` may import its narrow MCP Runtime Manager boundary and Built-in Tool name reservation directly from their defining `myclaw.tools` modules. This permission does not extend to other Terminal presentation modules, and the architecture does not provide a top-level MCP re-export module.
+
 Agent Runner is the sole bounded ReAct implementation. Foreground and User Schedule work share the current Agent Loop's Runner and Gateway with isolated invocation state. Dream owns a separate Runner and restricted Gateway using that same engine. Single-completion requests call Model Router directly. Context construction follows [ADR-0018](0018-centralize-model-request-context-construction.md).
 
 Session replacement first prepares a candidate MCP generation, pauses old foreground admission, waits for required Session persistence, and constructs and synchronously preflights an unstarted target Agent Loop. Active foreground work requires the existing force confirmation before destructive replacement. The successful replacement order is:
