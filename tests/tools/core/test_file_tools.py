@@ -41,7 +41,7 @@ def test_gateway_exports_the_new_path_and_line_contract(workspace: Path) -> None
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read UTF-8 text lines from a file within the current Workspace.",
+                "description": ReadFileTool.description,
                 "parameters": {
                     "type": "object",
                     "properties": {

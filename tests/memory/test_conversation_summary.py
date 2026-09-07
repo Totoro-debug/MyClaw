@@ -12,6 +12,7 @@ from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
+from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.memory.conversation_summary import ConversationSummaryManager
 from myclaw.memory.manager import MemoryManager
 from myclaw.memory.records import SummaryEntry
@@ -990,10 +991,22 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
         now=lambda: NOW,
     )
 
+    projected = project_messages(session.messages)
+    input_budget = estimate_input_tokens(
+        RuntimeStatusInput(
+            system_prompt=projected[0]["content"],
+            retained_messages=tuple(
+                json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+                for message in projected[1:]
+            ),
+            tool_definitions=(json.dumps(tool_schema, ensure_ascii=False, separators=(",", ":")),),
+            runtime_context="",
+        )
+    )
     await manager.prepare(
         session,
         project_messages=project_messages,
-        route_context_window=1_024,
+        route_context_window=input_budget + 128,
         route_max_output=128,
         tools=(tool_schema,),
     )

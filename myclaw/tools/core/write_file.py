@@ -12,7 +12,7 @@ class WriteFileTool(BaseTool):
     """Write exact UTF-8 bytes to any host-readable file path."""
 
     name = "write_file"
-    description = "Write UTF-8 text to a file within the current Workspace."
+    description = "Write UTF-8 text to a file. Paths outside the Workspace require confirmation."
     required = ("path", "content")
 
     path: Annotated[

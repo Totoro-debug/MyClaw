@@ -12,7 +12,9 @@ class EditFileTool(BaseTool):
     """Replace exact strict UTF-8 text in any host-readable file path."""
 
     name = "edit_file"
-    description = "Replace exact UTF-8 text in a file within the current Workspace."
+    description = (
+        "Replace exact UTF-8 text in a file. Paths outside the Workspace require confirmation."
+    )
     required = ("path", "old_text", "new_text")
 
     path: Annotated[

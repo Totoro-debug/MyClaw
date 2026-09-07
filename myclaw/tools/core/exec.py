@@ -63,7 +63,10 @@ class ExecTool(BaseTool):
     """Run one user-confirmable command through a direct Bash login shell."""
 
     name = "exec"
-    description = "Run one Bash login-shell command with captured output in the current Workspace."
+    description = (
+        "Run one Bash login-shell command with captured output in the selected directory. "
+        "External working directories and safety-check findings require confirmation."
+    )
     required = ("command",)
 
     command: Annotated[str, ToolParam(description="Bash command to execute.", min_length=1)]

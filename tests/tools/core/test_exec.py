@@ -128,9 +128,7 @@ def test_exec_schema_declares_bash_command_cwd_and_timeout(workspace: Path) -> N
         "type": "function",
         "function": {
             "name": "exec",
-            "description": (
-                "Run one Bash login-shell command with captured output in the current Workspace."
-            ),
+            "description": ExecTool.description,
             "parameters": {
                 "type": "object",
                 "properties": {

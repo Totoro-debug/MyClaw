@@ -12,7 +12,10 @@ class ReadFileTool(BaseTool):
     """Read a strict UTF-8 line window from any host-readable file."""
 
     name = "read_file"
-    description = "Read UTF-8 text lines from a file within the current Workspace."
+    description = (
+        "Read UTF-8 text lines from a file. "
+        "Paths outside the Workspace and Skill root require confirmation."
+    )
     required = ("path",)
 
     path: Annotated[
