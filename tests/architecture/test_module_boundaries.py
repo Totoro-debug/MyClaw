@@ -1,6 +1,8 @@
 import ast
 import importlib.util
 import inspect
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,25 @@ from myclaw.agent.context import ContextBuilder
 
 PROJECT_ROOT = Path(__file__).parents[2]
 PACKAGE_ROOT = PROJECT_ROOT / "myclaw"
+_CLI_PATH = Path("myclaw/terminal/cli.py")
+_CANDIDATE_CLI_TOOL_IMPORTS = frozenset(
+    {
+        ("myclaw.tools.mcp_runtime", "MCPRuntimeManager"),
+        ("myclaw.tools.mcp_runtime", "MCPServerFailure"),
+        ("myclaw.tools.mcp_runtime", "MCPSnapshotReport"),
+        ("myclaw.tools.mcp_runtime", "MCPStartupReport"),
+        ("myclaw.tools.mcp_runtime", "MCPToolSnapshot"),
+        ("myclaw.tools.tool_gateway", "BUILT_IN_TOOL_NAMES"),
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticImport:
+    source_module: str
+    symbol: str | None
+    form: str
+    line: int
 
 
 def test_retired_prompt_and_session_assembly_modules_are_absent() -> None:
@@ -35,6 +56,17 @@ def _imports(path: Path) -> tuple[tuple[str, int], ...]:
     return tuple(imports)
 
 
+def _resolved_from_module(node: ast.ImportFrom, *, package: tuple[str, ...]) -> str:
+    if node.level:
+        retained = len(package) - node.level + 1
+        base = package[: max(0, retained)]
+    else:
+        base = ()
+    if node.module is not None:
+        base = (*base, *node.module.split("."))
+    return ".".join(base)
+
+
 def _resolved_imports(
     source: str,
     *,
@@ -48,22 +80,74 @@ def _resolved_imports(
             continue
         if not isinstance(node, ast.ImportFrom):
             continue
-        if node.level:
-            retained = len(package) - node.level + 1
-            base = package[: max(0, retained)]
-        else:
-            base = ()
-        if node.module is not None:
-            base = (*base, *node.module.split("."))
-        module = ".".join(base)
+        module = _resolved_from_module(node, package=package)
         if module:
             imports.append((module, node.lineno))
         imports.extend(
-            (".".join((*base, alias.name)), node.lineno)
+            (".".join((module, alias.name)) if module else alias.name, node.lineno)
             for alias in node.names
-            if base or alias.name
+            if module or alias.name
         )
     return tuple(imports)
+
+
+def _resolved_static_imports(
+    source: str,
+    *,
+    package: tuple[str, ...],
+) -> tuple[_StaticImport, ...]:
+    tree = ast.parse(source)
+    imports: list[_StaticImport] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend(
+                _StaticImport(alias.name, None, "import", node.lineno) for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            module = _resolved_from_module(node, package=package)
+            imports.extend(
+                _StaticImport(module, alias.name, "from", node.lineno) for alias in node.names
+            )
+    return tuple(imports)
+
+
+def _is_tools_dependency(reference: _StaticImport) -> bool:
+    modules = [reference.source_module]
+    if reference.form == "from" and reference.symbol is not None:
+        modules.append(
+            ".".join((reference.source_module, reference.symbol))
+            if reference.source_module
+            else reference.symbol
+        )
+    return any(module == "myclaw.tools" or module.startswith("myclaw.tools.") for module in modules)
+
+
+def _terminal_tool_import_violations(
+    sources: Mapping[Path, str],
+    *,
+    allowed_symbols: Mapping[Path, frozenset[tuple[str, str]]],
+) -> tuple[str, ...]:
+    violations: list[str] = []
+    for path in sorted(sources, key=str):
+        allowed_for_path = allowed_symbols.get(path, frozenset())
+        for reference in _resolved_static_imports(
+            sources[path],
+            package=tuple(path.parent.parts),
+        ):
+            if not _is_tools_dependency(reference):
+                continue
+            is_allowed = (
+                reference.form == "from"
+                and reference.symbol is not None
+                and (reference.source_module, reference.symbol) in allowed_for_path
+            )
+            if is_allowed:
+                continue
+            imported = reference.source_module
+            if reference.form == "from" and reference.symbol is not None:
+                imported = f"{imported}.{reference.symbol}" if imported else reference.symbol
+            violations.append(f"{path}:{reference.line} imports {imported}")
+    return tuple(violations)
 
 
 def _is_blackboard_module(module: str) -> bool:
@@ -128,15 +212,116 @@ def test_tools_do_not_depend_on_provider() -> None:
 
 
 def test_terminal_depends_on_ports_instead_of_tool_implementations() -> None:
-    forbidden = {"myclaw.tools"}
-    violations = [
-        f"{path.relative_to(PROJECT_ROOT)}:{line} imports {module}"
+    sources = {
+        path.relative_to(PROJECT_ROOT): path.read_text(encoding="utf-8")
         for path in _python_files(PACKAGE_ROOT / "terminal")
-        for module, line in _imports(path)
-        if any(module == prefix or module.startswith(f"{prefix}.") for prefix in forbidden)
-    ]
+    }
 
-    assert violations == []
+    violations = _terminal_tool_import_violations(sources, allowed_symbols={})
+
+    assert violations == ()
+
+
+@pytest.mark.parametrize(("module", "symbol"), sorted(_CANDIDATE_CLI_TOOL_IMPORTS))
+def test_terminal_tool_import_checker_allows_each_candidate_cli_symbol(
+    module: str,
+    symbol: str,
+) -> None:
+    violations = _terminal_tool_import_violations(
+        {_CLI_PATH: f"from {module} import {symbol}"},
+        allowed_symbols={_CLI_PATH: _CANDIDATE_CLI_TOOL_IMPORTS},
+    )
+
+    assert violations == ()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from myclaw.tools.mcp_runtime import MCPRuntimeManager as Manager",
+        "from ..tools.mcp_runtime import MCPRuntimeManager",
+        "from ..tools.tool_gateway import BUILT_IN_TOOL_NAMES as BUILT_INS",
+    ],
+)
+def test_terminal_tool_import_checker_resolves_allowed_aliases_and_relative_imports(
+    source: str,
+) -> None:
+    violations = _terminal_tool_import_violations(
+        {_CLI_PATH: source},
+        allowed_symbols={_CLI_PATH: _CANDIDATE_CLI_TOOL_IMPORTS},
+    )
+
+    assert violations == ()
+
+
+def test_terminal_tool_import_checker_retains_original_symbol_form_and_line() -> None:
+    references = _resolved_static_imports(
+        "\nfrom myclaw.tools.mcp_runtime import MCPRuntimeManager as Manager",
+        package=("myclaw", "terminal"),
+    )
+
+    assert references == (
+        _StaticImport("myclaw.tools.mcp_runtime", "MCPRuntimeManager", "from", 2),
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        Path("myclaw/terminal/conversation.py"),
+        Path("myclaw/terminal/process_entry.py"),
+        Path("myclaw/terminal/internal/loader.py"),
+    ],
+)
+def test_terminal_tool_import_checker_rejects_candidate_symbols_outside_cli(path: Path) -> None:
+    violations = _terminal_tool_import_violations(
+        {path: "from myclaw.tools.mcp_runtime import MCPRuntimeManager"},
+        allowed_symbols={_CLI_PATH: _CANDIDATE_CLI_TOOL_IMPORTS},
+    )
+
+    assert violations
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from myclaw.tools.tool_gateway import ToolGateway",
+        "from myclaw.tools.tool_gateway import BUILT_IN_TOOL_NAMES, ToolGateway",
+        "from myclaw.tools.mcp_runtime import allocate_mcp_tool_name",
+        "import myclaw.tools.mcp_runtime",
+        "import myclaw.tools.mcp_runtime as runtime",
+        "from myclaw.tools import mcp_runtime",
+        "from myclaw.tools.mcp_runtime import *",
+        "from myclaw.tools.tool_gateway import ToolGateway as Gateway",
+        "from ..tools.tool_gateway import ToolGateway",
+        "def load():\n    from myclaw.tools.mcp_runtime import allocate_mcp_tool_name",
+        "if TYPE_CHECKING:\n    from myclaw.tools.mcp_runtime import allocate_mcp_tool_name",
+    ],
+)
+def test_terminal_tool_import_checker_rejects_unapproved_tool_imports(source: str) -> None:
+    violations = _terminal_tool_import_violations(
+        {_CLI_PATH: source},
+        allowed_symbols={_CLI_PATH: _CANDIDATE_CLI_TOOL_IMPORTS},
+    )
+
+    assert violations
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import asyncio",
+        "from myclaw.management.service import ManagementViewService",
+        "from .conversation import TerminalConversationApp",
+    ],
+)
+def test_terminal_tool_import_checker_allows_non_tool_dependencies(source: str) -> None:
+    violations = _terminal_tool_import_violations(
+        {_CLI_PATH: source},
+        allowed_symbols={_CLI_PATH: _CANDIDATE_CLI_TOOL_IMPORTS},
+    )
+
+    assert violations == ()
 
 
 def test_context_builder_constructor_owns_only_context_dependencies() -> None:
