@@ -111,127 +111,123 @@ class ManagementCommandDispatcher:
             parsed_command = _MANAGEMENT_COMMAND_BY_TOKEN.get(command)
             if parsed_command is None:
                 return ManagementCommandResult(handled=False, output=None)
-            return await self._dispatch(parsed_command, self._management)
-
-    async def _dispatch(
-        self,
-        command: ManagementCommandDefinition,
-        management: ManagementPort,
-    ) -> ManagementCommandResult:
-        if command is _EFFORT_COMMAND:
-            try:
-                effort = await management.reasoning_effort()
-            except ManagementError as management_error:
+            management = self._management
+            if parsed_command is _EFFORT_COMMAND:
+                try:
+                    effort = await management.reasoning_effort()
+                except ManagementError as management_error:
+                    return ManagementCommandResult(
+                        handled=True,
+                        output=f"{management_error.error.code}: {management_error.error.message}",
+                    )
                 return ManagementCommandResult(
                     handled=True,
-                    output=f"{management_error.error.code}: {management_error.error.message}",
+                    output=None,
+                    effort_selection=effort,
                 )
-            return ManagementCommandResult(
-                handled=True,
-                output=None,
-                effort_selection=effort,
-            )
-        if command is RESUME_MANAGEMENT_COMMAND:
-            try:
-                listing = await management.resumable_listing()
-            except ManagementError as management_error:
-                return ManagementCommandResult(
-                    handled=True,
-                    output=f"{management_error.error.code}: {management_error.error.message}",
-                )
-            sessions = listing.sessions
-            lines: list[str] = []
-            if listing.skipped_count:
-                lines.append(
-                    f"Warning: Skipped {listing.skipped_count} corrupt Conversation "
-                    f"{'Session' if listing.skipped_count == 1 else 'Sessions'}."
-                )
-            if not sessions:
-                lines.append("No resumable Conversation Sessions.")
-            else:
-                lines.append("Resumable sessions:")
-                lines.extend(
-                    f"{index}. {session.title} | "
-                    f"{format_rfc3339_milliseconds(session.updated_at)} | "
-                    f"{session.message_count} "
-                    f"{'message' if session.message_count == 1 else 'messages'}"
-                    for index, session in enumerate(sessions, start=1)
-                )
-            return ManagementCommandResult(
-                handled=True,
-                output="\n".join(lines),
-                resume_sessions=sessions,
-                resume_skipped_count=listing.skipped_count,
-            )
-        if command is _STATUS_COMMAND:
-            try:
-                status = await management.status()
-                output = json.dumps(status.to_dict(), ensure_ascii=False, indent=2)
-            except ManagementError as management_error:
-                output = f"{management_error.error.code}: {management_error.error.message}"
-            return ManagementCommandResult(handled=True, output=output)
-        if command is _MEMORY_COMMAND:
-            try:
-                output = await management.memory_view()
-            except ManagementError as management_error:
-                output = f"{management_error.error.code}: {management_error.error.message}"
-            return ManagementCommandResult(
-                handled=True,
-                output=output,
-            )
-        if command is _DREAM_COMMAND:
-            try:
-                result = await management.dream()
-            except ManagementError as management_error:
-                output = f"{management_error.error.code}: {management_error.error.message}"
-            else:
-                if result.error is None and result.status == "No pending summaries":
-                    output = result.status
+            if parsed_command is RESUME_MANAGEMENT_COMMAND:
+                try:
+                    listing = await management.resumable_listing()
+                except ManagementError as management_error:
+                    return ManagementCommandResult(
+                        handled=True,
+                        output=f"{management_error.error.code}: {management_error.error.message}",
+                    )
+                sessions = listing.sessions
+                lines: list[str] = []
+                if listing.skipped_count:
+                    lines.append(
+                        f"Warning: Skipped {listing.skipped_count} corrupt Conversation "
+                        f"{'Session' if listing.skipped_count == 1 else 'Sessions'}."
+                    )
+                if not sessions:
+                    lines.append("No resumable Conversation Sessions.")
                 else:
-                    headline = (
-                        result.status
-                        if result.error is None
-                        else f"{result.error.code}: {result.error.message}"
+                    lines.append("Resumable sessions:")
+                    lines.extend(
+                        f"{index}. {session.title} | "
+                        f"{format_rfc3339_milliseconds(session.updated_at)} | "
+                        f"{session.message_count} "
+                        f"{'message' if session.message_count == 1 else 'messages'}"
+                        for index, session in enumerate(sessions, start=1)
                     )
-                    output = (
-                        f"{headline}\n"
-                        f"processed_count: {result.processed_count}\n"
-                        f"memory_updated: {str(result.memory_updated).lower()}\n"
-                        f"cursor: {result.cursor}"
-                    )
-            return ManagementCommandResult(handled=True, output=output)
-        if command is RELOAD_SKILL_MANAGEMENT_COMMAND:
-            try:
-                metadata = await management.reload_skill()
-            except ManagementError:
-                return self._skill_reload_failure()
-            except Exception as error:
-                logger.warning(
-                    "Management command failed command=/reload_skill type={}",
-                    type(error).__name__,
+                return ManagementCommandResult(
+                    handled=True,
+                    output="\n".join(lines),
+                    resume_sessions=sessions,
+                    resume_skipped_count=listing.skipped_count,
                 )
-                return self._skill_reload_failure()
+            if parsed_command is _STATUS_COMMAND:
+                try:
+                    status = await management.status()
+                    output = json.dumps(status.to_dict(), ensure_ascii=False, indent=2)
+                except ManagementError as management_error:
+                    output = f"{management_error.error.code}: {management_error.error.message}"
+                return ManagementCommandResult(handled=True, output=output)
+            if parsed_command is _MEMORY_COMMAND:
+                try:
+                    output = await management.memory_view()
+                except ManagementError as management_error:
+                    output = f"{management_error.error.code}: {management_error.error.message}"
+                return ManagementCommandResult(
+                    handled=True,
+                    output=output,
+                )
+            if parsed_command is _DREAM_COMMAND:
+                try:
+                    result = await management.dream()
+                except ManagementError as management_error:
+                    output = f"{management_error.error.code}: {management_error.error.message}"
+                else:
+                    if result.error is None and result.status == "No pending summaries":
+                        output = result.status
+                    else:
+                        headline = (
+                            result.status
+                            if result.error is None
+                            else f"{result.error.code}: {result.error.message}"
+                        )
+                        output = (
+                            f"{headline}\n"
+                            f"processed_count: {result.processed_count}\n"
+                            f"memory_updated: {str(result.memory_updated).lower()}\n"
+                            f"cursor: {result.cursor}"
+                        )
+                return ManagementCommandResult(handled=True, output=output)
+            if parsed_command is RELOAD_SKILL_MANAGEMENT_COMMAND:
+                try:
+                    metadata = await management.reload_skill()
+                except ManagementError:
+                    return self._skill_reload_failure()
+                except Exception as error:
+                    logger.warning(
+                        "Management command failed command=/reload_skill type={}",
+                        type(error).__name__,
+                    )
+                    return self._skill_reload_failure()
+                return ManagementCommandResult(
+                    handled=True,
+                    output=f"Skill count: {len(metadata)}",
+                    skill_metadata=metadata,
+                )
+            if parsed_command is not _CONFIG_COMMAND:
+                raise RuntimeError(
+                    f"Supported Management Command has no handler: {parsed_command}"
+                )
+            try:
+                view = await management.config_view()
+            except ManagementError as management_error:
+                return ManagementCommandResult(
+                    handled=True,
+                    output=f"{management_error.error.code}: {management_error.error.message}",
+                )
+            prefix = f"{view.diagnostics_text()}Path: {view.path}\n"
+            if view.error is not None:
+                prefix = f"{view.error.code}: {view.error.message}\n{prefix}"
             return ManagementCommandResult(
                 handled=True,
-                output=f"Skill count: {len(metadata)}",
-                skill_metadata=metadata,
+                output=f"{prefix}{view.redacted_content}",
             )
-        if command is not _CONFIG_COMMAND:
-            raise RuntimeError(f"Supported Management Command has no handler: {command}")
-        try:
-            view = await management.config_view()
-        except ManagementError as management_error:
-            return ManagementCommandResult(
-                handled=True,
-                output=f"{management_error.error.code}: {management_error.error.message}",
-            )
-        prefix = f"{view.diagnostics_text()}Path: {view.path}\n"
-        if view.error is not None:
-            prefix = f"{view.error.code}: {view.error.message}\n{prefix}"
-        return ManagementCommandResult(
-            handled=True,
-            output=f"{prefix}{view.redacted_content}",
-        )
 
     async def update_reasoning_effort(
         self,

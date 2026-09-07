@@ -2,10 +2,11 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, cast
-from uuid import UUID
+from typing import TYPE_CHECKING, Any, cast
+from uuid import UUID, uuid4
 
 import pytest
+from loguru import logger
 
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -14,6 +15,7 @@ from myclaw.management.commands import (
     MANAGEMENT_COMMANDS,
     RESUME_MANAGEMENT_COMMAND,
     ManagementCommandDispatcher,
+    ManagementCommandResult,
 )
 from myclaw.management.service import RuntimeStatusInput
 from myclaw.memory.dream import DreamResult
@@ -22,6 +24,9 @@ from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillMetadata
 from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
 from tests.management.factories import management_service
+
+if TYPE_CHECKING:
+    from loguru import Message
 
 CONFIG_CONTENT = """[models.providers.primary]
 protocol = "anthropic"
@@ -568,6 +573,87 @@ async def test_memory_command_returns_renderable_complete_disk_text(
 
     assert result.handled is True
     assert result.output == content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ("success", "error", "cancelled"))
+async def test_dispatch_preserves_session_log_scope(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    management = management_service(AgentHome(agent_home))
+    dispatcher = ManagementCommandDispatcher(management)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    marker = str(uuid4())
+    session_id = f"outer-session-{marker}"
+    failure = RuntimeError("memory view failed")
+    records: list[tuple[str, object]] = []
+
+    def capture(message: "Message") -> None:
+        record = message.record
+        records.append((record["message"], record["extra"].get("session_id")))
+
+    async def memory_view() -> str:
+        logger.warning("waiting")
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            logger.warning("cancelled")
+            raise
+        logger.warning("resumed")
+        if outcome == "error":
+            raise failure
+        return "current memory\n"
+
+    async def dispatch_in_session() -> ManagementCommandResult:
+        with logger.contextualize(dispatch_scope=marker, session_id=session_id):
+            logger.warning("before")
+            try:
+                return await dispatcher.dispatch("/memory")
+            finally:
+                logger.warning("restored")
+
+    monkeypatch.setattr(management, "memory_view", memory_view)
+    sink_id = logger.add(
+        capture,
+        level="WARNING",
+        filter=lambda record: record["extra"].get("dispatch_scope") == marker,
+        catch=False,
+    )
+    task = asyncio.create_task(dispatch_in_session())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        if outcome == "cancelled":
+            task.cancel("cancelled by test")
+            with pytest.raises(asyncio.CancelledError, match="cancelled by test"):
+                await asyncio.wait_for(task, timeout=5)
+            assert task.cancelled()
+        else:
+            release.set()
+            if outcome == "error":
+                with pytest.raises(RuntimeError, match="memory view failed") as raised:
+                    await asyncio.wait_for(task, timeout=5)
+                assert raised.value is failure
+            else:
+                result = await asyncio.wait_for(task, timeout=5)
+                assert result == ManagementCommandResult(handled=True, output="current memory\n")
+    finally:
+        try:
+            if not task.done():
+                task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+        finally:
+            logger.remove(sink_id)
+
+    assert records == [
+        ("before", session_id),
+        ("waiting", None),
+        ("cancelled" if outcome == "cancelled" else "resumed", None),
+        ("restored", session_id),
+    ]
 
 
 @pytest.mark.asyncio
