@@ -1,6 +1,6 @@
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -61,6 +61,61 @@ call_timeout = 45
         45,
     )
     assert server.resolve_cwd(agent_home) == agent_home / "servers"
+
+
+def test_mcp_tool_keywords_are_trimmed_deduplicated_and_immutable(agent_home: Path) -> None:
+    loader = _loader_with_mcp(
+        agent_home,
+        """
+[mcp.servers.github]
+enabled = true
+transport = "stdio"
+command = "server"
+[mcp.servers.github.tool_keywords]
+search_issues = [" issue ", "", "issue", "github"]
+""",
+    )
+
+    server = loader.load().mcp["github"]
+
+    assert server.tool_keywords == {"search_issues": ("issue", "github")}
+    with pytest.raises(TypeError):
+        cast(Any, server.tool_keywords)["other"] = ("keyword",)
+
+
+@pytest.mark.parametrize(
+    "invalid_keywords",
+    [
+        'tool_keywords = "search"',
+        "[mcp.servers.invalid.tool_keywords]\nsearch = [1]",
+    ],
+    ids=("not-table", "non-string-item"),
+)
+def test_invalid_mcp_tool_keywords_are_isolated_per_server(
+    agent_home: Path,
+    invalid_keywords: str,
+) -> None:
+    loader = _loader_with_mcp(
+        agent_home,
+        f"""
+[mcp.servers.invalid]
+enabled = true
+transport = "stdio"
+command = "server"
+{invalid_keywords}
+
+[mcp.servers.valid]
+enabled = true
+transport = "stdio"
+command = "server"
+""",
+    )
+
+    configuration = loader.load()
+
+    assert set(configuration.mcp) == {"valid"}
+    assert len(loader.diagnostics) == 1
+    assert "tool_keywords" in loader.diagnostics[0].message
 
 
 def test_valid_streamable_http_server_preserves_headers_and_disabled_state(

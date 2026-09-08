@@ -21,6 +21,7 @@ _CLI_TOOL_IMPORTS = frozenset(
         ("myclaw.tools.mcp_runtime", "MCPSnapshotReport"),
         ("myclaw.tools.mcp_runtime", "MCPStartupReport"),
         ("myclaw.tools.mcp_runtime", "MCPToolSnapshot"),
+        ("myclaw.tools.mcp_keywords", "MCPKeywordPreparer"),
         ("myclaw.tools.tool_gateway", "BUILT_IN_TOOL_NAMES"),
     }
 )

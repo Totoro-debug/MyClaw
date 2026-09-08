@@ -12,6 +12,7 @@ TEMPLATE_NAMES = {
     "foreground-chat-system-prompt.md",
     "long-term-memory.md",
     "memory-task-prompt.md",
+    "mcp-keyword-system-prompt.md",
     "session-title-prompt.md",
     "skill-always-load.md",
     "skill-catalog.md",

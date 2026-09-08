@@ -379,6 +379,8 @@ schedule = "0 * * * *"
 # cwd = "."
 # connect_timeout = 30
 # call_timeout = 60
+# [mcp.servers.filesystem.tool_keywords]
+# list_files = ["files", "directory", "list"]
 
 # Configure a trusted Streamable HTTP MCP Server with optional static headers.
 # [mcp.servers.search]
@@ -387,6 +389,8 @@ schedule = "0 * * * *"
 # url = "https://example.com/mcp"
 # connect_timeout = 30
 # call_timeout = 60
+# [mcp.servers.search.tool_keywords]
+# search = ["search", "query"]
 # [mcp.servers.search.headers]
 # Authorization = "Bearer replace-with-a-token"
 

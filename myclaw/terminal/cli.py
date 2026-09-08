@@ -1,6 +1,7 @@
 """Command-line entry point for MyClaw."""
 
 import asyncio
+from collections.abc import Mapping
 from pathlib import Path
 from time import monotonic
 from uuid import uuid4
@@ -35,6 +36,7 @@ from myclaw.terminal.conversation import (
     TerminalConversationApp,
     is_interactive_terminal,
 )
+from myclaw.tools.mcp_keywords import MCPKeywordPreparer
 from myclaw.tools.mcp_runtime import (
     MCPRuntimeManager,
     MCPServerFailure,
@@ -174,6 +176,8 @@ async def _run_cli_conversation(
     terminal_app: TerminalConversationApp | None = None
     pending_target: AgentLoop | None = None
     active_mcp_snapshot: MCPToolSnapshot = ()
+    active_mcp_keywords: Mapping[str, tuple[str, ...]] = {}
+    mcp_keyword_preparer: MCPKeywordPreparer | None = None
     replacement_lock = asyncio.Lock()
     aborted_loops: list[AgentLoop] = []
     replacement_failed_closed = False
@@ -204,6 +208,14 @@ async def _run_cli_conversation(
         router = ModelRouter(
             configuration=configuration,
             provider_factory=create_provider,
+        )
+        mcp_keyword_preparer = MCPKeywordPreparer(
+            model_router=router,
+            config_path=agent_home.path / "config.toml",
+        )
+        active_mcp_keywords = await mcp_keyword_preparer.prepare(
+            active_mcp_snapshot,
+            getattr(configuration, "mcp", {}),
         )
         memory_manager = MemoryManager(workspace_state)
         dream = Dream(
@@ -280,7 +292,8 @@ async def _run_cli_conversation(
             return current_loop
 
         async def replace_agent_loop(session_id: str, force: bool) -> None:
-            nonlocal active_loop, active_mcp_snapshot, current_loop, pending_target
+            nonlocal active_loop, active_mcp_snapshot, active_mcp_keywords
+            nonlocal current_loop, pending_target
             nonlocal replacement_failed_closed
             async with replacement_lock:
                 old_loop = current_loop
@@ -298,6 +311,12 @@ async def _run_cli_conversation(
                     )
                 try:
                     candidate_report = await mcp_manager.prepare_generation()
+                    if mcp_keyword_preparer is None:
+                        raise RuntimeError("MCP Keyword Preparer is unavailable")
+                    candidate_keywords = await mcp_keyword_preparer.prepare(
+                        candidate_report.snapshot,
+                        getattr(configuration, "mcp", {}),
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
@@ -420,6 +439,7 @@ async def _run_cli_conversation(
                     await target.start()
                     mcp_manager.activate_generation(candidate_report)
                     active_mcp_snapshot = candidate_report.snapshot
+                    active_mcp_keywords = candidate_keywords
                     current_loop = target
                     active_loop = target
                     pending_target = None

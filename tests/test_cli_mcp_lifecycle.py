@@ -79,7 +79,14 @@ async def test_cli_starts_mcp_before_initial_loop_and_closes_it_after_loop(
 ) -> None:
     events: list[str] = []
     notices: list[str] = []
-    remote_tool = object()
+    keyword_calls: list[dict[str, object]] = []
+    remote_tool = SimpleNamespace(
+        server_name="github",
+        remote_name="search_issues",
+        name="mcp_github_search_issues",
+        description="Search GitHub issues.",
+        parameters={"type": "object", "properties": {}},
+    )
 
     class FakeMCPRuntimeManager:
         def __init__(self, workspace: Path, **kwargs: object) -> None:
@@ -119,6 +126,21 @@ async def test_cli_starts_mcp_before_initial_loop_and_closes_it_after_loop(
     class FakeRouter:
         def __init__(self, **kwargs: object) -> None:
             del kwargs
+
+        async def complete(
+            self,
+            route: str,
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+        ) -> ModelResponse:
+            events.append("keywords_prepare")
+            keyword_calls.append({"route": route, "messages": messages, "tools": tools})
+            return ModelResponse(
+                message=AssistantModelMessage(content='["issues", "search"]'),
+                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                finish_reason="stop",
+            )
 
         async def close(self) -> None:
             events.append("router_close")
@@ -226,7 +248,17 @@ async def test_cli_starts_mcp_before_initial_loop_and_closes_it_after_loop(
         configuration=_configuration(),
     )
 
-    assert events.index("mcp_start") < events.index("loop_init")
+    assert events.index("mcp_start") < events.index("keywords_prepare")
+    assert events.index("keywords_prepare") < events.index("loop_init")
+    assert len(keyword_calls) == 1
+    keyword_call = keyword_calls[0]
+    assert keyword_call["route"] == "chat"
+    assert keyword_call["tools"] == ()
+    serialized_messages = json.dumps(keyword_call["messages"], ensure_ascii=False)
+    assert "search_issues" in serialized_messages
+    assert "Search GitHub issues." in serialized_messages
+    assert "input_schema" in serialized_messages
+    assert "transport" not in serialized_messages
     assert events.index("loop_close") < events.index("mcp_close")
     assert events.index("mcp_close") < events.index("dream_close")
     assert events.index("dream_close") < events.index("router_close")
@@ -414,6 +446,7 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
     target_loop: Any | None = None
     replace_callback: Callable[[str, bool], Any] | None = None
     initial_tool = object()
+    keyword_snapshots: list[tuple[object, ...]] = []
 
     class FakeMCPRuntimeManager:
         def __init__(self, workspace: Path, **kwargs: object) -> None:
@@ -453,6 +486,18 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
 
         async def close(self) -> None:
             events.append("mcp_close")
+
+    class FakeMCPKeywordPreparer:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs["model_router"] is not None
+            assert isinstance(kwargs["config_path"], Path)
+
+        async def prepare(self, snapshot: Sequence[object], configuration: object) -> object:
+            del configuration
+            snapshot_tuple = tuple(snapshot)
+            keyword_snapshots.append(snapshot_tuple)
+            events.append(f"keywords_prepare_{len(keyword_snapshots)}")
+            return {f"generation-{len(keyword_snapshots)}": ("keyword",)}
 
     class FakeWorkspaceState:
         def __init__(self, workspace_path: Path) -> None:
@@ -585,6 +630,7 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
 
     monkeypatch.setattr(cli, "_print_mcp_notice", notices.append)
     monkeypatch.setattr(cli, "MCPRuntimeManager", FakeMCPRuntimeManager)
+    monkeypatch.setattr(cli, "MCPKeywordPreparer", FakeMCPKeywordPreparer)
     monkeypatch.setattr(cli, "WorkspaceState", FakeWorkspaceState)
     monkeypatch.setattr(cli, "MessageBus", FakeBus)
     monkeypatch.setattr(cli, "ModelRouter", FakeRouter)
@@ -608,8 +654,11 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
     assert target_loop is not None
     assert old_loop.mcp_tools == (initial_tool,)
     assert target_loop.mcp_tools == ()
+    assert keyword_snapshots == [(initial_tool,), ()]
     assert notices == [f"MCP Server '{failed_name}' unavailable during connect (TimeoutError)."]
-    assert events.index("mcp_prepare") < events.index("replacement_pause")
+    assert events.index("keywords_prepare_1") < events.index("old_init")
+    assert events.index("mcp_prepare") < events.index("keywords_prepare_2")
+    assert events.index("keywords_prepare_2") < events.index("replacement_pause")
     assert events.index("mcp_activate") < events.index("schedule_resume")
     assert events[-5:] == [
         "schedule_close",
@@ -654,6 +703,7 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
             cwd=workspace,
             connect_timeout=10,
             call_timeout=5,
+            tool_keywords={"echo": ("echo", "text")},
         )
     }
 
@@ -661,6 +711,7 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
     transport_events: list[str] = []
     loops: list[Any] = []
     schema_requests: list[tuple[dict[str, Any], ...]] = []
+    keyword_calls: list[object] = []
     replace_callback: Callable[[str, bool], Any] | None = None
     default_connection_factory = mcp_runtime._default_connection_factory
     stdio_transport = mcp_adapter.stdio_transport
@@ -740,6 +791,14 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
     class FakeRouter:
         def __init__(self, **kwargs: object) -> None:
             del kwargs
+
+        async def complete(self, *args: object, **kwargs: object) -> ModelResponse:
+            keyword_calls.append((args, kwargs))
+            return ModelResponse(
+                message=AssistantModelMessage(content='["must", "not", "run"]'),
+                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                finish_reason="stop",
+            )
 
         async def close(self) -> None:
             pass
@@ -899,6 +958,7 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
         "generation-2:inherited",
     ]
     assert transport_events == ["entered", "closed"] * (2 if closed_before_resume else 1)
+    assert keyword_calls == []
     observed.assert_closed()
     assert asyncio.all_tasks() - tasks_before == set()
 

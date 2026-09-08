@@ -2,7 +2,7 @@
 
 import re
 import tomllib
-from collections.abc import Mapping, MutableMapping, MutableSequence
+from collections.abc import Mapping, MutableMapping, MutableSequence, Sequence
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
@@ -162,6 +162,28 @@ class MCPServerConfiguration:
     headers: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     connect_timeout: int = _MCP_DEFAULT_CONNECT_TIMEOUT
     call_timeout: int = _MCP_DEFAULT_CALL_TIMEOUT
+    tool_keywords: Mapping[str, tuple[str, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tool_keywords, Mapping):
+            raise TypeError("MCP Server tool_keywords must be a mapping")
+        normalized: dict[str, tuple[str, ...]] = {}
+        for remote_name, raw_keywords in self.tool_keywords.items():
+            if not isinstance(remote_name, str) or not remote_name:
+                raise ValueError("MCP Server tool_keywords names must be non-empty strings")
+            if isinstance(raw_keywords, (str, bytes)) or not isinstance(raw_keywords, Sequence):
+                raise TypeError("MCP Server tool_keywords values must be arrays of strings")
+            values: list[str] = []
+            for keyword in raw_keywords:
+                if not isinstance(keyword, str):
+                    raise TypeError("MCP Server tool_keywords values must be arrays of strings")
+                normalized_keyword = keyword.strip()
+                if normalized_keyword and normalized_keyword not in values:
+                    values.append(normalized_keyword)
+            normalized[remote_name] = tuple(values)
+        object.__setattr__(self, "tool_keywords", MappingProxyType(normalized))
 
     def resolve_cwd(self, workspace: Path) -> Path:
         """Resolve a stdio cwd against the active Workspace."""
@@ -672,6 +694,22 @@ def _parse_string_array(value: object, field: str) -> tuple[str, ...]:
     return tuple(_string(item, field) for item in items)
 
 
+def _parse_mcp_tool_keywords(value: object, field: str) -> Mapping[str, tuple[str, ...]]:
+    table = _table(value, field)
+    parsed: dict[str, tuple[str, ...]] = {}
+    for remote_name, raw_keywords in table.items():
+        if not isinstance(remote_name, str) or not remote_name:
+            _invalid(field, "must contain nonempty remote Tool names")
+        keywords = _parse_string_array(raw_keywords, f"{field}.{remote_name}")
+        normalized: list[str] = []
+        for keyword in keywords:
+            normalized_keyword = keyword.strip()
+            if normalized_keyword and normalized_keyword not in normalized:
+                normalized.append(normalized_keyword)
+        parsed[remote_name] = tuple(normalized)
+    return MappingProxyType(parsed)
+
+
 def _parse_mcp_headers(value: object, field: str) -> Mapping[str, str]:
     table = _table(value, field)
     headers: dict[str, str] = {}
@@ -704,6 +742,7 @@ def _parse_mcp_server(mcp_name: str, value: object) -> MCPServerConfiguration:
             "headers",
             "connect_timeout",
             "call_timeout",
+            "tool_keywords",
         },
         prefix,
     )
@@ -728,6 +767,10 @@ def _parse_mcp_server(mcp_name: str, value: object) -> MCPServerConfiguration:
         f"{prefix}.call_timeout",
         1,
         _MCP_MAX_TIMEOUT,
+    )
+    tool_keywords = _parse_mcp_tool_keywords(
+        table.get("tool_keywords", {}),
+        f"{prefix}.tool_keywords",
     )
 
     if transport == "stdio":
@@ -756,6 +799,7 @@ def _parse_mcp_server(mcp_name: str, value: object) -> MCPServerConfiguration:
             ),
             connect_timeout=connect_timeout,
             call_timeout=call_timeout,
+            tool_keywords=tool_keywords,
         )
 
     for field_name in ("command", "args", "cwd"):
@@ -778,6 +822,7 @@ def _parse_mcp_server(mcp_name: str, value: object) -> MCPServerConfiguration:
         ),
         connect_timeout=connect_timeout,
         call_timeout=call_timeout,
+        tool_keywords=tool_keywords,
     )
 
 
