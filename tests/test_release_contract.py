@@ -591,7 +591,7 @@ def test_obsolete_runtime_log_contract_surface_is_absent() -> None:
     assert not [path for path in obsolete_paths if path.exists()]
 
 
-def test_readme_publishes_the_session_log_risk_contract() -> None:
+def test_session_log_adr_publishes_the_risk_contract() -> None:
     required_contract = (
         "same-session concurrency is unsupported",
         "unbounded queue",
@@ -603,9 +603,9 @@ def test_readme_publishes_the_session_log_risk_contract() -> None:
         "legacy agent home runtime log files remain untouched",
     )
 
-    for path in (ROOT / "README.md",):
-        content = path.read_text(encoding="utf-8").lower()
-        assert all(statement in content for statement in required_contract), path
+    path = ROOT / "docs" / "adr" / "0008-use-workspace-session-log.md"
+    content = path.read_text(encoding="utf-8").lower()
+    assert all(statement in content for statement in required_contract), path
 
 
 def test_active_contract_docs_do_not_claim_the_removed_runtime_log_implementation() -> None:
@@ -665,11 +665,6 @@ def test_active_support_contract_matches_host_neutral_release_evidence() -> None
     assert "owned-process" not in decision
     assert "runtime log locking" not in decision
 
-    active_paths = (
-        ROOT / "CONTEXT.md",
-        ROOT / "README.md",
-    )
-    support = "\n".join(path.read_text(encoding="utf-8").lower() for path in active_paths)
     for claim in (
         "py3-none-any",
         "windows x64",
@@ -677,9 +672,9 @@ def test_active_support_contract_matches_host_neutral_release_evidence() -> None
         "macos intel",
         "apple silicon",
         "unverified",
-        "no platform gate",
+        "no supported-platform gate",
     ):
-        assert claim in support
+        assert claim in decision
 
 
 def test_superseded_design_documents_are_absent() -> None:

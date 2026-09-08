@@ -1,462 +1,106 @@
 # MyClaw
 
-MyClaw 是一个面向单用户的、本地优先的 Personal Agent 运行时，支持 Python 3.12及以上版本。它以当前目录作为 Agent 的 Workspace，通过全屏终端对话连接模型、工具、会话、记忆、Skill 与定时任务，并将运行状态保存为本地可检查的文件。
+## 项目简介
 
-MyClaw 不是多租户 Agent 平台，也不是后台常驻服务。每次运行对应一个终端中的 Runtime Lifetime；用户可以在其中连续对话、调用工具、恢复历史 Conversation Session，并让计划任务在该进程存活期间执行。
+MyClaw 是面向单用户、本地优先的个人 Agent 运行时。通过全屏终端对话调用模型与工具，支持会话恢复、三层记忆、Skill、MCP 和定时任务，运行状态以文件形式保存在本地。
 
-## 核心能力
+## 项目安装
 
-- **全屏终端对话**：基于 Textual 和 Rich，支持流式回复、推理与工具活动展示。
-- **本地优先持久化**：配置、会话、记忆、日志、定时任务和工具产物均保存为本地文件。
-- **多模型路由**：支持 `openai-compatible` 和 `anthropic` Provider，并可为聊天、记忆和定时任务分别配置模型。
-- **统一工具目录**：十项 Built-in Tool 与 User Configuration 中配置的 MCP Tool 通过同一个 Tool Gateway 执行校验、授权和结果处理。
-- **三层记忆系统**：由 Short-term Memory、Conversation Summary 和 Long-term Memory 组成。
-- **Skill 发现与渐进使用**：从 Agent Home 捕获可原子重载的冻结 Skill Snapshot，支持手动斜杠调用、模型自主读取和可选的 System Prompt 投影。
-- **任务连续性**：在普通前台输入之前执行 Task Framing，用隐藏 Blackboard 维护当前目标和完成边界。
-- **Workspace 隔离**：每个启动目录拥有独立的 Session、Memory、Schedule、Artifact 和 Session Log。
+需要 Python 3.12+ 和 Git；使用命令执行工具还需安装 Bash。
 
-## 环境要求与平台支持
+目前已验证 Windows x64；macOS 尚未完成原生验证，其他 POSIX 平台暂无正式支持承诺。
 
-- Python 3.12 或更高版本。
-- 默认命令需要交互式 `stdin`、`stdout` 和 `stderr` TTY。
-- Exec Tool 启动一个直接的 Bash 子进程，能否使用取决于宿主机是否具备可用的 Bash。
-- 项目没有运行前的平台拦截（no platform gate）。
-
-发行包是同时包含 Windows 与 POSIX 宿主适配器的 `py3-none-any` Wheel。Windows x64是目前经过验证的平台（currently validated）；macOS Intel 与 Apple Silicon 是预期兼容目标，但尚未完成原生验证（unverified）。Linux 和其他 POSIX 宿主会尝试使用POSIX 适配器，但当前版本不作正式支持承诺。
-
-## Agent 安装与使用
-
-### 从源码安装
-
-在仓库根目录创建虚拟环境并安装 MyClaw。
+```bash
+git clone https://github.com/Totoro-debug/myclaw.git
+cd myclaw
+```
 
 Windows PowerShell：
 
 ```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .
-```
-
-macOS 或其他 POSIX Shell：
-
-```bash
-python3.12 -m venv .venv
-. .venv/bin/activate
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install .
 ```
 
-### 从 Wheel 安装
+macOS / Linux：
 
-先构建或取得发行 Wheel，再将路径传给 `pip`：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install .\dist\myclaw-0.1.0-py3-none-any.whl
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install .
 ```
 
-安装完成后，激活虚拟环境即可使用 `myclaw`。如果不激活，也可以直接运行虚拟环境中的可执行文件，例如 `.\.venv\Scripts\myclaw.exe`。
+## 项目最小配置
 
-### 首次启动
+执行 `myclaw config` 生成默认配置，再将 `~/.myclaw/config.toml` 的内容替换为以下配置。已有配置不会被该命令覆盖。`~` 表示当前用户主目录，Windows 下通常为 `C:\Users\<用户名>`。
 
-先进入希望 Agent 操作的目录，再启动 MyClaw：
-
-```powershell
-Set-Location D:\path\to\your-workspace
-myclaw
-```
-
-首次启动会创建当前操作系统账户的 Agent Home 和默认配置：
-
-```text
-~/.myclaw/config.toml
-```
-
-此时程序输出 `config_missing` 并以状态码 2 退出。这是预期行为：编辑新生成的配置，填入可用的 Provider 和 Model Route 后，再次执行 `myclaw`。
-
-> `~` 表示当前用户主目录。在 Windows 上通常对应
-> `C:\Users\<用户名>\.myclaw\`。
-
-### 配置模型
-
-下面是可工作的最小结构。Provider 地址、API Key、模型 ID 和模型限制必须替换为实际值：
+选择支持工具调用的模型，替换服务地址、API Key 和两处模型 ID。按模型实际限制设置 `context_window` 与 `max_output`，单位均为 token，后者必须小于前者；`timeout` 单位为秒。
 
 ```toml
-[models.providers.openai-local]
+[models.providers.my-provider]
 protocol = "openai-compatible"
 base_url = "https://provider.example/v1"
-api_key = "replace-with-a-dedicated-key"
-models = ["replace-with-a-model-id"]
+api_key = "replace-with-your-api-key"
+models = ["your-model-id"]
 
 [models.routes.default]
-provider_id = "openai-local"
-model = "replace-with-a-model-id"
+provider_id = "my-provider"
+model = "your-model-id"
 context_window = 200000
 max_output = 8192
 temperature = 0.2
-reasoning_effort = "medium"
 timeout = 120
 ```
 
-MyClaw 支持两种 Provider 协议：
+`protocol` 支持 `openai-compatible` 和 `anthropic`。只配置 `default` 路由即可供对话、记忆和定时任务使用，其余配置采用默认值。
 
-- `openai-compatible`
-- `anthropic`
+API Key 直接保存在配置文件中，当前不支持环境变量引用；`myclaw config` 显示时会脱敏。更多可选配置及 MCP 示例见[配置模板](myclaw/templates/default-config.md)。
 
-Model Route 按用途选择模型：
+## 项目启动
 
-| Route | 用途 |
-| --- | --- |
-| `default` | 其他 Route 不存在或允许回退时使用 |
-| `chat` | 前台对话、Session 标题和 Task Framing |
-| `memory` | Conversation Summary 与 Dream |
-| `schedule` | Schedule Job |
+在已激活虚拟环境的交互式终端中，进入希望 Agent 操作的目录后启动（将 `<workspace>` 替换为实际路径）：
 
-只配置 `default` 即可启动。删除某个用途专用的 Route 后，该用途会回退到 `default`。每个 Route 的 `model` 必须同时出现在对应 Provider 的 `models` 数组中。
-
-`api_key` 以明文保存在 `config.toml`。配置查看和面向用户的错误会隐藏 Key，但当前版本不支持环境变量引用或操作系统 Keychain。建议使用权限最小化的专用 Key，并保护 AgentHome 的文件权限。
-
-### 配置 MCP Server
-
-MCP Server 是由 User Configuration 明确信任的外部 Tool 来源。每个 `mcp_name` 只能有一个配置项；启用后，发现到的 MCP Tool 会冻结为当前 Runtime Generation 的 MCP Tool Snapshot，并追加到十项 Built-in Tool 之后形成 Tool Catalog。
-
-```toml
-[mcp.servers.filesystem]
-enabled = true
-transport = "stdio"
-command = "uvx"
-args = ["mcp-server-filesystem", "."]
-cwd = "."
-connect_timeout = 30
-call_timeout = 60
-
-[mcp.servers.search]
-enabled = true
-transport = "streamable-http"
-url = "https://example.com/mcp"
-headers = { Authorization = "Bearer replace-with-a-token" }
-connect_timeout = 30
-call_timeout = 60
-```
-
-stdio Server 继承 MyClaw 进程环境；`cwd` 省略时使用 Workspace，相对路径也相对 Workspace。MCP 配置不支持 `env` 或 `secret_env`。Streamable HTTP Server 可声明静态 `headers`。`connect_timeout` 与 `call_timeout` 的范围为 1–600 秒。
-
-无效的单个 MCP Server、连接失败或发现失败只会跳过该 Server，并通过脱敏诊断和一行终端提示报告；整个 TOML 无法解析仍是 fatal configuration error。`myclaw config` 和 `/config` 会显示脱敏后的 MCP 诊断，headers 值不会显示。
-
-MCP Tool 通过正常 Model request 的 `tools` 字段提供，不写入 System Prompt；它们是已配置的 trusted capability，不额外请求 Tool Confirmation。MCP 参数完整转发给 Server，结果沿用 Tool Gateway 的 text-only Tool Result 边界。没有 MCP reload command；`/resume` 只为已不可用的 Server 准备下一代 Snapshot，健康连接与已发现定义继续复用。
-
-查看脱敏后的当前配置：
-
-```powershell
-myclaw config
-```
-
-即使 TOML 无效，此命令也会尽量显示脱敏内容和错误位置。
-
-### 开始对话
-
-配置有效后，在 Workspace 目录中执行：
-
-```powershell
+```bash
+cd <workspace>
 myclaw
 ```
 
-当前目录的规范化绝对路径就是 Workspace 边界，也是 Session 与其他非全局状态的归属。MyClaw 不会自动查找 Git 根目录或父目录。
+新开终端后需重新激活安装目录中的虚拟环境，或使用其中 `myclaw` 可执行文件的绝对路径。启动需要交互式输入、输出，不能通过管道运行。
 
-普通输入会进入 Agent Loop。精确匹配的管理命令不经过模型：
+启动目录即 Workspace，不会自动切换到 Git 根目录。运行状态保存在该目录的 `.myclaw/` 中；定时任务仅在 MyClaw 进程运行期间执行。
 
-| 命令 | 功能 |
+`Enter` 提交输入，`Ctrl+J` 换行；`Ctrl+C` 取消当前回复，输入 `exit` 或 `quit` 退出。
+
+以下管理命令需单独输入，不附带参数：
+
+| 命令 | 用途 |
 | --- | --- |
-| `/config` | 查看脱敏后的 User Configuration |
-| `/status` | 查看 Runtime、模型、Token 和 Session 状态 |
-| `/effort` | 选择当前 Runtime Lifetime 的 chat Reasoning Effort |
-| `/resume` | 列出并恢复当前 Workspace 的 Conversation Session |
-| `/memory` | 查看当前 Long-term Memory |
-| `/dream` | 立即处理尚未消费的 Conversation Summary |
-| `/reload_skill` | 原子重载当前 Agent Loop 的 Skill |
-
-精确提交 `/effort` 会用五档横向 selector 替换输入框；确认后，当前 Runtime Lifetime 的
-`chat` 与 `default` 请求立即使用所选值，显式 `memory` 与 `schedule` route 保持独立。
-切换 Conversation Session 不会重置该值。
-选择成功后还会尽力写回磁盘上的 `default` 和已显式配置的 `chat` Route；写入失败不撤销已经生效的运行时选择。
-
-`/reload_skill` 不进入 Message Bus 或 Conversation Session。成功后，后续 Agent Run、手动 Skill 调用和终端补全共同使用新状态；已经开始的 Agent Run 继续使用其已构造的消息。失败时显示稳定错误，并完整保留先前状态。
-
-其他常用操作：
-
-- 输入 `exit` 或 `quit`：正常关闭 MyClaw。
-- 按 `Ctrl+C`：取消当前前台 Agent Run，终端对话仍保持可用。
-- Tool 请求需要一次性确认时：在终端确认或拒绝该次具体调用。
-
-## Skill 安装与使用
-
-Skill 是指导 Agent 使用现有能力的指令包。它不会注册新 Tool，也不会扩大文件、命令或
-网络权限。
-
-### 安装 Skill
-
-在 Agent Home 的 `skills` 下创建一个直接子目录，并在其中放置 UTF-8 编码的
-`SKILL.md`：
-
-```text
-~/.myclaw/
-  skills/
-    planner/
-      SKILL.md
-```
-
-最小 Skill 示例：
-
-```markdown
----
-name: planner
-description: 将复杂需求整理为清晰、可执行的计划
----
-
-# 工作方式
-
-1. 明确目标和完成边界。
-2. 找出约束、依赖与风险。
-3. 输出可验证的执行步骤。
-```
-
-元数据规则：
-
-- `name` 和 `description` 为必填字符串。
-- `name` 长度为 1～64 个字符，首字符只能是小写字母、下划线或连字符，后续还可使用数字。
-- `description` 去除首尾空白后长度为 1～1024 个字符。
-- Skill 名不能与 `/config`、`/status`、`/resume`、`/memory`、`/dream`、`/reload_skill` 等管理命令冲突。
-- MyClaw 只扫描 `~/.myclaw/skills` 的直接子目录；初始启动、任意 `/resume` 或成功的 `/reload_skill` 会重新扫描。磁盘修改在下一次成功加载前不会改变当前冻结状态。
-
-### 手动调用
-
-在终端中使用精确的 Skill 名称：
-
-```text
-/planner 为下周的发布工作制定计划
-```
-
-MyClaw 使用最近一次成功加载或重载时完整读取、校验并冻结的 `SKILL.md`，把 Skill 文档和 `/planner` 后面的请求一起提供给当前前台 Agent Run；手动调用不会再次访问磁盘。Conversation Session 只持久化用户输入的原始斜杠命令。
-
-未知的斜杠输入、大小写不匹配的名称或不完整名称不会触发 Skill，而是作为普通输入处理。
-
-### 模型自主选择
-
-前台 System Prompt 会获得有效 Skill 的名称、描述和绝对路径。模型可以根据描述选择Skill，再通过现有 `read_file` Tool 渐进读取 `SKILL.md`。Skill 根目录内的规范路径允许免确认读取；通过链接逃逸到目录外的路径仍遵循 Workspace 外部路径的确认规则。
-
-Skill 的绝对路径和被读取的内容可能发送给已配置的 Model Provider，请勿在 `SKILL.md` 中保存秘密。
-
-### 启动时加载
-
-需要每次前台模型调用都包含某个 Skill 时，在 Skill frontmatter 中设置布尔值：
-
-```yaml
-always: true
-```
-
-同时在 `~/.myclaw/config.toml` 中启用：
-
-```toml
-[runtime]
-enable_skill_always_load = true
-```
-
-每次成功加载的完整内容保持冻结，直到成功执行 `/reload_skill` 或创建新的 Agent Loop。`/reload_skill` 会先扫描、校验并检查输入预算，再一次性发布新状态；失败不会替换当前状态。此模式没有固定的 Skill 文件大小上限，但内容仍受聊天模型输入预算约束；初始启动或 `/resume` 的同步 preflight 超出完整 Model request 预算时会以 `model_context_overflow` 终止 Terminal Conversation。
+| `/resume` | 从当前 Workspace 的会话列表选择并恢复历史会话 |
+| `/status` | 查看运行状态与上下文用量 |
+| `/config` | 查看脱敏后的配置 |
+| `/effort` | 选择对话模型的推理强度 |
+| `/memory` | 查看长期记忆 |
+| `/dream` | 将待处理的会话摘要整理为长期记忆 |
+| `/reload_skill` | 重新加载 `~/.myclaw/skills/` 中的 Skill |
 
 ## 项目架构
 
-MyClaw 使用宿主无关的组合根，将终端呈现、Agent 编排、模型调用、Tool 授权和本地持久化分开：
-
-```text
-myclaw/
-├── terminal/       全屏 Terminal Conversation、键盘适配与 CLI 入口
-├── management/     管理命令分发及只读/受控管理视图
-├── agent/          Message Bus、Agent Loop、Agent Runner 与上下文构建
-├── provider/       Model Router、Provider 工厂及协议适配器
-├── tools/          Tool Gateway、权限策略、Built-in Tool 与 MCP 集成
-├── session/        Conversation Session 及模型消息投影
-├── memory/         Conversation Summary、Long-term Memory、Memory Manager 与 Dream
-├── schedule/       Schedule Job、Schedule Service 与 Workspace 存储
-├── skills/         Skill Catalog、校验和渐进加载
-├── config/         Agent Home 与 User Configuration
-├── logging/        进程诊断和 Workspace Session Log
-├── templates/      System Prompt 与 Runtime Prompt 模板
-└── utils/          宿主文件系统、时间、校验和异步任务支持
-```
-
-### 核心组件
+CLI 负责组装运行时和管理组件生命周期。前台输入经终端与 Message Bus 进入 Agent Loop，由 Agent Runner 循环调用模型与工具，结果经 Message Bus 返回终端。
 
 | 组件 | 职责 |
 | --- | --- |
-| Terminal Conversation | 接收用户输入，渲染回复、推理、Tool 活动和确认对话框 |
-| CLI composition root | 拥有 Runtime Lifetime 级组件、当前 Agent Loop 引用、Session 替换和关闭顺序 |
-| Message Bus | 在整个 Runtime Lifetime 内复用，在 Terminal Conversation 与当前 Agent Loop 间传递临时 Inbound/Outbound Message |
-| Agent Loop | 串行处理前台输入，管理 Session、Task Framing、Tool 和结果持久化 |
-| Agent Runner | 执行一次有迭代上限的 ReAct 模型与 Tool 循环 |
-| Model Router | 按逻辑 Route 解析 Provider 和模型，并处理限定重试与回退 |
-| MCP Runtime Manager | 管理 Runtime Lifetime 的 MCP 连接，为各 Agent Loop 提供冻结的 MCP Tool Snapshot |
-| Tool Gateway | Tool 调用的唯一公共入口，负责解析、校验、授权、执行和结果归一化 |
-| Memory Manager 与 Dream | 管理 Summary/Cursor/Long-term Memory 状态，并通过独立 Dream Runner 处理长期记忆 |
-| Schedule Service | 保存、触发和取消 Schedule Job；User Job 调用当前 Agent Loop，Dream System Job 直接调用 Dream |
-| Skill Snapshot | Skill Loader 在每次成功加载时完整读取并冻结有效 Skill 文档，对模型按用途投影元数据或正文 |
+| Terminal / Message Bus | 基于 Textual 与 Rich 展示对话，通过输入、输出队列连接当前 Agent Loop |
+| Agent Loop | 绑定一个会话，串行处理前台输入，管理上下文、任务目标和会话持久化 |
+| Agent Runner | 执行有迭代上限的模型与工具循环，供前台、定时任务和 Dream 复用 |
+| Model Router | 按用途选择模型，适配 OpenAI 兼容协议与 Anthropic，处理重试和回退 |
+| Tool Gateway / MCP | 统一内置与 MCP 工具的调用入口；MCP 连接由 CLI 管理，每个 Agent Loop 使用固定工具快照 |
+| Memory / Dream | 管理短期记忆、会话摘要和长期记忆；Dream 使用独立 Runner 与受限工具整理长期记忆 |
+| Schedule Service | 持久化并调度任务；用户任务调用当前 Agent Loop，记忆整理任务直接调用 Dream |
+| Skill Loader / Context Builder | 加载 Skill 快照，按需提供指令，统一构建 Agent Loop 的模型请求上下文 |
 
-### Tool Catalog
+全局配置与 Skill 位于 `~/.myclaw/`；会话、记忆、定时任务、工具产物和日志归各 Workspace 的 `.myclaw/` 所有。
 
-以下十项 Built-in Tool 固定提供，不能通过配置增删或替换；已配置的 MCP Tool 追加到其后：
+内置工具通过权限检查决定是否请求一次性确认；Exec 以当前用户权限执行，不提供操作系统沙箱。MCP 支持 stdio 和 Streamable HTTP，已启用的 Server 视为可信能力，其工具调用不再逐次确认。
 
-1. Read File
-2. Write File
-3. Edit File
-4. List Dir
-5. Glob
-6. Grep
-7. Exec
-8. Web Search
-9. Web Fetch
-10. Schedule
-
-过大的成功 Tool Result 会被外部化到当前 Workspace 的 `.myclaw/artifacts/<session_id>/`，模型收到指向该 Artifact 的归一化结果。
-
-## 核心数据流
-
-### 启动
-
-```text
-CLI
-  → 读取 ~/.myclaw/config.toml
-  → 以当前目录建立 Workspace
-  → 初始化 <workspace>/.myclaw/
-  → 连接已配置的 MCP Server，捕获初始 MCP Tool Snapshot
-  → 组合 Runtime Lifetime 级 Message Bus、Model Router、Memory Manager、Dream 与 Schedule Service
-  → 创建并 preflight 初始 Agent Loop，同时捕获初始 Skill Snapshot
-  → 注册或校正 Dream System Job，并创建或校正 schedule.json
-  → 启动 Terminal Conversation
-```
-
-### 前台 Agent Run
-
-```text
-用户输入
-  → Management Command 精确匹配，或进入 Message Bus
-  → Task Framing 更新当前 Blackboard
-  → 拼装 System Prompt、Runtime Context、Memory、Skill 与短期历史
-  → Agent Loop 调用 Agent Runner
-  → Model Router 调用 chat Route
-  → Tool Call 经 Tool Gateway 校验、授权并执行，终端更新工具行状态
-  → Tool Result 返回模型，直至生成最终回复或达到迭代上限
-  → 更新 Conversation Session、Token 用量和持久化请求
-  → Outbound Message 交给 Terminal Conversation 渲染
-```
-
-未命中管理命令或手动 Skill 的普通前台输入会额外触发一次无 Tool 的 Task Framing 调用。Blackboard 只包含当前
-`goal` 和 `completion_boundary`，用于帮助模型理解任务连续性；它不能授权执行、
-绕过 Tool Confirmation 或控制工作流。
-
-工具行从 Running 更新为成功、失败或拒绝；取消时仍未完成的工具行显示取消，缺失完成通知时显示状态未知。终端不展示 Tool Result 正文或 Artifact 引用，结果仍提供给模型并按现有规则持久化。
-
-### Memory
-
-```text
-较早的 Session 消息
-  → Conversation Summary
-  → <workspace>/.myclaw/memory/summary.jsonl
-  → Dream System Job 或 /dream 触发 Dream
-  → 领取 Summary 批次并预先推进 Summary Cursor
-  → memory Route 判断并更新 memory.md
-```
-
-Short-term Memory 是 Session 中尚未被摘要覆盖的后缀；Conversation Summary 是按序
-保存的摘要流；Long-term Memory 是跨 Conversation Session 生效的稳定信息。
-Dream 失败或取消不回退已推进的 Cursor，也不自动重试该批次；已完成的记忆编辑不会回滚。
-
-### Schedule
-
-Schedule Service 从 Workspace 的 `schedule.json` 读取任务，在 Runtime Lifetime 内
-等待触发时间。User Schedule Job 使用独立 Schedule Session 和 `schedule` Route，并通过
-当前 Agent Loop 共享该 Runtime Generation 的 Tool Gateway 与 Agent Runner；Dream System
-Job 则直接调用 `Dream.run()`，不创建 Schedule Session 或进入 Agent Loop。两条路径都不会
-向前台 Outbound Message 流发布执行过程，也没有交互式确认通道。
-
-## 本地数据与目录
-
-### Agent Home
-
-Agent Home 固定为当前账户的 `~/.myclaw/`，不能通过配置切换：
-
-```text
-~/.myclaw/
-├── config.toml
-└── skills/
-    └── <skill-directory>/
-        └── SKILL.md
-```
-
-它只保存全局 User Configuration 和用户编写的 Skill。
-
-### Workspace State
-
-每个启动目录都拥有独立的 `.myclaw`：
-
-```text
-<workspace>/.myclaw/
-├── .gitignore
-├── schedule.json
-├── memory/
-│   ├── memory.md
-│   ├── summary.jsonl
-│   └── .cursor
-├── sessions/
-│   └── <session_id>.jsonl
-├── schedule-sessions/
-│   └── schedule_<job_id>.jsonl
-├── artifacts/
-│   └── <session_id>/
-│       └── <tool_call_id_or_uuid4>.txt
-└── logs/
-    └── <session_id>.log
-```
-
-启动时创建 Workspace State 根目录、内部 `.gitignore`、`memory/`、`sessions/`、缺失的
-`memory.md`，并在注册 Dream System Job 时创建或校正 `schedule.json`；其余文件和目录由
-对应功能按需创建。
-
-建议将 Workspace 与其中的 `.myclaw` 一起备份。不要在 MyClaw 运行期间手动编辑Session、Summary、Summary Cursor 或 Schedule 状态文件。
-
-## 权限与安全边界
-
-- Workspace 内的文件操作仍受操作系统账户权限限制。
-- Built-in Tool 访问 Workspace 外部文件路径时会请求一次性 Tool Confirmation；`read_file` 读取 Agent Home 内 `skills` 子目录的规范路径除外，Agent Home 的其他路径不享有该豁免。未通过具体安全检查的 Exec/Web 目标也需要逐次确认。
-- Schedule Agent Run 没有交互式确认能力，因此拒绝所有需要确认的操作。
-- Exec 不是操作系统沙箱。命令继承当前用户权限，可能影响 Workspace 之外的系统资源。
-- Web Tool 会执行 URL、DNS、重定向及目标地址检查，但这不等同于完整网络隔离。
-- Tool、Skill 和 Blackboard 都不能扩大 Permission Policy 允许的权限。
-- 已配置的 MCP Server 是明确授权的外部能力，不附加上述 Built-in Tool 的逐次确认；它们的进程、网络和文件权限由 Server 与宿主系统决定。
-- Artifact 没有自动清理策略，Long-term Memory 也没有自动大小上限。
-
-## 运行限制
-
-- 同一 Conversation Session 不支持并发写入（same-session concurrency is unsupported）。
-- 多个 MyClaw 进程不会协调 Session、Session Log 或后台 Schedule。
-- Session Log 使用无界队列（unbounded queue）；正常上下文退出会无限等待队列排空（infinite drain）。
-- Session Log 不对每条记录执行 `fsync`（no per-record fsync），异常退出、断电或强制终止可能丢失最近记录。
-- Session Log 不主动脱敏（no active redaction），也不转义控制字符（no control escaping）。传给日志调用的凭据、换行或异常文本可能原样落盘。
-- 日志保留按 Session 独立计算（per-session retention），Workspace 的日志总量没有全局上限。
-- 旧版 Agent Home Runtime Log 文件保持原样（legacy Agent Home Runtime Log files remain untouched）；升级不会读取、移动、删除、截断或更新它们。
-- 普通后台 Session 保存失败没有用户确认或失败日志；崩溃后 Conversation Summary 与`last_consolidated` 可能暂时不一致。
-- 当前版本没有 daemon、HTTP/IPC 服务、subagent runtime、profiles、跨进程状态协调、Keychain 集成或环境变量 API Key；MCP 仅通过上述配置的 Runtime Lifetime 集成提供。
-
-## 开发文档
-
-产品需求与讨论以 [GitHub Issues](https://github.com/Totoro-debug/myclaw/issues) 为准；本地保留[领域词汇](CONTEXT.md)、[现行 ADR](docs/adr/)和[文档维护约定](docs/agents/domain.md)。旧方案、已完成计划和历史验收记录通过 Git 与 GitHub 追溯。
-
-安装开发依赖后，运行以下检查：
-
-```text
-python -m pip install -e .[dev]
-python -m pytest -q
-python -m ruff check .
-python -m ruff format --check .
-python -m mypy
-```
-
-## License
-
-MyClaw 使用 Apache License 2.0，完整条款见 [LICENSE](LICENSE)。
+架构决策见[现行 ADR](docs/adr/)，领域术语见[CONTEXT.md](CONTEXT.md)。
