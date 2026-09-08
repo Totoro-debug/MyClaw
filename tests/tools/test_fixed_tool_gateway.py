@@ -13,7 +13,6 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.config import MCPServerConfiguration
 from myclaw.schedule.service import ScheduleService
 from myclaw.tools.base import BaseTool
-from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.mcp import MCPTool, MCPToolSpec
 from myclaw.tools.mcp_runtime import MCPRuntimeManager, allocate_mcp_tool_name
 from myclaw.tools.tool_gateway import (
@@ -110,8 +109,63 @@ def test_fixed_catalog_order_and_detached_definitions(
     current_path = cast(dict[str, object], current_properties["path"])
     assert current_path["description"] != "changed"
     assert not hasattr(gateway, "register_tools")
-    assert not hasattr(gateway, "for_run")
+    assert hasattr(gateway, "for_run")
     assert not any(name in vars(gateway) for name in ("workspace", "schedule_store"))
+
+
+@pytest.mark.asyncio
+async def test_run_gateway_separates_catalog_and_exposure(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    class RunTool(BaseTool):
+        name = "run_tool"
+        description = "A tool added only to this run view."
+        value: str
+
+        async def execute(self, *, value: str) -> str:
+            return f"run:{value}"
+
+    gateway = _gateway(workspace, agent_home)
+    first = gateway.for_run(
+        excluded_names=("schedule",),
+        exposed_names=("read_file",),
+        run_tools=(RunTool(),),
+    )
+    second = gateway.for_run(
+        excluded_names=("schedule",),
+        exposed_names=("exec",),
+    )
+
+    assert _names(first) == ["read_file"]
+    assert first.exposed_names == ("read_file",)
+    assert "schedule" not in first.exposed_names
+    assert _names(second) == ["exec"]
+    assert _names(gateway)[-1] == "schedule"
+
+    direct = await first.call(
+        ModelToolCall(
+            id="call_run_tool",
+            name="run_tool",
+            arguments='{"value":"payload"}',
+        )
+    )
+    unavailable = await first.call(
+        ModelToolCall(id="call_schedule", name="schedule", arguments='{"action":"list"}')
+    )
+
+    assert (direct.status, direct.content) == ("success", "run:payload")
+    assert (unavailable.status, unavailable.content) == (
+        "error",
+        "The requested tool is not available.",
+    )
+    assert first.exposed_names == ("read_file",)
+
+    first.expose(("run_tool",))
+
+    assert _names(first) == ["read_file", "run_tool"]
+    assert list(first.exposed_names) == ["read_file", "run_tool"]
+    assert _names(second) == ["exec"]
 
 
 @pytest.mark.asyncio
@@ -218,36 +272,18 @@ async def test_fixed_gateway_reads_skill_root_without_confirmation(
     assert len(gateway.schemas) == 10
 
 
-@pytest.mark.asyncio
-async def test_foreground_and_scheduled_catalogs_always_include_web_and_exec(
+def test_run_catalog_exclusion_keeps_other_tools_available(
     workspace: Path,
     agent_home: Path,
 ) -> None:
     foreground = _gateway(workspace, agent_home)
-    scheduled = _gateway(workspace, agent_home)
+    scheduled = foreground.for_run(excluded_names=("schedule",))
 
-    assert _names(foreground) == _names(scheduled)
-    token = ScheduleTool._in_schedule_job.set(True)
-    try:
-        refused = await scheduled.call(
-            ModelToolCall(
-                id="call_scheduled_add",
-                name="schedule",
-                arguments=json.dumps(
-                    {
-                        "action": "add",
-                        "message": "should be refused",
-                        "every_seconds": 60,
-                    }
-                ),
-            )
-        )
-    finally:
-        ScheduleTool._in_schedule_job.reset(token)
-
-    assert refused.status == "refused"
-    assert refused.content == "Schedule add is unavailable in scheduled Agent context."
-    assert refused.confirmation is None
+    assert "schedule" in _names(foreground)
+    assert "schedule" not in _names(scheduled)
+    assert "web_search" in _names(scheduled)
+    assert "web_fetch" in _names(scheduled)
+    assert "exec" in _names(scheduled)
 
 
 @pytest.mark.asyncio

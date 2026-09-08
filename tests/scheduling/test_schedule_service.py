@@ -1434,7 +1434,7 @@ async def test_agent_loop_executes_at_job_with_schedule_route_and_partition(
     await router.close()
 
     request = provider.complete_requests[0]
-    assert len(request.tools) == 10
+    assert len(request.tools) == 9
     assert await schedule.public_snapshot() == ()
     session = Session.load(
         state,
@@ -1475,7 +1475,7 @@ async def test_agent_loop_runs_foreground_while_every_job_is_active(
 
         assert messages[-1].metadata == {"_streamed": True}
         assert schedule.status_snapshot().active_job_count == 1
-        assert len(provider.complete_requests[0].tools) == 10
+        assert len(provider.complete_requests[0].tools) == 9
         assert provider.stream_requests
     finally:
         provider.release_schedule.set()

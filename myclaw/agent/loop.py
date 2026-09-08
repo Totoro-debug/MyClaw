@@ -56,7 +56,6 @@ from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import LoadedSkill, ManualSkillInvocation, SkillLoader, SkillMetadata
 from myclaw.tools.base import BaseTool
-from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -634,11 +633,9 @@ class AgentLoop:
         current_task = asyncio.current_task()
         if current_task is not None:
             self._schedule_tasks.add(current_task)
-        token = ScheduleTool._in_schedule_job.set(True)
         try:
             await self._execute_schedule_job(job)
         finally:
-            ScheduleTool._in_schedule_job.reset(token)
             if current_task is not None:
                 self._schedule_tasks.discard(current_task)
 
@@ -690,10 +687,12 @@ class AgentLoop:
 
     async def _run_schedule_agent(self, session: Session, job: ScheduleJob) -> None:
         current_user = {"role": "user", "content": job.message}
+        run_gateway = self._tool_gateway.for_run(excluded_names=("schedule",))
         try:
             initial_messages = await self._prepare_schedule_context(
                 session,
                 deepcopy(current_user),
+                tool_gateway=run_gateway,
             )
         except asyncio.CancelledError:
             if not self._aborted:
@@ -715,7 +714,7 @@ class AgentLoop:
         result = await self._runner.run(
             initial_messages,
             model="schedule",
-            tool_gateway=self._tool_gateway,
+            tool_gateway=run_gateway,
             on_output=None,
             confirmation=None,
             externalize_result=self._result_externalizer_for(session),
@@ -1038,7 +1037,10 @@ class AgentLoop:
         self,
         active_session: Session,
         current_user: dict[str, Any],
+        *,
+        tool_gateway: ToolGateway | None = None,
     ) -> list[dict[str, Any]]:
+        effective_gateway = self._tool_gateway if tool_gateway is None else tool_gateway
         with self._context_builder.schedule_projection_scope():
             route = self._configuration.resolve_route("schedule").route
             initial_last_consolidated = active_session.last_consolidated
@@ -1064,7 +1066,7 @@ class AgentLoop:
                 project_messages=project_messages,
                 route_context_window=route.context_window,
                 route_max_output=route.max_output,
-                tools=self.tool_schemas,
+                tools=effective_gateway.schemas,
             )
             if active_session.last_consolidated == initial_last_consolidated:
                 return initial_projection

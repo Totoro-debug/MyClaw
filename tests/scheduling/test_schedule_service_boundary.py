@@ -17,8 +17,7 @@ from myclaw.schedule.service import (
     ScheduleService,
 )
 from myclaw.schedule.store import WorkspaceScheduleStore
-from myclaw.tools.core.schedule import ScheduleTool
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResult
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
 
@@ -94,7 +93,7 @@ async def test_schedule_service_facade_preserves_user_job_management(
 
 
 @pytest.mark.asyncio
-async def test_schedule_tool_guard_is_task_local_and_list_remove_stay_available(
+async def test_run_gateway_views_isolate_catalog_and_exposure(
     workspace: Path,
     agent_home: Path,
 ) -> None:
@@ -102,79 +101,35 @@ async def test_schedule_tool_guard_is_task_local_and_list_remove_stay_available(
     state = WorkspaceState(identity)
     state.initialize(agent_home_root=agent_home)
     service = _service(state)
-    foreground = ToolGateway(workspace=identity, schedule_service=service)
-    scheduled = ToolGateway(workspace=identity, schedule_service=service)
-    barrier = asyncio.Event()
-    foreground_done = asyncio.Event()
-
-    async def scheduled_task() -> tuple[ToolResult, ToolResult, ToolResult]:
-        token = ScheduleTool._in_schedule_job.set(True)
-        try:
-            await barrier.wait()
-            refused = await scheduled.call(
-                ModelToolCall(
-                    id="scheduled_add",
-                    name="schedule",
-                    arguments=json.dumps(
-                        {
-                            "action": "add",
-                            "message": "recursive",
-                            "every_seconds": 60,
-                        }
-                    ),
-                )
-            )
-            await foreground_done.wait()
-            listed = await scheduled.call(
-                ModelToolCall(
-                    id="scheduled_list",
-                    name="schedule",
-                    arguments='{"action":"list"}',
-                )
-            )
-            job_id = (await service.public_snapshot())[0].job_id
-            removed = await scheduled.call(
-                ModelToolCall(
-                    id="scheduled_remove",
-                    name="schedule",
-                    arguments=json.dumps({"action": "remove", "job_id": job_id}),
-                )
-            )
-            return refused, listed, removed
-        finally:
-            ScheduleTool._in_schedule_job.reset(token)
-
-    async def foreground_task() -> ToolResult:
-        await barrier.wait()
-        try:
-            return await foreground.call(
-                ModelToolCall(
-                    id="foreground_add",
-                    name="schedule",
-                    arguments=json.dumps(
-                        {
-                            "action": "add",
-                            "message": "foreground",
-                            "every_seconds": 60,
-                        }
-                    ),
-                )
-            )
-        finally:
-            foreground_done.set()
-
-    barrier.set()
-    scheduled_result, foreground_result = await asyncio.gather(
-        scheduled_task(),
-        foreground_task(),
+    generation = ToolGateway(workspace=identity, schedule_service=service)
+    scheduled = generation.for_run(
+        excluded_names=("schedule",),
+        exposed_names=("read_file",),
     )
-    refused, listed, removed = scheduled_result
-    assert refused.status == "refused"
-    assert refused.content == "Schedule add is unavailable in scheduled Agent context."
-    assert foreground_result.status == "success"
-    assert listed.status == "success"
-    assert removed.status == "success"
-    assert await service.public_snapshot() == ()
+    foreground = generation.for_run(exposed_names=("schedule",))
+
+    scheduled.expose(("exec",))
+    assert scheduled.exposed_names == ("read_file", "exec")
+    assert foreground.exposed_names == ("schedule",)
+    assert "schedule" not in {schema["function"]["name"] for schema in scheduled.schemas}
+
+    unavailable = await scheduled.call(
+        ModelToolCall(id="scheduled_add", name="schedule", arguments='{"action":"list"}')
+    )
+    added = await foreground.call(
+        ModelToolCall(
+            id="foreground_add",
+            name="schedule",
+            arguments=json.dumps({"action": "add", "message": "foreground", "every_seconds": 60}),
+        )
+    )
+
+    assert (unavailable.status, unavailable.content) == (
+        "error",
+        "The requested tool is not available.",
+    )
+    assert added.status == "success"
+    assert len(await service.public_snapshot()) == 1
 
 
 @pytest.mark.asyncio

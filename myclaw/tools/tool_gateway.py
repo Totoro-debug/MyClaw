@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -172,6 +172,20 @@ class ToolResult:
         return result
 
 
+def _normalize_tool_names(names: Collection[str], *, label: str) -> tuple[str, ...]:
+    if isinstance(names, str):
+        raise TypeError(f"{label} must be a collection of strings")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if not isinstance(name, str) or not name:
+            raise TypeError(f"{label} must contain non-empty strings")
+        if name not in seen:
+            seen.add(name)
+            normalized.append(name)
+    return tuple(normalized)
+
+
 class ToolGateway:
     """Create and invoke the Built-in Tool Catalog."""
 
@@ -208,7 +222,73 @@ class ToolGateway:
             raise ValueError("Tool names must be unique")
         self._catalog = tools
         self._tools = {tool.name: tool for tool in tools}
+        self._exposed_names = tuple(tool.name for tool in tools)
         self._failure_observer: Callable[[Exception], None] | None = None
+
+    def for_run(
+        self,
+        excluded_names: Collection[str] = (),
+        exposed_names: Collection[str] | None = None,
+        run_tools: Sequence[BaseTool] = (),
+    ) -> ToolGateway:
+        """Create an isolated Run view over this Gateway's reusable Tool instances."""
+        excluded = _normalize_tool_names(excluded_names, label="Excluded Tool names")
+        excluded_set = set(excluded)
+        additions = tuple(run_tools)
+        if any(not isinstance(tool, BaseTool) for tool in additions):
+            raise TypeError("Run Tools must be BaseTool instances")
+
+        catalog = tuple(
+            tool for tool in (*self._catalog, *additions) if tool.name not in excluded_set
+        )
+        if len({tool.name for tool in catalog}) != len(catalog):
+            raise ValueError("Run Tool names must be unique")
+
+        available_names = {tool.name for tool in catalog}
+        if exposed_names is None:
+            exposure = tuple(tool.name for tool in catalog)
+        else:
+            requested = _normalize_tool_names(exposed_names, label="Exposed Tool names")
+            unknown = set(requested) - available_names
+            if unknown:
+                raise ValueError("Exposed Tool names must be available in the Run Catalog")
+            exposure = tuple(tool.name for tool in catalog if tool.name in requested)
+
+        return self._from_catalog(
+            catalog,
+            exposed_names=exposure,
+            on_failure=self._failure_observer,
+        )
+
+    @classmethod
+    def _from_catalog(
+        cls,
+        catalog: tuple[BaseTool, ...],
+        *,
+        exposed_names: tuple[str, ...],
+        on_failure: Callable[[Exception], None] | None,
+    ) -> ToolGateway:
+        gateway = object.__new__(cls)
+        gateway._catalog = catalog
+        gateway._tools = {tool.name: tool for tool in catalog}
+        gateway._exposed_names = exposed_names
+        gateway._failure_observer = on_failure
+        return gateway
+
+    @property
+    def exposed_names(self) -> tuple[str, ...]:
+        """Return the names projected to the model for this Gateway view."""
+        return self._exposed_names
+
+    def expose(self, names: Collection[str]) -> None:
+        """Expose available Tools for subsequent model requests in this Run."""
+        requested = _normalize_tool_names(names, label="Exposed Tool names")
+        available_names = {tool.name for tool in self._catalog}
+        if set(requested) - available_names:
+            raise ValueError("Exposed Tool names must be available in the Run Catalog")
+        exposed = set(self._exposed_names)
+        exposed.update(requested)
+        self._exposed_names = tuple(tool.name for tool in self._catalog if tool.name in exposed)
 
     @classmethod
     def _for_memory(
@@ -220,17 +300,18 @@ class ToolGateway:
         """Build the isolated Long-term Memory catalog without widening the public API."""
         if not tools or len({tool.name for tool in tools}) != len(tools):
             raise ValueError("Memory Tool names must be unique and non-empty")
-        gateway = object.__new__(cls)
         catalog: tuple[BaseTool, ...] = tools
-        gateway._catalog = catalog
-        gateway._tools = {tool.name: tool for tool in catalog}
-        gateway._failure_observer = on_failure
-        return gateway
+        return cls._from_catalog(
+            catalog,
+            exposed_names=tuple(tool.name for tool in catalog),
+            on_failure=on_failure,
+        )
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
         """Build a detached schema list from each Tool in fixed Catalog order."""
-        return [tool.to_schema() for tool in self._catalog]
+        exposed = set(self._exposed_names)
+        return [tool.to_schema() for tool in self._catalog if tool.name in exposed]
 
     async def call(
         self,

@@ -41,7 +41,7 @@ from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.templates import render_template
-from myclaw.tools.tool_gateway import ModelToolCall
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
     FakeClock,
@@ -189,7 +189,7 @@ class _ScheduleProvider:
             timeout=timeout,
         )
         self.complete_requests.append(call)
-        route = "schedule" if len(tools) == 10 else "memory"
+        route = "schedule" if len(tools) == 9 else "memory"
         if route == "schedule":
             self._schedule_call_count += 1
             if self._block_schedule_call == self._schedule_call_count:
@@ -208,7 +208,7 @@ class _ScheduleProvider:
 
 
 def _is_schedule_call(call: ProviderCall) -> bool:
-    return len(call.tools) == 10
+    return len(call.tools) == 9
 
 
 def _response(content: str, *, tool_call: ModelToolCall | None = None) -> ModelResponse:
@@ -352,6 +352,7 @@ async def _close_components(
 def _capture_summary_projections(
     monkeypatch: pytest.MonkeyPatch,
     projections: list[list[dict[str, Any]]],
+    tool_names: list[tuple[str, ...]] | None = None,
 ) -> None:
     original_prepare = ConversationSummaryManager.prepare
 
@@ -375,6 +376,8 @@ def _capture_summary_projections(
         assert route_context_window is not None
         assert route_max_output is not None
         assert tools is not None
+        if tool_names is not None:
+            tool_names.append(tuple(schema["function"]["name"] for schema in tools))
         return await original_prepare(
             manager,
             session,
@@ -555,12 +558,13 @@ async def test_schedule_uses_context_builder_complete_context_projection(
     provider = _ScheduleProvider(schedule_responses=(_response("Background result."),))
     projection_calls: list[list[dict[str, Any]]] = []
     builder_projections: list[list[dict[str, Any]]] = []
+    summary_tool_names: list[tuple[str, ...]] = []
 
     def fail_foreground_context(*args: object, **kwargs: object) -> list[dict[str, object]]:
         del args, kwargs
         raise AssertionError("Schedule must not use ContextBuilder")
 
-    _capture_summary_projections(monkeypatch, projection_calls)
+    _capture_summary_projections(monkeypatch, projection_calls, summary_tool_names)
     _capture_schedule_projections(monkeypatch, builder_projections)
     schedule_now = NOW + timedelta(hours=2)
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
@@ -586,6 +590,9 @@ async def test_schedule_uses_context_builder_complete_context_projection(
 
     assert len(provider.direct_complete_messages) == 1
     messages, tools = provider.direct_complete_messages[0]
+    runner_tool_names = tuple(schema["function"]["name"] for schema in tools)
+    assert summary_tool_names == [runner_tool_names]
+    assert "schedule" not in runner_tool_names
     assert projection_calls == [messages]
     assert len(builder_projections) == 1
     assert all(projection == messages for projection in builder_projections)
@@ -623,7 +630,6 @@ async def test_schedule_uses_context_builder_complete_context_projection(
         "exec",
         "web_search",
         "web_fetch",
-        "schedule",
     ]
 
 
@@ -1043,7 +1049,6 @@ async def test_schedule_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessi
             "exec",
             "web_search",
             "web_fetch",
-            "schedule",
         ]
         assert await _schedule_state(workspace).public_snapshot() == ()
         schedule_session_paths = tuple(
@@ -1111,7 +1116,7 @@ async def test_foreground_and_schedule_share_runner_and_gateway_identity(
         provider,
         schedule_clock=_BlockingClock(NOW),
     )
-    observed: list[tuple[AgentRunner, object, str, object, object]] = []
+    observed: list[tuple[AgentRunner, ToolGateway, str, object, object]] = []
     original_run = AgentRunner.run
 
     async def record_run(
@@ -1143,7 +1148,9 @@ async def test_foreground_and_schedule_share_runner_and_gateway_identity(
 
     assert len(observed) == 2
     assert observed[0][0] is observed[1][0]
-    assert observed[0][1] is observed[1][1]
+    assert observed[0][1] is not observed[1][1]
+    assert "schedule" in {schema["function"]["name"] for schema in observed[0][1].schemas}
+    assert "schedule" not in {schema["function"]["name"] for schema in observed[1][1].schemas}
     assert [call[2] for call in observed] == ["chat", "schedule"]
     assert observed[0][3] is not None
     assert observed[1][3] is None

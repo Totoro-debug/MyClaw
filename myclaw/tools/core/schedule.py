@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from contextvars import ContextVar
 from datetime import UTC, datetime
-from typing import Any, ClassVar, cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from myclaw.schedule.model import JobSchedule, ScheduleJob
@@ -101,10 +100,6 @@ class ScheduleTool(BaseTool):
     name = "schedule"
     description = "Manage one-time and recurring Schedule Jobs."
     parameters = _ScheduleArgumentsSchema().to_json_schema()
-    _in_schedule_job: ClassVar[ContextVar[bool]] = ContextVar(
-        "myclaw_schedule_tool_in_schedule_job",
-        default=False,
-    )
 
     def __init__(
         self,
@@ -151,22 +146,6 @@ class ScheduleTool(BaseTool):
                 return _INVALID_ARGUMENTS
             return None
         return _INVALID_ARGUMENTS
-
-    def refusal_reason(
-        self,
-        *,
-        action: str,
-        message: str | None = None,
-        every_seconds: int | None = None,
-        cron_expr: str | None = None,
-        timezone: str | None = None,
-        at_time: str | None = None,
-        job_id: str | None = None,
-    ) -> str | None:
-        del message, every_seconds, cron_expr, timezone, at_time, job_id
-        if self._in_schedule_job.get() and action == "add":
-            return "Schedule add is unavailable in scheduled Agent context."
-        return None
 
     async def execute(
         self,

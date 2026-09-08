@@ -10,6 +10,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 import pytest
+from mcp.types import CallToolResult
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.loop import AgentLoop
@@ -33,9 +34,8 @@ from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
 from myclaw.tools.base import BaseTool
-from myclaw.tools.core.schedule import ScheduleTool
 from myclaw.tools.mcp import MCPTool, MCPToolSpec
-from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResult
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import TaskFramingRouterAdapter, collect_foreground_outbound
 
@@ -242,7 +242,10 @@ class _ScheduleToolOverlapRouter(_ScheduleRouter):
 async def _schedule_context(
     session: Session,
     current_user: dict[str, Any],
+    *,
+    tool_gateway: ToolGateway | None = None,
 ) -> list[dict[str, Any]]:
+    del tool_gateway
     return [
         {"role": "system", "content": "schedule system"},
         {"role": "user", "content": current_user["content"]},
@@ -379,31 +382,84 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
     ]
     assert schedule_session.messages[-1]["content"] == "scheduled result"
     assert router.routes == ["schedule"]
-    assert router.requests[0][1] == 10
+    assert router.requests[0][1] == 9
     assert framing_router.framing_requests == []
 
 
 @pytest.mark.asyncio
-async def test_foreground_and_user_schedule_runs_share_generation_mcp_tool_snapshot(
+@pytest.mark.parametrize(
+    ("action", "arguments"),
+    [
+        (
+            "add",
+            {"action": "add", "message": "must stay absent", "every_seconds": 60},
+        ),
+        ("list", {"action": "list"}),
+        (
+            "remove",
+            {"action": "remove", "job_id": str(JOB_ID)},
+        ),
+    ],
+)
+async def test_schedule_run_excludes_schedule_tool_from_catalog_and_schema(
+    tmp_path: Path,
+    action: str,
+    arguments: dict[str, object],
+) -> None:
+    router = _ScheduleRouter(
+        _tool_response(call_id=f"call_{action}", name="schedule", arguments=arguments),
+        _ScheduleRouter._response(),
+    )
+    loop, state, service, _bus = _loop(tmp_path, router)
+
+    await loop.run_schedule_job(_job())
+
+    assert router.requests[0][1] == 9
+    schedule_session = Session.load(
+        state,
+        f"schedule_{JOB_ID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    tool_message = next(
+        message for message in schedule_session.messages if message["role"] == "tool"
+    )
+    assert tool_message["status"] == "error"
+    assert tool_message["content"] == "The requested tool is not available."
+    assert await service.public_snapshot() == ()
+
+
+@pytest.mark.asyncio
+async def test_user_schedule_run_keeps_and_executes_generation_mcp_tool(
     tmp_path: Path,
 ) -> None:
-    class UnusedMCPSession:
-        async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
-            del name, arguments
-            raise AssertionError("MCP Tool must not execute in this schema projection test")
+    class RecordingMCPSession:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
 
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+            self.calls.append((name, arguments))
+            return CallToolResult(content=[])
+
+    mcp_session = RecordingMCPSession()
     mcp_tool = MCPTool(
         MCPToolSpec(
             server_name="alpha",
-            remote_name="echo",
-            model_name="mcp_alpha_echo",
-            description="Echo arguments.",
+            remote_name="schedule_meeting",
+            model_name="mcp_alpha_schedule_meeting",
+            description="Schedule an external meeting.",
             parameters={"type": "object"},
         ),
-        UnusedMCPSession(),
+        mcp_session,
     )
-    router = _ScheduleRouter()
-    loop, _state, _service, bus = _loop(tmp_path, router, mcp_tools=(mcp_tool,))
+    router = _ScheduleRouter(
+        _tool_response(
+            call_id="call_mcp_schedule",
+            name="mcp_alpha_schedule_meeting",
+            arguments={"title": "review", "timezone": "Asia/Shanghai"},
+        ),
+        _ScheduleRouter._response(),
+    )
+    loop, state, _service, bus = _loop(tmp_path, router, mcp_tools=(mcp_tool,))
 
     await loop.start()
     try:
@@ -415,11 +471,31 @@ async def test_foreground_and_user_schedule_runs_share_generation_mcp_tool_snaps
     generation_requests = [
         (route, tool_names)
         for route, tool_names in router.tool_requests
-        if "mcp_alpha_echo" in tool_names
+        if "mcp_alpha_schedule_meeting" in tool_names
     ]
-    assert [route for route, _tool_names in generation_requests] == ["chat", "schedule"]
-    assert generation_requests[0][1] == generation_requests[1][1]
-    assert generation_requests[0][1].count("mcp_alpha_echo") == 1
+    assert [route for route, _tool_names in generation_requests] == [
+        "chat",
+        "schedule",
+        "schedule",
+    ]
+    foreground_names = generation_requests[0][1]
+    schedule_names = generation_requests[1][1]
+    assert foreground_names == (*schedule_names[:9], "schedule", *schedule_names[9:])
+    assert all(tool_names == schedule_names for _route, tool_names in generation_requests[1:])
+    assert "schedule" not in schedule_names
+    assert schedule_names.count("mcp_alpha_schedule_meeting") == 1
+    assert mcp_session.calls == [
+        ("schedule_meeting", {"title": "review", "timezone": "Asia/Shanghai"})
+    ]
+    schedule_session = Session.load(
+        state,
+        f"schedule_{JOB_ID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    tool_message = next(
+        message for message in schedule_session.messages if message["role"] == "tool"
+    )
+    assert tool_message["status"] == "success"
 
 
 @pytest.mark.asyncio
@@ -492,7 +568,10 @@ async def test_schedule_run_reloads_canonical_session_and_closes_each_run(
     async def prepare_context(
         session: Session,
         current_user: dict[str, Any],
+        *,
+        tool_gateway: ToolGateway | None = None,
     ) -> list[dict[str, Any]]:
+        del tool_gateway
         observed_context.append((session.session_id, len(session.messages)))
         return [
             {"role": "system", "content": "schedule system"},
@@ -606,28 +685,29 @@ async def test_schedule_cancelled_runner_persists_user_and_propagates_cancelled_
 
 
 @pytest.mark.asyncio
-async def test_schedule_context_preparation_failures_reset_contextvar_and_preserve_cancel(
+async def test_schedule_context_preparation_failures_preserve_cancel(
     tmp_path: Path,
 ) -> None:
-    from myclaw.tools.core.schedule import ScheduleTool
-
     async def unexpected_context(
         session: Session,
         current_user: dict[str, Any],
+        *,
+        tool_gateway: ToolGateway | None = None,
     ) -> list[dict[str, Any]]:
-        del session, current_user
+        del session, current_user, tool_gateway
         raise RuntimeError("unexpected preparation failure")
 
     async def cancelled_context(
         session: Session,
         current_user: dict[str, Any],
+        *,
+        tool_gateway: ToolGateway | None = None,
     ) -> list[dict[str, Any]]:
-        del session, current_user
+        del session, current_user, tool_gateway
         raise asyncio.CancelledError()
 
     success_loop, _, _, _success_bus = _loop(tmp_path / "success", _ScheduleRouter())
     await success_loop.run_schedule_job(_job())
-    assert ScheduleTool._in_schedule_job.get() is False
 
     failed_loop, failed_state, _, _failed_bus = _loop(
         tmp_path / "failed",
@@ -637,7 +717,6 @@ async def test_schedule_context_preparation_failures_reset_contextvar_and_preser
     with pytest.raises(ScheduleJobExecutionError) as failed:
         await failed_loop.run_schedule_job(_job())
     assert failed.value.error.code == "model_failed"
-    assert ScheduleTool._in_schedule_job.get() is False
 
     cancelled_loop, cancelled_state, _, _cancelled_bus = _loop(
         tmp_path / "cancelled",
@@ -646,7 +725,6 @@ async def test_schedule_context_preparation_failures_reset_contextvar_and_preser
     )
     with pytest.raises(asyncio.CancelledError):
         await cancelled_loop.run_schedule_job(_job())
-    assert ScheduleTool._in_schedule_job.get() is False
 
     failed_session = Session.load(
         failed_state,
@@ -760,7 +838,7 @@ async def test_schedule_agent_reads_known_skill_path_via_shared_gateway(tmp_path
     assert tool_messages[0]["content"] == "---\nname: review\n---\nbody\n"
     assert confirmation_requests == []
     assert router.routes == ["schedule", "schedule"]
-    assert [tool_count for _, tool_count in router.requests] == [10, 10]
+    assert [tool_count for _, tool_count in router.requests] == [9, 9]
 
 
 @pytest.mark.asyncio
@@ -844,7 +922,7 @@ async def test_foreground_cancel_does_not_cancel_overlapping_schedule_run(
 
 
 @pytest.mark.asyncio
-async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
+async def test_schedule_run_uses_isolated_catalog_during_concurrent_foreground_run(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -915,8 +993,9 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
         await asyncio.gather(schedule_task, return_exceptions=True)
         await loop.close()
 
-    assert await service.public_snapshot() == ()
-    assert ScheduleTool._in_schedule_job.get() is False
+    foreground_jobs = await service.public_snapshot()
+    assert len(foreground_jobs) == 1
+    assert foreground_jobs[0].message == "foreground add"
 
     schedule_session = Session.load(
         state,
@@ -926,10 +1005,7 @@ async def test_schedule_contextvar_refuses_only_scheduled_add_on_shared_gateway(
     scheduled_tools = [
         message for message in schedule_session.messages if message["role"] == "tool"
     ]
-    assert [message["status"] for message in scheduled_tools] == [
-        "refused",
-        "success",
-        "success",
-    ]
-    assert json.loads(scheduled_tools[1]["content"])["jobs"][0]["message"] == "foreground add"
-    assert json.loads(scheduled_tools[2]["content"])["action"] == "remove"
+    assert [message["status"] for message in scheduled_tools] == ["error", "error", "error"]
+    assert all(
+        message["content"] == "The requested tool is not available." for message in scheduled_tools
+    )

@@ -12,7 +12,7 @@ from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.tools.core.schedule import ScheduleTool
-from myclaw.tools.tool_gateway import ModelToolCall, ToolResult
+from myclaw.tools.tool_gateway import ModelToolCall
 from tests.fixtures import SingleToolGateway, write_schedule_state
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -401,54 +401,39 @@ async def test_remove_requires_canonical_uuid_and_hides_unknown_or_system_jobs(
 
 
 @pytest.mark.asyncio
-async def test_scheduled_task_rejects_add_but_permits_list_and_remove(
+async def test_schedule_tool_supports_add_list_and_remove_without_context_guard(
     workspace: Path,
     agent_home: Path,
 ) -> None:
     store = _store(workspace, agent_home)
-    existing = ScheduleJob(
-        job_id=str(JOB_UUID),
-        message="Existing",
-        schedule=JobSchedule.every(60),
-        created_at_ms=1,
-        updated_at_ms=1,
-    )
-    await store.add_user_job(existing)
     gateway = _gateway(
         ScheduleTool(
             schedule_service=_service(store),
             now=lambda: NOW,
-            new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+            new_uuid=lambda: JOB_UUID,
         )
     )
 
-    async def scheduled_call(tool_call: ModelToolCall) -> ToolResult:
-        token = ScheduleTool._in_schedule_job.set(True)
-        try:
-            return await gateway.call(tool_call)
-        finally:
-            ScheduleTool._in_schedule_job.reset(token)
-
-    invalid_add = await scheduled_call(
+    invalid_add = await gateway.call(
         ModelToolCall(
-            id="call_invalid_scheduled_add",
+            id="call_invalid_add",
             name="schedule",
             arguments='{"action":"add","every_seconds":60}',
         )
     )
-    add = await scheduled_call(
+    add = await gateway.call(
         ModelToolCall(
-            id="call_scheduled_add",
+            id="call_add",
             name="schedule",
-            arguments='{"action":"add","message":"Recursive","every_seconds":60}',
+            arguments='{"action":"add","message":"Created","every_seconds":60}',
         )
     )
-    listed = await scheduled_call(
-        ModelToolCall(id="call_scheduled_list", name="schedule", arguments='{"action":"list"}')
+    listed = await gateway.call(
+        ModelToolCall(id="call_list", name="schedule", arguments='{"action":"list"}')
     )
-    removed = await scheduled_call(
+    removed = await gateway.call(
         ModelToolCall(
-            id="call_scheduled_remove",
+            id="call_remove",
             name="schedule",
             arguments=json.dumps({"action": "remove", "job_id": str(JOB_UUID)}),
         )
@@ -456,9 +441,9 @@ async def test_scheduled_task_rejects_add_but_permits_list_and_remove(
 
     assert invalid_add.status == "error"
     assert invalid_add.confirmation is None
-    assert add.status == "refused"
+    assert add.status == "success"
     assert add.confirmation is None
-    assert "scheduled Agent context" in add.content
+    assert json.loads(add.content)["action"] == "add"
     assert listed.status == "success"
     assert removed.status == "success"
     assert await store.snapshot() == ()
