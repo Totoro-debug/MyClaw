@@ -47,6 +47,7 @@ BUILT_IN_TOOL_NAMES: tuple[str, ...] = (
     "web_search",
     "web_fetch",
     "schedule",
+    "tool_search",
 )
 
 
@@ -279,6 +280,11 @@ class ToolGateway:
     def exposed_names(self) -> tuple[str, ...]:
         """Return the names projected to the model for this Gateway view."""
         return self._exposed_names
+
+    @property
+    def catalog(self) -> tuple[BaseTool, ...]:
+        """Return the complete Tool Catalog owned by this Gateway view."""
+        return self._catalog
 
     def expose(self, names: Collection[str]) -> None:
         """Expose available Tools for subsequent model requests in this Run."""

@@ -266,8 +266,10 @@ async def _run_cli_conversation(
             session_id: str | None,
             *,
             mcp_snapshot: MCPToolSnapshot | None = None,
+            mcp_keywords: Mapping[str, tuple[str, ...]] | None = None,
         ) -> AgentLoop:
             selected_mcp_snapshot = active_mcp_snapshot if mcp_snapshot is None else mcp_snapshot
+            selected_mcp_keywords = active_mcp_keywords if mcp_keywords is None else mcp_keywords
             return AgentLoop(
                 workspace_path=workspace_path,
                 workspace_state=workspace_state,
@@ -282,6 +284,7 @@ async def _run_cli_conversation(
                 new_uuid=uuid4,
                 monotonic_now=monotonic,
                 mcp_tools=selected_mcp_snapshot,
+                mcp_keywords=selected_mcp_keywords,
             )
 
         def current_agent_loop() -> AgentLoop:
@@ -369,6 +372,7 @@ async def _run_cli_conversation(
                     target = create_agent_loop(
                         session_id,
                         mcp_snapshot=candidate_report.snapshot,
+                        mcp_keywords=candidate_keywords,
                     )
                     pending_target = target
                     target.preflight()

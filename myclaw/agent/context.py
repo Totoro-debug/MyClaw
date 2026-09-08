@@ -27,6 +27,12 @@ _MARKDOWN_SAFE_JSON_TRANSLATION: dict[int, str] = {
     ord(">"): r"\u003e",
 }
 
+_SCHEDULE_RUN_BOUNDARY = (
+    "\n\n## Schedule Run Boundary\n"
+    "This is a background Schedule Agent Run. The `schedule` Tool is unavailable. "
+    "Do not create, list, or remove Schedule Jobs."
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _ScheduleProjectionSnapshot:
@@ -94,11 +100,14 @@ class ContextBuilder:
 
     def schedule_system_prompt(self) -> str:
         """Build the Schedule System Prompt without foreground Skill content."""
-        return _build_foreground_system_prompt(
-            workspace=self._workspace,
-            agent_home=self._agent_home,
-            long_term_memory=self._memory_manager.memory_snapshot(),
-            skills=(),
+        return (
+            _build_foreground_system_prompt(
+                workspace=self._workspace,
+                agent_home=self._agent_home,
+                long_term_memory=self._memory_manager.memory_snapshot(),
+                skills=(),
+            )
+            + _SCHEDULE_RUN_BOUNDARY
         )
 
     @contextmanager

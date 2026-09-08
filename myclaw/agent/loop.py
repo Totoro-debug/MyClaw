@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -56,6 +56,7 @@ from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import LoadedSkill, ManualSkillInvocation, SkillLoader, SkillMetadata
 from myclaw.tools.base import BaseTool
+from myclaw.tools.deferred import build_agent_run_gateway
 from myclaw.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -188,6 +189,7 @@ class AgentLoop:
         new_uuid: Callable[[], UUID],
         monotonic_now: Callable[[], float],
         mcp_tools: Sequence[BaseTool] = (),
+        mcp_keywords: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         if not isinstance(workspace_path, Path):
             raise TypeError("Agent Loop requires a Workspace Path")
@@ -240,6 +242,12 @@ class AgentLoop:
             skill_root=skill_loader.root,
             additional_tools=tuple(mcp_tools),
         )
+        selected_mcp_keywords = {} if mcp_keywords is None else dict(mcp_keywords)
+        baseline_gateway = build_agent_run_gateway(
+            tool_gateway,
+            mcp_keywords=selected_mcp_keywords,
+        )
+        baseline_tool_schemas = tuple(baseline_gateway.schemas)
         runner = AgentRunner(model_router)
         summary_manager = ConversationSummaryManager(
             provider=cast(SummaryModelRouter, model_router),
@@ -271,6 +279,8 @@ class AgentLoop:
         self._monotonic_now = monotonic_now
         self._schedule_now = schedule_service.current_time
         self._tool_gateway = tool_gateway
+        self._baseline_tool_schemas = baseline_tool_schemas
+        self._mcp_keywords = selected_mcp_keywords
         self._model_router = model_router
         self._runner = runner
         self._max_iterations = configuration.runtime.max_iterations
@@ -320,7 +330,14 @@ class AgentLoop:
 
     @property
     def tool_schemas(self) -> tuple[dict[str, Any], ...]:
-        return tuple(self._tool_gateway.schemas)
+        return tuple(deepcopy(schema) for schema in self._baseline_tool_schemas)
+
+    def _new_run_gateway(self, *, excluded_names: Sequence[str] = ()) -> ToolGateway:
+        return build_agent_run_gateway(
+            self._tool_gateway,
+            excluded_names=excluded_names,
+            mcp_keywords=self._mcp_keywords,
+        )
 
     @property
     def has_active_run(self) -> bool:
@@ -687,7 +704,7 @@ class AgentLoop:
 
     async def _run_schedule_agent(self, session: Session, job: ScheduleJob) -> None:
         current_user = {"role": "user", "content": job.message}
-        run_gateway = self._tool_gateway.for_run(excluded_names=("schedule",))
+        run_gateway = self._new_run_gateway(excluded_names=("schedule",))
         try:
             initial_messages = await self._prepare_schedule_context(
                 session,
@@ -914,12 +931,14 @@ class AgentLoop:
         else:
             staged_blackboard = None
             framing_usage = None
+        run_gateway = self._new_run_gateway()
         try:
             initial_messages = await self._prepare_foreground_context(
                 active_session,
                 deepcopy(current_user),
                 blackboard=staged_blackboard,
                 manual_invocation=manual_invocation,
+                tool_gateway=run_gateway,
             )
         except asyncio.CancelledError:
             if not self._cancel_requested:
@@ -943,7 +962,7 @@ class AgentLoop:
             result = await self._runner.run(
                 initial_messages,
                 model="chat",
-                tool_gateway=self._tool_gateway,
+                tool_gateway=run_gateway,
                 on_output=self._publish_runner_output,
                 confirmation=self._request_confirmation,
                 externalize_result=self._result_externalizer_for(active_session),
@@ -1006,8 +1025,10 @@ class AgentLoop:
         blackboard: Blackboard | None = None,
         *,
         manual_invocation: ManualSkillInvocation | None = None,
+        tool_gateway: ToolGateway | None = None,
     ) -> list[dict[str, Any]]:
         route = self._configuration.resolve_route("chat").route
+        effective_gateway = self._new_run_gateway() if tool_gateway is None else tool_gateway
 
         def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             return self._context_builder.build_foreground_messages(
@@ -1023,7 +1044,7 @@ class AgentLoop:
             project_messages=project_messages,
             route_context_window=route.context_window,
             route_max_output=route.max_output,
-            tools=self.tool_schemas,
+            tools=effective_gateway.schemas,
         )
         history = active_session.messages[active_session.last_consolidated :]
         return self._context_builder.build_foreground_messages(
@@ -1040,7 +1061,11 @@ class AgentLoop:
         *,
         tool_gateway: ToolGateway | None = None,
     ) -> list[dict[str, Any]]:
-        effective_gateway = self._tool_gateway if tool_gateway is None else tool_gateway
+        effective_gateway = (
+            self._new_run_gateway(excluded_names=("schedule",))
+            if tool_gateway is None
+            else tool_gateway
+        )
         with self._context_builder.schedule_projection_scope():
             route = self._configuration.resolve_route("schedule").route
             initial_last_consolidated = active_session.last_consolidated

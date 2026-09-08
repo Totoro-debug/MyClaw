@@ -41,6 +41,7 @@ from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.templates import render_template
+from myclaw.tools.deferred import RUN_BASELINE_TOOL_NAMES
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
@@ -189,7 +190,7 @@ class _ScheduleProvider:
             timeout=timeout,
         )
         self.complete_requests.append(call)
-        route = "schedule" if len(tools) == 9 else "memory"
+        route = "schedule" if len(tools) == 8 else "memory"
         if route == "schedule":
             self._schedule_call_count += 1
             if self._block_schedule_call == self._schedule_call_count:
@@ -208,7 +209,7 @@ class _ScheduleProvider:
 
 
 def _is_schedule_call(call: ProviderCall) -> bool:
-    return len(call.tools) == 9
+    return len(call.tools) == 8
 
 
 def _response(content: str, *, tool_call: ModelToolCall | None = None) -> ModelResponse:
@@ -620,17 +621,9 @@ async def test_schedule_uses_context_builder_complete_context_projection(
     }
     assert schedule_now.isoformat(timespec="milliseconds") not in str(messages[-1]["content"])
     assert all("timestamp" not in message for message in messages)
-    assert [definition["function"]["name"] for definition in tools] == [
-        "read_file",
-        "write_file",
-        "edit_file",
-        "list_dir",
-        "glob",
-        "grep",
-        "exec",
-        "web_search",
-        "web_fetch",
-    ]
+    assert tuple(definition["function"]["name"] for definition in tools) == (
+        RUN_BASELINE_TOOL_NAMES
+    )
 
 
 @pytest.mark.asyncio
@@ -1037,19 +1030,12 @@ async def test_schedule_dispatcher_wakes_for_due_at_job_and_keeps_schedule_sessi
         )
 
         assert _is_schedule_call(provider.complete_requests[0])
-        assert [
-            definition["function"]["name"] for definition in provider.complete_requests[0].tools
-        ] == [
-            "read_file",
-            "write_file",
-            "edit_file",
-            "list_dir",
-            "glob",
-            "grep",
-            "exec",
-            "web_search",
-            "web_fetch",
-        ]
+        assert (
+            tuple(
+                definition["function"]["name"] for definition in provider.complete_requests[0].tools
+            )
+            == RUN_BASELINE_TOOL_NAMES
+        )
         assert await _schedule_state(workspace).public_snapshot() == ()
         schedule_session_paths = tuple(
             (workspace / ".myclaw" / "schedule-sessions").glob("schedule_*.jsonl")
@@ -1149,8 +1135,12 @@ async def test_foreground_and_schedule_share_runner_and_gateway_identity(
     assert len(observed) == 2
     assert observed[0][0] is observed[1][0]
     assert observed[0][1] is not observed[1][1]
-    assert "schedule" in {schema["function"]["name"] for schema in observed[0][1].schemas}
-    assert "schedule" not in {schema["function"]["name"] for schema in observed[1][1].schemas}
+    assert tuple(schema["function"]["name"] for schema in observed[0][1].schemas) == (
+        RUN_BASELINE_TOOL_NAMES
+    )
+    assert tuple(schema["function"]["name"] for schema in observed[1][1].schemas) == (
+        RUN_BASELINE_TOOL_NAMES
+    )
     assert [call[2] for call in observed] == ["chat", "schedule"]
     assert observed[0][3] is not None
     assert observed[1][3] is None

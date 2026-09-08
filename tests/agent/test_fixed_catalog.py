@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 from loguru import logger
+from mcp.types import CallToolResult
 
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
 from myclaw.agent.message_bus import MessageBus
@@ -33,7 +34,10 @@ from myclaw.provider.models import (
 from myclaw.schedule.service import ScheduleService
 from myclaw.session.session import Session
 from myclaw.templates import render_template
+from myclaw.tools.base import BaseTool
 from myclaw.tools.core.web_fetch import JinaReaderClient
+from myclaw.tools.deferred import RUN_BASELINE_TOOL_NAMES
+from myclaw.tools.mcp import MCPTool, MCPToolSpec
 from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import TaskFramingRouterAdapter, collect_foreground_outbound
@@ -129,6 +133,37 @@ class _BlockingClock:
         await self._wake.wait()
 
 
+class _SyntheticMCPSession:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+        del name, arguments
+        return CallToolResult(content=[])
+
+
+def _synthetic_mcp_tools(count: int) -> tuple[MCPTool, ...]:
+    session = _SyntheticMCPSession()
+    return tuple(
+        MCPTool(
+            MCPToolSpec(
+                server_name="synthetic",
+                remote_name=f"large_tool_{index}",
+                model_name=f"mcp_synthetic_large_tool_{index}",
+                description="Synthetic cost measurement Tool.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "string",
+                            "description": "x" * 2048,
+                        }
+                    },
+                },
+            ),
+            session,
+        )
+        for index in range(count)
+    )
+
+
 def _response(*, content: str, tool_call: ModelToolCall | None = None) -> ModelResponse:
     return ModelResponse(
         message=AssistantModelMessage(
@@ -146,6 +181,7 @@ def _agent_loop(
     provider: _FixedCatalogProvider,
     *,
     config_text: str = VALID_CONFIG,
+    mcp_tools: Sequence[BaseTool] = (),
 ) -> tuple[AgentLoop, ModelRouter, ScheduleService, MessageBus]:
     home = AgentHome(agent_home)
     home.initialize()
@@ -186,6 +222,7 @@ def _agent_loop(
         now=lambda: NOW,
         new_uuid=uuid4,
         monotonic_now=lambda: 0.0,
+        mcp_tools=mcp_tools,
     )
     return loop, router, schedule, bus
 
@@ -246,14 +283,153 @@ async def test_agent_loop_uses_fixed_catalog_for_provider_confirmation_and_persi
         "glob",
         "grep",
         "exec",
-        "web_search",
-        "web_fetch",
-        "schedule",
+        "tool_search",
     ]
     tool_messages = [message for message in loop.session.messages if message["role"] == "tool"]
     assert len(tool_messages) == 1
     assert tool_messages[0]["content"] == "outside content"
     assert tool_messages[0]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_search_exposes_matching_tools_only_on_the_next_request(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _FixedCatalogProvider(
+        (
+            _response(
+                content="",
+                tool_call=ModelToolCall(
+                    id="call_search",
+                    name="tool_search",
+                    arguments=json.dumps({"query": "web"}),
+                ),
+            ),
+            _response(content="Done."),
+        )
+    )
+    loop, router, schedule, bus = _agent_loop(agent_home, workspace, provider)
+
+    try:
+        await loop.start()
+        await collect_foreground_outbound(bus, "Find web capabilities.")
+    finally:
+        await _close_loop(loop, router, schedule)
+
+    observed = [
+        tuple(definition["function"]["name"] for definition in request.tools)
+        for request in provider.stream_requests
+    ]
+    assert observed[0] == RUN_BASELINE_TOOL_NAMES
+    assert observed[1] == (
+        *RUN_BASELINE_TOOL_NAMES[:7],
+        "web_search",
+        "web_fetch",
+        "tool_search",
+    )
+    search_results = [message for message in loop.session.messages if message["role"] == "tool"]
+    assert [message["content"] for message in search_results] == ['["web_search", "web_fetch"]']
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_keeps_activations_within_one_run_and_resets_the_next_run(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _FixedCatalogProvider(
+        (
+            _response(
+                content="",
+                tool_call=ModelToolCall(
+                    id="call_search_web",
+                    name="tool_search",
+                    arguments=json.dumps({"query": "web"}),
+                ),
+            ),
+            _response(
+                content="",
+                tool_call=ModelToolCall(
+                    id="call_search_schedule",
+                    name="tool_search",
+                    arguments=json.dumps({"query": "schedule"}),
+                ),
+            ),
+            _response(content="First run done."),
+            _response(content="Second run done."),
+        )
+    )
+    loop, router, schedule, bus = _agent_loop(agent_home, workspace, provider)
+
+    try:
+        await loop.start()
+        await collect_foreground_outbound(bus, "Find web and scheduling capabilities.")
+        await collect_foreground_outbound(bus, "Start a separate run.")
+    finally:
+        await _close_loop(loop, router, schedule)
+
+    observed = [
+        tuple(definition["function"]["name"] for definition in request.tools)
+        for request in provider.stream_requests
+    ]
+    assert observed == [
+        RUN_BASELINE_TOOL_NAMES,
+        (*RUN_BASELINE_TOOL_NAMES[:7], "web_search", "web_fetch", "tool_search"),
+        (
+            *RUN_BASELINE_TOOL_NAMES[:7],
+            "web_search",
+            "web_fetch",
+            "schedule",
+            "tool_search",
+        ),
+        RUN_BASELINE_TOOL_NAMES,
+    ]
+    search_results = [
+        message["content"]
+        for message in loop.session.messages
+        if message["role"] == "tool" and message["name"] == "tool_search"
+    ]
+    assert search_results == ['["web_search", "web_fetch"]', '["schedule"]']
+
+
+@pytest.mark.asyncio
+async def test_foreground_initial_request_has_zero_schema_cost_for_100_unused_mcp_tools(
+    tmp_path: Path,
+) -> None:
+    baseline_workspace = tmp_path / "baseline-workspace"
+    baseline_workspace.mkdir()
+    baseline_provider = _FixedCatalogProvider((_response(content="Baseline."),))
+    baseline = _agent_loop(
+        tmp_path / "baseline-home",
+        baseline_workspace,
+        baseline_provider,
+    )
+    large_workspace = tmp_path / "large-workspace"
+    large_workspace.mkdir()
+    large_provider = _FixedCatalogProvider((_response(content="Large catalog."),))
+    large = _agent_loop(
+        tmp_path / "large-home",
+        large_workspace,
+        large_provider,
+        mcp_tools=_synthetic_mcp_tools(100),
+    )
+
+    try:
+        await baseline[0].start()
+        await collect_foreground_outbound(baseline[3], "Measure the baseline.")
+        await large[0].start()
+        await collect_foreground_outbound(large[3], "Measure the large Catalog.")
+    finally:
+        await _close_loop(baseline[0], baseline[1], baseline[2])
+        await _close_loop(large[0], large[1], large[2])
+
+    baseline_tools = baseline_provider.stream_requests[0].tools
+    large_tools = large_provider.stream_requests[0].tools
+    assert tuple(schema["function"]["name"] for schema in large_tools) == (RUN_BASELINE_TOOL_NAMES)
+    assert len(large[0]._tool_gateway.catalog) == 110
+    assert len(json.dumps(large_tools, sort_keys=True).encode("utf-8")) == len(
+        json.dumps(baseline_tools, sort_keys=True).encode("utf-8")
+    )
 
 
 @pytest.mark.asyncio
@@ -383,9 +559,7 @@ async def test_agent_loop_advertises_and_persists_multiple_autonomous_skill_read
             "glob",
             "grep",
             "exec",
-            "web_search",
-            "web_fetch",
-            "schedule",
+            "tool_search",
         ]
         for request in provider.stream_requests
     )

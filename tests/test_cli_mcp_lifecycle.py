@@ -561,10 +561,12 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
 
     class FakeAgentLoop:
         mcp_tools: tuple[object, ...]
+        mcp_keywords: dict[str, tuple[str, ...]]
 
         def __init__(self, **kwargs: object) -> None:
             nonlocal old_loop, target_loop
             self.mcp_tools = tuple(cast(Sequence[object], kwargs["mcp_tools"]))
+            self.mcp_keywords = dict(cast(Any, kwargs["mcp_keywords"]))
             self.session = SimpleNamespace(session_id=kwargs["session_id"] or "old")
             self.control = SimpleNamespace(has_active_run=False)
             self.skill_metadata = ()
@@ -620,6 +622,8 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
             assert target_loop is not None
             assert old_loop.mcp_tools == (initial_tool,)
             assert target_loop.mcp_tools == ()
+            assert old_loop.mcp_keywords == {"generation-1": ("keyword",)}
+            assert target_loop.mcp_keywords == {"generation-2": ("keyword",)}
 
         async def quiesce_for_rebind(self) -> None:
             events.append("quiesce")
@@ -654,6 +658,8 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
     assert target_loop is not None
     assert old_loop.mcp_tools == (initial_tool,)
     assert target_loop.mcp_tools == ()
+    assert old_loop.mcp_keywords == {"generation-1": ("keyword",)}
+    assert target_loop.mcp_keywords == {"generation-2": ("keyword",)}
     assert keyword_snapshots == [(initial_tool,), ()]
     assert notices == [f"MCP Server '{failed_name}' unavailable during connect (TimeoutError)."]
     assert events.index("keywords_prepare_1") < events.index("old_init")

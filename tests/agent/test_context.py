@@ -795,6 +795,9 @@ async def test_context_builder_reads_live_memory_and_lane_specific_skills(
     assert "Private planner instructions." in second_foreground
     assert "planner" not in second_schedule
     assert "Private planner instructions." not in second_schedule
+    assert "Schedule Run Boundary" in second_schedule
+    assert "`schedule` Tool is unavailable" in second_schedule
+    assert "`schedule`: 仅限前台对话" in second_schedule
     assert "<skill_catalog>" not in second_foreground
     assert "<skill_always_load>" not in second_foreground
     assert "```jsonl" in second_foreground

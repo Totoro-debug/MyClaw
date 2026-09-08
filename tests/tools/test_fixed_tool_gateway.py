@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.config import MCPServerConfiguration
 from myclaw.schedule.service import ScheduleService
 from myclaw.tools.base import BaseTool
+from myclaw.tools.deferred import RUN_BASELINE_TOOL_NAMES, build_agent_run_gateway
 from myclaw.tools.mcp import MCPTool, MCPToolSpec
 from myclaw.tools.mcp_runtime import MCPRuntimeManager, allocate_mcp_tool_name
 from myclaw.tools.tool_gateway import (
@@ -65,6 +67,15 @@ def _names(gateway: ToolGateway) -> list[str]:
     return [definition["function"]["name"] for definition in gateway.schemas]
 
 
+class _MCPCallSession:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+        self.calls.append((name, arguments))
+        return CallToolResult(content=[])
+
+
 def test_fixed_catalog_order_and_detached_definitions(
     workspace: Path,
     agent_home: Path,
@@ -111,6 +122,204 @@ def test_fixed_catalog_order_and_detached_definitions(
     assert not hasattr(gateway, "register_tools")
     assert hasattr(gateway, "for_run")
     assert not any(name in vars(gateway) for name in ("workspace", "schedule_store"))
+
+
+def test_agent_run_gateway_starts_with_search_baseline_and_activates_deferred_tools(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    remote_tool = MCPTool(
+        MCPToolSpec(
+            server_name="alpha",
+            remote_name="calendar_events",
+            model_name="mcp_alpha_calendar_events",
+            description="Read calendar events.",
+            parameters={"type": "object"},
+        ),
+        _MCPCallSession(),
+    )
+    gateway = _gateway(workspace, agent_home, additional_tools=(remote_tool,))
+
+    run_gateway = build_agent_run_gateway(
+        gateway,
+        mcp_keywords={"mcp_alpha_calendar_events": ("calendar", "events")},
+    )
+
+    assert tuple(_names(run_gateway)) == RUN_BASELINE_TOOL_NAMES
+    assert "mcp_alpha_calendar_events" not in _names(run_gateway)
+    result = asyncio.run(
+        run_gateway.call(
+            ModelToolCall(
+                id="search-calendar",
+                name="tool_search",
+                arguments=json.dumps({"query": "calendar"}),
+            )
+        )
+    )
+
+    assert result.status == "success"
+    assert json.loads(result.content) == ["mcp_alpha_calendar_events"]
+    assert "mcp_alpha_calendar_events" in _names(run_gateway)
+    assert tuple(run_gateway.exposed_names) == (
+        *RUN_BASELINE_TOOL_NAMES[:7],
+        "mcp_alpha_calendar_events",
+        "tool_search",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_run_gateway_indexes_remote_mcp_name_and_keywords_not_allocated_name(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    remote_tool = MCPTool(
+        MCPToolSpec(
+            server_name="alpha",
+            remote_name="calendar_events",
+            model_name="mcp_alpha_calendar_events",
+            description="Read calendar events.",
+            parameters={"type": "object"},
+        ),
+        _MCPCallSession(),
+    )
+    run_gateway = build_agent_run_gateway(
+        _gateway(workspace, agent_home, additional_tools=(remote_tool,)),
+        mcp_keywords={"mcp_alpha_calendar_events": ("appointments",)},
+    )
+
+    allocated_name_result = await run_gateway.call(
+        ModelToolCall(
+            id="search-allocated-prefix",
+            name="tool_search",
+            arguments=json.dumps({"query": "alpha"}),
+        )
+    )
+    keyword_result = await run_gateway.call(
+        ModelToolCall(
+            id="search-keywords",
+            name="tool_search",
+            arguments=json.dumps({"query": "calendar appointments"}),
+        )
+    )
+
+    assert json.loads(allocated_name_result.content) == []
+    assert json.loads(keyword_result.content) == ["mcp_alpha_calendar_events"]
+
+
+@pytest.mark.asyncio
+async def test_agent_run_gateway_direct_unexposed_call_does_not_activate_tool(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    session = _MCPCallSession()
+    remote_tool = MCPTool(
+        MCPToolSpec(
+            server_name="alpha",
+            remote_name="calendar_events",
+            model_name="mcp_alpha_calendar_events",
+            description="Read calendar events.",
+            parameters={"type": "object"},
+        ),
+        session,
+    )
+    run_gateway = build_agent_run_gateway(
+        _gateway(workspace, agent_home, additional_tools=(remote_tool,))
+    )
+
+    result = await run_gateway.call(
+        ModelToolCall(
+            id="direct-calendar",
+            name="mcp_alpha_calendar_events",
+            arguments=json.dumps({"range": "today", "extra": [None]}),
+        )
+    )
+
+    assert result.status == "success"
+    assert session.calls == [("calendar_events", {"range": "today", "extra": [None]})]
+    assert run_gateway.exposed_names == RUN_BASELINE_TOOL_NAMES
+
+
+@pytest.mark.asyncio
+async def test_agent_run_gateways_keep_search_exposure_isolated(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    remote_tool = MCPTool(
+        MCPToolSpec(
+            server_name="alpha",
+            remote_name="calendar_events",
+            model_name="mcp_alpha_calendar_events",
+            description="Read calendar events.",
+            parameters={"type": "object"},
+        ),
+        _MCPCallSession(),
+    )
+    gateway = _gateway(workspace, agent_home, additional_tools=(remote_tool,))
+    foreground = build_agent_run_gateway(
+        gateway,
+        mcp_keywords={"mcp_alpha_calendar_events": ("calendar",)},
+    )
+    scheduled = build_agent_run_gateway(
+        gateway,
+        excluded_names=("schedule",),
+        mcp_keywords={"mcp_alpha_calendar_events": ("calendar",)},
+    )
+
+    await asyncio.gather(
+        foreground.call(
+            ModelToolCall(
+                id="search-web",
+                name="tool_search",
+                arguments=json.dumps({"query": "web"}),
+            )
+        ),
+        scheduled.call(
+            ModelToolCall(
+                id="search-calendar",
+                name="tool_search",
+                arguments=json.dumps({"query": "calendar"}),
+            )
+        ),
+    )
+
+    assert "web_search" in foreground.exposed_names
+    assert "mcp_alpha_calendar_events" not in foreground.exposed_names
+    assert "mcp_alpha_calendar_events" in scheduled.exposed_names
+    assert "web_search" not in scheduled.exposed_names
+    assert "schedule" not in {tool.name for tool in scheduled.catalog}
+
+
+def test_agent_run_gateway_schedule_lane_excludes_schedule_from_lookup_and_search(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    gateway = _gateway(workspace, agent_home)
+    run_gateway = build_agent_run_gateway(gateway, excluded_names=("schedule",))
+
+    assert "schedule" not in run_gateway.exposed_names
+    assert "schedule" not in _names(run_gateway)
+    search = asyncio.run(
+        run_gateway.call(
+            ModelToolCall(
+                id="search-schedule",
+                name="tool_search",
+                arguments=json.dumps({"query": "schedule"}),
+            )
+        )
+    )
+    direct = asyncio.run(
+        run_gateway.call(
+            ModelToolCall(
+                id="direct-schedule",
+                name="schedule",
+                arguments=json.dumps({"action": "list"}),
+            )
+        )
+    )
+
+    assert json.loads(search.content) == []
+    assert direct.status == "error"
+    assert direct.content == "The requested tool is not available."
 
 
 @pytest.mark.asyncio

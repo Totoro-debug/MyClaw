@@ -34,6 +34,7 @@ from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
 from myclaw.tools.base import BaseTool
+from myclaw.tools.deferred import RUN_BASELINE_TOOL_NAMES
 from myclaw.tools.mcp import MCPTool, MCPToolSpec
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResult
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
@@ -48,6 +49,7 @@ class _ScheduleRouter:
         self.routes: list[str] = []
         self.requests: list[tuple[list[dict[str, Any]], int]] = []
         self.tool_requests: list[tuple[str, tuple[str, ...]]] = []
+        self.tool_schema_requests: list[tuple[str, tuple[dict[str, Any], ...]]] = []
         self._outcomes = list(outcomes)
 
     def stream(
@@ -64,6 +66,7 @@ class _ScheduleRouter:
         async def replay() -> AsyncIterator[ModelStreamEvent]:
             self.routes.append(route)
             self.tool_requests.append((route, tool_names))
+            self.tool_schema_requests.append((route, tuple(tools)))
             self.requests.append((list(messages), 0))
             yield ModelCompleted(response=self._response())
 
@@ -80,6 +83,7 @@ class _ScheduleRouter:
         del continuation
         self.routes.append(route)
         self.tool_requests.append((route, tuple(schema["function"]["name"] for schema in tools)))
+        self.tool_schema_requests.append((route, tuple(tools)))
         self.requests.append((list(messages), len(tools)))
         outcome = self._outcomes.pop(0) if self._outcomes else self._response()
         if isinstance(outcome, BaseException):
@@ -159,6 +163,73 @@ class _OverlapRouter(_ScheduleRouter):
         del route, messages, tools, continuation
         self.schedule_started.set()
         await self.schedule_release.wait()
+        return self._response()
+
+
+class _SearchOverlapRouter(_ScheduleRouter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.foreground_after_search = asyncio.Event()
+        self.schedule_after_search = asyncio.Event()
+        self._foreground_calls = 0
+        self._schedule_calls = 0
+
+    def stream(
+        self,
+        route: Literal["chat", "schedule"],
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del messages, continuation
+        tool_names = tuple(schema["function"]["name"] for schema in tools)
+
+        async def replay() -> AsyncIterator[ModelStreamEvent]:
+            if not tools:
+                yield ModelCompleted(response=self._response())
+                return
+            self.routes.append(route)
+            self.tool_requests.append((route, tool_names))
+            self.tool_schema_requests.append((route, tuple(tools)))
+            self._foreground_calls += 1
+            if self._foreground_calls == 1:
+                yield ModelCompleted(
+                    response=_tool_response(
+                        call_id="foreground-search-web",
+                        name="tool_search",
+                        arguments={"query": "web"},
+                    )
+                )
+                return
+            self.foreground_after_search.set()
+            await self.schedule_after_search.wait()
+            yield ModelCompleted(response=self._response())
+
+        return replay()
+
+    async def complete(
+        self,
+        route: Literal["chat", "schedule"],
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None = None,
+    ) -> ModelResponse:
+        del messages, continuation
+        if not tools:
+            return self._response()
+        self.routes.append(route)
+        self.tool_requests.append((route, tuple(schema["function"]["name"] for schema in tools)))
+        self.tool_schema_requests.append((route, tuple(tools)))
+        self._schedule_calls += 1
+        if self._schedule_calls == 1:
+            return _tool_response(
+                call_id="schedule-search-calendar",
+                name="tool_search",
+                arguments={"query": "calendar"},
+            )
+        self.schedule_after_search.set()
         return self._response()
 
 
@@ -328,10 +399,11 @@ async def _foreground_context(
     blackboard: Blackboard | None = None,
     *,
     manual_invocation: ManualSkillInvocation | None = None,
+    tool_gateway: ToolGateway | None = None,
 ) -> list[dict[str, Any]]:
     assert blackboard is None
     assert manual_invocation is None
-    del session, current_user
+    del session, current_user, tool_gateway
     return [{"role": "system", "content": "foreground system"}]
 
 
@@ -382,7 +454,7 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
     ]
     assert schedule_session.messages[-1]["content"] == "scheduled result"
     assert router.routes == ["schedule"]
-    assert router.requests[0][1] == 9
+    assert router.requests[0][1] == len(RUN_BASELINE_TOOL_NAMES)
     assert framing_router.framing_requests == []
 
 
@@ -414,7 +486,7 @@ async def test_schedule_run_excludes_schedule_tool_from_catalog_and_schema(
 
     await loop.run_schedule_job(_job())
 
-    assert router.requests[0][1] == 9
+    assert router.requests[0][1] == len(RUN_BASELINE_TOOL_NAMES)
     schedule_session = Session.load(
         state,
         f"schedule_{JOB_ID}",
@@ -426,6 +498,89 @@ async def test_schedule_run_excludes_schedule_tool_from_catalog_and_schema(
     assert tool_message["status"] == "error"
     assert tool_message["content"] == "The requested tool is not available."
     assert await service.public_snapshot() == ()
+
+
+@pytest.mark.asyncio
+async def test_schedule_run_search_activates_deferred_tools_for_the_next_request(
+    tmp_path: Path,
+) -> None:
+    router = _ScheduleRouter(
+        _tool_response(
+            call_id="call_search",
+            name="tool_search",
+            arguments={"query": "web"},
+        ),
+        _ScheduleRouter._response(),
+    )
+    loop, _state, _service, _bus = _loop(tmp_path, router)
+
+    await loop.run_schedule_job(_job())
+
+    assert router.tool_requests == [
+        ("schedule", RUN_BASELINE_TOOL_NAMES),
+        (
+            "schedule",
+            (*RUN_BASELINE_TOOL_NAMES[:7], "web_search", "web_fetch", "tool_search"),
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_schedule_initial_request_has_zero_schema_cost_for_100_unused_mcp_tools(
+    tmp_path: Path,
+) -> None:
+    class SyntheticMCPSession:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+            del name, arguments
+            return CallToolResult(content=[])
+
+    session = SyntheticMCPSession()
+    mcp_tools = tuple(
+        MCPTool(
+            MCPToolSpec(
+                server_name="synthetic",
+                remote_name=f"large_tool_{index}",
+                model_name=f"mcp_synthetic_large_tool_{index}",
+                description="Synthetic cost measurement Tool.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "string",
+                            "description": "x" * 2048,
+                        }
+                    },
+                },
+            ),
+            session,
+        )
+        for index in range(100)
+    )
+    baseline_router = _ScheduleRouter()
+    baseline_loop, _state, _service, _bus = _loop(
+        tmp_path / "baseline",
+        baseline_router,
+    )
+    large_router = _ScheduleRouter()
+    large_loop, _state, _service, _bus = _loop(
+        tmp_path / "large",
+        large_router,
+        mcp_tools=mcp_tools,
+    )
+
+    await baseline_loop.run_schedule_job(_job())
+    await large_loop.run_schedule_job(_job())
+
+    baseline_tools = baseline_router.tool_schema_requests[0][1]
+    large_tools = large_router.tool_schema_requests[0][1]
+    assert tuple(schema["function"]["name"] for schema in large_tools) == (RUN_BASELINE_TOOL_NAMES)
+    assert "schedule" not in {
+        tool.name for tool in large_loop._new_run_gateway(excluded_names=("schedule",)).catalog
+    }
+    assert len(large_loop._tool_gateway.catalog) == 110
+    assert len(json.dumps(large_tools, sort_keys=True).encode("utf-8")) == len(
+        json.dumps(baseline_tools, sort_keys=True).encode("utf-8")
+    )
 
 
 @pytest.mark.asyncio
@@ -468,22 +623,17 @@ async def test_user_schedule_run_keeps_and_executes_generation_mcp_tool(
     finally:
         await loop.close()
 
-    generation_requests = [
-        (route, tool_names)
-        for route, tool_names in router.tool_requests
-        if "mcp_alpha_schedule_meeting" in tool_names
+    schedule_requests = [
+        (route, tool_names) for route, tool_names in router.tool_requests if route == "schedule"
     ]
-    assert [route for route, _tool_names in generation_requests] == [
-        "chat",
+    assert [route for route, _tool_names in schedule_requests] == [
         "schedule",
         "schedule",
     ]
-    foreground_names = generation_requests[0][1]
-    schedule_names = generation_requests[1][1]
-    assert foreground_names == (*schedule_names[:9], "schedule", *schedule_names[9:])
-    assert all(tool_names == schedule_names for _route, tool_names in generation_requests[1:])
-    assert "schedule" not in schedule_names
-    assert schedule_names.count("mcp_alpha_schedule_meeting") == 1
+    assert all(tool_names == RUN_BASELINE_TOOL_NAMES for _route, tool_names in schedule_requests)
+    assert all(
+        "mcp_alpha_schedule_meeting" not in tool_names for _route, tool_names in schedule_requests
+    )
     assert mcp_session.calls == [
         ("schedule_meeting", {"title": "review", "timezone": "Asia/Shanghai"})
     ]
@@ -838,7 +988,10 @@ async def test_schedule_agent_reads_known_skill_path_via_shared_gateway(tmp_path
     assert tool_messages[0]["content"] == "---\nname: review\n---\nbody\n"
     assert confirmation_requests == []
     assert router.routes == ["schedule", "schedule"]
-    assert [tool_count for _, tool_count in router.requests] == [9, 9]
+    assert [tool_count for _, tool_count in router.requests] == [
+        len(RUN_BASELINE_TOOL_NAMES),
+        len(RUN_BASELINE_TOOL_NAMES),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1009,3 +1162,51 @@ async def test_schedule_run_uses_isolated_catalog_during_concurrent_foreground_r
     assert all(
         message["content"] == "The requested tool is not available." for message in scheduled_tools
     )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_foreground_and_schedule_searches_keep_exposure_isolated(
+    tmp_path: Path,
+) -> None:
+    class RecordingMCPSession:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+            del name, arguments
+            return CallToolResult(content=[])
+
+    mcp_tool = MCPTool(
+        MCPToolSpec(
+            server_name="alpha",
+            remote_name="calendar_events",
+            model_name="mcp_alpha_calendar_events",
+            description="Read calendar events.",
+            parameters={"type": "object"},
+        ),
+        RecordingMCPSession(),
+    )
+    router = _SearchOverlapRouter()
+    loop, _state, _service, bus = _loop(tmp_path, router, mcp_tools=(mcp_tool,))
+
+    await loop.start()
+    foreground = asyncio.create_task(
+        collect_foreground_outbound(bus, "Search for web capabilities.")
+    )
+    try:
+        await router.foreground_after_search.wait()
+        scheduled = asyncio.create_task(loop.run_schedule_job(_job()))
+        await asyncio.gather(foreground, scheduled)
+    finally:
+        await loop.close()
+
+    foreground_requests = [names for route, names in router.tool_requests if route == "chat"]
+    schedule_requests = [names for route, names in router.tool_requests if route == "schedule"]
+    assert foreground_requests == [
+        RUN_BASELINE_TOOL_NAMES,
+        (*RUN_BASELINE_TOOL_NAMES[:7], "web_search", "web_fetch", "tool_search"),
+    ]
+    assert schedule_requests == [
+        RUN_BASELINE_TOOL_NAMES,
+        (*RUN_BASELINE_TOOL_NAMES[:7], "mcp_alpha_calendar_events", "tool_search"),
+    ]
+    assert "mcp_alpha_calendar_events" not in foreground_requests[-1]
+    assert "web_search" not in schedule_requests[-1]
+    assert "schedule" not in schedule_requests[-1]

@@ -96,7 +96,7 @@ CLI 负责组装运行时和管理组件生命周期。前台输入经终端与 
 | Agent Loop | 绑定一个会话，串行处理前台输入，管理上下文、任务目标和会话持久化 |
 | Agent Runner | 执行有迭代上限的模型与工具循环，供前台、定时任务和 Dream 复用 |
 | Model Router | 按用途选择模型，适配 OpenAI 兼容协议与 Anthropic，处理重试和回退 |
-| Tool Gateway / MCP | 统一内置与 MCP 工具的调用入口；MCP 连接由 CLI 管理，每个 Agent Loop 使用固定工具快照 |
+| Tool Gateway / MCP | 统一内置与 MCP 工具的调用入口；MCP 连接由 CLI 管理，每个 Agent Loop 使用固定工具快照，单次 Agent Run 通过 `tool_search` 按需暴露延迟 Tool schema |
 | Memory / Dream | 管理短期记忆、会话摘要和长期记忆；Dream 使用独立 Runner 与受限工具整理长期记忆 |
 | Schedule Service | 持久化并调度任务；用户任务调用当前 Agent Loop，记忆整理任务直接调用 Dream |
 | Skill Loader / Context Builder | 加载 Skill 快照，按需提供指令，统一构建 Agent Loop 的模型请求上下文 |

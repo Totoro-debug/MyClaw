@@ -52,7 +52,7 @@ from myclaw.skills.catalog import (
     SkillMetadata,
 )
 from myclaw.tools.base import BaseTool
-from myclaw.tools.tool_gateway import ModelToolCall
+from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.agent.test_context import _FrozenDateTime
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import (
@@ -326,6 +326,7 @@ def test_agent_loop_constructor_is_the_generation_composition_boundary() -> None
         "new_uuid",
         "monotonic_now",
         "mcp_tools",
+        "mcp_keywords",
     )
     assert tuple(inspect.signature(AgentLoop.close).parameters) == ("self",)
 
@@ -514,7 +515,10 @@ def _runtime(
         current_user: dict[str, Any],
         blackboard: Blackboard | None = None,
         manual_invocation: ManualSkillInvocation | None = None,
+        *,
+        tool_gateway: ToolGateway | None = None,
     ) -> list[dict[str, Any]]:
+        del tool_gateway
         if selected_context_preparer_with_invocation is not None:
             return await selected_context_preparer_with_invocation(
                 active_session,
@@ -620,7 +624,7 @@ async def test_agent_loop_status_projection_starts_uptime_only_after_activation(
     await loop.close()
 
 
-def test_agent_loop_preflight_reserves_the_complete_tool_catalog_without_skills(
+def test_agent_loop_preflight_uses_the_deferred_baseline_without_unused_tool_schemas(
     tmp_path: Path,
 ) -> None:
     config = MINIMAL_VALID_CONFIG.replace(
@@ -633,12 +637,19 @@ def test_agent_loop_preflight_reserves_the_complete_tool_catalog_without_skills(
         mcp_tools=(_LargeSchemaTool(),),
     )
 
-    with pytest.raises(ModelContextOverflowError) as raised:
-        loop.preflight()
+    loop.preflight()
 
-    assert raised.value.error.code == "model_context_overflow"
-    assert raised.value.error.message == MODEL_CONTEXT_OVERFLOW_MESSAGE
-    assert loop.runtime_status_input().tool_definitions
+    assert tuple(schema["function"]["name"] for schema in loop.tool_schemas) == (
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "glob",
+        "grep",
+        "exec",
+        "tool_search",
+    )
+    assert "large_schema" not in loop.runtime_status_input().tool_definitions
 
 
 @pytest.mark.asyncio
@@ -1108,10 +1119,8 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
     expected_tools = loop.tool_schemas
     assert len(expected_tools) > 1
     original_build_status = builder.build_status_messages
-    original_schema = mcp_tool.to_schema
     public_projections: list[list[dict[str, Any]]] = []
     estimated_inputs: list[RuntimeStatusInput] = []
-    schema_prompts: list[str] = []
     chat_route = loop._configuration.resolve_route("chat").route
     available_input = chat_route.context_window - chat_route.max_output
 
@@ -1125,11 +1134,6 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
         public_projections.append(projected)
         return projected
 
-    def observe_schema() -> dict[str, Any]:
-        projected = original_build_status((), session_id=session.session_id)
-        schema_prompts.append(projected[0]["content"])
-        return original_schema()
-
     def observe_estimate(status_input: RuntimeStatusInput) -> int:
         estimated_inputs.append(status_input)
         projected = original_build_status((), session_id=session.session_id)
@@ -1140,7 +1144,6 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
 
     with monkeypatch.context() as patch:
         patch.setattr(builder, "build_status_messages", observe_public_status)
-        patch.setattr(mcp_tool, "to_schema", observe_schema)
         patch.setattr(loop_module, "estimate_input_tokens", observe_estimate)
         with builder.foreground_projection_scope(active_skills):
             validate = loop.preflight if operation == "preflight" else loop.reload_skill
@@ -1158,9 +1161,7 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
             assert '"name":"active"' in restored[0]["content"]
             assert '"name":"candidate"' not in restored[0]["content"]
 
-    assert len(public_projections) == len(estimated_inputs) == len(schema_prompts) == 1
-    assert '"name":"active"' in schema_prompts[0]
-    assert '"name":"candidate"' not in schema_prompts[0]
+    assert len(public_projections) == len(estimated_inputs) == 1
     budget_input = estimated_inputs[0]
     assert '"name":"active"' not in budget_input.system_prompt
     assert ('"name":"candidate"' in budget_input.system_prompt) is not empty_candidate
@@ -1170,6 +1171,7 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
         *(json.loads(message) for message in budget_input.retained_messages),
     ] == public_projections[0]
     assert tuple(json.loads(schema) for schema in budget_input.tool_definitions) == expected_tools
+    assert all("large_schema" not in schema for schema in budget_input.tool_definitions)
     assert estimate_input_tokens(budget_input) > estimate_input_tokens(
         replace(budget_input, tool_definitions=())
     )

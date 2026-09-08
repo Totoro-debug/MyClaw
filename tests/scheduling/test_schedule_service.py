@@ -32,6 +32,7 @@ from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
 from myclaw.session.session import Session, SessionStoragePartition
+from myclaw.tools.deferred import RUN_BASELINE_TOOL_NAMES
 from myclaw.utils import scheduler as scheduler_module
 from myclaw.utils.scheduler import AsyncioSchedulerClock
 from tests.configuration.test_config import VALID_CONFIG
@@ -1434,7 +1435,7 @@ async def test_agent_loop_executes_at_job_with_schedule_route_and_partition(
     await router.close()
 
     request = provider.complete_requests[0]
-    assert len(request.tools) == 9
+    assert len(request.tools) == len(RUN_BASELINE_TOOL_NAMES)
     assert await schedule.public_snapshot() == ()
     session = Session.load(
         state,
@@ -1475,7 +1476,7 @@ async def test_agent_loop_runs_foreground_while_every_job_is_active(
 
         assert messages[-1].metadata == {"_streamed": True}
         assert schedule.status_snapshot().active_job_count == 1
-        assert len(provider.complete_requests[0].tools) == 9
+        assert len(provider.complete_requests[0].tools) == len(RUN_BASELINE_TOOL_NAMES)
         assert provider.stream_requests
     finally:
         provider.release_schedule.set()
