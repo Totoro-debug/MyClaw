@@ -1,13 +1,13 @@
 import asyncio
+import inspect
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-import myclaw.tools.mcp_keywords as mcp_keywords
+import myclaw.config.config as config_module
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, MCPServerConfiguration
 from myclaw.provider.models import (
@@ -15,8 +15,17 @@ from myclaw.provider.models import (
     ModelResponse,
     ModelUsage,
 )
-from myclaw.tools.mcp import MCPTool
-from myclaw.tools.mcp_keywords import MCPKeywordPreparer, fill_mcp_tool_keywords
+from myclaw.tools.mcp import MCPTool, MCPToolSpec
+from myclaw.tools.mcp_keywords import MCPKeywordPreparer
+
+
+class _UnusedMCPSession:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+        del name, arguments
+        raise AssertionError("Keyword preparation must not call the MCP session")
+
+
+_UNUSED_MCP_SESSION = _UnusedMCPSession()
 
 
 def _tool(
@@ -27,15 +36,17 @@ def _tool(
     description: str = "Search GitHub issues.",
     parameters: dict[str, Any] | None = None,
 ) -> MCPTool:
-    return cast(
-        MCPTool,
-        SimpleNamespace(
+    return MCPTool(
+        MCPToolSpec(
             server_name=server_name,
             remote_name=remote_name,
-            name=model_name,
+            model_name=model_name,
             description=description,
-            parameters=parameters or {"type": "object", "properties": {}},
+            parameters=(
+                parameters if parameters is not None else {"type": "object", "properties": {}}
+            ),
         ),
+        _UNUSED_MCP_SESSION,
     )
 
 
@@ -77,12 +88,28 @@ def _server(
     )
 
 
+def _config_loader(tmp_path: Path) -> ConfigLoader:
+    return ConfigLoader(AgentHome(tmp_path))
+
+
+def test_preparer_interface_contains_only_production_inputs() -> None:
+    constructor = inspect.signature(MCPKeywordPreparer.__init__).parameters
+    prepare = inspect.signature(MCPKeywordPreparer.prepare).parameters
+
+    assert tuple(constructor) == ("self", "model_router", "config_loader")
+    assert all(
+        parameter.default is inspect.Parameter.empty
+        for parameter in tuple(constructor.values())[1:]
+    )
+    assert tuple(prepare) == ("self", "tools", "servers")
+
+
 @pytest.mark.asyncio
 async def test_preparer_prefers_trimmed_configured_keywords_without_model_call(
     tmp_path: Path,
 ) -> None:
     router = FakeRouter([json.dumps(["should-not-be-used"])])
-    preparer = MCPKeywordPreparer(router, tmp_path / "config.toml")
+    preparer = MCPKeywordPreparer(router, _config_loader(tmp_path))
 
     result = await preparer.prepare(
         (_tool(),),
@@ -109,7 +136,7 @@ command = "server"
 """,
         encoding="utf-8",
     )
-    preparer = MCPKeywordPreparer(router, config_path)
+    preparer = MCPKeywordPreparer(router, _config_loader(tmp_path))
 
     result = await preparer.prepare((tool,), {"github": _server()})
 
@@ -146,13 +173,13 @@ command = "server"
     )
     first_router = FakeRouter(['["issues", "search"]'])
 
-    first = await MCPKeywordPreparer(first_router, config_path).prepare(
+    first = await MCPKeywordPreparer(first_router, _config_loader(tmp_path)).prepare(
         (tool,), {"github": _server()}
     )
     saved_configuration = ConfigLoader(AgentHome(tmp_path)).load()
     second_router = FakeRouter(['["must-not-run"]'])
-    second = await MCPKeywordPreparer(second_router, config_path).prepare(
-        (tool,), saved_configuration
+    second = await MCPKeywordPreparer(second_router, _config_loader(tmp_path)).prepare(
+        (tool,), saved_configuration.mcp
     )
 
     assert first == second == {"mcp_github_search_issues": ("issues", "search")}
@@ -198,7 +225,7 @@ search_issues = ["user", "configured"]
             return response
 
     router = UserEditingRouter(['["generated"]'])
-    preparer = MCPKeywordPreparer(router, config_path)
+    preparer = MCPKeywordPreparer(router, _config_loader(tmp_path))
 
     first = await preparer.prepare((_tool(),), {"github": _server()})
     second = await preparer.prepare((_tool(),), {"github": _server()})
@@ -225,7 +252,7 @@ command = "server"
 """,
         encoding="utf-8",
     )
-    preparer = MCPKeywordPreparer(router, config_path)
+    preparer = MCPKeywordPreparer(router, _config_loader(tmp_path))
 
     first = await preparer.prepare((tool,), {"github": _server()})
     second = await preparer.prepare((tool,), {"github": _server()})
@@ -249,9 +276,10 @@ command = "server"
 )
 async def test_preparer_uses_only_the_remote_name_for_invalid_generated_output(
     content: str,
+    tmp_path: Path,
 ) -> None:
     router = FakeRouter([content])
-    preparer = MCPKeywordPreparer(router)
+    preparer = MCPKeywordPreparer(router, _config_loader(tmp_path))
 
     result = await preparer.prepare((_tool(),), {"github": _server()})
 
@@ -259,9 +287,11 @@ async def test_preparer_uses_only_the_remote_name_for_invalid_generated_output(
 
 
 @pytest.mark.asyncio
-async def test_preparer_retries_after_fingerprint_change_within_one_process() -> None:
+async def test_preparer_retries_after_fingerprint_change_within_one_process(
+    tmp_path: Path,
+) -> None:
     router = FakeRouter(['["issues"]', '["pulls"]'])
-    preparer = MCPKeywordPreparer(router)
+    preparer = MCPKeywordPreparer(router, _config_loader(tmp_path))
 
     first = await preparer.prepare(
         (_tool(description="Search GitHub issues."),),
@@ -278,9 +308,9 @@ async def test_preparer_retries_after_fingerprint_change_within_one_process() ->
 
 
 @pytest.mark.asyncio
-async def test_preparer_isolates_same_remote_name_between_servers() -> None:
+async def test_preparer_isolates_same_remote_name_between_servers(tmp_path: Path) -> None:
     router = FakeRouter(['["github"]', '["gitlab"]'])
-    preparer = MCPKeywordPreparer(router)
+    preparer = MCPKeywordPreparer(router, _config_loader(tmp_path))
     tools = (
         _tool(),
         _tool(server_name="gitlab", model_name="mcp_gitlab_search_issues"),
@@ -313,7 +343,7 @@ async def test_preparer_isolates_same_remote_name_between_servers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preparer_keeps_other_results_when_one_generation_fails() -> None:
+async def test_preparer_keeps_other_results_when_one_generation_fails(tmp_path: Path) -> None:
     class PartiallyFailingRouter(FakeRouter):
         async def complete(
             self,
@@ -334,7 +364,7 @@ async def test_preparer_keeps_other_results_when_one_generation_fails() -> None:
             return _response('["working"]')
 
     router = PartiallyFailingRouter([])
-    result = await MCPKeywordPreparer(router).prepare(
+    result = await MCPKeywordPreparer(router, _config_loader(tmp_path)).prepare(
         (
             _tool(remote_name="broken", model_name="mcp_github_broken"),
             _tool(remote_name="working", model_name="mcp_github_working"),
@@ -350,7 +380,9 @@ async def test_preparer_keeps_other_results_when_one_generation_fails() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preparer_propagates_cancellation_and_drains_sibling_tasks() -> None:
+async def test_preparer_propagates_cancellation_and_drains_sibling_tasks(
+    tmp_path: Path,
+) -> None:
     started = asyncio.Event()
     active = 0
 
@@ -371,7 +403,7 @@ async def test_preparer_propagates_cancellation_and_drains_sibling_tasks() -> No
             finally:
                 active -= 1
 
-    preparer = MCPKeywordPreparer(BlockingRouter([]))
+    preparer = MCPKeywordPreparer(BlockingRouter([]), _config_loader(tmp_path))
     task = asyncio.create_task(
         preparer.prepare(
             (
@@ -426,14 +458,18 @@ command = "server"
 
         monkeypatch.setattr(Path, "read_text", fail_config_read)
     elif failure_stage == "parse":
-        monkeypatch.setattr(cast(Any, mcp_keywords).tomlkit, "parse", fail)
+        monkeypatch.setattr(cast(Any, config_module).tomlkit, "parse", fail)
     elif failure_stage == "validation":
-        monkeypatch.setattr(cast(Any, mcp_keywords), "_parse_configuration", fail)
+        monkeypatch.setattr(cast(Any, config_module), "_parse_configuration", fail)
     elif failure_stage == "serialization":
-        monkeypatch.setattr(cast(Any, mcp_keywords).tomlkit, "dumps", fail)
+        monkeypatch.setattr(cast(Any, config_module).tomlkit, "dumps", fail)
     else:
-        monkeypatch.setattr(cast(Any, mcp_keywords).HOST_FILESYSTEM, "atomic_replace_text", fail)
-    result = await MCPKeywordPreparer(router, config_path).prepare(
+        monkeypatch.setattr(
+            cast(Any, config_module).HOST_FILESYSTEM,
+            "atomic_replace_text",
+            fail,
+        )
+    result = await MCPKeywordPreparer(router, _config_loader(tmp_path)).prepare(
         (_tool(),), {"github": _server()}
     )
 
@@ -472,49 +508,10 @@ async def test_preparer_limits_generation_concurrency_to_four(tmp_path: Path) ->
         return response
 
     router.complete = tracked_complete  # type: ignore[method-assign]
-    preparer = MCPKeywordPreparer(router, tmp_path / "missing.toml")
+    preparer = MCPKeywordPreparer(router, _config_loader(tmp_path / "missing"))
 
     result = await preparer.prepare(tools, {"github": _server()})
 
     assert peak <= 4
+    assert len(router.calls) == len(tools)
     assert len(result) == 9
-
-
-def test_fill_mcp_tool_keywords_preserves_unrelated_configuration_and_comments(
-    tmp_path: Path,
-) -> None:
-    config_path = tmp_path / "config.toml"
-    original = """# Keep this comment.
-[runtime]
-max_tool_result_chars = 4096
-
-[mcp.servers.github]
-enabled = true
-transport = "stdio"
-command = "server"
-# Keep this server comment.
-[mcp.servers.github.tool_keywords]
-existing = ["configured"]
-search_issues = []
-
-"""
-    config_path.write_text(original, encoding="utf-8")
-
-    effective = fill_mcp_tool_keywords(
-        config_path,
-        {
-            ("github", "existing"): ("generated",),
-            ("github", "search_issues"): ("issues", "search"),
-            ("removed", "missing"): ("must-not-recreate",),
-        },
-    )
-
-    saved = config_path.read_text(encoding="utf-8")
-    assert effective == {
-        ("github", "existing"): ("configured",),
-        ("github", "search_issues"): ("issues", "search"),
-    }
-    assert "# Keep this comment." in saved
-    assert "# Keep this server comment." in saved
-    assert 'existing = ["configured"]' in saved
-    assert "must-not-recreate" not in saved

@@ -5,8 +5,9 @@ from typing import Any, cast
 import pytest
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ConfigError, ConfigLoader
+from myclaw.config.config import ConfigError, ConfigLoader, MCPServerConfiguration
 from myclaw.management.commands import ManagementCommandDispatcher
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.management.factories import management_service
 
@@ -82,6 +83,59 @@ search_issues = [" issue ", "", "issue", "github"]
     with pytest.raises(TypeError):
         cast(Any, server.tool_keywords)["other"] = ("keyword",)
 
+    direct = MCPServerConfiguration(
+        mcp_name="direct",
+        enabled=True,
+        transport="stdio",
+        command="server",
+        tool_keywords={"search_issues": (" issue ", "", "issue", "github")},
+    )
+    assert direct.tool_keywords == {"search_issues": ("issue", "github")}
+
+
+@pytest.mark.parametrize(
+    ("keyword_literal", "unsafe_value"),
+    [
+        ('"搜索"', "搜索"),
+        ('"123"', "123"),
+        (r'"search\u0001"', "search\x01"),
+    ],
+    ids=("non-ascii", "digits-only", "control-character"),
+)
+def test_non_english_mcp_tool_keywords_are_isolated_with_one_safe_diagnostic(
+    agent_home: Path,
+    keyword_literal: str,
+    unsafe_value: str,
+) -> None:
+    loader = _loader_with_mcp(
+        agent_home,
+        f"""
+[mcp.servers.invalid]
+enabled = true
+transport = "stdio"
+command = "server"
+[mcp.servers.invalid.tool_keywords]
+search = [{keyword_literal}]
+
+[mcp.servers.valid]
+enabled = true
+transport = "stdio"
+command = "server"
+[mcp.servers.valid.tool_keywords]
+search = [" issues ", "issues", "github"]
+""",
+    )
+
+    configuration = loader.load()
+
+    assert set(configuration.mcp) == {"valid"}
+    assert configuration.mcp["valid"].tool_keywords == {"search": ("issues", "github")}
+    assert len(loader.diagnostics) == 1
+    diagnostic = loader.diagnostics[0]
+    assert diagnostic.mcp_name == "invalid"
+    assert "tool_keywords.search" in diagnostic.message
+    assert unsafe_value not in diagnostic.message
+
 
 @pytest.mark.parametrize(
     "invalid_keywords",
@@ -116,6 +170,127 @@ command = "server"
     assert set(configuration.mcp) == {"valid"}
     assert len(loader.diagnostics) == 1
     assert "tool_keywords" in loader.diagnostics[0].message
+
+
+def test_fill_mcp_tool_keywords_preserves_latest_content_and_replaces_once(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    original = """# Keep this comment.
+[runtime]
+max_tool_result_chars = 4096
+
+[mcp.servers.github]
+enabled = true
+transport = "stdio"
+command = "server"
+# Keep this server comment.
+[mcp.servers.github.tool_keywords]
+existing = ["configured"]
+search_issues = []
+
+"""
+    loader.path.write_text(original, encoding="utf-8")
+    replacement_calls: list[tuple[Path, str]] = []
+    original_replace = HOST_FILESYSTEM.atomic_replace_text
+
+    def record_replacement(target: Path, content: str) -> None:
+        replacement_calls.append((target, content))
+        original_replace(target, content)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_text", record_replacement)
+
+    effective = loader.fill_mcp_tool_keywords(
+        {
+            ("github", "existing"): ("generated",),
+            ("github", "search_issues"): (" issues ", "", "issues", "search"),
+            ("removed", "missing"): ("must-not-recreate",),
+        }
+    )
+
+    saved = loader.path.read_text(encoding="utf-8")
+    assert effective == {
+        ("github", "existing"): ("configured",),
+        ("github", "search_issues"): ("issues", "search"),
+    }
+    assert replacement_calls == [(loader.path, saved)]
+    assert "# Keep this comment." in saved
+    assert "# Keep this server comment." in saved
+    assert 'existing = ["configured"]' in saved
+    assert "must-not-recreate" not in saved
+    with pytest.raises(TypeError):
+        cast(Any, effective)[("github", "other")] = ("keyword",)
+
+
+def test_fill_mcp_tool_keywords_does_not_replace_when_values_are_already_set(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader_with_mcp(
+        agent_home,
+        """
+[mcp.servers.github]
+enabled = true
+transport = "stdio"
+command = "server"
+[mcp.servers.github.tool_keywords]
+search_issues = [" configured ", "configured"]
+""",
+    )
+    original = loader.path.read_text(encoding="utf-8")
+    replacement_calls: list[object] = []
+    monkeypatch.setattr(
+        HOST_FILESYSTEM,
+        "atomic_replace_text",
+        lambda *_args, **_kwargs: replacement_calls.append(None),
+    )
+
+    effective = loader.fill_mcp_tool_keywords(
+        {
+            ("github", "search_issues"): ("generated",),
+            ("removed", "missing"): ("must-not-recreate",),
+        }
+    )
+
+    assert effective == {("github", "search_issues"): ("configured",)}
+    assert loader.path.read_text(encoding="utf-8") == original
+    assert replacement_calls == []
+
+
+def test_fill_mcp_tool_keywords_validates_candidate_before_replacement(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    invalid_content = (
+        MINIMAL_VALID_CONFIG.replace(
+            "max_output = 1024",
+            "max_output = 8192",
+        )
+        + """
+[mcp.servers.github]
+enabled = true
+transport = "stdio"
+command = "server"
+"""
+    )
+    loader.path.write_text(invalid_content, encoding="utf-8")
+    replacement_calls: list[object] = []
+    monkeypatch.setattr(
+        HOST_FILESYSTEM,
+        "atomic_replace_text",
+        lambda *_args, **_kwargs: replacement_calls.append(None),
+    )
+
+    with pytest.raises(ConfigError) as raised:
+        loader.fill_mcp_tool_keywords({("github", "search_issues"): ("issues",)})
+
+    assert raised.value.error.code == "config_invalid"
+    assert loader.path.read_text(encoding="utf-8") == invalid_content
+    assert replacement_calls == []
 
 
 def test_valid_streamable_http_server_preserves_headers_and_disabled_state(

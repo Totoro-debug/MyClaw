@@ -205,6 +205,7 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
 
     home = AgentHome(tmp_path / "agent-home")
     configuration: Any = SimpleNamespace(
+        mcp={},
         memory=SimpleNamespace(schedule="0 * * * *", batch_size=10),
         runtime=SimpleNamespace(max_iterations=50),
     )
@@ -351,6 +352,7 @@ async def test_cli_async_root_cleans_partial_startup_without_registering_dream_j
 
     home = AgentHome(tmp_path / "agent-home")
     configuration: Any = SimpleNamespace(
+        mcp={},
         memory=SimpleNamespace(schedule="0 * * * *", batch_size=10),
         runtime=SimpleNamespace(max_iterations=50),
     )
@@ -1109,6 +1111,7 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
 
     home = AgentHome(tmp_path / "agent-home")
     configuration: Any = SimpleNamespace(
+        mcp={},
         memory=SimpleNamespace(schedule="0 * * * *", batch_size=10),
         runtime=SimpleNamespace(max_iterations=50),
     )
@@ -1432,6 +1435,7 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
 
     home = AgentHome(tmp_path / "agent-home")
     configuration: Any = SimpleNamespace(
+        mcp={},
         memory=SimpleNamespace(schedule="0 * * * *", batch_size=10),
         runtime=SimpleNamespace(max_iterations=50),
     )
@@ -1645,6 +1649,7 @@ async def test_cli_same_session_resume_waits_for_pending_persist_before_target_l
 
     home = AgentHome(tmp_path / "agent-home")
     configuration: Any = SimpleNamespace(
+        mcp={},
         memory=SimpleNamespace(schedule="0 * * * *", batch_size=10),
         runtime=SimpleNamespace(max_iterations=50),
     )
@@ -1843,6 +1848,7 @@ async def test_cli_resume_destructive_failure_fails_closed_and_aborts_each_loop_
 
     home = AgentHome(tmp_path / "agent-home")
     configuration: Any = SimpleNamespace(
+        mcp={},
         memory=SimpleNamespace(schedule="0 * * * *", batch_size=10),
         runtime=SimpleNamespace(max_iterations=50),
     )

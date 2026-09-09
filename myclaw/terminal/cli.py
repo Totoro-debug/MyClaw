@@ -200,7 +200,7 @@ async def _run_cli_conversation(
             workspace_path,
             built_in_names=BUILT_IN_TOOL_NAMES,
         )
-        startup_report = await mcp_manager.start(getattr(configuration, "mcp", {}))
+        startup_report = await mcp_manager.start(configuration.mcp)
         active_mcp_snapshot = startup_report.snapshot
         _report_mcp_generation(startup_report)
 
@@ -211,11 +211,11 @@ async def _run_cli_conversation(
         )
         mcp_keyword_preparer = MCPKeywordPreparer(
             model_router=router,
-            config_path=agent_home.path / "config.toml",
+            config_loader=ConfigLoader(agent_home),
         )
         active_mcp_keywords = await mcp_keyword_preparer.prepare(
             active_mcp_snapshot,
-            getattr(configuration, "mcp", {}),
+            configuration.mcp,
         )
         memory_manager = MemoryManager(workspace_state)
         dream = Dream(
@@ -318,7 +318,7 @@ async def _run_cli_conversation(
                         raise RuntimeError("MCP Keyword Preparer is unavailable")
                     candidate_keywords = await mcp_keyword_preparer.prepare(
                         candidate_report.snapshot,
-                        getattr(configuration, "mcp", {}),
+                        configuration.mcp,
                     )
                 except asyncio.CancelledError:
                     raise

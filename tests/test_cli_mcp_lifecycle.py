@@ -16,7 +16,7 @@ import myclaw.tools.mcp as mcp_adapter
 import myclaw.tools.mcp_runtime as mcp_runtime
 from myclaw.agent.runner import AgentRunner
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.config.config import MCPServerConfiguration
+from myclaw.config.config import ConfigLoader, MCPServerConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.management.service import ManagementError
 from myclaw.provider.models import (
@@ -488,12 +488,13 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
             events.append("mcp_close")
 
     class FakeMCPKeywordPreparer:
-        def __init__(self, **kwargs: object) -> None:
-            assert kwargs["model_router"] is not None
-            assert isinstance(kwargs["config_path"], Path)
+        def __init__(self, model_router: object, config_loader: ConfigLoader) -> None:
+            assert model_router is not None
+            assert isinstance(config_loader, ConfigLoader)
+            assert config_loader.path == tmp_path / "agent-home" / "config.toml"
 
-        async def prepare(self, snapshot: Sequence[object], configuration: object) -> object:
-            del configuration
+        async def prepare(self, snapshot: Sequence[object], servers: object) -> object:
+            assert servers == {}
             snapshot_tuple = tuple(snapshot)
             keyword_snapshots.append(snapshot_tuple)
             events.append(f"keywords_prepare_{len(keyword_snapshots)}")

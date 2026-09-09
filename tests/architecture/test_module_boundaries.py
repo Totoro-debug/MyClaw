@@ -420,6 +420,23 @@ def test_context_builder_constructor_owns_only_context_dependencies() -> None:
     assert "model_router" not in parameters
 
 
+def test_mcp_keyword_module_does_not_import_private_configuration_implementation() -> None:
+    path = PACKAGE_ROOT / "tools" / "mcp_keywords.py"
+    source = path.read_text(encoding="utf-8")
+    private_configuration_imports = [
+        reference
+        for reference in _resolved_static_imports(
+            source,
+            package=("myclaw", "tools"),
+        )
+        if reference.source_module == "myclaw.config.config"
+        and reference.symbol is not None
+        and reference.symbol.startswith("_")
+    ]
+
+    assert private_configuration_imports == []
+
+
 def test_context_builder_does_not_import_model_request_runtime_boundaries() -> None:
     path = PACKAGE_ROOT / "agent" / "context.py"
     forbidden_prefixes = (

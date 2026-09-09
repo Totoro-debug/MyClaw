@@ -148,6 +148,28 @@ class ResolvedModelRoute:
     used_default: bool
 
 
+def normalize_mcp_tool_keywords(value: object) -> tuple[str, ...]:
+    """Validate and canonicalize one MCP Tool keyword sequence."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("MCP Tool keywords must be an array of strings")
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise TypeError("MCP Tool keywords must be an array of strings")
+        keyword = item.strip()
+        if not keyword:
+            continue
+        if (
+            not keyword.isascii()
+            or re.search(r"[A-Za-z]", keyword) is None
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in keyword)
+        ):
+            raise ValueError("MCP Tool keywords must contain English terms")
+        if keyword not in normalized:
+            normalized.append(keyword)
+    return tuple(normalized)
+
+
 @dataclass(frozen=True, slots=True)
 class MCPServerConfiguration:
     """One validated, user-selected MCP Server configuration."""
@@ -173,16 +195,7 @@ class MCPServerConfiguration:
         for remote_name, raw_keywords in self.tool_keywords.items():
             if not isinstance(remote_name, str) or not remote_name:
                 raise ValueError("MCP Server tool_keywords names must be non-empty strings")
-            if isinstance(raw_keywords, (str, bytes)) or not isinstance(raw_keywords, Sequence):
-                raise TypeError("MCP Server tool_keywords values must be arrays of strings")
-            values: list[str] = []
-            for keyword in raw_keywords:
-                if not isinstance(keyword, str):
-                    raise TypeError("MCP Server tool_keywords values must be arrays of strings")
-                normalized_keyword = keyword.strip()
-                if normalized_keyword and normalized_keyword not in values:
-                    values.append(normalized_keyword)
-            normalized[remote_name] = tuple(values)
+            normalized[remote_name] = normalize_mcp_tool_keywords(raw_keywords)
         object.__setattr__(self, "tool_keywords", MappingProxyType(normalized))
 
     def resolve_cwd(self, workspace: Path) -> Path:
@@ -694,22 +707,6 @@ def _parse_string_array(value: object, field: str) -> tuple[str, ...]:
     return tuple(_string(item, field) for item in items)
 
 
-def _parse_mcp_tool_keywords(value: object, field: str) -> Mapping[str, tuple[str, ...]]:
-    table = _table(value, field)
-    parsed: dict[str, tuple[str, ...]] = {}
-    for remote_name, raw_keywords in table.items():
-        if not isinstance(remote_name, str) or not remote_name:
-            _invalid(field, "must contain nonempty remote Tool names")
-        keywords = _parse_string_array(raw_keywords, f"{field}.{remote_name}")
-        normalized: list[str] = []
-        for keyword in keywords:
-            normalized_keyword = keyword.strip()
-            if normalized_keyword and normalized_keyword not in normalized:
-                normalized.append(normalized_keyword)
-        parsed[remote_name] = tuple(normalized)
-    return MappingProxyType(parsed)
-
-
 def _parse_mcp_headers(value: object, field: str) -> Mapping[str, str]:
     table = _table(value, field)
     headers: dict[str, str] = {}
@@ -768,10 +765,20 @@ def _parse_mcp_server(mcp_name: str, value: object) -> MCPServerConfiguration:
         1,
         _MCP_MAX_TIMEOUT,
     )
-    tool_keywords = _parse_mcp_tool_keywords(
-        table.get("tool_keywords", {}),
-        f"{prefix}.tool_keywords",
-    )
+    keyword_field = f"{prefix}.tool_keywords"
+    keyword_table = _table(table.get("tool_keywords", {}), keyword_field)
+    parsed_keywords: dict[str, tuple[str, ...]] = {}
+    for remote_name, raw_keywords in keyword_table.items():
+        if not isinstance(remote_name, str) or not remote_name:
+            _invalid(keyword_field, "must contain nonempty remote Tool names")
+        remote_field = f"{keyword_field}.{remote_name}"
+        try:
+            parsed_keywords[remote_name] = normalize_mcp_tool_keywords(raw_keywords)
+        except TypeError:
+            _invalid(remote_field, "must be an array of strings")
+        except ValueError:
+            _invalid(remote_field, "must contain English terms")
+    tool_keywords = MappingProxyType(parsed_keywords)
 
     if transport == "stdio":
         for field_name in ("url", "headers"):
@@ -986,16 +993,7 @@ class ConfigLoader:
                 "must be low, medium, high, xhigh, or max",
             )
 
-        try:
-            content = self.path.read_text(encoding="utf-8")
-            source_document = tomlkit.parse(content)
-        except (tomlkit.exceptions.ParseError, UnicodeDecodeError) as error:
-            raise ConfigError(
-                ErrorInfo(
-                    "config_parse_error",
-                    "User Configuration TOML could not be parsed.",
-                )
-            ) from error
+        source_document = self._read_editable_toml()
 
         models = source_document.get("models", {})
         if not isinstance(models, Mapping):
@@ -1014,6 +1012,83 @@ class ConfigLoader:
         if isinstance(chat, MutableMapping):
             chat["reasoning_effort"] = effort
 
+        self._publish_editable_toml(source_document)
+
+    def fill_mcp_tool_keywords(
+        self,
+        generated: Mapping[tuple[str, str], tuple[str, ...]],
+    ) -> Mapping[tuple[str, str], tuple[str, ...]]:
+        """Fill still-empty MCP keyword entries in the latest configuration."""
+        if not isinstance(generated, Mapping):
+            raise TypeError("Generated MCP keywords must be a mapping")
+        assignments: dict[tuple[str, str], tuple[str, ...]] = {}
+        for identity, raw_keywords in generated.items():
+            if (
+                not isinstance(identity, tuple)
+                or len(identity) != 2
+                or not all(isinstance(item, str) and item for item in identity)
+            ):
+                raise TypeError("Generated MCP keyword identities must name a Server and Tool")
+            keywords = normalize_mcp_tool_keywords(raw_keywords)
+            if keywords:
+                assignments[identity] = keywords
+
+        source_document = self._read_editable_toml()
+        mcp = source_document.get("mcp")
+        if mcp is None:
+            return MappingProxyType({})
+        if not isinstance(mcp, MutableMapping):
+            raise TypeError("mcp must be a table")
+        servers = mcp.get("servers")
+        if servers is None:
+            return MappingProxyType({})
+        if not isinstance(servers, MutableMapping):
+            raise TypeError("mcp.servers must be a table")
+
+        effective: dict[tuple[str, str], tuple[str, ...]] = {}
+        changed = False
+        for (server_name, remote_name), keywords in assignments.items():
+            server = servers.get(server_name)
+            if server is None:
+                continue
+            if not isinstance(server, MutableMapping):
+                raise TypeError(f"mcp.servers.{server_name} must be a table")
+            keyword_table = server.get("tool_keywords")
+            if keyword_table is None:
+                keyword_table = tomlkit.table()
+                server["tool_keywords"] = keyword_table
+                changed = True
+            if not isinstance(keyword_table, MutableMapping):
+                raise TypeError(f"mcp.servers.{server_name}.tool_keywords must be a table")
+
+            existing = keyword_table.get(remote_name)
+            if existing is not None:
+                existing_keywords = normalize_mcp_tool_keywords(existing)
+                if existing_keywords:
+                    effective[(server_name, remote_name)] = existing_keywords
+                    continue
+            keyword_table[remote_name] = list(keywords)
+            effective[(server_name, remote_name)] = keywords
+            changed = True
+
+        if changed:
+            self._publish_editable_toml(source_document)
+        return MappingProxyType(effective)
+
+    def _read_editable_toml(self) -> MutableMapping[str, object]:
+        try:
+            content = self.path.read_text(encoding="utf-8")
+            source_document = tomlkit.parse(content)
+        except (tomlkit.exceptions.ParseError, UnicodeDecodeError) as error:
+            raise ConfigError(
+                ErrorInfo(
+                    "config_parse_error",
+                    "User Configuration TOML could not be parsed.",
+                )
+            ) from error
+        return cast(MutableMapping[str, object], source_document)
+
+    def _publish_editable_toml(self, source_document: Mapping[str, object]) -> None:
         candidate_content = tomlkit.dumps(source_document)
         candidate = tomllib.loads(candidate_content)
         candidate_diagnostics: list[ConfigurationDiagnostic] = []
