@@ -57,7 +57,7 @@ timeout = 120
 
 API Key 直接保存在配置文件中，当前不支持环境变量引用；`myclaw config` 显示时会脱敏。更多可选配置及 MCP 示例见[配置模板](myclaw/templates/default-config.md)。
 
-MCP Server 可在 `[mcp.servers.<name>.tool_keywords]` 下按远端 Tool 原名配置英文关键词；缺失项会在启动时通过现有 `chat` Model Route 准备并尽力保存。关键词生成或保存失败不会阻止 Agent 启动，失败项仅在当前进程内使用远端 Tool 原名。
+MCP Server 可在 `[mcp.servers.<name>.tool_keywords]` 下按远端 Tool 原名配置英文关键词；缺失或为空的关键词会在启动时通过现有 `chat` Model Route 生成并尽力保存。生成失败时，当前进程使用对应的远端 Tool 原名；生成成功但保存失败时，当前进程继续使用已生成的内存关键词。两类失败都不会阻止 Agent 启动。
 
 ## 项目启动
 

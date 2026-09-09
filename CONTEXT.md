@@ -157,8 +157,24 @@ A host-mediated, one-shot user decision bound to one validated Tool call in one 
 _Avoid_: Permission Policy, model approval, chat reply, persistent approval
 
 **Tool Catalog**:
-The ordered set of concrete capabilities available through a Tool Gateway.
+The ordered set of concrete Tool capabilities available for name lookup and invocation through a Tool Gateway. Membership is independent of Tool Exposure.
 _Avoid_: Plugin list, command list, model tools, subagent registry, MCP registry
+
+**Tool Exposure**:
+The inclusion of a Tool's complete invocation definition among the capabilities presented to the model for one model call. It neither changes Tool Catalog membership nor gates invocation.
+_Avoid_: Tool Catalog membership, Tool Activation, Tool execution, Permission Policy
+
+**Tool Activation**:
+The Agent Run-scoped selection of a deferred Tool for exposure in subsequent model calls. It expires with the Agent Run and neither authorizes nor invokes the Tool.
+_Avoid_: MCP Server enablement, Tool Confirmation, execution permission, persistent Session capability, Tool execution
+
+**Tool Search Keywords**:
+The English terms associated with a Tool for capability discovery through Tool Search.
+_Avoid_: Tool description, invocation parameters, user instruction, Skill metadata
+
+**Tool Search**:
+The Agent Run-scoped discovery of deferred Tools from that Run's available Tool Catalog using English query keywords. Returned Tools are activated for subsequent model calls in that Run.
+_Avoid_: Web Search, MCP discovery, Tool execution, permission grant
 
 **Built-in Tool**:
 A Tool capability shipped as part of the Personal Agent runtime rather than discovered from an MCP Server.
@@ -177,7 +193,7 @@ The CLI-owned Runtime Lifetime component that connects configured MCP Servers, r
 _Avoid_: Tool Gateway, MCP registry, Agent Loop
 
 **MCP Tool**:
-A Tool capability discovered from an MCP Server and exposed through the Tool Catalog with the same model-facing invocation semantics as a Built-in Tool, while retaining its external origin.
+A Tool capability discovered from an MCP Server and included in a Tool Catalog with the same invocation semantics as a Built-in Tool, while retaining its external origin.
 _Avoid_: Built-in Tool, Plugin Tool, direct MCP call
 
 **MCP Tool Snapshot**:
