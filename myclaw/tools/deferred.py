@@ -85,7 +85,10 @@ def _document_for_tool(
     configured_keywords = mcp_keywords.get(tool.name, ())
     if isinstance(configured_keywords, (str, bytes)):
         raise TypeError("Agent Run MCP keywords must contain string sequences")
-    terms = (original_name, *builtin_keywords, *configured_keywords)
+    keyword_terms = tuple(configured_keywords)
+    if keyword_terms == (original_name,):
+        keyword_terms = ()
+    terms = (original_name, *builtin_keywords, *keyword_terms)
     return ToolSearchDocument(
         name=tool.name,
         terms=terms,
