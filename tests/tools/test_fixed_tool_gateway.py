@@ -207,6 +207,55 @@ async def test_agent_run_gateway_indexes_remote_mcp_name_and_keywords_not_alloca
 
 
 @pytest.mark.asyncio
+async def test_agent_run_gateway_does_not_boost_exact_remote_name_fallback(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    earlier_tool = MCPTool(
+        MCPToolSpec(
+            server_name="alpha",
+            remote_name="calendar_events",
+            model_name="mcp_alpha_calendar_events",
+            description="Read calendar events from alpha.",
+            parameters={"type": "object"},
+        ),
+        _MCPCallSession(),
+    )
+    fallback_tool = MCPTool(
+        MCPToolSpec(
+            server_name="zulu",
+            remote_name="calendar_events",
+            model_name="mcp_zulu_calendar_events",
+            description="Read calendar events from zulu.",
+            parameters={"type": "object"},
+        ),
+        _MCPCallSession(),
+    )
+    run_gateway = build_agent_run_gateway(
+        _gateway(
+            workspace,
+            agent_home,
+            additional_tools=(earlier_tool, fallback_tool),
+        ),
+        mcp_keywords={"mcp_zulu_calendar_events": ("calendar_events",)},
+    )
+
+    result = await run_gateway.call(
+        ModelToolCall(
+            id="search-calendar",
+            name="tool_search",
+            arguments=json.dumps({"query": "calendar"}),
+        )
+    )
+
+    assert result.status == "success"
+    assert json.loads(result.content) == [
+        "mcp_alpha_calendar_events",
+        "mcp_zulu_calendar_events",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_agent_run_gateway_direct_unexposed_call_does_not_activate_tool(
     workspace: Path,
     agent_home: Path,
@@ -486,13 +535,19 @@ def test_run_catalog_exclusion_keeps_other_tools_available(
     agent_home: Path,
 ) -> None:
     foreground = _gateway(workspace, agent_home)
-    scheduled = foreground.for_run(excluded_names=("schedule",))
+    scheduled = foreground.for_run(
+        exposed_names=(),
+        excluded_names=("schedule",),
+    )
+    scheduled_catalog_names = {tool.name for tool in scheduled.catalog}
 
     assert "schedule" in _names(foreground)
-    assert "schedule" not in _names(scheduled)
-    assert "web_search" in _names(scheduled)
-    assert "web_fetch" in _names(scheduled)
-    assert "exec" in _names(scheduled)
+    assert scheduled.schemas == []
+    assert len(scheduled.catalog) == len(foreground.catalog) - 1
+    assert "schedule" not in scheduled_catalog_names
+    assert "web_search" in scheduled_catalog_names
+    assert "web_fetch" in scheduled_catalog_names
+    assert "exec" in scheduled_catalog_names
 
 
 @pytest.mark.asyncio

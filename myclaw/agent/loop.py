@@ -1025,10 +1025,9 @@ class AgentLoop:
         blackboard: Blackboard | None = None,
         *,
         manual_invocation: ManualSkillInvocation | None = None,
-        tool_gateway: ToolGateway | None = None,
+        tool_gateway: ToolGateway,
     ) -> list[dict[str, Any]]:
         route = self._configuration.resolve_route("chat").route
-        effective_gateway = self._new_run_gateway() if tool_gateway is None else tool_gateway
 
         def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             return self._context_builder.build_foreground_messages(
@@ -1044,7 +1043,7 @@ class AgentLoop:
             project_messages=project_messages,
             route_context_window=route.context_window,
             route_max_output=route.max_output,
-            tools=effective_gateway.schemas,
+            tools=tool_gateway.schemas,
         )
         history = active_session.messages[active_session.last_consolidated :]
         return self._context_builder.build_foreground_messages(
@@ -1059,13 +1058,8 @@ class AgentLoop:
         active_session: Session,
         current_user: dict[str, Any],
         *,
-        tool_gateway: ToolGateway | None = None,
+        tool_gateway: ToolGateway,
     ) -> list[dict[str, Any]]:
-        effective_gateway = (
-            self._new_run_gateway(excluded_names=("schedule",))
-            if tool_gateway is None
-            else tool_gateway
-        )
         with self._context_builder.schedule_projection_scope():
             route = self._configuration.resolve_route("schedule").route
             initial_last_consolidated = active_session.last_consolidated
@@ -1091,7 +1085,7 @@ class AgentLoop:
                 project_messages=project_messages,
                 route_context_window=route.context_window,
                 route_max_output=route.max_output,
-                tools=effective_gateway.schemas,
+                tools=tool_gateway.schemas,
             )
             if active_session.last_consolidated == initial_last_consolidated:
                 return initial_projection

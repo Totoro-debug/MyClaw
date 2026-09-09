@@ -52,6 +52,7 @@ from myclaw.skills.catalog import (
     SkillMetadata,
 )
 from myclaw.tools.base import BaseTool
+from myclaw.tools.deferred import RUN_BASELINE_TOOL_NAMES
 from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.agent.test_context import _FrozenDateTime
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
@@ -514,9 +515,9 @@ def _runtime(
         active_session: Session,
         current_user: dict[str, Any],
         blackboard: Blackboard | None = None,
-        manual_invocation: ManualSkillInvocation | None = None,
         *,
-        tool_gateway: ToolGateway | None = None,
+        manual_invocation: ManualSkillInvocation | None = None,
+        tool_gateway: ToolGateway,
     ) -> list[dict[str, Any]]:
         del tool_gateway
         if selected_context_preparer_with_invocation is not None:
@@ -650,6 +651,71 @@ def test_agent_loop_preflight_uses_the_deferred_baseline_without_unused_tool_sch
         "tool_search",
     )
     assert "large_schema" not in loop.runtime_status_input().tool_definitions
+
+
+@pytest.mark.asyncio
+async def test_foreground_context_and_runner_share_exactly_one_run_gateway(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blackboard = Blackboard(goal="Run one turn", completion_boundary="Return one answer")
+    loop, _session, bus = _runtime(
+        tmp_path,
+        _Router((_response("done"),)),
+        task_framing_outcomes=(_framing_response(blackboard, input_tokens=1, output_tokens=1),),
+        use_default_context_preparer=True,
+    )
+    created_gateways: list[ToolGateway] = []
+    context_gateways: list[ToolGateway] = []
+    runner_gateways: list[ToolGateway] = []
+    original_new_run_gateway = loop._new_run_gateway
+    original_prepare = loop._prepare_foreground_context
+    original_run = loop._runner.run
+
+    def new_run_gateway(*, excluded_names: Sequence[str] = ()) -> ToolGateway:
+        gateway = original_new_run_gateway(excluded_names=excluded_names)
+        created_gateways.append(gateway)
+        return gateway
+
+    async def prepare(
+        active_session: Session,
+        current_user: dict[str, Any],
+        blackboard: Blackboard | None = None,
+        *,
+        manual_invocation: ManualSkillInvocation | None = None,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]:
+        context_gateways.append(tool_gateway)
+        return await original_prepare(
+            active_session,
+            current_user,
+            blackboard,
+            manual_invocation=manual_invocation,
+            tool_gateway=tool_gateway,
+        )
+
+    async def run(*args: Any, **kwargs: Any) -> AgentRunnerResult:
+        gateway = kwargs["tool_gateway"]
+        assert isinstance(gateway, ToolGateway)
+        runner_gateways.append(gateway)
+        return await original_run(*args, **kwargs)
+
+    object.__setattr__(loop, "_new_run_gateway", new_run_gateway)
+    object.__setattr__(loop, "_prepare_foreground_context", prepare)
+    monkeypatch.setattr(loop._runner, "run", run)
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("one foreground turn"))
+        await _terminals(bus, 1)
+    finally:
+        await loop.close()
+
+    assert len(created_gateways) == 1
+    assert len(context_gateways) == 1
+    assert len(runner_gateways) == 1
+    assert created_gateways[0] is context_gateways[0] is runner_gateways[0]
+    assert created_gateways[0].exposed_names == RUN_BASELINE_TOOL_NAMES
 
 
 @pytest.mark.asyncio

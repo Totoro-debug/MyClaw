@@ -228,8 +228,9 @@ class ToolGateway:
 
     def for_run(
         self,
+        *,
+        exposed_names: Collection[str],
         excluded_names: Collection[str] = (),
-        exposed_names: Collection[str] | None = None,
         run_tools: Sequence[BaseTool] = (),
     ) -> ToolGateway:
         """Create an isolated Run view over this Gateway's reusable Tool instances."""
@@ -246,14 +247,11 @@ class ToolGateway:
             raise ValueError("Run Tool names must be unique")
 
         available_names = {tool.name for tool in catalog}
-        if exposed_names is None:
-            exposure = tuple(tool.name for tool in catalog)
-        else:
-            requested = _normalize_tool_names(exposed_names, label="Exposed Tool names")
-            unknown = set(requested) - available_names
-            if unknown:
-                raise ValueError("Exposed Tool names must be available in the Run Catalog")
-            exposure = tuple(tool.name for tool in catalog if tool.name in requested)
+        requested = _normalize_tool_names(exposed_names, label="Exposed Tool names")
+        unknown = set(requested) - available_names
+        if unknown:
+            raise ValueError("Exposed Tool names must be available in the Run Catalog")
+        exposure = tuple(tool.name for tool in catalog if tool.name in requested)
 
         return self._from_catalog(
             catalog,

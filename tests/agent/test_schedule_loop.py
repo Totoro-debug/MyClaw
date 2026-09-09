@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 import pytest
@@ -15,6 +15,7 @@ from mcp.types import CallToolResult
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.message_bus import InboundMessage, MessageBus
+from myclaw.agent.runner import AgentRunnerResult
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
@@ -314,13 +315,23 @@ async def _schedule_context(
     session: Session,
     current_user: dict[str, Any],
     *,
-    tool_gateway: ToolGateway | None = None,
+    tool_gateway: ToolGateway,
 ) -> list[dict[str, Any]]:
     del tool_gateway
     return [
         {"role": "system", "content": "schedule system"},
         {"role": "user", "content": current_user["content"]},
     ]
+
+
+class _ScheduleContextPreparer(Protocol):
+    async def __call__(
+        self,
+        session: Session,
+        current_user: dict[str, Any],
+        *,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]: ...
 
 
 def _job(*, job_id: UUID = JOB_ID) -> ScheduleJob:
@@ -338,10 +349,7 @@ def _loop(
     router: _ScheduleRouter,
     *,
     skill_loader: SkillLoader | None = None,
-    schedule_context_preparer: Callable[
-        [Session, dict[str, Any]],
-        Awaitable[list[dict[str, Any]]],
-    ] = _schedule_context,
+    schedule_context_preparer: _ScheduleContextPreparer = _schedule_context,
     externalize_result_for: Callable[[Session], Callable[[ToolResult], ToolResult]] | None = None,
     task_framing_router: TaskFramingRouterAdapter | None = None,
     mcp_tools: Sequence[BaseTool] = (),
@@ -399,7 +407,7 @@ async def _foreground_context(
     blackboard: Blackboard | None = None,
     *,
     manual_invocation: ManualSkillInvocation | None = None,
-    tool_gateway: ToolGateway | None = None,
+    tool_gateway: ToolGateway,
 ) -> list[dict[str, Any]]:
     assert blackboard is None
     assert manual_invocation is None
@@ -456,6 +464,57 @@ async def test_schedule_run_uses_schedule_session_and_keeps_foreground_bus_empty
     assert router.routes == ["schedule"]
     assert router.requests[0][1] == len(RUN_BASELINE_TOOL_NAMES)
     assert framing_router.framing_requests == []
+
+
+@pytest.mark.asyncio
+async def test_schedule_context_and_runner_share_exactly_one_run_gateway(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop, _state, _service, _bus = _loop(tmp_path, _ScheduleRouter())
+    created_gateways: list[ToolGateway] = []
+    context_gateways: list[ToolGateway] = []
+    runner_gateways: list[ToolGateway] = []
+    original_new_run_gateway = loop._new_run_gateway
+    original_prepare = loop._prepare_schedule_context
+    original_run = loop._runner.run
+
+    def new_run_gateway(*, excluded_names: Sequence[str] = ()) -> ToolGateway:
+        gateway = original_new_run_gateway(excluded_names=excluded_names)
+        created_gateways.append(gateway)
+        return gateway
+
+    async def prepare(
+        session: Session,
+        current_user: dict[str, Any],
+        *,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]:
+        context_gateways.append(tool_gateway)
+        return await original_prepare(
+            session,
+            current_user,
+            tool_gateway=tool_gateway,
+        )
+
+    async def run(*args: Any, **kwargs: Any) -> AgentRunnerResult:
+        gateway = kwargs["tool_gateway"]
+        assert isinstance(gateway, ToolGateway)
+        runner_gateways.append(gateway)
+        return await original_run(*args, **kwargs)
+
+    object.__setattr__(loop, "_new_run_gateway", new_run_gateway)
+    object.__setattr__(loop, "_prepare_schedule_context", prepare)
+    monkeypatch.setattr(loop._runner, "run", run)
+
+    await loop.run_schedule_job(_job())
+
+    assert len(created_gateways) == 1
+    assert len(context_gateways) == 1
+    assert len(runner_gateways) == 1
+    assert created_gateways[0] is context_gateways[0] is runner_gateways[0]
+    assert created_gateways[0].exposed_names == RUN_BASELINE_TOOL_NAMES
+    assert "schedule" not in {tool.name for tool in created_gateways[0].catalog}
 
 
 @pytest.mark.asyncio
@@ -719,7 +778,7 @@ async def test_schedule_run_reloads_canonical_session_and_closes_each_run(
         session: Session,
         current_user: dict[str, Any],
         *,
-        tool_gateway: ToolGateway | None = None,
+        tool_gateway: ToolGateway,
     ) -> list[dict[str, Any]]:
         del tool_gateway
         observed_context.append((session.session_id, len(session.messages)))
@@ -842,7 +901,7 @@ async def test_schedule_context_preparation_failures_preserve_cancel(
         session: Session,
         current_user: dict[str, Any],
         *,
-        tool_gateway: ToolGateway | None = None,
+        tool_gateway: ToolGateway,
     ) -> list[dict[str, Any]]:
         del session, current_user, tool_gateway
         raise RuntimeError("unexpected preparation failure")
@@ -851,7 +910,7 @@ async def test_schedule_context_preparation_failures_preserve_cancel(
         session: Session,
         current_user: dict[str, Any],
         *,
-        tool_gateway: ToolGateway | None = None,
+        tool_gateway: ToolGateway,
     ) -> list[dict[str, Any]]:
         del session, current_user, tool_gateway
         raise asyncio.CancelledError()
