@@ -55,11 +55,12 @@ class ToolSearchDocument:
         if self.catalog_order < 0:
             raise ValueError("Tool Search document catalog order must be nonnegative")
 
-        try:
-            source_terms: Iterable[str] = self.terms
-        except TypeError as error:
-            raise TypeError("Tool Search document terms must be an iterable of strings") from error
-        normalized = tuple(token for term in source_terms for token in _require_search_term(term))
+        normalized_terms: list[str] = []
+        for term in self.terms:
+            if not isinstance(term, str):
+                raise TypeError("Tool Search document terms must contain only strings")
+            normalized_terms.extend(tokenize_tool_search_text(term))
+        normalized = tuple(normalized_terms)
         object.__setattr__(self, "terms", normalized)
 
 
@@ -112,7 +113,7 @@ class ToolSearchIndex:
         excluded_names: Collection[str] = (),
     ) -> tuple[str, ...]:
         """Return up to three eligible model names ranked by BM25 score."""
-        query_terms = _unique_terms(tokenize_tool_search_text(query))
+        query_terms = tuple(dict.fromkeys(tokenize_tool_search_text(query)))
         if not query_terms:
             return ()
 
@@ -158,13 +159,3 @@ class ToolSearchIndex:
             for term in query_terms
             if (frequency := term_frequencies.get(term, 0))
         )
-
-
-def _require_search_term(term: str) -> tuple[str, ...]:
-    if not isinstance(term, str):
-        raise TypeError("Tool Search document terms must contain only strings")
-    return tokenize_tool_search_text(term)
-
-
-def _unique_terms(terms: Iterable[str]) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(terms))
