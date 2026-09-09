@@ -1,4 +1,6 @@
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1139,6 +1141,51 @@ timeout = 60
     assert 'model = "memory-model"' in updated
     assert updated.count('reasoning_effort = "xhigh"') == 2
     assert 'reasoning_effort = "max"' in updated
+
+
+def test_update_reasoning_effort_holds_shared_lock_from_latest_read_through_replace(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
+    latest = MINIMAL_VALID_CONFIG.replace(
+        "max_output = 1024",
+        "max_output = 2048\n\n# Added by a cooperating writer.",
+    )
+    lock_held = False
+    original_replace = HOST_FILESYSTEM.atomic_replace_text
+
+    @contextmanager
+    def acquire_after_user_write(
+        lock_path: Path,
+        *,
+        timeout: float = 1.0,
+    ) -> Iterator[None]:
+        nonlocal lock_held
+        assert lock_path == loader.path.with_name(".config.toml.lock")
+        assert timeout == 1.0
+        loader.path.write_text(latest, encoding="utf-8")
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
+
+    def replace_while_locked(target: Path, content: str) -> None:
+        assert lock_held
+        original_replace(target, content)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "exclusive_lock", acquire_after_user_write)
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_text", replace_while_locked)
+
+    loader.update_reasoning_effort("high")
+
+    updated = loader.path.read_text(encoding="utf-8")
+    assert "# Added by a cooperating writer." in updated
+    assert "max_output = 2048" in updated
+    assert 'reasoning_effort = "high"' in updated
 
 
 def test_update_reasoning_effort_keeps_external_edits_and_inherited_chat_absent(

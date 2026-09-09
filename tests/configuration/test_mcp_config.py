@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any, cast
@@ -222,6 +224,109 @@ search_issues = []
     assert "must-not-recreate" not in saved
     with pytest.raises(TypeError):
         cast(Any, effective)[("github", "other")] = ("keyword",)
+
+
+def test_fill_mcp_tool_keywords_holds_shared_lock_from_latest_read_through_replace(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader_with_mcp(
+        agent_home,
+        """
+[mcp.servers.github]
+enabled = true
+transport = "stdio"
+command = "server"
+[mcp.servers.github.tool_keywords]
+search_issues = []
+list_issues = []
+""",
+    )
+    latest = loader.path.read_text(encoding="utf-8").replace(
+        "search_issues = []",
+        'search_issues = ["configured"]\n# Added by a cooperating writer.',
+    )
+    lock_held = False
+    original_replace = HOST_FILESYSTEM.atomic_replace_text
+
+    @contextmanager
+    def acquire_after_user_write(
+        lock_path: Path,
+        *,
+        timeout: float = 1.0,
+    ) -> Iterator[None]:
+        nonlocal lock_held
+        assert lock_path == loader.path.with_name(".config.toml.lock")
+        assert timeout == 1.0
+        loader.path.write_text(latest, encoding="utf-8")
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
+
+    def replace_while_locked(target: Path, content: str) -> None:
+        assert lock_held
+        original_replace(target, content)
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "exclusive_lock", acquire_after_user_write)
+    monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_text", replace_while_locked)
+
+    effective = loader.fill_mcp_tool_keywords(
+        {
+            ("github", "search_issues"): ("generated-search",),
+            ("github", "list_issues"): ("generated-list",),
+        }
+    )
+
+    saved = loader.path.read_text(encoding="utf-8")
+    assert effective == {
+        ("github", "search_issues"): ("configured",),
+        ("github", "list_issues"): ("generated-list",),
+    }
+    assert "# Added by a cooperating writer." in saved
+    assert "generated-search" not in saved
+    assert 'list_issues = ["generated-list"]' in saved
+
+
+def test_fill_mcp_tool_keywords_does_not_restore_server_deleted_before_locked_read(
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader_with_mcp(
+        agent_home,
+        """
+[mcp.servers.github]
+enabled = true
+transport = "stdio"
+command = "server"
+""",
+    )
+    replacement_calls: list[object] = []
+
+    @contextmanager
+    def acquire_after_server_deletion(
+        lock_path: Path,
+        *,
+        timeout: float = 1.0,
+    ) -> Iterator[None]:
+        assert lock_path == loader.path.with_name(".config.toml.lock")
+        assert timeout == 1.0
+        loader.path.write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
+        yield
+
+    monkeypatch.setattr(HOST_FILESYSTEM, "exclusive_lock", acquire_after_server_deletion)
+    monkeypatch.setattr(
+        HOST_FILESYSTEM,
+        "atomic_replace_text",
+        lambda *_args, **_kwargs: replacement_calls.append(None),
+    )
+
+    effective = loader.fill_mcp_tool_keywords({("github", "search_issues"): ("generated",)})
+
+    assert effective == {}
+    assert "mcp.servers.github" not in loader.path.read_text(encoding="utf-8")
+    assert replacement_calls == []
 
 
 def test_fill_mcp_tool_keywords_does_not_replace_when_values_are_already_set(

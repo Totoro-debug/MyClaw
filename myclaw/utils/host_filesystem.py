@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import errno
+import importlib
 import os
 import tempfile
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from errno import EACCES
+from math import isfinite
 from os import stat_result
 from pathlib import Path
 from stat import (
@@ -15,7 +20,7 @@ from stat import (
     S_ISDIR,
     S_ISREG,
 )
-from typing import Final, NoReturn, Protocol
+from typing import Any, Final, NoReturn, Protocol, cast
 
 type FileIdentity = tuple[int, int, int, int]
 
@@ -31,6 +36,7 @@ _POSIX_UNSUPPORTED_SYNC_ERRNOS: Final = frozenset(
         getattr(errno, "EOPNOTSUPP", errno.EINVAL),
     }
 )
+_LOCK_RETRY_INTERVAL_SECONDS: Final = 0.01
 
 
 class UnsafeFilesystemPath(PermissionError):
@@ -63,6 +69,10 @@ class FilesystemAdapter(Protocol):
     def restrict_private_file(self, path: Path) -> None: ...
 
     def restrict_private_descriptor(self, descriptor: int) -> None: ...
+
+    def try_lock_exclusive(self, descriptor: int) -> bool: ...
+
+    def unlock(self, descriptor: int) -> None: ...
 
 
 class WindowsFilesystemAdapter:
@@ -124,6 +134,24 @@ class WindowsFilesystemAdapter:
 
     def restrict_private_descriptor(self, descriptor: int) -> None:
         del descriptor
+
+    def try_lock_exclusive(self, descriptor: int) -> bool:
+        msvcrt = cast(Any, importlib.import_module("msvcrt"))
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise
+        return True
+
+    def unlock(self, descriptor: int) -> None:
+        msvcrt = cast(Any, importlib.import_module("msvcrt"))
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
 
 
 class PosixFilesystemAdapter:
@@ -189,6 +217,22 @@ class PosixFilesystemAdapter:
             raise OSError("descriptor permission changes are unavailable")
         fchmod(descriptor, 0o600)
 
+    def try_lock_exclusive(self, descriptor: int) -> bool:
+        fcntl = cast(Any, importlib.import_module("fcntl"))
+
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                return False
+            raise
+        return True
+
+    def unlock(self, descriptor: int) -> None:
+        fcntl = cast(Any, importlib.import_module("fcntl"))
+
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
 
 class HostFilesystem:
     """Deep boundary for native persistent filesystem behavior."""
@@ -235,6 +279,40 @@ class HostFilesystem:
     def restrict_private_descriptor(self, descriptor: int) -> None:
         """Narrow an opened private file to host-appropriate owner access."""
         self._adapter.restrict_private_descriptor(descriptor)
+
+    @contextmanager
+    def exclusive_lock(self, lock_path: Path, *, timeout: float = 1.0) -> Iterator[None]:
+        """Hold an exclusive process lock on a stable sidecar path."""
+        if not isfinite(timeout) or timeout < 0:
+            raise ValueError("Lock timeout must be a finite non-negative number")
+        io_path = self.path_for_io(lock_path)
+        owned_parent = self.require_owned_directory(io_path.parent, within=io_path.parent)
+        if io_path.exists() or io_path.is_symlink():
+            self.require_owned_regular_file(io_path, within=owned_parent)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(io_path, flags, 0o600)
+        locked = False
+        try:
+            self.require_opened_owned_regular_file(
+                descriptor,
+                io_path,
+                within=owned_parent,
+            )
+            self._adapter.restrict_private_descriptor(descriptor)
+            deadline = time.monotonic() + timeout
+            while not self._adapter.try_lock_exclusive(descriptor):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out waiting for exclusive lock: {lock_path}")
+                time.sleep(min(_LOCK_RETRY_INTERVAL_SECONDS, remaining))
+            locked = True
+            yield
+        finally:
+            try:
+                if locked:
+                    self._adapter.unlock(descriptor)
+            finally:
+                os.close(descriptor)
 
     def require_owned_directory(self, path: Path, *, within: Path) -> Path:
         """Return an ordinary contained directory or reject an unsafe path."""

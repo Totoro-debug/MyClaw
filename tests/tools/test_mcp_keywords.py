@@ -425,7 +425,7 @@ async def test_preparer_propagates_cancellation_and_drains_sibling_tasks(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_stage",
-    ["read", "parse", "validation", "serialization", "replace"],
+    ["lock", "read", "parse", "validation", "serialization", "replace"],
 )
 async def test_preparer_keeps_generated_keywords_in_memory_when_persistence_fails(
     tmp_path: Path,
@@ -448,7 +448,13 @@ command = "server"
     def fail(*_args: object, **_kwargs: object) -> None:
         raise OSError(f"injected {failure_stage} failure")
 
-    if failure_stage == "read":
+    if failure_stage == "lock":
+        monkeypatch.setattr(
+            cast(Any, config_module).HOST_FILESYSTEM,
+            "exclusive_lock",
+            fail,
+        )
+    elif failure_stage == "read":
         original_read_text = Path.read_text
 
         def fail_config_read(path: Path, *args: object, **kwargs: object) -> str:
@@ -474,6 +480,7 @@ command = "server"
     )
 
     assert result == {"mcp_github_search_issues": ("issues",)}
+    assert b"tool_keywords" not in config_path.read_bytes()
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""

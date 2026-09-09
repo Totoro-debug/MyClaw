@@ -993,26 +993,28 @@ class ConfigLoader:
                 "must be low, medium, high, xhigh, or max",
             )
 
-        source_document = self._read_editable_toml()
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        with HOST_FILESYSTEM.exclusive_lock(lock_path):
+            source_document = self._read_editable_toml()
 
-        models = source_document.get("models", {})
-        if not isinstance(models, Mapping):
-            _invalid("models", "must be a table")
-        routes = models.get("routes", {})
-        if not isinstance(routes, MutableMapping):
-            _invalid("models.routes", "must be a table")
-        if "default" not in routes:
-            raise _missing_default_route_error()
-        default = routes["default"]
-        if not isinstance(default, MutableMapping):
-            _invalid("models.routes.default", "must be a table")
-        default["reasoning_effort"] = effort
+            models = source_document.get("models", {})
+            if not isinstance(models, Mapping):
+                _invalid("models", "must be a table")
+            routes = models.get("routes", {})
+            if not isinstance(routes, MutableMapping):
+                _invalid("models.routes", "must be a table")
+            if "default" not in routes:
+                raise _missing_default_route_error()
+            default = routes["default"]
+            if not isinstance(default, MutableMapping):
+                _invalid("models.routes.default", "must be a table")
+            default["reasoning_effort"] = effort
 
-        chat = routes.get("chat")
-        if isinstance(chat, MutableMapping):
-            chat["reasoning_effort"] = effort
+            chat = routes.get("chat")
+            if isinstance(chat, MutableMapping):
+                chat["reasoning_effort"] = effort
 
-        self._publish_editable_toml(source_document)
+            self._publish_editable_toml(source_document)
 
     def fill_mcp_tool_keywords(
         self,
@@ -1033,47 +1035,49 @@ class ConfigLoader:
             if keywords:
                 assignments[identity] = keywords
 
-        source_document = self._read_editable_toml()
-        mcp = source_document.get("mcp")
-        if mcp is None:
-            return MappingProxyType({})
-        if not isinstance(mcp, MutableMapping):
-            raise TypeError("mcp must be a table")
-        servers = mcp.get("servers")
-        if servers is None:
-            return MappingProxyType({})
-        if not isinstance(servers, MutableMapping):
-            raise TypeError("mcp.servers must be a table")
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        with HOST_FILESYSTEM.exclusive_lock(lock_path):
+            source_document = self._read_editable_toml()
+            mcp = source_document.get("mcp")
+            if mcp is None:
+                return MappingProxyType({})
+            if not isinstance(mcp, MutableMapping):
+                raise TypeError("mcp must be a table")
+            servers = mcp.get("servers")
+            if servers is None:
+                return MappingProxyType({})
+            if not isinstance(servers, MutableMapping):
+                raise TypeError("mcp.servers must be a table")
 
-        effective: dict[tuple[str, str], tuple[str, ...]] = {}
-        changed = False
-        for (server_name, remote_name), keywords in assignments.items():
-            server = servers.get(server_name)
-            if server is None:
-                continue
-            if not isinstance(server, MutableMapping):
-                raise TypeError(f"mcp.servers.{server_name} must be a table")
-            keyword_table = server.get("tool_keywords")
-            if keyword_table is None:
-                keyword_table = tomlkit.table()
-                server["tool_keywords"] = keyword_table
-                changed = True
-            if not isinstance(keyword_table, MutableMapping):
-                raise TypeError(f"mcp.servers.{server_name}.tool_keywords must be a table")
-
-            existing = keyword_table.get(remote_name)
-            if existing is not None:
-                existing_keywords = normalize_mcp_tool_keywords(existing)
-                if existing_keywords:
-                    effective[(server_name, remote_name)] = existing_keywords
+            effective: dict[tuple[str, str], tuple[str, ...]] = {}
+            changed = False
+            for (server_name, remote_name), keywords in assignments.items():
+                server = servers.get(server_name)
+                if server is None:
                     continue
-            keyword_table[remote_name] = list(keywords)
-            effective[(server_name, remote_name)] = keywords
-            changed = True
+                if not isinstance(server, MutableMapping):
+                    raise TypeError(f"mcp.servers.{server_name} must be a table")
+                keyword_table = server.get("tool_keywords")
+                if keyword_table is None:
+                    keyword_table = tomlkit.table()
+                    server["tool_keywords"] = keyword_table
+                    changed = True
+                if not isinstance(keyword_table, MutableMapping):
+                    raise TypeError(f"mcp.servers.{server_name}.tool_keywords must be a table")
 
-        if changed:
-            self._publish_editable_toml(source_document)
-        return MappingProxyType(effective)
+                existing = keyword_table.get(remote_name)
+                if existing is not None:
+                    existing_keywords = normalize_mcp_tool_keywords(existing)
+                    if existing_keywords:
+                        effective[(server_name, remote_name)] = existing_keywords
+                        continue
+                keyword_table[remote_name] = list(keywords)
+                effective[(server_name, remote_name)] = keywords
+                changed = True
+
+            if changed:
+                self._publish_editable_toml(source_document)
+            return MappingProxyType(effective)
 
     def _read_editable_toml(self) -> MutableMapping[str, object]:
         try:

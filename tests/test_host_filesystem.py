@@ -1,6 +1,8 @@
 import errno
 import os
 import subprocess
+import sys
+import time
 from os import stat_result
 from pathlib import Path
 from stat import S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG
@@ -15,6 +17,26 @@ from myclaw.utils.host_filesystem import (
 )
 
 windows_only = pytest.mark.skipif(os.name != "nt", reason="requires native Windows paths")
+
+_LOCK_PROCESS_SCRIPT = """
+import sys
+from pathlib import Path
+
+from myclaw.utils.host_filesystem import HOST_FILESYSTEM
+
+print("started", flush=True)
+try:
+    with HOST_FILESYSTEM.exclusive_lock(Path(sys.argv[1]), timeout=float(sys.argv[2])):
+        pass
+except TimeoutError:
+    print("timeout", flush=True)
+else:
+    print("acquired", flush=True)
+"""
+
+
+def _lock_process_command(lock_path: Path, timeout: float) -> list[str]:
+    return [sys.executable, "-c", _LOCK_PROCESS_SCRIPT, str(lock_path), str(timeout)]
 
 
 @windows_only
@@ -88,6 +110,95 @@ def test_host_filesystem_atomic_replace_publishes_exact_utf8_content(tmp_path: P
     HOST_FILESYSTEM.atomic_replace_text(target, "User: \u5f20\u4e09\nPreference: caf\u00e9\n")
 
     assert target.read_bytes() == (b"User: \xe5\xbc\xa0\xe4\xb8\x89\nPreference: caf\xc3\xa9\n")
+
+
+def test_host_filesystem_exclusive_lock_rejects_hard_link_without_modifying_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.write_bytes(b"")
+    lock_path = tmp_path / ".config.toml.lock"
+    lock_path.hardlink_to(target)
+
+    with pytest.raises(PermissionError):
+        with HOST_FILESYSTEM.exclusive_lock(lock_path):
+            pass
+
+    assert target.read_bytes() == b""
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [-0.1, float("nan"), float("inf")],
+    ids=("negative", "nan", "infinite"),
+)
+def test_host_filesystem_exclusive_lock_rejects_invalid_timeout_before_file_creation(
+    tmp_path: Path,
+    timeout: float,
+) -> None:
+    lock_path = tmp_path / ".config.toml.lock"
+
+    with pytest.raises(ValueError, match="finite non-negative"):
+        with HOST_FILESYSTEM.exclusive_lock(lock_path, timeout=timeout):
+            pass
+
+    assert not lock_path.exists()
+
+
+def test_host_filesystem_exclusive_lock_blocks_another_process(tmp_path: Path) -> None:
+    lock_path = tmp_path / ".config.toml.lock"
+
+    with HOST_FILESYSTEM.exclusive_lock(lock_path, timeout=1.0):
+        contender = subprocess.Popen(
+            _lock_process_command(lock_path, 2.0),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert contender.stdout is not None
+        assert contender.stdout.readline().strip() == "started"
+        time.sleep(0.05)
+        assert contender.poll() is None
+
+    stdout, stderr = contender.communicate(timeout=5)
+
+    assert contender.returncode == 0, stderr
+    assert stdout.strip() == "acquired"
+
+
+def test_host_filesystem_exclusive_lock_times_out_while_owned(tmp_path: Path) -> None:
+    lock_path = tmp_path / ".config.toml.lock"
+
+    with HOST_FILESYSTEM.exclusive_lock(lock_path, timeout=1.0):
+        contender = subprocess.run(
+            _lock_process_command(lock_path, 0.05),
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+        )
+
+    assert contender.stdout.splitlines() == ["started", "timeout"]
+
+
+def test_host_filesystem_exclusive_lock_releases_after_body_failure(tmp_path: Path) -> None:
+    lock_path = tmp_path / ".config.toml.lock"
+
+    with pytest.raises(RuntimeError, match="injected body failure"):
+        with HOST_FILESYSTEM.exclusive_lock(lock_path, timeout=1.0):
+            raise RuntimeError("injected body failure")
+
+    contender = subprocess.run(
+        _lock_process_command(lock_path, 0.2),
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert contender.stdout.splitlines() == ["started", "acquired"]
+    assert lock_path.is_file()
+    assert lock_path.read_bytes() == b""
 
 
 @windows_only
