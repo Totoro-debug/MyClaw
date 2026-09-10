@@ -11,7 +11,18 @@ from rich.console import Console
 from tzlocal import get_localzone_name
 
 from myclaw.agent.loop import AgentLoop, ModelContextOverflowError
+from myclaw.agent.memory.dream import Dream
+from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.tools.mcp_keywords import MCPKeywordPreparer
+from myclaw.agent.tools.mcp_runtime import (
+    MCPRuntimeManager,
+    MCPServerFailure,
+    MCPSnapshotReport,
+    MCPStartupReport,
+    MCPToolSnapshot,
+)
+from myclaw.agent.tools.tool_gateway import BUILT_IN_TOOL_NAMES
 from myclaw.agent.workspace_state import (
     WorkspaceState,
     WorkspaceStateError,
@@ -26,8 +37,6 @@ from myclaw.management.service import (
     ManagementError,
     ManagementViewService,
 )
-from myclaw.memory.dream import Dream
-from myclaw.memory.manager import MemoryManager
 from myclaw.provider.factory import create_provider
 from myclaw.provider.model_router import ModelRouter
 from myclaw.schedule.model import JobSchedule, ScheduleJob
@@ -36,15 +45,6 @@ from myclaw.terminal.conversation import (
     TerminalConversationApp,
     is_interactive_terminal,
 )
-from myclaw.tools.mcp_keywords import MCPKeywordPreparer
-from myclaw.tools.mcp_runtime import (
-    MCPRuntimeManager,
-    MCPServerFailure,
-    MCPSnapshotReport,
-    MCPStartupReport,
-    MCPToolSnapshot,
-)
-from myclaw.tools.tool_gateway import BUILT_IN_TOOL_NAMES
 from myclaw.utils.scheduler import AsyncioSchedulerClock
 from myclaw.utils.time import local_now
 

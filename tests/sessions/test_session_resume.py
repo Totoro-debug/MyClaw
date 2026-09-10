@@ -5,9 +5,9 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
-from myclaw.session.session import Session, SessionStoragePartition
 from tests.management.factories import management_service
 
 NOW = datetime(2026, 8, 1, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))

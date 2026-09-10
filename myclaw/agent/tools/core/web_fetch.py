@@ -13,8 +13,8 @@ from urllib.parse import SplitResult, urljoin, urlsplit
 
 from aiohttp import ClientResponse, ClientSession, ClientTimeout
 
-from myclaw.tools.base import BaseTool, ToolError, ToolParam, truncate_text
-from myclaw.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
+from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam, truncate_text
+from myclaw.agent.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
 
 CONNECT_TIMEOUT_SECONDS = 10.0
 TOTAL_TIMEOUT_SECONDS = 30.0

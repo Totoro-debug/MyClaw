@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated
 
-from myclaw.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam
 
 
 class ReadFileTool(BaseTool):

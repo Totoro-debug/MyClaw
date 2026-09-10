@@ -7,10 +7,10 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.session.session import Session
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.management.service import ManagementError
-from myclaw.session.session import Session
 from tests.management.factories import management_service
 
 NOW = datetime(2026, 8, 4, 14, 30, 0, 123000, tzinfo=timezone(timedelta(hours=8)))

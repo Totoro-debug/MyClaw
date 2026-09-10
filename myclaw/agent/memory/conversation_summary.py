@@ -8,13 +8,13 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any, Protocol
 
+from myclaw.agent.memory.manager import MemoryManager
+from myclaw.agent.session.session import Session
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
-from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
-from myclaw.session.session import Session
 from myclaw.templates import render_template
 
 type SummaryProjection = Callable[

@@ -22,15 +22,19 @@ from loguru import logger
 import myclaw.agent.loop as loop_module
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ModelContextOverflowError
+from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.runner import AgentRunnerResult, AgentRunnerRouter
+from myclaw.agent.session.session import Session
+from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES
+from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.logging.session import session_log as real_session_log
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
-from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -44,16 +48,12 @@ from myclaw.provider.models import (
 )
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleService
-from myclaw.session.session import Session
 from myclaw.skills.catalog import (
     LoadedSkill,
     ManualSkillInvocation,
     SkillLoader,
     SkillMetadata,
 )
-from myclaw.tools.base import BaseTool
-from myclaw.tools.deferred import RUN_BASELINE_TOOL_NAMES
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.agent.test_context import _FrozenDateTime
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import (
@@ -1165,9 +1165,7 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
         "[runtime]\nenable_skill_always_load = true\n\n[models.providers.primary]",
     )
     mcp_tool = _LargeSchemaTool()
-    loop, session, _bus = _runtime(
-        tmp_path, _Router(()), config_text=config, mcp_tools=(mcp_tool,)
-    )
+    loop, session, _bus = _runtime(tmp_path, _Router(()), config_text=config, mcp_tools=(mcp_tool,))
     builder = loop._context_builder
     loader = loop._skill_loader
     active_skills = loader.skills

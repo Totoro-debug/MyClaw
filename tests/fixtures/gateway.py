@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from myclaw.tools.base import BaseTool
-from myclaw.tools.tool_gateway import (
+from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.tool_gateway import (
     ConfirmationRequester,
     ModelToolCall,
     ToolGateway,

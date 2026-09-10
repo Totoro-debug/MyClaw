@@ -10,12 +10,13 @@ import pytest
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
+from myclaw.agent.memory.conversation_summary import ConversationSummaryManager
+from myclaw.agent.memory.manager import MemoryManager
+from myclaw.agent.memory.records import SummaryEntry
+from myclaw.agent.session.session import Session
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
-from myclaw.memory.conversation_summary import ConversationSummaryManager
-from myclaw.memory.manager import MemoryManager
-from myclaw.memory.records import SummaryEntry
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -24,7 +25,6 @@ from myclaw.provider.models import (
     ModelRoute,
     ModelUsage,
 )
-from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillLoader
 from myclaw.templates import render_template
 from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter

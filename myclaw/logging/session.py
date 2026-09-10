@@ -10,8 +10,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from myclaw.agent.session.session import Session
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.session.session import Session
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 _ROTATION_BYTES = 10_485_760

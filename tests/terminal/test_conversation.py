@@ -32,7 +32,14 @@ from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 
 import myclaw.terminal.cli as cli
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ForegroundConversationProjection
+from myclaw.agent.memory.dream import DreamResult
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
+from myclaw.agent.session.session import Session
+from myclaw.agent.tools.tool_gateway import (
+    ConfirmationDecision,
+    ConfirmationRequest,
+    ModelToolCall,
+)
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
@@ -42,7 +49,6 @@ from myclaw.management.commands import (
     ManagementCommandResult,
 )
 from myclaw.management.service import FatalManagementError, ManagementError
-from myclaw.memory.dream import DreamResult
 from myclaw.provider.models import (
     ModelCompleted,
     ModelContinuation,
@@ -51,7 +57,6 @@ from myclaw.provider.models import (
     ReasoningEffort,
     TextDelta,
 )
-from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.templates import render_template
 from myclaw.terminal.conversation import (
@@ -61,11 +66,6 @@ from myclaw.terminal.conversation import (
 )
 from myclaw.terminal.conversation import (
     _MessageBusRunProjection as _AgentRunProjection,
-)
-from myclaw.tools.tool_gateway import (
-    ConfirmationDecision,
-    ConfirmationRequest,
-    ModelToolCall,
 )
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.json_types import JsonObject

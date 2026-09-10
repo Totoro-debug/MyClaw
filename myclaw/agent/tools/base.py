@@ -26,7 +26,7 @@ from uuid import uuid4
 
 from loguru import logger
 
-from myclaw.tools.schema import Schema, ToolParam
+from myclaw.agent.tools.schema import Schema, ToolParam
 from myclaw.utils.validation import require_nonnegative_int
 
 _METADATA_NAMES = frozenset({"name", "description", "required", "parameters"})

@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from myclaw.agent.tools.tool_gateway import ModelToolCall
 from myclaw.config.config import ProviderConfiguration
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -19,7 +20,6 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.provider.openai_compatible import OpenAICompatibleProvider
-from myclaw.tools.tool_gateway import ModelToolCall
 
 READ_FILE_SCHEMA: dict[str, Any] = {
     "type": "function",

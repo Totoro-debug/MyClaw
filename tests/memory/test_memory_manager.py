@@ -4,15 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.config.agent_home import AgentHome
-from myclaw.memory.manager import MemoryManager, SummaryClaimError
-from myclaw.memory.records import SummaryEntry
-from myclaw.memory.store import (
+from myclaw.agent.memory.manager import MemoryManager, SummaryClaimError
+from myclaw.agent.memory.records import SummaryEntry
+from myclaw.agent.memory.store import (
     WorkspaceJsonlSummaryStore,
     WorkspaceLongTermMemoryStore,
     WorkspaceSummaryCursorStore,
 )
+from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.config.agent_home import AgentHome
 
 NOW = datetime(2026, 8, 27, 10, 0, tzinfo=timezone(timedelta(hours=8)))
 
@@ -149,7 +149,7 @@ async def test_manager_rejects_external_hard_linked_cursor(agent_home: Path) -> 
 
 
 def test_manager_module_has_no_execution_dependencies() -> None:
-    tree = ast.parse(Path("myclaw/memory/manager.py").read_text(encoding="utf-8"))
+    tree = ast.parse(Path("myclaw/agent/memory/manager.py").read_text(encoding="utf-8"))
     imported_names = {
         alias.name
         for node in ast.walk(tree)
@@ -166,7 +166,7 @@ def test_manager_module_has_no_execution_dependencies() -> None:
             (
                 "myclaw.agent.runner",
                 "myclaw.provider",
-                "myclaw.tools",
+                "myclaw.agent.tools",
                 "myclaw.schedule",
             )
         )

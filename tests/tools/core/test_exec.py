@@ -8,9 +8,9 @@ from typing import cast
 
 import pytest
 
-from myclaw.tools.core.exec import ExecTool
-from myclaw.tools.network_safety import DNSResolver
-from myclaw.tools.tool_gateway import (
+from myclaw.agent.tools.core.exec import ExecTool
+from myclaw.agent.tools.network_safety import DNSResolver
+from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
     ConfirmationRequester,

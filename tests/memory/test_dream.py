@@ -7,17 +7,17 @@ from pathlib import Path
 import pytest
 from markdown_it import MarkdownIt
 
+from myclaw.agent.memory.dream import Dream, DreamResult
+from myclaw.agent.memory.manager import MemoryManager
+from myclaw.agent.tools.tool_gateway import ModelToolCall
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
-from myclaw.memory.dream import Dream, DreamResult
-from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import AssistantModelMessage, ModelResponse, ModelUsage
 from myclaw.templates import render_template
-from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter
 from tests.fixtures.diagnostic_capture import capture_diagnostics

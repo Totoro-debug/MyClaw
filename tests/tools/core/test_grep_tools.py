@@ -8,9 +8,9 @@ from typing import cast
 
 import pytest
 
-from myclaw.tools.base import BaseTool
-from myclaw.tools.core.grep import GrepTool
-from myclaw.tools.tool_gateway import (
+from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.core.grep import GrepTool
+from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
     ConfirmationRequester,

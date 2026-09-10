@@ -5,11 +5,12 @@ from uuid import uuid4
 import pytest
 
 from myclaw.agent.loop import AgentLoop
+from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.tools.tool_gateway import ModelToolCall
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.memory.manager import MemoryManager
 from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -18,7 +19,6 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from myclaw.schedule.service import ScheduleService
-from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
     FakeClock,

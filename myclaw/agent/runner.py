@@ -11,6 +11,12 @@ from typing import Any, ClassVar, Literal, Protocol, cast
 
 from loguru import logger
 
+from myclaw.agent.tools.tool_gateway import (
+    ConfirmationRequester,
+    ModelToolCall,
+    ToolGateway,
+    ToolResult,
+)
 from myclaw.errors import TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
@@ -21,12 +27,6 @@ from myclaw.provider.models import (
     ModelUsage,
     ReasoningDelta,
     TextDelta,
-)
-from myclaw.tools.tool_gateway import (
-    ConfirmationRequester,
-    ModelToolCall,
-    ToolGateway,
-    ToolResult,
 )
 from myclaw.utils.validation import token_usage_validation_issue
 

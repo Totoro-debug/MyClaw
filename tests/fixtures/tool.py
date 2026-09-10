@@ -5,7 +5,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Annotated, cast
 
-from myclaw.tools.base import BaseTool, ToolParam
+from myclaw.agent.tools.base import BaseTool, ToolParam
 
 
 @dataclass(frozen=True, slots=True)

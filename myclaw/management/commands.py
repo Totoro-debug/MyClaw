@@ -8,6 +8,7 @@ from typing import Protocol
 
 from loguru import logger
 
+from myclaw.agent.memory.dream import DreamResult
 from myclaw.config.config import ConfigView
 from myclaw.logging.session import without_session_log
 from myclaw.management.service import (
@@ -18,7 +19,6 @@ from myclaw.management.service import (
     SessionListingEntry,
     SessionListingReport,
 )
-from myclaw.memory.dream import DreamResult
 from myclaw.provider.models import ReasoningEffort
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.utils.time import format_rfc3339_milliseconds
@@ -211,9 +211,7 @@ class ManagementCommandDispatcher:
                     skill_metadata=metadata,
                 )
             if parsed_command is not _CONFIG_COMMAND:
-                raise RuntimeError(
-                    f"Supported Management Command has no handler: {parsed_command}"
-                )
+                raise RuntimeError(f"Supported Management Command has no handler: {parsed_command}")
             try:
                 view = await management.config_view()
             except ManagementError as management_error:

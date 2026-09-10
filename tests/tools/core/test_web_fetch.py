@@ -9,15 +9,15 @@ from typing import ClassVar, Self, cast
 import pytest
 from aiohttp import ClientTimeout
 
-from myclaw.tools.core.web_fetch import (
+from myclaw.agent.tools.core.web_fetch import (
     HTTPClientBoundary,
     HTTPResponseBoundary,
     JinaReaderBoundary,
     JinaReaderClient,
     WebFetchTool,
 )
-from myclaw.tools.network_safety import DNSResolver
-from myclaw.tools.tool_gateway import (
+from myclaw.agent.tools.network_safety import DNSResolver
+from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
     ConfirmationRequester,
@@ -373,7 +373,7 @@ async def test_web_fetch_falls_back_after_jina_http_response(
     jina_response = FakeJinaHTTPResponse(status=status, content=content)
     FakeJinaHTTPSession.responses = [jina_response]
     monkeypatch.setattr(
-        "myclaw.tools.core.web_fetch.ClientSession",
+        "myclaw.agent.tools.core.web_fetch.ClientSession",
         FakeJinaHTTPSession,
     )
     resolver = FakeResolver(("93.184.216.34",))
@@ -428,7 +428,7 @@ async def test_web_fetch_requests_the_selected_jina_output_format(
     jina_response = FakeJinaHTTPResponse(status=200, content="Jina content")
     FakeJinaHTTPSession.responses = [jina_response]
     monkeypatch.setattr(
-        "myclaw.tools.core.web_fetch.ClientSession",
+        "myclaw.agent.tools.core.web_fetch.ClientSession",
         FakeJinaHTTPSession,
     )
     http = FakeHTTPClient(())
@@ -843,7 +843,7 @@ async def test_web_fetch_whole_call_timeout_is_bounded(monkeypatch: pytest.Monke
             await release.wait()
             return "never"
 
-    monkeypatch.setattr("myclaw.tools.core.web_fetch.TOTAL_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("myclaw.agent.tools.core.web_fetch.TOTAL_TIMEOUT_SECONDS", 0.01)
     resolver = FakeResolver(("93.184.216.34",))
     result = await _gateway(
         resolver=resolver,

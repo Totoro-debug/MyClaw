@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
 
-from myclaw.tools.base import BaseTool
-from myclaw.tools.core.tool_search import ToolSearchTool
-from myclaw.tools.search import (
+from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.core.tool_search import ToolSearchTool
+from myclaw.agent.tools.search import (
     BUILTIN_TOOL_SEARCH_KEYWORDS,
     ToolSearchDocument,
     ToolSearchIndex,
 )
-from myclaw.tools.tool_gateway import ToolGateway
+from myclaw.agent.tools.tool_gateway import ToolGateway
 
 RUN_BASELINE_TOOL_NAMES: tuple[str, ...] = (
     "read_file",

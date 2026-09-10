@@ -9,6 +9,7 @@ from math import isfinite
 from types import MappingProxyType
 from typing import Any, Final, Protocol, cast
 
+from myclaw.agent.tools.tool_gateway import ModelToolCall
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorCode, ErrorInfo
 from myclaw.provider.errors import EmptyModelResponseError, ModelCallError
@@ -27,7 +28,6 @@ from myclaw.provider.models import (
     last_assistant_message_index,
     require_tool_call_sequence,
 )
-from myclaw.tools.tool_gateway import ModelToolCall
 
 _REASONING_EFFORT_MAP: Final[Mapping[ReasoningEffort, str]] = MappingProxyType(
     {

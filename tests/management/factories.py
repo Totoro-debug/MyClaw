@@ -4,14 +4,14 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from myclaw.agent.memory.dream import DreamResult
+from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.management.service import (
     ManagementViewService,
     RuntimeStatusInput,
 )
-from myclaw.memory.dream import DreamResult
-from myclaw.memory.manager import MemoryManager
 from myclaw.provider.models import ReasoningEffort
 from myclaw.skills.catalog import SkillMetadata
 

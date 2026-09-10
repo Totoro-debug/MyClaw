@@ -14,12 +14,18 @@ from loguru import logger
 from mcp.types import CallToolResult
 
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
+from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.session.session import Session
+from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.core.web_fetch import JinaReaderClient
+from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES
+from myclaw.agent.tools.mcp import MCPTool, MCPToolSpec
+from myclaw.agent.tools.tool_gateway import ModelToolCall
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import ErrorInfo
-from myclaw.memory.manager import MemoryManager
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
@@ -32,13 +38,7 @@ from myclaw.provider.models import (
     ReasoningEffort,
 )
 from myclaw.schedule.service import ScheduleService
-from myclaw.session.session import Session
 from myclaw.templates import render_template
-from myclaw.tools.base import BaseTool
-from myclaw.tools.core.web_fetch import JinaReaderClient
-from myclaw.tools.deferred import RUN_BASELINE_TOOL_NAMES
-from myclaw.tools.mcp import MCPTool, MCPToolSpec
-from myclaw.tools.tool_gateway import ModelToolCall
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import TaskFramingRouterAdapter, collect_foreground_outbound
 from tests.fixtures.provider import ProviderCall
@@ -656,7 +656,7 @@ async def test_agent_loop_tool_failure_keeps_private_diagnostics_out_of_public_o
                 [OSError(f"query={query}"), ValueError("auth=PRIVATE_WEB_CREDENTIAL")],
             )
 
-    monkeypatch.setattr("myclaw.tools.core.web_search.DDGS", FailingDDGS)
+    monkeypatch.setattr("myclaw.agent.tools.core.web_search.DDGS", FailingDDGS)
     provider = _FixedCatalogProvider(
         (
             _response(

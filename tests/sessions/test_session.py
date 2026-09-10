@@ -8,8 +8,8 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -249,7 +249,7 @@ async def test_persist_retries_a_transient_write_with_async_backoff(
         delays.append(delay)
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_twice_then_replace)
-    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", immediate_backoff)
+    monkeypatch.setattr("myclaw.agent.session.session.asyncio.sleep", immediate_backoff)
 
     session.persist()
     await yield_once(0)
@@ -283,7 +283,7 @@ async def test_persist_retries_each_snapshot_before_starting_the_next_snapshot(
         return
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_first_snapshot_twice)
-    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", immediate_backoff)
+    monkeypatch.setattr("myclaw.agent.session.session.asyncio.sleep", immediate_backoff)
 
     session.persist()
     session.add_message("user", "Second snapshot")
@@ -326,7 +326,7 @@ async def test_pending_persist_waiter_cancellation_does_not_cancel_snapshots(
         await release_backoff.wait()
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_once_then_replace)
-    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", blocked_backoff)
+    monkeypatch.setattr("myclaw.agent.session.session.asyncio.sleep", blocked_backoff)
 
     session.persist()
     await first_write_failed.wait()
@@ -397,7 +397,7 @@ async def test_pending_persist_wait_drains_snapshot_queued_while_waiting(
         await release_backoff.wait()
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_once_then_replace)
-    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", blocked_backoff)
+    monkeypatch.setattr("myclaw.agent.session.session.asyncio.sleep", blocked_backoff)
 
     session.persist()
     await first_write_failed.wait()
@@ -433,7 +433,7 @@ async def test_pending_persist_wait_converges_with_concurrent_abandon(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_write)
-    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", blocked_backoff)
+    monkeypatch.setattr("myclaw.agent.session.session.asyncio.sleep", blocked_backoff)
 
     session.persist()
     await backoff_started.wait()
@@ -475,7 +475,7 @@ async def test_abandon_cancels_every_pending_snapshot_when_latest_has_not_starte
             raise
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_first_write)
-    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", blocked_backoff)
+    monkeypatch.setattr("myclaw.agent.session.session.asyncio.sleep", blocked_backoff)
 
     session.persist()
     await yield_once(0)
@@ -526,7 +526,7 @@ async def test_close_wins_against_an_old_async_snapshot_in_backoff(
         await release_backoff.wait()
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_async_then_save_sync)
-    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", blocked_backoff)
+    monkeypatch.setattr("myclaw.agent.session.session.asyncio.sleep", blocked_backoff)
 
     session.persist()
     await yield_once(0)
@@ -623,7 +623,7 @@ async def test_ordinary_persist_failure_is_silent_and_a_later_persist_is_indepen
         return
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_replace)
-    monkeypatch.setattr("myclaw.session.session.asyncio.sleep", immediate_backoff)
+    monkeypatch.setattr("myclaw.agent.session.session.asyncio.sleep", immediate_backoff)
     session.persist()
     await yield_once(0)
     assert len(attempts) == 3
@@ -680,7 +680,7 @@ def test_close_retries_latest_snapshot_with_bounded_delays(
         replace(target, content)
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_twice_then_replace)
-    monkeypatch.setattr("myclaw.session.session.time.sleep", sleeps.append)
+    monkeypatch.setattr("myclaw.agent.session.session.time.sleep", sleeps.append)
 
     session.close()
 
@@ -705,7 +705,7 @@ def test_close_swallows_failure_after_three_attempts(
         raise OSError("permanent snapshot failure")
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", fail_replace)
-    monkeypatch.setattr("myclaw.session.session.time.sleep", sleeps.append)
+    monkeypatch.setattr("myclaw.agent.session.session.time.sleep", sleeps.append)
 
     session.close()
 
@@ -746,7 +746,7 @@ async def test_close_supersedes_queued_persist_and_refreshes_each_attempt_timest
         replace(target, content)
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_replace)
-    monkeypatch.setattr("myclaw.session.session.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("myclaw.agent.session.session.time.sleep", lambda _delay: None)
 
     session.persist()
     session.close()

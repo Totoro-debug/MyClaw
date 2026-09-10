@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pytest
 
+from myclaw.agent.memory.dream import Dream, DreamResult
+from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
-from myclaw.memory.dream import Dream, DreamResult
-from myclaw.memory.manager import MemoryManager
 from myclaw.provider.models import AssistantModelMessage, ModelResponse, ModelUsage
 from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.service import ScheduleService

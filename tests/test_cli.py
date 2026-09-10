@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 import myclaw.terminal.cli as cli
 from myclaw.agent.loop import ModelContextOverflowError, TerminalAgentLoopControl
 from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.session.session import Session
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
@@ -28,7 +29,6 @@ from myclaw.management.service import (
     ManagementViewService,
     ResumeResult,
 )
-from myclaw.session.session import Session
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.conversation import TerminalConversationApp
 from myclaw.utils.time import local_now
@@ -1405,7 +1405,12 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
             assert rejected.abort_calls == 1
             assert rejected.start_calls == rejected.close_calls == 0
             for destructive_event in (
-                "quiesce", "schedule_pause", "old_abort", "bus_reset", "rebind", "target_start"
+                "quiesce",
+                "schedule_pause",
+                "old_abort",
+                "bus_reset",
+                "rebind",
+                "target_start",
             ):
                 assert destructive_event not in events
             assert user_executor is not None

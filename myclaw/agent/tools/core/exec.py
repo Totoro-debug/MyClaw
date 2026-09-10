@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Annotated, Final, Protocol
 from urllib.parse import urlsplit
 
-from myclaw.tools.base import BaseTool, ToolError, ToolParam, truncate_text
-from myclaw.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
+from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam, truncate_text
+from myclaw.agent.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
 
 _BASH: Final[str] = "bash"

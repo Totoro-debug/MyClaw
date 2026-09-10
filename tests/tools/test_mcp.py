@@ -18,10 +18,9 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, ImageContent, TextContent, Tool
 from pydantic import ValidationError
 
-import myclaw.tools.mcp as mcp_adapter
-from myclaw.config.config import MCPServerConfiguration
-from myclaw.tools.base import ToolError
-from myclaw.tools.mcp import (
+import myclaw.agent.tools.mcp as mcp_adapter
+from myclaw.agent.tools.base import ToolError
+from myclaw.agent.tools.mcp import (
     MCPServerConnection,
     MCPTool,
     MCPToolSchemaError,
@@ -30,7 +29,8 @@ from myclaw.tools.mcp import (
     mcp_tool_spec_from_remote,
     normalize_nullable,
 )
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
+from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolGateway
+from myclaw.config.config import MCPServerConfiguration
 from tests.fixtures.gateway import SingleToolGateway
 from tests.fixtures.mcp_wire import (
     http_wire_server,

@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from myclaw.tools.base import BaseTool
-from myclaw.tools.core.glob import GlobTool
-from myclaw.tools.core.list_dir import ListDirTool
-from myclaw.tools.tool_gateway import (
+from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.core.glob import GlobTool
+from myclaw.agent.tools.core.list_dir import ListDirTool
+from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
     ConfirmationRequester,

@@ -10,9 +10,9 @@ from typing import cast
 
 import pytest
 
-from myclaw.tools.base import ToolError
-from myclaw.tools.core.tool_search import ToolSearchTool
-from myclaw.tools.search import (
+from myclaw.agent.tools.base import ToolError
+from myclaw.agent.tools.core.tool_search import ToolSearchTool
+from myclaw.agent.tools.search import (
     BM25_B,
     BM25_K1,
     BUILTIN_TOOL_SEARCH_KEYWORDS,

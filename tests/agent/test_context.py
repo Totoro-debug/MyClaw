@@ -15,8 +15,8 @@ import pytest
 import myclaw.agent.context as context
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
+from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.memory.manager import MemoryManager
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
     SkillLoader,
@@ -420,9 +420,7 @@ def test_foreground_projection_scope_restores_nested_and_published_skills(
             else nullcontext()
         ):
             with builder.foreground_projection_scope(snapshots[1]):
-                assert (
-                    builder.build_status_messages([], session_id="session-id") == projections[1]
-                )
+                assert builder.build_status_messages([], session_id="session-id") == projections[1]
                 if exit_error is not None:
                     raise exit_error("inner scope exit")
 
@@ -471,9 +469,7 @@ def test_foreground_projection_scope_isolates_different_context_builders(
     assert scoped_projection != published_projection
 
     with first_builder.foreground_projection_scope(scoped_skills):
-        assert (
-            first_builder.build_status_messages([], session_id="session-id") == scoped_projection
-        )
+        assert first_builder.build_status_messages([], session_id="session-id") == scoped_projection
         assert (
             second_builder.build_status_messages([], session_id="session-id")
             == published_projection

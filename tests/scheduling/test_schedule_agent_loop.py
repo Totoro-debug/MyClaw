@@ -17,15 +17,18 @@ import pytest
 import myclaw.agent.context as context
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import AgentLoop
+from myclaw.agent.memory.conversation_summary import ConversationSummaryManager
+from myclaw.agent.memory.dream import Dream
+from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult
+from myclaw.agent.session.session import Session, SessionStoragePartition
+from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES
+from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.management.commands import ManagementCommandDispatcher
-from myclaw.memory.conversation_summary import ConversationSummaryManager
-from myclaw.memory.dream import Dream
-from myclaw.memory.manager import MemoryManager
 from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -39,10 +42,7 @@ from myclaw.provider.models import (
 from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.service import ScheduleClock, ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
-from myclaw.session.session import Session, SessionStoragePartition
 from myclaw.templates import render_template
-from myclaw.tools.deferred import RUN_BASELINE_TOOL_NAMES
-from myclaw.tools.tool_gateway import ModelToolCall, ToolGateway
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import (
     FakeClock,

@@ -8,10 +8,10 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+from myclaw.agent.tools.base import BaseTool, ToolError
+from myclaw.agent.tools.schema import Schema
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleService, ScheduleStaleRemovalError
-from myclaw.tools.base import BaseTool, ToolError
-from myclaw.tools.schema import Schema
 from myclaw.utils.validation import require_uuid4_string
 
 _INVALID_ARGUMENTS = "Invalid arguments for schedule."

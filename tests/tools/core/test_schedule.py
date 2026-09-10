@@ -7,12 +7,12 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.tools.core.schedule import ScheduleTool
+from myclaw.agent.tools.tool_gateway import ModelToolCall
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import WorkspaceScheduleStore
-from myclaw.tools.core.schedule import ScheduleTool
-from myclaw.tools.tool_gateway import ModelToolCall
 from tests.fixtures import SingleToolGateway, write_schedule_state
 
 JOB_UUID = UUID("550e8400-e29b-41d4-a716-446655440000")

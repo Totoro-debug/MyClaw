@@ -13,22 +13,22 @@ from uuid import UUID, uuid4
 
 from loguru import logger
 
-from myclaw.schedule.service import ScheduleService
-from myclaw.tools.base import (
+from myclaw.agent.tools.base import (
     ArtifactReference,
     BaseTool,
     ToolError,
 )
-from myclaw.tools.core.edit_file import EditFileTool
-from myclaw.tools.core.exec import ExecTool
-from myclaw.tools.core.glob import GlobTool
-from myclaw.tools.core.grep import GrepTool
-from myclaw.tools.core.list_dir import ListDirTool
-from myclaw.tools.core.read_file import ReadFileTool
-from myclaw.tools.core.schedule import ScheduleTool
-from myclaw.tools.core.web_fetch import WebFetchTool
-from myclaw.tools.core.web_search import WebSearchTool
-from myclaw.tools.core.write_file import WriteFileTool
+from myclaw.agent.tools.core.edit_file import EditFileTool
+from myclaw.agent.tools.core.exec import ExecTool
+from myclaw.agent.tools.core.glob import GlobTool
+from myclaw.agent.tools.core.grep import GrepTool
+from myclaw.agent.tools.core.list_dir import ListDirTool
+from myclaw.agent.tools.core.read_file import ReadFileTool
+from myclaw.agent.tools.core.schedule import ScheduleTool
+from myclaw.agent.tools.core.web_fetch import WebFetchTool
+from myclaw.agent.tools.core.web_search import WebSearchTool
+from myclaw.agent.tools.core.write_file import WriteFileTool
+from myclaw.schedule.service import ScheduleService
 from myclaw.utils.validation import require_uuid4
 
 type ConfirmationDecision = Literal["approved", "declined"]

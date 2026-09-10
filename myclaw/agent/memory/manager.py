@@ -6,14 +6,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.memory.records import SummaryEntry
-from myclaw.memory.store import (
+from myclaw.agent.memory.records import SummaryEntry
+from myclaw.agent.memory.store import (
     MemoryPathDeniedError,
     WorkspaceJsonlSummaryStore,
     WorkspaceLongTermMemoryStore,
     WorkspaceSummaryCursorStore,
 )
+from myclaw.agent.workspace_state import WorkspaceState
 
 
 @dataclass(frozen=True, slots=True)

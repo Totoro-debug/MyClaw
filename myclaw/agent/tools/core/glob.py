@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated
 
-from myclaw.tools.base import BaseTool, ToolError, ToolParam
-from myclaw.tools.core._directory import (
+from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.agent.tools.core._directory import (
     iter_directory_entries,
     matches_glob_pattern,
     normalize_glob_pattern,

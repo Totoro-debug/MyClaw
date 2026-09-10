@@ -87,15 +87,18 @@ _ISSUE_202_FORBIDDEN_MODULES = (
     "myclaw.agent.runtime",
     "myclaw.agent.workspace",
     "myclaw.memory.memory_scheduler",
+    "myclaw.agent.memory.memory_scheduler",
 )
 _ISSUE_202_FORBIDDEN_PARENT_IMPORTS = {
     "myclaw.agent": {"runtime", "workspace"},
     "myclaw.memory": {"memory_scheduler"},
+    "myclaw.agent.memory": {"memory_scheduler"},
 }
 
 _STANDARDS_2_3_FORBIDDEN_MODULES = (
     "myclaw.agent.repl",
     "myclaw.memory.memory_task",
+    "myclaw.agent.memory.memory_task",
     "myclaw.terminal.repl",
 )
 _STANDARDS_2_3_FORBIDDEN_NAMES = {
@@ -505,7 +508,9 @@ def test_clean_distributions_omit_deleted_agent_module_and_import_cleanly(
         "myclaw/agent/runtime.py",
         "myclaw/agent/repl.py",
         "myclaw/memory/memory_task.py",
+        "myclaw/agent/memory/memory_task.py",
         "myclaw/session/projection.py",
+        "myclaw/agent/session/projection.py",
         "myclaw/terminal/repl.py",
     )
     for deleted_module in deleted_modules:
@@ -547,11 +552,17 @@ def test_clean_distributions_omit_deleted_agent_module_and_import_cleanly(
                 "    'myclaw.agent.runtime',\n"
                 "    'myclaw.agent.repl',\n"
                 "    'myclaw.memory.memory_task',\n"
+                "    'myclaw.agent.memory.memory_task',\n"
                 "    'myclaw.session." + "projection',\n"
+                "    'myclaw.agent.session." + "projection',\n"
                 "    'myclaw.terminal.repl',\n"
                 ")\n"
                 "for legacy_module in legacy_modules:\n"
-                "    assert importlib.util.find_spec(legacy_module) is None\n"
+                "    try:\n"
+                "        spec = importlib.util.find_spec(legacy_module)\n"
+                "    except ModuleNotFoundError:\n"
+                "        spec = None\n"
+                "    assert spec is None\n"
                 "    try:\n"
                 "        importlib.import_module(legacy_module)\n"
                 "    except ModuleNotFoundError:\n"
@@ -727,7 +738,7 @@ def test_mcp_release_contract_excludes_out_of_scope_runtime_surfaces() -> None:
     production = "\n".join(
         path.read_text(encoding="utf-8") for path in sorted((ROOT / "myclaw").rglob("*.py"))
     )
-    gateway = (ROOT / "myclaw" / "tools" / "tool_gateway.py").read_text(encoding="utf-8")
+    gateway = (ROOT / "myclaw" / "agent" / "tools" / "tool_gateway.py").read_text(encoding="utf-8")
 
     for removed_name in (
         "PreparedToolCall",
@@ -810,7 +821,7 @@ def test_issue_202_architecture_claims_match_source_ast_contracts() -> None:
     } == {"set_inbound_changed_callback", "unbind_inbound_changed_callback"}
 
     memory_manager = _issue_202_class(
-        _issue_202_ast(ROOT / "myclaw" / "memory" / "manager.py"),
+        _issue_202_ast(ROOT / "myclaw" / "agent" / "memory" / "manager.py"),
         "MemoryManager",
     )
     assert _issue_202_method_names(memory_manager) == {
@@ -823,7 +834,7 @@ def test_issue_202_architecture_claims_match_source_ast_contracts() -> None:
     }
 
     dream = _issue_202_class(
-        _issue_202_ast(ROOT / "myclaw" / "memory" / "dream.py"),
+        _issue_202_ast(ROOT / "myclaw" / "agent" / "memory" / "dream.py"),
         "Dream",
     )
     assert _issue_202_parameter_names(_issue_202_function(dream, "__init__")) == (
@@ -908,9 +919,7 @@ def test_issue_202_cli_source_records_cutover_and_shutdown_order() -> None:
         _issue_202_attribute_call_lines(final_tree, "schedule_service", "close")
     )
     mcp_close_line = min(_issue_202_attribute_call_lines(final_tree, "mcp_manager", "close"))
-    assert all(
-        schedule_close_line < line < mcp_close_line for line in (*close_lines, *abort_lines)
-    )
+    assert all(schedule_close_line < line < mcp_close_line for line in (*close_lines, *abort_lines))
     shutdown_events = (
         min(_issue_202_attribute_call_lines(final_tree, "management", "deactivate")),
         min(_issue_202_attribute_call_lines(final_tree, "schedule_service", "pause_and_drain")),
@@ -983,7 +992,7 @@ def test_issue_202_active_stale_symbol_scan_is_precise_and_empty() -> None:
         "def read_body(): pass\n"
         "import myclaw.agent.runtime as legacy_runtime\n"
         "from myclaw.agent import workspace\n"
-        "from myclaw.memory.memory_scheduler import MemoryTaskScheduler\n"
+        "from myclaw.agent.memory.memory_scheduler import MemoryTaskScheduler\n"
     )
     stale_fixture_findings = _issue_202_stale_symbol_findings(
         stale_fixture,
@@ -996,6 +1005,7 @@ def test_issue_202_active_stale_symbol_scan_is_precise_and_empty() -> None:
     assert not (ROOT / "myclaw" / "agent" / "workspace.py").exists()
     legacy_scheduler_module = "_".join(("memory", "scheduler"))
     assert not (ROOT / "myclaw" / "memory" / f"{legacy_scheduler_module}.py").exists()
+    assert not (ROOT / "myclaw" / "agent" / "memory" / f"{legacy_scheduler_module}.py").exists()
 
 
 def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
@@ -1028,13 +1038,17 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
         path = ROOT.joinpath(*module.split(".")).with_suffix(".py")
         if path.exists():
             violations.append(f"{path.relative_to(ROOT).as_posix()}: deleted module exists")
-        if importlib.util.find_spec(module) is not None:
+        try:
+            spec = importlib.util.find_spec(module)
+        except ModuleNotFoundError:
+            spec = None
+        if spec is not None:
             violations.append(f"{module}: deleted module is discoverable")
 
     assert violations == []
 
     conversation_summary = _issue_202_class(
-        _issue_202_ast(ROOT / "myclaw" / "memory" / "conversation_summary.py"),
+        _issue_202_ast(ROOT / "myclaw" / "agent" / "memory" / "conversation_summary.py"),
         "ConversationSummaryManager",
     )
     summary_init = _issue_202_direct_method(conversation_summary, "__init__")
@@ -1106,7 +1120,7 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
     assert "bus" not in _issue_202_method_names(agent_loop)
 
     summary_store = _issue_202_class(
-        _issue_202_ast(ROOT / "myclaw" / "memory" / "store.py"),
+        _issue_202_ast(ROOT / "myclaw" / "agent" / "memory" / "store.py"),
         "WorkspaceJsonlSummaryStore",
     )
     assert "append_summary" not in _issue_202_method_names(summary_store)

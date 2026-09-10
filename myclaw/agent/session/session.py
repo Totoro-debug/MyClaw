@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any, Self, cast
 from uuid import UUID, uuid4
 
+from myclaw.agent.tools.base import ArtifactReference
 from myclaw.agent.workspace_state import WorkspaceState
-from myclaw.tools.base import ArtifactReference
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from myclaw.utils.time import format_rfc3339_milliseconds, local_now
