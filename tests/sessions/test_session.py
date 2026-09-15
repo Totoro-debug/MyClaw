@@ -88,6 +88,7 @@ def test_create_starts_a_memory_only_session_with_private_identity_generation(
     assert session.metadata == {
         "title": "Untitled session",
         "token_usage": ZERO_USAGE,
+        "summary": "",
     }
     assert session.last_compacted == 0
     assert not (state.sessions_directory / f"{session.session_id}.jsonl").exists()
@@ -159,6 +160,7 @@ async def test_persist_writes_one_complete_compact_utf8_snapshot_atomically(
         new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
     )
     session.add_message("user", "请读取 README。", extension={"nested": ["value"]})
+    session.update_metadata(summary="- Read the README.")
     replacements: list[tuple[Path, bytes]] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
 
@@ -176,7 +178,7 @@ async def test_persist_writes_one_complete_compact_utf8_snapshot_atomically(
         '"last_compacted":0,'
         '"metadata":{"title":"Untitled session",'
         '"token_usage":{"model_calls":0,"input_tokens":0,'
-        '"output_tokens":0,"total_tokens":0}}}\n'
+        '"output_tokens":0,"total_tokens":0},"summary":"- Read the README."}}\n'
         '{"role":"user","content":"请读取 README。",'
         '"timestamp":"2026-07-11T15:30:13.123+08:00",'
         '"extension":{"nested":["value"]}}\n'
@@ -191,7 +193,9 @@ async def test_persist_writes_one_complete_compact_utf8_snapshot_atomically(
     assert replacements == [(path, expected)]
     assert raw == expected
     assert b"\xe8\xaf\xb7\xe8\xaf\xbb" in raw
-    assert Session.load(state, SESSION_ID).messages == session.messages
+    loaded = Session.load(state, SESSION_ID)
+    assert loaded.metadata["summary"] == "- Read the README."
+    assert loaded.messages == session.messages
 
 
 @pytest.mark.asyncio
@@ -1609,6 +1613,7 @@ def test_update_metadata_normalizes_title_shallow_merges_and_accumulates_usage(
             "output_tokens": 5,
             "total_tokens": 25,
         },
+        "summary": "",
         "future": {"nested": ["before"]},
     }
 
@@ -1794,8 +1799,44 @@ def test_load_current_five_field_jsonl_preserves_json_native_extensions(
     assert loaded.created_at == CREATED_AT
     assert loaded.updated_at == UPDATED_AT
     assert loaded.last_compacted == 2
-    assert loaded.metadata == header["metadata"]
+    assert loaded.metadata == {**header["metadata"], "summary": ""}
     assert loaded.messages == messages
+
+
+def test_update_metadata_rejects_a_non_string_action_summary(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    before = copy.deepcopy(session.metadata)
+
+    with pytest.raises(ValueError, match=r"metadata\.summary must be a string"):
+        session.update_metadata(summary=123)
+
+    assert session.metadata == before
+
+
+def test_load_rejects_a_non_string_action_summary(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    _write_jsonl(
+        state,
+        [
+            _header(
+                metadata={
+                    "title": "Project review",
+                    "token_usage": dict(ZERO_USAGE),
+                    "summary": 123,
+                }
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match=r"metadata\.summary must be a string"):
+        Session.load(state, SESSION_ID)
 
 
 def test_load_canonicalizes_a_valid_blackboard_metadata_value(

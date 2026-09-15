@@ -918,6 +918,47 @@ def test_context_builder_builds_title_and_status_minimal_messages(
     assert history == original_history
 
 
+def test_context_builder_injects_action_summary_after_system_for_each_lane(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    builder = _builder(monkeypatch, workspace, "UTC")
+    history: list[dict[str, Any]] = [
+        {"role": "user", "content": "Earlier"},
+        {
+            "role": "assistant",
+            "content": "Answer",
+            "tool_calls": [],
+            "status": "completed",
+        },
+    ]
+    summary = "- Updated the conversation compaction flow."
+
+    foreground = builder.build_foreground_messages(
+        [*history, {"role": "user", "content": "Current"}],
+        session_id="session-id",
+        summary=summary,
+    )
+    schedule = builder.build_schedule_messages(
+        [*history, {"role": "user", "content": "Current"}],
+        session_id="session-id",
+        summary=summary,
+    )
+    status = builder.build_status_messages(history, session_id="session-id", summary=summary)
+
+    for projected in (foreground, schedule, status):
+        assert projected[1] == {"role": "user", "content": summary}
+        assert projected[2]["content"] == "Earlier"
+
+    without_summary = builder.build_foreground_messages(
+        history,
+        session_id="session-id",
+        summary="",
+    )
+    assert len(without_summary) == 3
+    assert without_summary[1]["content"] != summary
+
+
 def test_runtime_lane_projections_keep_current_turn_continuation_separate(
     monkeypatch: pytest.MonkeyPatch,
     workspace: Path,

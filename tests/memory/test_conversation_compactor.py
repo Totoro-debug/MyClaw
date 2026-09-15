@@ -276,7 +276,9 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
 ) -> None:
     state = _state(workspace)
     session = _session_with_history(state)
-    provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
+    provider = ScriptedFakeProvider(
+        completions=(_response("First turn summary."), _response("None"))
+    )
     memory_manager = MemoryManager(state)
 
     prepared = await _prepare_compaction(provider, memory_manager, session)
@@ -289,10 +291,10 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
         "Current question.",
     ]
     assert session.metadata["token_usage"] == {
-        "model_calls": 3,
-        "input_tokens": 28,
-        "output_tokens": 9,
-        "total_tokens": 37,
+        "model_calls": 4,
+        "input_tokens": 48,
+        "output_tokens": 14,
+        "total_tokens": 62,
     }
     request = provider.complete_requests[0]
     compaction_input = request.messages[1]["content"]
@@ -302,6 +304,44 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
     assert "Second question." not in compaction_input
     assert "future_field" not in compaction_input
     assert (await _claimed_entries(memory_manager))[0].content == "First turn summary."
+
+
+@pytest.mark.asyncio
+async def test_compaction_generates_fact_and_action_summaries_from_one_selected_payload(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = _session_with_history(state)
+    provider = ScriptedFakeProvider(
+        completions=(
+            _response("First turn summary."),
+            _response("- Updated the compaction flow."),
+        )
+    )
+    memory_manager = MemoryManager(state)
+
+    await _prepare_compaction(provider, memory_manager, session)
+
+    assert len(provider.complete_requests) == 2
+    fact_request, action_request = provider.complete_requests
+    assert fact_request.tools == action_request.tools == ()
+    assert fact_request.messages[1] == action_request.messages[1]
+    assert fact_request.messages[0] == {
+        "role": "system",
+        "content": render_template("conversation-compaction-system-prompt.md"),
+    }
+    assert action_request.messages[0] == {
+        "role": "system",
+        "content": render_template("conversation-summary-system-prompt.md"),
+    }
+    assert session.metadata["summary"] == "- Updated the compaction flow."
+    assert session.last_compacted == 2
+    assert [entry.content for entry in await _claimed_entries(memory_manager)] == [
+        "First turn summary."
+    ]
+    assert all(
+        message.get("content") != "- Updated the compaction flow." for message in session.messages
+    )
 
 
 @pytest.mark.asyncio
@@ -321,7 +361,9 @@ async def test_summary_candidate_includes_current_user_without_publishing_it(
         projected_inputs.append(deepcopy(list(messages)))
         return _project_messages(list(messages), system_prompt="CHAT SYSTEM")
 
-    provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
+    provider = ScriptedFakeProvider(
+        completions=(_response("First turn summary."), _response("None"))
+    )
     memory_manager = MemoryManager(state)
     manager = ConversationCompactor(
         provider=ScriptedFakeRouter(provider),
@@ -362,7 +404,9 @@ async def test_token_budget_summarizes_roughly_half_the_available_input(
     session.add_message("user", second_question)
     _add_assistant(session, second_answer)
     session.add_message("user", "Current question.")
-    provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
+    provider = ScriptedFakeProvider(
+        completions=(_response("First turn summary."), _response("None"))
+    )
 
     await _prepare_compaction(
         provider,
@@ -398,7 +442,9 @@ async def test_repeated_summary_preparation_advances_last_compacted_once_per_sum
     provider = ScriptedFakeProvider(
         completions=(
             _response("Summary one."),
+            _response("- Completed the first task."),
             _response("Summary two."),
+            _response("- Completed the second task."),
         )
     )
     memory_manager = MemoryManager(state)
@@ -415,11 +461,12 @@ async def test_repeated_summary_preparation_advances_last_compacted_once_per_sum
     assert second is session
     assert first_position == 2
     assert second.last_compacted == 4
+    assert session.metadata["summary"] == "- Completed the second task."
     assert [(entry.index, entry.content) for entry in await _claimed_entries(memory_manager)] == [
         (1, "Summary one."),
         (2, "Summary two."),
     ]
-    second_request = provider.complete_requests[1]
+    second_request = provider.complete_requests[2]
     compaction_input = second_request.messages[1]["content"]
     assert isinstance(compaction_input, str)
     assert "Question one." not in compaction_input
@@ -483,7 +530,7 @@ async def test_system_prompt_budget_keeps_raw_prompt_boundary(
 ) -> None:
     state = _state(workspace)
     session = _session_with_history(state)
-    provider = ScriptedFakeProvider(completions=(_response("Boundary summary."),))
+    provider = ScriptedFakeProvider(completions=(_response("Boundary summary."), _response("None")))
     memory_manager = MemoryManager(state)
 
     await _prepare_compaction(
@@ -621,7 +668,9 @@ async def test_complete_tool_schema_cost_triggers_summary_compression(
         session.add_message("user", "Question: " + "u" * 300)
         _add_assistant(session, "Answer: " + "a" * 300)
         session.add_message("user", "Current question.")
-    provider = ScriptedFakeProvider(completions=(_response("Tool-aware summary."),))
+    provider = ScriptedFakeProvider(
+        completions=(_response("Tool-aware summary."), _response("None"))
+    )
 
     await _prepare_compaction(
         provider,
@@ -708,7 +757,12 @@ async def test_complete_tool_schema_cost_is_reserved_when_selecting_cutoff(
             _add_assistant(session, f"Answer {index}: " + "a" * 300)
         session.add_message("user", "Current question.")
     provider = ScriptedFakeProvider(
-        completions=(_response("Plain summary."), _response("Tool summary."))
+        completions=(
+            _response("Plain summary."),
+            _response("None"),
+            _response("Tool summary."),
+            _response("None"),
+        )
     )
     memory_manager = MemoryManager(state)
 
@@ -751,6 +805,29 @@ async def test_summary_provider_failure_preserves_user_visible_model_error(
     assert raised.value.error.message == "PRIVATE FAILURE"
     assert session.last_compacted == 0
     assert not (state.memory_directory / "summary.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_action_summary_failure_keeps_previous_session_state_after_fact_append(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = _session_with_history(state)
+    session.update_metadata(summary="Previous action summary.")
+    failure = ModelCallError(ErrorInfo(code="model_failed", message="ACTION FAILURE"))
+    provider = ScriptedFakeProvider(completions=(_response("First turn summary."), failure))
+    memory_manager = MemoryManager(state)
+
+    with pytest.raises(ModelCallError) as raised:
+        await _prepare_compaction(provider, memory_manager, session)
+
+    assert raised.value.error.code == "model_failed"
+    assert raised.value.error.message == "ACTION FAILURE"
+    assert session.last_compacted == 0
+    assert session.metadata["summary"] == "Previous action summary."
+    assert [entry.content for entry in await _claimed_entries(memory_manager)] == [
+        "First turn summary."
+    ]
 
 
 @pytest.mark.asyncio
@@ -832,7 +909,9 @@ async def test_token_cutoff_excludes_schedule_continuation_from_history_budget(
             "content": "Current tool result.",
         },
     ]
-    provider = ScriptedFakeProvider(completions=(_response("Scheduled summary."),))
+    provider = ScriptedFakeProvider(
+        completions=(_response("Scheduled summary."), _response("None"))
+    )
     memory_manager = MemoryManager(state)
     context_builder = _schedule_context_builder(workspace, memory_manager)
 
@@ -907,7 +986,7 @@ async def test_cutoff_keeps_retained_suffix_at_user_boundary(
             session.add_message(role, content)
         else:
             _add_assistant(session, content)
-    provider = ScriptedFakeProvider(completions=(_response("Aligned summary."),))
+    provider = ScriptedFakeProvider(completions=(_response("Aligned summary."), _response("None")))
     memory_manager = MemoryManager(state)
 
     await _prepare_compaction(
@@ -1040,7 +1119,9 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
         memory_manager=memory_manager,
         skill_loader=skill_loader,
     )
-    provider = ScriptedFakeProvider(completions=(_response("Summary without Blackboard."),))
+    provider = ScriptedFakeProvider(
+        completions=(_response("Summary without Blackboard."), _response("None"))
+    )
     projected_calls: list[list[dict[str, Any]]] = []
 
     def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1234,7 +1315,7 @@ async def test_summary_projects_owned_message_shapes_without_mutating_session(
     _add_assistant(session, "Final answer.")
     session.add_message("user", "Current question.")
     original_messages = deepcopy(session.messages)
-    provider = ScriptedFakeProvider(completions=(_response("Summary."),))
+    provider = ScriptedFakeProvider(completions=(_response("Summary."), _response("None")))
 
     await _prepare_compaction(
         provider,
@@ -1280,7 +1361,7 @@ async def test_summary_fences_escape_dynamic_markdown_delimiters_without_changin
     fence_sensitive = 'Quotes: "quoted"\\slash\n```\n<tag> & 继续'
     session.add_message("user", fence_sensitive)
     session.add_message("user", "Current question.")
-    provider = ScriptedFakeProvider(completions=(_response("Summary."),))
+    provider = ScriptedFakeProvider(completions=(_response("Summary."), _response("None")))
 
     await _prepare_compaction(
         provider,

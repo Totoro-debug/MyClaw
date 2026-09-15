@@ -137,26 +137,22 @@ class ConversationCompactor:
         if cutoff == 0:
             raise _model_context_overflow()
         selected = short_term[:cutoff]
-        response = await self._provider.complete(
+        selected_payload = _compaction_user_context(selected)
+        fact_response = await self._provider.complete(
             "memory",
-            messages=[
-                {
-                    "role": "system",
-                    "content": render_template("conversation-compaction-system-prompt.md"),
-                },
-                {"role": "user", "content": _compaction_user_context(selected)},
-            ],
+            messages=_summary_request_messages(
+                template_name="conversation-compaction-system-prompt.md",
+                selected_payload=selected_payload,
+            ),
             tools=(),
         )
-        session.update_metadata(usage_delta={"model_calls": 1, **response.usage.to_dict()})
+        session.update_metadata(usage_delta={"model_calls": 1, **fact_response.usage.to_dict()})
         try:
             new_last_compacted = session.last_compacted + cutoff
             await self._memory_manager.append_summary(
-                content=response.message.content,
+                content=fact_response.message.content,
                 timestamp=self._persisted_now(),
             )
-            session.last_compacted = new_last_compacted
-            return session
         except (OSError, UnicodeError, ValueError) as error:
             raise ModelCallError(
                 ErrorInfo(
@@ -165,9 +161,29 @@ class ConversationCompactor:
                 )
             ) from error
 
+        action_response = await self._provider.complete(
+            "memory",
+            messages=_summary_request_messages(
+                template_name="conversation-summary-system-prompt.md",
+                selected_payload=selected_payload,
+            ),
+            tools=(),
+        )
+        session.update_metadata(usage_delta={"model_calls": 1, **action_response.usage.to_dict()})
+        session.update_metadata(summary=action_response.message.content)
+        session.last_compacted = new_last_compacted
+        return session
+
     def _persisted_now(self) -> datetime:
         value = self._now()
         return value.replace(microsecond=value.microsecond // 1000 * 1000)
+
+
+def _summary_request_messages(*, template_name: str, selected_payload: str) -> ModelMessages:
+    return [
+        {"role": "system", "content": render_template(template_name)},
+        {"role": "user", "content": selected_payload},
+    ]
 
 
 def _short_term_messages(

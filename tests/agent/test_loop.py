@@ -654,6 +654,59 @@ def test_agent_loop_preflight_uses_the_deferred_baseline_without_unused_tool_sch
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_injects_persisted_action_summary_into_foreground_and_status_context(
+    tmp_path: Path,
+) -> None:
+    class CapturingRouter(_Router):
+        def __init__(self) -> None:
+            super().__init__((_response("done"),))
+            self.requests: list[list[dict[str, Any]]] = []
+
+        def stream(
+            self,
+            route: Literal["chat", "schedule"],
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+            continuation: ModelContinuation | None = None,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(deepcopy(list(messages)))
+            return super().stream(
+                route,
+                messages=messages,
+                tools=tools,
+                continuation=continuation,
+            )
+
+    router = CapturingRouter()
+    loop, session, bus = _runtime(
+        tmp_path,
+        router,
+        task_framing_outcomes=None,
+        use_default_context_preparer=True,
+    )
+    action_summary = "- Updated the Session context contract."
+    session.update_metadata(summary=action_summary)
+
+    status = loop.runtime_status_input()
+    assert json.loads(status.retained_messages[0]) == {
+        "role": "user",
+        "content": action_summary,
+    }
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("Continue the work."))
+        await _terminals(bus, 1)
+    finally:
+        await loop.close()
+
+    assert len(router.requests) == 1
+    assert router.requests[0][1] == {"role": "user", "content": action_summary}
+    assert "Continue the work." in str(router.requests[0][-1]["content"])
+
+
+@pytest.mark.asyncio
 async def test_foreground_context_and_runner_share_exactly_one_run_gateway(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

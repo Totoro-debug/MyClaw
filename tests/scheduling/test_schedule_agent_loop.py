@@ -404,8 +404,14 @@ def _capture_schedule_projections(
         messages: Sequence[dict[str, Any]],
         *,
         session_id: str,
+        summary: str = "",
     ) -> list[dict[str, Any]]:
-        projected = original_build_schedule(builder, messages, session_id=session_id)
+        projected = original_build_schedule(
+            builder,
+            messages,
+            session_id=session_id,
+            summary=summary,
+        )
         projections.append(deepcopy(projected))
         return projected
 
@@ -876,6 +882,7 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
         ),
         memory_responses=(
             _response("Schedule history summary."),
+            _response("- Completed the scheduled work."),
             _response(
                 "",
                 tool_call=ModelToolCall(
@@ -901,6 +908,7 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
             ),
             _response("Long-term Memory updated."),
             _response("Second schedule history summary."),
+            _response("None"),
         ),
     )
     builder_projections: list[list[dict[str, Any]]] = []
@@ -971,6 +979,10 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
         schedule_requests = [
             request for request in provider.complete_requests if _is_schedule_call(request)
         ]
+        assert schedule_requests[0].messages[1] == {
+            "role": "user",
+            "content": "- Completed the scheduled work.",
+        }
         assert "Fresh schedule preference." not in cast(
             str, schedule_requests[0].messages[0]["content"]
         )

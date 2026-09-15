@@ -142,11 +142,13 @@ class ContextBuilder:
         history: Sequence[dict[str, Any]],
         *,
         session_id: str,
+        summary: str = "",
     ) -> list[dict[str, Any]]:
         """Build the minimum foreground request used by status and preflight."""
         return self.build_foreground_messages(
             [*history, {"role": "user", "content": ""}],
             session_id=session_id,
+            summary=summary,
         )
 
     def build_foreground_messages(
@@ -156,6 +158,7 @@ class ContextBuilder:
         session_id: str,
         blackboard: Blackboard | None = None,
         manual_invocation: ManualSkillInvocation | None = None,
+        summary: str = "",
     ) -> list[dict[str, Any]]:
         """Build the canonical initial Model Request Context for a foreground turn."""
         if manual_invocation is not None and not isinstance(
@@ -170,6 +173,7 @@ class ContextBuilder:
             session_id=session_id,
             blackboard=blackboard,
             manual_invocation=manual_invocation,
+            summary=summary,
         )
 
     def build_schedule_messages(
@@ -177,6 +181,7 @@ class ContextBuilder:
         messages: Sequence[dict[str, Any]],
         *,
         session_id: str,
+        summary: str = "",
     ) -> list[dict[str, Any]]:
         """Build the canonical initial Model Request Context for a Schedule Job."""
         snapshot = _SCHEDULE_PROJECTION_SNAPSHOT.get()
@@ -191,6 +196,7 @@ class ContextBuilder:
             system_prompt=system_prompt,
             session_id=session_id,
             current_time=current_time,
+            summary=summary,
         )
 
     @contextmanager
@@ -217,9 +223,14 @@ class ContextBuilder:
         blackboard: Blackboard | None = None,
         manual_invocation: ManualSkillInvocation | None = None,
         current_time: datetime | None = None,
+        summary: str = "",
     ) -> list[dict[str, Any]]:
+        if not isinstance(summary, str):
+            raise TypeError("Context Builder summary must be a string")
         current_user_index = _last_user_index(messages)
         projected = [{"role": "system", "content": system_prompt}]
+        if summary:
+            projected.append({"role": "user", "content": deepcopy(summary)})
         if current_user_index == len(messages):
             projected.extend(_project_history_messages(messages))
             return projected

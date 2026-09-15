@@ -38,9 +38,7 @@ class SessionStoragePartition(StrEnum):
     SCHEDULE = "schedule"
 
 
-_HEADER_FIELDS = frozenset(
-    {"session_id", "created_at", "updated_at", "last_compacted", "metadata"}
-)
+_HEADER_FIELDS = frozenset({"session_id", "created_at", "updated_at", "last_compacted", "metadata"})
 _TOKEN_USAGE_PATCH_KEYS = frozenset({"token_usage", "token_usage_delta", "usage_delta"})
 _SESSION_ID_PATTERN = re.compile(
     r"(?P<timestamp>\d{8}-\d{6}-\d{6})_"
@@ -350,6 +348,8 @@ class Session:
             if not isinstance(title, str):
                 raise TypeError("title must be a string")
             copied_patch["title"] = _normalize_title(title)
+        if "summary" in copied_patch:
+            _validate_action_summary(copied_patch["summary"], field="metadata.summary")
 
         updated_usage = self._usage_after_delta(token_delta)
         self.metadata.update(copied_patch)
@@ -618,6 +618,7 @@ def _initial_metadata() -> dict[str, Any]:
             "output_tokens": 0,
             "total_tokens": 0,
         },
+        "summary": "",
     }
 
 
@@ -694,13 +695,20 @@ def _validate_metadata(metadata: dict[str, Any]) -> None:
     if not title or " ".join(title.split()) != title or len(title) > 60:
         raise ValueError("metadata.title is not normalized")
     _validate_token_usage(metadata.get("token_usage"), field="metadata.token_usage")
+    _validate_action_summary(metadata.get("summary", ""), field="metadata.summary")
     _normalize_blackboard_metadata(metadata, invalid_is_absent=False)
 
 
 def _copy_loaded_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     copied = copy.deepcopy(metadata)
     _normalize_blackboard_metadata(copied, invalid_is_absent=True)
+    copied.setdefault("summary", "")
     return _copy_json_object(copied, field="metadata")
+
+
+def _validate_action_summary(value: Any, *, field: str) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
 
 
 def _normalize_blackboard_metadata(

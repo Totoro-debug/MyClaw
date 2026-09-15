@@ -432,6 +432,7 @@ class AgentLoop:
                 history=(),
                 session_id=self._session.session_id,
                 tool_schemas=tool_schemas,
+                summary=_session_action_summary(self._session),
             )
         available_input = chat_route.context_window - chat_route.max_output
         estimated = estimate_input_tokens(status_input)
@@ -1035,6 +1036,7 @@ class AgentLoop:
                 session_id=active_session.session_id,
                 blackboard=blackboard,
                 manual_invocation=manual_invocation,
+                summary="",
             )
 
         await self._compactor.prepare(
@@ -1051,6 +1053,7 @@ class AgentLoop:
             session_id=active_session.session_id,
             blackboard=blackboard,
             manual_invocation=manual_invocation,
+            summary=_session_action_summary(active_session),
         )
 
     async def _prepare_schedule_context(
@@ -1066,17 +1069,27 @@ class AgentLoop:
             initial_source = deepcopy(
                 [*active_session.messages[initial_last_compacted:], current_user]
             )
+            initial_summary = _session_action_summary(active_session)
             initial_projection = self._context_builder.build_schedule_messages(
                 initial_source,
                 session_id=active_session.session_id,
+                summary=initial_summary,
             )
+            initial_compaction_projection = initial_projection
+            if initial_summary:
+                initial_compaction_projection = self._context_builder.build_schedule_messages(
+                    initial_source,
+                    session_id=active_session.session_id,
+                    summary="",
+                )
 
             def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
                 if list(messages) == initial_source:
-                    return deepcopy(initial_projection)
+                    return deepcopy(initial_compaction_projection)
                 return self._context_builder.build_schedule_messages(
                     messages,
                     session_id=active_session.session_id,
+                    summary="",
                 )
 
             await self._compactor.prepare(
@@ -1093,6 +1106,7 @@ class AgentLoop:
             return self._context_builder.build_schedule_messages(
                 [*history, current_user],
                 session_id=active_session.session_id,
+                summary=_session_action_summary(active_session),
             )
 
     def runtime_status_input(self) -> RuntimeStatusInput:
@@ -1109,6 +1123,7 @@ class AgentLoop:
         usage_value = metadata.get("token_usage")
         if not isinstance(usage_value, dict):
             raise ValueError("Active Session token usage is malformed")
+        summary = _action_summary_from_metadata(metadata)
         usage_fields = ("model_calls", "input_tokens", "output_tokens", "total_tokens")
         usage = tuple((field, usage_value.get(field)) for field in usage_fields)
         if any(isinstance(value, bool) or not isinstance(value, int) for _, value in usage):
@@ -1118,6 +1133,7 @@ class AgentLoop:
             history=messages[last_compacted:],
             session_id=session_id,
             tool_schemas=self.tool_schemas,
+            summary=summary,
             session_title=title,
             session_message_count=len(messages),
             last_compacted=last_compacted,
@@ -1462,6 +1478,7 @@ def _foreground_runtime_status_input(
     history: Sequence[dict[str, Any]],
     session_id: str,
     tool_schemas: tuple[dict[str, Any], ...],
+    summary: str = "",
     session_title: str = "",
     session_message_count: int = 0,
     last_compacted: int = 0,
@@ -1471,7 +1488,14 @@ def _foreground_runtime_status_input(
     generation_started_at: float | None = None,
 ) -> RuntimeStatusInput:
     """Project and serialize a minimum foreground request for status and preflight."""
-    projected = context_builder.build_status_messages(history, session_id=session_id)
+    if summary:
+        projected = context_builder.build_status_messages(
+            history,
+            session_id=session_id,
+            summary=summary,
+        )
+    else:
+        projected = context_builder.build_status_messages(history, session_id=session_id)
     projected_system = projected[0].get("content")
     if not isinstance(projected_system, str):
         raise TypeError("Context Builder status system message is malformed")
@@ -1494,3 +1518,14 @@ def _foreground_runtime_status_input(
         context_window=context_window,
         generation_started_at=generation_started_at,
     )
+
+
+def _session_action_summary(session: Session) -> str:
+    return _action_summary_from_metadata(session.metadata)
+
+
+def _action_summary_from_metadata(metadata: dict[str, Any]) -> str:
+    summary = metadata.get("summary", "")
+    if not isinstance(summary, str):
+        raise ValueError("Active Session action summary is malformed")
+    return summary
