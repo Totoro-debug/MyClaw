@@ -366,7 +366,7 @@ max_iterations = 50
 enable_skill_always_load = false
 
 [memory]
-consolidation_message_threshold = 40
+compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
@@ -747,7 +747,7 @@ async def test_status_command_renders_actual_runtime_and_session_state(
             "total_tokens": 13,
         },
     )
-    session.last_consolidated = 1
+    session.last_compacted = 1
     dispatcher = ManagementCommandDispatcher(
         management_service(
             home,
@@ -761,7 +761,7 @@ async def test_status_command_renders_actual_runtime_and_session_state(
                     session_id=session.session_id,
                     session_title="New Conversation",
                     session_message_count=len(session.messages),
-                    last_consolidated=session.last_consolidated,
+                    last_compacted=session.last_compacted,
                     cumulative_usage=(
                         ("model_calls", 1),
                         ("input_tokens", 10),
@@ -789,7 +789,7 @@ async def test_status_command_renders_actual_runtime_and_session_state(
         "context_window": 8,
         "context_used_percent": 12.5,
         "session_message_count": 2,
-        "last_consolidated": 1,
+        "last_compacted": 1,
         "cumulative_usage": {
             "model_calls": 1,
             "input_tokens": 10,

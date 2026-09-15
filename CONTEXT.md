@@ -121,10 +121,10 @@ The three-layer memory structure owned by a Workspace: Short-term Memory, Conver
 _Avoid_: Single memory store, vector memory, raw transcript archive
 
 **Short-term Memory**:
-The unconsolidated suffix of a Conversation Session used to continue its current thread.
+The uncompacted suffix of a Conversation Session used to continue its current thread.
 _Avoid_: Chat log, transcript, prompt history, full Session file
 
-**`last_consolidated`**:
+**`last_compacted`**:
 The position in a Conversation Session separating messages already represented by Conversation Summary from Short-term Memory.
 _Avoid_: checkpoint, bookmark, Session ID
 
@@ -138,7 +138,7 @@ _Avoid_: Raw history, Session archive, manual notes, vector database, Conversati
 
 **Dream**:
 A background or manually triggered memory process that turns new Conversation Summary entries into Long-term Memory.
-_Avoid_: Memory Task, Chat turn, Session compression, full Agent Run
+_Avoid_: Memory Task, Chat turn, Conversation Compaction, full Agent Run
 
 **Summary Cursor**:
 The Workspace-owned position through which Dream has consumed the Conversation Summary stream.

@@ -39,7 +39,7 @@ class SessionStoragePartition(StrEnum):
 
 
 _HEADER_FIELDS = frozenset(
-    {"session_id", "created_at", "updated_at", "last_consolidated", "metadata"}
+    {"session_id", "created_at", "updated_at", "last_compacted", "metadata"}
 )
 _TOKEN_USAGE_PATCH_KEYS = frozenset({"token_usage", "token_usage_delta", "usage_delta"})
 _SESSION_ID_PATTERN = re.compile(
@@ -72,7 +72,7 @@ class Session:
     _now: Callable[[], datetime] | None
     messages: list[dict[str, Any]]
     metadata: dict[str, Any]
-    last_consolidated: int
+    last_compacted: int
     _pending_persist: asyncio.Task[None] | None
     _persist_tasks: set[asyncio.Task[None]]
     _closed: bool
@@ -91,14 +91,14 @@ class Session:
         updated_at: datetime,
         messages: list[dict[str, Any]],
         metadata: dict[str, Any],
-        last_consolidated: int,
+        last_compacted: int,
         partition: SessionStoragePartition | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> Self:
         resolved_partition = _resolve_partition(session_id, partition)
         require_aware_datetime(created_at, field="created_at")
         require_aware_datetime(updated_at, field="updated_at")
-        require_nonnegative_int(last_consolidated, field="last_consolidated")
+        require_nonnegative_int(last_compacted, field="last_compacted")
         session = object.__new__(cls)
         session._workspace_state = workspace_state
         session._session_id = session_id
@@ -108,7 +108,7 @@ class Session:
         session._now = now
         session.messages = messages
         session.metadata = metadata
-        session.last_consolidated = last_consolidated
+        session.last_compacted = last_compacted
         session._pending_persist = None
         session._persist_tasks = set()
         session._closed = False
@@ -144,7 +144,7 @@ class Session:
             updated_at=created_at,
             messages=[],
             metadata=_initial_metadata(),
-            last_consolidated=0,
+            last_compacted=0,
             partition=resolved_partition,
             now=now,
         )
@@ -192,7 +192,7 @@ class Session:
             raise ValueError("Session must contain a header record")
         try:
             header = records[0]
-            loaded_id, created_at, updated_at, last_consolidated, metadata = _parse_header(header)
+            loaded_id, created_at, updated_at, last_compacted, metadata = _parse_header(header)
             if loaded_id != session_id:
                 raise ValueError("Session metadata ID does not match its file name")
             messages = [_parse_message(record) for record in records[1:]]
@@ -205,7 +205,7 @@ class Session:
             updated_at=updated_at,
             messages=messages,
             metadata=metadata,
-            last_consolidated=last_consolidated,
+            last_compacted=last_compacted,
             partition=resolved_partition,
             now=now,
         )
@@ -435,7 +435,7 @@ class Session:
             "session_id": self._session_id,
             "created_at": format_rfc3339_milliseconds(self._created_at),
             "updated_at": format_rfc3339_milliseconds(self._updated_at),
-            "last_consolidated": self.last_consolidated,
+            "last_compacted": self.last_compacted,
             "metadata": copy.deepcopy(self.metadata),
         }
         records = (header, *copy.deepcopy(self.messages))
@@ -654,14 +654,14 @@ def _parse_header(
     Session._require_id(session_id)
     created_at = _parse_datetime(record["created_at"], field="created_at")
     updated_at = _parse_datetime(record["updated_at"], field="updated_at")
-    last_consolidated = record["last_consolidated"]
-    require_nonnegative_int(last_consolidated, field="last_consolidated")
+    last_compacted = record["last_compacted"]
+    require_nonnegative_int(last_compacted, field="last_compacted")
     metadata = record["metadata"]
     if not isinstance(metadata, dict):
         raise ValueError("Session metadata must be an object")
     metadata_copy = _copy_loaded_metadata(cast(dict[str, Any], metadata))
     _validate_metadata(metadata_copy)
-    return session_id, created_at, updated_at, last_consolidated, metadata_copy
+    return session_id, created_at, updated_at, last_compacted, metadata_copy
 
 
 def _parse_datetime(value: Any, *, field: str) -> datetime:

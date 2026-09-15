@@ -18,7 +18,7 @@ def test_runtime_status_exposes_the_documented_management_fields() -> None:
         context_window=200000,
         context_used_percent=2.1,
         session_message_count=12,
-        last_consolidated=4,
+        last_compacted=4,
         cumulative_usage={
             "model_calls": 5,
             "input_tokens": 6100,
@@ -36,7 +36,7 @@ def test_runtime_status_exposes_the_documented_management_fields() -> None:
         "context_window": 200000,
         "context_used_percent": 2.1,
         "session_message_count": 12,
-        "last_consolidated": 4,
+        "last_compacted": 4,
         "cumulative_usage": {
             "model_calls": 5,
             "input_tokens": 6100,
@@ -56,7 +56,7 @@ def test_runtime_status_rejects_negative_or_boolean_counters() -> None:
         context_window=200000,
         context_used_percent=2.1,
         session_message_count=12,
-        last_consolidated=4,
+        last_compacted=4,
         cumulative_usage={
             "model_calls": 5,
             "input_tokens": 6100,

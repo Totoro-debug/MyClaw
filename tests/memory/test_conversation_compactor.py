@@ -10,7 +10,7 @@ import pytest
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.memory.conversation_summary import ConversationSummaryManager
+from myclaw.agent.memory.conversation_compactor import ConversationCompactor
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.memory.records import SummaryEntry
 from myclaw.agent.session.session import Session
@@ -33,7 +33,7 @@ LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 8, 4, 16, 0, 0, tzinfo=LOCAL_OFFSET)
 
 
-class _DirectSummaryProvider:
+class _DirectCompactionProvider:
     def __init__(self, response: ModelResponse) -> None:
         self.response = response
         self.calls: list[dict[str, object]] = []
@@ -124,16 +124,16 @@ def _manager(
     memory_manager: MemoryManager,
     *,
     threshold: int = 4,
-) -> ConversationSummaryManager:
-    return ConversationSummaryManager(
+) -> ConversationCompactor:
+    return ConversationCompactor(
         provider=ScriptedFakeRouter(provider),
         memory_manager=memory_manager,
-        consolidation_message_threshold=threshold,
+        compaction_message_threshold=threshold,
         now=lambda: NOW,
     )
 
 
-async def _prepare_summary(
+async def _prepare_compaction(
     provider: ScriptedFakeProvider,
     memory_manager: MemoryManager,
     session: Session,
@@ -279,11 +279,11 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
     memory_manager = MemoryManager(state)
 
-    prepared = await _prepare_summary(provider, memory_manager, session)
+    prepared = await _prepare_compaction(provider, memory_manager, session)
 
     assert prepared is session
-    assert session.last_consolidated == 2
-    assert [message["content"] for message in session.messages[session.last_consolidated :]] == [
+    assert session.last_compacted == 2
+    assert [message["content"] for message in session.messages[session.last_compacted :]] == [
         "Second question.",
         "Second answer.",
         "Current question.",
@@ -295,12 +295,12 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
         "total_tokens": 37,
     }
     request = provider.complete_requests[0]
-    summary_input = request.messages[1]["content"]
-    assert isinstance(summary_input, str)
-    assert "First question." in summary_input
-    assert "First answer." in summary_input
-    assert "Second question." not in summary_input
-    assert "future_field" not in summary_input
+    compaction_input = request.messages[1]["content"]
+    assert isinstance(compaction_input, str)
+    assert "First question." in compaction_input
+    assert "First answer." in compaction_input
+    assert "Second question." not in compaction_input
+    assert "future_field" not in compaction_input
     assert (await _claimed_entries(memory_manager))[0].content == "First turn summary."
 
 
@@ -323,10 +323,10 @@ async def test_summary_candidate_includes_current_user_without_publishing_it(
 
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
     memory_manager = MemoryManager(state)
-    manager = ConversationSummaryManager(
+    manager = ConversationCompactor(
         provider=ScriptedFakeRouter(provider),
         memory_manager=memory_manager,
-        consolidation_message_threshold=4,
+        compaction_message_threshold=4,
         now=lambda: NOW,
     )
 
@@ -344,7 +344,7 @@ async def test_summary_candidate_includes_current_user_without_publishing_it(
         "content": "Current question.",
     }
     assert session.messages == original_messages
-    assert session.last_consolidated == 2
+    assert session.last_compacted == 2
 
 
 @pytest.mark.asyncio
@@ -364,7 +364,7 @@ async def test_token_budget_summarizes_roughly_half_the_available_input(
     session.add_message("user", "Current question.")
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         MemoryManager(state),
         session,
@@ -373,17 +373,17 @@ async def test_token_budget_summarizes_roughly_half_the_available_input(
         threshold=100,
     )
 
-    assert session.last_consolidated == 2
+    assert session.last_compacted == 2
     request = provider.complete_requests[0]
-    summary_input = request.messages[1]["content"]
-    assert isinstance(summary_input, str)
-    assert first_question in summary_input
-    assert first_answer in summary_input
-    assert second_question not in summary_input
+    compaction_input = request.messages[1]["content"]
+    assert isinstance(compaction_input, str)
+    assert first_question in compaction_input
+    assert first_answer in compaction_input
+    assert second_question not in compaction_input
 
 
 @pytest.mark.asyncio
-async def test_repeated_summary_preparation_advances_last_consolidated_once_per_summary(
+async def test_repeated_summary_preparation_advances_last_compacted_once_per_summary(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
@@ -403,31 +403,31 @@ async def test_repeated_summary_preparation_advances_last_consolidated_once_per_
     )
     memory_manager = MemoryManager(state)
 
-    first = await _prepare_summary(provider, memory_manager, session)
-    first_position = first.last_consolidated
+    first = await _prepare_compaction(provider, memory_manager, session)
+    first_position = first.last_compacted
     _add_assistant(session, "Answer three.")
     session.add_message("user", "Question four.")
     _add_assistant(session, "Answer four.")
     session.add_message("user", "Question five.")
-    second = await _prepare_summary(provider, memory_manager, session)
+    second = await _prepare_compaction(provider, memory_manager, session)
 
     assert first is session
     assert second is session
     assert first_position == 2
-    assert second.last_consolidated == 4
+    assert second.last_compacted == 4
     assert [(entry.index, entry.content) for entry in await _claimed_entries(memory_manager)] == [
         (1, "Summary one."),
         (2, "Summary two."),
     ]
     second_request = provider.complete_requests[1]
-    summary_input = second_request.messages[1]["content"]
-    assert isinstance(summary_input, str)
-    assert "Question one." not in summary_input
-    assert "Question two." in summary_input
+    compaction_input = second_request.messages[1]["content"]
+    assert isinstance(compaction_input, str)
+    assert "Question one." not in compaction_input
+    assert "Question two." in compaction_input
 
 
 @pytest.mark.asyncio
-async def test_summary_persistence_failure_leaves_last_consolidated_unchanged(
+async def test_summary_persistence_failure_leaves_last_compacted_unchanged(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
@@ -437,10 +437,10 @@ async def test_summary_persistence_failure_leaves_last_consolidated_unchanged(
     provider = ScriptedFakeProvider(completions=(_response("First turn summary."),))
 
     with pytest.raises(ModelCallError) as raised:
-        await _prepare_summary(provider, memory_manager, session)
+        await _prepare_compaction(provider, memory_manager, session)
 
     assert raised.value.error.code == "persistence_error"
-    assert session.last_consolidated == 0
+    assert session.last_compacted == 0
     assert session.metadata["token_usage"] == {
         "model_calls": 3,
         "input_tokens": 28,
@@ -450,7 +450,7 @@ async def test_summary_persistence_failure_leaves_last_consolidated_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_oversized_system_prompt_fails_without_summary_or_last_consolidated_progress(
+async def test_oversized_system_prompt_fails_without_summary_or_last_compacted_progress(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
@@ -460,7 +460,7 @@ async def test_oversized_system_prompt_fails_without_summary_or_last_consolidate
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _prepare_summary(
+        await _prepare_compaction(
             provider,
             memory_manager,
             session,
@@ -473,7 +473,7 @@ async def test_oversized_system_prompt_fails_without_summary_or_last_consolidate
     assert raised.value.error.code == "model_context_overflow"
     assert raised.value.error.message == "Model request context exceeds the available input budget."
     assert provider.complete_requests == []
-    assert session.last_consolidated == 0
+    assert session.last_compacted == 0
     assert not (state.memory_directory / "summary.jsonl").exists()
 
 
@@ -486,7 +486,7 @@ async def test_system_prompt_budget_keeps_raw_prompt_boundary(
     provider = ScriptedFakeProvider(completions=(_response("Boundary summary."),))
     memory_manager = MemoryManager(state)
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         memory_manager,
         session,
@@ -496,7 +496,7 @@ async def test_system_prompt_budget_keeps_raw_prompt_boundary(
         system_prompt="S" * 400,
     )
 
-    assert session.last_consolidated == 4
+    assert session.last_compacted == 4
     assert len(await _claimed_entries(memory_manager)) == 1
 
 
@@ -510,7 +510,7 @@ async def test_oversized_system_prompt_without_user_keeps_failure(
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _prepare_summary(
+        await _prepare_compaction(
             provider,
             memory_manager,
             session,
@@ -535,7 +535,7 @@ async def test_assistant_only_over_threshold_keeps_no_safe_cutoff_failure(
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _prepare_summary(
+        await _prepare_compaction(
             provider,
             memory_manager,
             session,
@@ -558,7 +558,7 @@ async def test_context_overflow_without_old_complete_turn_keeps_current_message(
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _prepare_summary(
+        await _prepare_compaction(
             provider,
             memory_manager,
             session,
@@ -569,7 +569,7 @@ async def test_context_overflow_without_old_complete_turn_keeps_current_message(
 
     assert raised.value.error.code == "model_context_overflow"
     assert provider.complete_requests == []
-    assert session.last_consolidated == 0
+    assert session.last_compacted == 0
     assert [message["content"] for message in session.messages] == [current_input]
     assert not (state.memory_directory / "summary.jsonl").exists()
 
@@ -588,7 +588,7 @@ async def test_oversized_current_input_does_not_summarize_earlier_history(
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _prepare_summary(
+        await _prepare_compaction(
             provider,
             memory_manager,
             session,
@@ -600,7 +600,7 @@ async def test_oversized_current_input_does_not_summarize_earlier_history(
 
     assert raised.value.error.code == "model_context_overflow"
     assert provider.complete_requests == []
-    assert session.last_consolidated == 0
+    assert session.last_compacted == 0
     assert [message["content"] for message in session.messages] == [
         "Earlier question.",
         "Earlier answer.",
@@ -623,7 +623,7 @@ async def test_complete_tool_schema_cost_triggers_summary_compression(
         session.add_message("user", "Current question.")
     provider = ScriptedFakeProvider(completions=(_response("Tool-aware summary."),))
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         MemoryManager(state),
         plain_session,
@@ -631,10 +631,10 @@ async def test_complete_tool_schema_cost_triggers_summary_compression(
         max_output=128,
         threshold=100,
     )
-    assert plain_session.last_consolidated == 0
+    assert plain_session.last_compacted == 0
     assert provider.complete_requests == []
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         MemoryManager(state),
         tool_session,
@@ -644,7 +644,7 @@ async def test_complete_tool_schema_cost_triggers_summary_compression(
         tools=_complete_tool_schemas(schema_shape, payload_size=700),
     )
 
-    assert tool_session.last_consolidated == 2
+    assert tool_session.last_compacted == 2
     assert provider.complete_requests
 
 
@@ -662,7 +662,7 @@ async def test_complete_tool_schema_cost_rejects_an_oversized_current_turn(
     provider = ScriptedFakeProvider()
     current_user = {"role": "user", "content": "c" * 250}
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         MemoryManager(state),
         plain_session,
@@ -672,10 +672,10 @@ async def test_complete_tool_schema_cost_rejects_an_oversized_current_turn(
         system_prompt="",
         current_user=current_user,
     )
-    assert plain_session.last_consolidated == 0
+    assert plain_session.last_compacted == 0
 
     with pytest.raises(ModelCallError) as raised:
-        await _prepare_summary(
+        await _prepare_compaction(
             provider,
             MemoryManager(state),
             tool_session,
@@ -690,7 +690,7 @@ async def test_complete_tool_schema_cost_rejects_an_oversized_current_turn(
     assert raised.value.error.code == "model_context_overflow"
     assert raised.value.error.message == MODEL_CONTEXT_OVERFLOW_MESSAGE
     assert provider.complete_requests == []
-    assert tool_session.last_consolidated == 0
+    assert tool_session.last_compacted == 0
 
 
 @pytest.mark.parametrize("schema_shape", ("description", "parameters", "catalog"))
@@ -712,7 +712,7 @@ async def test_complete_tool_schema_cost_is_reserved_when_selecting_cutoff(
     )
     memory_manager = MemoryManager(state)
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         memory_manager,
         plain_session,
@@ -720,7 +720,7 @@ async def test_complete_tool_schema_cost_is_reserved_when_selecting_cutoff(
         max_output=128,
         threshold=100,
     )
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         memory_manager,
         tool_session,
@@ -730,8 +730,8 @@ async def test_complete_tool_schema_cost_is_reserved_when_selecting_cutoff(
         tools=_complete_tool_schemas(schema_shape, payload_size=700),
     )
 
-    assert plain_session.last_consolidated == 4
-    assert tool_session.last_consolidated == 2
+    assert plain_session.last_compacted == 4
+    assert tool_session.last_compacted == 2
 
 
 @pytest.mark.asyncio
@@ -745,11 +745,11 @@ async def test_summary_provider_failure_preserves_user_visible_model_error(
     memory_manager = MemoryManager(state)
 
     with pytest.raises(ModelCallError) as raised:
-        await _prepare_summary(provider, memory_manager, session)
+        await _prepare_compaction(provider, memory_manager, session)
 
     assert raised.value.error.code == "model_failed"
     assert raised.value.error.message == "PRIVATE FAILURE"
-    assert session.last_consolidated == 0
+    assert session.last_compacted == 0
     assert not (state.memory_directory / "summary.jsonl").exists()
 
 
@@ -778,10 +778,10 @@ async def test_summary_cancellation_propagates_without_persisting_or_advancing_c
             raise AssertionError("unreachable")
 
     provider = _BlockingProvider()
-    manager = ConversationSummaryManager(
+    manager = ConversationCompactor(
         provider=provider,
         memory_manager=memory_manager,
-        consolidation_message_threshold=4,
+        compaction_message_threshold=4,
         now=lambda: NOW,
     )
     task = asyncio.create_task(
@@ -801,7 +801,7 @@ async def test_summary_cancellation_propagates_without_persisting_or_advancing_c
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert session.last_consolidated == 0
+    assert session.last_compacted == 0
     assert not (state.memory_directory / "summary.jsonl").exists()
 
 
@@ -839,7 +839,7 @@ async def test_token_cutoff_excludes_schedule_continuation_from_history_budget(
     def project_schedule(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         return context_builder.build_schedule_messages(messages, session_id=session.session_id)
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         memory_manager,
         session,
@@ -851,16 +851,16 @@ async def test_token_cutoff_excludes_schedule_continuation_from_history_budget(
         continuation=continuation,
     )
 
-    assert session.last_consolidated == 4
-    summary_input = provider.complete_requests[0].messages[1]["content"]
-    assert isinstance(summary_input, str)
-    assert "First question:" in summary_input
-    assert "Second question:" in summary_input
-    assert "Current tool call:" not in summary_input
+    assert session.last_compacted == 4
+    compaction_input = provider.complete_requests[0].messages[1]["content"]
+    assert isinstance(compaction_input, str)
+    assert "First question:" in compaction_input
+    assert "Second question:" in compaction_input
+    assert "Current tool call:" not in compaction_input
 
 
 @pytest.mark.parametrize(
-    ("messages", "expected_position", "last_summarized", "first_retained"),
+    ("messages", "expected_position", "last_compacted", "first_retained"),
     [
         (
             (
@@ -897,7 +897,7 @@ async def test_cutoff_keeps_retained_suffix_at_user_boundary(
     workspace: Path,
     messages: tuple[tuple[str, str], ...],
     expected_position: int,
-    last_summarized: str,
+    last_compacted: str,
     first_retained: str,
 ) -> None:
     state = _state(workspace)
@@ -910,7 +910,7 @@ async def test_cutoff_keeps_retained_suffix_at_user_boundary(
     provider = ScriptedFakeProvider(completions=(_response("Aligned summary."),))
     memory_manager = MemoryManager(state)
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         memory_manager,
         session,
@@ -919,13 +919,13 @@ async def test_cutoff_keeps_retained_suffix_at_user_boundary(
         threshold=6,
     )
 
-    assert session.last_consolidated == expected_position
-    assert session.messages[session.last_consolidated]["content"] == first_retained
+    assert session.last_compacted == expected_position
+    assert session.messages[session.last_compacted]["content"] == first_retained
     request = provider.complete_requests[0]
-    summary_input = request.messages[1]["content"]
-    assert isinstance(summary_input, str)
-    assert last_summarized in summary_input
-    assert first_retained not in summary_input
+    compaction_input = request.messages[1]["content"]
+    assert isinstance(compaction_input, str)
+    assert last_compacted in compaction_input
+    assert first_retained not in compaction_input
 
 
 def test_session_messages_remain_json_native(workspace: Path) -> None:
@@ -943,7 +943,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
     state = _state(workspace)
     session = _session_with_history(state)
     original_messages = deepcopy(session.messages)
-    provider = _DirectSummaryProvider(_response("Lane summary."))
+    provider = _DirectCompactionProvider(_response("Lane summary."))
     memory_manager = MemoryManager(state)
     tool_schema: dict[str, Any] = {
         "type": "function",
@@ -984,10 +984,10 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
         ) -> list[dict[str, Any]]:
             return context_builder.build_schedule_messages(messages, session_id=session.session_id)
 
-    manager = ConversationSummaryManager(
+    manager = ConversationCompactor(
         provider=provider,
         memory_manager=memory_manager,
-        consolidation_message_threshold=4,
+        compaction_message_threshold=4,
         now=lambda: NOW,
     )
 
@@ -1011,7 +1011,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
         tools=(tool_schema,),
     )
 
-    assert session.last_consolidated == 4
+    assert session.last_compacted == 4
     assert session.messages == original_messages
     assert [entry.content for entry in await _claimed_entries(memory_manager)] == ["Lane summary."]
 
@@ -1052,7 +1052,7 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
         projected_calls.append(deepcopy(projected))
         return projected
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         memory_manager,
         session,
@@ -1070,13 +1070,13 @@ async def test_foreground_summary_budget_uses_blackboard_without_persisting_proj
         for message in projection
         if message["role"] == "user"
     )
-    summary_request = provider.complete_requests[0]
-    summary_input = summary_request.messages[1]["content"]
-    assert isinstance(summary_input, str)
-    assert "## Task goal" not in summary_input
-    assert "## Completion boundary" not in summary_input
-    assert blackboard.goal not in summary_input
-    assert blackboard.completion_boundary not in summary_input
+    compaction_request = provider.complete_requests[0]
+    compaction_input = compaction_request.messages[1]["content"]
+    assert isinstance(compaction_input, str)
+    assert "## Task goal" not in compaction_input
+    assert "## Completion boundary" not in compaction_input
+    assert blackboard.goal not in compaction_input
+    assert blackboard.completion_boundary not in compaction_input
     assert all("blackboard" not in message for message in session.messages)
     assert [entry.content for entry in await _claimed_entries(memory_manager)] == [
         "Summary without Blackboard."
@@ -1105,7 +1105,7 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
         status="success",
         artifact=None,
     )
-    provider = _DirectSummaryProvider(_response("Projected summary."))
+    provider = _DirectCompactionProvider(_response("Projected summary."))
     memory_manager = MemoryManager(state)
     projection_calls: list[tuple[Sequence[dict[str, Any]], dict[str, Any]]] = []
     tool_schema: dict[str, Any] = {
@@ -1131,10 +1131,10 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
             *[{"role": message["role"], "content": message["content"]} for message in messages],
         ]
 
-    manager = ConversationSummaryManager(
+    manager = ConversationCompactor(
         provider=provider,
         memory_manager=memory_manager,
-        consolidation_message_threshold=4,
+        compaction_message_threshold=4,
         now=lambda: NOW,
     )
 
@@ -1160,7 +1160,7 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
     assert [message["content"] for message in projection_calls[0][0] if message["role"] == "user"][
         -1
     ] == "Current question."
-    assert session.last_consolidated == 2
+    assert session.last_compacted == 2
     assert provider.calls[0]["route"] == "memory"
     messages = provider.calls[0]["messages"]
     assert isinstance(messages, list)
@@ -1168,23 +1168,23 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
     assert [message["role"] for message in messages] == ["system", "user"]
     assert messages[0] == {
         "role": "system",
-        "content": render_template("conversation-summary-system-prompt.md"),
+        "content": render_template("conversation-compaction-system-prompt.md"),
     }
     assert messages[1]["role"] == "user"
-    summary_input = messages[1]["content"]
-    assert isinstance(summary_input, str)
+    compaction_input = messages[1]["content"]
+    assert isinstance(compaction_input, str)
     prefix = "## Conversation Messages\n\n```json\n"
     suffix = "\n```"
-    assert summary_input.startswith(prefix)
-    assert summary_input.endswith(suffix)
-    assert "<conversation_messages>" not in summary_input
-    assert "</conversation_messages>" not in summary_input
+    assert compaction_input.startswith(prefix)
+    assert compaction_input.endswith(suffix)
+    assert "<conversation_messages>" not in compaction_input
+    assert "</conversation_messages>" not in compaction_input
     assert all(
         marker not in str(message["content"])
         for message in messages
         for marker in (foreground_skill, blackboard_state)
     )
-    assert json.loads(summary_input[len(prefix) : -len(suffix)]) == [
+    assert json.loads(compaction_input[len(prefix) : -len(suffix)]) == [
         {"role": "user", "content": "First question."},
         {"role": "assistant", "content": "First answer.", "tool_calls": []},
     ]
@@ -1236,18 +1236,18 @@ async def test_summary_projects_owned_message_shapes_without_mutating_session(
     original_messages = deepcopy(session.messages)
     provider = ScriptedFakeProvider(completions=(_response("Summary."),))
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         MemoryManager(state),
         session,
         threshold=8,
     )
 
-    summary_input = provider.complete_requests[0].messages[1]["content"]
-    assert isinstance(summary_input, str)
+    compaction_input = provider.complete_requests[0].messages[1]["content"]
+    assert isinstance(compaction_input, str)
     prefix = "## Conversation Messages\n\n```json\n"
     suffix = "\n```"
-    assert json.loads(summary_input[len(prefix) : -len(suffix)]) == [
+    assert json.loads(compaction_input[len(prefix) : -len(suffix)]) == [
         {"role": "user", "content": "First question."},
         {
             "role": "assistant",
@@ -1282,19 +1282,19 @@ async def test_summary_fences_escape_dynamic_markdown_delimiters_without_changin
     session.add_message("user", "Current question.")
     provider = ScriptedFakeProvider(completions=(_response("Summary."),))
 
-    await _prepare_summary(
+    await _prepare_compaction(
         provider,
         MemoryManager(state),
         session,
         threshold=2,
     )
 
-    summary_input = provider.complete_requests[0].messages[1]["content"]
-    assert isinstance(summary_input, str)
+    compaction_input = provider.complete_requests[0].messages[1]["content"]
+    assert isinstance(compaction_input, str)
     prefix = "## Conversation Messages\n\n```json\n"
     suffix = "\n```"
-    payload = summary_input[len(prefix) : -len(suffix)]
-    assert summary_input.startswith(prefix)
-    assert summary_input.endswith(suffix)
+    payload = compaction_input[len(prefix) : -len(suffix)]
+    assert compaction_input.startswith(prefix)
+    assert compaction_input.endswith(suffix)
     assert "```" not in payload
     assert json.loads(payload) == [{"role": "user", "content": fence_sensitive}]

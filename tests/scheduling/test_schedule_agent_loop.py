@@ -17,7 +17,7 @@ import pytest
 import myclaw.agent.context as context
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import AgentLoop
-from myclaw.agent.memory.conversation_summary import ConversationSummaryManager
+from myclaw.agent.memory.conversation_compactor import ConversationCompactor
 from myclaw.agent.memory.dream import Dream
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
@@ -350,15 +350,15 @@ async def _close_components(
     await router.close()
 
 
-def _capture_summary_projections(
+def _capture_compaction_projections(
     monkeypatch: pytest.MonkeyPatch,
     projections: list[list[dict[str, Any]]],
     tool_names: list[tuple[str, ...]] | None = None,
 ) -> None:
-    original_prepare = ConversationSummaryManager.prepare
+    original_prepare = ConversationCompactor.prepare
 
     async def capture_projection(
-        manager: ConversationSummaryManager,
+        manager: ConversationCompactor,
         session: Session,
         *,
         current_user: dict[str, Any] | None = None,
@@ -371,7 +371,7 @@ def _capture_summary_projections(
         if current_user is not None:
             assert project_messages is not None
             projections.append(
-                project_messages([*session.messages[session.last_consolidated :], current_user])
+                project_messages([*session.messages[session.last_compacted :], current_user])
             )
         assert project_messages is not None
         assert route_context_window is not None
@@ -390,7 +390,7 @@ def _capture_summary_projections(
             tools=tools,
         )
 
-    monkeypatch.setattr(ConversationSummaryManager, "prepare", capture_projection)
+    monkeypatch.setattr(ConversationCompactor, "prepare", capture_projection)
 
 
 def _capture_schedule_projections(
@@ -502,7 +502,7 @@ async def test_foreground_provider_receives_builder_complete_context_projection(
         chat_responses=(_response("First answer."), _response("Second answer.")),
     )
     projection_calls: list[list[dict[str, Any]]] = []
-    _capture_summary_projections(monkeypatch, projection_calls)
+    _capture_compaction_projections(monkeypatch, projection_calls)
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
         agent_home,
         workspace,
@@ -559,13 +559,13 @@ async def test_schedule_uses_context_builder_complete_context_projection(
     provider = _ScheduleProvider(schedule_responses=(_response("Background result."),))
     projection_calls: list[list[dict[str, Any]]] = []
     builder_projections: list[list[dict[str, Any]]] = []
-    summary_tool_names: list[tuple[str, ...]] = []
+    compaction_tool_names: list[tuple[str, ...]] = []
 
     def fail_foreground_context(*args: object, **kwargs: object) -> list[dict[str, object]]:
         del args, kwargs
         raise AssertionError("Schedule must not use ContextBuilder")
 
-    _capture_summary_projections(monkeypatch, projection_calls, summary_tool_names)
+    _capture_compaction_projections(monkeypatch, projection_calls, compaction_tool_names)
     _capture_schedule_projections(monkeypatch, builder_projections)
     schedule_now = NOW + timedelta(hours=2)
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
@@ -592,7 +592,7 @@ async def test_schedule_uses_context_builder_complete_context_projection(
     assert len(provider.direct_complete_messages) == 1
     messages, tools = provider.direct_complete_messages[0]
     runner_tool_names = tuple(schema["function"]["name"] for schema in tools)
-    assert summary_tool_names == [runner_tool_names]
+    assert compaction_tool_names == [runner_tool_names]
     assert "schedule" not in runner_tool_names
     assert projection_calls == [messages]
     assert len(builder_projections) == 1
@@ -709,13 +709,13 @@ async def test_schedule_tool_loop_persists_each_message_from_awaitable_run(
 
 
 @pytest.mark.asyncio
-async def test_schedule_tool_loop_does_not_prepare_summary_inside_agent_run(
+async def test_schedule_tool_loop_does_not_prepare_compaction_inside_agent_run(
     agent_home: Path,
     workspace: Path,
 ) -> None:
     config_text = VALID_CONFIG.replace(
-        "consolidation_message_threshold = 50",
-        "consolidation_message_threshold = 5",
+        "compaction_message_threshold = 50",
+        "compaction_message_threshold = 5",
     )
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
@@ -794,7 +794,7 @@ async def test_schedule_tool_loop_does_not_prepare_summary_inside_agent_run(
         f"schedule_{JOB_UUID}",
         partition=SessionStoragePartition.SCHEDULE,
     )
-    assert persisted.last_consolidated == 0
+    assert persisted.last_compacted == 0
 
 
 @pytest.mark.asyncio
@@ -804,8 +804,8 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_text = VALID_CONFIG.replace(
-        "consolidation_message_threshold = 50",
-        "consolidation_message_threshold = 4",
+        "compaction_message_threshold = 50",
+        "compaction_message_threshold = 4",
     )
     home = AgentHome(agent_home)
     home.initialize()
@@ -1312,10 +1312,10 @@ async def test_schedule_shutdown_during_preparation_persists_user(
     provider = _ScheduleProvider(schedule_responses=(_response("Unused."),))
     context_started = asyncio.Event()
     context_never_completes = asyncio.Event()
-    original_prepare = ConversationSummaryManager.prepare
+    original_prepare = ConversationCompactor.prepare
 
     async def block_schedule_preparation(
-        manager: ConversationSummaryManager,
+        manager: ConversationCompactor,
         session: Session,
         *,
         current_user: dict[str, Any] | None = None,
@@ -1343,7 +1343,7 @@ async def test_schedule_shutdown_during_preparation_persists_user(
             tools=tools,
         )
 
-    monkeypatch.setattr(ConversationSummaryManager, "prepare", block_schedule_preparation)
+    monkeypatch.setattr(ConversationCompactor, "prepare", block_schedule_preparation)
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
         agent_home,
         workspace,
@@ -1380,10 +1380,10 @@ async def test_schedule_failure_logs_one_safe_session_warning(
     await store.add_user_job(job)
     provider = _ScheduleProvider()
     failure_started = asyncio.Event()
-    original_prepare = ConversationSummaryManager.prepare
+    original_prepare = ConversationCompactor.prepare
 
     async def fail_schedule_preparation(
-        manager: ConversationSummaryManager,
+        manager: ConversationCompactor,
         session: Session,
         *,
         current_user: dict[str, Any] | None = None,
@@ -1411,7 +1411,7 @@ async def test_schedule_failure_logs_one_safe_session_warning(
             tools=tools,
         )
 
-    monkeypatch.setattr(ConversationSummaryManager, "prepare", fail_schedule_preparation)
+    monkeypatch.setattr(ConversationCompactor, "prepare", fail_schedule_preparation)
     capture = capture_diagnostics()
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
         agent_home,

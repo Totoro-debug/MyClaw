@@ -17,9 +17,9 @@ from tzlocal import get_localzone_name
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.memory.conversation_summary import (
-    ConversationSummaryManager,
-    SummaryModelRouter,
+from myclaw.agent.memory.conversation_compactor import (
+    CompactionModelRouter,
+    ConversationCompactor,
 )
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import (
@@ -249,10 +249,10 @@ class AgentLoop:
         )
         baseline_tool_schemas = tuple(baseline_gateway.schemas)
         runner = AgentRunner(model_router)
-        summary_manager = ConversationSummaryManager(
-            provider=cast(SummaryModelRouter, model_router),
+        compactor = ConversationCompactor(
+            provider=cast(CompactionModelRouter, model_router),
             memory_manager=memory_manager,
-            consolidation_message_threshold=configuration.memory.consolidation_message_threshold,
+            compaction_message_threshold=configuration.memory.compaction_message_threshold,
             now=now,
         )
         active_session = (
@@ -274,7 +274,7 @@ class AgentLoop:
         self._skill_loader = skill_loader
         self._schedule_service = schedule_service
         self._context_builder = context_builder
-        self._summary_manager = summary_manager
+        self._compactor = compactor
         self._now = now
         self._monotonic_now = monotonic_now
         self._schedule_now = schedule_service.current_time
@@ -1037,7 +1037,7 @@ class AgentLoop:
                 manual_invocation=manual_invocation,
             )
 
-        await self._summary_manager.prepare(
+        await self._compactor.prepare(
             active_session,
             current_user=current_user,
             project_messages=project_messages,
@@ -1045,7 +1045,7 @@ class AgentLoop:
             route_max_output=route.max_output,
             tools=tool_gateway.schemas,
         )
-        history = active_session.messages[active_session.last_consolidated :]
+        history = active_session.messages[active_session.last_compacted :]
         return self._context_builder.build_foreground_messages(
             [*history, current_user],
             session_id=active_session.session_id,
@@ -1062,9 +1062,9 @@ class AgentLoop:
     ) -> list[dict[str, Any]]:
         with self._context_builder.schedule_projection_scope():
             route = self._configuration.resolve_route("schedule").route
-            initial_last_consolidated = active_session.last_consolidated
+            initial_last_compacted = active_session.last_compacted
             initial_source = deepcopy(
-                [*active_session.messages[initial_last_consolidated:], current_user]
+                [*active_session.messages[initial_last_compacted:], current_user]
             )
             initial_projection = self._context_builder.build_schedule_messages(
                 initial_source,
@@ -1079,7 +1079,7 @@ class AgentLoop:
                     session_id=active_session.session_id,
                 )
 
-            await self._summary_manager.prepare(
+            await self._compactor.prepare(
                 active_session,
                 current_user=current_user,
                 project_messages=project_messages,
@@ -1087,9 +1087,9 @@ class AgentLoop:
                 route_max_output=route.max_output,
                 tools=tool_gateway.schemas,
             )
-            if active_session.last_consolidated == initial_last_consolidated:
+            if active_session.last_compacted == initial_last_compacted:
                 return initial_projection
-            history = active_session.messages[active_session.last_consolidated :]
+            history = active_session.messages[active_session.last_compacted :]
             return self._context_builder.build_schedule_messages(
                 [*history, current_user],
                 session_id=active_session.session_id,
@@ -1102,7 +1102,7 @@ class AgentLoop:
         session_id = session.session_id
         messages = session.messages
         metadata = session.metadata
-        last_consolidated = session.last_consolidated
+        last_compacted = session.last_compacted
         title = metadata.get("title")
         if not isinstance(title, str):
             raise ValueError("Active Session title is malformed")
@@ -1115,12 +1115,12 @@ class AgentLoop:
             raise ValueError("Active Session token usage is malformed")
         return _foreground_runtime_status_input(
             context_builder=self._context_builder,
-            history=messages[last_consolidated:],
+            history=messages[last_compacted:],
             session_id=session_id,
             tool_schemas=self.tool_schemas,
             session_title=title,
             session_message_count=len(messages),
-            last_consolidated=last_consolidated,
+            last_compacted=last_compacted,
             cumulative_usage=tuple((field, cast(int, value)) for field, value in usage),
             chat_model=(
                 self._configured_chat_model
@@ -1464,7 +1464,7 @@ def _foreground_runtime_status_input(
     tool_schemas: tuple[dict[str, Any], ...],
     session_title: str = "",
     session_message_count: int = 0,
-    last_consolidated: int = 0,
+    last_compacted: int = 0,
     cumulative_usage: tuple[tuple[str, int], ...] = (),
     chat_model: str = "",
     context_window: int = 0,
@@ -1488,7 +1488,7 @@ def _foreground_runtime_status_input(
         session_id=session_id,
         session_title=session_title,
         session_message_count=session_message_count,
-        last_consolidated=last_consolidated,
+        last_compacted=last_compacted,
         cumulative_usage=cumulative_usage,
         chat_model=chat_model,
         context_window=context_window,

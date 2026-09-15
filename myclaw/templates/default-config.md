@@ -4,7 +4,7 @@ max_iterations = 50
 enable_skill_always_load = false
 
 [memory]
-consolidation_message_threshold = 40
+compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 

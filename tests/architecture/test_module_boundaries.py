@@ -584,23 +584,23 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
             for node in ast.walk(method)
         )
 
-    required_summary_arguments = {
+    required_compaction_arguments = {
         "project_messages",
         "route_context_window",
         "route_max_output",
         "tools",
     }
     for method_name in ("_prepare_foreground_context", "_prepare_schedule_context"):
-        summary_call = next(
+        compaction_call = next(
             node
             for node in ast.walk(methods[method_name])
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "prepare"
             and isinstance(node.func.value, ast.Attribute)
-            and node.func.value.attr == "_summary_manager"
+            and node.func.value.attr == "_compactor"
         )
-        assert required_summary_arguments <= {keyword.arg for keyword in summary_call.keywords}
+        assert required_compaction_arguments <= {keyword.arg for keyword in compaction_call.keywords}
 
     assert any(
         isinstance(node, ast.Call)
@@ -648,7 +648,7 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
 def test_runner_summary_and_dream_keep_context_builder_out_of_their_boundaries() -> None:
     paths = (
         PACKAGE_ROOT / "agent" / "runner.py",
-        PACKAGE_ROOT / "agent" / "memory" / "conversation_summary.py",
+        PACKAGE_ROOT / "agent" / "memory" / "conversation_compactor.py",
         PACKAGE_ROOT / "agent" / "memory" / "dream.py",
     )
     violations = [

@@ -37,7 +37,7 @@ def _header(**updates: Any) -> dict[str, Any]:
         "session_id": SESSION_ID,
         "created_at": CREATED_AT.isoformat(timespec="milliseconds"),
         "updated_at": UPDATED_AT.isoformat(timespec="milliseconds"),
-        "last_consolidated": 0,
+        "last_compacted": 0,
         "metadata": {
             "title": "Project review",
             "token_usage": dict(ZERO_USAGE),
@@ -89,7 +89,7 @@ def test_create_starts_a_memory_only_session_with_private_identity_generation(
         "title": "Untitled session",
         "token_usage": ZERO_USAGE,
     }
-    assert session.last_consolidated == 0
+    assert session.last_compacted == 0
     assert not (state.sessions_directory / f"{session.session_id}.jsonl").exists()
 
     with pytest.raises(TypeError, match=r"Session\.create\(\) or Session\.load\(\)"):
@@ -173,7 +173,7 @@ async def test_persist_writes_one_complete_compact_utf8_snapshot_atomically(
         '{"session_id":"20260711-153012-123000_550e8400-e29b-41d4-a716-446655440000",'
         '"created_at":"2026-07-11T15:30:12.123+08:00",'
         '"updated_at":"2026-07-11T15:30:17.123+08:00",'
-        '"last_consolidated":0,'
+        '"last_compacted":0,'
         '"metadata":{"title":"Untitled session",'
         '"token_usage":{"model_calls":0,"input_tokens":0,'
         '"output_tokens":0,"total_tokens":0}}}\n'
@@ -802,7 +802,7 @@ def test_public_state_is_directly_mutable_and_message_inputs_are_deep_copied(
     tool_calls[0]["arguments"] = "changed"
     usage["input_tokens"] = 99
     session.metadata["future_key"] = {"enabled": True}
-    session.last_consolidated = -1
+    session.last_compacted = -1
 
     assert session.messages[0]["extension"] == {"nested": ["before"]}
     assert session.messages[1]["tool_calls"] == [
@@ -823,7 +823,7 @@ def test_public_state_is_directly_mutable_and_message_inputs_are_deep_copied(
         "total_tokens": 15,
     }
     assert session.metadata["future_key"] == {"enabled": True}
-    assert session.last_consolidated == -1
+    assert session.last_compacted == -1
 
 
 def test_append_messages_commits_a_valid_increment_in_order_with_timestamps_and_usage(
@@ -1752,7 +1752,7 @@ def test_load_current_five_field_jsonl_preserves_json_native_extensions(
 ) -> None:
     state = _state(workspace, agent_home)
     header = _header(
-        last_consolidated=2,
+        last_compacted=2,
         metadata={
             "title": "Project review",
             "token_usage": {
@@ -1793,7 +1793,7 @@ def test_load_current_five_field_jsonl_preserves_json_native_extensions(
     assert loaded.session_id == SESSION_ID
     assert loaded.created_at == CREATED_AT
     assert loaded.updated_at == UPDATED_AT
-    assert loaded.last_consolidated == 2
+    assert loaded.last_compacted == 2
     assert loaded.metadata == header["metadata"]
     assert loaded.messages == messages
 
@@ -1863,9 +1863,10 @@ def test_load_treats_malformed_blackboard_metadata_as_absent(
     "records",
     [
         [_header(extra=True)],
+        [_header(last_consolidated=0)],
         [_header(session_id=OTHER_SESSION_ID)],
         [_header(created_at="2026-07-11T15:30:12")],
-        [_header(last_consolidated=-1)],
+        [_header(last_compacted=-1)],
         [_header(metadata={"title": "Project review", "token_usage": {}})],
         [
             _header(),

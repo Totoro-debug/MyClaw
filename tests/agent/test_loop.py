@@ -342,13 +342,13 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
         "skill_loader": 0,
         "skill_load": 0,
         "context_builder": 0,
-        "summary_manager": 0,
+        "compactor": 0,
         "tool_gateway": 0,
         "runner": 0,
         "persist": 0,
     }
     constructor_args: dict[str, list[tuple[Any, ...]]] = {
-        name: [] for name in ("context_builder", "summary_manager", "tool_gateway", "runner")
+        name: [] for name in ("context_builder", "compactor", "tool_gateway", "runner")
     }
 
     original_create = Session.create
@@ -388,7 +388,7 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
     monkeypatch.setattr(loop_module, "SkillLoader", RecordingSkillLoader)
     for name, attribute in (
         ("context_builder", "ContextBuilder"),
-        ("summary_manager", "ConversationSummaryManager"),
+        ("compactor", "ConversationCompactor"),
         ("tool_gateway", "ToolGateway"),
         ("runner", "AgentRunner"),
     ):
@@ -404,7 +404,7 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
         "skill_loader": 1,
         "skill_load": 1,
         "context_builder": 1,
-        "summary_manager": 1,
+        "compactor": 1,
         "tool_gateway": 1,
         "runner": 1,
         "persist": 0,
@@ -816,7 +816,7 @@ async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effec
     router = _Router(())
     loop, session, _bus = _runtime(tmp_path, router)
     session.add_message("user", "Status snapshot input")
-    session.last_consolidated = 0
+    session.last_compacted = 0
 
     class SessionAccessSpy:
         def __init__(self) -> None:
@@ -824,7 +824,7 @@ async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effec
                 "session_id": 0,
                 "messages": 0,
                 "metadata": 0,
-                "last_consolidated": 0,
+                "last_compacted": 0,
             }
 
         @property
@@ -843,9 +843,9 @@ async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effec
             return session.metadata
 
         @property
-        def last_consolidated(self) -> int:
-            self.calls["last_consolidated"] += 1
-            return session.last_consolidated
+        def last_compacted(self) -> int:
+            self.calls["last_compacted"] += 1
+            return session.last_compacted
 
     spy = SessionAccessSpy()
     messages_before = deepcopy(session.messages)
@@ -861,7 +861,7 @@ async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effec
         "session_id": 1,
         "messages": 1,
         "metadata": 1,
-        "last_consolidated": 1,
+        "last_compacted": 1,
     }
     assert session.messages == messages_before
     assert session.metadata == metadata_before

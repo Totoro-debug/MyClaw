@@ -1,4 +1,4 @@
-"""Synchronous Conversation Summary selection and persistence."""
+"""Synchronous Conversation Compaction selection and Conversation Summary persistence."""
 
 from __future__ import annotations
 
@@ -17,20 +17,20 @@ from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
 from myclaw.templates import render_template
 
-type SummaryProjection = Callable[
+type CompactionProjection = Callable[
     [Sequence[dict[str, Any]]],
     list[dict[str, Any]],
 ]
 
-_SUMMARY_JSON_TRANSLATION = str.maketrans({"`": r"\u0060"})
+_COMPACTION_JSON_TRANSLATION = str.maketrans({"`": r"\u0060"})
 
 __all__ = [
-    "ConversationSummaryManager",
-    "SummaryModelRouter",
+    "CompactionModelRouter",
+    "ConversationCompactor",
 ]
 
 
-class SummaryModelRouter(Protocol):
+class CompactionModelRouter(Protocol):
     """The direct Router seam used for the specialized memory model call."""
 
     async def complete(
@@ -42,27 +42,27 @@ class SummaryModelRouter(Protocol):
     ) -> ModelResponse: ...
 
 
-class ConversationSummaryManager:
+class ConversationCompactor:
     """Compress eligible early Session messages before an Agent Run model call."""
 
     def __init__(
         self,
         *,
-        provider: SummaryModelRouter,
+        provider: CompactionModelRouter,
         memory_manager: MemoryManager,
-        consolidation_message_threshold: int,
+        compaction_message_threshold: int,
         now: Callable[[], datetime],
     ) -> None:
         self._provider = provider
         self._memory_manager = memory_manager
-        self._message_threshold = consolidation_message_threshold
+        self._message_threshold = compaction_message_threshold
         self._now = now
 
     async def prepare(
         self,
         session: Session,
         *,
-        project_messages: SummaryProjection,
+        project_messages: CompactionProjection,
         route_context_window: int,
         route_max_output: int,
         tools: Sequence[dict[str, Any]],
@@ -84,7 +84,7 @@ class ConversationSummaryManager:
         self,
         session: Session,
         *,
-        project_messages: SummaryProjection,
+        project_messages: CompactionProjection,
         route_context_window: int,
         route_max_output: int,
         tools: Sequence[dict[str, Any]],
@@ -107,9 +107,9 @@ class ConversationSummaryManager:
         if fixed_request_tokens > available_input:
             raise _model_context_overflow()
         if current_user_index < len(short_term):
-            non_summarizable_messages = project_messages(short_term[current_user_index:])
+            non_compactable_messages = project_messages(short_term[current_user_index:])
             if (
-                _estimate_messages(non_summarizable_messages, tools=effective_tools)
+                _estimate_messages(non_compactable_messages, tools=effective_tools)
                 >= available_input
             ):
                 raise _model_context_overflow()
@@ -142,20 +142,20 @@ class ConversationSummaryManager:
             messages=[
                 {
                     "role": "system",
-                    "content": render_template("conversation-summary-system-prompt.md"),
+                    "content": render_template("conversation-compaction-system-prompt.md"),
                 },
-                {"role": "user", "content": _summary_user_context(selected)},
+                {"role": "user", "content": _compaction_user_context(selected)},
             ],
             tools=(),
         )
         session.update_metadata(usage_delta={"model_calls": 1, **response.usage.to_dict()})
         try:
-            new_last_consolidated = session.last_consolidated + cutoff
+            new_last_compacted = session.last_compacted + cutoff
             await self._memory_manager.append_summary(
                 content=response.message.content,
                 timestamp=self._persisted_now(),
             )
-            session.last_consolidated = new_last_consolidated
+            session.last_compacted = new_last_compacted
             return session
         except (OSError, UnicodeError, ValueError) as error:
             raise ModelCallError(
@@ -176,7 +176,7 @@ def _short_term_messages(
     current_user: dict[str, Any] | None = None,
     continuation: Sequence[dict[str, Any]] = (),
 ) -> list[dict[str, Any]]:
-    messages = list(session.messages[session.last_consolidated :])
+    messages = list(session.messages[session.last_compacted :])
     if current_user is not None:
         messages.append(current_user)
     messages.extend(continuation)
@@ -204,7 +204,7 @@ def _token_cutoff(
     messages: Sequence[dict[str, Any]],
     current_user_index: int,
     input_budget: int,
-    project_messages: SummaryProjection,
+    project_messages: CompactionProjection,
     tools: Sequence[dict[str, Any]],
 ) -> int:
     if current_user_index == len(messages):
@@ -268,7 +268,7 @@ def _projected_history_bytes(messages: Sequence[dict[str, Any]]) -> int:
     )
 
 
-def _project_summary_message(message: dict[str, Any]) -> dict[str, Any] | None:
+def _project_compaction_message(message: dict[str, Any]) -> dict[str, Any] | None:
     role = message["role"]
     if role == "user":
         return {"role": "user", "content": deepcopy(message["content"])}
@@ -301,16 +301,16 @@ def _project_summary_message(message: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _summary_user_context(messages: list[dict[str, Any]]) -> str:
+def _compaction_user_context(messages: list[dict[str, Any]]) -> str:
     records = [
         projected
         for message in messages
-        if (projected := _project_summary_message(message)) is not None
+        if (projected := _project_compaction_message(message)) is not None
     ]
     serialized = json.dumps(
         records,
         ensure_ascii=False,
         separators=(",", ":"),
         allow_nan=False,
-    ).translate(_SUMMARY_JSON_TRANSLATION)
+    ).translate(_COMPACTION_JSON_TRANSLATION)
     return f"## Conversation Messages\n\n```json\n{serialized}\n```"

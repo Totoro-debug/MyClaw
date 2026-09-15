@@ -108,7 +108,7 @@ class RuntimeConfiguration:
 
 @dataclass(frozen=True, slots=True)
 class MemoryConfiguration:
-    consolidation_message_threshold: int
+    compaction_message_threshold: int
     batch_size: int
     schedule: str
 
@@ -579,9 +579,9 @@ def _parse_memory(document: Mapping[str, object]) -> MemoryConfiguration:
     if len(schedule.split()) != 5 or not croniter.is_valid(schedule):
         _invalid("memory.schedule", "must be a valid five-field cron expression")
     return MemoryConfiguration(
-        consolidation_message_threshold=_integer(
-            table.get("consolidation_message_threshold", 40),
-            "memory.consolidation_message_threshold",
+        compaction_message_threshold=_integer(
+            table.get("compaction_message_threshold", 40),
+            "memory.compaction_message_threshold",
             4,
             10_000,
         ),
@@ -884,7 +884,7 @@ def _validate_defined_fields(document: Mapping[str, object]) -> None:
     memory = _table(document.get("memory", {}), "memory")
     _reject_unknown(
         memory,
-        {"consolidation_message_threshold", "batch_size", "schedule"},
+        {"compaction_message_threshold", "batch_size", "schedule"},
         "memory",
     )
 

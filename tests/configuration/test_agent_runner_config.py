@@ -14,7 +14,7 @@ def _config(max_iterations: str | None = None) -> str:
 {runtime}
 
 [memory]
-consolidation_message_threshold = 40
+compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 

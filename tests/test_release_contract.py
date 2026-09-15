@@ -351,6 +351,7 @@ _EXPECTED_REMOVED_MARKDOWN_PATHS = frozenset(
         ROOT / "docs" / "security-fault-review.md",
         ROOT / "docs" / "terminal-conversation-ui-design.md",
         ROOT / "myclaw" / "templates" / "blackboard.md",
+        ROOT / "myclaw" / "templates" / "conversation-summary-system-prompt.md",
         ROOT / "myclaw" / "templates" / "conversation-summary-input.md",
         ROOT / "myclaw" / "templates" / "current-user-input.md",
         ROOT / "myclaw" / "templates" / "interrupted-assistant-content.md",
@@ -1047,21 +1048,21 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
 
     assert violations == []
 
-    conversation_summary = _issue_202_class(
-        _issue_202_ast(ROOT / "myclaw" / "agent" / "memory" / "conversation_summary.py"),
-        "ConversationSummaryManager",
+    conversation_compactor = _issue_202_class(
+        _issue_202_ast(ROOT / "myclaw" / "agent" / "memory" / "conversation_compactor.py"),
+        "ConversationCompactor",
     )
-    summary_init = _issue_202_direct_method(conversation_summary, "__init__")
-    assert _issue_202_parameter_names(summary_init) == (
+    compaction_init = _issue_202_direct_method(conversation_compactor, "__init__")
+    assert _issue_202_parameter_names(compaction_init) == (
         "self",
         "provider",
         "memory_manager",
-        "consolidation_message_threshold",
+        "compaction_message_threshold",
         "now",
     )
-    assert all(default is None for default in summary_init.args.kw_defaults)
-    summary_prepare = _issue_202_direct_method(conversation_summary, "prepare")
-    assert _issue_202_parameter_names(summary_prepare) == (
+    assert all(default is None for default in compaction_init.args.kw_defaults)
+    compaction_prepare = _issue_202_direct_method(conversation_compactor, "prepare")
+    assert _issue_202_parameter_names(compaction_prepare) == (
         "self",
         "session",
         "project_messages",
@@ -1071,7 +1072,7 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
         "current_user",
         "continuation",
     )
-    assert summary_prepare.args.kw_defaults[:4] == [None, None, None, None]
+    assert compaction_prepare.args.kw_defaults[:4] == [None, None, None, None]
 
     management = _issue_202_class(
         _issue_202_ast(ROOT / "myclaw" / "management" / "service.py"),

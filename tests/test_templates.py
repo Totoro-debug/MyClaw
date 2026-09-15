@@ -7,7 +7,7 @@ from myclaw.templates import load_template, render_template
 
 TEMPLATE_NAMES = {
     "blackboard-system-prompt.md",
-    "conversation-summary-system-prompt.md",
+    "conversation-compaction-system-prompt.md",
     "default-config.md",
     "foreground-chat-system-prompt.md",
     "long-term-memory.md",

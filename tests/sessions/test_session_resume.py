@@ -115,7 +115,7 @@ async def test_resume_listing_skips_a_session_with_malformed_field_types(
                 "session_id": corrupt_id,
                 "created_at": "2026-08-01T12:00:00.123+08:00",
                 "updated_at": "2026-08-01T12:00:00.123+08:00",
-                "last_consolidated": 0,
+                "last_compacted": 0,
                 "metadata": {
                     "title": "Corrupt session",
                     "token_usage": "not-an-object",

@@ -15,7 +15,7 @@ max_iterations = 50
 enable_skill_always_load = false
 
 [memory]
-consolidation_message_threshold = 40
+compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
@@ -92,7 +92,7 @@ VALID_CONFIG = """[runtime]
 max_tool_result_chars = 60000
 
 [memory]
-consolidation_message_threshold = 50
+compaction_message_threshold = 50
 batch_size = 12
 schedule = "15 * * * *"
 
@@ -182,7 +182,7 @@ REDACTION_CONFIG = """# User Configuration
 max_tool_result_chars = 50000
 
 [memory]
-consolidation_message_threshold = 40
+compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
@@ -212,7 +212,7 @@ EXPECTED_REDACTED_CONFIG = """# User Configuration
 max_tool_result_chars = 50000
 
 [memory]
-consolidation_message_threshold = 40
+compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
@@ -499,7 +499,7 @@ def test_valid_configuration_loads_as_typed_values(agent_home: Path) -> None:
 
     assert (
         configuration.runtime.max_tool_result_chars,
-        configuration.memory.consolidation_message_threshold,
+        configuration.memory.compaction_message_threshold,
         configuration.memory.batch_size,
         configuration.memory.schedule,
         configuration.models.providers["anthropic-default"].models,
@@ -570,7 +570,7 @@ def test_omitted_defaulted_configuration_fields_use_accepted_defaults(
 
     assert (
         configuration.runtime.max_tool_result_chars,
-        configuration.memory.consolidation_message_threshold,
+        configuration.memory.compaction_message_threshold,
         configuration.memory.batch_size,
         configuration.memory.schedule,
         configuration.models.routes["default"].reasoning_effort,
@@ -857,10 +857,10 @@ def test_config_view_reports_undefined_fields(
         ),
         (
             VALID_CONFIG.replace(
-                "consolidation_message_threshold = 50",
-                "consolidation_message_threshold = 3",
+                "compaction_message_threshold = 50",
+                "compaction_message_threshold = 3",
             ),
-            "memory.consolidation_message_threshold",
+            "memory.compaction_message_threshold",
         ),
         (VALID_CONFIG.replace("batch_size = 12", "batch_size = 1001"), "memory.batch_size"),
         (

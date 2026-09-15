@@ -483,7 +483,7 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
         context_window=10,
         context_used_percent=40.0,
         session_message_count=0,
-        last_consolidated=0,
+        last_compacted=0,
         cumulative_usage={
             "model_calls": 0,
             "input_tokens": 0,
@@ -524,7 +524,7 @@ async def test_status_reads_one_current_loop_projection_per_request_and_resets_u
             session_id="20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000",
             session_title="First generation",
             session_message_count=2,
-            last_consolidated=1,
+            last_compacted=1,
             cumulative_usage=(
                 ("model_calls", 1),
                 ("input_tokens", 10),
@@ -545,7 +545,7 @@ async def test_status_reads_one_current_loop_projection_per_request_and_resets_u
             session_id="20260711-153012-123457_6fa459ea-ee8a-4ca4-894e-db77e160355e",
             session_title="Second generation",
             session_message_count=5,
-            last_consolidated=4,
+            last_compacted=4,
             cumulative_usage=(
                 ("model_calls", 2),
                 ("input_tokens", 20),
@@ -577,13 +577,13 @@ async def test_status_reads_one_current_loop_projection_per_request_and_resets_u
     second_status = await service.status()
 
     assert first_status.session_message_count == 2
-    assert first_status.last_consolidated == 1
+    assert first_status.last_compacted == 1
     assert first_status.chat_model == "first-provider/first-model"
     assert first_status.context_window == 100
     assert first_status.uptime_seconds == 90
     assert first_status.cumulative_usage["total_tokens"] == 13
     assert second_status.session_message_count == 5
-    assert second_status.last_consolidated == 4
+    assert second_status.last_compacted == 4
     assert second_status.chat_model == "second-provider/second-model"
     assert second_status.context_window == 200
     assert second_status.uptime_seconds == 10
@@ -608,7 +608,7 @@ async def test_management_status_builds_once_from_the_current_loop_projection(
             session_id="20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000",
             session_title="Current generation",
             session_message_count=3,
-            last_consolidated=2,
+            last_compacted=2,
             cumulative_usage=(
                 ("model_calls", 1),
                 ("input_tokens", 2),
@@ -643,7 +643,7 @@ async def test_management_status_builds_once_from_the_current_loop_projection(
     status = await service.status()
 
     assert status.session_message_count == 3
-    assert status.last_consolidated == 2
+    assert status.last_compacted == 2
     assert status.uptime_seconds == 5
     assert status.cumulative_usage["total_tokens"] == 5
     assert provider_calls == 1

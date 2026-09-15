@@ -99,7 +99,7 @@ class RuntimeStatusInput:
     session_id: str = ""
     session_title: str = ""
     session_message_count: int = 0
-    last_consolidated: int = 0
+    last_compacted: int = 0
     cumulative_usage: tuple[tuple[str, int], ...] = ()
     chat_model: str = ""
     context_window: int = 0
@@ -118,7 +118,7 @@ class RuntimeStatus:
     context_window: int
     context_used_percent: float
     session_message_count: int
-    last_consolidated: int
+    last_compacted: int
     cumulative_usage: dict[str, int]
     schedule: dict[str, object] | None = None
 
@@ -128,7 +128,7 @@ class RuntimeStatus:
         require_nonnegative_int(self.context_window, field="context_window")
         require_nonnegative_number(self.context_used_percent, field="context_used_percent")
         require_nonnegative_int(self.session_message_count, field="session_message_count")
-        require_nonnegative_int(self.last_consolidated, field="last_consolidated")
+        require_nonnegative_int(self.last_compacted, field="last_compacted")
 
     def to_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -140,7 +140,7 @@ class RuntimeStatus:
             "context_window": self.context_window,
             "context_used_percent": self.context_used_percent,
             "session_message_count": self.session_message_count,
-            "last_consolidated": self.last_consolidated,
+            "last_compacted": self.last_compacted,
             "cumulative_usage": dict(self.cumulative_usage),
         }
         if self.schedule is not None:
@@ -323,7 +323,7 @@ class ManagementViewService:
                 context_window=projection.context_window,
                 context_used_percent=estimated / projection.context_window * 100,
                 session_message_count=projection.session_message_count,
-                last_consolidated=projection.last_consolidated,
+                last_compacted=projection.last_compacted,
                 cumulative_usage=dict(projection.cumulative_usage),
                 schedule=dict(self._schedule_status()),
             )
