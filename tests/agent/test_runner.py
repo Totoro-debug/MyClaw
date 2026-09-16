@@ -162,6 +162,11 @@ class _DirectGateway:
         )
 
 
+class _MicroCompressionGateway(_DirectGateway):
+    def is_micro_compression_eligible(self, tool_name: str) -> bool:
+        return tool_name in {"work", "read_file"}
+
+
 class _RetryingRouter:
     def __init__(self) -> None:
         self.logical_calls = 0
@@ -1081,6 +1086,174 @@ async def test_runner_normalizes_externalizer_failure_to_safe_tool_error() -> No
         "content": "work result could not be stored.",
         "artifact": None,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("iterations", "expected_omitted_results"),
+    ((10, 0), (11, 10), (12, 11)),
+)
+async def test_runner_micro_compresses_only_stale_tool_results_after_eleventh_call(
+    iterations: int,
+    expected_omitted_results: int,
+) -> None:
+    large_content = "x" * 513
+    tool_results = tuple(
+        ToolResult(
+            tool_call_id=f"call-{number}",
+            name="work",
+            status=("success", "error", "refused")[number % 3],
+            content=large_content,
+        )
+        for number in range(iterations)
+    )
+    final_script = StreamScript(
+        events=(
+            ModelCompleted(
+                response=ModelResponse(
+                    message=AssistantModelMessage(content="Done"),
+                    usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                    finish_reason="stop",
+                )
+            ),
+        )
+    )
+    provider = ScriptedFakeProvider(streams=(*_tool_iteration_scripts(iterations), final_script))
+    gateway = _MicroCompressionGateway([], tool_results)
+    initial_messages = [{"role": "user", "content": "Keep working."}]
+    original_initial_messages = [dict(message) for message in initial_messages]
+
+    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+        initial_messages,
+        model="chat",
+        tool_gateway=gateway,  # type: ignore[arg-type]
+        on_output=_ignore_output,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+    )
+
+    request_tool_messages = [
+        message
+        for message in provider.stream_requests[-1].messages
+        if message.get("role") == "tool"
+    ]
+    assert len(request_tool_messages) == iterations
+    assert (
+        sum(
+            message["content"] == "[work result omitted from context]"
+            for message in request_tool_messages
+        )
+        == expected_omitted_results
+    )
+    assert request_tool_messages[-1]["content"] == large_content
+    assert initial_messages == original_initial_messages
+    assert all(
+        message["content"] == large_content
+        for message in result.messages
+        if message.get("role") == "tool"
+    )
+    assert {message["status"] for message in result.messages if message.get("role") == "tool"} == {
+        "success",
+        "error",
+        "refused",
+    }
+
+
+@pytest.mark.asyncio
+async def test_runner_micro_compression_includes_eligible_history_but_keeps_recent_cycle() -> None:
+    large_content = "h" * 513
+    history: list[dict[str, Any]] = [
+        {"role": "user", "content": "Previous request."},
+        {
+            "role": "tool",
+            "tool_call_id": "old-call",
+            "name": "read_file",
+            "status": "success",
+            "content": large_content,
+            "artifact": None,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "boundary-call",
+            "name": "read_file",
+            "status": "success",
+            "content": "b" * 512,
+            "artifact": None,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "non-eligible-call",
+            "name": "write_file",
+            "status": "success",
+            "content": large_content,
+            "artifact": None,
+        },
+        {"role": "user", "content": "Current request."},
+    ]
+    final_script = StreamScript(
+        events=(
+            ModelCompleted(
+                response=ModelResponse(
+                    message=AssistantModelMessage(content="Done"),
+                    usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                    finish_reason="stop",
+                )
+            ),
+        )
+    )
+    provider = ScriptedFakeProvider(streams=(*_tool_iteration_scripts(11), final_script))
+    gateway = _MicroCompressionGateway(
+        [],
+        tuple(
+            ToolResult(
+                tool_call_id=f"call-{number}",
+                name="work",
+                status="success",
+                content=large_content,
+            )
+            for number in range(11)
+        ),
+    )
+    original_history = [dict(message) for message in history]
+
+    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+        history,
+        model="chat",
+        tool_gateway=gateway,  # type: ignore[arg-type]
+        on_output=_ignore_output,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+    )
+
+    final_request = provider.stream_requests[-1].messages
+    old_tool = next(
+        message for message in final_request if message.get("tool_call_id") == "old-call"
+    )
+    assert old_tool["content"] == "[read_file result omitted from context]"
+    boundary_tool = next(
+        message for message in final_request if message.get("tool_call_id") == "boundary-call"
+    )
+    assert boundary_tool["content"] == "b" * 512
+    non_eligible_tool = next(
+        message for message in final_request if message.get("tool_call_id") == "non-eligible-call"
+    )
+    assert non_eligible_tool["content"] == large_content
+    current_cycle_tool = [
+        message
+        for message in final_request
+        if message.get("role") == "tool" and message.get("tool_call_id") == "call-10"
+    ]
+    assert current_cycle_tool[0]["content"] == large_content
+    assert history == original_history
+    assert all(
+        message["content"] == large_content
+        for message in result.messages
+        if message.get("role") == "tool"
+    )
 
 
 @pytest.mark.asyncio

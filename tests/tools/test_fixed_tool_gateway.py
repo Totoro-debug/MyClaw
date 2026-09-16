@@ -124,6 +124,52 @@ def test_fixed_catalog_order_and_detached_definitions(
     assert not any(name in vars(gateway) for name in ("workspace", "schedule_store"))
 
 
+def test_tool_gateway_identifies_micro_compression_eligible_tool_origins(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    remote_tool = MCPTool(
+        MCPToolSpec(
+            server_name="alpha",
+            remote_name="generated",
+            model_name="remote_generated_name",
+            description="A dynamically named remote Tool.",
+            parameters={"type": "object"},
+        ),
+        _MCPCallSession(),
+    )
+    gateway = _gateway(workspace, agent_home, additional_tools=(remote_tool,))
+
+    assert all(
+        gateway.is_micro_compression_eligible(name)
+        for name in (
+            "exec",
+            "glob",
+            "grep",
+            "list_dir",
+            "read_file",
+            "web_fetch",
+            "web_search",
+        )
+    )
+    assert gateway.is_micro_compression_eligible(remote_tool.name)
+    assert not any(
+        gateway.is_micro_compression_eligible(name)
+        for name in ("edit_file", "write_file", "schedule", "tool_search", "unknown")
+    )
+
+    class LooksLikeMCPTool(BaseTool):
+        name = "mcp_not_an_mcp_tool"
+        description = "A local Tool with an MCP-looking name."
+        parameters: ClassVar[dict[str, Any]] = {"type": "object"}
+
+        async def execute(self) -> str:
+            return ""
+
+    run_gateway = gateway.for_run(exposed_names=(), run_tools=(LooksLikeMCPTool(),))
+    assert not run_gateway.is_micro_compression_eligible("mcp_not_an_mcp_tool")
+
+
 def test_agent_run_gateway_starts_with_search_baseline_and_activates_deferred_tools(
     workspace: Path,
     agent_home: Path,

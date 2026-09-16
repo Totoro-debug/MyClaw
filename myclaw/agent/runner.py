@@ -46,6 +46,8 @@ _MAX_ITERATIONS_MESSAGE = (
     "MyClaw 本轮对话已经达到最大循环次数，仍没有输出最终结果。"  # noqa: RUF001
     "可以再次尝试本次请求或者尝试给出更明确的任务目标。"
 )
+_MICRO_COMPRESSION_TOOL_CALL_THRESHOLD = 10
+_TOOL_RESULT_MICRO_COMPRESSION_CHAR_LIMIT = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +123,40 @@ def _empty_usage() -> dict[str, int]:
         "output_tokens": 0,
         "total_tokens": 0,
     }
+
+
+def _project_for_model_request(
+    messages: Sequence[dict[str, Any]],
+    *,
+    omit_tool_results_before: int | None,
+    gateway: ToolGateway,
+) -> list[dict[str, Any]]:
+    """Project stale Tool content for one detached Provider request."""
+    projected = deepcopy(list(messages))
+    if omit_tool_results_before is None:
+        return projected
+
+    for index, message in enumerate(projected):
+        if index >= omit_tool_results_before or message.get("role") != "tool":
+            continue
+        name = message.get("name")
+        content = message.get("content")
+        if (
+            not isinstance(name, str)
+            or not _is_micro_compression_eligible(gateway, name)
+            or not isinstance(content, str)
+            or len(content) <= _TOOL_RESULT_MICRO_COMPRESSION_CHAR_LIMIT
+        ):
+            continue
+        message["content"] = f"[{name} result omitted from context]"
+    return projected
+
+
+def _is_micro_compression_eligible(gateway: ToolGateway, tool_name: object) -> bool:
+    if not isinstance(tool_name, str):
+        return False
+    checker = getattr(gateway, "is_micro_compression_eligible", None)
+    return bool(checker(tool_name)) if callable(checker) else False
 
 
 @dataclass(slots=True)
@@ -202,6 +238,9 @@ class AgentRunner:
         events: AsyncIterator[ModelStreamEvent] | None = None
         is_cancel_requested = cancel_requested or _never_cancel
         externalize = externalize_result or _identity_tool_result
+        eligible_tool_call_count = 0
+        micro_compression_enabled = False
+        last_completed_cycle_start: int | None = None
 
         async def emit(event: AgentRunnerOutput) -> None:
             if on_output is None:
@@ -253,11 +292,19 @@ class AgentRunner:
                 partial_content.clear()
                 usage["model_calls"] += 1
                 response: ModelResponse | None = None
+                current_cycle_start = len(runtime_messages)
+                request_messages = deepcopy(runtime_messages)
+                if model != "memory" and tool_gateway is not None and micro_compression_enabled:
+                    request_messages = _project_for_model_request(
+                        runtime_messages,
+                        omit_tool_results_before=last_completed_cycle_start,
+                        gateway=tool_gateway,
+                    )
                 if model == "chat":
                     router = cast(AgentRunnerRouter, self._model_router)
                     events = router.stream(
                         model,
-                        messages=deepcopy(runtime_messages),
+                        messages=request_messages,
                         tools=() if tool_gateway is None else tuple(tool_gateway.schemas),
                         continuation=continuation,
                     )
@@ -299,7 +346,7 @@ class AgentRunner:
                         raise ValueError("Memory Agent Runs require a Memory Router")
                     response = await self._model_router.complete(
                         model,
-                        messages=deepcopy(runtime_messages),
+                        messages=request_messages,
                         tools=() if tool_gateway is None else tuple(tool_gateway.schemas),
                         continuation=continuation,
                     )
@@ -307,7 +354,7 @@ class AgentRunner:
                     router = cast(AgentRunnerRouter, self._model_router)
                     response = await router.complete(
                         model,
-                        messages=deepcopy(runtime_messages),
+                        messages=request_messages,
                         tools=() if tool_gateway is None else tuple(tool_gateway.schemas),
                         continuation=continuation,
                     )
@@ -383,6 +430,12 @@ class AgentRunner:
                     result = _externalize_tool_result(result, externalize)
                     _append_run_message(runtime_messages, increment, _tool_run_message(result))
                     pending_tool_calls.pop(0)
+                    if model != "memory" and _is_micro_compression_eligible(
+                        tool_gateway, tool_call.name
+                    ):
+                        eligible_tool_call_count += 1
+                        if eligible_tool_call_count > _MICRO_COMPRESSION_TOOL_CALL_THRESHOLD:
+                            micro_compression_enabled = True
                     await emit(
                         AgentRunnerToolCallFinished(
                             tool_call_id=tool_call.id,
@@ -401,6 +454,7 @@ class AgentRunner:
                     if is_cancel_requested():
                         return finish_cancelled(final_content="")
 
+                last_completed_cycle_start = current_cycle_start
                 if usage["model_calls"] >= max_iterations:
                     limit_error = ErrorInfo("agent_iteration_limit", _MAX_ITERATIONS_MESSAGE)
                     _append_run_message(

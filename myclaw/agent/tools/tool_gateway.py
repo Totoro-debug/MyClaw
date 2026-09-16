@@ -28,6 +28,7 @@ from myclaw.agent.tools.core.schedule import ScheduleTool
 from myclaw.agent.tools.core.web_fetch import WebFetchTool
 from myclaw.agent.tools.core.web_search import WebSearchTool
 from myclaw.agent.tools.core.write_file import WriteFileTool
+from myclaw.agent.tools.mcp import MCPTool
 from myclaw.schedule.service import ScheduleService
 from myclaw.utils.validation import require_uuid4
 
@@ -48,6 +49,9 @@ BUILT_IN_TOOL_NAMES: tuple[str, ...] = (
     "web_fetch",
     "schedule",
     "tool_search",
+)
+_MICRO_COMPRESSION_ELIGIBLE_BUILT_IN_NAMES = frozenset(
+    {"exec", "glob", "grep", "list_dir", "read_file", "web_fetch", "web_search"}
 )
 
 
@@ -283,6 +287,18 @@ class ToolGateway:
     def catalog(self) -> tuple[BaseTool, ...]:
         """Return the complete Tool Catalog owned by this Gateway view."""
         return self._catalog
+
+    def is_micro_compression_eligible(self, tool_name: str) -> bool:
+        """Return whether one catalogued Tool result may be micro-compressed."""
+        if not isinstance(tool_name, str):
+            return False
+        tools = getattr(self, "_tools", None)
+        if not isinstance(tools, dict):
+            return False
+        tool = tools.get(tool_name)
+        return tool is not None and (
+            tool_name in _MICRO_COMPRESSION_ELIGIBLE_BUILT_IN_NAMES or isinstance(tool, MCPTool)
+        )
 
     def expose(self, names: Collection[str]) -> None:
         """Expose available Tools for subsequent model requests in this Run."""
