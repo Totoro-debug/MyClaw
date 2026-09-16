@@ -1473,6 +1473,8 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
     )
     mcp_tool = _LargeSchemaTool()
     loop, session, _bus = _runtime(tmp_path, _Router(()), config_text=config, mcp_tools=(mcp_tool,))
+    action_summary = "- Preserved the active Session work."
+    session.update_metadata(summary=action_summary)
     builder = loop._context_builder
     loader = loop._skill_loader
     active_skills = loader.skills
@@ -1491,17 +1493,22 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
     assert len(expected_tools) > 1
     original_build_status = builder.build_status_messages
     public_projections: list[list[dict[str, Any]]] = []
+    observed_summaries: list[str] = []
     estimated_inputs: list[RuntimeStatusInput] = []
     chat_route = loop._configuration.resolve_route("chat").route
     available_input = chat_route.context_window - chat_route.max_output
 
     def observe_public_status(
-        history: Sequence[dict[str, Any]], *, session_id: str
+        history: Sequence[dict[str, Any]],
+        *,
+        session_id: str,
+        summary: str = "",
     ) -> list[dict[str, Any]]:
         assert tuple(history) == ()
         assert session_id == session.session_id
         assert loader.skills == published_skills
-        projected = original_build_status(history, session_id=session_id)
+        observed_summaries.append(summary)
+        projected = original_build_status(history, session_id=session_id, summary=summary)
         public_projections.append(projected)
         return projected
 
@@ -1533,6 +1540,8 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
             assert '"name":"candidate"' not in restored[0]["content"]
 
     assert len(public_projections) == len(estimated_inputs) == 1
+    assert observed_summaries == [action_summary]
+    assert public_projections[0][1] == {"role": "user", "content": action_summary}
     budget_input = estimated_inputs[0]
     assert '"name":"active"' not in budget_input.system_prompt
     assert ('"name":"candidate"' in budget_input.system_prompt) is not empty_candidate
@@ -1584,13 +1593,18 @@ def test_reload_public_projection_failure_restores_scope_without_publication(
     )
     original_build_status = builder.build_status_messages
     projected_prompts: list[str] = []
+    observed_summaries: list[str] = []
     estimated_inputs: list[RuntimeStatusInput] = []
     error = error_type("candidate projection failed")
 
     def fail_public_status(
-        history: Sequence[dict[str, Any]], *, session_id: str
+        history: Sequence[dict[str, Any]],
+        *,
+        session_id: str,
+        summary: str = "",
     ) -> list[dict[str, Any]]:
-        projected = original_build_status(history, session_id=session_id)
+        observed_summaries.append(summary)
+        projected = original_build_status(history, session_id=session_id, summary=summary)
         projected_prompts.append(projected[0]["content"])
         raise error
 
@@ -1611,6 +1625,7 @@ def test_reload_public_projection_failure_restores_scope_without_publication(
             assert '"name":"published"' not in restored[0]["content"]
 
     assert len(projected_prompts) == 1
+    assert observed_summaries == [""]
     assert '"name":"candidate"' in projected_prompts[0]
     assert '"name":"active"' not in projected_prompts[0]
     assert '"name":"published"' not in projected_prompts[0]

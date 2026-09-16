@@ -1488,14 +1488,11 @@ def _foreground_runtime_status_input(
     generation_started_at: float | None = None,
 ) -> RuntimeStatusInput:
     """Project and serialize a minimum foreground request for status and preflight."""
-    if summary:
-        projected = context_builder.build_status_messages(
-            history,
-            session_id=session_id,
-            summary=summary,
-        )
-    else:
-        projected = context_builder.build_status_messages(history, session_id=session_id)
+    projected = context_builder.build_status_messages(
+        history,
+        session_id=session_id,
+        summary=summary,
+    )
     projected_system = projected[0].get("content")
     if not isinstance(projected_system, str):
         raise TypeError("Context Builder status system message is malformed")
