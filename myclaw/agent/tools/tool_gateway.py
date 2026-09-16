@@ -292,10 +292,7 @@ class ToolGateway:
         """Return whether one catalogued Tool result may be micro-compressed."""
         if not isinstance(tool_name, str):
             return False
-        tools = getattr(self, "_tools", None)
-        if not isinstance(tools, dict):
-            return False
-        tool = tools.get(tool_name)
+        tool = self._tools.get(tool_name)
         return tool is not None and (
             tool_name in _MICRO_COMPRESSION_ELIGIBLE_BUILT_IN_NAMES or isinstance(tool, MCPTool)
         )

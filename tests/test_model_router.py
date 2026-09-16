@@ -1523,6 +1523,10 @@ async def test_agent_runner_next_tool_loop_request_reads_latest_runtime_effort()
         def __init__(self) -> None:
             self.schemas: list[dict[str, object]] = []
 
+        def is_micro_compression_eligible(self, tool_name: str) -> bool:
+            del tool_name
+            return False
+
         async def call(
             self,
             observed: ModelToolCall,

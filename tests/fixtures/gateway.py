@@ -30,6 +30,9 @@ class SingleToolGateway(ToolGateway):
     def schemas(self) -> list[dict[str, Any]]:
         return self._gateway.schemas
 
+    def is_micro_compression_eligible(self, tool_name: str) -> bool:
+        return self._gateway.is_micro_compression_eligible(tool_name)
+
     async def call(
         self,
         tool_call: ModelToolCall,

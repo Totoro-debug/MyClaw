@@ -161,6 +161,10 @@ class _DirectGateway:
             tool_call_id=tool_call.id, name=tool_call.name, status="success", content="done"
         )
 
+    def is_micro_compression_eligible(self, tool_name: str) -> bool:
+        del tool_name
+        return False
+
 
 class _MicroCompressionGateway(_DirectGateway):
     def is_micro_compression_eligible(self, tool_name: str) -> bool:

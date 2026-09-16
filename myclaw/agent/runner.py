@@ -143,20 +143,13 @@ def _project_for_model_request(
         content = message.get("content")
         if (
             not isinstance(name, str)
-            or not _is_micro_compression_eligible(gateway, name)
+            or not gateway.is_micro_compression_eligible(name)
             or not isinstance(content, str)
             or len(content) <= _TOOL_RESULT_MICRO_COMPRESSION_CHAR_LIMIT
         ):
             continue
         message["content"] = f"[{name} result omitted from context]"
     return projected
-
-
-def _is_micro_compression_eligible(gateway: ToolGateway, tool_name: object) -> bool:
-    if not isinstance(tool_name, str):
-        return False
-    checker = getattr(gateway, "is_micro_compression_eligible", None)
-    return bool(checker(tool_name)) if callable(checker) else False
 
 
 @dataclass(slots=True)
@@ -293,13 +286,14 @@ class AgentRunner:
                 usage["model_calls"] += 1
                 response: ModelResponse | None = None
                 current_cycle_start = len(runtime_messages)
-                request_messages = deepcopy(runtime_messages)
                 if model != "memory" and tool_gateway is not None and micro_compression_enabled:
                     request_messages = _project_for_model_request(
                         runtime_messages,
                         omit_tool_results_before=last_completed_cycle_start,
                         gateway=tool_gateway,
                     )
+                else:
+                    request_messages = deepcopy(runtime_messages)
                 if model == "chat":
                     router = cast(AgentRunnerRouter, self._model_router)
                     events = router.stream(
@@ -430,8 +424,8 @@ class AgentRunner:
                     result = _externalize_tool_result(result, externalize)
                     _append_run_message(runtime_messages, increment, _tool_run_message(result))
                     pending_tool_calls.pop(0)
-                    if model != "memory" and _is_micro_compression_eligible(
-                        tool_gateway, tool_call.name
+                    if model != "memory" and tool_gateway.is_micro_compression_eligible(
+                        tool_call.name
                     ):
                         eligible_tool_call_count += 1
                         if eligible_tool_call_count > _MICRO_COMPRESSION_TOOL_CALL_THRESHOLD:
