@@ -600,7 +600,9 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
             and isinstance(node.func.value, ast.Attribute)
             and node.func.value.attr == "_compactor"
         )
-        assert required_compaction_arguments <= {keyword.arg for keyword in compaction_call.keywords}
+        assert required_compaction_arguments <= {
+            keyword.arg for keyword in compaction_call.keywords
+        }
 
     assert any(
         isinstance(node, ast.Call)

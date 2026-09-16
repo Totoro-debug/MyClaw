@@ -348,6 +348,7 @@ def _loop(
     tmp_path: Path,
     router: _ScheduleRouter,
     *,
+    config_text: str = MINIMAL_VALID_CONFIG,
     skill_loader: SkillLoader | None = None,
     schedule_context_preparer: _ScheduleContextPreparer = _schedule_context,
     externalize_result_for: Callable[[Session], Callable[[ToolResult], ToolResult]] | None = None,
@@ -358,7 +359,7 @@ def _loop(
     workspace.mkdir(parents=True)
     agent_home = AgentHome(tmp_path / "agent-home")
     agent_home.initialize()
-    (agent_home.path / "config.toml").write_text(MINIMAL_VALID_CONFIG, encoding="utf-8")
+    (agent_home.path / "config.toml").write_text(config_text, encoding="utf-8")
     configuration = ConfigLoader(agent_home).load()
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=tmp_path / "agent-home")
@@ -1100,6 +1101,81 @@ async def test_schedule_oversized_result_uses_canonical_schedule_artifact_sessio
     artifact = tool_message["artifact"]
     assert artifact["path"].startswith(f".myclaw/artifacts/schedule_{JOB_ID}/")
     assert (state.workspace_path / artifact["path"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_schedule_agent_loop_micro_compression_keeps_artifacts_and_session_history_complete(
+    tmp_path: Path,
+) -> None:
+    router = _ScheduleRouter(
+        *(
+            [
+                _tool_response(
+                    call_id=f"call_{index}",
+                    name="read_file",
+                    arguments={"path": "large.txt", "limit": 10000},
+                )
+                for index in range(12)
+            ]
+            + [_ScheduleRouter._response()]
+        )
+    )
+    loop, state, _service, _bus = _loop(
+        tmp_path,
+        router,
+        config_text="[runtime]\nmax_tool_result_chars = 1000\n\n" + MINIMAL_VALID_CONFIG,
+    )
+    (state.workspace_path / "large.txt").write_text("x" * 4000, encoding="utf-8")
+
+    try:
+        await loop.run_schedule_job(_job())
+    finally:
+        await loop.close()
+
+    assert len(router.requests) == 13
+    previous_request = router.requests[-2][0]
+    previous_tools = [message for message in previous_request if message.get("role") == "tool"]
+    assert (
+        sum(
+            message["content"] == "[read_file result omitted from context]"
+            for message in previous_tools
+        )
+        == 10
+    )
+    assert len(previous_tools[-1]["content"]) > 512
+
+    final_request = router.requests[-1][0]
+    final_tools = [message for message in final_request if message.get("role") == "tool"]
+    assert len(final_tools) == 12
+    assert (
+        sum(
+            message["content"] == "[read_file result omitted from context]"
+            for message in final_tools
+        )
+        == 11
+    )
+    assert len(final_tools[-1]["content"]) > 512
+
+    schedule_session = Session.load(
+        state,
+        f"schedule_{JOB_ID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    persisted_tools = [
+        message for message in schedule_session.messages if message.get("role") == "tool"
+    ]
+    assert len(persisted_tools) == 12
+    assert all(len(message["content"]) > 512 for message in persisted_tools)
+    assert all(
+        message["content"] != "[read_file result omitted from context]"
+        for message in persisted_tools
+    )
+    for message in persisted_tools:
+        artifact = message["artifact"]
+        assert isinstance(artifact, dict)
+        artifact_content = (state.workspace_path / artifact["path"]).read_text(encoding="utf-8")
+        assert artifact_content == "x" * 4000
+        assert "result omitted from context" not in artifact_content
 
 
 @pytest.mark.asyncio

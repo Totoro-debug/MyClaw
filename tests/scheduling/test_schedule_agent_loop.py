@@ -234,6 +234,17 @@ def _schedule_tool_response(call_id: str, arguments: dict[str, object]) -> Model
     )
 
 
+def _read_file_response(call_id: str) -> ModelResponse:
+    return _response(
+        "",
+        tool_call=ModelToolCall(
+            id=call_id,
+            name="read_file",
+            arguments=json.dumps({"path": "large.txt", "limit": 10_000}, separators=(",", ":")),
+        ),
+    )
+
+
 def _due_job(*, message: str = "Run this.") -> ScheduleJob:
     return ScheduleJob(
         job_id=str(JOB_UUID),
@@ -1001,6 +1012,115 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
         ]
     finally:
         await _close_components(loop, router, schedule, dream_owner)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runs_keep_summaries_and_micro_compression_state_isolated(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _ScheduleProvider(
+        chat_responses=(
+            *(_read_file_response(f"foreground-{index}") for index in range(10)),
+            _response("Foreground result."),
+        ),
+        schedule_responses=(
+            *(_read_file_response(f"schedule-{index}") for index in range(11)),
+            _response("Schedule result."),
+        ),
+        block_schedule_call=12,
+    )
+    clock = _BlockingClock(NOW)
+    loop, router, schedule, dream, _dispatcher, bus = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=clock,
+    )
+    foreground_summary = "- Updated the foreground Session."
+    schedule_summary = "- Updated the Schedule Session."
+    loop.session.update_metadata(summary=foreground_summary)
+
+    schedule_session = Session.create(
+        loop.session.workspace_state,
+        now=lambda: NOW,
+        partition=SessionStoragePartition.SCHEDULE,
+        job_id=JOB_UUID,
+    )
+    schedule_session.add_message("user", "Earlier scheduled work.")
+    schedule_session.update_metadata(summary=schedule_summary)
+    schedule_session.close()
+    (workspace / "large.txt").write_text("x" * 4_000, encoding="utf-8")
+
+    await loop.start()
+    scheduled = asyncio.create_task(loop.run_schedule_job(_due_job()))
+    try:
+        await _wait_until(provider.schedule_block_started.is_set)
+        foreground = asyncio.create_task(
+            collect_foreground_outbound(bus, "Continue the foreground work.")
+        )
+        await asyncio.wait_for(foreground, timeout=3.0)
+        provider.release_schedule.set()
+        await asyncio.wait_for(scheduled, timeout=3.0)
+    finally:
+        provider.release_schedule.set()
+        await asyncio.wait_for(
+            asyncio.gather(scheduled, return_exceptions=True),
+            timeout=3.0,
+        )
+        await asyncio.wait_for(
+            _close_components(loop, router, schedule, dream),
+            timeout=3.0,
+        )
+
+    assert len(provider.stream_requests) == 11
+    foreground_messages = provider.stream_requests[-1].messages
+    assert foreground_messages[1] == {
+        "role": "user",
+        "content": foreground_summary,
+    }
+    assert schedule_summary not in json.dumps(foreground_messages)
+    foreground_tools = [message for message in foreground_messages if message.get("role") == "tool"]
+    assert len(foreground_tools) == 10
+    assert all(
+        "result omitted from context" not in str(message["content"]) for message in foreground_tools
+    )
+
+    schedule_requests = [
+        request for request in provider.complete_requests if _is_schedule_call(request)
+    ]
+    assert len(schedule_requests) == 12
+    schedule_messages = schedule_requests[-1].messages
+    assert schedule_messages[1] == {
+        "role": "user",
+        "content": schedule_summary,
+    }
+    assert foreground_summary not in json.dumps(schedule_messages)
+    schedule_tools = [message for message in schedule_messages if message.get("role") == "tool"]
+    assert len(schedule_tools) == 11
+    assert (
+        sum(
+            message["content"] == "[read_file result omitted from context]"
+            for message in schedule_tools
+        )
+        == 10
+    )
+    latest_schedule_content = schedule_tools[-1]["content"]
+    assert isinstance(latest_schedule_content, str)
+    assert len(latest_schedule_content) > 512
+
+    restored_foreground = Session.load(loop.session.workspace_state, loop.session.session_id)
+    restored_schedule = Session.load(
+        loop.session.workspace_state,
+        f"schedule_{JOB_UUID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert restored_foreground.metadata["summary"] == foreground_summary
+    assert restored_schedule.metadata["summary"] == schedule_summary
+    assert all(
+        message.get("content") not in {foreground_summary, schedule_summary}
+        for message in (*restored_foreground.messages, *restored_schedule.messages)
+    )
 
 
 @pytest.mark.asyncio
