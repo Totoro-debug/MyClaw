@@ -709,7 +709,7 @@ async def test_agent_loop_injects_persisted_action_summary_into_foreground_and_s
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_compaction_persists_action_summary_and_keeps_it_out_of_session_messages(
+async def test_agent_loop_compaction_omits_empty_action_summary_from_context_and_persistence(
     tmp_path: Path,
 ) -> None:
     config_text = MINIMAL_VALID_CONFIG.replace(
@@ -728,9 +728,7 @@ async def test_agent_loop_compaction_persists_action_summary_and_keeps_it_out_of
             )
             self.stream_requests: list[list[dict[str, Any]]] = []
             self.memory_requests: list[list[dict[str, Any]]] = []
-            self.memory_responses = deque(
-                (_response("Fact summary."), _response("- Updated the compaction flow."))
-            )
+            self.memory_responses = deque((_response("Fact summary."), _response("None")))
 
         def stream(
             self,
@@ -779,6 +777,7 @@ async def test_agent_loop_compaction_persists_action_summary_and_keeps_it_out_of
         await _terminals(bus, 1)
         await bus.put_inbound(InboundMessage("Third question."))
         await _terminals(bus, 1)
+        status = loop.runtime_status_input()
     finally:
         await loop.close()
 
@@ -786,18 +785,14 @@ async def test_agent_loop_compaction_persists_action_summary_and_keeps_it_out_of
     assert router.memory_requests[0][1] == router.memory_requests[1][1]
     assert router.memory_requests[0][0]["content"] != router.memory_requests[1][0]["content"]
     assert previous_summary not in json.dumps(router.memory_requests)
-    assert session.metadata["summary"] == "- Updated the compaction flow."
+    assert session.metadata["summary"] == ""
     assert session.last_compacted == 2
-    assert all(
-        message.get("content") != "- Updated the compaction flow." for message in session.messages
-    )
+    assert all(message.get("content") != "None" for message in session.messages)
+    assert all(json.loads(message).get("content") != "None" for message in status.retained_messages)
 
     assert len(router.stream_requests) == 3
     third_request = router.stream_requests[2]
-    assert third_request[1] == {
-        "role": "user",
-        "content": "- Updated the compaction flow.",
-    }
+    assert all(message.get("content") != "None" for message in third_request)
     assert "Third question." in str(third_request[-1]["content"])
 
     summary_records = [
@@ -808,10 +803,76 @@ async def test_agent_loop_compaction_persists_action_summary_and_keeps_it_out_of
     ]
     assert [record["content"] for record in summary_records] == ["Fact summary."]
     restored = Session.load(session.workspace_state, session.session_id)
-    assert restored.metadata["summary"] == "- Updated the compaction flow."
-    assert all(
-        message.get("content") != "- Updated the compaction flow." for message in restored.messages
+    assert restored.metadata["summary"] == ""
+    assert all(message.get("content") != "None" for message in restored.messages)
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_restores_empty_action_summary_for_foreground_status_and_preflight(
+    tmp_path: Path,
+) -> None:
+    def prepare_session(state: WorkspaceState) -> str:
+        restored = Session.create(state, now=_Clock().now, new_uuid=uuid4)
+        restored.add_message("user", "Persisted foreground history.")
+        restored.update_metadata(summary="")
+        restored.close()
+        return restored.session_id
+
+    class CapturingRouter(_Router):
+        def __init__(self) -> None:
+            super().__init__((_response("Restored answer."),))
+            self.requests: list[list[dict[str, Any]]] = []
+
+        def stream(
+            self,
+            route: Literal["chat", "schedule"],
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+            continuation: ModelContinuation | None = None,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(deepcopy(list(messages)))
+            return super().stream(
+                route,
+                messages=messages,
+                tools=tools,
+                continuation=continuation,
+            )
+
+    router = CapturingRouter()
+    loop, session, bus = _runtime(
+        tmp_path,
+        router,
+        task_framing_outcomes=(),
+        use_default_context_preparer=True,
+        prepare_session=prepare_session,
     )
+
+    assert session.metadata["summary"] == ""
+    status = loop.runtime_status_input()
+    retained_messages = tuple(map(json.loads, status.retained_messages))
+    assert retained_messages[0] == {
+        "role": "user",
+        "content": "Persisted foreground history.",
+    }
+    assert all(message.get("content") not in {"", "None"} for message in retained_messages)
+    loop.preflight()
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("Continue the restored work."))
+        await _terminals(bus, 1)
+    finally:
+        await loop.close()
+
+    assert router.requests[0][1] == {
+        "role": "user",
+        "content": "Persisted foreground history.",
+    }
+    assert all(message.get("content") != "None" for message in router.requests[0])
+    restored = Session.load(session.workspace_state, session.session_id)
+    assert restored.metadata["summary"] == ""
+    assert all(message.get("content") != "None" for message in restored.messages)
 
 
 @pytest.mark.asyncio

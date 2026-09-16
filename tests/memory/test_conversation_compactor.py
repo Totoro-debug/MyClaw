@@ -307,15 +307,31 @@ async def test_message_threshold_summarizes_session_suffix_and_updates_public_st
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action_response", "expected_summary"),
+    (
+        pytest.param("None", "", id="empty-sentinel"),
+        pytest.param("\nNone\n", "", id="empty-sentinel-with-whitespace"),
+        pytest.param(
+            "- Updated the compaction flow.",
+            "- Updated the compaction flow.",
+            id="nonempty-summary",
+        ),
+    ),
+)
 async def test_compaction_generates_fact_and_action_summaries_from_one_selected_payload(
     workspace: Path,
+    action_response: str,
+    expected_summary: str,
 ) -> None:
     state = _state(workspace)
     session = _session_with_history(state)
+    session.update_metadata(summary="- Stale compacted work.")
+    original_messages = deepcopy(session.messages)
     provider = ScriptedFakeProvider(
         completions=(
             _response("First turn summary."),
-            _response("- Updated the compaction flow."),
+            _response(action_response),
         )
     )
     memory_manager = MemoryManager(state)
@@ -334,14 +350,12 @@ async def test_compaction_generates_fact_and_action_summaries_from_one_selected_
         "role": "system",
         "content": render_template("conversation-summary-system-prompt.md"),
     }
-    assert session.metadata["summary"] == "- Updated the compaction flow."
+    assert session.metadata["summary"] == expected_summary
     assert session.last_compacted == 2
     assert [entry.content for entry in await _claimed_entries(memory_manager)] == [
         "First turn summary."
     ]
-    assert all(
-        message.get("content") != "- Updated the compaction flow." for message in session.messages
-    )
+    assert session.messages == original_messages
 
 
 @pytest.mark.asyncio

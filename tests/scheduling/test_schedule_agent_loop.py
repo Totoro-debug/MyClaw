@@ -1000,6 +1000,14 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
         assert "Fresh schedule preference." in cast(
             str, schedule_requests[1].messages[0]["content"]
         )
+        assert all(message.get("content") != "None" for message in schedule_requests[1].messages)
+        restored_schedule = Session.load(
+            state,
+            f"schedule_{JOB_UUID}",
+            partition=SessionStoragePartition.SCHEDULE,
+        )
+        assert restored_schedule.metadata["summary"] == ""
+        assert all(message.get("content") != "None" for message in restored_schedule.messages)
         summary_records = [
             json.loads(line)
             for line in (state.memory_directory / "summary.jsonl")

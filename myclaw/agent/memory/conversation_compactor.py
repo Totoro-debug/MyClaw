@@ -170,7 +170,10 @@ class ConversationCompactor:
             tools=(),
         )
         session.update_metadata(usage_delta={"model_calls": 1, **action_response.usage.to_dict()})
-        session.update_metadata(summary=action_response.message.content)
+        action_summary = action_response.message.content
+        if action_summary.strip() == "None":
+            action_summary = ""
+        session.update_metadata(summary=action_summary)
         session.last_compacted = new_last_compacted
         return session
 
