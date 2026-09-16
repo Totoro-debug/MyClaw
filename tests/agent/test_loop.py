@@ -112,6 +112,28 @@ class _Router:
         raise AssertionError("unexpected direct completion")
 
 
+class _CapturingRouter(_Router):
+    def __init__(self, outcomes: Sequence[ModelResponse | BaseException]) -> None:
+        super().__init__(outcomes)
+        self.requests: list[list[dict[str, Any]]] = []
+
+    def stream(
+        self,
+        route: Literal["chat", "schedule"],
+        *,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(deepcopy(list(messages)))
+        return super().stream(
+            route,
+            messages=messages,
+            tools=tools,
+            continuation=continuation,
+        )
+
+
 class _LargeSchemaTool(BaseTool):
     name = "large_schema"
     description = "A test Tool with a deliberately large request schema."
@@ -659,28 +681,7 @@ def test_agent_loop_preflight_uses_the_deferred_baseline_without_unused_tool_sch
 async def test_agent_loop_injects_persisted_action_summary_into_foreground_and_status_context(
     tmp_path: Path,
 ) -> None:
-    class CapturingRouter(_Router):
-        def __init__(self) -> None:
-            super().__init__((_response("done"),))
-            self.requests: list[list[dict[str, Any]]] = []
-
-        def stream(
-            self,
-            route: Literal["chat", "schedule"],
-            *,
-            messages: Sequence[dict[str, Any]],
-            tools: Sequence[dict[str, Any]],
-            continuation: ModelContinuation | None = None,
-        ) -> AsyncIterator[ModelStreamEvent]:
-            self.requests.append(deepcopy(list(messages)))
-            return super().stream(
-                route,
-                messages=messages,
-                tools=tools,
-                continuation=continuation,
-            )
-
-    router = CapturingRouter()
+    router = _CapturingRouter((_response("done"),))
     loop, session, bus = _runtime(
         tmp_path,
         router,
@@ -818,28 +819,7 @@ async def test_agent_loop_restores_empty_action_summary_for_foreground_status_an
         restored.close()
         return restored.session_id
 
-    class CapturingRouter(_Router):
-        def __init__(self) -> None:
-            super().__init__((_response("Restored answer."),))
-            self.requests: list[list[dict[str, Any]]] = []
-
-        def stream(
-            self,
-            route: Literal["chat", "schedule"],
-            *,
-            messages: Sequence[dict[str, Any]],
-            tools: Sequence[dict[str, Any]],
-            continuation: ModelContinuation | None = None,
-        ) -> AsyncIterator[ModelStreamEvent]:
-            self.requests.append(deepcopy(list(messages)))
-            return super().stream(
-                route,
-                messages=messages,
-                tools=tools,
-                continuation=continuation,
-            )
-
-    router = CapturingRouter()
+    router = _CapturingRouter((_response("Restored answer."),))
     loop, session, bus = _runtime(
         tmp_path,
         router,
@@ -865,6 +845,7 @@ async def test_agent_loop_restores_empty_action_summary_for_foreground_status_an
     finally:
         await loop.close()
 
+    assert len(router.requests) == 1
     assert router.requests[0][1] == {
         "role": "user",
         "content": "Persisted foreground history.",
@@ -888,28 +869,7 @@ async def test_agent_loop_restores_action_summary_for_foreground_and_preflight_c
         restored.close()
         return restored.session_id
 
-    class CapturingRouter(_Router):
-        def __init__(self) -> None:
-            super().__init__((_response("Restored answer."),))
-            self.requests: list[list[dict[str, Any]]] = []
-
-        def stream(
-            self,
-            route: Literal["chat", "schedule"],
-            *,
-            messages: Sequence[dict[str, Any]],
-            tools: Sequence[dict[str, Any]],
-            continuation: ModelContinuation | None = None,
-        ) -> AsyncIterator[ModelStreamEvent]:
-            self.requests.append(deepcopy(list(messages)))
-            return super().stream(
-                route,
-                messages=messages,
-                tools=tools,
-                continuation=continuation,
-            )
-
-    router = CapturingRouter()
+    router = _CapturingRouter((_response("Restored answer."),))
     loop, session, bus = _runtime(
         tmp_path,
         router,
@@ -933,6 +893,7 @@ async def test_agent_loop_restores_action_summary_for_foreground_and_preflight_c
     finally:
         await loop.close()
 
+    assert len(router.requests) == 1
     assert router.requests[0][1] == {
         "role": "user",
         "content": action_summary,
