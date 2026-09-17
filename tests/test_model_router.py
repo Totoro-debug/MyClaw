@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 
-from myclaw.agent.runner import AgentRunner
+from myclaw.agent.runner import AgentRunner, IdentityAgentRunRequestPreparer
 from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolResult
 from myclaw.config.config import (
     MemoryConfiguration,
@@ -1549,7 +1549,7 @@ async def test_agent_runner_next_tool_loop_request_reads_latest_runtime_effort()
                 content="updated",
             )
 
-    result = await AgentRunner(router).run(
+    result = await AgentRunner(router, IdentityAgentRunRequestPreparer()).run(
         [{"role": "user", "content": "Run work."}],
         model="chat",
         tool_gateway=cast(Any, UpdatingGateway()),

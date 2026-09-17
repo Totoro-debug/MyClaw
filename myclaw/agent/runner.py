@@ -1,4 +1,4 @@
-"""Reusable, bounded, Session-independent Agent Runner execution."""
+"""Reusable, bounded Agent Runner execution without conversation ownership."""
 
 from __future__ import annotations
 
@@ -116,6 +116,36 @@ class AgentRunnerMemoryRouter(ABC):
     ) -> ModelResponse: ...
 
 
+class AgentRunRequestPreparer(Protocol):
+    """Prepare one provider-neutral request from detached Agent Run snapshots."""
+
+    async def prepare(
+        self,
+        candidate: Sequence[dict[str, Any]],
+        *,
+        increment: Sequence[dict[str, Any]],
+        latest_cycle_start: int | None,
+        tools: Sequence[dict[str, Any]],
+        continuation_revision: int,
+    ) -> Sequence[dict[str, Any]]: ...
+
+
+class IdentityAgentRunRequestPreparer:
+    """Preserve the existing request projection while detaching mutable messages."""
+
+    async def prepare(
+        self,
+        candidate: Sequence[dict[str, Any]],
+        *,
+        increment: Sequence[dict[str, Any]],
+        latest_cycle_start: int | None,
+        tools: Sequence[dict[str, Any]],
+        continuation_revision: int,
+    ) -> list[dict[str, Any]]:
+        del increment, latest_cycle_start, tools, continuation_revision
+        return deepcopy(list(candidate))
+
+
 def _empty_usage() -> dict[str, int]:
     return {
         "model_calls": 0,
@@ -150,6 +180,20 @@ def _project_for_model_request(
             continue
         message["content"] = f"[{name} result omitted from context]"
     return projected
+
+
+def _latest_completed_cycle_start(messages: Sequence[dict[str, Any]]) -> int | None:
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        tool_calls = message.get("tool_calls")
+        if (
+            message.get("role") == "assistant"
+            and isinstance(tool_calls, Sequence)
+            and not isinstance(tool_calls, (str, bytes))
+            and tool_calls
+        ):
+            return index
+    return None
 
 
 @dataclass(slots=True)
@@ -199,8 +243,10 @@ class AgentRunner:
     def __init__(
         self,
         model_router: AgentRunnerRouter | AgentRunnerMemoryRouter,
+        request_preparer: AgentRunRequestPreparer,
     ) -> None:
         self._model_router = model_router
+        self._request_preparer = request_preparer
 
     async def run(
         self,
@@ -233,7 +279,8 @@ class AgentRunner:
         externalize = externalize_result or _identity_tool_result
         eligible_tool_call_count = 0
         micro_compression_enabled = False
-        last_completed_cycle_start: int | None = None
+        latest_cycle_start: int | None = None
+        continuation_revision = 0
 
         async def emit(event: AgentRunnerOutput) -> None:
             if on_output is None:
@@ -285,21 +332,32 @@ class AgentRunner:
                 partial_content.clear()
                 usage["model_calls"] += 1
                 response: ModelResponse | None = None
-                current_cycle_start = len(runtime_messages)
+                current_cycle_start_in_increment = len(increment)
+                exposed_tools = (
+                    () if tool_gateway is None else tuple(deepcopy(tool_gateway.schemas))
+                )
+                prepared_messages = await self._request_preparer.prepare(
+                    deepcopy(runtime_messages),
+                    increment=deepcopy(increment),
+                    latest_cycle_start=latest_cycle_start,
+                    tools=deepcopy(exposed_tools),
+                    continuation_revision=continuation_revision,
+                )
+                request_messages: Sequence[dict[str, Any]]
                 if model != "memory" and tool_gateway is not None and micro_compression_enabled:
                     request_messages = _project_for_model_request(
-                        runtime_messages,
-                        omit_tool_results_before=last_completed_cycle_start,
+                        prepared_messages,
+                        omit_tool_results_before=_latest_completed_cycle_start(prepared_messages),
                         gateway=tool_gateway,
                     )
                 else:
-                    request_messages = deepcopy(runtime_messages)
+                    request_messages = prepared_messages
                 if model == "chat":
                     router = cast(AgentRunnerRouter, self._model_router)
                     events = router.stream(
                         model,
                         messages=request_messages,
-                        tools=() if tool_gateway is None else tuple(tool_gateway.schemas),
+                        tools=exposed_tools,
                         continuation=continuation,
                     )
                     try:
@@ -341,7 +399,7 @@ class AgentRunner:
                     response = await self._model_router.complete(
                         model,
                         messages=request_messages,
-                        tools=() if tool_gateway is None else tuple(tool_gateway.schemas),
+                        tools=exposed_tools,
                         continuation=continuation,
                     )
                 else:
@@ -349,7 +407,7 @@ class AgentRunner:
                     response = await router.complete(
                         model,
                         messages=request_messages,
-                        tools=() if tool_gateway is None else tuple(tool_gateway.schemas),
+                        tools=exposed_tools,
                         continuation=continuation,
                     )
 
@@ -360,6 +418,7 @@ class AgentRunner:
                     list(response.message.tool_calls) if tool_gateway is not None else []
                 )
                 continuation_for_next_call = response.continuation if pending_tool_calls else None
+                continuation_revision += 1
 
                 if is_cancel_requested():
                     return finish_cancelled(final_content="")
@@ -448,7 +507,7 @@ class AgentRunner:
                     if is_cancel_requested():
                         return finish_cancelled(final_content="")
 
-                last_completed_cycle_start = current_cycle_start
+                latest_cycle_start = current_cycle_start_in_increment
                 if usage["model_calls"] >= max_iterations:
                     limit_error = ErrorInfo("agent_iteration_limit", _MAX_ITERATIONS_MESSAGE)
                     _append_run_message(
@@ -761,6 +820,7 @@ async def _close_iterator(iterator: AsyncIterator[object] | None) -> None:
 
 
 __all__ = [
+    "AgentRunRequestPreparer",
     "AgentRunner",
     "AgentRunnerFinishReason",
     "AgentRunnerMemoryRouter",
@@ -773,6 +833,7 @@ __all__ = [
     "AgentRunnerSegment",
     "AgentRunnerToolCallFinished",
     "AgentRunnerToolCallStarted",
+    "IdentityAgentRunRequestPreparer",
 ]
 
 

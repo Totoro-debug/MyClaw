@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator, Sequence
+from copy import deepcopy
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -13,8 +14,10 @@ from myclaw.agent.runner import (
     AgentRunner,
     AgentRunnerResponseSegmentEnd,
     AgentRunnerResult,
+    AgentRunnerRouter,
     AgentRunnerToolCallFinished,
     AgentRunnerToolCallStarted,
+    IdentityAgentRunRequestPreparer,
 )
 from myclaw.agent.tools.base import ArtifactReference
 from myclaw.agent.tools.tool_gateway import (
@@ -49,6 +52,10 @@ async def _observe(events: list[object], event: object) -> None:
 
 async def _ignore_output(event: object) -> None:
     del event
+
+
+def _runner(router: AgentRunnerRouter) -> AgentRunner:
+    return AgentRunner(router, IdentityAgentRunRequestPreparer())
 
 
 class _ClosingRouter:
@@ -215,6 +222,31 @@ class _RetryingRouter:
         raise AssertionError("Unexpected complete call")
 
 
+class _RecordingRequestPreparer:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
+    async def prepare(
+        self,
+        candidate: Sequence[dict[str, Any]],
+        *,
+        increment: Sequence[dict[str, Any]],
+        latest_cycle_start: int | None,
+        tools: Sequence[dict[str, Any]],
+        continuation_revision: int,
+    ) -> list[dict[str, Any]]:
+        self.requests.append(
+            {
+                "candidate": deepcopy(list(candidate)),
+                "increment": deepcopy(list(increment)),
+                "latest_cycle_start": latest_cycle_start,
+                "tools": deepcopy(tuple(tools)),
+                "continuation_revision": continuation_revision,
+            }
+        )
+        return deepcopy(list(candidate))
+
+
 def _tool_iteration_scripts(count: int) -> tuple[StreamScript, ...]:
     return tuple(
         StreamScript(
@@ -246,9 +278,167 @@ def test_runner_requires_explicit_max_iterations_input() -> None:
 def test_runner_constructor_and_module_exclude_product_orchestration_dependencies() -> None:
     module = inspect.getmodule(AgentRunner)
 
-    assert tuple(inspect.signature(AgentRunner).parameters) == ("model_router",)
+    assert tuple(inspect.signature(AgentRunner).parameters) == (
+        "model_router",
+        "request_preparer",
+    )
     assert module is not None
     assert {"Session", "MessageBus", "ContextBuilder"}.isdisjoint(vars(module))
+
+
+@pytest.mark.asyncio
+async def test_runner_prepares_each_logical_request_with_run_local_context() -> None:
+    first_call = ModelToolCall(id="call-1", name="work", arguments="{}")
+    second_call = ModelToolCall(id="call-2", name="work", arguments="{}")
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(
+                                content="First",
+                                tool_calls=(first_call,),
+                            ),
+                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                            finish_reason="tool_calls",
+                            continuation=ModelContinuation(
+                                provider_id="test-provider",
+                                payload=object(),
+                            ),
+                        )
+                    ),
+                )
+            ),
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(
+                                content="Second",
+                                tool_calls=(second_call,),
+                            ),
+                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                            finish_reason="tool_calls",
+                            continuation=None,
+                        )
+                    ),
+                )
+            ),
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Done"),
+                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    gateway = _DirectGateway([])
+    gateway.schemas = [{"name": "work", "description": "work"}]
+    preparer = _RecordingRequestPreparer()
+
+    result = await AgentRunner(ScriptedFakeRouter(provider), preparer).run(
+        [{"role": "system", "content": "System"}, {"role": "user", "content": "Run."}],
+        model="chat",
+        tool_gateway=gateway,  # type: ignore[arg-type]
+        on_output=_ignore_output,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+    )
+
+    assert result.finish_reason == "completed"
+    assert len(preparer.requests) == 3
+    assert [request["latest_cycle_start"] for request in preparer.requests] == [None, 0, 2]
+    assert [request["continuation_revision"] for request in preparer.requests] == [0, 1, 2]
+    assert all(request["tools"] == tuple(gateway.schemas) for request in preparer.requests)
+    assert [len(request["increment"]) for request in preparer.requests] == [0, 2, 4]
+    assert all(
+        message["role"] in {"assistant", "tool"}
+        for request in preparer.requests
+        for message in request["increment"]
+    )
+    assert preparer.requests[1]["candidate"][-1]["content"] == "done"
+    assert preparer.requests[2]["candidate"][-1]["content"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_identity_request_preparation_is_detached_and_value_equivalent() -> None:
+    messages = [{"role": "user", "content": {"nested": ["original"]}}]
+
+    prepared = await IdentityAgentRunRequestPreparer().prepare(
+        messages,
+        increment=(),
+        latest_cycle_start=None,
+        tools=(),
+        continuation_revision=0,
+    )
+
+    assert prepared == messages
+    assert prepared is not messages
+    prepared[0]["content"]["nested"].append("changed")
+    assert messages[0]["content"] == {"nested": ["original"]}
+
+
+@pytest.mark.asyncio
+async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools() -> None:
+    class MutatingPreparer:
+        async def prepare(
+            self,
+            candidate: Sequence[dict[str, Any]],
+            *,
+            increment: Sequence[dict[str, Any]],
+            latest_cycle_start: int | None,
+            tools: Sequence[dict[str, Any]],
+            continuation_revision: int,
+        ) -> Sequence[dict[str, Any]]:
+            del increment, latest_cycle_start, continuation_revision
+            candidate[0]["content"]["nested"].append("projected")
+            tools[0]["parameters"]["enum"].append("mutated")
+            return candidate
+
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Done"),
+                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    gateway = _DirectGateway([])
+    gateway.schemas = [{"name": "work", "parameters": {"type": "string", "enum": ["original"]}}]
+    initial_messages = [{"role": "user", "content": {"nested": ["original"]}}]
+
+    await AgentRunner(ScriptedFakeRouter(provider), MutatingPreparer()).run(
+        initial_messages,
+        model="chat",
+        tool_gateway=gateway,  # type: ignore[arg-type]
+        on_output=_ignore_output,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+    )
+
+    assert provider.stream_requests[0].messages[0]["content"] == {
+        "nested": ["original", "projected"]
+    }
+    assert provider.stream_requests[0].tools == tuple(gateway.schemas)
+    assert gateway.schemas[0]["parameters"]["enum"] == ["original"]
+    assert initial_messages[0]["content"] == {"nested": ["original"]}
 
 
 def test_result_validates_exact_usage_and_finish_invariants() -> None:
@@ -337,7 +527,7 @@ async def test_runner_returns_generated_increment_and_closes_response_segment() 
         )
     )
     events: list[object] = []
-    runner = AgentRunner(ScriptedFakeRouter(provider))
+    runner = _runner(ScriptedFakeRouter(provider))
 
     result = await runner.run(
         [{"role": "system", "content": "System"}, {"role": "user", "content": "Hello"}],
@@ -380,7 +570,7 @@ async def test_runner_emits_completed_content_when_provider_omits_text_deltas() 
     )
     events: list[object] = []
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Hello"}],
         model="chat",
         tool_gateway=None,
@@ -401,8 +591,9 @@ async def test_runner_emits_completed_content_when_provider_omits_text_deltas() 
 @pytest.mark.asyncio
 async def test_router_internal_retry_consumes_one_runner_model_call() -> None:
     router = _RetryingRouter()
+    preparer = _RecordingRequestPreparer()
 
-    result = await AgentRunner(router).run(
+    result = await AgentRunner(router, preparer).run(
         [{"role": "user", "content": "Retry."}],
         model="chat",
         tool_gateway=None,
@@ -417,6 +608,7 @@ async def test_router_internal_retry_consumes_one_runner_model_call() -> None:
     assert result.usage["model_calls"] == 1
     assert router.logical_calls == 1
     assert router.provider_attempts == 2
+    assert len(preparer.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -459,7 +651,7 @@ async def test_runner_executes_all_tools_in_provider_order_in_one_iteration() ->
     ]
     gateway = SingleToolGateway(tools)
     observed: list[object] = []
-    runner = AgentRunner(ScriptedFakeRouter(provider))
+    runner = _runner(ScriptedFakeRouter(provider))
 
     result = await runner.run(
         [{"role": "user", "content": "Run the tools."}],
@@ -541,7 +733,7 @@ async def test_runner_passes_confirmation_requester_directly_before_tool_call() 
         if isinstance(event, AgentRunnerToolCallStarted):
             order.append("callback")
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Run work."}],
         model="chat",
         tool_gateway=gateway,  # type: ignore[arg-type]
@@ -598,7 +790,7 @@ async def test_runner_continues_after_provider_valid_tool_result_status(
     gateway = _DirectGateway([], (tool_result,))
     observed: list[object] = []
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Continue."}],
         model="chat",
         tool_gateway=gateway,  # type: ignore[arg-type]
@@ -634,7 +826,7 @@ async def test_runner_uses_complete_for_schedule_without_stream_output() -> None
         )
     )
     observed: list[object] = []
-    runner = AgentRunner(ScriptedFakeRouter(provider))
+    runner = _runner(ScriptedFakeRouter(provider))
 
     result = await runner.run(
         [{"role": "user", "content": "Schedule this."}],
@@ -667,7 +859,7 @@ async def test_runner_honors_cancellation_after_schedule_response() -> None:
     )
     cancellation = iter((False, True)).__next__
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Cancel schedule."}],
         model="schedule",
         tool_gateway=None,
@@ -711,7 +903,7 @@ async def test_runner_switches_and_closes_only_real_stream_segments() -> None:
         )
     )
     observed: list[object] = []
-    runner = AgentRunner(ScriptedFakeRouter(provider))
+    runner = _runner(ScriptedFakeRouter(provider))
 
     await runner.run(
         [{"role": "user", "content": "Explain."}],
@@ -744,7 +936,7 @@ async def test_reasoning_cancellation_closes_segment_without_fabricating_a_messa
     cancellation = iter((False, True)).__next__
     observed: list[object] = []
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Cancel reasoning."}],
         model="chat",
         tool_gateway=None,
@@ -773,7 +965,7 @@ async def test_runner_counts_a_failed_logical_model_call_and_repairs_it() -> Non
             ),
         )
     )
-    runner = AgentRunner(ScriptedFakeRouter(provider))
+    runner = _runner(ScriptedFakeRouter(provider))
 
     result = await runner.run(
         [{"role": "user", "content": "Fail."}],
@@ -809,7 +1001,7 @@ async def test_provider_turn_cancellation_returns_structured_cancelled_result() 
         )
     )
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Cancel from provider."}],
         model="chat",
         tool_gateway=None,
@@ -831,7 +1023,7 @@ async def test_provider_turn_cancellation_returns_structured_cancelled_result() 
 @pytest.mark.asyncio
 async def test_entry_cancellation_does_not_start_a_model_call() -> None:
     provider = ScriptedFakeProvider()
-    runner = AgentRunner(ScriptedFakeRouter(provider))
+    runner = _runner(ScriptedFakeRouter(provider))
 
     result = await runner.run(
         [{"role": "user", "content": "Cancel."}],
@@ -857,7 +1049,7 @@ async def test_runner_repairs_partial_response_on_cooperative_cancellation() -> 
     provider = ScriptedFakeProvider(streams=(StreamScript(events=(TextDelta(delta="partial"),)),))
     cancellation = iter((False, True)).__next__
     observed: list[object] = []
-    runner = AgentRunner(ScriptedFakeRouter(provider))
+    runner = _runner(ScriptedFakeRouter(provider))
 
     result = await runner.run(
         [{"role": "user", "content": "Cancel after text."}],
@@ -902,7 +1094,7 @@ async def test_runner_cancellation_repairs_only_unfinished_tools() -> None:
     second = FakeTool(name="second", description="second", outcomes=("done-second",))
     gateway = SingleToolGateway((first, second))
     cancellation = iter((False, False, False, True)).__next__
-    runner = AgentRunner(ScriptedFakeRouter(provider))
+    runner = _runner(ScriptedFakeRouter(provider))
 
     result = await runner.run(
         [{"role": "user", "content": "Use both."}],
@@ -943,7 +1135,7 @@ async def test_cancellation_after_completed_tool_response_keeps_one_assistant_se
     work = FakeTool(name="work", description="work", outcomes=("unused",))
     cancellation = iter((False, False, True)).__next__
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Cancel after the model response."}],
         model="chat",
         tool_gateway=SingleToolGateway((work,)),
@@ -991,7 +1183,7 @@ async def test_runner_externalizes_tool_result() -> None:
         )
     )
     gateway = SingleToolGateway((FakeTool(name="work", description="work", outcomes=("large",)),))
-    runner = AgentRunner(ScriptedFakeRouter(provider))
+    runner = _runner(ScriptedFakeRouter(provider))
 
     def externalize(result: ToolResult) -> ToolResult:
         assert result.content == "large"
@@ -1070,7 +1262,7 @@ async def test_runner_normalizes_externalizer_failure_to_safe_tool_error() -> No
         del result
         raise RuntimeError("private artifact detail")
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Externalizer failure."}],
         model="chat",
         tool_gateway=gateway,  # type: ignore[arg-type]
@@ -1126,8 +1318,9 @@ async def test_runner_micro_compresses_only_stale_tool_results_after_eleventh_ca
     gateway = _MicroCompressionGateway([], tool_results)
     initial_messages = [{"role": "user", "content": "Keep working."}]
     original_initial_messages = [dict(message) for message in initial_messages]
+    preparer = _RecordingRequestPreparer()
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await AgentRunner(ScriptedFakeRouter(provider), preparer).run(
         initial_messages,
         model="chat",
         tool_gateway=gateway,  # type: ignore[arg-type]
@@ -1152,6 +1345,16 @@ async def test_runner_micro_compresses_only_stale_tool_results_after_eleventh_ca
         == expected_omitted_results
     )
     assert request_tool_messages[-1]["content"] == large_content
+    preparer_tool_messages = [
+        message for message in preparer.requests[-1]["candidate"] if message.get("role") == "tool"
+    ]
+    preparer_increment_tools = [
+        message for message in preparer.requests[-1]["increment"] if message.get("role") == "tool"
+    ]
+    assert len(preparer_tool_messages) == iterations
+    assert len(preparer_increment_tools) == iterations
+    assert all(message["content"] == large_content for message in preparer_tool_messages)
+    assert all(message["content"] == large_content for message in preparer_increment_tools)
     assert initial_messages == original_initial_messages
     assert all(
         message["content"] == large_content
@@ -1222,7 +1425,7 @@ async def test_runner_micro_compression_includes_eligible_history_but_keeps_rece
     )
     original_history = [dict(message) for message in history]
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         history,
         model="chat",
         tool_gateway=gateway,  # type: ignore[arg-type]
@@ -1261,9 +1464,82 @@ async def test_runner_micro_compression_includes_eligible_history_but_keeps_rece
 
 
 @pytest.mark.asyncio
+async def test_runner_recomputes_latest_cycle_after_preparer_removes_history() -> None:
+    class PrefixDroppingPreparer:
+        async def prepare(
+            self,
+            candidate: Sequence[dict[str, Any]],
+            *,
+            increment: Sequence[dict[str, Any]],
+            latest_cycle_start: int | None,
+            tools: Sequence[dict[str, Any]],
+            continuation_revision: int,
+        ) -> list[dict[str, Any]]:
+            del increment, latest_cycle_start, tools, continuation_revision
+            return deepcopy(list(candidate[4:]))
+
+    large_content = "x" * 513
+    history: list[dict[str, Any]] = [
+        {"role": "system", "content": "System"},
+        {"role": "user", "content": "Previous request."},
+        {"role": "assistant", "content": "Previous response.", "tool_calls": []},
+        {"role": "tool", "name": "read_file", "content": large_content},
+        {"role": "user", "content": "Current request."},
+    ]
+    final_script = StreamScript(
+        events=(
+            ModelCompleted(
+                response=ModelResponse(
+                    message=AssistantModelMessage(content="Done"),
+                    usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                    finish_reason="stop",
+                )
+            ),
+        )
+    )
+    provider = ScriptedFakeProvider(streams=(*_tool_iteration_scripts(11), final_script))
+    gateway = _MicroCompressionGateway(
+        [],
+        tuple(
+            ToolResult(
+                tool_call_id=f"call-{number}",
+                name="work",
+                status="success",
+                content=large_content,
+            )
+            for number in range(11)
+        ),
+    )
+
+    result = await AgentRunner(ScriptedFakeRouter(provider), PrefixDroppingPreparer()).run(
+        history,
+        model="chat",
+        tool_gateway=gateway,  # type: ignore[arg-type]
+        on_output=_ignore_output,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+    )
+
+    final_request_tools = {
+        message["tool_call_id"]: message
+        for message in provider.stream_requests[-1].messages
+        if message.get("role") == "tool"
+    }
+    assert final_request_tools["call-9"]["content"] == "[work result omitted from context]"
+    assert final_request_tools["call-10"]["content"] == large_content
+    assert all(
+        message["content"] == large_content
+        for message in result.messages
+        if message.get("role") == "tool"
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("value", (49, 0, True, 50.0))
 async def test_runner_rejects_invalid_max_iterations(value: object) -> None:
-    runner = AgentRunner(ScriptedFakeRouter(ScriptedFakeProvider()))
+    runner = _runner(ScriptedFakeRouter(ScriptedFakeProvider()))
 
     with pytest.raises(ValueError):
         await runner.run(
@@ -1283,7 +1559,7 @@ async def test_runner_stops_after_fiftieth_tool_iteration_without_a_new_model_ca
     provider = ScriptedFakeProvider(streams=_tool_iteration_scripts(50))
     work = FakeTool(name="work", description="work", outcomes=tuple("ok" for _ in range(50)))
     gateway = SingleToolGateway((work,))
-    runner = AgentRunner(ScriptedFakeRouter(provider))
+    runner = _runner(ScriptedFakeRouter(provider))
 
     result = await runner.run(
         [{"role": "user", "content": "Keep working."}],
@@ -1326,7 +1602,7 @@ async def test_runner_completes_when_fiftieth_model_response_has_no_tools() -> N
     provider = ScriptedFakeProvider(streams=(*_tool_iteration_scripts(49), final_script))
     work = FakeTool(name="work", description="work", outcomes=tuple("ok" for _ in range(49)))
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Finish on the boundary."}],
         model="chat",
         tool_gateway=SingleToolGateway((work,)),
@@ -1350,7 +1626,7 @@ async def test_cancellation_after_fiftieth_tool_takes_priority_over_iteration_li
     provider = ScriptedFakeProvider(streams=_tool_iteration_scripts(50))
     work = FakeTool(name="work", description="work", outcomes=tuple("ok" for _ in range(50)))
 
-    result = await AgentRunner(ScriptedFakeRouter(provider)).run(
+    result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Cancel at the boundary."}],
         model="chat",
         tool_gateway=SingleToolGateway((work,)),
@@ -1381,7 +1657,7 @@ async def test_callback_failure_propagates_and_closes_provider_iterator() -> Non
         del event
         raise RuntimeError("output sink failed")
 
-    runner = AgentRunner(router)  # type: ignore[arg-type]
+    runner = _runner(cast(AgentRunnerRouter, router))
 
     with pytest.raises(RuntimeError, match="output sink failed"):
         await runner.run(
@@ -1414,7 +1690,7 @@ async def test_callback_failure_while_repairing_model_error_stays_external() -> 
             raise RuntimeError("end sink failed")
 
     with pytest.raises(RuntimeError, match="end sink failed"):
-        await AgentRunner(ScriptedFakeRouter(provider)).run(
+        await _runner(ScriptedFakeRouter(provider)).run(
             [{"role": "user", "content": "Callback during failure."}],
             model="chat",
             tool_gateway=None,
@@ -1452,7 +1728,7 @@ async def test_tool_start_callback_failure_does_not_start_gateway_call() -> None
             raise RuntimeError("tool output sink failed")
 
     with pytest.raises(RuntimeError, match="tool output sink failed"):
-        await AgentRunner(ScriptedFakeRouter(provider)).run(
+        await _runner(ScriptedFakeRouter(provider)).run(
             [{"role": "user", "content": "Fail before Tool."}],
             model="chat",
             tool_gateway=gateway,  # type: ignore[arg-type]
@@ -1513,7 +1789,7 @@ async def test_task_cancellation_closes_tool_operation_and_confirmation_future()
         return await decision
 
     task = asyncio.create_task(
-        AgentRunner(ScriptedFakeRouter(provider)).run(
+        _runner(ScriptedFakeRouter(provider)).run(
             [{"role": "user", "content": "Cancel confirmation."}],
             model="chat",
             tool_gateway=BlockingGateway([]),  # type: ignore[arg-type]
@@ -1560,7 +1836,7 @@ async def test_noncooperative_task_cancellation_propagates_after_iterator_close(
         return replay()
 
     router.stream = blocking_stream  # type: ignore[method-assign]
-    runner = AgentRunner(router)  # type: ignore[arg-type]
+    runner = _runner(cast(AgentRunnerRouter, router))
     task = asyncio.create_task(
         runner.run(
             [{"role": "user", "content": "Cancel task."}],
@@ -1593,7 +1869,7 @@ async def test_task_cancellation_during_callback_honors_cooperative_cancel_reque
             callback_started.set()
             await blocker.wait()
 
-    runner = AgentRunner(router)  # type: ignore[arg-type]
+    runner = _runner(cast(AgentRunnerRouter, router))
     task = asyncio.create_task(
         runner.run(
             [{"role": "user", "content": "Cancel in callback."}],
@@ -1629,7 +1905,7 @@ async def test_concurrent_runs_do_not_share_increment_usage_or_continuation() ->
             FakeTool(name="B", description="B", outcomes=("B result",)),
         )
     )
-    runner = AgentRunner(router)  # type: ignore[arg-type]
+    runner = _runner(cast(AgentRunnerRouter, router))
 
     results = await asyncio.gather(
         runner.run(

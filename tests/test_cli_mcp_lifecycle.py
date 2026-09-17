@@ -14,7 +14,7 @@ import pytest
 import myclaw.agent.tools.mcp as mcp_adapter
 import myclaw.agent.tools.mcp_runtime as mcp_runtime
 import myclaw.terminal.cli as cli
-from myclaw.agent.runner import AgentRunner
+from myclaw.agent.runner import AgentRunner, IdentityAgentRunRequestPreparer
 from myclaw.agent.session.session import Session
 from myclaw.agent.tools.mcp import MCPServerConnection
 from myclaw.agent.tools.mcp_runtime import MCPServerFailure, MCPStartupReport
@@ -903,7 +903,10 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
             user_message = {"role": "user", "content": f"echo {self.value}"}
             self.session.add_message("user", user_message["content"])
             gateway = ToolGateway._for_memory(cast(Any, self.mcp_tools))
-            result = await AgentRunner(cast(Any, FlowRouter(self.value))).run(
+            result = await AgentRunner(
+                cast(Any, FlowRouter(self.value)),
+                IdentityAgentRunRequestPreparer(),
+            ).run(
                 [user_message],
                 model="chat",
                 tool_gateway=gateway,

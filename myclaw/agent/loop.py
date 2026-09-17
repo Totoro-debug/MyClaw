@@ -35,6 +35,7 @@ from myclaw.agent.runner import (
     AgentRunnerRouter,
     AgentRunnerToolCallFinished,
     AgentRunnerToolCallStarted,
+    IdentityAgentRunRequestPreparer,
     _build_assistant_repair_message,
 )
 from myclaw.agent.session.session import Session, SessionStoragePartition
@@ -248,7 +249,7 @@ class AgentLoop:
             mcp_keywords=selected_mcp_keywords,
         )
         baseline_tool_schemas = tuple(baseline_gateway.schemas)
-        runner = AgentRunner(model_router)
+        runner = AgentRunner(model_router, IdentityAgentRunRequestPreparer())
         compactor = ConversationCompactor(
             provider=cast(CompactionModelRouter, model_router),
             memory_manager=memory_manager,
