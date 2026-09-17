@@ -519,7 +519,7 @@ async def test_config_command_renders_safe_persistence_failure(
 
 
 @pytest.mark.asyncio
-async def test_config_command_keeps_undefined_source_inspectable(
+async def test_config_command_ignores_undefined_source_fields(
     agent_home: Path,
 ) -> None:
     home = AgentHome(agent_home)
@@ -530,12 +530,7 @@ async def test_config_command_keeps_undefined_source_inspectable(
 
     result = await dispatcher.dispatch("/config")
 
-    assert result.output == (
-        "config_invalid: Configuration field "
-        "'models.providers.primary.unexpected' is not recognized.\n"
-        f"Path: {config_path}\n"
-        f"{REDACTED_SCHEMA_INVALID_CONFIG_CONTENT}"
-    )
+    assert result.output == f"Path: {config_path}\n{REDACTED_SCHEMA_INVALID_CONFIG_CONTENT}"
     assert "schema-command-secret" not in result.output
 
 

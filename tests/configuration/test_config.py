@@ -424,6 +424,154 @@ def test_configuration_projects_undefined_fields_and_legacy_routes(agent_home: P
     assert configuration.runtime.max_tool_result_chars == 60000
 
 
+@pytest.mark.parametrize("operation", ["startup", "view"])
+@pytest.mark.parametrize(
+    ("content", "marker", "expected_mcp"),
+    [
+        (
+            "future_setting = true\n\n" + VALID_CONFIG,
+            "future_setting = true",
+            False,
+        ),
+        (
+            VALID_CONFIG.replace(
+                "max_tool_result_chars = 60000",
+                "max_tool_result_chars = 60000\nfuture_runtime_setting = true",
+            ),
+            "future_runtime_setting = true",
+            False,
+        ),
+        (
+            VALID_CONFIG + "\n[tools.web]\nenabled = true\n",
+            "enabled = true",
+            False,
+        ),
+        (
+            VALID_CONFIG + "\n[mcp.servers.future]\n"
+            'enabled = true\ntransport = "stdio"\ncommand = "uvx"\n'
+            "future_server_setting = true\n",
+            "future_server_setting = true",
+            True,
+        ),
+    ],
+    ids=("top-level", "known-table", "static-table", "mcp-server"),
+)
+def test_unknown_configuration_projection_is_accepted_by_startup_and_config_view(
+    agent_home: Path,
+    operation: str,
+    content: str,
+    marker: str,
+    expected_mcp: bool,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(content, encoding="utf-8")
+
+    if operation == "startup":
+        configuration = loader.load_for_startup()
+
+        assert loader.diagnostics == ()
+        assert set(configuration.models.routes) == {"default"}
+        assert set(configuration.mcp) == ({"future"} if expected_mcp else set())
+        return
+
+    view = loader.view()
+
+    assert view.error is None
+    assert view.diagnostics == ()
+    assert marker in view.redacted_content
+    assert "sk-ant-secret" not in view.redacted_content
+
+
+@pytest.mark.parametrize("operation", ["startup", "view"])
+@pytest.mark.parametrize("value", ["0.5", '"not-a-ratio"'], ids=("valid", "invalid"))
+def test_compact_ratio_remains_an_ignored_field_without_a_warning(
+    agent_home: Path,
+    operation: str,
+    value: str,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    content = VALID_CONFIG.replace(
+        "[runtime]\n",
+        f"[runtime]\ncompact_ratio = {value}\n",
+    )
+    loader.path.write_text(content, encoding="utf-8")
+
+    if operation == "startup":
+        configuration = loader.load_for_startup()
+
+        assert loader.diagnostics == ()
+        assert not hasattr(configuration.runtime, "compact_ratio")
+        return
+
+    view = loader.view()
+
+    assert view.error is None
+    assert view.diagnostics == ()
+    assert "compact_ratio" not in view.diagnostics_text()
+    assert not hasattr(view, "effective_compact_ratio")
+
+
+@pytest.mark.parametrize("operation", ["startup", "view"])
+@pytest.mark.parametrize(
+    ("content", "error_code", "field"),
+    [
+        (
+            VALID_CONFIG.replace("max_tool_result_chars = 60000", "max_tool_result_chars = 999"),
+            "config_invalid",
+            "runtime.max_tool_result_chars",
+        ),
+        (
+            VALID_CONFIG.replace('model = "claude-model"\n', ""),
+            "config_invalid",
+            "models.routes.default.model",
+        ),
+        (
+            VALID_CONFIG
+            + """
+[models.providers.invalid]
+protocol = "anthropic"
+base_url = "https://invalid.example"
+api_key = "invalid-secret"
+""",
+            "config_invalid",
+            "models.providers.invalid.models",
+        ),
+        (
+            VALID_CONFIG + "\n[broken\nvalue = true\n",
+            "config_parse_error",
+            None,
+        ),
+    ],
+    ids=("known-invalid", "missing-required", "eager-provider", "malformed-toml"),
+)
+def test_startup_and_config_view_preserve_configuration_failures(
+    agent_home: Path,
+    operation: str,
+    content: str,
+    error_code: str,
+    field: str | None,
+) -> None:
+    loader = ConfigLoader(AgentHome(agent_home))
+    loader.ensure_default()
+    loader.path.write_text(content, encoding="utf-8")
+
+    if operation == "startup":
+        with pytest.raises(ConfigError) as raised:
+            loader.load_for_startup()
+
+        error = raised.value.error
+    else:
+        view = loader.view()
+        assert view.error is not None
+        error = view.error
+
+    assert error.code == error_code
+    if field is not None:
+        assert field in error.message
+
+
 def test_startup_gate_does_not_resolve_provider_or_model_usability(agent_home: Path) -> None:
     loader = ConfigLoader(AgentHome(agent_home))
     loader.ensure_default()
@@ -623,32 +771,37 @@ def test_config_view_redacts_multiline_api_key_in_valid_dotted_toml(agent_home: 
 
 
 @pytest.mark.parametrize(
-    ("content", "secrets"),
+    ("content", "secrets", "expected_error"),
     (
         pytest.param(
             SCHEMA_INVALID_API_KEY_ALIAS_CONFIG,
             ("sk-schema-alias-secret",),
+            "config_invalid",
             id="schema-alias",
         ),
         pytest.param(
             '[diagnostics]\nAPI_Key = "sk-nested-secret"\nmessage = "keep"\n',
             ("sk-nested-secret",),
+            None,
             id="unknown-table",
         ),
         pytest.param(
             '[diagnostics]\napi_key = ["sk-array-secret"]\nmessage = "keep"\n',
             ("sk-array-secret",),
+            None,
             id="non-string-value",
         ),
         pytest.param(
             '[[diagnostics]]\napi_key = "sk-array-table-secret"\nmessage = "keep"\n',
             ("sk-array-table-secret",),
+            None,
             id="array-table",
         ),
         pytest.param(
             r""""api\u005fkey" = "sk-valid-escaped-secret"
 """,
             ("sk-valid-escaped-secret",),
+            None,
             id="escaped-key",
         ),
     ),
@@ -657,6 +810,7 @@ def test_config_view_redacts_structured_api_key_variants(
     agent_home: Path,
     content: str,
     secrets: tuple[str, ...],
+    expected_error: str | None,
 ) -> None:
     loader = ConfigLoader(AgentHome(agent_home))
     loader.ensure_default()
@@ -664,8 +818,11 @@ def test_config_view_redacts_structured_api_key_variants(
 
     view = loader.view()
 
-    assert view.error is not None
-    assert view.error.code == "config_invalid"
+    if expected_error is None:
+        assert view.error is None
+    else:
+        assert view.error is not None
+        assert view.error.code == expected_error
     assert all(secret not in view.redacted_content for secret in secrets)
     assert "***REDACTED***" in view.redacted_content
 
@@ -758,7 +915,7 @@ def test_config_view_returns_safe_parse_error_and_conservatively_redacted_raw_te
     assert "second-plaintext-key" not in view.error.message
 
 
-def test_config_view_keeps_undefined_configuration_inspectable(agent_home: Path) -> None:
+def test_config_view_ignores_undefined_configuration_fields(agent_home: Path) -> None:
     loader = ConfigLoader(AgentHome(agent_home))
     loader.ensure_default()
     content = REDACTION_CONFIG.replace(
@@ -769,72 +926,10 @@ def test_config_view_keeps_undefined_configuration_inspectable(agent_home: Path)
 
     view = loader.view()
 
-    assert view.error is not None
-    assert view.error.code == "config_invalid"
-    assert "runtime.misspelled_setting" in view.error.message
+    assert view.error is None
+    assert view.diagnostics == ()
     assert "misspelled_setting = true" in view.redacted_content
     assert "plaintext-primary-key" not in view.redacted_content
-
-
-@pytest.mark.parametrize(
-    ("content", "field"),
-    (
-        (VALID_CONFIG + "\n[unexpected]\nvalue = true\n", "unexpected"),
-        (
-            VALID_CONFIG.replace(
-                "max_tool_result_chars = 60000",
-                "max_tool_result_chars = 60000\nunknown = true",
-            ),
-            "runtime.unknown",
-        ),
-        (
-            VALID_CONFIG.replace("batch_size = 12", "batch_size = 12\nunknown = true"),
-            "memory.unknown",
-        ),
-        (VALID_CONFIG + "\n[tools.web]\nenabled = true\n", "tools"),
-        (
-            VALID_CONFIG.replace(
-                "[models.providers.anthropic-default]",
-                "[models]\nunknown = true\n\n[models.providers.anthropic-default]",
-            ),
-            "models.unknown",
-        ),
-        (
-            VALID_CONFIG.replace(
-                'models = ["claude-model"]',
-                'models = ["claude-model"]\nunknown = true',
-            ),
-            "models.providers.anthropic-default.unknown",
-        ),
-        (
-            VALID_CONFIG.replace("timeout = 120", "timeout = 120\nunknown = true"),
-            "models.routes.default.unknown",
-        ),
-        (
-            VALID_CONFIG + "\n[models.routes.cron]\nlegacy = true\n",
-            "models.routes.cron",
-        ),
-        (
-            VALID_CONFIG + "\n[models.routes.future]\nfuture = true\n",
-            "models.routes.future",
-        ),
-    ),
-)
-def test_config_view_reports_undefined_fields(
-    agent_home: Path,
-    content: str,
-    field: str,
-) -> None:
-    loader = ConfigLoader(AgentHome(agent_home))
-    loader.ensure_default()
-    loader.path.write_text(content, encoding="utf-8")
-
-    view = loader.view()
-
-    assert view.error is not None
-    assert view.error.code == "config_invalid"
-    assert field in view.error.message
-    assert "sk-ant-secret" not in view.redacted_content
 
 
 @pytest.mark.parametrize(

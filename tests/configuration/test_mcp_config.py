@@ -654,7 +654,7 @@ command = "uvx"
         ("nested", "{ value = true }"),
     ],
 )
-def test_unknown_mcp_fields_are_isolated_per_server(
+def test_unknown_mcp_fields_are_ignored_per_server(
     agent_home: Path,
     unknown_field: str,
     unknown_value: str,
@@ -675,11 +675,16 @@ command = "uvx"
 """,
     )
 
-    configuration = loader.load()
+    configuration = loader.load_for_startup()
 
-    assert set(configuration.mcp) == {"valid"}
-    assert len(loader.diagnostics) == 1
-    assert f"{unknown_field}" in loader.diagnostics[0].message
+    assert set(configuration.mcp) == {"invalid", "valid"}
+    assert loader.diagnostics == ()
+
+    view = loader.view()
+
+    assert view.error is None
+    assert view.diagnostics == ()
+    assert f"{unknown_field} =" in view.redacted_content
 
 
 @pytest.mark.parametrize(
@@ -1092,7 +1097,8 @@ def test_invalid_mcp_field_diagnostic_escapes_control_characters(
 enabled = true
 transport = "stdio"
 command = "uvx"
-"{encoded_field}" = true
+[mcp.servers.valid.tool_keywords]
+"{encoded_field}" = [1]
 """,
     )
 

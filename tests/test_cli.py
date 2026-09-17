@@ -2342,7 +2342,7 @@ def test_installed_config_command_hides_invalid_utf8_and_traceback(
     assert "Traceback" not in visible
 
 
-def test_installed_config_command_keeps_undefined_content_inspectable(
+def test_installed_config_command_ignores_undefined_content_fields(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -2355,9 +2355,9 @@ def test_installed_config_command_keeps_undefined_content_inspectable(
 
     result = run_installed_myclaw(agent_home, "config", workspace=workspace)
 
-    assert result.returncode == 2
-    assert "config_invalid" in result.stdout
-    assert "runtime.misspelled_setting" in result.stdout
+    assert result.returncode == 0
+    assert "config_invalid" not in result.stdout
+    assert "runtime.misspelled_setting" not in result.stdout
     assert "misspelled_setting = true" in result.stdout
     assert_plaintext_absent(result.stdout + result.stderr, "plaintext-primary-key")
     assert not (workspace / ".myclaw").exists()

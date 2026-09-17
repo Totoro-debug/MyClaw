@@ -286,13 +286,6 @@ def _required(table: Mapping[str, object], key: str, field: str) -> object:
     return table[key]
 
 
-def _reject_unknown(table: Mapping[str, object], allowed: set[str], prefix: str) -> None:
-    unknown = sorted(set(table) - allowed)
-    if unknown:
-        field = f"{prefix}.{unknown[0]}" if prefix else unknown[0]
-        _invalid(field, "is not recognized")
-
-
 def _require_supported_route(requested_route: str) -> None:
     if requested_route not in _ROUTE_NAMES:
         _invalid("models.routes", "was requested with an unsupported route name")
@@ -727,22 +720,9 @@ def _parse_mcp_server(mcp_name: str, value: object) -> MCPServerConfiguration:
     if not valid_name:
         _invalid(prefix, "must use a lowercase name with up to 64 letters, digits, '_' or '-'")
     table = _table(value, prefix)
-    _reject_unknown(
-        table,
-        {
-            "enabled",
-            "transport",
-            "command",
-            "args",
-            "cwd",
-            "url",
-            "headers",
-            "connect_timeout",
-            "call_timeout",
-            "tool_keywords",
-        },
-        prefix,
-    )
+    for field_name in ("env", "secret_env"):
+        if field_name in table:
+            _invalid(f"{prefix}.{field_name}", "is not recognized")
     transport = _string(
         _required(table, "transport", f"{prefix}.transport"),
         f"{prefix}.transport",
@@ -839,7 +819,6 @@ def _parse_mcp(
     diagnostics: list[ConfigurationDiagnostic] | None = None,
 ) -> Mapping[str, MCPServerConfiguration]:
     table = _table(document.get("mcp", {}), "mcp")
-    _reject_unknown(table, {"servers"}, "mcp")
     servers = _table(table.get("servers", {}), "mcp.servers")
     parsed: dict[str, MCPServerConfiguration] = {}
     for mcp_name, value in servers.items():
@@ -868,59 +847,6 @@ def _parse_configuration(
         models=_parse_models(document),
         mcp=_parse_mcp(document, diagnostics=diagnostics),
     )
-
-
-def _validate_defined_fields(document: Mapping[str, object]) -> None:
-    """Preserve strict config-inspection diagnostics without changing startup projection."""
-    _reject_unknown(document, {"runtime", "memory", "models", "mcp"}, "")
-
-    runtime = _table(document.get("runtime", {}), "runtime")
-    _reject_unknown(
-        runtime,
-        {"max_tool_result_chars", "max_iterations", "enable_skill_always_load"},
-        "runtime",
-    )
-
-    memory = _table(document.get("memory", {}), "memory")
-    _reject_unknown(
-        memory,
-        {"compaction_message_threshold", "batch_size", "schedule"},
-        "memory",
-    )
-
-    models = _table(document.get("models", {}), "models")
-    _reject_unknown(models, {"providers", "routes"}, "models")
-    providers = _table(models.get("providers", {}), "models.providers")
-    for provider_id, value in providers.items():
-        prefix = f"models.providers.{provider_id}"
-        if not _PROVIDER_ID_PATTERN.fullmatch(provider_id):
-            _invalid(prefix, "must use a lowercase kebab-case provider ID")
-        provider = _table(value, prefix)
-        _reject_unknown(provider, {"protocol", "base_url", "api_key", "models"}, prefix)
-
-    routes = _table(models.get("routes", {}), "models.routes")
-    for route_name, value in routes.items():
-        prefix = f"models.routes.{route_name}"
-        if route_name not in _ROUTE_NAMES:
-            _invalid(prefix, "is not a supported Model Route")
-        route = _table(value, prefix)
-        _reject_unknown(
-            route,
-            {
-                "provider_id",
-                "model",
-                "context_window",
-                "max_output",
-                "temperature",
-                "reasoning_effort",
-                "timeout",
-            },
-            prefix,
-        )
-
-    mcp = _table(document.get("mcp", {}), "mcp")
-    _reject_unknown(mcp, {"servers"}, "mcp")
-    _table(mcp.get("servers", {}), "mcp.servers")
 
 
 class ConfigLoader:
@@ -1122,7 +1048,6 @@ class ConfigLoader:
         error: ErrorInfo | None = None
         diagnostics: list[ConfigurationDiagnostic] = []
         try:
-            _validate_defined_fields(document)
             _parse_configuration(document, diagnostics=diagnostics)
         except ConfigError as config_error:
             error = config_error.error
