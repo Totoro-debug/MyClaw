@@ -29,6 +29,7 @@ from myclaw.management.service import (
     ManagementViewService,
     ResumeResult,
 )
+from myclaw.provider.model_router import ModelRouteStatus
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.terminal.conversation import TerminalConversationApp
 from myclaw.utils.time import local_now
@@ -41,6 +42,18 @@ from tests.configuration.test_config import (
     REDACTION_CONFIG,
     VALID_CONFIG,
 )
+
+
+def _fake_memory_route_status() -> ModelRouteStatus:
+    return ModelRouteStatus(
+        requested_route="memory",
+        selected_route="memory",
+        provider_id="test-provider",
+        model="test-model",
+        context_window=200_000,
+        max_output=8_192,
+        used_default=False,
+    )
 
 
 def test_legacy_runtime_module_is_not_discoverable() -> None:
@@ -97,6 +110,10 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
         def __init__(self, **kwargs: object) -> None:
             del kwargs
             events.append("router_init")
+
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
 
         async def close(self) -> None:
             events.append("router_close")
@@ -291,6 +308,10 @@ async def test_cli_async_root_cleans_partial_startup_without_registering_dream_j
             del kwargs
             events.append("router_init")
 
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
+
         async def close(self) -> None:
             events.append("router_close")
 
@@ -475,6 +496,10 @@ def _invoke_cli_resume_preparation_failure(
             self.close_calls = 0
             events.append("router_init")
             router_instance = self
+
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
 
         async def close(self) -> None:
             self.close_calls += 1
@@ -938,6 +963,10 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
             del kwargs
             router_instances.append(self)
 
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
+
         async def close(self) -> None:
             events.append("router_close")
 
@@ -1215,6 +1244,10 @@ async def test_cli_resume_active_requires_force_before_replacing_the_generation(
     class FakeRouter:
         def __init__(self, **kwargs: object) -> None:
             del kwargs
+
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
 
         async def close(self) -> None:
             events.append("router_close")
@@ -1514,6 +1547,10 @@ async def test_cli_same_session_resume_waits_for_pending_persist_before_target_l
         def __init__(self, **kwargs: object) -> None:
             del kwargs
 
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
+
         async def close(self) -> None:
             return None
 
@@ -1720,6 +1757,10 @@ async def test_cli_resume_destructive_failure_fails_closed_and_aborts_each_loop_
     class FakeRouter:
         def __init__(self, **kwargs: object) -> None:
             del kwargs
+
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
 
         async def close(self) -> None:
             events.append("router_close")

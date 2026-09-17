@@ -222,7 +222,7 @@ async def _run_cli_conversation(
             memory_manager=memory_manager,
             model_router=router,
             batch_size=configuration.memory.batch_size,
-            max_iterations=configuration.runtime.max_iterations,
+            memory_route_status=router.route_status("memory"),
         )
 
         async def execute_user_job(job: ScheduleJob) -> None:

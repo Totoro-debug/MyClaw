@@ -23,6 +23,7 @@ from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.config import ConfigLoader, MCPServerConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.management.service import ManagementError
+from myclaw.provider.model_router import ModelRouteStatus
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
@@ -31,6 +32,18 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from tests.fixtures.mcp_wire import ObservedLifetimes, stdio_wire_configuration, wire_tool
+
+
+def _fake_memory_route_status() -> ModelRouteStatus:
+    return ModelRouteStatus(
+        requested_route="memory",
+        selected_route="memory",
+        provider_id="test-provider",
+        model="test-model",
+        context_window=200_000,
+        max_output=8_192,
+        used_default=False,
+    )
 
 
 def _configuration() -> Any:
@@ -126,6 +139,10 @@ async def test_cli_starts_mcp_before_initial_loop_and_closes_it_after_loop(
     class FakeRouter:
         def __init__(self, **kwargs: object) -> None:
             del kwargs
+
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
 
         async def complete(
             self,
@@ -311,6 +328,10 @@ async def test_cli_keeps_old_generation_when_mcp_candidate_preparation_fails(
     class FakeRouter:
         def __init__(self, **kwargs: object) -> None:
             del kwargs
+
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
 
         async def close(self) -> None:
             pass
@@ -514,6 +535,10 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
     class FakeRouter:
         def __init__(self, **kwargs: object) -> None:
             del kwargs
+
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
 
         async def close(self) -> None:
             events.append("router_close")
@@ -798,6 +823,10 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
     class FakeRouter:
         def __init__(self, **kwargs: object) -> None:
             del kwargs
+
+        def route_status(self, route: str) -> ModelRouteStatus:
+            assert route == "memory"
+            return _fake_memory_route_status()
 
         async def complete(self, *args: object, **kwargs: object) -> ModelResponse:
             keyword_calls.append((args, kwargs))

@@ -285,7 +285,7 @@ def _agent_loop(
         memory_manager=memory_manager,
         model_router=router,
         batch_size=configuration.memory.batch_size,
-        max_iterations=configuration.runtime.max_iterations,
+        memory_route_status=router.route_status("memory"),
     )
     loop: AgentLoop | None = None
 
@@ -897,14 +897,6 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
             _response(
                 "",
                 tool_call=ModelToolCall(
-                    id="read-memory",
-                    name="read_file",
-                    arguments=json.dumps({"path": str(memory_path)}),
-                ),
-            ),
-            _response(
-                "",
-                tool_call=ModelToolCall(
                     id="edit-memory",
                     name="edit_file",
                     arguments=json.dumps(
@@ -912,12 +904,11 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
                             "path": str(memory_path),
                             "old_text": "## User Info\n",
                             "new_text": new_user_info,
-                            "replace_all": "false",
+                            "replace_all": False,
                         }
                     ),
                 ),
             ),
-            _response("Long-term Memory updated."),
             _response("Second schedule history summary."),
             _response("None"),
         ),

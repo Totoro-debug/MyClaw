@@ -843,7 +843,7 @@ def test_issue_202_architecture_claims_match_source_ast_contracts() -> None:
         "memory_manager",
         "model_router",
         "batch_size",
-        "max_iterations",
+        "memory_route_status",
     )
     assert _issue_202_method_names(dream) == {
         "run",

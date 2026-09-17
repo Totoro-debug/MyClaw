@@ -9,6 +9,7 @@ from typing import Any
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
+from myclaw.provider.model_router import ModelAttemptGuard
 from myclaw.provider.models import (
     ModelContinuation,
     ModelProvider,
@@ -143,6 +144,7 @@ class ScriptedFakeRouter:
 
     def __init__(self, provider: ModelProvider) -> None:
         self._provider = provider
+        self.complete_calls = 0
 
     def stream(
         self,
@@ -171,8 +173,10 @@ class ScriptedFakeRouter:
         messages: Sequence[dict[str, object]],
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
     ) -> ModelResponse:
-        del route
+        del route, guard
+        self.complete_calls += 1
         return await self._provider.complete(
             messages=messages,
             tools=tools,

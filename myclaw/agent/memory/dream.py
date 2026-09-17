@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Sequence
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol
 
 from loguru import logger
 
+from myclaw.agent.context_budget import ContextBudget, estimate_request_tokens
 from myclaw.agent.memory.manager import (
     MemoryEditMismatchError,
     MemoryEditReadError,
@@ -20,16 +20,13 @@ from myclaw.agent.memory.manager import (
     MemoryPathDeniedError,
     SummaryClaimError,
 )
-from myclaw.agent.runner import (
-    AgentRunner,
-    AgentRunnerMemoryRouter,
-)
 from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam
 from myclaw.agent.tools.tool_gateway import ToolGateway
-from myclaw.errors import ErrorInfo
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.logging.session import without_session_log
 from myclaw.provider.errors import ModelCallError
-from myclaw.provider.models import ModelContinuation, ModelMessages, ModelResponse
+from myclaw.provider.model_router import ModelAttemptGuard, ModelRouteStatus
+from myclaw.provider.models import ModelMessages, ModelResponse
 from myclaw.templates import render_template
 from myclaw.utils.validation import require_nonnegative_int
 
@@ -51,34 +48,6 @@ class DreamResult:
         require_nonnegative_int(self.cursor, field="cursor")
         if not isinstance(self.memory_updated, bool):
             raise ValueError("memory_updated must be a boolean")
-
-
-class DreamReadFileTool(BaseTool):
-    """Read only the Long-term Memory target owned by MemoryManager."""
-
-    name = "read_file"
-    description = "Read the current Long-term Memory UTF-8 text."
-    required = ("path",)
-
-    path: Annotated[str, ToolParam(description="Exact Long-term Memory file path.")]
-    offset: Annotated[int, ToolParam(description="Zero-based first line.", minimum=0)] = 0
-    limit: Annotated[
-        int,
-        ToolParam(description="Maximum lines to return.", minimum=1, maximum=10000),
-    ] = 2000
-
-    def __init__(self, *, memory_manager: MemoryManager) -> None:
-        self._memory_manager = memory_manager
-
-    async def execute(self, *, path: str, offset: int, limit: int) -> str:
-        _require_long_term_path(path, expected=self._memory_manager.long_term_path)
-        try:
-            content = await self._memory_manager.read_long_term()
-        except MemoryPathDeniedError as error:
-            raise ToolError("Long-term Memory must be a regular Workspace State file.") from error
-        except (OSError, UnicodeError, ValueError) as error:
-            raise ToolError("Long-term Memory could not be read.") from error
-        return "\n".join(content.splitlines()[offset : offset + limit])
 
 
 class DreamEditFileTool(BaseTool):
@@ -131,7 +100,7 @@ class DreamEditFileTool(BaseTool):
 
 
 class DreamModelRouter(Protocol):
-    """The memory-route seam consumed only by Dream."""
+    """The one-shot memory-route seam consumed only by Dream."""
 
     async def complete(
         self,
@@ -139,55 +108,12 @@ class DreamModelRouter(Protocol):
         *,
         messages: ModelMessages,
         tools: Sequence[dict[str, Any]],
+        guard: ModelAttemptGuard | None = None,
     ) -> ModelResponse: ...
 
 
-class _DreamModelFailure(Exception):
-    def __init__(self, failure: ModelCallError) -> None:
-        self.error = failure.error
-        super().__init__(failure.error.message)
-
-
-class _DreamRouter(AgentRunnerMemoryRouter):
-    """Adapt the Runner's non-streaming lane to the dedicated memory route."""
-
-    def __init__(
-        self,
-        router: DreamModelRouter,
-        capture_failure: Callable[[Exception], None],
-    ) -> None:
-        self._router = router
-        self._capture_failure = capture_failure
-
-    async def complete(
-        self,
-        route: Literal["memory"],
-        *,
-        messages: ModelMessages,
-        tools: Sequence[dict[str, Any]],
-        continuation: ModelContinuation | None = None,
-    ) -> ModelResponse:
-        if route != "memory":
-            raise ValueError("Dream Runner must use the memory route")
-        del continuation
-        try:
-            return await self._router.complete(
-                route,
-                messages=_provider_memory_messages(messages),
-                tools=tools,
-            )
-        except asyncio.CancelledError:
-            raise
-        except ModelCallError as failure:
-            self._capture_failure(failure)
-            raise _DreamModelFailure(failure) from failure
-        except Exception as error:
-            self._capture_failure(error)
-            raise
-
-
 class Dream:
-    """Own one dedicated memory Agent Runner and restricted Tool Gateway."""
+    """Run one budget-checked Memory decision and apply its edits in order."""
 
     def __init__(
         self,
@@ -195,19 +121,21 @@ class Dream:
         memory_manager: MemoryManager,
         model_router: DreamModelRouter,
         batch_size: int,
-        max_iterations: int,
+        memory_route_status: ModelRouteStatus,
     ) -> None:
         require_nonnegative_int(batch_size, field="batch_size")
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
+        if memory_route_status.requested_route != "memory":
+            raise ValueError("Dream requires the memory Model Route")
         self._memory_manager = memory_manager
+        self._model_router = model_router
         self._batch_size = batch_size
-        self._max_iterations = max_iterations
+        self._memory_route_status = memory_route_status
         self._failure_diagnostic: Exception | None = None
         self._memory_updated = False
         self._tool_gateway = ToolGateway._for_memory(
             (
-                DreamReadFileTool(memory_manager=memory_manager),
                 DreamEditFileTool(
                     memory_manager=memory_manager,
                     on_edit=self._record_memory_update,
@@ -215,7 +143,6 @@ class Dream:
             ),
             on_failure=self._capture_terminal_failure,
         )
-        self._runner = AgentRunner(_DreamRouter(model_router, self._capture_terminal_failure))
         self._running = False
         self._running_cursor = 0
         self._task: asyncio.Task[DreamResult | None] | None = None
@@ -303,6 +230,12 @@ class Dream:
                 cursor=claim.cursor,
             )
 
+        try:
+            long_term_memory = await self._memory_manager.read_long_term()
+        except (OSError, UnicodeError, ValueError) as error:
+            self._capture_terminal_failure(error)
+            return _state_read_failure(cursor=claim.cursor)
+
         records = "\n".join(
             json.dumps(
                 entry.to_dict(),
@@ -322,6 +255,8 @@ class Dream:
             {
                 "role": "user",
                 "content": (
+                    "## Long-term Memory\n\n"
+                    f"{long_term_memory}\n\n"
                     "## Summary Cursor\n\n"
                     f"{claim.previous_cursor}\n\n"
                     "## Conversation Summaries\n\n"
@@ -331,45 +266,60 @@ class Dream:
                 ),
             },
         ]
+        tools = tuple(self._tool_gateway.schemas)
+        if not _request_fits(self._memory_route_status, messages=messages, tools=tools):
+            overflow = _model_context_overflow()
+            self._capture_terminal_failure(overflow)
+            return _model_failure(cursor=claim.cursor, error=overflow.error)
+
         try:
-            result = await self._runner.run(
-                messages,
-                model="memory",
-                tool_gateway=self._tool_gateway,
-                on_output=None,
-                confirmation=None,
-                externalize_result=None,
-                cancel_requested=None,
-                max_iterations=self._max_iterations,
-                stop_on_tool_error=True,
-                propagate_unexpected_errors=True,
-                tool_calls_as_tasks=False,
+            response = await self._model_router.complete(
+                "memory",
+                messages=messages,
+                tools=tools,
+                guard=_memory_attempt_guard,
             )
-        except _DreamModelFailure as failure:
-            return DreamResult(
-                status="Memory Task failed.",
-                processed_count=0,
+        except asyncio.CancelledError:
+            raise
+        except ModelCallError as model_error:
+            self._capture_terminal_failure(model_error)
+            return _model_failure(
+                cursor=claim.cursor,
                 memory_updated=self._memory_updated,
-                cursor=claim.cursor,
-                error=failure.error,
+                error=model_error.error,
             )
+
+        if response.finish_reason == "cancelled":
+            return _model_failure(
+                cursor=claim.cursor,
+                memory_updated=False,
+                error=_finish_reason_error("cancelled"),
+            )
+        if response.finish_reason == "length":
+            return _model_failure(
+                cursor=claim.cursor,
+                memory_updated=False,
+                error=_finish_reason_error("length"),
+            )
+
+        for tool_call in response.message.tool_calls:
+            result = await self._tool_gateway.call(tool_call)
+            if result.status != "success":
+                return _model_failure(
+                    cursor=claim.cursor,
+                    memory_updated=self._memory_updated,
+                    error=ErrorInfo("tool_failed", result.content),
+                )
+
         memory_updated = self._memory_updated
-        if result.finish_reason == "completed":
-            count = len(claim.entries)
-            noun = "summary" if count == 1 else "summaries"
-            outcome = "updated" if memory_updated else "unchanged"
-            return DreamResult(
-                status=f"Processed {count} {noun}; Long-term Memory {outcome}.",
-                processed_count=count,
-                memory_updated=memory_updated,
-                cursor=claim.cursor,
-            )
+        count = len(claim.entries)
+        noun = "summary" if count == 1 else "summaries"
+        outcome = "updated" if memory_updated else "unchanged"
         return DreamResult(
-            status="Memory Task failed.",
-            processed_count=0,
+            status=f"Processed {count} {noun}; Long-term Memory {outcome}.",
+            processed_count=count,
             memory_updated=memory_updated,
             cursor=claim.cursor,
-            error=result.error or ErrorInfo("model_failed", "The model request failed."),
         )
 
     def _capture_terminal_failure(self, error: Exception) -> None:
@@ -395,32 +345,56 @@ def _require_long_term_path(path: str, *, expected: Path) -> None:
         raise ToolError("Memory Tasks may access only Long-term Memory.")
 
 
-def _provider_memory_messages(messages: ModelMessages) -> ModelMessages:
-    """Preserve the pre-193 provider transcript while Runner keeps its own records."""
-    projected: list[dict[str, Any]] = []
-    for message in messages:
-        role = message.get("role")
-        if role == "assistant":
-            projected.append(
-                {
-                    "role": "assistant",
-                    "content": message.get("content", ""),
-                    "tool_calls": deepcopy(message.get("tool_calls", [])),
-                }
-            )
-            continue
-        if role == "tool":
-            projected.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": message.get("tool_call_id"),
-                    "name": message.get("name"),
-                    "content": message.get("content", ""),
-                }
-            )
-            continue
-        projected.append(deepcopy(message))
-    return projected
+def _memory_attempt_guard(
+    route_status: ModelRouteStatus,
+    messages: ModelMessages,
+    tools: Sequence[dict[str, Any]],
+) -> bool:
+    return _request_fits(route_status, messages=messages, tools=tools)
+
+
+def _request_fits(
+    route_status: ModelRouteStatus,
+    *,
+    messages: ModelMessages,
+    tools: Sequence[dict[str, Any]],
+) -> bool:
+    budget = ContextBudget(
+        context_window=route_status.context_window,
+        max_output=route_status.max_output,
+        compact_ratio=0.9,
+    )
+    return not budget.exceeds_available_context(estimate_request_tokens(messages, tools))
+
+
+def _model_context_overflow() -> ModelCallError:
+    return ModelCallError(
+        ErrorInfo(
+            code="model_context_overflow",
+            message=MODEL_CONTEXT_OVERFLOW_MESSAGE,
+        )
+    )
+
+
+def _finish_reason_error(finish_reason: Literal["length", "cancelled"]) -> ErrorInfo:
+    if finish_reason == "cancelled":
+        return ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
+    return ErrorInfo("model_failed", "Memory Task model response reached its output limit.")
+
+
+def _model_failure(
+    *,
+    cursor: int,
+    error: ErrorInfo,
+    memory_updated: bool = False,
+) -> DreamResult:
+    return DreamResult(
+        status="Memory Task failed.",
+        processed_count=0,
+        memory_updated=memory_updated,
+        cursor=cursor,
+        error=error,
+    )
 
 
 def _state_read_failure(*, cursor: int) -> DreamResult:
@@ -453,6 +427,5 @@ __all__ = [
     "Dream",
     "DreamEditFileTool",
     "DreamModelRouter",
-    "DreamReadFileTool",
     "DreamResult",
 ]

@@ -13,12 +13,23 @@ from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
+from myclaw.provider.model_router import ModelRouteStatus
 from myclaw.provider.models import AssistantModelMessage, ModelResponse, ModelUsage
 from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.service import ScheduleService
 from myclaw.schedule.store import ScheduleStateError, WorkspaceScheduleStore
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter
+
+_FAKE_MEMORY_ROUTE_STATUS = ModelRouteStatus(
+    requested_route="memory",
+    selected_route="memory",
+    provider_id="test-provider",
+    model="test-model",
+    context_window=200_000,
+    max_output=8_192,
+    used_default=False,
+)
 
 
 class _Clock:
@@ -120,7 +131,7 @@ def _dream(state: WorkspaceState, provider: ScriptedFakeProvider) -> Dream:
         memory_manager=MemoryManager(state),
         model_router=ScriptedFakeRouter(provider),
         batch_size=10,
-        max_iterations=50,
+        memory_route_status=_FAKE_MEMORY_ROUTE_STATUS,
     )
 
 
@@ -2079,7 +2090,7 @@ async def test_schedule_service_runs_dream_silently_without_a_foreground_session
         memory_manager=manager,
         model_router=ScriptedFakeRouter(provider),
         batch_size=10,
-        max_iterations=50,
+        memory_route_status=_FAKE_MEMORY_ROUTE_STATUS,
     )
     clock = _AdvancingClock()
 
@@ -2139,7 +2150,12 @@ async def test_schedule_service_close_cancels_and_drains_an_active_dream_run(
     manager = MemoryManager(state)
     await manager.append_summary("A pending summary.", datetime(2026, 8, 7, 12, 0, tzinfo=UTC))
     router = _BlockingDreamRouter()
-    dream = Dream(memory_manager=manager, model_router=router, batch_size=10, max_iterations=50)
+    dream = Dream(
+        memory_manager=manager,
+        model_router=router,
+        batch_size=10,
+        memory_route_status=_FAKE_MEMORY_ROUTE_STATUS,
+    )
     clock = _AdvancingClock()
 
     async def execute_user_job(job: ScheduleJob) -> None:
