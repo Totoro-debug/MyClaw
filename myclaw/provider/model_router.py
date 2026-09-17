@@ -9,6 +9,7 @@ from typing import Any, Protocol, cast
 from loguru import logger
 
 from myclaw.config.config import ProviderConfiguration, ResolvedModelRoute, UserConfiguration
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     REASONING_EFFORT_LEVELS,
@@ -44,7 +45,13 @@ class ModelRouteStatus:
     provider_id: str
     model: str
     context_window: int
+    max_output: int
     used_default: bool
+
+
+type ModelAttemptGuard = Callable[
+    [ModelRouteStatus, ModelMessages, Sequence[dict[str, Any]]], bool | None
+]
 
 
 class ModelRouter:
@@ -110,6 +117,7 @@ class ModelRouter:
         messages: ModelMessages,
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         resolved, reasoning_effort = self._begin_call(route, continuation=continuation)
         return self._stream_direct(
@@ -118,6 +126,7 @@ class ModelRouter:
             tools=tools,
             continuation=continuation,
             reasoning_effort=reasoning_effort,
+            guard=guard,
         )
 
     async def _stream_direct(
@@ -128,11 +137,13 @@ class ModelRouter:
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None,
         reasoning_effort: ReasoningEffort | None,
+        guard: ModelAttemptGuard | None,
     ) -> AsyncIterator[ModelStreamEvent]:
         if continuation is not None and continuation.provider_id != resolved.provider.provider_id:
             continuation = None
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            self._check_attempt_guard(resolved, messages=messages, tools=tools, guard=guard)
             provider = self._provider(resolved.provider)
             emitted = False
             try:
@@ -172,6 +183,7 @@ class ModelRouter:
         messages: ModelMessages,
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
     ) -> Coroutine[Any, Any, ModelResponse]:
         resolved, reasoning_effort = self._begin_call(route, continuation=continuation)
         return self._complete_direct(
@@ -180,6 +192,7 @@ class ModelRouter:
             tools=tools,
             continuation=continuation,
             reasoning_effort=reasoning_effort,
+            guard=guard,
         )
 
     async def _complete_direct(
@@ -190,11 +203,13 @@ class ModelRouter:
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None,
         reasoning_effort: ReasoningEffort | None,
+        guard: ModelAttemptGuard | None,
     ) -> ModelResponse:
         if continuation is not None and continuation.provider_id != resolved.provider.provider_id:
             continuation = None
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            self._check_attempt_guard(resolved, messages=messages, tools=tools, guard=guard)
             provider = self._provider(resolved.provider)
             try:
                 return await provider.complete(
@@ -221,6 +236,20 @@ class ModelRouter:
                 )
 
         raise AssertionError("Provider attempt budget exhausted without a terminal result")
+
+    def _check_attempt_guard(
+        self,
+        resolved: ResolvedModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[dict[str, Any]],
+        guard: ModelAttemptGuard | None,
+    ) -> None:
+        if guard is None:
+            return
+        status = _route_status(cast(ModelRoute, resolved.requested_route), resolved)
+        if guard(status, messages, tools) is False:
+            raise _model_context_overflow()
 
     async def close(self) -> None:
         if self._aborted:
@@ -483,5 +512,15 @@ def _route_status(
         provider_id=resolved.provider.provider_id,
         model=resolved.route.model,
         context_window=resolved.route.context_window,
+        max_output=resolved.route.max_output,
         used_default=resolved.used_default,
+    )
+
+
+def _model_context_overflow() -> ModelCallError:
+    return ModelCallError(
+        ErrorInfo(
+            code="model_context_overflow",
+            message=MODEL_CONTEXT_OVERFLOW_MESSAGE,
+        )
     )
