@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Self, cast
 from uuid import UUID, uuid4
 
+from myclaw.agent.context_budget import ContextUsageSnapshot
 from myclaw.agent.tools.base import ArtifactReference
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
@@ -320,6 +321,87 @@ class Session:
         if metadata_changed:
             self.metadata.clear()
             self.metadata.update(candidate_metadata)
+
+    def commit_agent_run(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        pending_last_compacted: int,
+        pending_action_summary: str | None,
+        usage_delta: dict[str, int] | None = None,
+        metadata_updates: dict[str, Any] | None = None,
+        metadata_removals: tuple[str, ...] = (),
+    ) -> None:
+        """Atomically publish one dormant Agent Run terminal increment."""
+        self._ensure_not_abandoned()
+        if not isinstance(messages, list):
+            raise TypeError("messages must be a list")
+        require_nonnegative_int(pending_last_compacted, field="pending_last_compacted")
+
+        if pending_action_summary is None:
+            action_summary = ""
+        else:
+            _validate_action_summary(pending_action_summary, field="pending_action_summary")
+            action_summary = pending_action_summary
+
+        copied_updates = _copy_metadata_updates(metadata_updates)
+        removals = _validate_metadata_removals(metadata_removals)
+        _validate_agent_run_metadata_patch(copied_updates, removals)
+        _normalize_blackboard_metadata(copied_updates, invalid_is_absent=False)
+
+        copied_usage_delta: dict[str, Any] | None = None
+        if usage_delta is not None:
+            if not isinstance(usage_delta, dict):
+                raise TypeError("usage_delta must be a dictionary")
+            copied_usage_delta = _copy_json_object(usage_delta, field="usage_delta")
+            _validate_token_usage(copied_usage_delta, field="usage_delta")
+
+        candidate_metadata = copy.deepcopy(self.metadata)
+        _validate_metadata(candidate_metadata)
+        candidate_metadata.update(copied_updates)
+        for key in removals:
+            candidate_metadata.pop(key, None)
+        candidate_metadata["summary"] = action_summary
+        _validate_metadata(candidate_metadata)
+
+        updated_usage = copy.deepcopy(candidate_metadata["token_usage"])
+        if copied_usage_delta is not None:
+            updated_usage = _accumulate_token_usage(updated_usage, copied_usage_delta)
+
+        candidate_messages = copy.deepcopy(self.messages)
+        for index, record in enumerate(candidate_messages):
+            if not isinstance(record, dict):
+                raise TypeError(f"messages[{index}] must be a dictionary")
+            _validate_message(record)
+
+        for index, record in enumerate(messages):
+            if not isinstance(record, dict):
+                raise TypeError(f"messages[{index}] must be a dictionary")
+            copied = _copy_json_object(record, field="message")
+            if "timestamp" in copied:
+                raise ValueError("timestamp is reserved for Session message timestamps")
+            copied["timestamp"] = format_rfc3339_milliseconds(self._clock_now())
+            try:
+                _validate_message(copied)
+            except KeyError as error:
+                raise ValueError(f"Session message is missing {error.args[0]}") from error
+            candidate_messages.append(copied)
+            if copied["role"] == "assistant":
+                updated_usage = _accumulate_token_usage(updated_usage, copied["token_usage"])
+
+        if pending_last_compacted > len(candidate_messages):
+            raise ValueError("pending_last_compacted must not exceed final message count")
+        candidate_metadata["token_usage"] = updated_usage
+        _validate_metadata(candidate_metadata)
+
+        candidate_state = self.__dict__.copy()
+        candidate_state.update(
+            messages=candidate_messages,
+            metadata=candidate_metadata,
+            last_compacted=pending_last_compacted,
+        )
+        self.__dict__ = candidate_state
+        self.persist()
 
     def update_metadata(self, metadata: dict[str, Any] | None = None, **updates: Any) -> None:
         """Apply a copied shallow metadata patch and accumulate token usage deltas."""
@@ -737,6 +819,26 @@ def _copy_metadata_updates(value: dict[str, Any] | None) -> dict[str, Any]:
     return _copy_json_object(value, field="metadata_updates")
 
 
+def _validate_agent_run_metadata_patch(
+    updates: dict[str, Any],
+    removals: frozenset[str],
+) -> None:
+    conflict = set(updates).intersection(removals)
+    if conflict:
+        raise ValueError("metadata updates and removals cannot target the same key")
+    protected_updates = {"title", *_TOKEN_USAGE_PATCH_KEYS}.intersection(updates)
+    if protected_updates:
+        raise ValueError("title and token usage cannot be changed through metadata_updates")
+    if "summary" in updates or "summary" in removals:
+        raise ValueError("Action Summary must be supplied through pending_action_summary")
+    usage_removals = (_TOKEN_USAGE_PATCH_KEYS - {"token_usage"}).intersection(removals)
+    if usage_removals:
+        raise ValueError("token usage must be supplied through usage_delta")
+    required_removals = {"title", "token_usage"}.intersection(removals)
+    if required_removals:
+        raise ValueError("required Session metadata cannot be removed")
+
+
 def _validate_metadata_removals(value: tuple[str, ...]) -> frozenset[str]:
     if not isinstance(value, tuple):
         raise TypeError("metadata_removals must be a tuple")
@@ -787,6 +889,8 @@ def _validate_message(message: dict[str, Any]) -> None:
     except ValueError as error:
         raise ValueError("message timestamp must be ISO 8601") from error
     require_aware_datetime(timestamp, field="message timestamp")
+    if role != "assistant" and "context_usage" in message:
+        raise ValueError("context_usage is only valid on assistant messages")
     if role == "user":
         if not message["content"].strip():
             raise ValueError("user message content must not be blank")
@@ -829,6 +933,10 @@ def _validate_assistant_message(message: dict[str, Any]) -> None:
             raise ValueError("assistant error must contain a message")
     token_usage = message["token_usage"]
     _validate_token_usage(token_usage, field="assistant.token_usage")
+    if "context_usage" in message:
+        ContextUsageSnapshot.from_dict(message["context_usage"])
+        if token_usage["model_calls"] != 1:
+            raise ValueError("context_usage requires exactly one assistant model call")
     if token_usage["model_calls"] != 1 and not (
         status == "error"
         and token_usage["model_calls"] == 0

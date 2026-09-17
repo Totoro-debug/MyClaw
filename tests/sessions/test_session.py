@@ -8,6 +8,7 @@ from uuid import UUID
 
 import pytest
 
+from myclaw.agent.context_budget import CONTEXT_ESTIMATOR_VERSION, ContextUsageSnapshot
 from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
@@ -24,6 +25,21 @@ ZERO_USAGE = {
     "output_tokens": 0,
     "total_tokens": 0,
 }
+
+
+def _context_usage() -> dict[str, object]:
+    return ContextUsageSnapshot(
+        requested_route="chat",
+        selected_route="chat",
+        provider_id="provider-1",
+        model="model-1",
+        context_window=8192,
+        max_output=2048,
+        anchor_estimated_tokens=120,
+        estimator_version=CONTEXT_ESTIMATOR_VERSION,
+        run_projected_tokens=240,
+        run_projection_source="reported_delta",
+    ).to_dict()
 
 
 def _state(workspace: Path, agent_home: Path) -> WorkspaceState:
@@ -1940,3 +1956,630 @@ def test_load_rejects_jsonl_without_a_trailing_newline(
 
     with pytest.raises(ValueError, match="newline"):
         Session.load(state, SESSION_ID)
+
+
+def test_assistant_context_usage_is_optional_and_round_trips_through_jsonl(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    old_assistant: dict[str, Any] = {
+        "role": "assistant",
+        "content": "Old response.",
+        "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+        "tool_calls": [],
+        "status": "completed",
+        "error": None,
+        "token_usage": {"model_calls": 1, "input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+    }
+    _write_jsonl(state, [_header(), old_assistant])
+
+    old_loaded = Session.load(state, SESSION_ID)
+
+    assert old_loaded.messages[0].get("context_usage") is None
+
+    new_session = Session.create(
+        state,
+        now=lambda: CREATED_AT,
+        new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
+    )
+    provenance = _context_usage()
+    new_session.add_message(
+        "assistant",
+        "New response.",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={"model_calls": 1, "input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+        context_usage=provenance,
+    )
+    new_session.close()
+
+    loaded = Session.load(state, new_session.session_id)
+
+    assert loaded.messages == new_session.messages
+    assert loaded.messages[0]["context_usage"] == provenance
+
+
+@pytest.mark.parametrize("role", ["user", "tool"])
+def test_context_usage_is_rejected_for_non_assistant_messages_at_construction(
+    agent_home: Path,
+    workspace: Path,
+    role: str,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    fields: dict[str, Any] = {"context_usage": _context_usage()}
+    if role == "tool":
+        fields.update(tool_call_id="call-1", name="read_file", status="success")
+
+    with pytest.raises(ValueError, match=r"context_usage.*assistant"):
+        session.add_message(role, "Message content.", **fields)
+
+
+def test_context_usage_is_rejected_for_non_assistant_messages_at_load(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    _write_jsonl(
+        state,
+        [
+            _header(),
+            {
+                "role": "user",
+                "content": "Invalid provenance.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+                "context_usage": _context_usage(),
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match=r"context_usage.*assistant"):
+        Session.load(state, SESSION_ID)
+
+
+@pytest.mark.parametrize(
+    "context_usage",
+    [
+        {key: value for key, value in _context_usage().items() if key != "model"},
+        {**_context_usage(), "reported_usage": dict(ZERO_USAGE)},
+    ],
+)
+def test_assistant_context_usage_rejects_missing_or_unknown_fields_at_construction(
+    agent_home: Path,
+    workspace: Path,
+    context_usage: dict[str, object],
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+
+    with pytest.raises(ValueError, match=r"context_usage.*shape"):
+        session.add_message(
+            "assistant",
+            "Invalid provenance.",
+            tool_calls=[],
+            status="completed",
+            error=None,
+            token_usage={
+                "model_calls": 1,
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "total_tokens": 3,
+            },
+            context_usage=context_usage,
+        )
+
+    assert session.messages == []
+    assert session.metadata["token_usage"] == ZERO_USAGE
+
+
+def test_context_usage_is_rejected_for_a_synthetic_zero_call_assistant(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+
+    with pytest.raises(ValueError, match="exactly one assistant model call"):
+        session.add_message(
+            "assistant",
+            "Iteration limit reached.",
+            tool_calls=[],
+            status="error",
+            error={"code": "agent_iteration_limit", "message": "Iteration limit reached."},
+            token_usage=dict(ZERO_USAGE),
+            context_usage=_context_usage(),
+        )
+
+    assert session.messages == []
+    assert session.metadata["token_usage"] == ZERO_USAGE
+
+
+def test_commit_agent_run_publishes_messages_cursor_summary_usage_and_metadata_once(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "Existing history.")
+    session.update_metadata(
+        title="Concurrent title",
+        old_extension={"remove": True},
+        concurrent_extension={"version": 2},
+    )
+    before_state = session.__dict__
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "Current request."},
+        {
+            "role": "assistant",
+            "content": "Completed response.",
+            "tool_calls": [],
+            "status": "completed",
+            "error": None,
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 11,
+                "output_tokens": 3,
+                "total_tokens": 14,
+            },
+            "context_usage": _context_usage(),
+        },
+    ]
+
+    metadata_updates: dict[str, Any] = {
+        "blackboard": {
+            "goal": "  Ship the change  ",
+            "completion_boundary": "  Tests pass  ",
+        },
+        "task_framing_status": "resolved",
+        "future_extension": {"trace": ["before"]},
+    }
+    session.commit_agent_run(
+        messages,
+        pending_last_compacted=2,
+        pending_action_summary=None,
+        usage_delta={
+            "model_calls": 3,
+            "input_tokens": 30,
+            "output_tokens": 10,
+            "total_tokens": 40,
+        },
+        metadata_updates=metadata_updates,
+        metadata_removals=("old_extension", "unknown_extension"),
+    )
+    messages[0]["content"] = "Changed after commit."
+    messages[1]["context_usage"]["model"] = "changed-after-commit"
+    metadata_updates["blackboard"]["goal"] = "Changed after commit"
+    metadata_updates["future_extension"]["trace"].append("after")
+
+    assert session.__dict__ is not before_state
+    assert [message["content"] for message in before_state["messages"]] == ["Existing history."]
+    assert [message["content"] for message in session.messages] == [
+        "Existing history.",
+        "Current request.",
+        "Completed response.",
+    ]
+    assert session.last_compacted == 2
+    assert session.metadata["title"] == "Concurrent title"
+    assert session.metadata["summary"] == ""
+    assert session.metadata["blackboard"] == {
+        "goal": "Ship the change",
+        "completion_boundary": "Tests pass",
+    }
+    assert session.metadata["task_framing_status"] == "resolved"
+    assert session.metadata["concurrent_extension"] == {"version": 2}
+    assert session.metadata["future_extension"] == {"trace": ["before"]}
+    assert "old_extension" not in session.metadata
+    assert "unknown_extension" not in session.metadata
+    assert session.metadata["token_usage"] == {
+        "model_calls": 4,
+        "input_tokens": 41,
+        "output_tokens": 13,
+        "total_tokens": 54,
+    }
+    assert session.messages[-1]["context_usage"] == _context_usage()
+    assert "context_usage" not in session.metadata
+    assert persist_calls == [None]
+
+
+@pytest.mark.parametrize(
+    ("metadata_updates", "metadata_removals", "match"),
+    [
+        ({"future": True}, ("future",), "same key"),
+        ({"title": "Stale run-start title"}, (), "title"),
+        ({"token_usage": dict(ZERO_USAGE)}, (), "token usage"),
+        ({"token_usage_delta": dict(ZERO_USAGE)}, (), "token usage"),
+        ({"usage_delta": dict(ZERO_USAGE)}, (), "token usage"),
+        ({}, ("title",), "required Session metadata"),
+        ({}, ("token_usage",), "required Session metadata"),
+        ({}, ("token_usage_delta",), "token usage"),
+        ({}, ("usage_delta",), "token usage"),
+        ({"summary": "patch"}, (), "Action Summary"),
+        ({}, ("summary",), "Action Summary"),
+    ],
+)
+def test_commit_agent_run_rejects_ambiguous_or_protected_metadata_patches(
+    agent_home: Path,
+    workspace: Path,
+    metadata_updates: dict[str, Any],
+    metadata_removals: tuple[str, ...],
+    match: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "Existing history.")
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+    before_cursor = session.last_compacted
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    with pytest.raises(ValueError, match=match):
+        session.commit_agent_run(
+            [],
+            pending_last_compacted=0,
+            pending_action_summary="",
+            metadata_updates=metadata_updates,
+            metadata_removals=metadata_removals,
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+    assert session.last_compacted == before_cursor
+    assert persist_calls == []
+
+
+def test_commit_agent_run_rejects_string_metadata_removals_without_state_changes(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    before_metadata = copy.deepcopy(session.metadata)
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    with pytest.raises(TypeError, match="metadata_removals must be a tuple"):
+        session.commit_agent_run(
+            [],
+            pending_last_compacted=0,
+            pending_action_summary="",
+            metadata_removals="blackboard",  # type: ignore[arg-type]
+        )
+
+    assert session.messages == []
+    assert session.metadata == before_metadata
+    assert session.last_compacted == 0
+    assert persist_calls == []
+
+
+def test_commit_agent_run_validation_failure_leaves_every_observable_field_unchanged(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "Existing history.")
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+    before_cursor = session.last_compacted
+    before_updated_at = session.updated_at
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "Prepared response.",
+            "tool_calls": [],
+            "status": "completed",
+            "error": None,
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "total_tokens": 3,
+            },
+            "context_usage": {**_context_usage(), "context_window": 0},
+        }
+    ]
+    original_messages = copy.deepcopy(messages)
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    with pytest.raises(ValueError, match="context_window"):
+        session.commit_agent_run(
+            messages,
+            pending_last_compacted=99,
+            pending_action_summary="Pending summary.",
+            usage_delta={
+                "model_calls": 1,
+                "input_tokens": 4,
+                "output_tokens": 2,
+                "total_tokens": 6,
+            },
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+    assert session.last_compacted == before_cursor
+    assert session.updated_at == before_updated_at
+    assert messages == original_messages
+    assert persist_calls == []
+
+
+@pytest.mark.parametrize(
+    ("token_usage", "match"),
+    [
+        (
+            {"model_calls": 2, "input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            "model_calls",
+        ),
+        (
+            {"model_calls": 1, "input_tokens": 2, "output_tokens": 1, "total_tokens": 99},
+            "total_tokens",
+        ),
+    ],
+)
+def test_commit_agent_run_rejects_invalid_assistant_usage_without_state_changes(
+    agent_home: Path,
+    workspace: Path,
+    token_usage: dict[str, int],
+    match: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "Existing history.")
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+    before_cursor = session.last_compacted
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    with pytest.raises(ValueError, match=match):
+        session.commit_agent_run(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Invalid usage.",
+                    "tool_calls": [],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": token_usage,
+                }
+            ],
+            pending_last_compacted=1,
+            pending_action_summary="Pending summary.",
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+    assert session.last_compacted == before_cursor
+    assert persist_calls == []
+
+
+def test_commit_agent_run_state_replacement_failure_does_not_publish_or_persist(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "Existing history.")
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+    before_cursor = session.last_compacted
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    def fail_state_replacement(instance: Session, name: str, value: object) -> None:
+        if instance is session and name == "__dict__":
+            raise RuntimeError("state replacement failed")
+        object.__setattr__(instance, name, value)
+
+    monkeypatch.setattr(Session, "__setattr__", fail_state_replacement, raising=False)
+
+    with pytest.raises(RuntimeError, match="state replacement failed"):
+        session.commit_agent_run(
+            [{"role": "user", "content": "Current request."}],
+            pending_last_compacted=0,
+            pending_action_summary="Pending summary.",
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+    assert session.last_compacted == before_cursor
+    assert persist_calls == []
+
+
+def test_commit_agent_run_keeps_main_context_provenance_separate_from_independent_usage(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.update_metadata(title="Concurrent title")
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+    provenance = _context_usage()
+    main_messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "Main response.",
+            "tool_calls": [],
+            "status": "completed",
+            "error": None,
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 7,
+                "output_tokens": 2,
+                "total_tokens": 9,
+            },
+            "context_usage": provenance,
+        }
+    ]
+
+    session.commit_agent_run(
+        main_messages,
+        pending_last_compacted=1,
+        pending_action_summary="Action summary.",
+        metadata_updates={"blackboard": {"goal": "Goal", "completion_boundary": "Done"}},
+    )
+    session.commit_agent_run(
+        [],
+        pending_last_compacted=1,
+        pending_action_summary="Action summary.",
+        usage_delta={
+            "model_calls": 2,
+            "input_tokens": 13,
+            "output_tokens": 5,
+            "total_tokens": 18,
+        },
+        metadata_updates={"task_framing_status": "resolved"},
+    )
+
+    assert session.metadata["token_usage"] == {
+        "model_calls": 3,
+        "input_tokens": 20,
+        "output_tokens": 7,
+        "total_tokens": 27,
+    }
+    assert session.metadata["title"] == "Concurrent title"
+    assert session.metadata["task_framing_status"] == "resolved"
+    assert session.metadata["blackboard"] == {"goal": "Goal", "completion_boundary": "Done"}
+    assert session.messages[0]["context_usage"] == provenance
+    assert "context_usage" not in session.metadata
+    assert persist_calls == [None, None]
+
+
+def test_commit_agent_run_rejects_a_cursor_past_the_final_message_count(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "Existing history.")
+    before_messages = copy.deepcopy(session.messages)
+    before_metadata = copy.deepcopy(session.metadata)
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    with pytest.raises(ValueError, match="final message count"):
+        session.commit_agent_run(
+            [{"role": "user", "content": "Current request."}],
+            pending_last_compacted=3,
+            pending_action_summary="Pending summary.",
+        )
+
+    assert session.messages == before_messages
+    assert session.metadata == before_metadata
+    assert session.last_compacted == 0
+    assert persist_calls == []
+
+
+def test_commit_agent_run_accepts_a_cursor_into_base_messages_plus_increment(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.add_message("user", "First existing message.")
+    session.add_message("user", "Second existing message.")
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    session.commit_agent_run(
+        [{"role": "user", "content": "Current increment."}],
+        pending_last_compacted=3,
+        pending_action_summary="Pending summary.",
+    )
+
+    assert session.last_compacted == 3
+    assert len(session.messages) == 3
+    assert persist_calls == [None]
+
+
+def test_commit_agent_run_keeps_published_state_when_persist_clock_fails(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    clock_values = iter((CREATED_AT, CREATED_AT))
+
+    def fail_after_message_timestamp() -> datetime:
+        try:
+            return next(clock_values)
+        except StopIteration as error:
+            raise RuntimeError("persist clock failed") from error
+
+    session = Session.create(
+        _state(workspace, agent_home),
+        now=fail_after_message_timestamp,
+    )
+
+    with pytest.raises(RuntimeError, match="persist clock failed"):
+        session.commit_agent_run(
+            [{"role": "user", "content": "Committed before persist scheduling."}],
+            pending_last_compacted=1,
+            pending_action_summary="Committed Action Summary.",
+        )
+
+    assert [message["content"] for message in session.messages] == [
+        "Committed before persist scheduling."
+    ]
+    assert session.last_compacted == 1
+    assert session.metadata["summary"] == "Committed Action Summary."
+    assert session.updated_at == CREATED_AT
+
+
+def test_commit_agent_run_clears_action_summary_and_removes_staged_metadata(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session.create(_state(workspace, agent_home))
+    session.update_metadata(
+        summary="Existing Action Summary.",
+        blackboard={"goal": "Goal", "completion_boundary": "Done"},
+        task_framing_status="resolved",
+        future_extension={"remove": True},
+    )
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    session.commit_agent_run(
+        [],
+        pending_last_compacted=0,
+        pending_action_summary=None,
+        metadata_removals=(
+            "blackboard",
+            "task_framing_status",
+            "future_extension",
+            "missing_extension",
+        ),
+    )
+
+    assert session.metadata["summary"] == ""
+    assert "blackboard" not in session.metadata
+    assert "task_framing_status" not in session.metadata
+    assert "future_extension" not in session.metadata
+    assert persist_calls == [None]
+
+
+def test_commit_agent_run_does_not_modify_conversation_summary_or_fact_state(
+    agent_home: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state)
+    summary_path = state.memory_directory / "summary.jsonl"
+    existing_summary = b'{"index":1,"content":"Existing fact"}\n'
+    summary_path.write_bytes(existing_summary)
+    persist_calls: list[None] = []
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    session.commit_agent_run(
+        [{"role": "user", "content": "Session-only increment."}],
+        pending_last_compacted=0,
+        pending_action_summary=None,
+    )
+
+    assert summary_path.read_bytes() == existing_summary
+    assert persist_calls == [None]
