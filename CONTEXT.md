@@ -132,6 +132,10 @@ _Avoid_: checkpoint, bookmark, Session ID
 A Workspace-owned ordered stream of compact summaries derived from earlier Conversation Session messages.
 _Avoid_: Long-term Memory, raw history, manual note, Session memory
 
+**Action Summary**:
+A Conversation Session-owned summary of neutral, completed small tasks extracted from messages removed by the latest compaction; it remains available to later Agent Runs in that Session's model context but is not part of the Workspace Conversation Summary stream.
+_Avoid_: Long-term Memory, progress status, task tracker, Conversation Summary
+
 **Long-term Memory**:
 A Workspace-level durable memory of stable information intended to influence later Agent behavior across Conversation Sessions.
 _Avoid_: Raw history, Session archive, manual notes, vector database, Conversation Summary
@@ -203,6 +207,10 @@ _Avoid_: live MCP registry, mutable Tool Catalog, MCP Server list
 **Tool Artifact**:
 A durable external representation of an oversized successful Tool result associated with one Conversation Session.
 _Avoid_: Tool result, attachment, memory entry
+
+**Tool Result Micro-compression**:
+An Agent Run model-context projection that omits oversized results from eligible earlier ReAct Tool messages after that run has made more than ten such Tool calls, without changing the returned Tool messages or persisted Session history.
+_Avoid_: Tool Artifact, Tool result deletion, Tool execution truncation, permission filtering
 
 **Schedule**:
 The domain encompassing persistent scheduled tasks and the service that manages and runs them.
