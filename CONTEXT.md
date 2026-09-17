@@ -72,6 +72,10 @@ _Avoid_: Agent Loop, Conversation Session, Runtime Lifetime, Provider retry loop
 One complete Agent execution for one input against one Conversation Session, from input acceptance through its final outcome and persistence request.
 _Avoid_: Agent Turn, Runtime, Model call, Tool call
 
+**ReAct Cycle**:
+One assistant response that requests Tools together with every corresponding Tool result completed before the next model request; a terminal assistant response without Tool calls ends the Agent Run instead of starting another cycle.
+_Avoid_: Agent Run, Model call, individual Tool call, Provider retry
+
 **Blackboard**:
 A hidden task definition attached to a Conversation Session and its foreground Agent Runs, containing one current goal and one completion boundary. It supports interpretation without controlling execution or exposing a task-management surface.
 _Avoid_: Task list, plan, workflow state, progress tracker
@@ -91,6 +95,22 @@ _Avoid_: Runtime Context, user message, Conversation Summary
 **Model Request Context**:
 The provider-neutral ordered messages assembled for one model call, including its System Prompt, Runtime Context, projected conversational messages, and any model-visible execution continuation.
 _Avoid_: Prompt, Conversation Session, raw Session transcript, Provider request payload
+
+**Reported Model Usage**:
+The token usage returned by a Model Provider for one completed model request and response, used as the primary measurement basis for later context budgeting when available.
+_Avoid_: Session token total, local token estimate, cost total
+
+**Projected Next-request Usage**:
+The expected token occupancy of the next Model Request Context, based first on the latest applicable Reported Model Usage plus subsequent context changes, with a complete local estimate as fallback.
+_Avoid_: Reported Model Usage, cumulative Session usage, output token limit
+
+**Available Context**:
+The maximum input-token capacity of one resolved Model Route after reserving that route's configured maximum output, calculated as `context_window - max_output`.
+_Avoid_: Context window, Compaction Context Window, current context usage
+
+**Compaction Context Window**:
+The proactive compression threshold for a Model Route, calculated as `ceil(Available Context * Runtime compact_ratio)`; it triggers compaction before the hard input capacity is exhausted.
+_Avoid_: Available Context, model context limit, output token limit
 
 **Skill**:
 A named, discoverable instruction package that guides an Agent Run through existing capabilities without registering Tools or expanding permissions.
@@ -133,7 +153,7 @@ A Workspace-owned ordered stream of compact summaries derived from earlier Conve
 _Avoid_: Long-term Memory, raw history, manual note, Session memory
 
 **Action Summary**:
-A Conversation Session-owned summary of neutral, completed small tasks extracted from messages removed by the latest compaction; it remains available to later Agent Runs in that Session's model context but is not part of the Workspace Conversation Summary stream.
+A Conversation Session-owned rolling summary of neutral, completed small tasks represented by compacted messages; each successful compaction replaces or clears it for later Agent Runs without adding it to the Workspace Conversation Summary stream.
 _Avoid_: Long-term Memory, progress status, task tracker, Conversation Summary
 
 **Long-term Memory**:
@@ -141,7 +161,7 @@ A Workspace-level durable memory of stable information intended to influence lat
 _Avoid_: Raw history, Session archive, manual notes, vector database, Conversation Summary
 
 **Dream**:
-A background or manually triggered memory process that turns new Conversation Summary entries into Long-term Memory.
+A background or manually triggered one-shot memory process that turns new Conversation Summary entries into Long-term Memory through at most one logical Memory Model request before applying any returned edits.
 _Avoid_: Memory Task, Chat turn, Conversation Compaction, full Agent Run
 
 **Summary Cursor**:
