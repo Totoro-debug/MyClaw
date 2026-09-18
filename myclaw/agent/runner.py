@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -31,7 +30,6 @@ from myclaw.provider.models import (
 from myclaw.utils.validation import token_usage_validation_issue
 
 type AgentRunnerRoute = Literal["chat", "schedule"]
-type AgentRunnerModelRoute = Literal["chat", "schedule", "memory"]
 type AgentRunnerSegment = Literal["reasoning", "response"]
 type AgentRunnerFinishReason = Literal["completed", "failed", "cancelled", "max_iterations"]
 type AgentRunnerOutput = (
@@ -102,20 +100,6 @@ class AgentRunnerRouter(Protocol):
     ) -> ModelResponse: ...
 
 
-class AgentRunnerMemoryRouter(ABC):
-    """Nominal non-streaming Router seam reserved for Memory Agent Runs."""
-
-    @abstractmethod
-    async def complete(
-        self,
-        route: Literal["memory"],
-        *,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[dict[str, Any]],
-        continuation: ModelContinuation | None = None,
-    ) -> ModelResponse: ...
-
-
 class AgentRunRequestPreparer(Protocol):
     """Prepare one provider-neutral request from detached Agent Run snapshots."""
 
@@ -147,44 +131,6 @@ class AgentRunRequestPreparer(Protocol):
         response: ModelResponse,
         increment: Sequence[dict[str, Any]],
     ) -> dict[str, object] | None: ...
-
-
-class IdentityAgentRunRequestPreparer:
-    """Preserve the existing request projection while detaching mutable messages."""
-
-    @property
-    def recounts_retained_tool_calls(self) -> bool:
-        return False
-
-    async def prepare(
-        self,
-        candidate: Sequence[dict[str, Any]],
-        *,
-        increment: Sequence[dict[str, Any]],
-        latest_cycle_start: int | None,
-        tools: Sequence[dict[str, Any]],
-        continuation_revision: int,
-    ) -> list[dict[str, Any]]:
-        del increment, latest_cycle_start, tools, continuation_revision
-        return deepcopy(list(candidate))
-
-    def observe_request_projection(
-        self,
-        messages: Sequence[dict[str, Any]],
-        *,
-        micro_compression_enabled: bool,
-    ) -> None:
-        del messages, micro_compression_enabled
-
-    def record_response(
-        self,
-        *,
-        request_messages: Sequence[dict[str, Any]],
-        tools: Sequence[dict[str, Any]],
-        response: ModelResponse,
-        increment: Sequence[dict[str, Any]],
-    ) -> None:
-        del request_messages, tools, response, increment
 
 
 def _empty_usage() -> dict[str, int]:
@@ -304,7 +250,7 @@ class AgentRunner:
 
     def __init__(
         self,
-        model_router: AgentRunnerRouter | AgentRunnerMemoryRouter,
+        model_router: AgentRunnerRouter,
         request_preparer: AgentRunRequestPreparer,
     ) -> None:
         self._model_router = model_router
@@ -314,7 +260,7 @@ class AgentRunner:
         self,
         initial_messages: Sequence[dict[str, Any]],
         *,
-        model: AgentRunnerModelRoute,
+        model: AgentRunnerRoute,
         tool_gateway: ToolGateway | None,
         on_output: AgentRunnerOutputCallback | None,
         confirmation: ConfirmationRequester | None,
@@ -324,15 +270,11 @@ class AgentRunner:
         stop_on_tool_error: bool = False,
         propagate_unexpected_errors: bool = False,
         tool_calls_as_tasks: bool = True,
-        model_router: AgentRunnerRouter | AgentRunnerMemoryRouter | None = None,
-        request_preparer: AgentRunRequestPreparer | None = None,
     ) -> AgentRunnerResult:
-        if model not in {"chat", "schedule", "memory"}:
-            raise ValueError("Agent Runner model route must be chat, schedule, or memory")
         _validate_max_iterations(max_iterations)
 
-        active_router = self._model_router if model_router is None else model_router
-        active_preparer = self._request_preparer if request_preparer is None else request_preparer
+        active_router = self._model_router
+        active_preparer = self._request_preparer
         runtime_messages = deepcopy(list(initial_messages))
         increment: list[dict[str, Any]] = []
         pending_tool_calls: list[ModelToolCall] = []
@@ -417,11 +359,7 @@ class AgentRunner:
                 except BaseException as error:
                     raise _RequestPreparationFailure(error) from error
                 request_messages: Sequence[dict[str, Any]]
-                if (
-                    active_preparer.recounts_retained_tool_calls
-                    and model != "memory"
-                    and tool_gateway is not None
-                ):
+                if active_preparer.recounts_retained_tool_calls and tool_gateway is not None:
                     retained_eligible_count = _micro_compression_eligible_count(
                         prepared_messages,
                         gateway=tool_gateway,
@@ -429,7 +367,7 @@ class AgentRunner:
                     micro_compression_enabled = (
                         retained_eligible_count > _MICRO_COMPRESSION_TOOL_CALL_THRESHOLD
                     )
-                if model != "memory" and tool_gateway is not None and micro_compression_enabled:
+                if tool_gateway is not None and micro_compression_enabled:
                     request_messages = _project_for_model_request(
                         prepared_messages,
                         omit_tool_results_before=_latest_completed_cycle_start(prepared_messages),
@@ -449,7 +387,7 @@ class AgentRunner:
                 model_call_started = True
                 usage["model_calls"] += 1
                 if model == "chat":
-                    router = cast(AgentRunnerRouter, active_router)
+                    router = active_router
                     events = router.stream(
                         model,
                         messages=request_messages,
@@ -489,18 +427,8 @@ class AgentRunner:
                     finally:
                         await _close_iterator(events)
                         events = None
-                elif model == "memory":
-                    if not isinstance(active_router, AgentRunnerMemoryRouter):
-                        raise ValueError("Memory Agent Runs require a Memory Router")
-                    response = await active_router.complete(
-                        model,
-                        messages=request_messages,
-                        tools=exposed_tools,
-                        continuation=continuation,
-                    )
                 else:
-                    router = cast(AgentRunnerRouter, active_router)
-                    response = await router.complete(
+                    response = await active_router.complete(
                         model,
                         messages=request_messages,
                         tools=exposed_tools,
@@ -594,9 +522,7 @@ class AgentRunner:
                     result = _externalize_tool_result(result, externalize)
                     _append_run_message(runtime_messages, increment, _tool_run_message(result))
                     pending_tool_calls.pop(0)
-                    if model != "memory" and tool_gateway.is_micro_compression_eligible(
-                        tool_call.name
-                    ):
+                    if tool_gateway.is_micro_compression_eligible(tool_call.name):
                         eligible_tool_call_count += 1
                         if eligible_tool_call_count > _MICRO_COMPRESSION_TOOL_CALL_THRESHOLD:
                             micro_compression_enabled = True
@@ -949,7 +875,6 @@ __all__ = [
     "AgentRunRequestPreparer",
     "AgentRunner",
     "AgentRunnerFinishReason",
-    "AgentRunnerMemoryRouter",
     "AgentRunnerOutput",
     "AgentRunnerOutputCallback",
     "AgentRunnerResponseSegmentEnd",
@@ -959,7 +884,6 @@ __all__ = [
     "AgentRunnerSegment",
     "AgentRunnerToolCallFinished",
     "AgentRunnerToolCallStarted",
-    "IdentityAgentRunRequestPreparer",
 ]
 
 

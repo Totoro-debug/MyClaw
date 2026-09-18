@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 
-from myclaw.agent.runner import AgentRunner, IdentityAgentRunRequestPreparer
+from myclaw.agent.runner import AgentRunner
 from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolResult
 from myclaw.config.config import (
     MemoryConfiguration,
@@ -31,7 +31,7 @@ from myclaw.provider.models import (
     ModelUsage,
     TextDelta,
 )
-from tests.fixtures import FakeClock, ScriptedFakeProvider, StreamScript
+from tests.fixtures import DetachedRequestPreparer, FakeClock, ScriptedFakeProvider, StreamScript
 from tests.fixtures.diagnostic_capture import capture_diagnostics
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -1548,7 +1548,7 @@ async def test_agent_runner_next_tool_loop_request_reads_latest_runtime_effort()
                 content="updated",
             )
 
-    result = await AgentRunner(router, IdentityAgentRunRequestPreparer()).run(
+    result = await AgentRunner(router, DetachedRequestPreparer()).run(
         [{"role": "user", "content": "Run work."}],
         model="chat",
         tool_gateway=cast(Any, UpdatingGateway()),

@@ -427,6 +427,47 @@ def _adr_status(path: Path) -> object:
     return frontmatter.get("status")
 
 
+def _adr_status_contract_issues(decisions: list[Path]) -> list[str]:
+    numbers: dict[str, Path] = {}
+    issues: list[str] = []
+    for path in decisions:
+        number = path.name.split("-", 1)[0]
+        previous = numbers.get(number)
+        if previous is not None:
+            issues.append(f"duplicate ADR number {number}: {previous.name}, {path.name}")
+        else:
+            numbers[number] = path
+
+    for path in decisions:
+        number = path.name.split("-", 1)[0]
+        status = _adr_status(path)
+        if status == "accepted":
+            continue
+        if not isinstance(status, str):
+            issues.append(f"{path.name}: missing ADR status")
+            continue
+        match = re.fullmatch(r"superseded by ADR-(?P<number>\d{4})", status)
+        if match is None:
+            issues.append(f"{path.name}: invalid ADR status {status!r}")
+            continue
+        superseder_number = match.group("number")
+        if superseder_number == number:
+            issues.append(f"{path.name}: ADR cannot supersede itself")
+            continue
+        if int(superseder_number) < int(number):
+            issues.append(
+                f"{path.name}: superseding ADR-{superseder_number} must have a later number"
+            )
+            continue
+        superseder = numbers.get(superseder_number)
+        if superseder is None:
+            issues.append(f"{path.name}: superseding ADR-{superseder_number} does not exist")
+            continue
+        if _adr_status(superseder) != "accepted":
+            issues.append(f"{path.name}: superseding ADR-{superseder_number} is not accepted")
+    return issues
+
+
 def test_distribution_declares_supported_loguru_release_range() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
@@ -708,12 +749,64 @@ def test_superseded_design_documents_are_absent() -> None:
     assert not [path for path in superseded if path.exists()]
 
 
-def test_current_adrs_have_unique_numbers_and_accepted_status() -> None:
+def test_current_adrs_have_unique_numbers_and_valid_status_contract() -> None:
     decisions = sorted((ROOT / "docs" / "adr").glob("*.md"))
-    numbers = [path.name.split("-", 1)[0] for path in decisions]
 
-    assert len(numbers) == len(set(numbers))
-    assert all(_adr_status(path) == "accepted" for path in decisions)
+    assert _adr_status_contract_issues(decisions) == []
+
+
+@pytest.mark.parametrize(
+    ("documents", "expected"),
+    [
+        (
+            {"0001-first.md": "accepted", "0001-second.md": "accepted"},
+            "duplicate ADR number",
+        ),
+        ({"0001-first.md": None}, "missing ADR status"),
+        ({"0001-first.md": "draft"}, "invalid ADR status"),
+        ({"0001-first.md": "superseded by ADR-0001"}, "ADR cannot supersede itself"),
+        (
+            {
+                "0001-first.md": "accepted",
+                "0002-second.md": "superseded by ADR-0001",
+            },
+            "must have a later number",
+        ),
+        (
+            {
+                "0001-first.md": "Superseded by ADR-0002",
+                "0002-second.md": "accepted",
+            },
+            "invalid ADR status",
+        ),
+        (
+            {"0001-first.md": "superseded by ADR-0099"},
+            "superseding ADR-0099 does not exist",
+        ),
+        (
+            {
+                "0001-first.md": "superseded by ADR-0002",
+                "0002-second.md": "superseded by ADR-0003",
+            },
+            "superseding ADR-0002 is not accepted",
+        ),
+    ],
+)
+def test_adr_status_contract_rejects_invalid_relationships(
+    tmp_path: Path,
+    documents: dict[str, str | None],
+    expected: str,
+) -> None:
+    paths: list[Path] = []
+    for filename, status in documents.items():
+        status_line = "title: fixture\n" if status is None else f"status: {status}\n"
+        path = tmp_path / filename
+        path.write_text(f"---\n{status_line}---\n", encoding="utf-8")
+        paths.append(path)
+
+    issues = _adr_status_contract_issues(sorted(paths))
+
+    assert expected in "\n".join(issues)
 
 
 def test_mcp_transport_evidence_uses_local_fixtures() -> None:
@@ -1048,31 +1141,20 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
 
     assert violations == []
 
-    conversation_compactor = _issue_202_class(
-        _issue_202_ast(ROOT / "myclaw" / "agent" / "memory" / "conversation_compactor.py"),
-        "_LegacyConversationCompactor",
+
+def test_ticket_10_transition_only_agent_run_scaffolding_is_absent() -> None:
+    production_text = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted((ROOT / "myclaw").rglob("*.py"))
     )
-    compaction_init = _issue_202_direct_method(conversation_compactor, "__init__")
-    assert _issue_202_parameter_names(compaction_init) == (
-        "self",
-        "provider",
-        "memory_manager",
-        "compaction_message_threshold",
-        "now",
-    )
-    assert all(default is None for default in compaction_init.args.kw_defaults)
-    compaction_prepare = _issue_202_direct_method(conversation_compactor, "prepare")
-    assert _issue_202_parameter_names(compaction_prepare) == (
-        "self",
-        "session",
-        "project_messages",
-        "route_context_window",
-        "route_max_output",
-        "tools",
-        "current_user",
-        "continuation",
-    )
-    assert compaction_prepare.args.kw_defaults[:4] == [None, None, None, None]
+
+    assert "_LegacyConversationCompactor" not in production_text
+    assert "CompactionModelRouter" not in production_text
+    assert "compaction_message_threshold" not in production_text
+    assert "estimated_input_tokens" not in production_text
+    assert "context_used_percent" not in production_text
+    assert "AgentRunnerMemoryRouter" not in production_text
+    assert "AgentRunnerModelRoute" not in production_text
+    assert "IdentityAgentRunRequestPreparer" not in production_text
 
     management = _issue_202_class(
         _issue_202_ast(ROOT / "myclaw" / "management" / "service.py"),

@@ -23,7 +23,6 @@ from myclaw.agent.context_budget import (
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.session.session import Session
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, TURN_CANCELLED_MESSAGE, ErrorInfo
-from myclaw.logging.session import without_session_log
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelAttemptGuard, ModelRouteStatus
 from myclaw.provider.models import (
@@ -53,20 +52,7 @@ __all__ = [
     "AgentRunRouter",
     "AgentRunStagedValues",
     "AgentRunTerminalCommitValues",
-    "CompactionModelRouter",
 ]
-
-
-class CompactionModelRouter(Protocol):
-    """The direct Router seam used for the specialized memory model call."""
-
-    async def complete(
-        self,
-        route: ModelRoute,
-        *,
-        messages: ModelMessages,
-        tools: Sequence[dict[str, Any]],
-    ) -> ModelResponse: ...
 
 
 class AgentRunContextModelRouter(Protocol):
@@ -1770,210 +1756,11 @@ def _insert_action_summary(
     return result
 
 
-class _LegacyConversationCompactor:
-    """Compress eligible early Session messages before an Agent Run model call."""
-
-    def __init__(
-        self,
-        *,
-        provider: CompactionModelRouter,
-        memory_manager: MemoryManager,
-        compaction_message_threshold: int,
-        now: Callable[[], datetime],
-    ) -> None:
-        self._provider = provider
-        self._memory_manager = memory_manager
-        self._message_threshold = compaction_message_threshold
-        self._now = now
-
-    async def prepare(
-        self,
-        session: Session,
-        *,
-        project_messages: CompactionProjection,
-        route_context_window: int,
-        route_max_output: int,
-        tools: Sequence[dict[str, Any]],
-        current_user: dict[str, Any] | None = None,
-        continuation: Sequence[dict[str, Any]] = (),
-    ) -> Session:
-        with without_session_log():
-            return await self._prepare(
-                session,
-                current_user=current_user,
-                continuation=continuation,
-                project_messages=project_messages,
-                route_context_window=route_context_window,
-                route_max_output=route_max_output,
-                tools=tools,
-            )
-
-    async def _prepare(
-        self,
-        session: Session,
-        *,
-        project_messages: CompactionProjection,
-        route_context_window: int,
-        route_max_output: int,
-        tools: Sequence[dict[str, Any]],
-        current_user: dict[str, Any] | None,
-        continuation: Sequence[dict[str, Any]],
-    ) -> Session:
-        effective_tools = tuple(tools)
-        short_term = _short_term_messages(
-            session,
-            current_user=current_user,
-            continuation=continuation,
-        )
-        current_user_index = _last_user_message_index(short_term)
-        complete_messages = project_messages(short_term)
-        available_input = route_context_window - route_max_output
-        fixed_request_tokens = _estimate_messages(
-            complete_messages[:1],
-            tools=effective_tools,
-        )
-        if fixed_request_tokens > available_input:
-            raise _model_context_overflow()
-        if current_user_index < len(short_term):
-            non_compactable_messages = project_messages(short_term[current_user_index:])
-            if (
-                _estimate_messages(non_compactable_messages, tools=effective_tools)
-                >= available_input
-            ):
-                raise _model_context_overflow()
-        token_triggered = (
-            _estimate_messages(complete_messages, tools=effective_tools) >= available_input
-        )
-        message_triggered = len(short_term) >= self._message_threshold
-        if not token_triggered and not message_triggered:
-            return session
-        initial_cutoff = 0
-        if token_triggered:
-            initial_cutoff = _token_cutoff(
-                short_term,
-                current_user_index,
-                available_input,
-                project_messages,
-                tools=effective_tools,
-            )
-        if message_triggered:
-            initial_cutoff = max(
-                initial_cutoff,
-                min(self._message_threshold // 2, len(short_term) - 1),
-            )
-        cutoff = _aligned_cutoff(short_term, initial_cutoff)
-        if cutoff == 0:
-            raise _model_context_overflow()
-        selected = short_term[:cutoff]
-        selected_payload = _compaction_user_context(selected)
-        fact_response = await self._provider.complete(
-            "memory",
-            messages=_summary_request_messages(
-                template_name="conversation-compaction-system-prompt.md",
-                selected_payload=selected_payload,
-            ),
-            tools=(),
-        )
-        session.update_metadata(usage_delta={"model_calls": 1, **fact_response.usage.to_dict()})
-        try:
-            new_last_compacted = session.last_compacted + cutoff
-            await self._memory_manager.append_summary(
-                content=fact_response.message.content,
-                timestamp=self._persisted_now(),
-            )
-        except (OSError, UnicodeError, ValueError) as error:
-            raise ModelCallError(
-                ErrorInfo(
-                    code="persistence_error",
-                    message="Conversation Summary could not be persisted.",
-                )
-            ) from error
-
-        action_response = await self._provider.complete(
-            "memory",
-            messages=_summary_request_messages(
-                template_name="conversation-summary-system-prompt.md",
-                selected_payload=selected_payload,
-            ),
-            tools=(),
-        )
-        session.update_metadata(usage_delta={"model_calls": 1, **action_response.usage.to_dict()})
-        action_summary = action_response.message.content
-        if action_summary.strip() == "None":
-            action_summary = ""
-        session.update_metadata(summary=action_summary)
-        session.last_compacted = new_last_compacted
-        return session
-
-    def _persisted_now(self) -> datetime:
-        value = self._now()
-        return value.replace(microsecond=value.microsecond // 1000 * 1000)
-
-
 def _summary_request_messages(*, template_name: str, selected_payload: str) -> ModelMessages:
     return [
         {"role": "system", "content": render_template(template_name)},
         {"role": "user", "content": selected_payload},
     ]
-
-
-def _short_term_messages(
-    session: Session,
-    *,
-    current_user: dict[str, Any] | None = None,
-    continuation: Sequence[dict[str, Any]] = (),
-) -> list[dict[str, Any]]:
-    messages = list(session.messages[session.last_compacted :])
-    if current_user is not None:
-        messages.append(current_user)
-    messages.extend(continuation)
-    return messages
-
-
-def _last_user_message_index(messages: Sequence[dict[str, Any]]) -> int:
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "user":
-            return index
-    return len(messages)
-
-
-def _aligned_cutoff(messages: list[dict[str, Any]], initial: int) -> int:
-    for index in range(initial, len(messages)):
-        if messages[index].get("role") == "user":
-            return index
-    for index in range(initial - 1, -1, -1):
-        if messages[index].get("role") == "user":
-            return index
-    return 0
-
-
-def _token_cutoff(
-    messages: Sequence[dict[str, Any]],
-    current_user_index: int,
-    input_budget: int,
-    project_messages: CompactionProjection,
-    tools: Sequence[dict[str, Any]],
-) -> int:
-    if current_user_index == len(messages):
-        return len(messages)
-    current_user = messages[current_user_index]
-    continuation = messages[current_user_index + 1 :]
-    tool_tokens = _estimate_messages((), tools=tools)
-    target_bytes = max(input_budget - tool_tokens, 0) // 2 * 4
-    for index in range(current_user_index):
-        projected = project_messages([*messages[: index + 1], current_user, *continuation])
-        selected_bytes = _projected_history_bytes(projected)
-        if selected_bytes >= target_bytes:
-            return index + 1
-    return current_user_index
-
-
-def _estimate_messages(
-    messages: Sequence[dict[str, Any]],
-    *,
-    tools: Sequence[dict[str, Any]] = (),
-) -> int:
-    return estimate_request_tokens(messages, tools)
 
 
 def _model_context_overflow() -> ModelCallError:
@@ -1982,15 +1769,6 @@ def _model_context_overflow() -> ModelCallError:
             code="model_context_overflow",
             message=MODEL_CONTEXT_OVERFLOW_MESSAGE,
         )
-    )
-
-
-def _projected_history_bytes(messages: Sequence[dict[str, Any]]) -> int:
-    current_user_index = _last_user_message_index(messages)
-    history_end = len(messages) if current_user_index == len(messages) else current_user_index
-    return sum(
-        len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        for message in messages[1:history_end]
     )
 
 

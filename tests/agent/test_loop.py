@@ -25,7 +25,7 @@ from myclaw.agent.context_budget import estimate_request_tokens
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ModelContextOverflowError
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
-from myclaw.agent.runner import AgentRunnerResult, AgentRunnerRouter
+from myclaw.agent.runner import AgentRunner, AgentRunnerResult, AgentRunnerRouter
 from myclaw.agent.session.session import Session
 from myclaw.agent.tools.base import BaseTool
 from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES
@@ -424,12 +424,13 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
         "skill_load": 1,
         "context_builder": 1,
         "tool_gateway": 1,
-        "runner": 1,
+        "runner": 0,
         "persist": 0,
     }
     assert asyncio.all_tasks() == tasks_before
     assert router.calls == []
-    assert constructor_args["runner"][0][0] is loop._model_router
+    assert constructor_args["runner"] == []
+    assert isinstance(loop._model_router, TaskFramingRouterAdapter)
     assert loop._model_router._delegate is router
     assert not (session.workspace_state.sessions_directory / f"{session.session_id}.jsonl").exists()
 
@@ -875,7 +876,7 @@ async def test_foreground_context_and_runner_share_exactly_one_run_gateway(
     runner_gateways: list[ToolGateway] = []
     original_new_run_gateway = loop._new_run_gateway
     original_prepare = loop._prepare_agent_run
-    original_run = loop._runner.run
+    original_run = AgentRunner.run
 
     def new_run_gateway(*, excluded_names: Sequence[str] = ()) -> ToolGateway:
         gateway = original_new_run_gateway(excluded_names=excluded_names)
@@ -898,7 +899,7 @@ async def test_foreground_context_and_runner_share_exactly_one_run_gateway(
 
     object.__setattr__(loop, "_new_run_gateway", new_run_gateway)
     object.__setattr__(loop, "_prepare_agent_run", prepare)
-    monkeypatch.setattr(loop._runner, "run", run)
+    monkeypatch.setattr(AgentRunner, "run", run)
 
     await loop.start()
     try:
@@ -2678,7 +2679,7 @@ async def test_append_failure_reports_safe_terminal_and_fifo_consumer_continues(
         del args, kwargs
         return results.popleft()
 
-    monkeypatch.setattr(loop._runner, "run", run)
+    monkeypatch.setattr(AgentRunner, "run", run)
     await loop.start()
     try:
         await _bus.put_inbound(InboundMessage("cannot commit"))

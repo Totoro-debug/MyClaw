@@ -615,9 +615,9 @@ def test_issue_243_production_model_calls_use_one_explicit_run_context_seam() ->
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "run"
             and isinstance(node.func.value, ast.Attribute)
-            and node.func.value.attr == "_runner"
+            and node.func.value.attr == "runner"
         )
-        assert {"model_router", "request_preparer"} <= {
+        assert not {"model_router", "request_preparer"} & {
             keyword.arg for keyword in runner_call.keywords
         }
 

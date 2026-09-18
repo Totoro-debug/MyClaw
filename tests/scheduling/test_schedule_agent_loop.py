@@ -1199,7 +1199,7 @@ def test_schedule_service_user_executor_is_bound_to_agent_loop(
 
 
 @pytest.mark.asyncio
-async def test_foreground_and_schedule_share_runner_and_gateway_identity(
+async def test_foreground_and_schedule_use_distinct_runner_and_gateway_identity(
     agent_home: Path,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1245,7 +1245,7 @@ async def test_foreground_and_schedule_share_runner_and_gateway_identity(
         await _close_components(loop, router, schedule, dream)
 
     assert len(observed) == 2
-    assert observed[0][0] is observed[1][0]
+    assert observed[0][0] is not observed[1][0]
     assert observed[0][1] is not observed[1][1]
     assert tuple(schema["function"]["name"] for schema in observed[0][1].schemas) == (
         RUN_BASELINE_TOOL_NAMES

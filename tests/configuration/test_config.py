@@ -93,7 +93,6 @@ max_tool_result_chars = 60000
 compact_ratio = 0.9
 
 [memory]
-compaction_message_threshold = 50
 batch_size = 12
 schedule = "15 * * * *"
 
@@ -187,7 +186,6 @@ max_tool_result_chars = 50000
 compact_ratio = 0.9
 
 [memory]
-compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
@@ -218,7 +216,6 @@ max_tool_result_chars = 50000
 compact_ratio = 0.9
 
 [memory]
-compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 

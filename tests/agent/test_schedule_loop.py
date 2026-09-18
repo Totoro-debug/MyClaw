@@ -15,7 +15,7 @@ from mcp.types import CallToolResult
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import InboundMessage, MessageBus
-from myclaw.agent.runner import AgentRunnerResult
+from myclaw.agent.runner import AgentRunner, AgentRunnerResult
 from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.tools.base import BaseTool
 from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES
@@ -439,7 +439,7 @@ async def test_schedule_context_and_runner_share_exactly_one_run_gateway(
     runner_gateways: list[ToolGateway] = []
     original_new_run_gateway = loop._new_run_gateway
     original_prepare = loop._prepare_agent_run
-    original_run = loop._runner.run
+    original_run = AgentRunner.run
 
     def new_run_gateway(*, excluded_names: Sequence[str] = ()) -> ToolGateway:
         gateway = original_new_run_gateway(excluded_names=excluded_names)
@@ -462,7 +462,7 @@ async def test_schedule_context_and_runner_share_exactly_one_run_gateway(
 
     object.__setattr__(loop, "_new_run_gateway", new_run_gateway)
     object.__setattr__(loop, "_prepare_agent_run", prepare)
-    monkeypatch.setattr(loop._runner, "run", run)
+    monkeypatch.setattr(AgentRunner, "run", run)
 
     await loop.run_schedule_job(_job())
 

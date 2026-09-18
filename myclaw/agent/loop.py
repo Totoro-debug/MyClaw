@@ -36,7 +36,6 @@ from myclaw.agent.runner import (
     AgentRunnerResult,
     AgentRunnerToolCallFinished,
     AgentRunnerToolCallStarted,
-    IdentityAgentRunRequestPreparer,
     _build_assistant_repair_message,
 )
 from myclaw.agent.session.session import Session, SessionStoragePartition
@@ -184,6 +183,7 @@ class _AgentRunContext:
     router: AgentRunContextRouterAdapter
     controller: AgentRunContextController
     request_preparer: AgentRunContextRequestPreparer
+    runner: AgentRunner
 
 
 class AgentLoop:
@@ -264,7 +264,6 @@ class AgentLoop:
             mcp_keywords=selected_mcp_keywords,
         )
         baseline_tool_schemas = tuple(baseline_gateway.schemas)
-        runner = AgentRunner(model_router, IdentityAgentRunRequestPreparer())
         active_session = (
             Session.create(workspace_state, now=now, new_uuid=new_uuid)
             if session_id is None
@@ -292,7 +291,6 @@ class AgentLoop:
         self._baseline_tool_schemas = baseline_tool_schemas
         self._mcp_keywords = selected_mcp_keywords
         self._model_router = model_router
-        self._runner = runner
         self._max_iterations = configuration.runtime.max_iterations
         self._bus = bus
         self._generation_started_at: float | None = None
@@ -771,7 +769,7 @@ class AgentLoop:
             )
 
         try:
-            result = await self._runner.run(
+            result = await run_context.runner.run(
                 initial_messages,
                 model="schedule",
                 tool_gateway=run_gateway,
@@ -780,8 +778,6 @@ class AgentLoop:
                 externalize_result=self._result_externalizer_for(session),
                 cancel_requested=self._schedule_service.cancellation_requested,
                 max_iterations=self._max_iterations,
-                model_router=run_context.router,
-                request_preparer=run_context.request_preparer,
             )
         except ModelCallError as failure:
             raise ScheduleJobExecutionError(failure.error) from failure
@@ -847,6 +843,7 @@ class AgentLoop:
             router=run_router,
             controller=controller,
             request_preparer=request_preparer,
+            runner=AgentRunner(run_router, request_preparer),
         )
 
     async def _prepare_agent_run(
@@ -1173,7 +1170,7 @@ class AgentLoop:
         if title_work is not None and not title_work.coordination.prepared.done():
             title_work.coordination.prepared.set_result(True)
         try:
-            result = await self._runner.run(
+            result = await run_context.runner.run(
                 initial_messages,
                 model="chat",
                 tool_gateway=run_gateway,
@@ -1182,8 +1179,6 @@ class AgentLoop:
                 externalize_result=self._result_externalizer_for(active_session),
                 cancel_requested=lambda: self._cancel_requested,
                 max_iterations=self._max_iterations,
-                model_router=run_context.router,
-                request_preparer=run_context.request_preparer,
             )
             self._remember_foreground_route_status(run_context.router)
         except ModelCallError as failure:

@@ -17,7 +17,6 @@ from myclaw.agent.runner import (
     AgentRunnerRouter,
     AgentRunnerToolCallFinished,
     AgentRunnerToolCallStarted,
-    IdentityAgentRunRequestPreparer,
 )
 from myclaw.agent.tools.base import ArtifactReference
 from myclaw.agent.tools.tool_gateway import (
@@ -39,6 +38,7 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from tests.fixtures import (
+    DetachedRequestPreparer,
     FakeTool,
     ScriptedFakeProvider,
     ScriptedFakeRouter,
@@ -56,7 +56,7 @@ async def _ignore_output(event: object) -> None:
 
 
 def _runner(router: AgentRunnerRouter) -> AgentRunner:
-    return AgentRunner(router, IdentityAgentRunRequestPreparer())
+    return AgentRunner(router, DetachedRequestPreparer())
 
 
 @pytest.mark.asyncio
@@ -134,7 +134,7 @@ async def test_runner_uses_run_local_router_and_request_provenance_recorder() ->
 
     router = Router()
     preparer = RecordingPreparer()
-    result = await AgentRunner(router, IdentityAgentRunRequestPreparer()).run(
+    result = await AgentRunner(router, preparer).run(
         [{"role": "user", "content": "request"}],
         model="chat",
         tool_gateway=None,
@@ -143,8 +143,6 @@ async def test_runner_uses_run_local_router_and_request_provenance_recorder() ->
         externalize_result=None,
         cancel_requested=None,
         max_iterations=50,
-        model_router=router,
-        request_preparer=preparer,
     )
 
     assert preparer.recorded == 1
@@ -315,7 +313,7 @@ class _RetryingRouter:
         raise AssertionError("Unexpected complete call")
 
 
-class _RecordingRequestPreparer(IdentityAgentRunRequestPreparer):
+class _RecordingRequestPreparer(DetachedRequestPreparer):
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
         self.observations: list[dict[str, Any]] = []
@@ -481,10 +479,10 @@ async def test_runner_prepares_each_logical_request_with_run_local_context() -> 
 
 
 @pytest.mark.asyncio
-async def test_identity_request_preparation_is_detached_and_value_equivalent() -> None:
+async def test_detached_request_preparation_is_value_equivalent() -> None:
     messages = [{"role": "user", "content": {"nested": ["original"]}}]
 
-    prepared = await IdentityAgentRunRequestPreparer().prepare(
+    prepared = await DetachedRequestPreparer().prepare(
         messages,
         increment=(),
         latest_cycle_start=None,
@@ -500,7 +498,7 @@ async def test_identity_request_preparation_is_detached_and_value_equivalent() -
 
 @pytest.mark.asyncio
 async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools() -> None:
-    class MutatingPreparer(IdentityAgentRunRequestPreparer):
+    class MutatingPreparer(DetachedRequestPreparer):
         @property
         def recounts_retained_tool_calls(self) -> bool:
             return False
@@ -571,7 +569,7 @@ async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools(
 async def test_request_projection_observer_failure_stops_before_provider(
     failure_type: type[BaseException],
 ) -> None:
-    class FailingObserverPreparer(IdentityAgentRunRequestPreparer):
+    class FailingObserverPreparer(DetachedRequestPreparer):
         @property
         def recounts_retained_tool_calls(self) -> bool:
             return False
@@ -1653,7 +1651,7 @@ async def test_runner_micro_compression_includes_eligible_history_but_keeps_rece
 
 @pytest.mark.asyncio
 async def test_runner_micro_compression_recounts_retained_history_before_provider_request() -> None:
-    class RetainedProjectionPreparer(IdentityAgentRunRequestPreparer):
+    class RetainedProjectionPreparer(DetachedRequestPreparer):
         @property
         def recounts_retained_tool_calls(self) -> bool:
             return True
@@ -1742,7 +1740,7 @@ async def test_runner_micro_compression_recounts_retained_history_before_provide
 
 @pytest.mark.asyncio
 async def test_runner_recomputes_latest_cycle_after_preparer_removes_history() -> None:
-    class PrefixDroppingPreparer(IdentityAgentRunRequestPreparer):
+    class PrefixDroppingPreparer(DetachedRequestPreparer):
         @property
         def recounts_retained_tool_calls(self) -> bool:
             return True

@@ -59,6 +59,8 @@ API Key 直接保存在配置文件中，当前不支持环境变量引用；`my
 
 MCP Server 可在 `[mcp.servers.<name>.tool_keywords]` 下按远端 Tool 原名配置英文关键词；缺失或为空的关键词会在启动时通过现有 `chat` Model Route 生成并尽力保存。生成失败时，当前进程使用对应的远端 Tool 原名；生成成功但保存失败时，当前进程继续使用已生成的内存关键词。两类失败都不会阻止 Agent 启动。
 
+`[runtime].compact_ratio` 的默认值为 `0.9`，只接受有限且非布尔的数值 `0.5` 至 `0.95`（含边界）。缺失或非法值会回退到 `0.9`，并产生且只产生一条安全诊断；原始配置不会被自动改写。`/config` 同时显示实际生效的比例和脱敏后的原始 TOML；已移除的 `compaction_message_threshold` 等未知字段会被忽略。
+
 ## 项目启动
 
 在已激活虚拟环境的交互式终端中，进入希望 Agent 操作的目录后启动（将 `<workspace>` 替换为实际路径）：
@@ -94,10 +96,10 @@ CLI 负责组装运行时和管理组件生命周期。前台输入经终端与 
 | --- | --- |
 | Terminal / Message Bus | 基于 Textual 与 Rich 展示对话，通过输入、输出队列连接当前 Agent Loop |
 | Agent Loop | 绑定一个会话，串行处理前台输入，管理上下文、任务目标和会话持久化 |
-| Agent Runner | 执行有迭代上限的模型与工具循环，供前台、定时任务和 Dream 复用 |
+| Agent Runner | 执行有迭代上限的模型与工具循环，供前台和用户定时任务复用 |
 | Model Router | 按用途选择模型，适配 OpenAI 兼容协议与 Anthropic，处理重试和回退 |
 | Tool Gateway / MCP | 统一内置与 MCP 工具的调用入口；MCP 连接由 CLI 管理，每个 Agent Loop 使用固定工具快照，单次 Agent Run 通过 `tool_search` 按需暴露延迟 Tool schema |
-| Memory / Dream | 管理短期记忆、会话摘要和长期记忆；Dream 使用独立 Runner 与受限工具整理长期记忆 |
+| Memory / Dream | 管理短期记忆、会话摘要和长期记忆；Dream 通过一次受限的 `memory` 请求整理长期记忆 |
 | Schedule Service | 持久化并调度任务；用户任务调用当前 Agent Loop，记忆整理任务直接调用 Dream |
 | Skill Loader / Context Builder | 加载 Skill 快照，按需提供指令，统一构建 Agent Loop 的模型请求上下文 |
 
@@ -106,3 +108,32 @@ CLI 负责组装运行时和管理组件生命周期。前台输入经终端与 
 内置工具通过权限检查决定是否请求一次性确认；Exec 以当前用户权限执行，不提供操作系统沙箱。MCP 支持 stdio 和 Streamable HTTP，已启用的 Server 视为可信能力，其工具调用不再逐次确认。
 
 架构决策见[现行 ADR](docs/adr/)，领域术语见[CONTEXT.md](CONTEXT.md)。
+
+## 运行时合同
+
+### `/status`
+
+前台和用户定时任务共用同一套上下文预算；Dream 不进入这套 Agent Run 预算。`/status` 的上下文字段定义如下：
+
+- `context_window`：当前聊天 Model Route 的总上下文窗口。
+- `max_output`：为模型输出预留的 token 上限。
+- `available_context`：可用于输入的预算，等于 `context_window - max_output`。
+- `compact_ratio`：实际生效的配置比例，默认 `0.9`。
+- `compact_context_window`：软压缩阈值，等于 `ceil(available_context * compact_ratio)`。
+- `projected_next_request_tokens`：下一次模型请求的投影 token 数；若最新兼容的 Provider 用量可作为锚点则使用报告增量，否则使用完整本地估算。
+- `projection_source`：投影来源，`reported_delta` 表示报告用量增量，`estimated` 表示本地估算。
+- `input_budget_used_percent`：`projected_next_request_tokens / available_context * 100`，分母是可用输入预算。
+
+`cumulative_usage` 是 Session 生命周期内的累计模型调用、输入、输出和总 token 用量，仅用于观测，不代表当前请求上下文占用；Schedule 状态不混入前台 Session 的上下文字段。
+
+### Agent Run
+
+Foreground 和 User Schedule Agent Run 在启动及每次 ReAct 请求前都执行同一套预算检查。历史压缩优先于 Provider-only Tool Result Micro-compression；达到软阈值时按 10%/50% 保留规则选择历史，达到硬输入上限则以 `model_context_overflow` 结束，且每个实际 Provider 尝试都重新检查自己的 Route。超过十个符合条件的 Tool Call 后，才会对请求投影中的旧 Tool Result 做微压缩；持久化消息、摘要和 Tool Artifact 不写入占位符。终止时由 Agent Loop 一次性提交本次 Session 增量及 Agent Run 状态，摘要流保持在 Session 事务之外。
+
+### Dream
+
+Dream 不是 Agent Run，不创建 Agent Runner 或 Agent Run Context Controller，也不执行上下文压缩。没有待处理 Conversation Summary 时，Dream 发起 `0` 次模型请求；领取到待处理 Summary 后，恰好发起一个逻辑上的 `memory` 模型请求，Router 自动重试只增加 Provider attempt，不增加逻辑请求数。该请求只暴露 `edit_file`，返回的编辑按顺序执行；前面的编辑成功后，即使后续编辑失败，已完成的修改仍保留。
+
+### 权威合同与公共证据
+
+Ticket #234 的统一要求由 [ADR-0023](docs/adr/0023-manage-agent-run-context-by-projected-token-budget.md)、[ADR-0024](docs/adr/0024-use-one-shot-dream-model-request.md) 和 [ADR-0025](docs/adr/0025-ignore-unknown-user-configuration-fields.md) 共同定义；[ADR-0022](docs/adr/0022-action-summary-and-tool-result-micro-compression.md) 已明确标记为被 ADR-0023 取代。公共行为证据集中在[控制器测试](tests/memory/test_agent_run_context_controller.py)、[前台循环测试](tests/agent/test_loop.py)、[定时任务测试](tests/agent/test_schedule_loop.py)、[Dream 测试](tests/memory/test_dream.py)、[Session 测试](tests/sessions/test_session.py)和[发布合同测试](tests/test_release_contract.py)。

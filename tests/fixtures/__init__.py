@@ -14,11 +14,13 @@ from tests.fixtures.provider import (
     StreamScript,
     unexpected_provider_factory,
 )
+from tests.fixtures.request_preparer import DetachedRequestPreparer
 from tests.fixtures.schedule import write_schedule_state
 from tests.fixtures.tool import FakeTool, FakeToolCall
 
 __all__ = [
     "BlockingTaskFramingRouterAdapter",
+    "DetachedRequestPreparer",
     "FakeClock",
     "FakeTool",
     "FakeToolCall",

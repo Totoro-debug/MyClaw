@@ -11,7 +11,6 @@ max_iterations = 50
 enable_skill_always_load = false
 
 [memory]
-compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
@@ -104,11 +103,21 @@ def test_malformed_config_has_no_effective_ratio(tmp_path: Path) -> None:
 
 
 def test_removed_threshold_is_not_a_memory_configuration_field(tmp_path: Path) -> None:
-    loader = _loader(tmp_path)
+    legacy_content = VALID_CONFIG.replace(
+        "[runtime]\n",
+        "[runtime]\ncompact_ratio = 0.9\n",
+    ).replace(
+        "[memory]\n",
+        "[memory]\ncompaction_message_threshold = 40\n",
+    )
+    loader = _loader(tmp_path, legacy_content)
 
     configuration = loader.load()
+    view = loader.view()
 
     assert not hasattr(configuration.memory, "compaction_message_threshold")
+    assert view.error is None
+    assert "compaction_message_threshold = 40" in view.redacted_content
 
 
 def test_runtime_configuration_still_rejects_other_known_invalid_fields(tmp_path: Path) -> None:
