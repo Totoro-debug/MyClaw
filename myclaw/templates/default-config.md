@@ -2,9 +2,9 @@
 max_tool_result_chars = 4096
 max_iterations = 50
 enable_skill_always_load = false
+compact_ratio = 0.9
 
 [memory]
-compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 

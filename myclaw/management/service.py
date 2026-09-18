@@ -3,11 +3,19 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from loguru import logger
 
 from myclaw import __version__
+from myclaw.agent.context_budget import (
+    CONTEXT_ESTIMATOR_VERSION,
+    ContextBudget,
+    ContextUsageSnapshot,
+    ProjectionSource,
+    estimate_request_tokens,
+    project_next_request_tokens,
+)
 from myclaw.agent.memory.dream import DreamResult
 from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.workspace_state import WorkspaceState
@@ -90,12 +98,8 @@ class SessionListingReport:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeStatusInput:
-    """Immutable status projection and exact next-request text fragments."""
+    """Immutable status projection for the exact next request."""
 
-    system_prompt: str
-    retained_messages: tuple[str, ...]
-    tool_definitions: tuple[str, ...]
-    runtime_context: str
     session_id: str = ""
     session_title: str = ""
     session_message_count: int = 0
@@ -103,6 +107,16 @@ class RuntimeStatusInput:
     cumulative_usage: tuple[tuple[str, int], ...] = ()
     chat_model: str = ""
     context_window: int = 0
+    max_output: int = 0
+    compact_ratio: float = 0.9
+    requested_route: str = "chat"
+    selected_route: str = "chat"
+    provider_id: str = ""
+    model: str = ""
+    projected_messages: tuple[dict[str, Any], ...] = ()
+    projected_tools: tuple[dict[str, Any], ...] = ()
+    latest_usage_context: ContextUsageSnapshot | None = None
+    latest_reported_usage: tuple[tuple[str, int], ...] = ()
     generation_started_at: float | None = None
 
 
@@ -114,9 +128,14 @@ class RuntimeStatus:
     chat_model: str
     chat_reasoning_effort: ReasoningEffort
     uptime_seconds: int
-    estimated_input_tokens: int
     context_window: int
-    context_used_percent: float
+    max_output: int
+    available_context: int
+    compact_ratio: float
+    compact_context_window: int
+    projected_next_request_tokens: int
+    projection_source: ProjectionSource
+    input_budget_used_percent: float
     session_message_count: int
     last_compacted: int
     cumulative_usage: dict[str, int]
@@ -124,9 +143,25 @@ class RuntimeStatus:
 
     def __post_init__(self) -> None:
         require_nonnegative_int(self.uptime_seconds, field="uptime_seconds")
-        require_nonnegative_int(self.estimated_input_tokens, field="estimated_input_tokens")
-        require_nonnegative_int(self.context_window, field="context_window")
-        require_nonnegative_number(self.context_used_percent, field="context_used_percent")
+        budget = ContextBudget(
+            context_window=self.context_window,
+            max_output=self.max_output,
+            compact_ratio=self.compact_ratio,
+        )
+        if self.available_context != budget.available_context:
+            raise ValueError("available_context does not match the route budget")
+        if self.compact_context_window != budget.compact_context_window:
+            raise ValueError("compact_context_window does not match the route budget")
+        require_nonnegative_int(
+            self.projected_next_request_tokens,
+            field="projected_next_request_tokens",
+        )
+        if self.projection_source not in {"estimated", "reported_delta"}:
+            raise ValueError("projection_source is invalid")
+        require_nonnegative_number(
+            self.input_budget_used_percent,
+            field="input_budget_used_percent",
+        )
         require_nonnegative_int(self.session_message_count, field="session_message_count")
         require_nonnegative_int(self.last_compacted, field="last_compacted")
 
@@ -136,9 +171,14 @@ class RuntimeStatus:
             "chat_model": self.chat_model,
             "chat_reasoning_effort": self.chat_reasoning_effort,
             "uptime_seconds": self.uptime_seconds,
-            "estimated_input_tokens": self.estimated_input_tokens,
             "context_window": self.context_window,
-            "context_used_percent": self.context_used_percent,
+            "max_output": self.max_output,
+            "available_context": self.available_context,
+            "compact_ratio": self.compact_ratio,
+            "compact_context_window": self.compact_context_window,
+            "projected_next_request_tokens": self.projected_next_request_tokens,
+            "projection_source": self.projection_source,
+            "input_budget_used_percent": self.input_budget_used_percent,
             "session_message_count": self.session_message_count,
             "last_compacted": self.last_compacted,
             "cumulative_usage": dict(self.cumulative_usage),
@@ -156,18 +196,6 @@ class ResumeResult:
 
     def __post_init__(self) -> None:
         Session._require_id(self.session_id, partition=SessionStoragePartition.FOREGROUND)
-
-
-def estimate_input_tokens(status_input: RuntimeStatusInput) -> int:
-    """Estimate tokens as ceil(total UTF-8 bytes / 4)."""
-    components = (
-        status_input.system_prompt,
-        *status_input.retained_messages,
-        *status_input.tool_definitions,
-        status_input.runtime_context,
-    )
-    byte_count = sum(len(component.encode("utf-8")) for component in components)
-    return (byte_count + 3) // 4
 
 
 class ManagementError(Exception):
@@ -309,9 +337,30 @@ class ManagementViewService:
         try:
             projection = self._current_agent_loop().runtime_status_input()
             chat_reasoning_effort = await self.reasoning_effort()
-            estimated = estimate_input_tokens(projection)
             if projection.context_window <= 0:
                 raise ValueError("Runtime status context window must be positive")
+            budget = ContextBudget(
+                context_window=projection.context_window,
+                max_output=projection.max_output,
+                compact_ratio=projection.compact_ratio,
+            )
+            estimated = estimate_request_tokens(
+                projection.projected_messages,
+                projection.projected_tools,
+            )
+            reported_usage = dict(projection.latest_reported_usage)
+            projected = project_next_request_tokens(
+                estimated,
+                snapshot=projection.latest_usage_context,
+                reported_usage=reported_usage,
+                requested_route=projection.requested_route,
+                selected_route=projection.selected_route,
+                provider_id=projection.provider_id,
+                model=projection.model,
+                context_window=budget.context_window,
+                max_output=budget.max_output,
+                estimator_version=CONTEXT_ESTIMATOR_VERSION,
+            )
             started_at = projection.generation_started_at
             uptime = 0 if started_at is None else max(0, int(self._monotonic() - started_at))
             return RuntimeStatus(
@@ -319,9 +368,16 @@ class ManagementViewService:
                 chat_model=projection.chat_model,
                 chat_reasoning_effort=chat_reasoning_effort,
                 uptime_seconds=uptime,
-                estimated_input_tokens=estimated,
-                context_window=projection.context_window,
-                context_used_percent=estimated / projection.context_window * 100,
+                context_window=budget.context_window,
+                max_output=budget.max_output,
+                available_context=budget.available_context,
+                compact_ratio=budget.compact_ratio,
+                compact_context_window=budget.compact_context_window,
+                projected_next_request_tokens=projected.projected_tokens,
+                projection_source=projected.source,
+                input_budget_used_percent=(
+                    projected.projected_tokens / budget.available_context * 100
+                ),
                 session_message_count=projection.session_message_count,
                 last_compacted=projection.last_compacted,
                 cumulative_usage=dict(projection.cumulative_usage),

@@ -622,7 +622,11 @@ async def test_agent_loop_keeps_artifact_and_log_correlation_when_persist_fails(
     finally:
         await _close_loop(loop, router, schedule)
 
-    assert messages[-1].metadata == {"_streamed": True}
+    assert messages[-1].metadata == {
+        "finish_reason": "failed",
+        "error_code": "persistence_error",
+        "_streamed": True,
+    }
     tool_message = next(message for message in loop.session.messages if message["role"] == "tool")
     artifact = tool_message["artifact"]
     assert isinstance(artifact, dict)

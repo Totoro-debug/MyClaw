@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from copy import deepcopy
-from typing import Any
+from typing import Any, cast
 
 from myclaw.agent.runner import AgentRunnerRoute, AgentRunnerRouter
+from myclaw.config.config import UserConfiguration
+from myclaw.provider.model_router import ModelAttemptGuard, ModelRouteStatus
 from myclaw.provider.models import (
     ModelContinuation,
     ModelMessages,
@@ -24,11 +27,26 @@ class TaskFramingRouterAdapter:
     def __init__(
         self,
         delegate: AgentRunnerRouter,
-        outcomes: Sequence[ModelResponse | BaseException] = (),
+        outcomes: Sequence[ModelResponse | BaseException] | None = (),
     ) -> None:
         self._delegate = delegate
-        self._outcomes = deque(outcomes)
+        self._outcomes = None if outcomes is None else deque(outcomes)
         self.framing_requests: list[ModelMessages] = []
+        self._configured_statuses: dict[ModelRoute, ModelRouteStatus] = {}
+        self._last_statuses: dict[ModelRoute, ModelRouteStatus] = {}
+
+    def bind_configuration(self, configuration: UserConfiguration) -> None:
+        for route in cast(tuple[ModelRoute, ...], ("chat", "schedule", "memory", "default")):
+            resolved = configuration.resolve_route(route)
+            self._configured_statuses[route] = ModelRouteStatus(
+                requested_route=route,
+                selected_route=cast(ModelRoute, resolved.selected_route),
+                provider_id=resolved.provider.provider_id,
+                model=resolved.route.model,
+                context_window=resolved.route.context_window,
+                max_output=resolved.route.max_output,
+                used_default=resolved.used_default,
+            )
 
     def stream(
         self,
@@ -37,7 +55,20 @@ class TaskFramingRouterAdapter:
         messages: ModelMessages,
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
+        if _accepts_guard(self._delegate.stream):
+            return cast(
+                AsyncIterator[ModelStreamEvent],
+                cast(Any, self._delegate).stream(
+                    route,
+                    messages=messages,
+                    tools=tools,
+                    continuation=continuation,
+                    guard=guard,
+                ),
+            )
+        self._check_fake_attempt(route, messages=messages, tools=tools, guard=guard)
         return self._delegate.stream(
             route,
             messages=messages,
@@ -52,16 +83,54 @@ class TaskFramingRouterAdapter:
         messages: ModelMessages,
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
     ) -> ModelResponse:
-        if _is_task_framing_request(route, messages=messages, tools=tools):
+        if self._outcomes is not None and _is_task_framing_request(
+            route, messages=messages, tools=tools
+        ):
             self.framing_requests.append(deepcopy(messages))
             return await self._complete_task_framing()
+        if _accepts_guard(self._delegate.complete):
+            return cast(
+                ModelResponse,
+                await cast(Any, self._delegate).complete(
+                    route,
+                    messages=messages,
+                    tools=tools,
+                    continuation=continuation,
+                    guard=guard,
+                ),
+            )
+        self._check_fake_attempt(route, messages=messages, tools=tools, guard=guard)
         return await self._delegate.complete(
             route,  # type: ignore[arg-type]
             messages=messages,
             tools=tools,
             continuation=continuation,
         )
+
+    def current_call_status(self, route: ModelRoute) -> ModelRouteStatus | None:
+        current_call_status = getattr(self._delegate, "current_call_status", None)
+        if callable(current_call_status):
+            status = current_call_status(route)
+            if isinstance(status, ModelRouteStatus):
+                return status
+        return self._last_statuses.get(route)
+
+    def _check_fake_attempt(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[dict[str, Any]],
+        guard: ModelAttemptGuard | None,
+    ) -> None:
+        status = self._configured_statuses.get(route)
+        if status is None:
+            raise AssertionError("test Router requires a bound configuration")
+        self._last_statuses[route] = status
+        if guard is not None:
+            guard(status, messages, tools)
 
     async def _complete_task_framing(self) -> ModelResponse:
         if not self._outcomes:
@@ -102,3 +171,7 @@ def _is_task_framing_request(
     return (
         route == "chat" and not tools and len(messages) == 1 and messages[0].get("role") == "system"
     )
+
+
+def _accepts_guard(method: object) -> bool:
+    return "guard" in inspect.signature(cast(Any, method)).parameters

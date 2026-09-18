@@ -139,6 +139,15 @@ class AgentRunRequestPreparer(Protocol):
         micro_compression_enabled: bool,
     ) -> None: ...
 
+    def record_response(
+        self,
+        *,
+        request_messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        response: ModelResponse,
+        increment: Sequence[dict[str, Any]],
+    ) -> dict[str, object] | None: ...
+
 
 class IdentityAgentRunRequestPreparer:
     """Preserve the existing request projection while detaching mutable messages."""
@@ -166,6 +175,16 @@ class IdentityAgentRunRequestPreparer:
         micro_compression_enabled: bool,
     ) -> None:
         del messages, micro_compression_enabled
+
+    def record_response(
+        self,
+        *,
+        request_messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        response: ModelResponse,
+        increment: Sequence[dict[str, Any]],
+    ) -> None:
+        del request_messages, tools, response, increment
 
 
 def _empty_usage() -> dict[str, int]:
@@ -274,6 +293,12 @@ class _CallbackFailure(Exception):
         super().__init__("Agent Runner output callback failed")
 
 
+class _RequestPreparationFailure(Exception):
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        super().__init__("Agent Runner request preparation failed")
+
+
 class AgentRunner:
     """Run bounded ReAct execution while owning only a Model Router reference."""
 
@@ -299,11 +324,15 @@ class AgentRunner:
         stop_on_tool_error: bool = False,
         propagate_unexpected_errors: bool = False,
         tool_calls_as_tasks: bool = True,
+        model_router: AgentRunnerRouter | AgentRunnerMemoryRouter | None = None,
+        request_preparer: AgentRunRequestPreparer | None = None,
     ) -> AgentRunnerResult:
         if model not in {"chat", "schedule", "memory"}:
             raise ValueError("Agent Runner model route must be chat, schedule, or memory")
         _validate_max_iterations(max_iterations)
 
+        active_router = self._model_router if model_router is None else model_router
+        active_preparer = self._request_preparer if request_preparer is None else request_preparer
         runtime_messages = deepcopy(list(initial_messages))
         increment: list[dict[str, Any]] = []
         pending_tool_calls: list[ModelToolCall] = []
@@ -312,6 +341,7 @@ class AgentRunner:
         continuation: ModelContinuation | None = None
         segment: AgentRunnerSegment | None = None
         events: AsyncIterator[ModelStreamEvent] | None = None
+        model_call_started = False
         is_cancel_requested = cancel_requested or _never_cancel
         externalize = externalize_result or _identity_tool_result
         eligible_tool_call_count = 0
@@ -358,6 +388,7 @@ class AgentRunner:
                 increment,
                 partial_content,
                 pending_tool_calls,
+                model_calls=int(model_call_started),
             )
             return _cancelled_result(increment, usage, final_content=final_content)
 
@@ -367,22 +398,27 @@ class AgentRunner:
         try:
             while True:
                 partial_content.clear()
-                usage["model_calls"] += 1
+                model_call_started = False
                 response: ModelResponse | None = None
                 current_cycle_start_in_increment = len(increment)
                 exposed_tools = (
                     () if tool_gateway is None else tuple(deepcopy(tool_gateway.schemas))
                 )
-                prepared_messages = await self._request_preparer.prepare(
-                    deepcopy(runtime_messages),
-                    increment=deepcopy(increment),
-                    latest_cycle_start=latest_cycle_start,
-                    tools=deepcopy(exposed_tools),
-                    continuation_revision=continuation_revision,
-                )
+                try:
+                    prepared_messages = await active_preparer.prepare(
+                        deepcopy(runtime_messages),
+                        increment=deepcopy(increment),
+                        latest_cycle_start=latest_cycle_start,
+                        tools=deepcopy(exposed_tools),
+                        continuation_revision=continuation_revision,
+                    )
+                except (asyncio.CancelledError, ModelCallError):
+                    raise
+                except BaseException as error:
+                    raise _RequestPreparationFailure(error) from error
                 request_messages: Sequence[dict[str, Any]]
                 if (
-                    self._request_preparer.recounts_retained_tool_calls
+                    active_preparer.recounts_retained_tool_calls
                     and model != "memory"
                     and tool_gateway is not None
                 ):
@@ -401,12 +437,19 @@ class AgentRunner:
                     )
                 else:
                     request_messages = prepared_messages
-                self._request_preparer.observe_request_projection(
-                    deepcopy(list(request_messages)),
-                    micro_compression_enabled=micro_compression_enabled,
-                )
+                try:
+                    active_preparer.observe_request_projection(
+                        deepcopy(list(request_messages)),
+                        micro_compression_enabled=micro_compression_enabled,
+                    )
+                except (asyncio.CancelledError, ModelCallError):
+                    raise
+                except BaseException as error:
+                    raise _RequestPreparationFailure(error) from error
+                model_call_started = True
+                usage["model_calls"] += 1
                 if model == "chat":
-                    router = cast(AgentRunnerRouter, self._model_router)
+                    router = cast(AgentRunnerRouter, active_router)
                     events = router.stream(
                         model,
                         messages=request_messages,
@@ -447,16 +490,16 @@ class AgentRunner:
                         await _close_iterator(events)
                         events = None
                 elif model == "memory":
-                    if not isinstance(self._model_router, AgentRunnerMemoryRouter):
+                    if not isinstance(active_router, AgentRunnerMemoryRouter):
                         raise ValueError("Memory Agent Runs require a Memory Router")
-                    response = await self._model_router.complete(
+                    response = await active_router.complete(
                         model,
                         messages=request_messages,
                         tools=exposed_tools,
                         continuation=continuation,
                     )
                 else:
-                    router = cast(AgentRunnerRouter, self._model_router)
+                    router = cast(AgentRunnerRouter, active_router)
                     response = await router.complete(
                         model,
                         messages=request_messages,
@@ -465,7 +508,22 @@ class AgentRunner:
                     )
 
                 _add_usage(usage, response.usage)
-                _append_run_message(runtime_messages, increment, _assistant_run_message(response))
+                assistant_message = _assistant_run_message(response)
+                try:
+                    context_usage = active_preparer.record_response(
+                        request_messages=deepcopy(list(request_messages)),
+                        tools=deepcopy(list(exposed_tools)),
+                        response=response,
+                        increment=deepcopy([*increment, assistant_message]),
+                    )
+                except (asyncio.CancelledError, ModelCallError):
+                    raise
+                except BaseException as error:
+                    raise _RequestPreparationFailure(error) from error
+                if context_usage is not None:
+                    assistant_message["context_usage"] = deepcopy(context_usage)
+                _append_run_message(runtime_messages, increment, assistant_message)
+                model_call_started = False
                 partial_content.clear()
                 pending_tool_calls = (
                     list(response.message.tool_calls) if tool_gateway is not None else []
@@ -584,11 +642,18 @@ class AgentRunner:
                 continuation = continuation_for_next_call
         except _CallbackFailure as failure:
             raise failure.error from failure
+        except _RequestPreparationFailure as failure:
+            raise failure.error from failure
         except ModelCallError as failure:
             await close_segment_for_error()
+            if failure.error.code == "model_context_overflow" and model_call_started:
+                usage["model_calls"] -= 1
+                model_call_started = False
             if failure.error.code == "turn_cancelled" or is_cancel_requested():
                 cancelled_content = "".join(partial_content)
                 return finish_cancelled(final_content=cancelled_content)
+            if failure.error.code == "model_context_overflow" and usage["model_calls"] == 0:
+                raise
             _log_agent_failure(failure)
             failed_content = "".join(partial_content) if model == "chat" else ""
             _repair_failed_messages(
@@ -598,6 +663,7 @@ class AgentRunner:
                 pending_tool_calls,
                 stream=model == "chat",
                 failure=failure,
+                model_calls=int(model_call_started),
             )
             return AgentRunnerResult(
                 messages=increment,
@@ -617,6 +683,7 @@ class AgentRunner:
                     increment,
                     partial_content,
                     pending_tool_calls,
+                    model_calls=int(model_call_started),
                 )
             except BaseException:
                 pass
@@ -637,6 +704,7 @@ class AgentRunner:
                 pending_tool_calls,
                 stream=model == "chat",
                 failure=generic_failure,
+                model_calls=int(model_call_started),
             )
             return AgentRunnerResult(
                 messages=increment,
@@ -792,6 +860,8 @@ def _repair_cancelled_messages(
     increment: list[dict[str, Any]],
     partial_content: list[str],
     pending_tool_calls: list[ModelToolCall],
+    *,
+    model_calls: int,
 ) -> None:
     if partial_content:
         _append_run_message(
@@ -804,6 +874,7 @@ def _repair_cancelled_messages(
                     code="turn_cancelled",
                     message="Turn interrupted by user.",
                 ),
+                model_calls=model_calls,
             ),
         )
     for tool_call in pending_tool_calls:
@@ -832,6 +903,7 @@ def _repair_failed_messages(
     *,
     stream: bool,
     failure: ModelCallError,
+    model_calls: int,
 ) -> None:
     for tool_call in pending_tool_calls:
         _append_run_message(
@@ -855,6 +927,7 @@ def _repair_failed_messages(
             content="".join(partial_content) if stream else "",
             status="error",
             error=failure.error,
+            model_calls=model_calls,
         ),
     )
     partial_content.clear()

@@ -17,7 +17,6 @@ import pytest
 import myclaw.agent.context as context
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.loop import AgentLoop
-from myclaw.agent.memory.conversation_compactor import ConversationCompactor
 from myclaw.agent.memory.dream import Dream
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
@@ -361,47 +360,22 @@ async def _close_components(
     await router.close()
 
 
-def _capture_compaction_projections(
+def _capture_foreground_projections(
     monkeypatch: pytest.MonkeyPatch,
     projections: list[list[dict[str, Any]]],
-    tool_names: list[tuple[str, ...]] | None = None,
 ) -> None:
-    original_prepare = ConversationCompactor.prepare
+    original_build_foreground = ContextBuilder.build_foreground_messages
 
-    async def capture_projection(
-        manager: ConversationCompactor,
-        session: Session,
-        *,
-        current_user: dict[str, Any] | None = None,
-        continuation: Sequence[dict[str, Any]] = (),
-        project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
-        route_context_window: int | None = None,
-        route_max_output: int | None = None,
-        tools: Sequence[dict[str, Any]] | None = None,
-    ) -> Session:
-        if current_user is not None:
-            assert project_messages is not None
-            projections.append(
-                project_messages([*session.messages[session.last_compacted :], current_user])
-            )
-        assert project_messages is not None
-        assert route_context_window is not None
-        assert route_max_output is not None
-        assert tools is not None
-        if tool_names is not None:
-            tool_names.append(tuple(schema["function"]["name"] for schema in tools))
-        return await original_prepare(
-            manager,
-            session,
-            current_user=current_user,
-            continuation=continuation,
-            project_messages=project_messages,
-            route_context_window=route_context_window,
-            route_max_output=route_max_output,
-            tools=tools,
-        )
+    def capture_projection(
+        builder: ContextBuilder,
+        messages: Sequence[dict[str, Any]],
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        projected = original_build_foreground(builder, messages, **kwargs)
+        projections.append(deepcopy(projected))
+        return projected
 
-    monkeypatch.setattr(ConversationCompactor, "prepare", capture_projection)
+    monkeypatch.setattr(ContextBuilder, "build_foreground_messages", capture_projection)
 
 
 def _capture_schedule_projections(
@@ -519,7 +493,7 @@ async def test_foreground_provider_receives_builder_complete_context_projection(
         chat_responses=(_response("First answer."), _response("Second answer.")),
     )
     projection_calls: list[list[dict[str, Any]]] = []
-    _capture_compaction_projections(monkeypatch, projection_calls)
+    _capture_foreground_projections(monkeypatch, projection_calls)
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
         agent_home,
         workspace,
@@ -535,7 +509,7 @@ async def test_foreground_provider_receives_builder_complete_context_projection(
         await _close_components(loop, router, schedule, dream)
 
     assert len(provider.stream_requests) == 2
-    assert projection_calls == [call.messages for call in provider.stream_requests]
+    assert all(call.messages in projection_calls for call in provider.stream_requests)
     first_messages = provider.stream_requests[0].messages
     assert [message["role"] for message in first_messages] == ["system", "user"]
     assert "First question." in str(first_messages[-1]["content"])
@@ -574,15 +548,12 @@ async def test_schedule_uses_context_builder_complete_context_projection(
         )
     )
     provider = _ScheduleProvider(schedule_responses=(_response("Background result."),))
-    projection_calls: list[list[dict[str, Any]]] = []
     builder_projections: list[list[dict[str, Any]]] = []
-    compaction_tool_names: list[tuple[str, ...]] = []
 
     def fail_foreground_context(*args: object, **kwargs: object) -> list[dict[str, object]]:
         del args, kwargs
         raise AssertionError("Schedule must not use ContextBuilder")
 
-    _capture_compaction_projections(monkeypatch, projection_calls, compaction_tool_names)
     _capture_schedule_projections(monkeypatch, builder_projections)
     schedule_now = NOW + timedelta(hours=2)
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
@@ -609,11 +580,9 @@ async def test_schedule_uses_context_builder_complete_context_projection(
     assert len(provider.direct_complete_messages) == 1
     messages, tools = provider.direct_complete_messages[0]
     runner_tool_names = tuple(schema["function"]["name"] for schema in tools)
-    assert compaction_tool_names == [runner_tool_names]
     assert "schedule" not in runner_tool_names
-    assert projection_calls == [messages]
-    assert len(builder_projections) == 1
-    assert all(projection == messages for projection in builder_projections)
+    assert builder_projections
+    assert messages in builder_projections
     assert messages[0]["role"] == "system"
     system_content = cast(str, messages[0]["content"])
     assert str(workspace) in system_content
@@ -730,10 +699,6 @@ async def test_schedule_tool_loop_does_not_prepare_compaction_inside_agent_run(
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    config_text = VALID_CONFIG.replace(
-        "compaction_message_threshold = 50",
-        "compaction_message_threshold = 5",
-    )
     state = WorkspaceState(workspace)
     state.initialize(agent_home_root=agent_home)
     await WorkspaceScheduleStore(state).add_user_job(
@@ -779,7 +744,6 @@ async def test_schedule_tool_loop_does_not_prepare_compaction_inside_agent_run(
         workspace,
         provider,
         schedule_clock=_BlockingClock(NOW),
-        config_text=config_text,
     )
 
     await loop.start()
@@ -820,9 +784,28 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config_text = VALID_CONFIG.replace(
-        "compaction_message_threshold = 50",
-        "compaction_message_threshold = 4",
+    config_text = (
+        VALID_CONFIG
+        + """
+
+[models.routes.schedule]
+provider_id = "anthropic-default"
+model = "claude-model"
+context_window = 4096
+max_output = 512
+temperature = 0.2
+reasoning_effort = "medium"
+timeout = 120
+
+[models.routes.memory]
+provider_id = "anthropic-default"
+model = "claude-model"
+context_window = 200000
+max_output = 8192
+temperature = 0.2
+reasoning_effort = "medium"
+timeout = 120
+"""
     )
     home = AgentHome(agent_home)
     home.initialize()
@@ -848,10 +831,11 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
         partition=SessionStoragePartition.SCHEDULE,
         job_id=JOB_UUID,
     )
-    schedule_session.add_message("user", "Oldest scheduled request.")
+    history_padding = " previous schedule context" * 150
+    schedule_session.add_message("user", "Oldest scheduled request." + history_padding)
     schedule_session.add_message(
         "assistant",
-        "Oldest scheduled answer.",
+        "Oldest scheduled answer." + history_padding,
         tool_calls=[],
         status="completed",
         error=None,
@@ -862,10 +846,10 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
             "total_tokens": 2,
         },
     )
-    schedule_session.add_message("user", "Earlier scheduled request.")
+    schedule_session.add_message("user", "Earlier scheduled request." + history_padding)
     schedule_session.add_message(
         "assistant",
-        "Earlier scheduled answer.",
+        "Earlier scheduled answer." + history_padding,
         tool_calls=[],
         status="completed",
         error=None,
@@ -888,8 +872,8 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
     )
     provider = _ScheduleProvider(
         schedule_responses=(
-            _response("First scheduled result."),
-            _response("Second scheduled result."),
+            _response("First scheduled result." + history_padding),
+            _response("Second scheduled result." + history_padding),
         ),
         memory_responses=(
             _response("Schedule history summary."),
@@ -997,7 +981,7 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
             f"schedule_{JOB_UUID}",
             partition=SessionStoragePartition.SCHEDULE,
         )
-        assert restored_schedule.metadata["summary"] == ""
+        assert restored_schedule.metadata["summary"] == "- Completed the scheduled work."
         assert all(message.get("content") != "None" for message in restored_schedule.messages)
         summary_records = [
             json.loads(line)
@@ -1005,10 +989,7 @@ async def test_schedule_summary_flows_through_memory_to_a_later_schedule_run(
             .read_text(encoding="utf-8")
             .splitlines()
         ]
-        assert [record["content"] for record in summary_records] == [
-            "Schedule history summary.",
-            "Second schedule history summary.",
-        ]
+        assert [record["content"] for record in summary_records] == ["Schedule history summary."]
     finally:
         await _close_components(loop, router, schedule, dream_owner)
 
@@ -1443,44 +1424,25 @@ async def test_schedule_shutdown_during_preparation_persists_user(
     provider = _ScheduleProvider(schedule_responses=(_response("Unused."),))
     context_started = asyncio.Event()
     context_never_completes = asyncio.Event()
-    original_prepare = ConversationCompactor.prepare
-
-    async def block_schedule_preparation(
-        manager: ConversationCompactor,
-        session: Session,
-        *,
-        current_user: dict[str, Any] | None = None,
-        continuation: Sequence[dict[str, Any]] = (),
-        project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
-        route_context_window: int | None = None,
-        route_max_output: int | None = None,
-        tools: Sequence[dict[str, Any]] | None = None,
-    ) -> Session:
-        if session.session_id == job.session_id:
-            context_started.set()
-            await context_never_completes.wait()
-        assert project_messages is not None
-        assert route_context_window is not None
-        assert route_max_output is not None
-        assert tools is not None
-        return await original_prepare(
-            manager,
-            session,
-            current_user=current_user,
-            continuation=continuation,
-            project_messages=project_messages,
-            route_context_window=route_context_window,
-            route_max_output=route_max_output,
-            tools=tools,
-        )
-
-    monkeypatch.setattr(ConversationCompactor, "prepare", block_schedule_preparation)
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
         agent_home,
         workspace,
         provider,
         schedule_clock=_BlockingClock(NOW),
     )
+    original_prepare = loop._prepare_agent_run
+
+    async def block_schedule_preparation(
+        run_context: Any,
+        *,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]:
+        if run_context.current_user["content"] == job.message:
+            context_started.set()
+            await context_never_completes.wait()
+        return await original_prepare(run_context, tool_gateway=tool_gateway)
+
+    object.__setattr__(loop, "_prepare_agent_run", block_schedule_preparation)
 
     schedule.start()
     await context_started.wait()
@@ -1511,45 +1473,26 @@ async def test_schedule_failure_logs_one_safe_session_warning(
     await store.add_user_job(job)
     provider = _ScheduleProvider()
     failure_started = asyncio.Event()
-    original_prepare = ConversationCompactor.prepare
-
-    async def fail_schedule_preparation(
-        manager: ConversationCompactor,
-        session: Session,
-        *,
-        current_user: dict[str, Any] | None = None,
-        continuation: Sequence[dict[str, Any]] = (),
-        project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]] | None = None,
-        route_context_window: int | None = None,
-        route_max_output: int | None = None,
-        tools: Sequence[dict[str, Any]] | None = None,
-    ) -> Session:
-        if session.session_id == job.session_id:
-            failure_started.set()
-            raise RuntimeError("PRIVATE_SCHEDULE_PREPARATION_BODY")
-        assert project_messages is not None
-        assert route_context_window is not None
-        assert route_max_output is not None
-        assert tools is not None
-        return await original_prepare(
-            manager,
-            session,
-            current_user=current_user,
-            continuation=continuation,
-            project_messages=project_messages,
-            route_context_window=route_context_window,
-            route_max_output=route_max_output,
-            tools=tools,
-        )
-
-    monkeypatch.setattr(ConversationCompactor, "prepare", fail_schedule_preparation)
-    capture = capture_diagnostics()
     loop, router, schedule, dream, _dispatcher, _bus = _agent_loop(
         agent_home,
         workspace,
         provider,
         schedule_clock=_BlockingClock(NOW),
     )
+    original_prepare = loop._prepare_agent_run
+
+    async def fail_schedule_preparation(
+        run_context: Any,
+        *,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]:
+        if run_context.current_user["content"] == job.message:
+            failure_started.set()
+            raise RuntimeError("PRIVATE_SCHEDULE_PREPARATION_BODY")
+        return await original_prepare(run_context, tool_gateway=tool_gateway)
+
+    object.__setattr__(loop, "_prepare_agent_run", fail_schedule_preparation)
+    capture = capture_diagnostics()
     try:
         schedule.start()
         await failure_started.wait()

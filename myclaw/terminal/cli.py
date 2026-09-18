@@ -661,6 +661,13 @@ def config_command() -> None:
     if view.error is not None:
         _print_error(view.error, view.path)
     else:
+        if view.effective_compact_ratio is not None:
+            console.print(
+                f"Effective runtime.compact_ratio: {view.effective_compact_ratio:g}",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
         if view.diagnostics:
             console.print(
                 view.diagnostics_text(),

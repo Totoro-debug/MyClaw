@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from myclaw.agent.context_budget import (
     CONTEXT_ESTIMATOR_VERSION,
@@ -17,13 +17,13 @@ from myclaw.agent.context_budget import (
     ContextUsageSnapshot,
     ProjectionSource,
     estimate_request_tokens,
+    estimate_run_slice_tokens,
     project_next_request_tokens,
 )
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.session.session import Session
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.logging.session import without_session_log
-from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelAttemptGuard, ModelRouteStatus
 from myclaw.provider.models import (
@@ -39,7 +39,7 @@ type CompactionProjection = Callable[
     [Sequence[dict[str, Any]]],
     list[dict[str, Any]],
 ]
-type RouteStatusSource = ModelRouteStatus | Callable[[], ModelRouteStatus] | None
+type RouteStatusSource = ModelRouteStatus | Callable[[], ModelRouteStatus | None] | None
 
 _COMPACTION_JSON_TRANSLATION = str.maketrans({"`": r"\u0060"})
 
@@ -50,10 +50,10 @@ __all__ = [
     "AgentRunContextRequestPreparer",
     "AgentRunContextRouterAdapter",
     "AgentRunContextSnapshot",
+    "AgentRunRouter",
     "AgentRunStagedValues",
     "AgentRunTerminalCommitValues",
     "CompactionModelRouter",
-    "ConversationCompactor",
 ]
 
 
@@ -80,6 +80,32 @@ class AgentRunContextModelRouter(Protocol):
         tools: Sequence[dict[str, Any]],
         guard: ModelAttemptGuard | None = None,
     ) -> ModelResponse: ...
+
+
+class AgentRunRouter(Protocol):
+    """Router contract required by an active foreground or Schedule Agent Run."""
+
+    def stream(
+        self,
+        route: Literal["chat", "schedule"],
+        *,
+        messages: ModelMessages,
+        tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]: ...
+
+    def complete(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
+    ) -> Coroutine[Any, Any, ModelResponse]: ...
+
+    def current_call_status(self, route: ModelRoute) -> ModelRouteStatus | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +230,11 @@ class AgentRunContextController:
         self._pending_fact: _PendingFactBatch | None = None
         self._failed_context_revision: str | None = None
         self._failed_exception: Exception | None = None
+        self._run_anchor_context: ContextUsageSnapshot | None = None
+        self._run_anchor_usage: dict[str, int] | None = None
+        self._run_anchor_tools: tuple[dict[str, Any], ...] | None = None
+        self._run_anchor_non_target: tuple[dict[str, Any], ...] | None = None
+        self._run_current_user: dict[str, Any] | None = None
 
     @classmethod
     def from_session(
@@ -361,6 +392,7 @@ class AgentRunContextController:
         )
         if self._base_context_revision is None or self._base_context_revision != revision:
             self._base_context_revision = revision
+        self._run_current_user = copied_user
         if self._failed_context_revision == revision:
             assert self._failed_exception is not None
             raise self._failed_exception
@@ -573,6 +605,91 @@ class AgentRunContextController:
             compacted=True,
             retained_messages=tuple(deepcopy(final_projected)),
         )
+
+    def record_main_agent_response(
+        self,
+        *,
+        request_messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        response: ModelResponse,
+        increment: Sequence[dict[str, Any]],
+        route_status: ModelRouteStatus | None,
+        requested_route: str,
+        selected_route: str | None,
+        provider_id: str,
+        model: str,
+        route_context_window: int,
+        route_max_output: int,
+        estimator_version: str,
+    ) -> ContextUsageSnapshot:
+        """Record one main response's route, anchor and run projection provenance."""
+        route_values = _route_projection_values(
+            route_status=route_status,
+            requested_route=requested_route,
+            selected_route=selected_route,
+            provider_id=provider_id,
+            model=model,
+            context_window=route_context_window,
+            max_output=route_max_output,
+        )
+        anchor_estimated_tokens = estimate_request_tokens(
+            [*request_messages, response.message.to_dict()],
+            tools,
+        )
+        current_user = self._current_user_for_run()
+        run_messages: list[dict[str, Any]] = []
+        if current_user is not None and not self._current_user_compacted:
+            run_messages.append(current_user)
+        run_messages.extend(deepcopy(list(increment)))
+        run_projected_tokens = estimate_run_slice_tokens(run_messages)
+        projection_source: ProjectionSource = "estimated"
+        baseline = self._run_anchor_context
+        baseline_usage = self._run_anchor_usage
+        non_target = _non_target_projection(request_messages)
+        if (
+            baseline is not None
+            and baseline_usage is not None
+            and self._run_anchor_tools == tuple(deepcopy(list(tools)))
+            and self._run_anchor_non_target == non_target
+            and not self._current_user_compacted
+            and _usage_context_matches(baseline, route_values, estimator_version)
+            and _valid_main_agent_usage(baseline_usage)
+        ):
+            run_projected_tokens = max(
+                0,
+                baseline.run_projected_tokens
+                + response.usage.total_tokens
+                - baseline_usage["total_tokens"],
+            )
+            projection_source = "reported_delta"
+
+        context = ContextUsageSnapshot(
+            requested_route=route_values.requested_route,
+            selected_route=route_values.selected_route,
+            provider_id=route_values.provider_id,
+            model=route_values.model,
+            context_window=route_values.context_window,
+            max_output=route_values.max_output,
+            anchor_estimated_tokens=anchor_estimated_tokens,
+            estimator_version=estimator_version,
+            run_projected_tokens=run_projected_tokens,
+            run_projection_source=projection_source,
+        )
+        usage = {
+            "model_calls": 1,
+            **response.usage.to_dict(),
+        }
+        self._usage_history = [(context, deepcopy(usage))]
+        self._latest_usage_context = context
+        self._run_anchor_context = context
+        self._run_anchor_usage = deepcopy(usage)
+        self._run_anchor_tools = tuple(deepcopy(list(tools)))
+        self._run_anchor_non_target = non_target
+        return context
+
+    def _current_user_for_run(self) -> dict[str, Any] | None:
+        """Return the detached current User captured by the request preparer."""
+        return None if self._run_current_user is None else deepcopy(self._run_current_user)
 
     async def prepare_react(
         self,
@@ -1300,66 +1417,94 @@ class AgentRunContextRequestPreparer:
         )
         self._micro_compression_enabled = micro_compression_enabled
 
-
-class _GuardedAgentRunRouter(Protocol):
-    def stream(
+    def record_response(
         self,
-        route: ModelRoute,
         *,
-        messages: ModelMessages,
+        request_messages: Sequence[dict[str, Any]],
         tools: Sequence[dict[str, Any]],
-        continuation: ModelContinuation | None = None,
-        guard: ModelAttemptGuard | None = None,
-    ) -> AsyncIterator[ModelStreamEvent]: ...
-
-    def complete(
-        self,
-        route: ModelRoute,
-        *,
-        messages: ModelMessages,
-        tools: Sequence[dict[str, Any]],
-        continuation: ModelContinuation | None = None,
-        guard: ModelAttemptGuard | None = None,
-    ) -> Coroutine[Any, Any, ModelResponse]: ...
+        response: ModelResponse,
+        increment: Sequence[dict[str, Any]],
+    ) -> dict[str, object] | None:
+        """Attach the usage anchor for the assistant response just produced."""
+        route_status = _resolve_route_status(self._route_status)
+        if route_status is None and (not self._provider_id or not self._model):
+            return None
+        return self._controller.record_main_agent_response(
+            request_messages=request_messages,
+            tools=tools,
+            response=response,
+            increment=increment,
+            route_status=route_status,
+            requested_route=self._requested_route,
+            selected_route=self._selected_route,
+            provider_id=self._provider_id,
+            model=self._model,
+            route_context_window=self._route_context_window,
+            route_max_output=self._route_max_output,
+            estimator_version=self._estimator_version,
+        ).to_dict()
 
 
 class AgentRunContextRouterAdapter:
     """Add the per-attempt hard budget guard in an explicit Agent Run composition."""
 
-    def __init__(self, router: _GuardedAgentRunRouter) -> None:
+    def __init__(self, router: AgentRunRouter) -> None:
         self._router = router
+        self._call_statuses: dict[ModelRoute, ModelRouteStatus] = {}
 
     def stream(
         self,
-        route: ModelRoute,
+        route: Literal["chat", "schedule"],
         *,
         messages: ModelMessages,
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
-        return self._router.stream(
+        events = self._router.stream(
             route,
             messages=messages,
             tools=tools,
             continuation=continuation,
-            guard=_agent_run_hard_guard,
+            guard=_agent_run_hard_guard if guard is None else guard,
         )
 
-    def complete(
+        async def observe() -> AsyncIterator[ModelStreamEvent]:
+            try:
+                async for event in events:
+                    yield event
+            finally:
+                self._remember_call_status(route)
+
+        return observe()
+
+    async def complete(
         self,
         route: ModelRoute,
         *,
         messages: ModelMessages,
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
-    ) -> Coroutine[Any, Any, ModelResponse]:
-        return self._router.complete(
-            route,
-            messages=messages,
-            tools=tools,
-            continuation=continuation,
-            guard=_agent_run_hard_guard,
-        )
+        guard: ModelAttemptGuard | None = None,
+    ) -> ModelResponse:
+        try:
+            return await self._router.complete(
+                route,
+                messages=messages,
+                tools=tools,
+                continuation=continuation,
+                guard=_agent_run_hard_guard if guard is None else guard,
+            )
+        finally:
+            self._remember_call_status(route)
+
+    def current_call_status(self, route: ModelRoute) -> ModelRouteStatus | None:
+        return self._call_statuses.get(route)
+
+    def _remember_call_status(self, route: ModelRoute) -> None:
+        status = self._router.current_call_status(route)
+        if status is not None:
+            self._call_statuses[route] = status
 
 
 @dataclass(frozen=True, slots=True)
@@ -1466,6 +1611,17 @@ def _normalized_staged_action_summary(value: object) -> str | None:
     if not isinstance(value, str):
         raise ValueError("Session action summary must be a string or None")
     return None if not value or value.strip() == "None" else value
+
+
+def _non_target_projection(
+    messages: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Capture the stable provider-visible prefix before this run's User."""
+    copied = deepcopy(list(messages))
+    for index in range(len(copied) - 1, -1, -1):
+        if copied[index].get("role") == "user":
+            return tuple(copied[:index])
+    return tuple(copied)
 
 
 def _main_agent_usage_history(
@@ -1614,7 +1770,7 @@ def _insert_action_summary(
     return result
 
 
-class ConversationCompactor:
+class _LegacyConversationCompactor:
     """Compress eligible early Session messages before an Agent Run model call."""
 
     def __init__(
@@ -1817,28 +1973,7 @@ def _estimate_messages(
     *,
     tools: Sequence[dict[str, Any]] = (),
 ) -> int:
-    system_prompt = ""
-    retained = messages
-    if messages and messages[0].get("role") == "system":
-        content = messages[0].get("content")
-        if not isinstance(content, str):
-            raise TypeError("Projected system message content must be a string")
-        system_prompt = content
-        retained = messages[1:]
-    retained_messages = tuple(
-        json.dumps(message, ensure_ascii=False, separators=(",", ":")) for message in retained
-    )
-    tool_definitions = tuple(
-        json.dumps(tool, ensure_ascii=False, separators=(",", ":")) for tool in tools
-    )
-    return estimate_input_tokens(
-        RuntimeStatusInput(
-            system_prompt=system_prompt,
-            retained_messages=retained_messages,
-            tool_definitions=tool_definitions,
-            runtime_context="",
-        )
-    )
+    return estimate_request_tokens(messages, tools)
 
 
 def _model_context_overflow() -> ModelCallError:

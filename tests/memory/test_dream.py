@@ -100,7 +100,6 @@ def _memory_configuration(
     return UserConfiguration(
         runtime=RuntimeConfiguration(max_tool_result_chars=4096),
         memory=MemoryConfiguration(
-            compaction_message_threshold=40,
             batch_size=10,
             schedule="0 * * * *",
         ),

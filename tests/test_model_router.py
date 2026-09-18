@@ -63,7 +63,6 @@ def configuration() -> UserConfiguration:
     return UserConfiguration(
         runtime=RuntimeConfiguration(max_tool_result_chars=50_000),
         memory=MemoryConfiguration(
-            compaction_message_threshold=40,
             batch_size=10,
             schedule="0 * * * *",
         ),

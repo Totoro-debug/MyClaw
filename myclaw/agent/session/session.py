@@ -938,10 +938,7 @@ def _validate_assistant_message(message: dict[str, Any]) -> None:
         if token_usage["model_calls"] != 1:
             raise ValueError("context_usage requires exactly one assistant model call")
     if token_usage["model_calls"] != 1 and not (
-        status == "error"
-        and token_usage["model_calls"] == 0
-        and error is not None
-        and error["code"] == "agent_iteration_limit"
+        status in {"error", "interrupted"} and token_usage["model_calls"] == 0 and error is not None
     ):
         raise ValueError("assistant.token_usage.model_calls must equal 1")
     if status != "error":

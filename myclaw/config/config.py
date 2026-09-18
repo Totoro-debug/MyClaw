@@ -30,6 +30,7 @@ _MCP_TRANSPORTS: Final = frozenset({"stdio", "streamable-http"})
 _MCP_DEFAULT_CONNECT_TIMEOUT: Final = 30
 _MCP_DEFAULT_CALL_TIMEOUT: Final = 60
 _MCP_MAX_TIMEOUT: Final = 600
+_DEFAULT_COMPACT_RATIO: Final = 0.9
 _API_KEY_FIELD_PATTERN: Final = re.compile(r"api[-_]?key", flags=re.IGNORECASE)
 _TOML_KEY_SEGMENT_PATTERN: Final = r"""(?:[a-z0-9_-]+|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*')"""
 
@@ -104,11 +105,11 @@ class RuntimeConfiguration:
     max_tool_result_chars: int
     max_iterations: int = 50
     enable_skill_always_load: bool = False
+    compact_ratio: float = _DEFAULT_COMPACT_RATIO
 
 
 @dataclass(frozen=True, slots=True)
 class MemoryConfiguration:
-    compaction_message_threshold: int
     batch_size: int
     schedule: str
 
@@ -250,13 +251,37 @@ class ConfigurationDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeConfigurationDiagnostic:
+    """A safe diagnostic for a runtime field using its declared fallback."""
+
+    field: str
+    reason: str
+
+    @property
+    def mcp_name(self) -> None:
+        """Preserve the optional diagnostic identity exposed by ConfigView consumers."""
+        return None
+
+    @property
+    def message(self) -> str:
+        return (
+            f"Configuration field {self.field!r} is invalid or missing; "
+            f"using {_DEFAULT_COMPACT_RATIO:g}."
+        )
+
+
+type ConfigurationDiagnosticValue = ConfigurationDiagnostic | RuntimeConfigurationDiagnostic
+
+
+@dataclass(frozen=True, slots=True)
 class ConfigView:
     """A configuration path, redacted content, parse error, and safe diagnostics."""
 
     path: Path
     redacted_content: str
     error: ErrorInfo | None
-    diagnostics: tuple[ConfigurationDiagnostic, ...] = ()
+    diagnostics: tuple[ConfigurationDiagnosticValue, ...] = ()
+    effective_compact_ratio: float | None = None
 
     def diagnostics_text(self) -> str:
         return "".join(f"{diagnostic.message}\n" for diagnostic in self.diagnostics)
@@ -545,7 +570,35 @@ def _redact_sensitive_content(content: str) -> str:
     return "".join(lines)
 
 
-def _parse_runtime(document: Mapping[str, object]) -> RuntimeConfiguration:
+def _parse_compact_ratio(
+    table: Mapping[str, object],
+    *,
+    diagnostics: list[ConfigurationDiagnosticValue] | None,
+) -> float:
+    value = table.get("compact_ratio")
+    valid = (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and isfinite(value)
+        and 0.5 <= value <= 0.95
+    )
+    if not valid:
+        if diagnostics is not None:
+            diagnostics.append(
+                RuntimeConfigurationDiagnostic(
+                    field="runtime.compact_ratio",
+                    reason="must be a finite number from 0.5 to 0.95",
+                )
+            )
+        return _DEFAULT_COMPACT_RATIO
+    return float(cast(int | float, value))
+
+
+def _parse_runtime(
+    document: Mapping[str, object],
+    *,
+    diagnostics: list[ConfigurationDiagnosticValue] | None,
+) -> RuntimeConfiguration:
     table = _table(document.get("runtime", {}), "runtime")
     return RuntimeConfiguration(
         max_tool_result_chars=_integer(
@@ -563,6 +616,7 @@ def _parse_runtime(document: Mapping[str, object]) -> RuntimeConfiguration:
             table.get("enable_skill_always_load", False),
             "runtime.enable_skill_always_load",
         ),
+        compact_ratio=_parse_compact_ratio(table, diagnostics=diagnostics),
     )
 
 
@@ -572,12 +626,6 @@ def _parse_memory(document: Mapping[str, object]) -> MemoryConfiguration:
     if len(schedule.split()) != 5 or not croniter.is_valid(schedule):
         _invalid("memory.schedule", "must be a valid five-field cron expression")
     return MemoryConfiguration(
-        compaction_message_threshold=_integer(
-            table.get("compaction_message_threshold", 40),
-            "memory.compaction_message_threshold",
-            4,
-            10_000,
-        ),
         batch_size=_integer(
             table.get("batch_size", 10),
             "memory.batch_size",
@@ -816,7 +864,7 @@ def _parse_mcp_server(mcp_name: str, value: object) -> MCPServerConfiguration:
 def _parse_mcp(
     document: Mapping[str, object],
     *,
-    diagnostics: list[ConfigurationDiagnostic] | None = None,
+    diagnostics: list[ConfigurationDiagnosticValue] | None = None,
 ) -> Mapping[str, MCPServerConfiguration]:
     table = _table(document.get("mcp", {}), "mcp")
     servers = _table(table.get("servers", {}), "mcp.servers")
@@ -839,10 +887,10 @@ def _parse_mcp(
 def _parse_configuration(
     document: dict[str, object],
     *,
-    diagnostics: list[ConfigurationDiagnostic] | None = None,
+    diagnostics: list[ConfigurationDiagnosticValue] | None = None,
 ) -> UserConfiguration:
     return UserConfiguration(
-        runtime=_parse_runtime(document),
+        runtime=_parse_runtime(document, diagnostics=diagnostics),
         memory=_parse_memory(document),
         models=_parse_models(document),
         mcp=_parse_mcp(document, diagnostics=diagnostics),
@@ -854,14 +902,14 @@ class ConfigLoader:
 
     def __init__(self, agent_home: AgentHome) -> None:
         self.agent_home = agent_home
-        self._diagnostics: tuple[ConfigurationDiagnostic, ...] = ()
+        self._diagnostics: tuple[ConfigurationDiagnosticValue, ...] = ()
 
     @property
     def path(self) -> Path:
         return self.agent_home.path / "config.toml"
 
     @property
-    def diagnostics(self) -> tuple[ConfigurationDiagnostic, ...]:
+    def diagnostics(self) -> tuple[ConfigurationDiagnosticValue, ...]:
         """Return diagnostics from the most recent successful configuration parse."""
         return self._diagnostics
 
@@ -884,7 +932,7 @@ class ConfigLoader:
                 )
             ) from error
         document = _table(loaded, "configuration")
-        diagnostics: list[ConfigurationDiagnostic] = []
+        diagnostics: list[ConfigurationDiagnosticValue] = []
         configuration = _parse_configuration(document, diagnostics=diagnostics)
         self._diagnostics = tuple(diagnostics)
         return configuration
@@ -1021,7 +1069,7 @@ class ConfigLoader:
     def _publish_editable_toml(self, source_document: Mapping[str, object]) -> None:
         candidate_content = tomlkit.dumps(source_document)
         candidate = tomllib.loads(candidate_content)
-        candidate_diagnostics: list[ConfigurationDiagnostic] = []
+        candidate_diagnostics: list[ConfigurationDiagnosticValue] = []
         _parse_configuration(
             _table(candidate, "configuration"),
             diagnostics=candidate_diagnostics,
@@ -1046,16 +1094,19 @@ class ConfigLoader:
             )
         document = _table(loaded, "configuration")
         error: ErrorInfo | None = None
-        diagnostics: list[ConfigurationDiagnostic] = []
+        diagnostics: list[ConfigurationDiagnosticValue] = []
+        effective_compact_ratio: float | None = None
         try:
-            _parse_configuration(document, diagnostics=diagnostics)
+            configuration = _parse_configuration(document, diagnostics=diagnostics)
         except ConfigError as config_error:
             error = config_error.error
         else:
             self._diagnostics = tuple(diagnostics)
+            effective_compact_ratio = configuration.runtime.compact_ratio
         return ConfigView(
             path=self.path,
             redacted_content=_redact_parsed_content(content),
             error=error,
             diagnostics=tuple(diagnostics),
+            effective_compact_ratio=effective_compact_ratio,
         )

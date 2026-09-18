@@ -143,11 +143,13 @@ class ContextBuilder:
         *,
         session_id: str,
         summary: str = "",
+        blackboard: Blackboard | None = None,
     ) -> list[dict[str, Any]]:
         """Build the minimum foreground request used by status and preflight."""
         return self.build_foreground_messages(
             [*history, {"role": "user", "content": ""}],
             session_id=session_id,
+            blackboard=blackboard,
             summary=summary,
         )
 

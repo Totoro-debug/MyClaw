@@ -6,13 +6,12 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 from uuid import UUID
 
 import pytest
 from mcp.types import CallToolResult
 
-from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import InboundMessage, MessageBus
@@ -37,7 +36,7 @@ from myclaw.provider.models import (
 )
 from myclaw.schedule.model import DREAM_JOB_ID, JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
-from myclaw.skills.catalog import ManualSkillInvocation, SkillLoader
+from myclaw.skills.catalog import SkillLoader
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import TaskFramingRouterAdapter, collect_foreground_outbound
 
@@ -311,29 +310,6 @@ class _ScheduleToolOverlapRouter(_ScheduleRouter):
         return self._response()
 
 
-async def _schedule_context(
-    session: Session,
-    current_user: dict[str, Any],
-    *,
-    tool_gateway: ToolGateway,
-) -> list[dict[str, Any]]:
-    del tool_gateway
-    return [
-        {"role": "system", "content": "schedule system"},
-        {"role": "user", "content": current_user["content"]},
-    ]
-
-
-class _ScheduleContextPreparer(Protocol):
-    async def __call__(
-        self,
-        session: Session,
-        current_user: dict[str, Any],
-        *,
-        tool_gateway: ToolGateway,
-    ) -> list[dict[str, Any]]: ...
-
-
 def _job(*, job_id: UUID = JOB_ID) -> ScheduleJob:
     return ScheduleJob(
         job_id=str(job_id),
@@ -350,7 +326,6 @@ def _loop(
     *,
     config_text: str = MINIMAL_VALID_CONFIG,
     skill_loader: SkillLoader | None = None,
-    schedule_context_preparer: _ScheduleContextPreparer = _schedule_context,
     externalize_result_for: Callable[[Session], Callable[[ToolResult], ToolResult]] | None = None,
     task_framing_router: TaskFramingRouterAdapter | None = None,
     mcp_tools: Sequence[BaseTool] = (),
@@ -377,6 +352,8 @@ def _loop(
         execute_dream=execute_dream,
     )
     bus = MessageBus()
+    model_router = task_framing_router or TaskFramingRouterAdapter(router)
+    model_router.bind_configuration(configuration)
     loop = AgentLoop(
         workspace_path=workspace,
         workspace_state=state,
@@ -384,7 +361,7 @@ def _loop(
         configuration=configuration,
         bus=bus,
         schedule_service=service,
-        model_router=task_framing_router or TaskFramingRouterAdapter(router),
+        model_router=model_router,
         memory_manager=MemoryManager(state),
         session_id=None,
         now=lambda: NOW,
@@ -397,23 +374,7 @@ def _loop(
         loop._context_builder._skill_loader = skill_loader
     if externalize_result_for is not None:
         object.__setattr__(loop, "_result_externalizer_for", externalize_result_for)
-    object.__setattr__(loop, "_prepare_foreground_context", _foreground_context)
-    object.__setattr__(loop, "_prepare_schedule_context", schedule_context_preparer)
     return loop, state, service, bus
-
-
-async def _foreground_context(
-    session: Session,
-    current_user: dict[str, Any],
-    blackboard: Blackboard | None = None,
-    *,
-    manual_invocation: ManualSkillInvocation | None = None,
-    tool_gateway: ToolGateway,
-) -> list[dict[str, Any]]:
-    assert blackboard is None
-    assert manual_invocation is None
-    del session, current_user, tool_gateway
-    return [{"role": "system", "content": "foreground system"}]
 
 
 class _Clock:
@@ -477,7 +438,7 @@ async def test_schedule_context_and_runner_share_exactly_one_run_gateway(
     context_gateways: list[ToolGateway] = []
     runner_gateways: list[ToolGateway] = []
     original_new_run_gateway = loop._new_run_gateway
-    original_prepare = loop._prepare_schedule_context
+    original_prepare = loop._prepare_agent_run
     original_run = loop._runner.run
 
     def new_run_gateway(*, excluded_names: Sequence[str] = ()) -> ToolGateway:
@@ -486,17 +447,12 @@ async def test_schedule_context_and_runner_share_exactly_one_run_gateway(
         return gateway
 
     async def prepare(
-        session: Session,
-        current_user: dict[str, Any],
+        context: Any,
         *,
         tool_gateway: ToolGateway,
     ) -> list[dict[str, Any]]:
         context_gateways.append(tool_gateway)
-        return await original_prepare(
-            session,
-            current_user,
-            tool_gateway=tool_gateway,
-        )
+        return await original_prepare(context, tool_gateway=tool_gateway)
 
     async def run(*args: Any, **kwargs: Any) -> AgentRunnerResult:
         gateway = kwargs["tool_gateway"]
@@ -505,7 +461,7 @@ async def test_schedule_context_and_runner_share_exactly_one_run_gateway(
         return await original_run(*args, **kwargs)
 
     object.__setattr__(loop, "_new_run_gateway", new_run_gateway)
-    object.__setattr__(loop, "_prepare_schedule_context", prepare)
+    object.__setattr__(loop, "_prepare_agent_run", prepare)
     monkeypatch.setattr(loop._runner, "run", run)
 
     await loop.run_schedule_job(_job())
@@ -774,25 +730,24 @@ async def test_schedule_run_reloads_canonical_session_and_closes_each_run(
 ) -> None:
     router = _ScheduleRouter()
     observed_context: list[tuple[str, int]] = []
+    loop, state, _, _bus = _loop(tmp_path, router)
+    original_prepare = loop._prepare_agent_run
 
-    async def prepare_context(
-        session: Session,
-        current_user: dict[str, Any],
-        *,
-        tool_gateway: ToolGateway,
-    ) -> list[dict[str, Any]]:
-        del tool_gateway
-        observed_context.append((session.session_id, len(session.messages)))
-        return [
-            {"role": "system", "content": "schedule system"},
-            {"role": "user", "content": current_user["content"]},
-        ]
+    async def prepare(context: Any, *, tool_gateway: ToolGateway) -> list[dict[str, Any]]:
+        try:
+            current = Session.load(
+                state,
+                f"schedule_{JOB_ID}",
+                partition=SessionStoragePartition.SCHEDULE,
+            )
+        except FileNotFoundError:
+            message_count = 0
+        else:
+            message_count = len(current.messages)
+        observed_context.append((f"schedule_{JOB_ID}", message_count))
+        return await original_prepare(context, tool_gateway=tool_gateway)
 
-    loop, state, _, _bus = _loop(
-        tmp_path,
-        router,
-        schedule_context_preparer=prepare_context,
-    )
+    object.__setattr__(loop, "_prepare_agent_run", prepare)
     persisted: list[str] = []
     closed: list[str] = []
     original_persist = Session.persist
@@ -898,41 +853,31 @@ async def test_schedule_cancelled_runner_persists_user_and_propagates_cancelled_
 async def test_schedule_context_preparation_failures_preserve_cancel(
     tmp_path: Path,
 ) -> None:
-    async def unexpected_context(
-        session: Session,
-        current_user: dict[str, Any],
-        *,
-        tool_gateway: ToolGateway,
-    ) -> list[dict[str, Any]]:
-        del session, current_user, tool_gateway
-        raise RuntimeError("unexpected preparation failure")
-
-    async def cancelled_context(
-        session: Session,
-        current_user: dict[str, Any],
-        *,
-        tool_gateway: ToolGateway,
-    ) -> list[dict[str, Any]]:
-        del session, current_user, tool_gateway
-        raise asyncio.CancelledError()
-
     success_loop, _, _, _success_bus = _loop(tmp_path / "success", _ScheduleRouter())
     await success_loop.run_schedule_job(_job())
 
-    failed_loop, failed_state, _, _failed_bus = _loop(
-        tmp_path / "failed",
-        _ScheduleRouter(),
-        schedule_context_preparer=unexpected_context,
-    )
+    failed_loop, failed_state, _, _failed_bus = _loop(tmp_path / "failed", _ScheduleRouter())
+
+    async def unexpected_prepare(
+        context: Any, *, tool_gateway: ToolGateway
+    ) -> list[dict[str, Any]]:
+        del context, tool_gateway
+        raise RuntimeError("unexpected preparation failure")
+
+    object.__setattr__(failed_loop, "_prepare_agent_run", unexpected_prepare)
     with pytest.raises(ScheduleJobExecutionError) as failed:
         await failed_loop.run_schedule_job(_job())
     assert failed.value.error.code == "model_failed"
 
     cancelled_loop, cancelled_state, _, _cancelled_bus = _loop(
-        tmp_path / "cancelled",
-        _ScheduleRouter(),
-        schedule_context_preparer=cancelled_context,
+        tmp_path / "cancelled", _ScheduleRouter()
     )
+
+    async def cancelled_prepare(context: Any, *, tool_gateway: ToolGateway) -> list[dict[str, Any]]:
+        del context, tool_gateway
+        raise asyncio.CancelledError()
+
+    object.__setattr__(cancelled_loop, "_prepare_agent_run", cancelled_prepare)
     with pytest.raises(asyncio.CancelledError):
         await cancelled_loop.run_schedule_job(_job())
 
@@ -948,6 +893,24 @@ async def test_schedule_context_preparation_failures_preserve_cancel(
     )
     assert [message["role"] for message in failed_session.messages] == ["user", "assistant"]
     assert [message["role"] for message in cancelled_session.messages] == ["user"]
+
+
+@pytest.mark.asyncio
+async def test_schedule_run_start_hard_overflow_does_not_commit_or_call_provider(
+    tmp_path: Path,
+) -> None:
+    config = MINIMAL_VALID_CONFIG.replace("max_output = 1024", "max_output = 7000")
+    router = _ScheduleRouter()
+    loop, state, _, bus = _loop(tmp_path, router, config_text=config)
+    job = replace(_job(), message="x" * 20_000)
+
+    with pytest.raises(ScheduleJobExecutionError) as raised:
+        await loop.run_schedule_job(job)
+
+    assert raised.value.error.code == "model_context_overflow"
+    assert router.routes == []
+    await _assert_no_outbound(bus)
+    assert not (state.schedule_sessions_directory / f"schedule_{JOB_ID}.jsonl").exists()
 
 
 def _tool_response(
@@ -1123,7 +1086,10 @@ async def test_schedule_agent_loop_micro_compression_keeps_artifacts_and_session
     loop, state, _service, _bus = _loop(
         tmp_path,
         router,
-        config_text="[runtime]\nmax_tool_result_chars = 1000\n\n" + MINIMAL_VALID_CONFIG,
+        config_text=MINIMAL_VALID_CONFIG.replace(
+            "compact_ratio = 0.9",
+            "compact_ratio = 0.9\nmax_tool_result_chars = 1000",
+        ),
     )
     (state.workspace_path / "large.txt").write_text("x" * 4000, encoding="utf-8")
 
@@ -1235,6 +1201,8 @@ async def test_schedule_run_uses_isolated_catalog_during_concurrent_foreground_r
         execute_dream=execute_dream,
     )
     router = _ScheduleToolOverlapRouter(service)
+    model_router = TaskFramingRouterAdapter(router)
+    model_router.bind_configuration(configuration)
     bus = MessageBus()
     loop = AgentLoop(
         workspace_path=workspace,
@@ -1243,15 +1211,13 @@ async def test_schedule_run_uses_isolated_catalog_during_concurrent_foreground_r
         configuration=configuration,
         bus=bus,
         schedule_service=service,
-        model_router=TaskFramingRouterAdapter(router),
+        model_router=model_router,
         memory_manager=MemoryManager(state),
         session_id=None,
         now=lambda: NOW,
         new_uuid=lambda: JOB_ID,
         monotonic_now=lambda: 0.0,
     )
-    object.__setattr__(loop, "_prepare_foreground_context", _foreground_context)
-    object.__setattr__(loop, "_prepare_schedule_context", _schedule_context)
     await loop.start()
     schedule_task = asyncio.create_task(loop.run_schedule_job(_job()))
     try:

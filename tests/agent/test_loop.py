@@ -4,10 +4,10 @@ import asyncio
 import inspect
 import json
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event as ThreadEvent
@@ -21,6 +21,7 @@ from loguru import logger
 
 import myclaw.agent.loop as loop_module
 from myclaw.agent.blackboard import Blackboard
+from myclaw.agent.context_budget import estimate_request_tokens
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ModelContextOverflowError
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
@@ -34,7 +35,6 @@ from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.logging.session import session_log as real_session_log
-from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -50,7 +50,6 @@ from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleService
 from myclaw.skills.catalog import (
     LoadedSkill,
-    ManualSkillInvocation,
     SkillLoader,
     SkillMetadata,
 )
@@ -364,13 +363,12 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
         "skill_loader": 0,
         "skill_load": 0,
         "context_builder": 0,
-        "compactor": 0,
         "tool_gateway": 0,
         "runner": 0,
         "persist": 0,
     }
     constructor_args: dict[str, list[tuple[Any, ...]]] = {
-        name: [] for name in ("context_builder", "compactor", "tool_gateway", "runner")
+        name: [] for name in ("context_builder", "tool_gateway", "runner")
     }
 
     original_create = Session.create
@@ -410,7 +408,6 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
     monkeypatch.setattr(loop_module, "SkillLoader", RecordingSkillLoader)
     for name, attribute in (
         ("context_builder", "ContextBuilder"),
-        ("compactor", "ConversationCompactor"),
         ("tool_gateway", "ToolGateway"),
         ("runner", "AgentRunner"),
     ):
@@ -426,15 +423,14 @@ async def test_agent_loop_constructs_each_generation_collaborator_once_without_s
         "skill_loader": 1,
         "skill_load": 1,
         "context_builder": 1,
-        "compactor": 1,
         "tool_gateway": 1,
         "runner": 1,
         "persist": 0,
     }
     assert asyncio.all_tasks() == tasks_before
     assert router.calls == []
-    assert constructor_args["runner"][0][0] is router
-    assert loop._model_router is router
+    assert constructor_args["runner"][0][0] is loop._model_router
+    assert loop._model_router._delegate is router
     assert not (session.workspace_state.sessions_directory / f"{session.session_id}.jsonl").exists()
 
     await loop.abort()
@@ -485,24 +481,11 @@ def _runtime(
     tmp_path: Path,
     router: AgentRunnerRouter,
     *,
-    context_preparer: Callable[[Session, dict[str, Any]], Awaitable[list[dict[str, Any]]]]
-    | None = None,
-    context_preparer_with_blackboard: Callable[
-        [Session, dict[str, Any], Blackboard | None],
-        Awaitable[list[dict[str, Any]]],
-    ]
-    | None = None,
-    context_preparer_with_invocation: Callable[
-        [Session, dict[str, Any], Blackboard | None, ManualSkillInvocation | None],
-        Awaitable[list[dict[str, Any]]],
-    ]
-    | None = None,
     task_framing_outcomes: Sequence[ModelResponse | BaseException] | None = (),
     title_prompt: str | None = None,
     skill_loader: SkillLoader | None = None,
     monotonic_now: Callable[[], float] | None = None,
     config_text: str | None = None,
-    use_default_context_preparer: bool = False,
     mcp_tools: Sequence[BaseTool] = (),
     prepare_session: Callable[[WorkspaceState], str] | None = None,
 ) -> tuple[AgentLoop, Session, MessageBus]:
@@ -531,40 +514,13 @@ def _runtime(
         execute_user_job=execute_user_job,
         execute_dream=execute_dream,
     )
-    selected_context_preparer = _context if context_preparer is None else context_preparer
-    selected_context_preparer_with_blackboard = context_preparer_with_blackboard
-    selected_context_preparer_with_invocation = context_preparer_with_invocation
-
-    async def prepare(
-        active_session: Session,
-        current_user: dict[str, Any],
-        blackboard: Blackboard | None = None,
-        *,
-        manual_invocation: ManualSkillInvocation | None = None,
-        tool_gateway: ToolGateway,
-    ) -> list[dict[str, Any]]:
-        del tool_gateway
-        if selected_context_preparer_with_invocation is not None:
-            return await selected_context_preparer_with_invocation(
-                active_session,
-                current_user,
-                blackboard,
-                manual_invocation,
-            )
-        if selected_context_preparer_with_blackboard is not None:
-            return await selected_context_preparer_with_blackboard(
-                active_session,
-                current_user,
-                blackboard,
-            )
-        return await selected_context_preparer(active_session, current_user)
-
     bus = MessageBus()
     model_router = (
         router
-        if task_framing_outcomes is None
+        if isinstance(router, TaskFramingRouterAdapter)
         else TaskFramingRouterAdapter(router, task_framing_outcomes)
     )
+    model_router.bind_configuration(configuration)
     loop = AgentLoop(
         workspace_path=workspace,
         workspace_state=state,
@@ -598,8 +554,6 @@ def _runtime(
     if skill_loader is not None:
         loop._skill_loader = skill_loader
         loop._context_builder._skill_loader = skill_loader
-    if not use_default_context_preparer:
-        object.__setattr__(loop, "_prepare_foreground_context", prepare)
     return loop, loop.session, bus
 
 
@@ -674,7 +628,10 @@ def test_agent_loop_preflight_uses_the_deferred_baseline_without_unused_tool_sch
         "exec",
         "tool_search",
     )
-    assert "large_schema" not in loop.runtime_status_input().tool_definitions
+    assert all(
+        schema["function"]["name"] != "large_schema"
+        for schema in loop.runtime_status_input().projected_tools
+    )
 
 
 @pytest.mark.asyncio
@@ -686,13 +643,12 @@ async def test_agent_loop_injects_persisted_action_summary_into_foreground_and_s
         tmp_path,
         router,
         task_framing_outcomes=None,
-        use_default_context_preparer=True,
     )
     action_summary = "- Updated the Session context contract."
     session.update_metadata(summary=action_summary)
 
     status = loop.runtime_status_input()
-    assert json.loads(status.retained_messages[0]) == {
+    assert status.projected_messages[1] == {
         "role": "user",
         "content": action_summary,
     }
@@ -710,14 +666,9 @@ async def test_agent_loop_injects_persisted_action_summary_into_foreground_and_s
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_compaction_omits_empty_action_summary_from_context_and_persistence(
+async def test_agent_loop_does_not_compact_by_message_count(
     tmp_path: Path,
 ) -> None:
-    config_text = MINIMAL_VALID_CONFIG.replace(
-        "[models.providers.primary]",
-        "[memory]\ncompaction_message_threshold = 4\n\n[models.providers.primary]",
-    )
-
     class CompactionRouter(_Router):
         def __init__(self) -> None:
             super().__init__(
@@ -763,9 +714,8 @@ async def test_agent_loop_compaction_omits_empty_action_summary_from_context_and
     loop, session, bus = _runtime(
         tmp_path,
         router,
-        config_text=config_text,
+        config_text=MINIMAL_VALID_CONFIG,
         task_framing_outcomes=(),
-        use_default_context_preparer=True,
     )
     previous_summary = "- Preserved the previous compacted work."
     session.update_metadata(summary=previous_summary)
@@ -782,29 +732,19 @@ async def test_agent_loop_compaction_omits_empty_action_summary_from_context_and
     finally:
         await loop.close()
 
-    assert len(router.memory_requests) == 2
-    assert router.memory_requests[0][1] == router.memory_requests[1][1]
-    assert router.memory_requests[0][0]["content"] != router.memory_requests[1][0]["content"]
-    assert previous_summary not in json.dumps(router.memory_requests)
-    assert session.metadata["summary"] == ""
-    assert session.last_compacted == 2
+    assert router.memory_requests == []
+    assert session.metadata["summary"] == previous_summary
+    assert session.last_compacted == 0
     assert all(message.get("content") != "None" for message in session.messages)
-    assert all(json.loads(message).get("content") != "None" for message in status.retained_messages)
+    assert previous_summary in json.dumps(status.projected_messages)
 
     assert len(router.stream_requests) == 3
     third_request = router.stream_requests[2]
     assert all(message.get("content") != "None" for message in third_request)
     assert "Third question." in str(third_request[-1]["content"])
 
-    summary_records = [
-        json.loads(line)
-        for line in (session.workspace_state.memory_directory / "summary.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
-    assert [record["content"] for record in summary_records] == ["Fact summary."]
     restored = Session.load(session.workspace_state, session.session_id)
-    assert restored.metadata["summary"] == ""
+    assert restored.metadata["summary"] == previous_summary
     assert all(message.get("content") != "None" for message in restored.messages)
 
 
@@ -824,13 +764,12 @@ async def test_agent_loop_restores_empty_action_summary_for_foreground_status_an
         tmp_path,
         router,
         task_framing_outcomes=(),
-        use_default_context_preparer=True,
         prepare_session=prepare_session,
     )
 
     assert session.metadata["summary"] == ""
     status = loop.runtime_status_input()
-    retained_messages = tuple(map(json.loads, status.retained_messages))
+    retained_messages = status.projected_messages[1:]
     assert retained_messages[0] == {
         "role": "user",
         "content": "Persisted foreground history.",
@@ -874,13 +813,12 @@ async def test_agent_loop_restores_action_summary_for_foreground_and_preflight_c
         tmp_path,
         router,
         task_framing_outcomes=(),
-        use_default_context_preparer=True,
         prepare_session=prepare_session,
     )
 
     assert session.metadata["summary"] == action_summary
     status = loop.runtime_status_input()
-    assert json.loads(status.retained_messages[0]) == {
+    assert status.projected_messages[1] == {
         "role": "user",
         "content": action_summary,
     }
@@ -931,13 +869,12 @@ async def test_foreground_context_and_runner_share_exactly_one_run_gateway(
         tmp_path,
         _Router((_response("done"),)),
         task_framing_outcomes=(_framing_response(blackboard, input_tokens=1, output_tokens=1),),
-        use_default_context_preparer=True,
     )
     created_gateways: list[ToolGateway] = []
     context_gateways: list[ToolGateway] = []
     runner_gateways: list[ToolGateway] = []
     original_new_run_gateway = loop._new_run_gateway
-    original_prepare = loop._prepare_foreground_context
+    original_prepare = loop._prepare_agent_run
     original_run = loop._runner.run
 
     def new_run_gateway(*, excluded_names: Sequence[str] = ()) -> ToolGateway:
@@ -946,21 +883,12 @@ async def test_foreground_context_and_runner_share_exactly_one_run_gateway(
         return gateway
 
     async def prepare(
-        active_session: Session,
-        current_user: dict[str, Any],
-        blackboard: Blackboard | None = None,
+        context: Any,
         *,
-        manual_invocation: ManualSkillInvocation | None = None,
         tool_gateway: ToolGateway,
     ) -> list[dict[str, Any]]:
         context_gateways.append(tool_gateway)
-        return await original_prepare(
-            active_session,
-            current_user,
-            blackboard,
-            manual_invocation=manual_invocation,
-            tool_gateway=tool_gateway,
-        )
+        return await original_prepare(context, tool_gateway=tool_gateway)
 
     async def run(*args: Any, **kwargs: Any) -> AgentRunnerResult:
         gateway = kwargs["tool_gateway"]
@@ -969,7 +897,7 @@ async def test_foreground_context_and_runner_share_exactly_one_run_gateway(
         return await original_run(*args, **kwargs)
 
     object.__setattr__(loop, "_new_run_gateway", new_run_gateway)
-    object.__setattr__(loop, "_prepare_foreground_context", prepare)
+    object.__setattr__(loop, "_prepare_agent_run", prepare)
     monkeypatch.setattr(loop._runner, "run", run)
 
     await loop.start()
@@ -1084,6 +1012,12 @@ async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effec
     router = _Router(())
     loop, session, _bus = _runtime(tmp_path, router)
     session.add_message("user", "Status snapshot input")
+    session.update_metadata(
+        blackboard={
+            "goal": "Project the persisted task state.",
+            "completion_boundary": "The status request contains this Blackboard.",
+        }
+    )
     session.last_compacted = 0
 
     class SessionAccessSpy:
@@ -1137,23 +1071,13 @@ async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effec
     assert set(asyncio.all_tasks()) == tasks_before
     assert router.calls == []
     assert loop._consumer_task is None
-    assert isinstance(projection.retained_messages, tuple)
+    assert isinstance(projection.projected_messages, tuple)
     assert isinstance(projection.cumulative_usage, tuple)
-    assert all(isinstance(value, str) for value in projection.retained_messages)
+    assert all(isinstance(value, dict) for value in projection.projected_messages)
+    assert "Project the persisted task state." in str(projection.projected_messages)
     with pytest.raises(FrozenInstanceError):
         projection.session_message_count = 99  # type: ignore[misc]
     await loop.close()
-
-
-async def _context(
-    session: Session,
-    current_user: dict[str, Any],
-) -> list[dict[str, Any]]:
-    del session
-    return [
-        {"role": "system", "content": "test"},
-        {"role": "user", "content": current_user["content"]},
-    ]
 
 
 async def _terminals(bus: MessageBus, count: int) -> list[OutboundMessage]:
@@ -1235,8 +1159,8 @@ def test_agent_loop_reload_rejects_an_always_loaded_budget_overrun_before_public
         encoding="utf-8",
     )
     config = MINIMAL_VALID_CONFIG.replace(
-        "[models.providers.primary]",
-        "[runtime]\nenable_skill_always_load = true\n\n[models.providers.primary]",
+        "compact_ratio = 0.9",
+        "compact_ratio = 0.9\nenable_skill_always_load = true",
     )
     loop, _session, _bus = _runtime(tmp_path, _Router(()), config_text=config)
     loader = loop._skill_loader
@@ -1269,8 +1193,8 @@ def test_reload_validator_candidate_projection_is_isolated_until_atomic_publish(
         encoding="utf-8",
     )
     config = MINIMAL_VALID_CONFIG.replace(
-        "[models.providers.primary]",
-        "[runtime]\nenable_skill_always_load = true\n\n[models.providers.primary]",
+        "compact_ratio = 0.9",
+        "compact_ratio = 0.9\nenable_skill_always_load = true",
     )
     loop, _session, _bus = _runtime(tmp_path, _Router(()), config_text=config)
     loader = loop._skill_loader
@@ -1285,8 +1209,12 @@ def test_reload_validator_candidate_projection_is_isolated_until_atomic_publish(
     release_validation = ThreadEvent()
     candidate_prompts: list[str] = []
 
-    def block_candidate_estimate(status_input: RuntimeStatusInput) -> int:
-        candidate_prompts.append(status_input.system_prompt)
+    def block_candidate_estimate(
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+    ) -> int:
+        del tools
+        candidate_prompts.append(str(messages[0]["content"]))
         public_messages = loop._context_builder.build_status_messages(
             (), session_id=loop.session.session_id
         )
@@ -1297,7 +1225,7 @@ def test_reload_validator_candidate_projection_is_isolated_until_atomic_publish(
             raise AssertionError("candidate validation was not released")
         return 0
 
-    monkeypatch.setattr(loop_module, "estimate_input_tokens", block_candidate_estimate)
+    monkeypatch.setattr(loop_module, "estimate_request_tokens", block_candidate_estimate)
     published: list[tuple[SkillMetadata, ...]] = []
     failures: list[BaseException] = []
 
@@ -1368,16 +1296,20 @@ def test_reload_candidate_validation_restores_the_active_skill_snapshot(
     chat_route = loop._configuration.resolve_route("chat").route
     available_input = chat_route.context_window - chat_route.max_output
 
-    def estimate_candidate(status_input: RuntimeStatusInput) -> int:
-        candidate_prompts.append(status_input.system_prompt)
+    def estimate_candidate(
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+    ) -> int:
+        del tools
+        candidate_prompts.append(str(messages[0]["content"]))
         assert loader.skills == published_skills
         public_messages = builder.build_status_messages((), session_id=session.session_id)
         assert '"name":"active"' in public_messages[0]["content"]
         assert '"name":"candidate"' not in public_messages[0]["content"]
         assert '"name":"published"' not in public_messages[0]["content"]
-        return available_input + int(over_budget)
+        return available_input - 1 + int(over_budget)
 
-    monkeypatch.setattr(loop_module, "estimate_input_tokens", estimate_candidate)
+    monkeypatch.setattr(loop_module, "estimate_request_tokens", estimate_candidate)
     with builder.foreground_projection_scope(active_skills):
         if over_budget:
             with pytest.raises(ModelContextOverflowError) as raised:
@@ -1413,7 +1345,7 @@ def test_reload_candidate_validation_restores_the_active_skill_snapshot(
 
 @pytest.mark.parametrize("operation", ["preflight", "reload"])
 @pytest.mark.parametrize("empty_candidate", [False, True], ids=["skills", "empty"])
-@pytest.mark.parametrize("over_budget", [False, True], ids=["at-budget", "over-budget"])
+@pytest.mark.parametrize("over_budget", [False, True], ids=["below-budget", "over-budget"])
 def test_skill_budget_uses_public_status_projection_and_complete_tools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1429,8 +1361,8 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
         encoding="utf-8",
     )
     config = MINIMAL_VALID_CONFIG.replace(
-        "[models.providers.primary]",
-        "[runtime]\nenable_skill_always_load = true\n\n[models.providers.primary]",
+        "compact_ratio = 0.9",
+        "compact_ratio = 0.9\nenable_skill_always_load = true",
     )
     mcp_tool = _LargeSchemaTool()
     loop, session, _bus = _runtime(tmp_path, _Router(()), config_text=config, mcp_tools=(mcp_tool,))
@@ -1455,7 +1387,7 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
     original_build_status = builder.build_status_messages
     public_projections: list[list[dict[str, Any]]] = []
     observed_summaries: list[str] = []
-    estimated_inputs: list[RuntimeStatusInput] = []
+    estimated_requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
     chat_route = loop._configuration.resolve_route("chat").route
     available_input = chat_route.context_window - chat_route.max_output
 
@@ -1473,17 +1405,20 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
         public_projections.append(projected)
         return projected
 
-    def observe_estimate(status_input: RuntimeStatusInput) -> int:
-        estimated_inputs.append(status_input)
+    def observe_estimate(
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+    ) -> int:
+        estimated_requests.append((deepcopy(list(messages)), deepcopy(list(tools))))
         projected = original_build_status((), session_id=session.session_id)
         assert '"name":"active"' in projected[0]["content"]
         assert '"name":"candidate"' not in projected[0]["content"]
         assert loader.skills == published_skills
-        return available_input + int(over_budget)
+        return available_input - 1 + int(over_budget)
 
     with monkeypatch.context() as patch:
         patch.setattr(builder, "build_status_messages", observe_public_status)
-        patch.setattr(loop_module, "estimate_input_tokens", observe_estimate)
+        patch.setattr(loop_module, "estimate_request_tokens", observe_estimate)
         with builder.foreground_projection_scope(active_skills):
             validate = loop.preflight if operation == "preflight" else loop.reload_skill
             if over_budget:
@@ -1500,28 +1435,27 @@ def test_skill_budget_uses_public_status_projection_and_complete_tools(
             assert '"name":"active"' in restored[0]["content"]
             assert '"name":"candidate"' not in restored[0]["content"]
 
-    assert len(public_projections) == len(estimated_inputs) == 1
+    assert len(public_projections) == len(estimated_requests) == 1
     assert observed_summaries == [action_summary]
     assert public_projections[0][1] == {"role": "user", "content": action_summary}
-    budget_input = estimated_inputs[0]
-    assert '"name":"active"' not in budget_input.system_prompt
-    assert ('"name":"candidate"' in budget_input.system_prompt) is not empty_candidate
-    assert ("candidate instructions" in budget_input.system_prompt) is not empty_candidate
-    assert [
-        {"role": "system", "content": budget_input.system_prompt},
-        *(json.loads(message) for message in budget_input.retained_messages),
-    ] == public_projections[0]
-    assert tuple(json.loads(schema) for schema in budget_input.tool_definitions) == expected_tools
-    assert all("large_schema" not in schema for schema in budget_input.tool_definitions)
-    assert estimate_input_tokens(budget_input) > estimate_input_tokens(
-        replace(budget_input, tool_definitions=())
+    budget_messages, budget_tools = estimated_requests[0]
+    assert '"name":"active"' not in budget_messages[0]["content"]
+    assert ('"name":"candidate"' in budget_messages[0]["content"]) is not empty_candidate
+    assert ("candidate instructions" in budget_messages[0]["content"]) is not empty_candidate
+    assert budget_messages == public_projections[0]
+    assert tuple(budget_tools) == expected_tools
+    assert all("large_schema" not in schema for schema in budget_tools)
+    assert estimate_request_tokens(budget_messages, budget_tools) > estimate_request_tokens(
+        budget_messages,
     )
     if not over_budget:
         ordinary_status = loop.runtime_status_input()
-        assert ordinary_status.system_prompt == budget_input.system_prompt
-        assert ordinary_status.retained_messages == budget_input.retained_messages
-        assert ordinary_status.tool_definitions == budget_input.tool_definitions
-        assert estimate_input_tokens(ordinary_status) == estimate_input_tokens(budget_input)
+        assert ordinary_status.projected_messages == tuple(budget_messages)
+        assert ordinary_status.projected_tools == tuple(budget_tools)
+        assert estimate_request_tokens(
+            ordinary_status.projected_messages,
+            ordinary_status.projected_tools,
+        ) == estimate_request_tokens(budget_messages, budget_tools)
 
 
 @pytest.mark.parametrize("error_type", [ValueError, asyncio.CancelledError])
@@ -1555,7 +1489,6 @@ def test_reload_public_projection_failure_restores_scope_without_publication(
     original_build_status = builder.build_status_messages
     projected_prompts: list[str] = []
     observed_summaries: list[str] = []
-    estimated_inputs: list[RuntimeStatusInput] = []
     error = error_type("candidate projection failed")
 
     def fail_public_status(
@@ -1569,13 +1502,8 @@ def test_reload_public_projection_failure_restores_scope_without_publication(
         projected_prompts.append(projected[0]["content"])
         raise error
 
-    def observe_estimate(status_input: RuntimeStatusInput) -> int:
-        estimated_inputs.append(status_input)
-        return 0
-
     with monkeypatch.context() as patch:
         patch.setattr(builder, "build_status_messages", fail_public_status)
-        patch.setattr(loop_module, "estimate_input_tokens", observe_estimate)
         with builder.foreground_projection_scope(active_skills):
             with pytest.raises(error_type) as raised:
                 loop.reload_skill()
@@ -1590,7 +1518,6 @@ def test_reload_public_projection_failure_restores_scope_without_publication(
     assert '"name":"candidate"' in projected_prompts[0]
     assert '"name":"active"' not in projected_prompts[0]
     assert '"name":"published"' not in projected_prompts[0]
-    assert estimated_inputs == []
     assert loader.skills == published_skills
     assert loader.metadata == published_metadata
     assert loader.resolve_manual("/published request") == published_invocation
@@ -1643,7 +1570,6 @@ async def test_reload_during_active_run_preserves_old_request_and_updates_future
     loop, session, bus = _runtime(
         tmp_path,
         router,
-        use_default_context_preparer=True,
     )
     before_messages = deepcopy(session.messages)
     await loop.start()
@@ -1747,18 +1673,21 @@ async def test_reload_during_context_preparation_keeps_run_skill_snapshot(
     loop, session, bus = _runtime(
         tmp_path,
         router,
-        use_default_context_preparer=True,
     )
     preparation_started = asyncio.Event()
     release_preparation = asyncio.Event()
-    original_prepare = loop._prepare_foreground_context
+    original_prepare = loop._prepare_agent_run
 
-    async def blocked_prepare(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    async def blocked_prepare(
+        context: Any,
+        *,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]:
         preparation_started.set()
         await release_preparation.wait()
-        return await original_prepare(*args, **kwargs)
+        return await original_prepare(context, tool_gateway=tool_gateway)
 
-    object.__setattr__(loop, "_prepare_foreground_context", blocked_prepare)
+    object.__setattr__(loop, "_prepare_agent_run", blocked_prepare)
     before_messages = deepcopy(session.messages)
     await loop.start()
     try:
@@ -1790,26 +1719,26 @@ async def test_loop_consumes_foreground_inputs_fifo_and_publishes_one_terminal_e
 ) -> None:
     router = _Router((_response("one"), _response("two"), _response("three")))
     loop, session, _bus = _runtime(tmp_path, router)
-    append_calls = 0
+    commit_calls = 0
     persist_calls = 0
-    original_append = Session.append_messages
+    original_commit = Session.commit_agent_run
     original_persist = Session.persist
 
-    def append_messages(
+    def commit_agent_run(
         active: Session,
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> None:
-        nonlocal append_calls
-        append_calls += 1
-        original_append(active, messages, **kwargs)
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(active, messages, **kwargs)
 
     def persist(active: Session) -> None:
         nonlocal persist_calls
         persist_calls += 1
         original_persist(active)
 
-    monkeypatch.setattr(Session, "append_messages", append_messages)
+    monkeypatch.setattr(Session, "commit_agent_run", commit_agent_run)
     monkeypatch.setattr(Session, "persist", persist)
     await loop.start()
     try:
@@ -1831,7 +1760,7 @@ async def test_loop_consumes_foreground_inputs_fifo_and_publishes_one_terminal_e
             {"_streamed": True},
             {"_streamed": True},
         ]
-        assert append_calls == 3
+        assert commit_calls == 3
         assert persist_calls == 3
     finally:
         await loop.close()
@@ -1853,34 +1782,12 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
         enable_always_load=False,
     )
     loader.load()
-    router = TaskFramingRouterAdapter(
-        _Router((_response("Generated title"), _response("Completed")))
-    )
-    observed: list[tuple[dict[str, Any], ManualSkillInvocation | None]] = []
-
-    async def prepare(
-        active_session: Session,
-        current_user: dict[str, Any],
-        blackboard: Blackboard | None,
-        manual_invocation: ManualSkillInvocation | None,
-    ) -> list[dict[str, Any]]:
-        del active_session
-        observed.append((deepcopy(current_user), manual_invocation))
-        assert blackboard is None
-        assert manual_invocation is not None
-        return [
-            {"role": "system", "content": "test"},
-            {
-                "role": "user",
-                "content": f"<skill>{manual_invocation.body}</skill>"
-                f"<request>{manual_invocation.request}</request>",
-            },
-        ]
+    base_router = _CapturingRouter((_response("Generated title"), _response("Completed")))
+    router = TaskFramingRouterAdapter(base_router)
 
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        context_preparer_with_invocation=prepare,
         task_framing_outcomes=None,
         title_prompt="Generate a title",
         skill_loader=loader,
@@ -1899,12 +1806,8 @@ async def test_manual_skill_invocation_preserves_raw_order_and_projects_expanded
 
     assert len(router.calls) == 2
     assert raw_input in router.calls
-    assert f"<skill>{document}</skill><request>Do the work</request>" in router.calls
+    assert any("Follow the plan." in call and "Do the work" in call for call in router.calls)
     assert router.framing_requests == []
-    assert observed[0][0] == {"role": "user", "content": raw_input}
-    assert observed[0][1] is not None
-    assert observed[0][1].body == document
-    assert observed[0][1].request == "Do the work"
     assert [message["content"] for message in session.messages if message["role"] == "user"] == [
         raw_input
     ]
@@ -1928,32 +1831,12 @@ async def test_published_manual_skill_loader_ignores_later_file_changes(
     loader.load()
     instruction.unlink()
 
-    router = TaskFramingRouterAdapter(
-        _Router((_response("Generated title"), _response("Completed")))
-    )
-
-    async def prepare(
-        active_session: Session,
-        current_user: dict[str, Any],
-        blackboard: Blackboard | None,
-        manual_invocation: ManualSkillInvocation | None,
-    ) -> list[dict[str, Any]]:
-        del active_session, current_user
-        assert blackboard is None
-        assert manual_invocation is not None
-        return [
-            {"role": "system", "content": "test"},
-            {
-                "role": "user",
-                "content": f"<skill>{manual_invocation.body}</skill>"
-                f"<request>{manual_invocation.request}</request>",
-            },
-        ]
+    base_router = _CapturingRouter((_response("Generated title"), _response("Completed")))
+    router = TaskFramingRouterAdapter(base_router)
 
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        context_preparer_with_invocation=prepare,
         task_framing_outcomes=None,
         title_prompt="Generate a title",
         skill_loader=loader,
@@ -1966,7 +1849,7 @@ async def test_published_manual_skill_loader_ignores_later_file_changes(
         await loop.close()
 
     assert len(router.calls) == 2
-    assert f"<skill>{document}</skill><request>request</request>" in router.calls
+    assert any("PRIVATE MANUAL BODY" in call and '"request"' in call for call in router.calls)
     assert router.framing_requests == []
     assert [message["content"] for message in session.messages if message["role"] == "user"] == [
         raw_input
@@ -2066,24 +1949,18 @@ async def test_manual_skill_context_failure_preserves_blackboard_and_usage(
     loader = _planner_skill_loader(tmp_path)
     router = TaskFramingRouterAdapter(_Router(()))
 
-    async def fail_context(
-        active_session: Session,
-        current_user: dict[str, Any],
-        blackboard: Blackboard | None,
-        manual_invocation: ManualSkillInvocation | None,
-    ) -> list[dict[str, Any]]:
-        del active_session, current_user
-        assert blackboard is None
-        assert manual_invocation is not None
-        raise ModelCallError(ErrorInfo("model_failed", "context failed"))
-
     loop, session, bus = _runtime(
         tmp_path,
         router,
-        context_preparer_with_invocation=fail_context,
         task_framing_outcomes=None,
         skill_loader=loader,
     )
+
+    async def fail_prepare(context: Any, *, tool_gateway: ToolGateway) -> list[dict[str, Any]]:
+        del context, tool_gateway
+        raise ModelCallError(ErrorInfo("model_failed", "context failed"))
+
+    object.__setattr__(loop, "_prepare_agent_run", fail_prepare)
     session.update_metadata(
         blackboard={
             "goal": "Preserved goal",
@@ -2101,8 +1978,12 @@ async def test_manual_skill_context_failure_preserves_blackboard_and_usage(
 
     assert terminal.metadata["finish_reason"] == "failed"
     assert router.framing_requests == []
-    assert session.metadata == before_metadata
-    assert session.messages == []
+    assert session.metadata["blackboard"] == before_metadata["blackboard"]
+    assert session.metadata["token_usage"] == {
+        **before_metadata["token_usage"],
+        "model_calls": 0,
+    }
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
 
 
 @pytest.mark.asyncio
@@ -2113,15 +1994,8 @@ async def test_manual_skill_context_cancellation_preserves_blackboard_and_usage(
     router = TaskFramingRouterAdapter(_Router(()))
     started = asyncio.Event()
 
-    async def block_context(
-        active_session: Session,
-        current_user: dict[str, Any],
-        blackboard: Blackboard | None,
-        manual_invocation: ManualSkillInvocation | None,
-    ) -> list[dict[str, Any]]:
-        del active_session, current_user
-        assert blackboard is None
-        assert manual_invocation is not None
+    async def block_prepare(context: Any, *, tool_gateway: ToolGateway) -> list[dict[str, Any]]:
+        del context, tool_gateway
         started.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
@@ -2129,10 +2003,10 @@ async def test_manual_skill_context_cancellation_preserves_blackboard_and_usage(
     loop, session, bus = _runtime(
         tmp_path,
         router,
-        context_preparer_with_invocation=block_context,
         task_framing_outcomes=None,
         skill_loader=loader,
     )
+    object.__setattr__(loop, "_prepare_agent_run", block_prepare)
     session.update_metadata(
         blackboard={
             "goal": "Preserved goal",
@@ -2154,8 +2028,12 @@ async def test_manual_skill_context_cancellation_preserves_blackboard_and_usage(
         "_streamed": True,
     }
     assert router.framing_requests == []
-    assert session.metadata == before_metadata
-    assert session.messages == []
+    assert session.metadata["blackboard"] == before_metadata["blackboard"]
+    assert session.metadata["token_usage"] == {
+        **before_metadata["token_usage"],
+        "model_calls": 0,
+    }
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
 
 
 @pytest.mark.asyncio
@@ -2165,18 +2043,17 @@ async def test_loop_preparation_failure_has_no_session_commit_and_fifo_continues
     router = _Router((_response("after failure"),))
     calls = 0
 
-    async def prepare(
-        active: Session,
-        current: dict[str, object],
-    ) -> list[dict[str, object]]:
+    loop, session, _bus = _runtime(tmp_path, router)
+    original_prepare = loop._prepare_agent_run
+
+    async def wrapped_prepare(context: Any, *, tool_gateway: ToolGateway) -> list[dict[str, Any]]:
         nonlocal calls
-        del active, current
         calls += 1
         if calls == 1:
             raise ModelCallError(ErrorInfo("model_failed", "preparation failed"))
-        return [{"role": "system", "content": "test"}, {"role": "user", "content": "ok"}]
+        return await original_prepare(context, tool_gateway=tool_gateway)
 
-    loop, session, _bus = _runtime(tmp_path, router, context_preparer=prepare)
+    object.__setattr__(loop, "_prepare_agent_run", wrapped_prepare)
     await loop.start()
     try:
         await _bus.put_inbound(InboundMessage("first"))
@@ -2193,10 +2070,37 @@ async def test_loop_preparation_failure_has_no_session_commit_and_fifo_continues
         assert second.metadata == {"_streamed": True}
         assert [
             message["content"] for message in session.messages if message["role"] == "user"
-        ] == ["second"]
+        ] == ["first", "second"]
+        assert session.messages[1]["status"] == "error"
         assert len(router.calls) == 1
     finally:
         await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_foreground_run_start_hard_overflow_does_not_commit_or_call_provider(
+    tmp_path: Path,
+) -> None:
+    config = MINIMAL_VALID_CONFIG.replace(
+        "context_window = 200000", "context_window = 8192"
+    ).replace("max_output = 8192", "max_output = 1024")
+    router = _Router(())
+    loop, session, bus = _runtime(tmp_path, router, config_text=config)
+    messages_before = deepcopy(session.messages)
+    metadata_before = deepcopy(session.metadata)
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("x" * 100_000))
+        terminal = (await _terminals(bus, 1))[0]
+    finally:
+        await loop.close()
+
+    assert terminal.metadata["error_code"] == "model_context_overflow"
+    assert session.messages == messages_before
+    assert session.metadata == metadata_before
+    assert router.calls == []
+    assert not (session.workspace_state.sessions_directory / f"{session.session_id}.jsonl").exists()
 
 
 @pytest.mark.asyncio
@@ -2211,26 +2115,26 @@ async def test_loop_commits_failed_runner_result_once_before_one_safe_terminal(
         router,
         task_framing_outcomes=(_framing_response(staged, input_tokens=4, output_tokens=2),),
     )
-    append_calls = 0
+    commit_calls = 0
     persist_calls = 0
-    original_append = Session.append_messages
+    original_commit = Session.commit_agent_run
     original_persist = Session.persist
 
-    def append_messages(
+    def commit_agent_run(
         active: Session,
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> None:
-        nonlocal append_calls
-        append_calls += 1
-        original_append(active, messages, **kwargs)
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(active, messages, **kwargs)
 
     def persist(active: Session) -> None:
         nonlocal persist_calls
         persist_calls += 1
         original_persist(active)
 
-    monkeypatch.setattr(Session, "append_messages", append_messages)
+    monkeypatch.setattr(Session, "commit_agent_run", commit_agent_run)
     monkeypatch.setattr(Session, "persist", persist)
     await loop.start()
     try:
@@ -2244,7 +2148,7 @@ async def test_loop_commits_failed_runner_result_once_before_one_safe_terminal(
             "error_code": "model_failed",
             "_streamed": True,
         }
-        assert append_calls == 1
+        assert commit_calls == 1
         assert persist_calls == 1
         assert [message["role"] for message in session.messages] == ["user", "assistant"]
         assert session.messages[-1]["status"] == "error"
@@ -2274,26 +2178,26 @@ async def test_loop_commits_max_iteration_repair_once_before_safe_terminal(
         router,
         task_framing_outcomes=(_framing_response(staged, input_tokens=4, output_tokens=2),),
     )
-    append_calls = 0
+    commit_calls = 0
     persist_calls = 0
-    original_append = Session.append_messages
+    original_commit = Session.commit_agent_run
     original_persist = Session.persist
 
-    def append_messages(
+    def commit_agent_run(
         active: Session,
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> None:
-        nonlocal append_calls
-        append_calls += 1
-        original_append(active, messages, **kwargs)
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(active, messages, **kwargs)
 
     def persist(active: Session) -> None:
         nonlocal persist_calls
         persist_calls += 1
         original_persist(active)
 
-    monkeypatch.setattr(Session, "append_messages", append_messages)
+    monkeypatch.setattr(Session, "commit_agent_run", commit_agent_run)
     monkeypatch.setattr(Session, "persist", persist)
     await loop.start()
     try:
@@ -2311,7 +2215,7 @@ async def test_loop_commits_max_iteration_repair_once_before_safe_terminal(
             "error_code": "agent_iteration_limit",
             "_streamed": True,
         }
-        assert append_calls == 1
+        assert commit_calls == 1
         assert persist_calls == 1
         assert session.metadata["token_usage"] == {
             "model_calls": 51,
@@ -2345,26 +2249,26 @@ async def test_loop_cancellation_repairs_and_keeps_the_next_queued_input(
             _framing_response(staged, input_tokens=4, output_tokens=2),
         ),
     )
-    append_calls = 0
+    commit_calls = 0
     persist_calls = 0
-    original_append = Session.append_messages
+    original_commit = Session.commit_agent_run
     original_persist = Session.persist
 
-    def append_messages(
+    def commit_agent_run(
         active: Session,
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> None:
-        nonlocal append_calls
-        append_calls += 1
-        original_append(active, messages, **kwargs)
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(active, messages, **kwargs)
 
     def persist(active: Session) -> None:
         nonlocal persist_calls
         persist_calls += 1
         original_persist(active)
 
-    monkeypatch.setattr(Session, "append_messages", append_messages)
+    monkeypatch.setattr(Session, "commit_agent_run", commit_agent_run)
     monkeypatch.setattr(Session, "persist", persist)
     await loop.start()
     try:
@@ -2383,7 +2287,7 @@ async def test_loop_cancellation_repairs_and_keeps_the_next_queued_input(
             },
             {"_streamed": True},
         ]
-        assert append_calls == 2
+        assert commit_calls == 2
         assert persist_calls == 2
         assert [
             message["content"] for message in session.messages if message["role"] == "user"
@@ -2462,16 +2366,14 @@ async def test_preparation_cancellation_publishes_the_cancelled_terminal(
 ) -> None:
     started = asyncio.Event()
 
-    async def prepare(
-        active: Session,
-        current: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        del active, current
+    async def prepare(context: Any, *, tool_gateway: ToolGateway) -> list[dict[str, Any]]:
+        del context, tool_gateway
         started.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
-    loop, session, _bus = _runtime(tmp_path, _Router(()), context_preparer=prepare)
+    loop, session, _bus = _runtime(tmp_path, _Router(()))
+    object.__setattr__(loop, "_prepare_agent_run", prepare)
     await loop.start()
     try:
         await _bus.put_inbound(InboundMessage("cancel during preparation"))
@@ -2487,7 +2389,8 @@ async def test_preparation_cancellation_publishes_the_cancelled_terminal(
             "error_code": "turn_cancelled",
             "_streamed": True,
         }
-        assert session.messages == []
+        assert [message["role"] for message in session.messages] == ["user", "assistant"]
+        assert session.messages[-1]["status"] == "interrupted"
         assert session.metadata["token_usage"]["model_calls"] == 0
     finally:
         await loop.close()
@@ -2497,20 +2400,17 @@ async def test_preparation_cancellation_publishes_the_cancelled_terminal(
 async def test_preparation_failure_does_not_start_title_or_accumulate_usage(
     tmp_path: Path,
 ) -> None:
-    async def fail_preparation(
-        active: Session,
-        current: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        del active, current
+    async def fail_preparation(context: Any, *, tool_gateway: ToolGateway) -> list[dict[str, Any]]:
+        del context, tool_gateway
         raise ModelCallError(ErrorInfo("model_failed", "preparation failed"))
 
     router = _Router((_response("must not become a title"),))
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        context_preparer=fail_preparation,
         title_prompt="Generate a title",
     )
+    object.__setattr__(loop, "_prepare_agent_run", fail_preparation)
     await loop.start()
     try:
         await _bus.put_inbound(InboundMessage("uncommitted input"))
@@ -2518,8 +2418,8 @@ async def test_preparation_failure_does_not_start_title_or_accumulate_usage(
         for _ in range(5):
             await asyncio.sleep(0)
 
-        assert router.calls == []
-        assert session.messages == []
+        assert router.calls == ["uncommitted input"]
+        assert [message["role"] for message in session.messages] == ["user", "assistant"]
         assert session.metadata["title"] == "Untitled session"
         assert session.metadata["token_usage"] == {
             "model_calls": 0,
@@ -2539,10 +2439,9 @@ async def test_async_preparation_failure_discards_parallel_title_result(
     release_preparation = asyncio.Event()
 
     async def fail_after_waiting(
-        active: Session,
-        current: dict[str, Any],
+        context: Any, *, tool_gateway: ToolGateway
     ) -> list[dict[str, Any]]:
-        del active, current
+        del context, tool_gateway
         preparation_started.set()
         await release_preparation.wait()
         raise ModelCallError(ErrorInfo("model_failed", "preparation failed"))
@@ -2551,9 +2450,9 @@ async def test_async_preparation_failure_discards_parallel_title_result(
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        context_preparer=fail_after_waiting,
         title_prompt="Generate a title",
     )
+    object.__setattr__(loop, "_prepare_agent_run", fail_after_waiting)
     await loop.start()
     try:
         await _bus.put_inbound(InboundMessage("uncommitted input"))
@@ -2574,7 +2473,7 @@ async def test_async_preparation_failure_discards_parallel_title_result(
             "error_code": "model_failed",
             "_streamed": True,
         }
-        assert session.messages == []
+        assert [message["role"] for message in session.messages] == ["user", "assistant"]
         assert session.metadata["title"] == "Untitled session"
         assert session.metadata["token_usage"] == {
             "model_calls": 0,
@@ -2794,7 +2693,7 @@ async def test_append_failure_reports_safe_terminal_and_fifo_consumer_continues(
     assert failed.type == "system_control"
     assert failed.metadata == {
         "finish_reason": "failed",
-        "error_code": "persistence_error",
+        "error_code": "model_failed",
         "_streamed": True,
     }
     assert completed.type == "model_response"
@@ -2824,7 +2723,11 @@ async def test_persist_request_failure_is_silent_and_terminal_stays_ordered(
         capture.close()
         await loop.close()
 
-    assert terminal.metadata == {"_streamed": True}
+    assert terminal.metadata == {
+        "finish_reason": "failed",
+        "error_code": "persistence_error",
+        "_streamed": True,
+    }
     assert [message["role"] for message in session.messages] == ["user", "assistant"]
     assert "Foreground Session persist failed" not in capture.event_text
     assert "private persistence detail" not in capture.text
@@ -3109,24 +3012,10 @@ async def test_foreground_frames_once_with_exact_session_inputs_and_atomic_proje
         _Router((_response("answer"),)),
         (_framing_response(staged, input_tokens=5, output_tokens=2),),
     )
-    observed: list[Blackboard | None] = []
-
-    async def prepare(
-        active: Session,
-        current: dict[str, Any],
-        blackboard: Blackboard | None,
-    ) -> list[dict[str, Any]]:
-        del active
-        observed.append(blackboard)
-        return [
-            {"role": "system", "content": "test"},
-            {"role": "user", "content": current["content"]},
-        ]
 
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        context_preparer_with_blackboard=prepare,
         task_framing_outcomes=None,
     )
     session.update_metadata(
@@ -3160,8 +3049,7 @@ async def test_foreground_frames_once_with_exact_session_inputs_and_atomic_proje
     assert "raw <blackboard> input" in framing_content
     assert "Latest complete assistant content" in framing_content
     assert '"task_goal":"Previous goal"' in framing_content
-    assert observed == [staged]
-    assert observed[0] is not staged
+    assert any(staged.goal in call and staged.completion_boundary in call for call in router.calls)
     assert [message["content"] for message in session.messages if message["role"] == "user"] == [
         "raw <blackboard> input"
     ]
@@ -3232,42 +3120,25 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
         router,
         (_framing_response(staged, input_tokens=4, output_tokens=2),),
     )
-    context_calls: list[Blackboard | None] = []
     projected_blackboard = (
         f"## Task goal\n\n{staged.goal}\n\n## Completion boundary\n\n{staged.completion_boundary}"
     )
 
-    async def prepare(
-        active: Session,
-        current: dict[str, Any],
-        blackboard: Blackboard | None,
-    ) -> list[dict[str, Any]]:
-        del active
-        context_calls.append(blackboard)
-        return [
-            {"role": "system", "content": "test"},
-            {
-                "role": "user",
-                "content": f"{current['content']}\n\n{projected_blackboard}",
-            },
-        ]
-
     loop, session, _bus = _runtime(
         tmp_path,
         framing_router,
-        context_preparer_with_blackboard=prepare,
         task_framing_outcomes=None,
     )
-    append_calls = 0
-    original_append = session.append_messages
+    commit_calls = 0
+    original_commit = session.commit_agent_run
 
-    def append_messages(messages: list[dict[str, Any]], **kwargs: Any) -> None:
-        nonlocal append_calls
-        append_calls += 1
+    def commit_agent_run(messages: list[dict[str, Any]], **kwargs: Any) -> None:
+        nonlocal commit_calls
+        commit_calls += 1
         assert kwargs["usage_delta"] == framing_usage
-        original_append(messages, **kwargs)
+        original_commit(messages, **kwargs)
 
-    monkeypatch.setattr(session, "append_messages", append_messages)
+    monkeypatch.setattr(session, "commit_agent_run", commit_agent_run)
     await loop.start()
     try:
         await _bus.put_inbound(InboundMessage("raw tool input"))
@@ -3277,11 +3148,9 @@ async def test_tool_iterations_reuse_one_framing_and_context_projection_before_o
 
     assert terminal.metadata == {"_streamed": True}
     assert len(framing_router.framing_requests) == 1
-    assert context_calls == [staged]
-    assert context_calls[0] is not staged
     assert len(router.requests) == 2
     assert all(request[1]["content"].endswith(projected_blackboard) for request in router.requests)
-    assert append_calls == 1
+    assert commit_calls == 1
     assert [message["role"] for message in session.messages] == [
         "user",
         "assistant",
@@ -3330,21 +3199,10 @@ async def test_invalid_and_model_failed_framing_statuses_fail_open_and_clear_on_
         _Router((_response("raw answer"),)),
         (framing_outcome,),
     )
-    observed: list[Blackboard | None] = []
-
-    async def prepare(
-        active: Session,
-        current: dict[str, Any],
-        blackboard: Blackboard | None,
-    ) -> list[dict[str, Any]]:
-        del active, current
-        observed.append(blackboard)
-        return [{"role": "system", "content": "test"}]
 
     loop, session, _bus = _runtime(
         tmp_path,
         router,
-        context_preparer_with_blackboard=prepare,
         task_framing_outcomes=None,
     )
     session.update_metadata(
@@ -3360,7 +3218,6 @@ async def test_invalid_and_model_failed_framing_statuses_fail_open_and_clear_on_
 
     assert terminal.metadata == {"_streamed": True}
     assert len(router.framing_requests) == 1
-    assert observed == [None]
     assert "blackboard" not in session.metadata
     assert session.metadata["token_usage"] == {
         "model_calls": expected_framing_usage["model_calls"] + 1,
@@ -3394,7 +3251,8 @@ async def test_framing_cancellation_reclaims_first_title_task_without_commit(
         "error_code": "turn_cancelled",
         "_streamed": True,
     }
-    assert session.messages == []
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
+    assert session.messages[-1]["status"] == "interrupted"
     assert session.metadata["title"] == "Untitled session"
     assert session.metadata["token_usage"] == {
         "model_calls": 0,
@@ -3413,20 +3271,16 @@ async def test_context_failure_after_framing_preserves_previous_blackboard_and_u
     previous = Blackboard(goal="Previous goal", completion_boundary="Previous boundary")
     staged = Blackboard(goal="Staged goal", completion_boundary="Staged boundary")
 
-    async def fail_context(
-        active: Session,
-        current: dict[str, Any],
-        blackboard: Blackboard | None,
-    ) -> list[dict[str, Any]]:
-        del active, current, blackboard
+    async def fail_prepare(context: Any, *, tool_gateway: ToolGateway) -> list[dict[str, Any]]:
+        del context, tool_gateway
         raise ModelCallError(ErrorInfo("model_failed", "context failed"))
 
     loop, session, _bus = _runtime(
         tmp_path,
         _Router(()),
-        context_preparer_with_blackboard=fail_context,
         task_framing_outcomes=(_framing_response(staged, input_tokens=4, output_tokens=2),),
     )
+    object.__setattr__(loop, "_prepare_agent_run", fail_prepare)
     session.update_metadata(
         blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
     )
@@ -3441,11 +3295,17 @@ async def test_context_failure_after_framing_preserves_previous_blackboard_and_u
 
     assert terminal.metadata["finish_reason"] == "failed"
     assert session.metadata["blackboard"] == {
-        "goal": previous.goal,
-        "completion_boundary": previous.completion_boundary,
+        "goal": staged.goal,
+        "completion_boundary": staged.completion_boundary,
     }
-    assert session.metadata["token_usage"] == before_usage
-    assert session.messages == []
+    assert session.metadata["token_usage"] == {
+        **before_usage,
+        "model_calls": 1,
+        "input_tokens": 4,
+        "output_tokens": 2,
+        "total_tokens": 6,
+    }
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
 
 
 @pytest.mark.asyncio
@@ -3456,12 +3316,8 @@ async def test_context_cancellation_after_framing_preserves_previous_blackboard_
     staged = Blackboard(goal="Staged goal", completion_boundary="Staged boundary")
     started = asyncio.Event()
 
-    async def block_context(
-        active: Session,
-        current: dict[str, Any],
-        blackboard: Blackboard | None,
-    ) -> list[dict[str, Any]]:
-        del active, current, blackboard
+    async def block_prepare(context: Any, *, tool_gateway: ToolGateway) -> list[dict[str, Any]]:
+        del context, tool_gateway
         started.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
@@ -3469,9 +3325,9 @@ async def test_context_cancellation_after_framing_preserves_previous_blackboard_
     loop, session, _bus = _runtime(
         tmp_path,
         _Router(()),
-        context_preparer_with_blackboard=block_context,
         task_framing_outcomes=(_framing_response(staged, input_tokens=4, output_tokens=2),),
     )
+    object.__setattr__(loop, "_prepare_agent_run", block_prepare)
     session.update_metadata(
         blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
     )
@@ -3490,11 +3346,17 @@ async def test_context_cancellation_after_framing_preserves_previous_blackboard_
         "_streamed": True,
     }
     assert session.metadata["blackboard"] == {
-        "goal": previous.goal,
-        "completion_boundary": previous.completion_boundary,
+        "goal": staged.goal,
+        "completion_boundary": staged.completion_boundary,
     }
-    assert session.metadata["token_usage"] == before_usage
-    assert session.messages == []
+    assert session.metadata["token_usage"] == {
+        **before_usage,
+        "model_calls": 1,
+        "input_tokens": 4,
+        "output_tokens": 2,
+        "total_tokens": 6,
+    }
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import pytest
 
-from myclaw.agent.context_budget import estimate_run_slice_tokens
+from myclaw.agent.context_budget import estimate_request_tokens, estimate_run_slice_tokens
 from myclaw.agent.memory.conversation_compactor import (
     AgentRunContextController,
     AgentRunContextPreparation,
@@ -79,7 +79,6 @@ def _router_configuration(
     return UserConfiguration(
         runtime=RuntimeConfiguration(max_tool_result_chars=50_000),
         memory=MemoryConfiguration(
-            compaction_message_threshold=40,
             batch_size=10,
             schedule="0 * * * *",
         ),
@@ -512,6 +511,25 @@ async def test_react_sole_current_run_may_compact_at_or_below_fifty_percent(
     assert controller.current_user_compacted is True
     assert result.selected_batch[0] == current_user
     assert result.retained_messages[-1]["content"].startswith("current result")
+
+    response = _response("final answer")
+    response_message = response.message.to_dict()
+    context = controller.record_main_agent_response(
+        request_messages=result.retained_messages,
+        tools=(),
+        response=response,
+        increment=[*increment, response_message],
+        route_status=None,
+        requested_route="chat",
+        selected_route="chat",
+        provider_id="provider",
+        model="model",
+        route_context_window=available + 100,
+        route_max_output=100,
+        estimator_version="utf8-bytes-div4-v1",
+    )
+
+    assert context.run_projected_tokens == estimate_run_slice_tokens([*increment, response_message])
 
 
 @pytest.mark.asyncio
@@ -1249,6 +1267,78 @@ async def test_latest_usage_context_uses_only_compatible_main_agent_assistant(
     assert controller.latest_usage_context.provider_id == "provider"
     assert result.projection_source == "reported_delta"
     assert controller.pending_compaction_usage["model_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_main_response_provenance_anchors_completed_response_and_then_uses_reported_delta(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    controller = _controller(workspace, session, ScriptedFakeProvider())
+    current_user = {"role": "user", "content": "current request"}
+    tools = ({"type": "function", "function": {"name": "read_file"}},)
+    preparation = await controller.prepare_run_start(
+        project_messages=_project_messages,
+        current_user=current_user,
+        route_context_window=1_600,
+        route_max_output=200,
+        tools=tools,
+        provider_id="provider",
+        model="model",
+    )
+    first = _response("first answer", input_tokens=20, output_tokens=5)
+    first_message = first.message.to_dict()
+
+    first_context = controller.record_main_agent_response(
+        request_messages=preparation.retained_messages,
+        tools=tools,
+        response=first,
+        increment=[first_message],
+        route_status=None,
+        requested_route="chat",
+        selected_route="chat",
+        provider_id="provider",
+        model="model",
+        route_context_window=1_600,
+        route_max_output=200,
+        estimator_version="utf8-bytes-div4-v1",
+    )
+
+    assert first_context.run_projection_source == "estimated"
+    assert first_context.anchor_estimated_tokens == estimate_request_tokens(
+        [*preparation.retained_messages, first_message], tools
+    )
+
+    tool_message = {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "name": "read_file",
+        "content": "tool result",
+    }
+    second_request = [*preparation.retained_messages, first_message, tool_message]
+    second = _response("second answer", input_tokens=24, output_tokens=6)
+    second_message = second.message.to_dict()
+    second_context = controller.record_main_agent_response(
+        request_messages=second_request,
+        tools=tools,
+        response=second,
+        increment=[first_message, tool_message, second_message],
+        route_status=None,
+        requested_route="chat",
+        selected_route="chat",
+        provider_id="provider",
+        model="model",
+        route_context_window=1_600,
+        route_max_output=200,
+        estimator_version="utf8-bytes-div4-v1",
+    )
+
+    assert second_context.run_projection_source == "reported_delta"
+    assert second_context.run_projected_tokens == first_context.run_projected_tokens + 5
+    assert second_context.anchor_estimated_tokens == estimate_request_tokens(
+        [*second_request, second_message], tools
+    )
 
 
 @pytest.mark.asyncio

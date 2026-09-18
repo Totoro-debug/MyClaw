@@ -10,13 +10,13 @@ import pytest
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.memory.conversation_compactor import ConversationCompactor
+from myclaw.agent.context_budget import estimate_request_tokens
+from myclaw.agent.memory.conversation_compactor import _LegacyConversationCompactor
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.memory.records import SummaryEntry
 from myclaw.agent.session.session import Session
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
-from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -124,8 +124,8 @@ def _manager(
     memory_manager: MemoryManager,
     *,
     threshold: int = 4,
-) -> ConversationCompactor:
-    return ConversationCompactor(
+) -> _LegacyConversationCompactor:
+    return _LegacyConversationCompactor(
         provider=ScriptedFakeRouter(provider),
         memory_manager=memory_manager,
         compaction_message_threshold=threshold,
@@ -379,7 +379,7 @@ async def test_summary_candidate_includes_current_user_without_publishing_it(
         completions=(_response("First turn summary."), _response("None"))
     )
     memory_manager = MemoryManager(state)
-    manager = ConversationCompactor(
+    manager = _LegacyConversationCompactor(
         provider=ScriptedFakeRouter(provider),
         memory_manager=memory_manager,
         compaction_message_threshold=4,
@@ -869,7 +869,7 @@ async def test_summary_cancellation_propagates_without_persisting_or_advancing_c
             raise AssertionError("unreachable")
 
     provider = _BlockingProvider()
-    manager = ConversationCompactor(
+    manager = _LegacyConversationCompactor(
         provider=provider,
         memory_manager=memory_manager,
         compaction_message_threshold=4,
@@ -1077,7 +1077,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
         ) -> list[dict[str, Any]]:
             return context_builder.build_schedule_messages(messages, session_id=session.session_id)
 
-    manager = ConversationCompactor(
+    manager = _LegacyConversationCompactor(
         provider=provider,
         memory_manager=memory_manager,
         compaction_message_threshold=4,
@@ -1085,17 +1085,7 @@ async def test_actual_lane_projections_share_summary_cutoff_and_persistence_poli
     )
 
     projected = project_messages(session.messages)
-    input_budget = estimate_input_tokens(
-        RuntimeStatusInput(
-            system_prompt=projected[0]["content"],
-            retained_messages=tuple(
-                json.dumps(message, ensure_ascii=False, separators=(",", ":"))
-                for message in projected[1:]
-            ),
-            tool_definitions=(json.dumps(tool_schema, ensure_ascii=False, separators=(",", ":")),),
-            runtime_context="",
-        )
-    )
+    input_budget = estimate_request_tokens(projected, (tool_schema,))
     await manager.prepare(
         session,
         project_messages=project_messages,
@@ -1226,7 +1216,7 @@ async def test_summary_uses_lane_projection_and_direct_memory_route(
             *[{"role": message["role"], "content": message["content"]} for message in messages],
         ]
 
-    manager = ConversationCompactor(
+    manager = _LegacyConversationCompactor(
         provider=provider,
         memory_manager=memory_manager,
         compaction_message_threshold=4,

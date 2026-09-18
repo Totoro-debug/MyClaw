@@ -364,9 +364,9 @@ DEFAULT_CONFIG_CONTENT = """[runtime]
 max_tool_result_chars = 4096
 max_iterations = 50
 enable_skill_always_load = false
+compact_ratio = 0.9
 
 [memory]
-compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
@@ -467,7 +467,11 @@ async def test_config_command_returns_renderable_complete_redacted_text(
     result = await dispatcher.dispatch("/config")
 
     assert result.handled is True
-    assert result.output == f"Path: {config_path}\n{REDACTED_CONFIG_CONTENT}"
+    assert result.output == (
+        "Effective runtime.compact_ratio: 0.9\n"
+        "Configuration field 'runtime.compact_ratio' is invalid or missing; using 0.9.\n"
+        f"Path: {config_path}\n{REDACTED_CONFIG_CONTENT}"
+    )
     assert "command-secret" not in result.output
 
 
@@ -530,7 +534,11 @@ async def test_config_command_ignores_undefined_source_fields(
 
     result = await dispatcher.dispatch("/config")
 
-    assert result.output == f"Path: {config_path}\n{REDACTED_SCHEMA_INVALID_CONFIG_CONTENT}"
+    assert result.output == (
+        "Effective runtime.compact_ratio: 0.9\n"
+        "Configuration field 'runtime.compact_ratio' is invalid or missing; using 0.9.\n"
+        f"Path: {config_path}\n{REDACTED_SCHEMA_INVALID_CONFIG_CONTENT}"
+    )
     assert "schema-command-secret" not in result.output
 
 
@@ -543,7 +551,9 @@ async def test_config_command_generates_and_displays_missing_configuration(
 
     result = await dispatcher.dispatch("/config")
 
-    assert result.output == f"Path: {config_path}\n{DEFAULT_CONFIG_CONTENT}"
+    assert result.output == (
+        f"Effective runtime.compact_ratio: 0.9\nPath: {config_path}\n{DEFAULT_CONFIG_CONTENT}"
+    )
     assert config_path.read_text(encoding="utf-8") == DEFAULT_CONFIG_CONTENT
 
 
@@ -749,10 +759,7 @@ async def test_status_command_renders_actual_runtime_and_session_state(
             workspace_state=state,
             current_agent_loop=lambda: _StatusProjectionLoop(
                 RuntimeStatusInput(
-                    system_prompt="abcd",
-                    retained_messages=(),
-                    tool_definitions=(),
-                    runtime_context="",
+                    projected_messages=({"role": "system", "content": "abcd"},),
                     session_id=session.session_id,
                     session_title="New Conversation",
                     session_message_count=len(session.messages),
@@ -780,9 +787,14 @@ async def test_status_command_renders_actual_runtime_and_session_state(
         "chat_model": "fallback/chat-model",
         "chat_reasoning_effort": "medium",
         "uptime_seconds": 65,
-        "estimated_input_tokens": 1,
         "context_window": 8,
-        "context_used_percent": 12.5,
+        "max_output": 0,
+        "available_context": 8,
+        "compact_ratio": 0.9,
+        "compact_context_window": 8,
+        "projected_next_request_tokens": 1,
+        "projection_source": "estimated",
+        "input_budget_used_percent": 12.5,
         "session_message_count": 2,
         "last_compacted": 1,
         "cumulative_usage": {

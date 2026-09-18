@@ -1050,7 +1050,7 @@ def test_standards_2_3_legacy_interfaces_are_absent_from_source() -> None:
 
     conversation_compactor = _issue_202_class(
         _issue_202_ast(ROOT / "myclaw" / "agent" / "memory" / "conversation_compactor.py"),
-        "ConversationCompactor",
+        "_LegacyConversationCompactor",
     )
     compaction_init = _issue_202_direct_method(conversation_compactor, "__init__")
     assert _issue_202_parameter_names(compaction_init) == (

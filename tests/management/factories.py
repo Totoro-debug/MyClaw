@@ -22,10 +22,6 @@ class _DefaultLoop:
 
     def runtime_status_input(self) -> RuntimeStatusInput:
         return RuntimeStatusInput(
-            system_prompt="",
-            retained_messages=(),
-            tool_definitions=(),
-            runtime_context="",
             chat_model="test/model",
             context_window=1,
         )

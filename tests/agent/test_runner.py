@@ -5,7 +5,7 @@ import inspect
 from collections.abc import AsyncIterator, Sequence
 from copy import deepcopy
 from dataclasses import replace
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import pytest
@@ -33,6 +33,7 @@ from myclaw.provider.models import (
     ModelCompleted,
     ModelContinuation,
     ModelResponse,
+    ModelStreamEvent,
     ModelUsage,
     ReasoningDelta,
     TextDelta,
@@ -56,6 +57,98 @@ async def _ignore_output(event: object) -> None:
 
 def _runner(router: AgentRunnerRouter) -> AgentRunner:
     return AgentRunner(router, IdentityAgentRunRequestPreparer())
+
+
+@pytest.mark.asyncio
+async def test_runner_uses_run_local_router_and_request_provenance_recorder() -> None:
+    class Router:
+        def stream(
+            self,
+            route: Literal["chat", "schedule"],
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+            continuation: ModelContinuation | None = None,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            del route, messages, tools, continuation
+
+            async def replay() -> AsyncIterator[ModelStreamEvent]:
+                yield ModelCompleted(
+                    response=ModelResponse(
+                        message=AssistantModelMessage(content="done"),
+                        usage=ModelUsage(input_tokens=8, output_tokens=2, total_tokens=10),
+                        finish_reason="stop",
+                    )
+                )
+
+            return replay()
+
+        async def complete(
+            self,
+            route: Literal["chat", "schedule"],
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+            continuation: ModelContinuation | None = None,
+        ) -> ModelResponse:
+            del route, messages, tools, continuation
+            raise AssertionError("unexpected completion")
+
+    class RecordingPreparer:
+        recounts_retained_tool_calls = False
+
+        def __init__(self) -> None:
+            self.recorded = 0
+
+        async def prepare(
+            self,
+            candidate: Sequence[dict[str, Any]],
+            *,
+            increment: Sequence[dict[str, Any]],
+            latest_cycle_start: int | None,
+            tools: Sequence[dict[str, Any]],
+            continuation_revision: int,
+        ) -> list[dict[str, Any]]:
+            del increment, latest_cycle_start, tools, continuation_revision
+            return deepcopy(list(candidate))
+
+        def observe_request_projection(
+            self,
+            messages: Sequence[dict[str, Any]],
+            *,
+            micro_compression_enabled: bool,
+        ) -> None:
+            del messages, micro_compression_enabled
+
+        def record_response(
+            self,
+            *,
+            request_messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+            response: ModelResponse,
+            increment: Sequence[dict[str, Any]],
+        ) -> dict[str, object]:
+            del request_messages, tools, response, increment
+            self.recorded += 1
+            return {"selected_route": "default"}
+
+    router = Router()
+    preparer = RecordingPreparer()
+    result = await AgentRunner(router, IdentityAgentRunRequestPreparer()).run(
+        [{"role": "user", "content": "request"}],
+        model="chat",
+        tool_gateway=None,
+        on_output=None,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+        model_router=router,
+        request_preparer=preparer,
+    )
+
+    assert preparer.recorded == 1
+    assert result.messages[0]["context_usage"] == {"selected_route": "default"}
 
 
 class _ClosingRouter:
@@ -222,7 +315,7 @@ class _RetryingRouter:
         raise AssertionError("Unexpected complete call")
 
 
-class _RecordingRequestPreparer:
+class _RecordingRequestPreparer(IdentityAgentRunRequestPreparer):
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
         self.observations: list[dict[str, Any]] = []
@@ -407,7 +500,7 @@ async def test_identity_request_preparation_is_detached_and_value_equivalent() -
 
 @pytest.mark.asyncio
 async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools() -> None:
-    class MutatingPreparer:
+    class MutatingPreparer(IdentityAgentRunRequestPreparer):
         @property
         def recounts_retained_tool_calls(self) -> bool:
             return False
@@ -420,11 +513,11 @@ async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools(
             latest_cycle_start: int | None,
             tools: Sequence[dict[str, Any]],
             continuation_revision: int,
-        ) -> Sequence[dict[str, Any]]:
+        ) -> list[dict[str, Any]]:
             del increment, latest_cycle_start, continuation_revision
             candidate[0]["content"]["nested"].append("projected")
             tools[0]["parameters"]["enum"].append("mutated")
-            return candidate
+            return list(candidate)
 
         def observe_request_projection(
             self,
@@ -478,7 +571,7 @@ async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools(
 async def test_request_projection_observer_failure_stops_before_provider(
     failure_type: type[BaseException],
 ) -> None:
-    class FailingObserverPreparer:
+    class FailingObserverPreparer(IdentityAgentRunRequestPreparer):
         @property
         def recounts_retained_tool_calls(self) -> bool:
             return False
@@ -1560,7 +1653,7 @@ async def test_runner_micro_compression_includes_eligible_history_but_keeps_rece
 
 @pytest.mark.asyncio
 async def test_runner_micro_compression_recounts_retained_history_before_provider_request() -> None:
-    class RetainedProjectionPreparer:
+    class RetainedProjectionPreparer(IdentityAgentRunRequestPreparer):
         @property
         def recounts_retained_tool_calls(self) -> bool:
             return True
@@ -1649,7 +1742,7 @@ async def test_runner_micro_compression_recounts_retained_history_before_provide
 
 @pytest.mark.asyncio
 async def test_runner_recomputes_latest_cycle_after_preparer_removes_history() -> None:
-    class PrefixDroppingPreparer:
+    class PrefixDroppingPreparer(IdentityAgentRunRequestPreparer):
         @property
         def recounts_retained_tool_calls(self) -> bool:
             return True

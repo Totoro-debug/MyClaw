@@ -13,9 +13,9 @@ EXPECTED_DEFAULT_CONFIG = """[runtime]
 max_tool_result_chars = 4096
 max_iterations = 50
 enable_skill_always_load = false
+compact_ratio = 0.9
 
 [memory]
-compaction_message_threshold = 40
 batch_size = 10
 schedule = "0 * * * *"
 
@@ -90,6 +90,7 @@ timeout = 120
 
 VALID_CONFIG = """[runtime]
 max_tool_result_chars = 60000
+compact_ratio = 0.9
 
 [memory]
 compaction_message_threshold = 50
@@ -117,6 +118,9 @@ protocol = "openai-compatible"
 base_url = "https://models.example/v1"
 api_key = "minimal-secret"
 models = ["small-model"]
+
+[runtime]
+compact_ratio = 0.9
 
 [models.routes.default]
 provider_id = "primary"
@@ -180,6 +184,7 @@ timeout = 90
 REDACTION_CONFIG = """# User Configuration
 [runtime]
 max_tool_result_chars = 50000
+compact_ratio = 0.9
 
 [memory]
 compaction_message_threshold = 40
@@ -210,6 +215,7 @@ timeout = 60
 EXPECTED_REDACTED_CONFIG = """# User Configuration
 [runtime]
 max_tool_result_chars = 50000
+compact_ratio = 0.9
 
 [memory]
 compaction_message_threshold = 40
@@ -485,14 +491,14 @@ def test_unknown_configuration_projection_is_accepted_by_startup_and_config_view
 
 @pytest.mark.parametrize("operation", ["startup", "view"])
 @pytest.mark.parametrize("value", ["0.5", '"not-a-ratio"'], ids=("valid", "invalid"))
-def test_compact_ratio_remains_an_ignored_field_without_a_warning(
+def test_compact_ratio_is_loaded_or_falls_back_with_a_warning(
     agent_home: Path,
     operation: str,
     value: str,
 ) -> None:
     loader = ConfigLoader(AgentHome(agent_home))
     loader.ensure_default()
-    content = VALID_CONFIG.replace(
+    content = VALID_CONFIG.replace("compact_ratio = 0.9\n", "").replace(
         "[runtime]\n",
         f"[runtime]\ncompact_ratio = {value}\n",
     )
@@ -501,16 +507,17 @@ def test_compact_ratio_remains_an_ignored_field_without_a_warning(
     if operation == "startup":
         configuration = loader.load_for_startup()
 
-        assert loader.diagnostics == ()
-        assert not hasattr(configuration.runtime, "compact_ratio")
+        expected = 0.5 if value == "0.5" else 0.9
+        assert configuration.runtime.compact_ratio == expected
+        assert len(loader.diagnostics) == (0 if value == "0.5" else 1)
         return
 
     view = loader.view()
 
     assert view.error is None
-    assert view.diagnostics == ()
-    assert "compact_ratio" not in view.diagnostics_text()
-    assert not hasattr(view, "effective_compact_ratio")
+    expected = 0.5 if value == "0.5" else 0.9
+    assert view.effective_compact_ratio == expected
+    assert len(view.diagnostics) == (0 if value == "0.5" else 1)
 
 
 @pytest.mark.parametrize("operation", ["startup", "view"])
@@ -647,13 +654,13 @@ def test_valid_configuration_loads_as_typed_values(agent_home: Path) -> None:
 
     assert (
         configuration.runtime.max_tool_result_chars,
-        configuration.memory.compaction_message_threshold,
+        configuration.runtime.compact_ratio,
         configuration.memory.batch_size,
         configuration.memory.schedule,
         configuration.models.providers["anthropic-default"].models,
         configuration.models.routes["default"].reasoning_effort,
         configuration.models.routes["default"].timeout,
-    ) == (60000, 50, 12, "15 * * * *", ("claude-model",), "medium", 120)
+    ) == (60000, 0.9, 12, "15 * * * *", ("claude-model",), "medium", 120)
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
@@ -718,12 +725,12 @@ def test_omitted_defaulted_configuration_fields_use_accepted_defaults(
 
     assert (
         configuration.runtime.max_tool_result_chars,
-        configuration.memory.compaction_message_threshold,
+        configuration.runtime.compact_ratio,
         configuration.memory.batch_size,
         configuration.memory.schedule,
         configuration.models.routes["default"].reasoning_effort,
         configuration.runtime.enable_skill_always_load,
-    ) == (4096, 40, 10, "0 * * * *", "medium", False)
+    ) == (4096, 0.9, 10, "0 * * * *", "medium", False)
     assert write_operations == []
     assert loader.path.read_text(encoding="utf-8") == before_load
 
@@ -949,13 +956,6 @@ def test_config_view_ignores_undefined_configuration_fields(agent_home: Path) ->
                 'max_tool_result_chars = 60000\nenable_skill_always_load = "true"',
             ),
             "runtime.enable_skill_always_load",
-        ),
-        (
-            VALID_CONFIG.replace(
-                "compaction_message_threshold = 50",
-                "compaction_message_threshold = 3",
-            ),
-            "memory.compaction_message_threshold",
         ),
         (VALID_CONFIG.replace("batch_size = 12", "batch_size = 1001"), "memory.batch_size"),
         (

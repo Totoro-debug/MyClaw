@@ -524,7 +524,7 @@ def test_agent_loop_delegates_foreground_context_construction_to_context_builder
     assert "build_messages" not in source
     assert "_project_foreground_messages" not in source
     assert "_project_foreground_summary_messages" not in methods
-    assert calls_builder("_prepare_foreground_context", "build_foreground_messages")
+    assert calls_builder("_execute_foreground_logged", "build_foreground_messages")
 
 
 def test_agent_loop_delegates_schedule_context_construction_to_context_builder() -> None:
@@ -537,7 +537,7 @@ def test_agent_loop_delegates_schedule_context_construction_to_context_builder()
     prepare_schedule = next(
         node
         for node in agent_loop.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_prepare_schedule_context"
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_schedule_agent_scoped"
     )
 
     assert hasattr(ContextBuilder, "build_schedule_messages")
@@ -563,14 +563,9 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
         for node in agent_loop.body
         if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
     }
-    functions = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
-    }
     expected_builder_calls = {
-        "_prepare_foreground_context": "build_foreground_messages",
-        "_prepare_schedule_context": "build_schedule_messages",
+        "_execute_foreground_logged": "build_foreground_messages",
+        "_run_schedule_agent_scoped": "build_schedule_messages",
         "_router_stream_title": "build_title_messages",
     }
     for method_name, builder_method in expected_builder_calls.items():
@@ -584,31 +579,67 @@ def test_agent_loop_request_paths_stay_inside_context_builder() -> None:
             for node in ast.walk(method)
         )
 
-    required_compaction_arguments = {
-        "project_messages",
-        "route_context_window",
-        "route_max_output",
-        "tools",
-    }
-    for method_name in ("_prepare_foreground_context", "_prepare_schedule_context"):
-        compaction_call = next(
-            node
-            for node in ast.walk(methods[method_name])
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "prepare"
-            and isinstance(node.func.value, ast.Attribute)
-            and node.func.value.attr == "_compactor"
-        )
-        assert required_compaction_arguments <= {
-            keyword.arg for keyword in compaction_call.keywords
-        }
-
     assert any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "_validate_model_context_budget"
         for node in ast.walk(methods["preflight"])
+    )
+
+
+def test_issue_243_production_model_calls_use_one_explicit_run_context_seam() -> None:
+    path = PACKAGE_ROOT / "agent" / "loop.py"
+    loop_tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = loop_tree
+    loop_class = next(
+        node
+        for node in loop_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
+    )
+    methods = {
+        node.name: node
+        for node in loop_class.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+    }
+    functions = {
+        node.name: node
+        for node in loop_tree.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+    }
+
+    for method_name in ("_execute_foreground_logged", "_run_schedule_agent_scoped"):
+        runner_call = next(
+            node
+            for node in ast.walk(methods[method_name])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "_runner"
+        )
+        assert {"model_router", "request_preparer"} <= {
+            keyword.arg for keyword in runner_call.keywords
+        }
+
+    compactor_tree = ast.parse(
+        (PACKAGE_ROOT / "agent" / "memory" / "conversation_compactor.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert not any(
+        isinstance(node, ast.ClassDef) and node.name == "ConversationCompactor"
+        for node in compactor_tree.body
+    )
+    adapter = next(
+        node
+        for node in compactor_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AgentRunContextRouterAdapter"
+    )
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"getattr", "hasattr"}
+        for node in ast.walk(adapter)
     )
     assert any(
         isinstance(node, ast.Call)

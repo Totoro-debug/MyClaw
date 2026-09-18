@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NoReturn, Protocol, cast
+from typing import Any, Literal, NoReturn, Protocol, cast
 from uuid import UUID
 
 from loguru import logger
@@ -17,9 +16,12 @@ from tzlocal import get_localzone_name
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
+from myclaw.agent.context_budget import ContextBudget, ContextUsageSnapshot, estimate_request_tokens
 from myclaw.agent.memory.conversation_compactor import (
-    CompactionModelRouter,
-    ConversationCompactor,
+    AgentRunContextController,
+    AgentRunContextRequestPreparer,
+    AgentRunContextRouterAdapter,
+    AgentRunRouter,
 )
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import (
@@ -32,7 +34,6 @@ from myclaw.agent.runner import (
     AgentRunner,
     AgentRunnerResponseSegmentEnd,
     AgentRunnerResult,
-    AgentRunnerRouter,
     AgentRunnerToolCallFinished,
     AgentRunnerToolCallStarted,
     IdentityAgentRunRequestPreparer,
@@ -57,10 +58,10 @@ from myclaw.errors import (
 )
 from myclaw.logging.session import session_log
 from myclaw.management.commands import MANAGEMENT_COMMANDS
-from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
+from myclaw.management.service import RuntimeStatusInput
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouteStatus
-from myclaw.provider.models import ModelCompleted, ReasoningDelta, TextDelta
+from myclaw.provider.models import ModelCompleted, ModelRoute, ReasoningDelta, TextDelta
 from myclaw.schedule.model import ScheduleJob
 from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.skills.catalog import LoadedSkill, ManualSkillInvocation, SkillLoader, SkillMetadata
@@ -171,6 +172,20 @@ class _TitleWork:
     coordination: _TitleCoordination
 
 
+@dataclass(slots=True)
+class _AgentRunContext:
+    """Run-local budget, projection and guarded Router collaborators."""
+
+    route: Literal["chat", "schedule"]
+    current_user: dict[str, Any]
+    route_context_window: int
+    route_max_output: int
+    project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]]
+    router: AgentRunContextRouterAdapter
+    controller: AgentRunContextController
+    request_preparer: AgentRunContextRequestPreparer
+
+
 class AgentLoop:
     """Own the complete serial foreground execution path."""
 
@@ -183,7 +198,7 @@ class AgentLoop:
         configuration: UserConfiguration,
         bus: MessageBus,
         schedule_service: ScheduleService,
-        model_router: AgentRunnerRouter,
+        model_router: AgentRunRouter,
         memory_manager: MemoryManager,
         session_id: str | None,
         now: Callable[[], datetime],
@@ -250,12 +265,6 @@ class AgentLoop:
         )
         baseline_tool_schemas = tuple(baseline_gateway.schemas)
         runner = AgentRunner(model_router, IdentityAgentRunRequestPreparer())
-        compactor = ConversationCompactor(
-            provider=cast(CompactionModelRouter, model_router),
-            memory_manager=memory_manager,
-            compaction_message_threshold=configuration.memory.compaction_message_threshold,
-            now=now,
-        )
         active_session = (
             Session.create(workspace_state, now=now, new_uuid=new_uuid)
             if session_id is None
@@ -275,7 +284,7 @@ class AgentLoop:
         self._skill_loader = skill_loader
         self._schedule_service = schedule_service
         self._context_builder = context_builder
-        self._compactor = compactor
+        self._memory_manager = memory_manager
         self._now = now
         self._monotonic_now = monotonic_now
         self._schedule_now = schedule_service.current_time
@@ -435,9 +444,14 @@ class AgentLoop:
                 tool_schemas=tool_schemas,
                 summary=_session_action_summary(self._session),
             )
-        available_input = chat_route.context_window - chat_route.max_output
-        estimated = estimate_input_tokens(status_input)
-        if estimated > available_input:
+        budget = ContextBudget(
+            context_window=chat_route.context_window,
+            max_output=chat_route.max_output,
+            compact_ratio=self._configuration.runtime.compact_ratio,
+        )
+        projected_messages = status_input.projected_messages
+        estimated = estimate_request_tokens(projected_messages, status_input.projected_tools)
+        if estimated >= budget.available_context:
             raise ModelContextOverflowError(
                 ErrorInfo(
                     "model_context_overflow",
@@ -705,45 +719,80 @@ class AgentLoop:
                         )
 
     async def _run_schedule_agent(self, session: Session, job: ScheduleJob) -> None:
+        with self._context_builder.schedule_projection_scope():
+            await self._run_schedule_agent_scoped(session, job)
+
+    async def _run_schedule_agent_scoped(self, session: Session, job: ScheduleJob) -> None:
         current_user = {"role": "user", "content": job.message}
         run_gateway = self._new_run_gateway(excluded_names=("schedule",))
+
+        def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+            return self._context_builder.build_schedule_messages(
+                messages,
+                session_id=session.session_id,
+                summary="",
+            )
+
+        run_context = self._new_agent_run_context(
+            session,
+            current_user=deepcopy(current_user),
+            route="schedule",
+            project_messages=project_messages,
+        )
         try:
-            initial_messages = await self._prepare_schedule_context(
-                session,
-                deepcopy(current_user),
+            initial_messages = await self._prepare_agent_run(
+                run_context,
                 tool_gateway=run_gateway,
             )
         except asyncio.CancelledError:
             if not self._aborted:
-                self._persist_schedule_cancelled_user(session, current_user, job)
+                self._commit_schedule_run(session, run_context, [current_user], job=job)
             raise
         except ModelCallError as failure:
             if self._aborted:
                 raise asyncio.CancelledError() from None
-            self._persist_schedule_failure(session, current_user, failure.error)
-        except Exception:
+            if failure.error.code == "model_context_overflow":
+                raise ScheduleJobExecutionError(failure.error) from failure
+            self._commit_schedule_failure(session, run_context, current_user, failure.error, job)
+        except Exception as failure:
             if self._aborted:
                 raise asyncio.CancelledError() from None
-            self._persist_schedule_failure(
+            _runtime_logger().error(
+                "Schedule Agent Run preparation failed unexpectedly job_id={} type={}",
+                job.job_id,
+                type(failure).__name__,
+            )
+            self._commit_schedule_failure(
                 session,
+                run_context,
                 current_user,
                 ErrorInfo("model_failed", "The model request failed."),
+                job,
             )
 
-        result = await self._runner.run(
-            initial_messages,
-            model="schedule",
-            tool_gateway=run_gateway,
-            on_output=None,
-            confirmation=None,
-            externalize_result=self._result_externalizer_for(session),
-            cancel_requested=self._schedule_service.cancellation_requested,
-            max_iterations=self._max_iterations,
-        )
+        try:
+            result = await self._runner.run(
+                initial_messages,
+                model="schedule",
+                tool_gateway=run_gateway,
+                on_output=None,
+                confirmation=None,
+                externalize_result=self._result_externalizer_for(session),
+                cancel_requested=self._schedule_service.cancellation_requested,
+                max_iterations=self._max_iterations,
+                model_router=run_context.router,
+                request_preparer=run_context.request_preparer,
+            )
+        except ModelCallError as failure:
+            raise ScheduleJobExecutionError(failure.error) from failure
         if self._aborted:
             raise asyncio.CancelledError()
-        session.append_messages([deepcopy(current_user), *deepcopy(result.messages)])
-        session.persist()
+        self._commit_schedule_run(
+            session,
+            run_context,
+            [deepcopy(current_user), *deepcopy(result.messages)],
+            job=job,
+        )
 
         if result.finish_reason == "cancelled":
             raise asyncio.CancelledError()
@@ -751,39 +800,150 @@ class AgentLoop:
             error = result.error or ErrorInfo("model_failed", "The model request failed.")
             raise ScheduleJobExecutionError(error)
 
-    @staticmethod
-    def _persist_schedule_cancelled_user(
+    def _new_agent_run_context(
+        self,
         session: Session,
+        *,
         current_user: dict[str, Any],
+        route: Literal["chat", "schedule"],
+        project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]],
+    ) -> _AgentRunContext:
+        resolved = self._configuration.resolve_route(route)
+        configured_route = resolved.route
+        route_status = _configured_model_route_status(self._configuration, route)
+        memory_route_status = _configured_model_route_status(self._configuration, "memory")
+        run_router = AgentRunContextRouterAdapter(self._model_router)
+        controller = AgentRunContextController.from_session(
+            session,
+            provider=run_router,
+            memory_manager=self._memory_manager,
+            now=self._now,
+        )
+        request_preparer = controller.as_request_preparer(
+            project_messages=project_messages,
+            route_context_window=configured_route.context_window,
+            route_max_output=configured_route.max_output,
+            current_user=current_user,
+            compact_ratio=self._configuration.runtime.compact_ratio,
+            route_status=lambda: run_router.current_call_status(route) or route_status,
+            memory_route_status=lambda: (
+                run_router.current_call_status("memory") or memory_route_status
+            ),
+            requested_route=route,
+            selected_route=(route_status.selected_route if route_status is not None else route),
+            provider_id=(
+                route_status.provider_id
+                if route_status is not None
+                else resolved.provider.provider_id
+            ),
+            model=(route_status.model if route_status is not None else configured_route.model),
+        )
+        return _AgentRunContext(
+            route=route,
+            current_user=deepcopy(current_user),
+            route_context_window=configured_route.context_window,
+            route_max_output=configured_route.max_output,
+            project_messages=project_messages,
+            router=run_router,
+            controller=controller,
+            request_preparer=request_preparer,
+        )
+
+    async def _prepare_agent_run(
+        self,
+        context: _AgentRunContext,
+        *,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]:
+        route_status = _configured_model_route_status(self._configuration, context.route)
+        memory_route_status = _configured_model_route_status(self._configuration, "memory")
+        preparation = await context.controller.prepare_run_start(
+            project_messages=context.project_messages,
+            route_context_window=context.route_context_window,
+            route_max_output=context.route_max_output,
+            tools=tool_gateway.schemas,
+            current_user=deepcopy(context.current_user),
+            compact_ratio=self._configuration.runtime.compact_ratio,
+            route_status=route_status,
+            memory_route_status=memory_route_status,
+            requested_route=context.route,
+            selected_route=(
+                route_status.selected_route if route_status is not None else context.route
+            ),
+            provider_id=(route_status.provider_id if route_status is not None else "configured"),
+            model=(route_status.model if route_status is not None else "configured"),
+        )
+        return list(deepcopy(preparation.retained_messages))
+
+    def _commit_agent_run(
+        self,
+        session: Session,
+        context: _AgentRunContext,
+        messages: list[dict[str, Any]],
+        *,
+        usage_delta: dict[str, int] | None = None,
+        metadata_updates: dict[str, Any] | None = None,
+        metadata_removals: tuple[str, ...] = (),
+    ) -> None:
+        values = context.controller.terminal_commit_values()
+        combined_usage = _merge_usage_deltas(values.usage_delta, usage_delta)
+        session.commit_agent_run(
+            messages,
+            pending_last_compacted=values.pending_last_compacted,
+            pending_action_summary=values.pending_action_summary,
+            usage_delta=combined_usage or None,
+            metadata_updates=metadata_updates,
+            metadata_removals=metadata_removals,
+        )
+
+    def _commit_schedule_run(
+        self,
+        session: Session,
+        context: _AgentRunContext,
+        messages: list[dict[str, Any]],
+        *,
         job: ScheduleJob,
     ) -> None:
         try:
-            session.append_messages([current_user])
-            session.persist()
-        except Exception as error:
+            self._commit_agent_run(session, context, messages)
+        except (OSError, UnicodeError) as error:
             logger.error(
-                "Schedule cancellation persistence failed job_id={} type={}",
+                "Schedule Agent Run commit failed job_id={} type={}",
                 job.job_id,
                 type(error).__name__,
             )
+            raise ScheduleJobExecutionError(
+                ErrorInfo("persistence_error", "The Conversation Session could not be updated.")
+            ) from error
+        except Exception as error:
+            _runtime_logger().error(
+                "Schedule Agent Run commit contract failed job_id={} type={}",
+                job.job_id,
+                type(error).__name__,
+            )
+            raise ScheduleJobExecutionError(
+                ErrorInfo("model_failed", "The model request failed.")
+            ) from error
 
-    @staticmethod
-    def _persist_schedule_failure(
+    def _commit_schedule_failure(
+        self,
         session: Session,
+        context: _AgentRunContext,
         current_user: dict[str, Any],
         error: ErrorInfo,
+        job: ScheduleJob,
     ) -> NoReturn:
-        session.append_messages(
+        self._commit_schedule_run(
+            session,
+            context,
             [
                 deepcopy(current_user),
                 _build_assistant_repair_message(
-                    content="",
-                    status="error",
-                    error=error,
+                    content="", status="error", error=error, model_calls=0
                 ),
-            ]
+            ],
+            job=job,
         )
-        session.persist()
         raise ScheduleJobExecutionError(error)
 
     def respond_to_confirmation(
@@ -905,6 +1065,32 @@ class AgentLoop:
         if not inbound.content.strip():
             return False
 
+        staged_blackboard: Blackboard | None = None
+
+        def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+            return self._context_builder.build_foreground_messages(
+                messages,
+                session_id=active_session.session_id,
+                blackboard=staged_blackboard,
+                manual_invocation=manual_invocation,
+                summary="",
+            )
+
+        run_context = self._new_agent_run_context(
+            active_session,
+            current_user=deepcopy(current_user),
+            route="chat",
+            project_messages=project_messages,
+        )
+        framing_usage: dict[str, int] | None = None
+
+        def metadata_patch() -> tuple[dict[str, Any] | None, tuple[str, ...]]:
+            if manual_invocation is not None:
+                return None, ()
+            if staged_blackboard is None:
+                return None, ("blackboard",)
+            return {"blackboard": staged_blackboard.to_dict()}, ()
+
         if manual_invocation is None:
             previous_blackboard = Blackboard.from_dict(active_session.metadata.get("blackboard"))
             last_assistant_content = _latest_assistant_content(active_session)
@@ -918,10 +1104,15 @@ class AgentLoop:
             except asyncio.CancelledError:
                 if not self._cancel_requested:
                     raise
-                await self._publish_preparation_failure(
-                    ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
+                return await self._finish_foreground_terminal(
+                    active_session,
+                    run_context,
+                    current_user,
+                    error=ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE),
+                    framing_usage=framing_usage,
+                    metadata_updates=metadata_patch()[0],
+                    metadata_removals=metadata_patch()[1],
                 )
-                return False
 
             if framing_result.status != "resolved":
                 _runtime_logger().warning(
@@ -935,28 +1126,49 @@ class AgentLoop:
             framing_usage = None
         run_gateway = self._new_run_gateway()
         try:
-            initial_messages = await self._prepare_foreground_context(
-                active_session,
-                deepcopy(current_user),
-                blackboard=staged_blackboard,
-                manual_invocation=manual_invocation,
+            initial_messages = await self._prepare_agent_run(
+                run_context,
                 tool_gateway=run_gateway,
             )
         except asyncio.CancelledError:
             if not self._cancel_requested:
                 raise
-            await self._publish_preparation_failure(
-                ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
+            return await self._finish_foreground_terminal(
+                active_session,
+                run_context,
+                current_user,
+                error=ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE),
+                framing_usage=framing_usage,
+                metadata_updates=metadata_patch()[0],
+                metadata_removals=metadata_patch()[1],
             )
-            return False
         except ModelCallError as failure:
-            await self._publish_preparation_failure(failure.error)
-            return False
-        except Exception:
-            await self._publish_preparation_failure(
-                ErrorInfo("model_failed", "The model request failed.")
+            if failure.error.code == "model_context_overflow":
+                await self._publish_preparation_failure(failure.error)
+                return True
+            return await self._finish_foreground_terminal(
+                active_session,
+                run_context,
+                current_user,
+                error=failure.error,
+                framing_usage=framing_usage,
+                metadata_updates=metadata_patch()[0],
+                metadata_removals=metadata_patch()[1],
             )
-            return False
+        except Exception as error:
+            _runtime_logger().error(
+                "Agent Run preparation failed unexpectedly type={}",
+                type(error).__name__,
+            )
+            return await self._finish_foreground_terminal(
+                active_session,
+                run_context,
+                current_user,
+                error=ErrorInfo("model_failed", "The model request failed."),
+                framing_usage=framing_usage,
+                metadata_updates=metadata_patch()[0],
+                metadata_removals=metadata_patch()[1],
+            )
 
         if title_work is not None and not title_work.coordination.prepared.done():
             title_work.coordination.prepared.set_result(True)
@@ -970,15 +1182,26 @@ class AgentLoop:
                 externalize_result=self._result_externalizer_for(active_session),
                 cancel_requested=lambda: self._cancel_requested,
                 max_iterations=self._max_iterations,
+                model_router=run_context.router,
+                request_preparer=run_context.request_preparer,
             )
-            self._remember_foreground_route_status()
+            self._remember_foreground_route_status(run_context.router)
+        except ModelCallError as failure:
+            self._remember_foreground_route_status(run_context.router)
+            await self._publish_preparation_failure(failure.error)
+            return True
         except asyncio.CancelledError:
             if not self._cancel_requested:
                 raise
-            await self._publish_preparation_failure(
-                ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
+            return await self._finish_foreground_terminal(
+                active_session,
+                run_context,
+                current_user,
+                error=ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE),
+                framing_usage=framing_usage,
+                metadata_updates=metadata_patch()[0],
+                metadata_removals=metadata_patch()[1],
             )
-            return False
 
         if self._aborted:
             return False
@@ -998,122 +1221,94 @@ class AgentLoop:
             try:
                 if self._aborted:
                     return False
-                active_session.append_messages(
+                self._commit_agent_run(
+                    active_session,
+                    run_context,
                     [deepcopy(current_user), *deepcopy(result.messages)],
+                    usage_delta=framing_usage,
                     metadata_updates=metadata_updates,
                     metadata_removals=metadata_removals,
-                    usage_delta=framing_usage,
                 )
-            except Exception as failure:
-                _runtime_logger().opt(exception=failure).error(
+            except (OSError, UnicodeError) as failure:
+                _runtime_logger().error(
                     "Agent Run Session increment failed code=persistence_error type={}",
                     type(failure).__name__,
                 )
                 await self._publish_commit_failure()
                 return False
-            try:
-                if self._aborted:
-                    return False
-                active_session.persist()
-            except Exception:
-                pass
+            except Exception as failure:
+                _runtime_logger().error(
+                    "Agent Run Session increment contract failed type={}",
+                    type(failure).__name__,
+                )
+                await self._publish_preparation_failure(
+                    ErrorInfo("model_failed", "The model request failed.")
+                )
+                return False
         await self._publish_terminal(result)
         return True
 
-    async def _prepare_foreground_context(
+    async def _finish_foreground_terminal(
         self,
         active_session: Session,
-        current_user: dict[str, Any],
-        blackboard: Blackboard | None = None,
-        *,
-        manual_invocation: ManualSkillInvocation | None = None,
-        tool_gateway: ToolGateway,
-    ) -> list[dict[str, Any]]:
-        route = self._configuration.resolve_route("chat").route
-
-        def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-            return self._context_builder.build_foreground_messages(
-                messages,
-                session_id=active_session.session_id,
-                blackboard=blackboard,
-                manual_invocation=manual_invocation,
-                summary="",
-            )
-
-        await self._compactor.prepare(
-            active_session,
-            current_user=current_user,
-            project_messages=project_messages,
-            route_context_window=route.context_window,
-            route_max_output=route.max_output,
-            tools=tool_gateway.schemas,
-        )
-        history = active_session.messages[active_session.last_compacted :]
-        return self._context_builder.build_foreground_messages(
-            [*history, current_user],
-            session_id=active_session.session_id,
-            blackboard=blackboard,
-            manual_invocation=manual_invocation,
-            summary=_session_action_summary(active_session),
-        )
-
-    async def _prepare_schedule_context(
-        self,
-        active_session: Session,
+        context: _AgentRunContext,
         current_user: dict[str, Any],
         *,
-        tool_gateway: ToolGateway,
-    ) -> list[dict[str, Any]]:
-        with self._context_builder.schedule_projection_scope():
-            route = self._configuration.resolve_route("schedule").route
-            initial_last_compacted = active_session.last_compacted
-            initial_source = deepcopy(
-                [*active_session.messages[initial_last_compacted:], current_user]
-            )
-            initial_summary = _session_action_summary(active_session)
-            initial_projection = self._context_builder.build_schedule_messages(
-                initial_source,
-                session_id=active_session.session_id,
-                summary=initial_summary,
-            )
-            initial_compaction_projection = initial_projection
-            if initial_summary:
-                initial_compaction_projection = self._context_builder.build_schedule_messages(
-                    initial_source,
-                    session_id=active_session.session_id,
-                    summary="",
+        error: ErrorInfo,
+        framing_usage: dict[str, int] | None,
+        metadata_updates: dict[str, Any] | None,
+        metadata_removals: tuple[str, ...],
+    ) -> bool:
+        if self._aborted:
+            return False
+        try:
+            async with self._foreground_commit_gate:
+                if self._aborted:
+                    return False
+                self._commit_agent_run(
+                    active_session,
+                    context,
+                    [
+                        deepcopy(current_user),
+                        _build_assistant_repair_message(
+                            content=(
+                                TURN_CANCELLED_MESSAGE if error.code == "turn_cancelled" else ""
+                            ),
+                            status="interrupted" if error.code == "turn_cancelled" else "error",
+                            error=error,
+                            model_calls=0,
+                        ),
+                    ],
+                    usage_delta=framing_usage,
+                    metadata_updates=metadata_updates,
+                    metadata_removals=metadata_removals,
                 )
-
-            def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-                if list(messages) == initial_source:
-                    return deepcopy(initial_compaction_projection)
-                return self._context_builder.build_schedule_messages(
-                    messages,
-                    session_id=active_session.session_id,
-                    summary="",
-                )
-
-            await self._compactor.prepare(
-                active_session,
-                current_user=current_user,
-                project_messages=project_messages,
-                route_context_window=route.context_window,
-                route_max_output=route.max_output,
-                tools=tool_gateway.schemas,
+        except (OSError, UnicodeError) as failure:
+            _runtime_logger().error(
+                "Agent Run preparation commit failed code=persistence_error type={}",
+                type(failure).__name__,
             )
-            if active_session.last_compacted == initial_last_compacted:
-                return initial_projection
-            history = active_session.messages[active_session.last_compacted :]
-            return self._context_builder.build_schedule_messages(
-                [*history, current_user],
-                session_id=active_session.session_id,
-                summary=_session_action_summary(active_session),
+            await self._publish_commit_failure()
+            return False
+        except Exception as failure:
+            _runtime_logger().error(
+                "Agent Run preparation commit contract failed type={}",
+                type(failure).__name__,
             )
+            await self._publish_preparation_failure(
+                ErrorInfo("model_failed", "The model request failed.")
+            )
+            return False
+        await self._publish_preparation_failure(error)
+        return True
 
     def runtime_status_input(self) -> RuntimeStatusInput:
         """Return the status token input projected by this generation's Context Builder."""
         session = self._session
-        route_status = self._last_foreground_route_status
+        route_status = self._last_foreground_route_status or _configured_model_route_status(
+            self._configuration,
+            "chat",
+        )
         session_id = session.session_id
         messages = session.messages
         metadata = session.metadata
@@ -1135,6 +1330,7 @@ class AgentLoop:
             session_id=session_id,
             tool_schemas=self.tool_schemas,
             summary=summary,
+            blackboard=Blackboard.from_dict(metadata.get("blackboard")),
             session_title=title,
             session_message_count=len(messages),
             last_compacted=last_compacted,
@@ -1150,20 +1346,24 @@ class AgentLoop:
                 else route_status.context_window
             ),
             generation_started_at=self._generation_started_at,
+            max_output=(
+                self._configuration.resolve_route("chat").route.max_output
+                if route_status is None
+                else route_status.max_output
+            ),
+            compact_ratio=self._configuration.runtime.compact_ratio,
+            requested_route="chat",
+            selected_route=("chat" if route_status is None else route_status.selected_route),
+            provider_id=("" if route_status is None else route_status.provider_id),
+            model=("" if route_status is None else route_status.model),
+            latest_usage_context=_latest_main_agent_context(messages),
+            latest_reported_usage=_latest_main_agent_usage(messages),
         )
 
-    def _remember_foreground_route_status(self) -> None:
-        current_call_status = getattr(self._model_router, "current_call_status", None)
-        if callable(current_call_status):
-            status = current_call_status("chat")
-            if isinstance(status, ModelRouteStatus):
-                self._last_foreground_route_status = status
-                return
-        route_status = getattr(self._model_router, "route_status", None)
-        if callable(route_status):
-            status = route_status("chat")
-            if isinstance(status, ModelRouteStatus):
-                self._last_foreground_route_status = status
+    def _remember_foreground_route_status(self, router: AgentRunContextRouterAdapter) -> None:
+        status = router.current_call_status("chat")
+        if status is not None:
+            self._last_foreground_route_status = status
 
     def _result_externalizer_for(
         self,
@@ -1473,6 +1673,76 @@ def _latest_assistant_content(session: Session) -> str:
     return ""
 
 
+def _merge_usage_deltas(
+    first: Mapping[str, int] | None,
+    second: Mapping[str, int] | None,
+) -> dict[str, int]:
+    result = {
+        "model_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    for delta in (first, second):
+        if delta is None:
+            continue
+        for field in result:
+            result[field] += delta[field]
+    return result
+
+
+def _configured_model_route_status(
+    configuration: UserConfiguration,
+    route: ModelRoute,
+) -> ModelRouteStatus:
+    resolved = configuration.resolve_route(route)
+    return ModelRouteStatus(
+        requested_route=route,
+        selected_route=cast(ModelRoute, resolved.selected_route),
+        provider_id=resolved.provider.provider_id,
+        model=resolved.route.model,
+        context_window=resolved.route.context_window,
+        max_output=resolved.route.max_output,
+        used_default=resolved.used_default,
+    )
+
+
+def _latest_main_agent_provenance(
+    messages: Sequence[dict[str, Any]],
+) -> tuple[ContextUsageSnapshot | None, tuple[tuple[str, int], ...]]:
+    fields = ("model_calls", "input_tokens", "output_tokens", "total_tokens")
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        context_value = message.get("context_usage")
+        usage_value = message.get("token_usage")
+        if not isinstance(context_value, dict) or not isinstance(usage_value, dict):
+            continue
+        try:
+            context = ContextUsageSnapshot.from_dict(context_value)
+        except (TypeError, ValueError):
+            continue
+        values = tuple(usage_value.get(field) for field in fields)
+        if any(type(value) is not int or value < 0 for value in values):
+            continue
+        return context, tuple(
+            (field, cast(int, value)) for field, value in zip(fields, values, strict=True)
+        )
+    return None, ()
+
+
+def _latest_main_agent_context(
+    messages: Sequence[dict[str, Any]],
+) -> ContextUsageSnapshot | None:
+    return _latest_main_agent_provenance(messages)[0]
+
+
+def _latest_main_agent_usage(
+    messages: Sequence[dict[str, Any]],
+) -> tuple[tuple[str, int], ...]:
+    return _latest_main_agent_provenance(messages)[1]
+
+
 def _foreground_runtime_status_input(
     *,
     context_builder: ContextBuilder,
@@ -1480,33 +1750,38 @@ def _foreground_runtime_status_input(
     session_id: str,
     tool_schemas: tuple[dict[str, Any], ...],
     summary: str = "",
+    blackboard: Blackboard | None = None,
     session_title: str = "",
     session_message_count: int = 0,
     last_compacted: int = 0,
     cumulative_usage: tuple[tuple[str, int], ...] = (),
     chat_model: str = "",
     context_window: int = 0,
+    max_output: int = 0,
+    compact_ratio: float = 0.9,
+    requested_route: str = "chat",
+    selected_route: str = "chat",
+    provider_id: str = "",
+    model: str = "",
+    latest_usage_context: ContextUsageSnapshot | None = None,
+    latest_reported_usage: tuple[tuple[str, int], ...] = (),
     generation_started_at: float | None = None,
 ) -> RuntimeStatusInput:
     """Project and serialize a minimum foreground request for status and preflight."""
-    projected = context_builder.build_status_messages(
-        history,
-        session_id=session_id,
-        summary=summary,
-    )
-    projected_system = projected[0].get("content")
-    if not isinstance(projected_system, str):
-        raise TypeError("Context Builder status system message is malformed")
+    if blackboard is None:
+        projected = context_builder.build_status_messages(
+            history,
+            session_id=session_id,
+            summary=summary,
+        )
+    else:
+        projected = context_builder.build_status_messages(
+            history,
+            session_id=session_id,
+            summary=summary,
+            blackboard=blackboard,
+        )
     return RuntimeStatusInput(
-        system_prompt=projected_system,
-        retained_messages=tuple(
-            json.dumps(message, ensure_ascii=False, separators=(",", ":"))
-            for message in projected[1:]
-        ),
-        tool_definitions=tuple(
-            json.dumps(schema, ensure_ascii=False, separators=(",", ":")) for schema in tool_schemas
-        ),
-        runtime_context="",
         session_id=session_id,
         session_title=session_title,
         session_message_count=session_message_count,
@@ -1514,6 +1789,16 @@ def _foreground_runtime_status_input(
         cumulative_usage=cumulative_usage,
         chat_model=chat_model,
         context_window=context_window,
+        max_output=max_output,
+        compact_ratio=compact_ratio,
+        requested_route=requested_route,
+        selected_route=selected_route,
+        provider_id=provider_id,
+        model=model,
+        projected_messages=tuple(deepcopy(projected)),
+        projected_tools=tuple(deepcopy(tool_schemas)),
+        latest_usage_context=latest_usage_context,
+        latest_reported_usage=latest_reported_usage,
         generation_started_at=generation_started_at,
     )
 

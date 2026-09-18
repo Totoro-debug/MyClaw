@@ -1,4 +1,3 @@
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
@@ -15,7 +14,6 @@ from myclaw.management.service import (
     ManagementError,
     RuntimeStatus,
     RuntimeStatusInput,
-    estimate_input_tokens,
 )
 from myclaw.provider.models import ReasoningEffort
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
@@ -65,35 +63,6 @@ max_output = 512
 temperature = 0
 timeout = 60
 """
-
-
-@pytest.mark.parametrize("component", ("system", "history", "current", "tools"))
-@pytest.mark.parametrize("previous_size,size", ((0, 1), (1, 32), (32, 256)))
-def test_input_estimate_increases_for_each_complete_request_component(
-    component: str,
-    previous_size: int,
-    size: int,
-) -> None:
-    baseline = RuntimeStatusInput(
-        system_prompt="",
-        retained_messages=(),
-        tool_definitions=(),
-        runtime_context="",
-    )
-
-    def with_component_size(component_size: int) -> RuntimeStatusInput:
-        value = "x" * component_size
-        if component == "system":
-            return replace(baseline, system_prompt=value)
-        if component == "history":
-            return replace(baseline, retained_messages=(value,))
-        if component == "current":
-            return replace(baseline, runtime_context=value)
-        return replace(baseline, tool_definitions=(value,))
-
-    assert estimate_input_tokens(with_component_size(size)) > estimate_input_tokens(
-        with_component_size(previous_size)
-    )
 
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
@@ -452,10 +421,11 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
         workspace_state=state,
         current_agent_loop=lambda: _StatusProjectionLoop(
             RuntimeStatusInput(
-                system_prompt="abcd",
-                retained_messages=("\u00e9",),
-                tool_definitions=("tool",),
-                runtime_context="\u4f60",
+                projected_messages=(
+                    {"role": "system", "content": "abcd"},
+                    {"role": "user", "content": "\u00e9\u4f60"},
+                ),
+                projected_tools=({"name": "tool"},),
                 session_id=session.session_id,
                 session_title="New Conversation",
                 context_window=10,
@@ -479,9 +449,14 @@ async def test_status_reports_prepared_session_and_frozen_utf8_token_estimate(
         chat_model="primary/model-id",
         chat_reasoning_effort="medium",
         uptime_seconds=12,
-        estimated_input_tokens=4,
         context_window=10,
-        context_used_percent=40.0,
+        max_output=0,
+        available_context=10,
+        compact_ratio=0.9,
+        compact_context_window=9,
+        projected_next_request_tokens=13,
+        projection_source="estimated",
+        input_budget_used_percent=130.0,
         session_message_count=0,
         last_compacted=0,
         cumulative_usage={
@@ -517,10 +492,7 @@ async def test_status_reads_one_current_loop_projection_per_request_and_resets_u
     home.initialize()
     first = _StatusProjectionLoop(
         RuntimeStatusInput(
-            system_prompt="first",
-            retained_messages=(),
-            tool_definitions=(),
-            runtime_context="",
+            projected_messages=({"role": "system", "content": "first"},),
             session_id="20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000",
             session_title="First generation",
             session_message_count=2,
@@ -538,10 +510,7 @@ async def test_status_reads_one_current_loop_projection_per_request_and_resets_u
     )
     second = _StatusProjectionLoop(
         RuntimeStatusInput(
-            system_prompt="second",
-            retained_messages=(),
-            tool_definitions=(),
-            runtime_context="",
+            projected_messages=({"role": "system", "content": "second"},),
             session_id="20260711-153012-123457_6fa459ea-ee8a-4ca4-894e-db77e160355e",
             session_title="Second generation",
             session_message_count=5,
@@ -601,10 +570,7 @@ async def test_management_status_builds_once_from_the_current_loop_projection(
     home.initialize()
     loop = _StatusProjectionLoop(
         RuntimeStatusInput(
-            system_prompt="status",
-            retained_messages=(),
-            tool_definitions=(),
-            runtime_context="",
+            projected_messages=({"role": "system", "content": "status"},),
             session_id="20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000",
             session_title="Current generation",
             session_message_count=3,
@@ -660,10 +626,7 @@ async def test_status_uptime_clamps_a_monotonic_clock_rollback_to_zero(
     home.initialize()
     loop = _StatusProjectionLoop(
         RuntimeStatusInput(
-            system_prompt="status",
-            retained_messages=(),
-            tool_definitions=(),
-            runtime_context="",
+            projected_messages=({"role": "system", "content": "status"},),
             session_id="20260711-153012-123456_550e8400-e29b-41d4-a716-446655440000",
             session_title="Rollback generation",
             chat_model="provider/model",
@@ -700,10 +663,7 @@ async def test_generation_sensitive_views_snapshot_each_current_provider_once(
     target.close()
     loop = _StatusProjectionLoop(
         RuntimeStatusInput(
-            system_prompt="current",
-            retained_messages=(),
-            tool_definitions=(),
-            runtime_context="",
+            projected_messages=({"role": "system", "content": "current"},),
         )
     )
     memory = _MemoryReader("current memory")
@@ -765,10 +725,7 @@ async def test_resume_prepares_before_loading_resumable_sessions(
     target.add_message("user", "Resume target")
     loop = _StatusProjectionLoop(
         RuntimeStatusInput(
-            system_prompt="current",
-            retained_messages=(),
-            tool_definitions=(),
-            runtime_context="",
+            projected_messages=({"role": "system", "content": "current"},),
         )
     )
     events: list[str] = []
