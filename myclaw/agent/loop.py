@@ -19,9 +19,9 @@ from myclaw.agent.context import ContextBuilder
 from myclaw.agent.context_budget import ContextBudget, ContextUsageSnapshot, estimate_request_tokens
 from myclaw.agent.memory.conversation_compactor import (
     AgentRunContextController,
-    AgentRunContextRequestPreparer,
     AgentRunContextRouterAdapter,
     AgentRunRouter,
+    latest_main_agent_usage_anchor,
 )
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import (
@@ -182,7 +182,6 @@ class _AgentRunContext:
     project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]]
     router: AgentRunContextRouterAdapter
     controller: AgentRunContextController
-    request_preparer: AgentRunContextRequestPreparer
     runner: AgentRunner
 
 
@@ -235,10 +234,6 @@ class AgentLoop:
             raise TypeError("Agent Loop Session ID must be a string or None")
 
         # Build every generation-local collaborator before publishing any Loop field.
-        resolved_chat_route = configuration.resolve_route("chat")
-        chat_route = resolved_chat_route.route
-        configured_chat_model = f"{resolved_chat_route.provider.provider_id}/{chat_route.model}"
-        configured_chat_context_window = chat_route.context_window
         skill_loader = SkillLoader(
             root=agent_home.skills_directory,
             reserved_names=tuple(command.token for command in MANAGEMENT_COMMANDS),
@@ -277,8 +272,6 @@ class AgentLoop:
 
         self._workspace_state = workspace_state
         self._configuration = configuration
-        self._configured_chat_model = configured_chat_model
-        self._configured_chat_context_window = configured_chat_context_window
         self._session = active_session
         self._skill_loader = skill_loader
         self._schedule_service = schedule_service
@@ -315,7 +308,6 @@ class AgentLoop:
         self._preflight_error: Exception | None = None
         self._session_closed = False
         self._session_abandoned = False
-        self._last_foreground_route_status: ModelRouteStatus | None = None
 
     @property
     def control(self) -> TerminalAgentLoopControl:
@@ -842,7 +834,6 @@ class AgentLoop:
             project_messages=project_messages,
             router=run_router,
             controller=controller,
-            request_preparer=request_preparer,
             runner=AgentRunner(run_router, request_preparer),
         )
 
@@ -854,7 +845,7 @@ class AgentLoop:
     ) -> list[dict[str, Any]]:
         route_status = _configured_model_route_status(self._configuration, context.route)
         memory_route_status = _configured_model_route_status(self._configuration, "memory")
-        preparation = await context.controller.prepare_run_start(
+        retained_messages = await context.controller.prepare_run_start(
             project_messages=context.project_messages,
             route_context_window=context.route_context_window,
             route_max_output=context.route_max_output,
@@ -870,7 +861,7 @@ class AgentLoop:
             provider_id=(route_status.provider_id if route_status is not None else "configured"),
             model=(route_status.model if route_status is not None else "configured"),
         )
-        return list(deepcopy(preparation.retained_messages))
+        return list(deepcopy(retained_messages))
 
     def _commit_agent_run(
         self,
@@ -1180,9 +1171,7 @@ class AgentLoop:
                 cancel_requested=lambda: self._cancel_requested,
                 max_iterations=self._max_iterations,
             )
-            self._remember_foreground_route_status(run_context.router)
         except ModelCallError as failure:
-            self._remember_foreground_route_status(run_context.router)
             await self._publish_preparation_failure(failure.error)
             return True
         except asyncio.CancelledError:
@@ -1300,10 +1289,7 @@ class AgentLoop:
     def runtime_status_input(self) -> RuntimeStatusInput:
         """Return the status token input projected by this generation's Context Builder."""
         session = self._session
-        route_status = self._last_foreground_route_status or _configured_model_route_status(
-            self._configuration,
-            "chat",
-        )
+        route_status = _configured_model_route_status(self._configuration, "chat")
         session_id = session.session_id
         messages = session.messages
         metadata = session.metadata
@@ -1319,6 +1305,12 @@ class AgentLoop:
         usage = tuple((field, usage_value.get(field)) for field in usage_fields)
         if any(isinstance(value, bool) or not isinstance(value, int) for _, value in usage):
             raise ValueError("Active Session token usage is malformed")
+        usage_anchor = latest_main_agent_usage_anchor(messages)
+        latest_usage_context: ContextUsageSnapshot | None = None
+        latest_reported_usage: tuple[tuple[str, int], ...] = ()
+        if usage_anchor is not None:
+            latest_usage_context, reported_usage = usage_anchor
+            latest_reported_usage = tuple((field, reported_usage[field]) for field in usage_fields)
         return _foreground_runtime_status_input(
             context_builder=self._context_builder,
             history=messages[last_compacted:],
@@ -1330,35 +1322,18 @@ class AgentLoop:
             session_message_count=len(messages),
             last_compacted=last_compacted,
             cumulative_usage=tuple((field, cast(int, value)) for field, value in usage),
-            chat_model=(
-                self._configured_chat_model
-                if route_status is None
-                else f"{route_status.provider_id}/{route_status.model}"
-            ),
-            context_window=(
-                self._configured_chat_context_window
-                if route_status is None
-                else route_status.context_window
-            ),
+            chat_model=f"{route_status.provider_id}/{route_status.model}",
+            context_window=route_status.context_window,
             generation_started_at=self._generation_started_at,
-            max_output=(
-                self._configuration.resolve_route("chat").route.max_output
-                if route_status is None
-                else route_status.max_output
-            ),
+            max_output=route_status.max_output,
             compact_ratio=self._configuration.runtime.compact_ratio,
             requested_route="chat",
-            selected_route=("chat" if route_status is None else route_status.selected_route),
-            provider_id=("" if route_status is None else route_status.provider_id),
-            model=("" if route_status is None else route_status.model),
-            latest_usage_context=_latest_main_agent_context(messages),
-            latest_reported_usage=_latest_main_agent_usage(messages),
+            selected_route=route_status.selected_route,
+            provider_id=route_status.provider_id,
+            model=route_status.model,
+            latest_usage_context=latest_usage_context,
+            latest_reported_usage=latest_reported_usage,
         )
-
-    def _remember_foreground_route_status(self, router: AgentRunContextRouterAdapter) -> None:
-        status = router.current_call_status("chat")
-        if status is not None:
-            self._last_foreground_route_status = status
 
     def _result_externalizer_for(
         self,
@@ -1700,42 +1675,6 @@ def _configured_model_route_status(
         max_output=resolved.route.max_output,
         used_default=resolved.used_default,
     )
-
-
-def _latest_main_agent_provenance(
-    messages: Sequence[dict[str, Any]],
-) -> tuple[ContextUsageSnapshot | None, tuple[tuple[str, int], ...]]:
-    fields = ("model_calls", "input_tokens", "output_tokens", "total_tokens")
-    for message in reversed(messages):
-        if message.get("role") != "assistant":
-            continue
-        context_value = message.get("context_usage")
-        usage_value = message.get("token_usage")
-        if not isinstance(context_value, dict) or not isinstance(usage_value, dict):
-            continue
-        try:
-            context = ContextUsageSnapshot.from_dict(context_value)
-        except (TypeError, ValueError):
-            continue
-        values = tuple(usage_value.get(field) for field in fields)
-        if any(type(value) is not int or value < 0 for value in values):
-            continue
-        return context, tuple(
-            (field, cast(int, value)) for field, value in zip(fields, values, strict=True)
-        )
-    return None, ()
-
-
-def _latest_main_agent_context(
-    messages: Sequence[dict[str, Any]],
-) -> ContextUsageSnapshot | None:
-    return _latest_main_agent_provenance(messages)[0]
-
-
-def _latest_main_agent_usage(
-    messages: Sequence[dict[str, Any]],
-) -> tuple[tuple[str, int], ...]:
-    return _latest_main_agent_provenance(messages)[1]
 
 
 def _foreground_runtime_status_input(

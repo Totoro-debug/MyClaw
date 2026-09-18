@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import pytest
 
 from myclaw.agent.context_budget import estimate_request_tokens, estimate_run_slice_tokens
 from myclaw.agent.memory.conversation_compactor import (
     AgentRunContextController,
-    AgentRunContextPreparation,
     AgentRunContextRouterAdapter,
     AgentRunContextSnapshot,
+    latest_main_agent_usage_anchor,
 )
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.runner import AgentRunner
@@ -126,6 +127,120 @@ def _usage(input_tokens: int = 4, output_tokens: int = 2) -> dict[str, int]:
     }
 
 
+def _context_usage(
+    *,
+    requested_route: str = "chat",
+    provider_id: str = "provider",
+    context_window: int = 1_600,
+) -> dict[str, object]:
+    return {
+        "requested_route": requested_route,
+        "selected_route": "chat",
+        "provider_id": provider_id,
+        "model": "model",
+        "context_window": context_window,
+        "max_output": 200,
+        "anchor_estimated_tokens": 20,
+        "estimator_version": "utf8-bytes-div4-v1",
+        "run_projected_tokens": 80,
+        "run_projection_source": "estimated",
+    }
+
+
+def _assistant_with_usage(
+    content: str,
+    *,
+    context_usage: object = None,
+    token_usage: object = None,
+) -> dict[str, object]:
+    message: dict[str, object] = {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [],
+        "status": "completed",
+        "error": None,
+    }
+    if context_usage is not None:
+        message["context_usage"] = context_usage
+    if token_usage is not None:
+        message["token_usage"] = token_usage
+    return message
+
+
+def test_latest_main_agent_usage_anchor_returns_a_detached_latest_assistant_anchor() -> None:
+    usage = _usage(100, 10)
+    messages: list[dict[str, Any]] = [
+        _assistant_with_usage(
+            "latest answer",
+            context_usage=_context_usage(),
+            token_usage=usage,
+        ),
+        {"role": "user", "content": "later user"},
+        {"role": "tool", "content": "later tool"},
+    ]
+
+    anchor = latest_main_agent_usage_anchor(messages)
+
+    assert anchor is not None
+    context, copied_usage = anchor
+    assert context.provider_id == "provider"
+    assert copied_usage == usage
+    copied_usage["input_tokens"] = 999
+    assert usage["input_tokens"] == 100
+
+
+@pytest.mark.parametrize(
+    "latest",
+    (
+        pytest.param(
+            _assistant_with_usage("missing context", token_usage=_usage()),
+            id="context-missing",
+        ),
+        pytest.param(
+            _assistant_with_usage(
+                "malformed context",
+                context_usage={"requested_route": "chat"},
+                token_usage=_usage(),
+            ),
+            id="context-malformed",
+        ),
+        pytest.param(
+            _assistant_with_usage("missing usage", context_usage=_context_usage()),
+            id="usage-missing",
+        ),
+        pytest.param(
+            _assistant_with_usage(
+                "malformed usage",
+                context_usage=_context_usage(),
+                token_usage={**_usage(), "total_tokens": 999},
+            ),
+            id="usage-malformed",
+        ),
+        pytest.param(
+            _assistant_with_usage(
+                "unsupported route",
+                context_usage=_context_usage(requested_route="memory"),
+                token_usage=_usage(),
+            ),
+            id="requested-route-unsupported",
+        ),
+    ),
+)
+def test_latest_main_agent_usage_anchor_stops_at_an_invalid_latest_assistant(
+    latest: dict[str, object],
+) -> None:
+    messages = [
+        _assistant_with_usage(
+            "older valid answer",
+            context_usage=_context_usage(),
+            token_usage=_usage(100, 10),
+        ),
+        latest,
+    ]
+
+    assert latest_main_agent_usage_anchor(messages) is None
+
+
 def _add_assistant(session: Session, content: str) -> None:
     session.add_message(
         "assistant",
@@ -207,7 +322,7 @@ async def _prepare_controller(
     memory_route_status: ModelRouteStatus | None = None,
     provider_id: str = "",
     model: str = "",
-) -> AgentRunContextPreparation:
+) -> tuple[dict[str, Any], ...]:
     return await controller.prepare_run_start(
         project_messages=_project_messages,
         current_user={"role": "user", "content": current_user},
@@ -253,6 +368,28 @@ def _project_messages(
     ]
 
 
+def _project_messages_with_tool_calls(
+    messages: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {"role": "system", "content": "SYSTEM"},
+        *deepcopy(list(messages)),
+    ]
+
+
+def _summary_payload(
+    provider: ScriptedFakeProvider,
+    request_index: int = 0,
+) -> list[dict[str, Any]]:
+    content = provider.complete_requests[request_index].messages[1]["content"]
+    assert isinstance(content, str)
+    _prefix, marker, tail = content.partition("```json\n")
+    assert marker
+    serialized, marker, _suffix = tail.partition("\n```")
+    assert marker
+    return cast(list[dict[str, Any]], json.loads(serialized))
+
+
 @pytest.mark.asyncio
 async def test_controller_stages_run_start_compaction_from_detached_snapshot(
     workspace: Path,
@@ -284,23 +421,22 @@ async def test_controller_stages_run_start_compaction_from_detached_snapshot(
         tools=(),
     )
 
-    assert result.selected_batch
-    assert all(message["content"] != "New user must stay out" for message in result.selected_batch)
+    selected = _summary_payload(provider)
+    assert selected
+    assert all(message["content"] != "New user must stay out" for message in selected)
     assert "New user must stay out" not in str(provider.complete_requests[0].messages)
-    assert manager.pending_action_summary == "Updated action"
-    assert manager.pending_last_compacted > snapshot.last_compacted
-    assert manager.pending_compaction_usage == {
+    assert sum(message.get("content") == "New user must stay out" for message in result) == 1
+    terminal = manager.terminal_commit_values()
+    assert terminal.pending_action_summary == "Updated action"
+    assert terminal.pending_last_compacted > snapshot.last_compacted
+    assert terminal.usage_delta == {
         "model_calls": 2,
         "input_tokens": 40,
         "output_tokens": 10,
         "total_tokens": 50,
     }
-    terminal = manager.terminal_commit_values()
-    assert terminal.pending_last_compacted == manager.pending_last_compacted
-    assert terminal.pending_action_summary == "Updated action"
-    assert terminal.usage_delta == manager.pending_compaction_usage
     terminal.usage_delta["model_calls"] = 99
-    assert manager.pending_compaction_usage["model_calls"] == 2
+    assert manager.terminal_commit_values().usage_delta["model_calls"] == 2
 
 
 def test_snapshot_copies_transcript_and_metadata_without_retaining_session(
@@ -336,17 +472,77 @@ async def test_controller_detaches_from_the_supplied_snapshot(workspace: Path) -
     snapshot.messages[0]["content"] = "mutated outside controller"
     assert isinstance(snapshot.metadata, dict)
     snapshot.metadata["summary"] = "mutated action"
-    result = await _prepare_controller(
+    await _prepare_controller(
         controller,
         context_window=1_000,
         max_output=200,
         memory_route_status=_memory_status(context_window=4_000),
     )
 
-    assert "original user" in str(result.selected_batch)
-    assert "mutated outside controller" not in str(result.selected_batch)
+    assert "original user" in str(_summary_payload(provider))
+    assert "mutated outside controller" not in str(_summary_payload(provider))
     assert "original action" in str(provider.complete_requests[1].messages)
     assert "mutated action" not in str(provider.complete_requests[1].messages)
+
+
+@pytest.mark.asyncio
+async def test_prepare_run_start_returns_a_detached_message_tuple(workspace: Path) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    _add_tool_run(session, "history", result_size=20)
+    provider = ScriptedFakeProvider()
+    controller = _controller(workspace, session, provider)
+    kwargs: dict[str, Any] = {
+        "project_messages": _project_messages_with_tool_calls,
+        "route_context_window": 10_000,
+        "route_max_output": 100,
+    }
+
+    first = await controller.prepare_run_start(**kwargs)
+    terminal = controller.terminal_commit_values()
+    assert isinstance(first, tuple)
+    first_assistant = next(message for message in first if message["role"] == "assistant")
+    first_assistant["tool_calls"][0]["arguments"] = '{"mutated": true}'
+
+    second = await controller.prepare_run_start(**kwargs)
+    second_assistant = next(message for message in second if message["role"] == "assistant")
+
+    assert isinstance(second, tuple)
+    assert second_assistant["tool_calls"][0]["arguments"] == "{}"
+    assert controller.terminal_commit_values() == terminal
+    assert provider.complete_requests == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_react_returns_a_detached_message_tuple(workspace: Path) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    provider = ScriptedFakeProvider()
+    controller = _controller(workspace, session, provider)
+    increment = _react_cycle("current", size=20)
+    kwargs: dict[str, Any] = {
+        "project_messages": _project_messages_with_tool_calls,
+        "increment": increment,
+        "latest_cycle_start": 0,
+        "route_context_window": 10_000,
+        "route_max_output": 100,
+        "current_user": {"role": "user", "content": "current request"},
+    }
+
+    first = await controller.prepare_react(**kwargs)
+    terminal = controller.terminal_commit_values()
+    assert isinstance(first, tuple)
+    first_assistant = next(message for message in first if message["role"] == "assistant")
+    first_assistant["tool_calls"][0]["arguments"] = '{"mutated": true}'
+
+    second = await controller.prepare_react(**kwargs)
+    second_assistant = next(message for message in second if message["role"] == "assistant")
+
+    assert isinstance(second, tuple)
+    assert second_assistant["tool_calls"][0]["arguments"] == "{}"
+    assert increment[0]["tool_calls"][0]["arguments"] == "{}"
+    assert controller.terminal_commit_values() == terminal
+    assert provider.complete_requests == []
 
 
 @pytest.mark.asyncio
@@ -370,11 +566,12 @@ async def test_multiple_runs_under_ten_percent_keep_latest_run(
         memory_route_status=_memory_status(context_window=4_000),
     )
 
-    assert result.compacted is True
     fact_payload = str(provider.complete_requests[0].messages[1]["content"])
     assert "old user" in fact_payload
     assert "middle user" in fact_payload
     assert "latest user" not in fact_payload
+    assert "latest user" in str(result)
+    assert controller.terminal_commit_values().pending_last_compacted > 0
 
 
 @pytest.mark.asyncio
@@ -436,15 +633,19 @@ async def test_single_completed_run_selects_its_entire_cursor_suffix(
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
 
-    result = await _prepare_controller(
+    await _prepare_controller(
         controller,
         context_window=800,
         max_output=200,
         memory_route_status=_memory_status(context_window=4_000),
     )
 
-    assert [message["role"] for message in result.selected_batch] == ["user", "assistant"]
+    assert [message["role"] for message in _summary_payload(provider)] == [
+        "user",
+        "assistant",
+    ]
     assert "only user" in str(provider.complete_requests[0].messages[1]["content"])
+    assert controller.terminal_commit_values().pending_last_compacted == len(session.messages)
 
 
 @pytest.mark.asyncio
@@ -471,16 +672,12 @@ async def test_react_current_run_at_exactly_fifty_percent_keeps_current_run_and_
         memory_route_status=_memory_status(context_window=10_000),
     )
 
-    assert result.compacted is True
-    assert controller.current_user_compacted is False
-    assert [message["content"] for message in result.selected_batch] == [
+    assert [message["content"] for message in _summary_payload(provider)] == [
         message["content"] for message in session.messages
     ]
-    assert "current request" not in str(result.selected_batch)
-    assert (
-        all(message.get("content") != "current request" for message in result.retained_messages)
-        is False
-    )
+    assert "current request" not in str(_summary_payload(provider))
+    assert sum(message.get("content") == "current request" for message in result) == 1
+    assert controller.terminal_commit_values().pending_last_compacted == len(session.messages)
 
 
 @pytest.mark.asyncio
@@ -507,15 +704,15 @@ async def test_react_sole_current_run_may_compact_at_or_below_fifty_percent(
         memory_route_status=_memory_status(context_window=10_000),
     )
 
-    assert result.compacted is True
-    assert controller.current_user_compacted is True
-    assert result.selected_batch[0] == current_user
-    assert result.retained_messages[-1]["content"].startswith("current result")
+    assert _summary_payload(provider)[0] == current_user
+    assert result[-1]["content"].startswith("current result")
+    assert sum(message.get("content") == "current request" for message in result) == 1
+    assert controller.terminal_commit_values().pending_last_compacted == 1
 
     response = _response("final answer")
     response_message = response.message.to_dict()
     context = controller.record_main_agent_response(
-        request_messages=result.retained_messages,
+        request_messages=result,
         tools=(),
         response=response,
         increment=[*increment, response_message],
@@ -557,14 +754,9 @@ async def test_react_current_run_just_above_fifty_percent_may_select_early_curre
         memory_route_status=_memory_status(context_window=10_000),
     )
 
-    assert result.compacted is True
-    assert controller.current_user_compacted is True
-    assert "current request" in str(result.selected_batch)
-    assert result.retained_messages[-1]["content"].startswith("current result")
-    assert (
-        sum(message.get("content") == "current request" for message in result.retained_messages)
-        == 1
-    )
+    assert "current request" in str(_summary_payload(provider))
+    assert result[-1]["content"].startswith("current result")
+    assert sum(message.get("content") == "current request" for message in result) == 1
 
 
 @pytest.mark.asyncio
@@ -623,10 +815,9 @@ async def test_react_compaction_consumes_only_new_batch_after_current_user_is_co
         **kwargs,
     )
 
-    assert first.compacted is True
-    assert second.compacted is True
-    assert controller.current_user_compacted is True
-    assert controller.pending_last_compacted == 5
+    assert first != second
+    assert len(provider.complete_requests) == 4
+    assert controller.terminal_commit_values().pending_last_compacted == 5
     second_fact = str(provider.complete_requests[2].messages[1]["content"])
     second_action = str(provider.complete_requests[3].messages[1]["content"])
     assert "early assistant" not in second_fact
@@ -634,10 +825,7 @@ async def test_react_compaction_consumes_only_new_batch_after_current_user_is_co
     assert "current request" not in second_fact
     assert "latest result" in second_fact
     assert "current request" not in second_action
-    assert (
-        sum(message.get("content") == "current request" for message in second.retained_messages)
-        == 1
-    )
+    assert sum(message.get("content") == "current request" for message in second) == 1
 
 
 @pytest.mark.asyncio
@@ -862,10 +1050,10 @@ async def test_react_action_failure_keeps_fact_and_retries_only_the_pending_acti
 
     with pytest.raises(ModelCallError, match="action failed"):
         await controller.prepare_react(**kwargs)
-    assert controller.pending_last_compacted == 0
-    assert controller.pending_action_summary is None
-    assert controller.current_user_compacted is False
-    assert controller.pending_compaction_usage["model_calls"] == 1
+    failed_values = controller.terminal_commit_values()
+    assert failed_values.pending_last_compacted == 0
+    assert failed_values.pending_action_summary is None
+    assert failed_values.usage_delta["model_calls"] == 1
     assert len(provider.complete_requests) == 2
 
     with pytest.raises(ModelCallError, match="action failed"):
@@ -873,10 +1061,10 @@ async def test_react_action_failure_keeps_fact_and_retries_only_the_pending_acti
     assert len(provider.complete_requests) == 2
 
     recovered = await controller.prepare_react(**kwargs, continuation_revision=1)
-    assert recovered.compacted is True
-    assert controller.pending_last_compacted == 1
-    assert controller.pending_action_summary == "recovered action"
-    assert controller.current_user_compacted is True
+    recovered_values = controller.terminal_commit_values()
+    assert recovered_values.pending_last_compacted == 1
+    assert recovered_values.pending_action_summary == "recovered action"
+    assert sum(message.get("content") == "current request" for message in recovered) == 1
     assert (state.memory_directory / "summary.jsonl").read_text(encoding="utf-8").count(
         '"content":"facts"'
     ) == 1
@@ -912,7 +1100,7 @@ async def test_cursor_intersects_recovered_run_boundary_without_selecting_fragme
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
 
-    result = await _prepare_controller(
+    await _prepare_controller(
         controller,
         current_user="cursor current " + "c" * 2_000,
         context_window=1_200,
@@ -920,8 +1108,10 @@ async def test_cursor_intersects_recovered_run_boundary_without_selecting_fragme
         memory_route_status=_memory_status(context_window=4_000),
     )
 
-    assert tuple(message["role"] for message in result.selected_batch) == expected_roles
-    assert controller.pending_last_compacted == cursor + len(expected_roles)
+    assert tuple(message["role"] for message in _summary_payload(provider)) == expected_roles
+    assert controller.terminal_commit_values().pending_last_compacted == cursor + len(
+        expected_roles
+    )
 
 
 @pytest.mark.asyncio
@@ -985,13 +1175,12 @@ async def test_consecutive_staging_consumes_only_new_batch_and_replaces_action_s
         **kwargs,
     )
 
-    assert first.selected_batch
-    assert second.selected_batch
+    assert first != second
     assert "first user" in str(provider.complete_requests[0].messages[1]["content"])
     assert "first user" not in str(provider.complete_requests[2].messages[1]["content"])
     assert "latest user" in str(provider.complete_requests[2].messages[1]["content"])
     assert "action one" in str(provider.complete_requests[3].messages[1]["content"])
-    assert controller.pending_action_summary == "action two"
+    assert controller.terminal_commit_values().pending_action_summary == "action two"
     assert len(provider.complete_requests) == 4
 
 
@@ -1013,7 +1202,7 @@ async def test_action_none_stages_removal_of_previous_action_summary(
         memory_route_status=_memory_status(context_window=4_000),
     )
 
-    assert controller.pending_action_summary is None
+    assert controller.terminal_commit_values().pending_action_summary is None
     assert "previous action" in str(provider.complete_requests[1].messages[1]["content"])
 
 
@@ -1044,9 +1233,10 @@ async def test_fact_model_failure_does_not_stage_cursor_action_or_summary(
             memory_route_status=_memory_status(context_window=4_000),
         )
 
-    assert controller.pending_last_compacted == 0
-    assert controller.pending_action_summary == "previous action"
-    assert controller.pending_compaction_usage["model_calls"] == 0
+    terminal = controller.terminal_commit_values()
+    assert terminal.pending_last_compacted == 0
+    assert terminal.pending_action_summary == "previous action"
+    assert terminal.usage_delta["model_calls"] == 0
     assert not (state.memory_directory / "summary.jsonl").exists()
     assert len(provider.complete_requests) == 1
 
@@ -1073,9 +1263,10 @@ async def test_fact_persistence_failure_keeps_batch_uncommitted_but_stages_usage
             memory_route_status=_memory_status(context_window=4_000),
         )
 
-    assert controller.pending_last_compacted == 0
-    assert controller.pending_action_summary == "previous action"
-    assert controller.pending_compaction_usage == {
+    terminal = controller.terminal_commit_values()
+    assert terminal.pending_last_compacted == 0
+    assert terminal.pending_action_summary == "previous action"
+    assert terminal.usage_delta == {
         "model_calls": 1,
         "input_tokens": 7,
         "output_tokens": 3,
@@ -1106,9 +1297,10 @@ async def test_action_failure_keeps_fact_and_earlier_staged_state_without_advanc
     with pytest.raises(ModelCallError):
         await _prepare_controller(controller, **kwargs)
 
-    assert controller.pending_last_compacted == 0
-    assert controller.pending_action_summary == "previous action"
-    assert controller.pending_compaction_usage["model_calls"] == 1
+    failed_values = controller.terminal_commit_values()
+    assert failed_values.pending_last_compacted == 0
+    assert failed_values.pending_action_summary == "previous action"
+    assert failed_values.usage_delta["model_calls"] == 1
     assert "facts" in (state.memory_directory / "summary.jsonl").read_text(encoding="utf-8")
     assert len(provider.complete_requests) == 2
 
@@ -1119,11 +1311,12 @@ async def test_action_failure_keeps_fact_and_earlier_staged_state_without_advanc
     recovered = await _prepare_controller(controller, current_user="changed user", **kwargs)
 
     summary_content = (state.memory_directory / "summary.jsonl").read_text(encoding="utf-8")
-    assert recovered.compacted is True
+    recovered_values = controller.terminal_commit_values()
     assert summary_content.count('"content":"facts"') == 1
-    assert controller.pending_last_compacted == len(session.messages)
-    assert controller.pending_action_summary == "recovered action"
-    assert controller.pending_compaction_usage["model_calls"] == 2
+    assert recovered_values.pending_last_compacted == len(session.messages)
+    assert recovered_values.pending_action_summary == "recovered action"
+    assert recovered_values.usage_delta["model_calls"] == 2
+    assert "changed user" in str(recovered)
     assert len(provider.complete_requests) == 3
 
 
@@ -1158,9 +1351,10 @@ async def test_action_finish_failure_keeps_orphan_fact_and_usage_without_advanci
         )
 
     assert raised.value.error.code == error_code
-    assert controller.pending_last_compacted == 0
-    assert controller.pending_action_summary == "previous action"
-    assert controller.pending_compaction_usage == {
+    terminal = controller.terminal_commit_values()
+    assert terminal.pending_last_compacted == 0
+    assert terminal.pending_action_summary == "previous action"
+    assert terminal.usage_delta == {
         "model_calls": 2,
         "input_tokens": 28,
         "output_tokens": 8,
@@ -1179,18 +1373,20 @@ async def test_summary_hard_overflow_is_rejected_before_provider_call(
     _add_run(session, "old", size=800)
     provider = ScriptedFakeProvider()
     controller = _controller(workspace, session, provider)
+    kwargs: dict[str, Any] = {
+        "context_window": 1_000,
+        "max_output": 200,
+        "memory_route_status": _memory_status(context_window=20, max_output=10),
+    }
 
     with pytest.raises(ModelCallError) as raised:
-        await _prepare_controller(
-            controller,
-            context_window=1_000,
-            max_output=200,
-            memory_route_status=_memory_status(context_window=20, max_output=10),
-        )
+        await _prepare_controller(controller, **kwargs)
+    with pytest.raises(ModelCallError) as repeated:
+        await _prepare_controller(controller, **kwargs)
 
     assert raised.value.error.code == "model_context_overflow"
+    assert repeated.value is raised.value
     assert provider.complete_requests == []
-    assert controller.checked_context_revision is not None
 
 
 @pytest.mark.asyncio
@@ -1213,9 +1409,10 @@ async def test_action_replacement_is_checked_against_the_final_hard_limit(
         await _prepare_controller(controller, **kwargs)
 
     assert raised.value.error.code == "model_context_overflow"
-    assert controller.pending_last_compacted == len(session.messages)
-    assert controller.pending_action_summary == oversized_action
-    assert controller.pending_compaction_usage["model_calls"] == 2
+    terminal = controller.terminal_commit_values()
+    assert terminal.pending_last_compacted == len(session.messages)
+    assert terminal.pending_action_summary == oversized_action
+    assert terminal.usage_delta["model_calls"] == 2
     assert len(provider.complete_requests) == 2
 
     with pytest.raises(ModelCallError):
@@ -1224,7 +1421,7 @@ async def test_action_replacement_is_checked_against_the_final_hard_limit(
 
 
 @pytest.mark.asyncio
-async def test_latest_usage_context_uses_only_compatible_main_agent_assistant(
+async def test_compatible_main_agent_usage_changes_the_run_start_compaction_decision(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
@@ -1245,7 +1442,7 @@ async def test_latest_usage_context_uses_only_compatible_main_agent_assistant(
             "selected_route": "chat",
             "provider_id": "provider",
             "model": "model",
-            "context_window": 1_600,
+            "context_window": 360,
             "max_output": 200,
             "anchor_estimated_tokens": 20,
             "estimator_version": "utf8-bytes-div4-v1",
@@ -1253,20 +1450,69 @@ async def test_latest_usage_context_uses_only_compatible_main_agent_assistant(
             "run_projection_source": "estimated",
         },
     )
-    controller = _controller(workspace, session, ScriptedFakeProvider())
+    provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
+    controller = _controller(workspace, session, provider)
 
     result = await _prepare_controller(
         controller,
-        context_window=1_600,
+        context_window=360,
+        max_output=200,
+        memory_route_status=_memory_status(context_window=4_000),
+        provider_id="provider",
+        model="model",
+    )
+
+    assert len(provider.complete_requests) == 2
+    assert "old user" in str(_summary_payload(provider))
+    assert sum(message.get("content") == "new user" for message in result) == 1
+    terminal = controller.terminal_commit_values()
+    assert terminal.pending_last_compacted == len(session.messages)
+    assert terminal.usage_delta["model_calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_latest_assistant_without_provenance_forces_run_start_local_estimate(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    session.add_message("user", "older user")
+    session.add_message(
+        "assistant",
+        "older answer",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage=_usage(100, 10),
+        context_usage=_context_usage(context_window=360),
+    )
+    session.add_message("user", "latest user")
+    session.add_message(
+        "assistant",
+        "latest answer without provenance",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage=_usage(20, 5),
+    )
+    provider = ScriptedFakeProvider()
+    controller = _controller(workspace, session, provider)
+
+    retained = await _prepare_controller(
+        controller,
+        context_window=360,
         max_output=200,
         provider_id="provider",
         model="model",
     )
 
-    assert controller.latest_usage_context is not None
-    assert controller.latest_usage_context.provider_id == "provider"
-    assert result.projection_source == "reported_delta"
-    assert controller.pending_compaction_usage["model_calls"] == 0
+    assert provider.complete_requests == []
+    assert "older user" in str(retained)
+    assert "latest answer without provenance" in str(retained)
+    assert "new user" in str(retained)
+    terminal = controller.terminal_commit_values()
+    assert terminal.pending_last_compacted == 0
+    assert terminal.usage_delta["model_calls"] == 0
 
 
 @pytest.mark.asyncio
@@ -1291,7 +1537,7 @@ async def test_main_response_provenance_anchors_completed_response_and_then_uses
     first_message = first.message.to_dict()
 
     first_context = controller.record_main_agent_response(
-        request_messages=preparation.retained_messages,
+        request_messages=preparation,
         tools=tools,
         response=first,
         increment=[first_message],
@@ -1307,7 +1553,7 @@ async def test_main_response_provenance_anchors_completed_response_and_then_uses
 
     assert first_context.run_projection_source == "estimated"
     assert first_context.anchor_estimated_tokens == estimate_request_tokens(
-        [*preparation.retained_messages, first_message], tools
+        [*preparation, first_message], tools
     )
 
     tool_message = {
@@ -1316,7 +1562,7 @@ async def test_main_response_provenance_anchors_completed_response_and_then_uses
         "name": "read_file",
         "content": "tool result",
     }
-    second_request = [*preparation.retained_messages, first_message, tool_message]
+    second_request = [*preparation, first_message, tool_message]
     second = _response("second answer", input_tokens=24, output_tokens=6)
     second_message = second.message.to_dict()
     second_context = controller.record_main_agent_response(
@@ -1361,7 +1607,7 @@ async def test_incompatible_latest_main_usage_does_not_fall_back_to_an_older_anc
                 "selected_route": "chat",
                 "provider_id": provider_id,
                 "model": "model",
-                "context_window": 1_600,
+                "context_window": 360,
                 "max_output": 200,
                 "anchor_estimated_tokens": 20,
                 "estimator_version": "utf8-bytes-div4-v1",
@@ -1369,19 +1615,24 @@ async def test_incompatible_latest_main_usage_does_not_fall_back_to_an_older_anc
                 "run_projection_source": "estimated",
             },
         )
-    controller = _controller(workspace, session, ScriptedFakeProvider())
+    provider = ScriptedFakeProvider()
+    controller = _controller(workspace, session, provider)
 
     result = await _prepare_controller(
         controller,
-        context_window=1_600,
+        context_window=360,
         max_output=200,
         provider_id="provider",
         model="model",
     )
 
-    assert controller.latest_usage_context is not None
-    assert controller.latest_usage_context.provider_id == "other-provider"
-    assert result.projection_source == "estimated"
+    assert provider.complete_requests == []
+    assert "older user" in str(result)
+    assert "latest user" in str(result)
+    assert "new user" in str(result)
+    terminal = controller.terminal_commit_values()
+    assert terminal.pending_last_compacted == 0
+    assert terminal.usage_delta["model_calls"] == 0
 
 
 @pytest.mark.asyncio
@@ -1400,13 +1651,11 @@ async def test_same_context_revision_is_a_noop_after_successful_staging(
     }
 
     first = await _prepare_controller(controller, **kwargs)
+    first_values = controller.terminal_commit_values()
     second = await _prepare_controller(controller, **kwargs)
 
-    assert first.compacted is True
-    assert second.compacted is False
-    assert second.selected_batch == ()
-    assert second.context_revision == first.context_revision
-    assert controller.checked_context_revision == first.context_revision
+    assert second == first
+    assert controller.terminal_commit_values() == first_values
     assert len(provider.complete_requests) == 2
 
 
@@ -1451,7 +1700,7 @@ async def test_request_preparer_reuses_run_start_revision_without_duplicate_summ
 
 
 @pytest.mark.asyncio
-async def test_runner_final_projection_is_the_stable_checked_revision(
+async def test_runner_final_projection_is_stable_across_repeated_preparation(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
@@ -1471,14 +1720,12 @@ async def test_runner_final_projection_is_the_stable_checked_revision(
         tools=(),
         continuation_revision=0,
     )
-    preparation_revision = controller.checked_context_revision
     provider_projection = deepcopy(first)
     provider_projection[-1]["content"] = "[read_file result omitted from context]"
     preparer.observe_request_projection(
         provider_projection,
         micro_compression_enabled=True,
     )
-    finalized_revision = controller.checked_context_revision
     second = await preparer.prepare(
         [],
         increment=(),
@@ -1486,15 +1733,13 @@ async def test_runner_final_projection_is_the_stable_checked_revision(
         tools=(),
         continuation_revision=0,
     )
-    assert controller.checked_context_revision == finalized_revision
     preparer.observe_request_projection(
         provider_projection,
         micro_compression_enabled=True,
     )
 
-    assert finalized_revision != preparation_revision
     assert second == first
-    assert controller.checked_context_revision == finalized_revision
+    assert sum(message.get("content") == "current request" for message in second) == 1
 
 
 @pytest.mark.asyncio
@@ -1508,19 +1753,37 @@ async def test_react_revision_changes_for_each_model_visible_input_source(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    controller = _controller(workspace, session, ScriptedFakeProvider())
+    _add_run(session, "old", size=800)
+    failure = ModelCallError(ErrorInfo("model_failed", "summary failed"))
+    provider = ScriptedFakeProvider(completions=(failure, failure))
+    controller = _controller(workspace, session, provider)
+    base_status = ModelRouteStatus(
+        requested_route="chat",
+        selected_route="chat",
+        provider_id="provider",
+        model="model",
+        context_window=1_000,
+        max_output=200,
+        used_default=False,
+    )
     base: dict[str, Any] = {
         "project_messages": _project_messages,
         "increment": (),
         "latest_cycle_start": None,
-        "route_context_window": 4_000,
-        "route_max_output": 100,
+        "route_context_window": 1_000,
+        "route_max_output": 200,
         "current_user": {"role": "user", "content": "current request"},
         "tools": (),
+        "compact_ratio": 0.5,
+        "route_status": base_status,
+        "memory_route_status": _memory_status(context_window=4_000),
         "continuation_revision": 0,
     }
-    await controller.prepare_react(**base)
-    first_revision = controller.checked_context_revision
+    with pytest.raises(ModelCallError, match="summary failed"):
+        await controller.prepare_react(**base)
+    with pytest.raises(ModelCallError, match="summary failed"):
+        await controller.prepare_react(**base)
+    assert len(provider.complete_requests) == 1
 
     changed = dict(base)
     if change == "message":
@@ -1535,8 +1798,8 @@ async def test_react_revision_changes_for_each_model_visible_input_source(
             selected_route="default",
             provider_id="other-provider",
             model="other-model",
-            context_window=4_000,
-            max_output=100,
+            context_window=1_000,
+            max_output=200,
             used_default=True,
         )
     elif change == "capacity":
@@ -1545,8 +1808,8 @@ async def test_react_revision_changes_for_each_model_visible_input_source(
             selected_route="chat",
             provider_id="provider",
             model="model",
-            context_window=3_900,
-            max_output=100,
+            context_window=900,
+            max_output=200,
             used_default=False,
         )
     elif change == "estimator":
@@ -1556,9 +1819,10 @@ async def test_react_revision_changes_for_each_model_visible_input_source(
     else:
         changed["micro_compression_enabled"] = True
 
-    await controller.prepare_react(**changed)
+    with pytest.raises(ModelCallError, match="summary failed"):
+        await controller.prepare_react(**changed)
 
-    assert controller.checked_context_revision != first_revision
+    assert len(provider.complete_requests) == 2
 
 
 @pytest.mark.asyncio
@@ -1584,8 +1848,8 @@ async def test_request_preparer_refreshes_route_identity_for_each_request(
                 selected_route="default",
                 provider_id="provider-two",
                 model="model-two",
-                context_window=3_000,
-                max_output=200,
+                context_window=20,
+                max_output=10,
                 used_default=True,
             ),
         )
@@ -1598,23 +1862,24 @@ async def test_request_preparer_refreshes_route_identity_for_each_request(
         route_status=lambda: next(statuses),
     )
 
-    await preparer.prepare(
+    first = await preparer.prepare(
         [],
         increment=(),
         latest_cycle_start=None,
         tools=(),
         continuation_revision=0,
     )
-    first_revision = controller.checked_context_revision
-    await preparer.prepare(
-        [],
-        increment=(),
-        latest_cycle_start=None,
-        tools=(),
-        continuation_revision=1,
-    )
+    with pytest.raises(ModelCallError) as raised:
+        await preparer.prepare(
+            [],
+            increment=(),
+            latest_cycle_start=None,
+            tools=(),
+            continuation_revision=1,
+        )
 
-    assert controller.checked_context_revision != first_revision
+    assert sum(message.get("content") == "request" for message in first) == 1
+    assert raised.value.error.code == "model_context_overflow"
 
 
 @pytest.mark.asyncio
@@ -1643,7 +1908,9 @@ async def test_action_summary_is_part_of_the_model_visible_revision(workspace: P
         current_user={"role": "user", "content": "request"},
     )
 
-    assert first_result.context_revision != second_result.context_revision
+    assert first_result != second_result
+    assert "first action" in str(first_result)
+    assert "second action" in str(second_result)
 
 
 @pytest.mark.asyncio
@@ -1701,10 +1968,9 @@ async def test_react_preparer_compacts_early_sole_run_and_preserves_latest_cycle
         memory_route_status=_memory_status(context_window=10_000),
     )
 
-    assert result.compacted is True
-    assert controller.current_user_compacted is True
-    assert controller.pending_last_compacted == 3
-    assert [message["role"] for message in result.selected_batch] == [
+    terminal = controller.terminal_commit_values()
+    assert terminal.pending_last_compacted == 3
+    assert [message["role"] for message in _summary_payload(provider)] == [
         "user",
         "assistant",
         "tool",
@@ -1716,13 +1982,10 @@ async def test_react_preparer_compacts_early_sole_run_and_preserves_latest_cycle
     assert action_payload.count("complete early result") == 1
     assert "complete latest result" not in fact_payload
     assert "complete latest result" not in action_payload
-    assert (
-        sum(message.get("content") == "current instruction" for message in result.retained_messages)
-        == 1
-    )
+    assert sum(message.get("content") == "current instruction" for message in result) == 1
     assert any(
         message.get("content", "").startswith("complete latest result")
-        for message in result.retained_messages
+        for message in result
         if message.get("role") == "tool"
     )
     repeated = await controller.prepare_react(
@@ -1735,17 +1998,10 @@ async def test_react_preparer_compacts_early_sole_run_and_preserves_latest_cycle
         compact_ratio=0.5,
         memory_route_status=_memory_status(context_window=10_000),
     )
-    assert repeated.compacted is False
-    assert repeated.selected_batch == ()
-    assert repeated.context_revision == result.context_revision
+    assert repeated == result
+    assert controller.terminal_commit_values() == terminal
     assert len(provider.complete_requests) == 2
-    assert (
-        sum(
-            message.get("content") == "current instruction"
-            for message in repeated.retained_messages
-        )
-        == 1
-    )
+    assert sum(message.get("content") == "current instruction" for message in repeated) == 1
 
 
 @pytest.mark.asyncio
@@ -1788,9 +2044,13 @@ async def test_visible_tool_schema_change_rechecks_a_new_revision(
         ),
     )
 
-    assert first.context_revision != second.context_revision
-    assert second.compacted is True
+    assert first != second
     assert len(provider.complete_requests) == 4
+    assert "first user" not in str(_summary_payload(provider, 2))
+    assert "latest user" in str(_summary_payload(provider, 2))
+    terminal = controller.terminal_commit_values()
+    assert terminal.pending_action_summary == "action two"
+    assert terminal.usage_delta["model_calls"] == 4
 
 
 def _estimate_latest_run(session: Session) -> int:

@@ -20,6 +20,7 @@ import pytest
 from loguru import logger
 
 import myclaw.agent.loop as loop_module
+import myclaw.agent.memory.conversation_compactor as compactor_module
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context_budget import estimate_request_tokens
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ModelContextOverflowError
@@ -36,6 +37,7 @@ from myclaw.config.config import ConfigLoader
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.logging.session import session_log as real_session_log
 from myclaw.provider.errors import ModelCallError
+from myclaw.provider.model_router import ModelRouter, ModelRouteStatus
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
@@ -57,10 +59,13 @@ from tests.agent.test_context import _FrozenDateTime
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import (
     BlockingTaskFramingRouterAdapter,
+    ScriptedFakeProvider,
+    StreamScript,
     TaskFramingRouterAdapter,
     collect_foreground_outbound,
 )
 from tests.fixtures.diagnostic_capture import capture_diagnostics
+from tests.management.factories import management_service
 
 
 class _Clock:
@@ -456,6 +461,28 @@ def _response(
         ),
         finish_reason="stop",
     )
+
+
+def _status_context_usage(
+    *,
+    selected_route: str,
+    provider_id: str,
+    model: str,
+    context_window: int,
+    max_output: int,
+) -> dict[str, object]:
+    return {
+        "requested_route": "chat",
+        "selected_route": selected_route,
+        "provider_id": provider_id,
+        "model": model,
+        "context_window": context_window,
+        "max_output": max_output,
+        "anchor_estimated_tokens": 20,
+        "estimator_version": "utf8-bytes-div4-v1",
+        "run_projected_tokens": 80,
+        "run_projection_source": "estimated",
+    }
 
 
 def _framing_response(
@@ -1009,6 +1036,7 @@ async def test_replacement_barrier_blocks_a_late_foreground_commit_until_release
 @pytest.mark.asyncio
 async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effect_free(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     router = _Router(())
     loop, session, _bus = _runtime(tmp_path, router)
@@ -1054,6 +1082,16 @@ async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effec
     messages_before = deepcopy(session.messages)
     metadata_before = deepcopy(session.metadata)
     tasks_before = set(asyncio.all_tasks())
+    selector_inputs: list[Sequence[dict[str, Any]]] = []
+    original_selector = compactor_module.latest_main_agent_usage_anchor
+
+    def observe_selector(
+        messages: Sequence[dict[str, Any]],
+    ) -> tuple[object, dict[str, int]] | None:
+        selector_inputs.append(messages)
+        return original_selector(messages)
+
+    monkeypatch.setattr(loop_module, "latest_main_agent_usage_anchor", observe_selector)
     object.__setattr__(loop, "_session", spy)
     try:
         projection = loop.runtime_status_input()
@@ -1071,6 +1109,7 @@ async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effec
     assert session._pending_persist is None
     assert set(asyncio.all_tasks()) == tasks_before
     assert router.calls == []
+    assert selector_inputs == [session.messages]
     assert loop._consumer_task is None
     assert isinstance(projection.projected_messages, tuple)
     assert isinstance(projection.cumulative_usage, tuple)
@@ -1088,6 +1127,230 @@ async def _terminals(bus: MessageBus, count: int) -> list[OutboundMessage]:
         if message.metadata.get("_streamed") is True:
             terminals.append(message)
     return terminals
+
+
+def test_agent_loop_status_uses_the_configured_static_default_route(tmp_path: Path) -> None:
+    router = _Router(())
+    loop, session, _bus = _runtime(tmp_path, router)
+
+    status = loop.runtime_status_input()
+
+    assert (
+        status.requested_route,
+        status.selected_route,
+        status.provider_id,
+        status.model,
+        status.context_window,
+        status.max_output,
+    ) == ("chat", "default", "primary", "small-model", 8192, 1024)
+    assert status.chat_model == "primary/small-model"
+    assert router.calls == []
+    assert session._pending_persist is None
+
+
+@pytest.mark.asyncio
+async def test_status_treats_the_latest_assistant_as_the_usage_provenance_boundary(
+    tmp_path: Path,
+) -> None:
+    router = _Router(())
+    loop, session, _bus = _runtime(tmp_path, router)
+    session.add_message("user", "Older request")
+    session.add_message(
+        "assistant",
+        "Older response",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "total_tokens": 110,
+        },
+        context_usage=_status_context_usage(
+            selected_route="default",
+            provider_id="primary",
+            model="small-model",
+            context_window=8192,
+            max_output=1024,
+        ),
+    )
+    management = management_service(
+        AgentHome(tmp_path / "agent-home"),
+        current_agent_loop=lambda: loop,
+        workspace_state=session.workspace_state,
+    )
+
+    reported = await management.status()
+
+    session.add_message("user", "New request")
+    session.add_message(
+        "assistant",
+        "New response without provenance",
+        tool_calls=[],
+        status="completed",
+        error=None,
+        token_usage={
+            "model_calls": 1,
+            "input_tokens": 20,
+            "output_tokens": 5,
+            "total_tokens": 25,
+        },
+    )
+    estimated = await management.status()
+
+    assert reported.projection_source == "reported_delta"
+    assert estimated.projection_source == "estimated"
+    assert router.calls == []
+    assert session._pending_persist is None
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_status_after_dynamic_fallback_projects_the_next_configured_chat_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = """[models.providers.chat-provider]
+protocol = "openai-compatible"
+base_url = "https://chat.example/v1"
+api_key = "chat-secret"
+models = ["chat-model"]
+
+[models.providers.default-provider]
+protocol = "anthropic"
+base_url = "https://default.example/v1"
+api_key = "default-secret"
+models = ["default-model"]
+
+[runtime]
+compact_ratio = 0.9
+
+[models.routes.chat]
+provider_id = "chat-provider"
+model = "chat-model"
+context_window = 32000
+max_output = 2048
+temperature = 0
+timeout = 30
+
+[models.routes.default]
+provider_id = "default-provider"
+model = "default-model"
+context_window = 16000
+max_output = 1024
+temperature = 0
+timeout = 30
+"""
+    router_home = AgentHome(tmp_path / "router-home")
+    router_home.initialize()
+    (router_home.path / "config.toml").write_text(config, encoding="utf-8")
+    router_configuration = ConfigLoader(router_home).load()
+    chat_provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(),
+                error=ModelCallError(ErrorInfo("provider_auth_error", "Use fallback.")),
+            ),
+            StreamScript(events=(ModelCompleted(response=_response("Configured chat.")),)),
+        )
+    )
+    default_provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(ModelCompleted(response=_response("Fallback.")),)),)
+    )
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    model_router = ModelRouter(
+        configuration=router_configuration,
+        provider_factory=lambda provider: providers[provider.provider_id],
+        jitter=None,
+    )
+    loop, session, bus = _runtime(tmp_path, model_router, config_text=config)
+    persist_calls: list[None] = []
+    attempt_statuses: list[ModelRouteStatus] = []
+    original_guard = compactor_module._agent_run_hard_guard
+
+    def capture_attempt_status(
+        route_status: ModelRouteStatus,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+    ) -> bool | None:
+        attempt_statuses.append(route_status)
+        return original_guard(route_status, messages, tools)
+
+    monkeypatch.setattr(compactor_module, "_agent_run_hard_guard", capture_attempt_status)
+    monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("Use fallback for this run."))
+        await _terminals(bus, 1)
+        assert len(chat_provider.stream_requests) == 1
+        assert len(default_provider.stream_requests) == 1
+        assert [status.selected_route for status in attempt_statuses] == ["chat", "default"]
+        assert persist_calls == [None]
+        fallback_context = session.messages[-1]["context_usage"]
+        assert fallback_context["selected_route"] == "default"
+        assert fallback_context["provider_id"] == "default-provider"
+
+        provider_counts = (
+            len(chat_provider.stream_requests),
+            len(default_provider.stream_requests),
+        )
+        persist_count = len(persist_calls)
+        status_input = loop.runtime_status_input()
+        status = await management_service(
+            AgentHome(tmp_path / "agent-home"),
+            current_agent_loop=lambda: loop,
+            workspace_state=session.workspace_state,
+        ).status()
+
+        assert (
+            status_input.requested_route,
+            status_input.selected_route,
+            status_input.provider_id,
+            status_input.model,
+            status_input.context_window,
+            status_input.max_output,
+        ) == ("chat", "chat", "chat-provider", "chat-model", 32000, 2048)
+        assert status_input.chat_model == "chat-provider/chat-model"
+        assert status.projection_source == "estimated"
+        assert (
+            len(chat_provider.stream_requests),
+            len(default_provider.stream_requests),
+        ) == provider_counts
+        assert len(persist_calls) == persist_count
+
+        attempt_count = len(attempt_statuses)
+        await bus.put_inbound(InboundMessage("Start the next independent run."))
+        await _terminals(bus, 1)
+
+        assert len(chat_provider.stream_requests) == 2
+        assert len(default_provider.stream_requests) == 1
+        assert len(attempt_statuses) == attempt_count + 1
+        next_attempt_status = attempt_statuses[-1]
+        assert (
+            next_attempt_status.requested_route,
+            next_attempt_status.selected_route,
+            next_attempt_status.provider_id,
+            next_attempt_status.model,
+            next_attempt_status.context_window,
+            next_attempt_status.max_output,
+        ) == (
+            status_input.requested_route,
+            status_input.selected_route,
+            status_input.provider_id,
+            status_input.model,
+            status_input.context_window,
+            status_input.max_output,
+        )
+        next_attempt = chat_provider.stream_requests[1]
+        assert (next_attempt.model, next_attempt.max_output) == ("chat-model", 2048)
+        assert persist_calls == [None, None]
+    finally:
+        await loop.close()
 
 
 def test_agent_loop_exposes_public_control_seam(tmp_path: Path) -> None:

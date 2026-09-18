@@ -113,14 +113,14 @@ CLI 负责组装运行时和管理组件生命周期。前台输入经终端与 
 
 ### `/status`
 
-前台和用户定时任务共用同一套上下文预算；Dream 不进入这套 Agent Run 预算。`/status` 的上下文字段定义如下：
+前台和用户定时任务共用同一套上下文预算；Dream 不进入这套 Agent Run 预算。`/status` 只基于当前已提交的 Conversation Session 和当前 User Configuration，投影下一次独立 Foreground Agent Run 的初始模型请求基线，不读取未提交的 run-local staged state。Route 字段来自当前配置解析出的初始 `chat` Model Route；未配置 `chat` 时可使用配置层面的静态 `default`，上一逻辑调用的动态 fallback 不会成为下一次调用的初始 Route。上下文字段定义如下：
 
-- `context_window`：当前聊天 Model Route 的总上下文窗口。
+- `context_window`：当前配置解析出的初始 `chat` Model Route 的总上下文窗口。
 - `max_output`：为模型输出预留的 token 上限。
 - `available_context`：可用于输入的预算，等于 `context_window - max_output`。
 - `compact_ratio`：实际生效的配置比例，默认 `0.9`。
 - `compact_context_window`：软压缩阈值，等于 `ceil(available_context * compact_ratio)`。
-- `projected_next_request_tokens`：下一次模型请求的投影 token 数；若最新兼容的 Provider 用量可作为锚点则使用报告增量，否则使用完整本地估算。
+- `projected_next_request_tokens`：上述下一次独立 Foreground Agent Run 初始模型请求的投影 token 数；仅当最新 main-Agent assistant 的 Provider 用量 provenance 合法且兼容时使用报告增量，缺失、非法或不兼容时使用完整本地估算，不跨过该 assistant 复用更早锚点。
 - `projection_source`：投影来源，`reported_delta` 表示报告用量增量，`estimated` 表示本地估算。
 - `input_budget_used_percent`：`projected_next_request_tokens / available_context * 100`，分母是可用输入预算。
 

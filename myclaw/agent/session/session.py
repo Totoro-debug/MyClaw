@@ -250,78 +250,6 @@ class Session:
         if updated_usage is not None:
             self.metadata["token_usage"] = updated_usage
 
-    def append_messages(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        metadata_updates: dict[str, Any] | None = None,
-        metadata_removals: tuple[str, ...] = (),
-        usage_delta: dict[str, int] | None = None,
-    ) -> None:
-        """Atomically append a validated Agent Run increment."""
-        self._ensure_not_abandoned()
-        if not isinstance(messages, list):
-            raise TypeError("messages must be a list")
-
-        copied_updates = _copy_metadata_updates(metadata_updates)
-        removals = _validate_metadata_removals(metadata_removals)
-        conflict = set(copied_updates).intersection(removals)
-        if conflict:
-            raise ValueError("metadata updates and removals cannot target the same key")
-        required_removals = {"title", "token_usage"}.intersection(removals)
-        if required_removals:
-            raise ValueError("required Session metadata cannot be removed")
-        usage_patch = _TOKEN_USAGE_PATCH_KEYS.intersection(copied_updates)
-        if usage_patch:
-            raise ValueError("token usage must be supplied through usage_delta")
-
-        copied_usage_delta: dict[str, Any] | None = None
-        if usage_delta is not None:
-            if not isinstance(usage_delta, dict):
-                raise TypeError("usage_delta must be a dictionary")
-            copied_usage_delta = _copy_json_object(usage_delta, field="usage_delta")
-            _validate_token_usage(copied_usage_delta, field="usage_delta")
-
-        candidate_metadata = copy.deepcopy(self.metadata)
-        _validate_metadata(candidate_metadata)
-        candidate_metadata.update(copied_updates)
-        for key in removals:
-            candidate_metadata.pop(key, None)
-        _validate_metadata(candidate_metadata)
-
-        updated_usage = copy.deepcopy(candidate_metadata["token_usage"])
-        if copied_usage_delta is not None:
-            updated_usage = _accumulate_token_usage(updated_usage, copied_usage_delta)
-
-        prepared: list[dict[str, Any]] = []
-        for index, record in enumerate(messages):
-            if not isinstance(record, dict):
-                raise TypeError(f"messages[{index}] must be a dictionary")
-            copied = _copy_json_object(record, field="message")
-            if "timestamp" in copied:
-                raise ValueError("timestamp is reserved for Session message timestamps")
-            copied["timestamp"] = format_rfc3339_milliseconds(self._clock_now())
-            try:
-                _validate_message(copied)
-            except KeyError as error:
-                raise ValueError(f"Session message is missing {error.args[0]}") from error
-            prepared.append(copied)
-
-            if copied["role"] == "assistant":
-                updated_usage = _accumulate_token_usage(
-                    updated_usage,
-                    copied["token_usage"],
-                )
-
-        candidate_metadata["token_usage"] = updated_usage
-        _validate_metadata(candidate_metadata)
-        metadata_changed = candidate_metadata != self.metadata
-
-        self.messages.extend(prepared)
-        if metadata_changed:
-            self.metadata.clear()
-            self.metadata.update(candidate_metadata)
-
     def commit_agent_run(
         self,
         messages: list[dict[str, Any]],
@@ -332,7 +260,7 @@ class Session:
         metadata_updates: dict[str, Any] | None = None,
         metadata_removals: tuple[str, ...] = (),
     ) -> None:
-        """Atomically publish one dormant Agent Run terminal increment."""
+        """Atomically publish one Agent Run terminal increment."""
         self._ensure_not_abandoned()
         if not isinstance(messages, list):
             raise TypeError("messages must be a list")

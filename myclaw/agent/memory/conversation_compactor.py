@@ -45,13 +45,12 @@ _COMPACTION_JSON_TRANSLATION = str.maketrans({"`": r"\u0060"})
 __all__ = [
     "AgentRunContextController",
     "AgentRunContextModelRouter",
-    "AgentRunContextPreparation",
     "AgentRunContextRequestPreparer",
     "AgentRunContextRouterAdapter",
     "AgentRunContextSnapshot",
     "AgentRunRouter",
-    "AgentRunStagedValues",
     "AgentRunTerminalCommitValues",
+    "latest_main_agent_usage_anchor",
 ]
 
 
@@ -121,41 +120,12 @@ class AgentRunContextSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class AgentRunStagedValues:
-    """Detached values that a later terminal Session commit may publish."""
-
-    pending_last_compacted: int
-    pending_action_summary: str | None
-    pending_compaction_usage: Mapping[str, int]
-    current_user_compacted: bool
-    latest_usage_context: ContextUsageSnapshot | None
-    checked_context_revision: str | None
-
-
-@dataclass(frozen=True, slots=True)
 class AgentRunTerminalCommitValues:
     """Detached values accepted by ``Session.commit_agent_run``."""
 
     pending_last_compacted: int
     pending_action_summary: str | None
     usage_delta: dict[str, int]
-
-
-@dataclass(frozen=True, slots=True)
-class AgentRunContextPreparation:
-    """Result of checking one run-start request against the staged controller."""
-
-    selected_batch: tuple[dict[str, Any], ...]
-    projected_tokens: int
-    projection_source: ProjectionSource
-    context_revision: str
-    compacted: bool
-    retained_messages: tuple[dict[str, Any], ...] = ()
-
-    @property
-    def selected_messages(self) -> tuple[dict[str, Any], ...]:
-        """Alias used by callers that name the selected raw batch messages."""
-        return self.selected_batch
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +150,7 @@ class _ReactRevisionObservation:
 
 
 class AgentRunContextController:
-    """Run-local staged context state shared by Run-start and future ReAct preparation."""
+    """Run-local staged context state shared by Run-start and ReAct preparation."""
 
     def __init__(
         self,
@@ -208,11 +178,9 @@ class AgentRunContextController:
         )
         self._pending_compaction_usage = _empty_usage()
         self._current_user_compacted = False
-        self._usage_history = _main_agent_usage_history(snapshot.messages)
-        self._latest_usage_context = self._usage_history[0][0] if self._usage_history else None
-        self._base_context_revision: str | None = None
+        usage_anchor = latest_main_agent_usage_anchor(snapshot.messages)
+        self._usage_history = [] if usage_anchor is None else [usage_anchor]
         self._checked_preparation_revision: str | None = None
-        self._checked_context_revision: str | None = None
         self._pending_fact: _PendingFactBatch | None = None
         self._failed_context_revision: str | None = None
         self._failed_exception: Exception | None = None
@@ -272,47 +240,8 @@ class AgentRunContextController:
             estimator_version=estimator_version,
         )
 
-    @property
-    def pending_last_compacted(self) -> int:
-        return self._pending_last_compacted
-
-    @property
-    def pending_action_summary(self) -> str | None:
-        return self._pending_action_summary
-
-    @property
-    def pending_compaction_usage(self) -> dict[str, int]:
-        return dict(self._pending_compaction_usage)
-
-    @property
-    def current_user_compacted(self) -> bool:
-        return self._current_user_compacted
-
-    @property
-    def latest_usage_context(self) -> ContextUsageSnapshot | None:
-        return self._latest_usage_context
-
-    @property
-    def checked_context_revision(self) -> str | None:
-        return self._checked_context_revision
-
-    @property
-    def base_context_revision(self) -> str | None:
-        return self._base_context_revision
-
-    def staged_values(self) -> AgentRunStagedValues:
-        """Return detached staged values for a later terminal commit."""
-        return AgentRunStagedValues(
-            pending_last_compacted=self._pending_last_compacted,
-            pending_action_summary=self._pending_action_summary,
-            pending_compaction_usage=dict(self._pending_compaction_usage),
-            current_user_compacted=self._current_user_compacted,
-            latest_usage_context=self._latest_usage_context,
-            checked_context_revision=self._checked_context_revision,
-        )
-
     def terminal_commit_values(self) -> AgentRunTerminalCommitValues:
-        """Return only values accepted by the dormant terminal Session commit."""
+        """Return values accepted by the terminal Session commit."""
         return AgentRunTerminalCommitValues(
             pending_last_compacted=self._pending_last_compacted,
             pending_action_summary=self._pending_action_summary,
@@ -335,7 +264,7 @@ class AgentRunContextController:
         provider_id: str = "",
         model: str = "",
         estimator_version: str = CONTEXT_ESTIMATOR_VERSION,
-    ) -> AgentRunContextPreparation:
+    ) -> tuple[dict[str, Any], ...]:
         """Check and stage Run-start history compression without publishing Session state."""
         budget = ContextBudget(
             context_window=route_context_window,
@@ -364,9 +293,6 @@ class AgentRunContextController:
             route_values=route_values,
             estimator_version=estimator_version,
         )
-        compatible_context = self._compatible_usage_context(route_values, estimator_version)
-        if compatible_context is not None:
-            self._latest_usage_context = compatible_context
         revision = self._context_revision(
             current_user=copied_user,
             tools=effective_tools,
@@ -376,8 +302,6 @@ class AgentRunContextController:
             compact_ratio=compact_ratio,
             estimator_version=estimator_version,
         )
-        if self._base_context_revision is None or self._base_context_revision != revision:
-            self._base_context_revision = revision
         self._run_current_user = copied_user
         if self._failed_context_revision == revision:
             assert self._failed_exception is not None
@@ -385,15 +309,7 @@ class AgentRunContextController:
         self._failed_context_revision = None
         self._failed_exception = None
         if self._checked_preparation_revision == revision:
-            assert self._checked_context_revision is not None
-            return AgentRunContextPreparation(
-                selected_batch=(),
-                projected_tokens=projection.projected_tokens,
-                projection_source=projection.source,
-                context_revision=self._checked_context_revision,
-                compacted=False,
-                retained_messages=tuple(deepcopy(projected)),
-            )
+            return tuple(deepcopy(projected))
 
         protected_projection = self._projected_tokens(
             project_messages,
@@ -409,15 +325,7 @@ class AgentRunContextController:
             raise overflow_error
         if self._pending_fact is None and not budget.should_compact(projection.projected_tokens):
             self._checked_preparation_revision = revision
-            self._checked_context_revision = revision
-            return AgentRunContextPreparation(
-                selected_batch=(),
-                projected_tokens=projection.projected_tokens,
-                projection_source=projection.source,
-                context_revision=revision,
-                compacted=False,
-                retained_messages=tuple(deepcopy(projected)),
-            )
+            return tuple(deepcopy(projected))
 
         pending_fact = self._pending_fact
         if pending_fact is None:
@@ -458,19 +366,11 @@ class AgentRunContextController:
         else:
             if not batch:
                 self._checked_preparation_revision = revision
-                self._checked_context_revision = revision
                 if projection.projected_tokens >= budget.available_context:
                     overflow_error = _model_context_overflow()
                     self._record_failure(revision, overflow_error)
                     raise overflow_error
-                return AgentRunContextPreparation(
-                    selected_batch=(),
-                    projected_tokens=projection.projected_tokens,
-                    projection_source=projection.source,
-                    context_revision=revision,
-                    compacted=False,
-                    retained_messages=tuple(deepcopy(projected)),
-                )
+                return tuple(deepcopy(projected))
 
         selected_payload = (
             _compaction_user_context(list(batch))
@@ -576,21 +476,12 @@ class AgentRunContextController:
             compact_ratio=compact_ratio,
             estimator_version=estimator_version,
         )
-        self._base_context_revision = final_revision
         self._checked_preparation_revision = final_revision
-        self._checked_context_revision = final_revision
         if final_projection.projected_tokens >= budget.available_context:
             overflow_error = _model_context_overflow()
             self._record_failure(final_revision, overflow_error)
             raise overflow_error
-        return AgentRunContextPreparation(
-            selected_batch=tuple(deepcopy(list(batch))),
-            projected_tokens=final_projection.projected_tokens,
-            projection_source=final_projection.source,
-            context_revision=final_revision,
-            compacted=True,
-            retained_messages=tuple(deepcopy(final_projected)),
-        )
+        return tuple(deepcopy(final_projected))
 
     def record_main_agent_response(
         self,
@@ -666,7 +557,6 @@ class AgentRunContextController:
             **response.usage.to_dict(),
         }
         self._usage_history = [(context, deepcopy(usage))]
-        self._latest_usage_context = context
         self._run_anchor_context = context
         self._run_anchor_usage = deepcopy(usage)
         self._run_anchor_tools = tuple(deepcopy(list(tools)))
@@ -697,7 +587,7 @@ class AgentRunContextController:
         estimator_version: str = CONTEXT_ESTIMATOR_VERSION,
         continuation_revision: int = 0,
         micro_compression_enabled: bool = False,
-    ) -> AgentRunContextPreparation:
+    ) -> tuple[dict[str, Any], ...]:
         """Prepare one ReAct request from the run's raw increment."""
         route_values = _route_projection_values(
             route_status=route_status,
@@ -737,9 +627,6 @@ class AgentRunContextController:
             route_values=route_values,
             estimator_version=estimator_version,
         )
-        compatible_context = self._compatible_usage_context(route_values, estimator_version)
-        if compatible_context is not None:
-            self._latest_usage_context = compatible_context
         revision = self._context_revision(
             current_user=copied_user,
             tools=effective_tools,
@@ -753,23 +640,13 @@ class AgentRunContextController:
             continuation_revision=continuation_revision,
             micro_compression_enabled=micro_compression_enabled,
         )
-        if self._base_context_revision is None or self._base_context_revision != revision:
-            self._base_context_revision = revision
         if self._failed_context_revision == revision:
             assert self._failed_exception is not None
             raise self._failed_exception
         self._failed_context_revision = None
         self._failed_exception = None
         if self._checked_preparation_revision == revision:
-            assert self._checked_context_revision is not None
-            return AgentRunContextPreparation(
-                selected_batch=(),
-                projected_tokens=projection.projected_tokens,
-                projection_source=projection.source,
-                context_revision=self._checked_context_revision,
-                compacted=False,
-                retained_messages=tuple(deepcopy(projected)),
-            )
+            return tuple(deepcopy(projected))
 
         protected = self._react_protected_projection(
             copied_increment,
@@ -786,15 +663,7 @@ class AgentRunContextController:
             raise overflow_error
         if self._pending_fact is None and not budget.should_compact(projection.projected_tokens):
             self._checked_preparation_revision = revision
-            self._checked_context_revision = revision
-            return AgentRunContextPreparation(
-                selected_batch=(),
-                projected_tokens=projection.projected_tokens,
-                projection_source=projection.source,
-                context_revision=revision,
-                compacted=False,
-                retained_messages=tuple(deepcopy(projected)),
-            )
+            return tuple(deepcopy(projected))
 
         pending_fact = self._pending_fact
         if pending_fact is None:
@@ -809,15 +678,7 @@ class AgentRunContextController:
             cutoff = pending_fact.cutoff
         if not batch:
             self._checked_preparation_revision = revision
-            self._checked_context_revision = revision
-            return AgentRunContextPreparation(
-                selected_batch=(),
-                projected_tokens=projection.projected_tokens,
-                projection_source=projection.source,
-                context_revision=revision,
-                compacted=False,
-                retained_messages=tuple(deepcopy(projected)),
-            )
+            return tuple(deepcopy(projected))
 
         selected_user = (
             copied_user is not None
@@ -915,12 +776,6 @@ class AgentRunContextController:
             current_user=copied_user,
             project_messages=project_messages,
         )
-        final_projection = self._projection_from_candidate(
-            final_projected,
-            tools=effective_tools,
-            route_values=route_values,
-            estimator_version=estimator_version,
-        )
         final_revision = self._context_revision(
             current_user=copied_user,
             tools=effective_tools,
@@ -934,17 +789,8 @@ class AgentRunContextController:
             continuation_revision=continuation_revision,
             micro_compression_enabled=micro_compression_enabled,
         )
-        self._base_context_revision = final_revision
         self._checked_preparation_revision = final_revision
-        self._checked_context_revision = final_revision
-        return AgentRunContextPreparation(
-            selected_batch=tuple(deepcopy(list(batch))),
-            projected_tokens=final_projection.projected_tokens,
-            projection_source=final_projection.source,
-            context_revision=final_revision,
-            compacted=True,
-            retained_messages=tuple(deepcopy(final_projected)),
-        )
+        return tuple(deepcopy(final_projected))
 
     def observe_react_request_projection(
         self,
@@ -969,14 +815,8 @@ class AgentRunContextController:
             continuation_revision=observation.continuation_revision,
             micro_compression_enabled=micro_compression_enabled,
         )
-        final_revision = _finalized_context_revision(
-            preparation_revision,
-            prepared_messages=observation.prepared_messages,
-            provider_messages=messages,
-        )
-        self._base_context_revision = final_revision
+        del messages
         self._checked_preparation_revision = preparation_revision
-        self._checked_context_revision = final_revision
 
     def _react_virtual_messages(
         self,
@@ -1145,9 +985,7 @@ class AgentRunContextController:
         )
 
     def _record_failure(self, revision: str, error: Exception) -> None:
-        self._base_context_revision = revision
         self._checked_preparation_revision = revision
-        self._checked_context_revision = revision
         self._failed_context_revision = revision
         self._failed_exception = error
 
@@ -1349,7 +1187,7 @@ class AgentRunContextRequestPreparer:
             context_window=self._route_context_window,
             max_output=self._route_max_output,
         )
-        preparation = await self._controller.prepare_react(
+        prepared_messages = await self._controller.prepare_react(
             project_messages=self._project_messages,
             increment=deepcopy(list(increment)),
             latest_cycle_start=latest_cycle_start,
@@ -1368,7 +1206,7 @@ class AgentRunContextRequestPreparer:
             continuation_revision=continuation_revision,
             micro_compression_enabled=self._micro_compression_enabled,
         )
-        prepared_messages = tuple(deepcopy(list(preparation.retained_messages)))
+        prepared_messages = tuple(deepcopy(list(prepared_messages)))
         self._pending_observation = _ReactRevisionObservation(
             prepared_messages=prepared_messages,
             current_user=None if self._current_user is None else deepcopy(self._current_user),
@@ -1610,25 +1448,26 @@ def _non_target_projection(
     return tuple(copied)
 
 
-def _main_agent_usage_history(
+def latest_main_agent_usage_anchor(
     messages: Sequence[dict[str, Any]],
-) -> list[tuple[ContextUsageSnapshot, dict[str, int]]]:
+) -> tuple[ContextUsageSnapshot, dict[str, int]] | None:
+    """Return the latest main-Agent assistant usage anchor, if it is valid."""
     for message in reversed(messages):
         if message.get("role") != "assistant":
             continue
         context_value = message.get("context_usage")
         usage_value = message.get("token_usage")
         if context_value is None or not _valid_main_agent_usage(usage_value):
-            return []
+            return None
         try:
             context = ContextUsageSnapshot.from_dict(context_value)
         except (TypeError, ValueError):
-            return []
+            return None
         if context.requested_route not in {"chat", "schedule"}:
-            return []
+            return None
         assert isinstance(usage_value, dict)
-        return [(context, deepcopy(usage_value))]
-    return []
+        return context, deepcopy(usage_value)
+    return None
 
 
 def _valid_main_agent_usage(value: object) -> bool:
@@ -1710,27 +1549,6 @@ def _agent_run_hard_guard(
     tools: Sequence[dict[str, Any]],
 ) -> bool:
     return _summary_hard_guard(status, messages, tools)
-
-
-def _finalized_context_revision(
-    preparation_revision: str,
-    *,
-    prepared_messages: Sequence[dict[str, Any]],
-    provider_messages: Sequence[dict[str, Any]],
-) -> str:
-    if list(provider_messages) == list(prepared_messages):
-        return preparation_revision
-    encoded = json.dumps(
-        {
-            "preparation_revision": preparation_revision,
-            "provider_messages": list(provider_messages),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _normalize_action_summary(content: str) -> str | None:

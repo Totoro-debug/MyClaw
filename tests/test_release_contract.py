@@ -1216,3 +1216,178 @@ def test_ticket_10_transition_only_agent_run_scaffolding_is_absent() -> None:
         "self",
         "candidate",
     )
+
+
+def test_issue_234_session_uses_only_the_terminal_agent_run_commit() -> None:
+    session = _issue_202_class(
+        _issue_202_ast(ROOT / "myclaw" / "agent" / "session" / "session.py"),
+        "Session",
+    )
+    methods = _issue_202_method_names(session)
+
+    assert "commit_agent_run" in methods
+    assert "append_messages" not in methods
+
+    production_findings: list[str] = []
+    for path in sorted((ROOT / "myclaw").rglob("*.py")):
+        tree = _issue_202_ast(path)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == (
+                "append_messages"
+            ):
+                production_findings.append(f"{path}:{node.lineno}: declaration")
+            if isinstance(node, ast.Name) and node.id == "append_messages":
+                production_findings.append(f"{path}:{node.lineno}: name")
+            if isinstance(node, ast.Attribute) and node.attr == "append_messages":
+                production_findings.append(f"{path}:{node.lineno}: attribute")
+
+    test_findings: list[str] = []
+    release_contract_path = ROOT / "tests" / "test_release_contract.py"
+    for path in sorted((ROOT / "tests").rglob("*.py")):
+        if path == release_contract_path:
+            continue
+        tree = _issue_202_ast(path)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == (
+                "append_messages"
+            ):
+                test_findings.append(f"{path}:{node.lineno}: declaration")
+            if isinstance(node, ast.Name) and node.id == "append_messages":
+                test_findings.append(f"{path}:{node.lineno}: name")
+            if isinstance(node, ast.Attribute) and node.attr == "append_messages":
+                test_findings.append(f"{path}:{node.lineno}: attribute")
+
+    documentation_findings = [
+        path
+        for path in _tracked_markdown_paths()
+        if "append_messages" in path.read_text(encoding="utf-8")
+    ]
+    assert production_findings == []
+    assert test_findings == []
+    assert documentation_findings == []
+
+
+def test_issue_234_status_uses_one_canonical_anchor_and_no_sticky_route_state() -> None:
+    loop_tree = _issue_202_ast(ROOT / "myclaw" / "agent" / "loop.py")
+    compactor_tree = _issue_202_ast(
+        ROOT / "myclaw" / "agent" / "memory" / "conversation_compactor.py"
+    )
+    forbidden_names = {
+        "_configured_chat_context_window",
+        "_configured_chat_model",
+        "_last_foreground_route_status",
+        "_latest_main_agent_context",
+        "_latest_main_agent_provenance",
+        "_latest_main_agent_usage",
+        "_main_agent_usage_history",
+        "_remember_foreground_route_status",
+        "configured_chat_context_window",
+        "configured_chat_model",
+    }
+    findings: list[str] = []
+    for path, tree in (
+        (ROOT / "myclaw" / "agent" / "loop.py", loop_tree),
+        (
+            ROOT / "myclaw" / "agent" / "memory" / "conversation_compactor.py",
+            compactor_tree,
+        ),
+    ):
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in forbidden_names:
+                    findings.append(f"{path}:{node.lineno}: declaration {node.name}")
+            if isinstance(node, ast.Name) and node.id in forbidden_names:
+                findings.append(f"{path}:{node.lineno}: name {node.id}")
+            if isinstance(node, ast.Attribute) and node.attr in forbidden_names:
+                findings.append(f"{path}:{node.lineno}: attribute {node.attr}")
+    assert findings == []
+
+    anchor_definitions = [
+        node
+        for node in compactor_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "latest_main_agent_usage_anchor"
+    ]
+    assert len(anchor_definitions) == 1
+
+    controller = _issue_202_class(compactor_tree, "AgentRunContextController")
+    controller_init = _issue_202_direct_method(controller, "__init__")
+    controller_anchor_calls = [
+        node
+        for node in ast.walk(controller_init)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "latest_main_agent_usage_anchor"
+    ]
+    assert len(controller_anchor_calls) == 1
+
+    loop = _issue_202_class(loop_tree, "AgentLoop")
+    runtime_status = _issue_202_direct_method(loop, "runtime_status_input")
+    status_anchor_calls = [
+        node
+        for node in ast.walk(runtime_status)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "latest_main_agent_usage_anchor"
+    ]
+    configured_route_calls = [
+        node
+        for node in ast.walk(runtime_status)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_configured_model_route_status"
+        and len(node.args) == 2
+        and isinstance(node.args[1], ast.Constant)
+        and node.args[1].value == "chat"
+    ]
+    assert len(status_anchor_calls) == 1
+    assert len(configured_route_calls) == 1
+
+
+def test_issue_234_controller_migration_scaffolding_is_absent() -> None:
+    compactor_tree = _issue_202_ast(
+        ROOT / "myclaw" / "agent" / "memory" / "conversation_compactor.py"
+    )
+    class_names = {node.name for node in compactor_tree.body if isinstance(node, ast.ClassDef)}
+    removed_dtos = {"AgentRunContextPreparation", "AgentRunStagedValues"}
+
+    assert removed_dtos.isdisjoint(class_names)
+    assert {"AgentRunContextRequestPreparer", "AgentRunTerminalCommitValues"} <= class_names
+
+    exports_assignment = next(
+        node
+        for node in compactor_tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
+    )
+    exports = ast.literal_eval(exports_assignment.value)
+    assert removed_dtos.isdisjoint(exports)
+
+    controller = _issue_202_class(compactor_tree, "AgentRunContextController")
+    controller_methods = _issue_202_method_names(controller)
+    assert {
+        "base_context_revision",
+        "checked_context_revision",
+        "current_user_compacted",
+        "latest_usage_context",
+        "pending_action_summary",
+        "pending_compaction_usage",
+        "pending_last_compacted",
+        "staged_values",
+    }.isdisjoint(controller_methods)
+    assert "terminal_commit_values" in controller_methods
+    assert {
+        "_base_context_revision",
+        "_checked_context_revision",
+        "_latest_usage_context",
+    }.isdisjoint(node.attr for node in ast.walk(controller) if isinstance(node, ast.Attribute))
+
+    run_context = _issue_202_class(
+        _issue_202_ast(ROOT / "myclaw" / "agent" / "loop.py"),
+        "_AgentRunContext",
+    )
+    run_context_fields = {
+        node.target.id
+        for node in run_context.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert "request_preparer" not in run_context_fields

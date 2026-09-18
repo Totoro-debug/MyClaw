@@ -918,8 +918,11 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
                 max_iterations=50,
             )
             assert result.final_content == "done"
-            self.session.append_messages(result.messages)
-            self.session.persist()
+            self.session.commit_agent_run(
+                result.messages,
+                pending_last_compacted=self.session.last_compacted,
+                pending_action_summary=cast(str, self.session.metadata["summary"]),
+            )
             await self.session.wait_for_pending_persist()
 
         async def close(self) -> None:

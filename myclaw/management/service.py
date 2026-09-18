@@ -98,7 +98,7 @@ class SessionListingReport:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeStatusInput:
-    """Immutable status projection for the exact next request."""
+    """Committed-Session baseline for the next independent Foreground Agent Run."""
 
     session_id: str = ""
     session_title: str = ""
