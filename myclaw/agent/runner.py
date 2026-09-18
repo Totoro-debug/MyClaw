@@ -119,6 +119,9 @@ class AgentRunnerMemoryRouter(ABC):
 class AgentRunRequestPreparer(Protocol):
     """Prepare one provider-neutral request from detached Agent Run snapshots."""
 
+    @property
+    def recounts_retained_tool_calls(self) -> bool: ...
+
     async def prepare(
         self,
         candidate: Sequence[dict[str, Any]],
@@ -129,9 +132,20 @@ class AgentRunRequestPreparer(Protocol):
         continuation_revision: int,
     ) -> Sequence[dict[str, Any]]: ...
 
+    def observe_request_projection(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        micro_compression_enabled: bool,
+    ) -> None: ...
+
 
 class IdentityAgentRunRequestPreparer:
     """Preserve the existing request projection while detaching mutable messages."""
+
+    @property
+    def recounts_retained_tool_calls(self) -> bool:
+        return False
 
     async def prepare(
         self,
@@ -144,6 +158,14 @@ class IdentityAgentRunRequestPreparer:
     ) -> list[dict[str, Any]]:
         del increment, latest_cycle_start, tools, continuation_revision
         return deepcopy(list(candidate))
+
+    def observe_request_projection(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        micro_compression_enabled: bool,
+    ) -> None:
+        del messages, micro_compression_enabled
 
 
 def _empty_usage() -> dict[str, int]:
@@ -180,6 +202,21 @@ def _project_for_model_request(
             continue
         message["content"] = f"[{name} result omitted from context]"
     return projected
+
+
+def _micro_compression_eligible_count(
+    messages: Sequence[dict[str, Any]],
+    *,
+    gateway: ToolGateway,
+) -> int:
+    return sum(
+        1
+        for message in messages
+        if message.get("role") == "tool"
+        and isinstance(message.get("name"), str)
+        and message.get("status", "success") in {"success", "error", "refused"}
+        and gateway.is_micro_compression_eligible(cast(str, message["name"]))
+    )
 
 
 def _latest_completed_cycle_start(messages: Sequence[dict[str, Any]]) -> int | None:
@@ -344,6 +381,18 @@ class AgentRunner:
                     continuation_revision=continuation_revision,
                 )
                 request_messages: Sequence[dict[str, Any]]
+                if (
+                    self._request_preparer.recounts_retained_tool_calls
+                    and model != "memory"
+                    and tool_gateway is not None
+                ):
+                    retained_eligible_count = _micro_compression_eligible_count(
+                        prepared_messages,
+                        gateway=tool_gateway,
+                    )
+                    micro_compression_enabled = (
+                        retained_eligible_count > _MICRO_COMPRESSION_TOOL_CALL_THRESHOLD
+                    )
                 if model != "memory" and tool_gateway is not None and micro_compression_enabled:
                     request_messages = _project_for_model_request(
                         prepared_messages,
@@ -352,6 +401,10 @@ class AgentRunner:
                     )
                 else:
                     request_messages = prepared_messages
+                self._request_preparer.observe_request_projection(
+                    deepcopy(list(request_messages)),
+                    micro_compression_enabled=micro_compression_enabled,
+                )
                 if model == "chat":
                     router = cast(AgentRunnerRouter, self._model_router)
                     events = router.stream(

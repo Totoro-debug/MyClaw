@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -11,23 +12,92 @@ from myclaw.agent.context_budget import estimate_run_slice_tokens
 from myclaw.agent.memory.conversation_compactor import (
     AgentRunContextController,
     AgentRunContextPreparation,
+    AgentRunContextRouterAdapter,
     AgentRunContextSnapshot,
 )
 from myclaw.agent.memory.manager import MemoryManager
+from myclaw.agent.runner import AgentRunner
 from myclaw.agent.session.session import Session
+from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolResult
 from myclaw.agent.workspace_state import WorkspaceState
+from myclaw.config.config import (
+    MemoryConfiguration,
+    ModelsConfiguration,
+    ProviderConfiguration,
+    RouteConfiguration,
+    RuntimeConfiguration,
+    UserConfiguration,
+)
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
-from myclaw.provider.model_router import ModelRouteStatus
+from myclaw.provider.model_router import ModelRouter, ModelRouteStatus
 from myclaw.provider.models import (
     AssistantModelMessage,
+    ModelCompleted,
+    ModelContinuation,
     ModelResponse,
     ModelUsage,
 )
-from tests.fixtures import ScriptedFakeProvider, ScriptedFakeRouter
+from tests.fixtures import FakeClock, ScriptedFakeProvider, ScriptedFakeRouter, StreamScript
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 8, 4, 16, 0, 0, tzinfo=LOCAL_OFFSET)
+
+
+def _router_configuration(
+    *,
+    chat_context_window: int,
+    default_context_window: int,
+    max_output: int = 10,
+) -> UserConfiguration:
+    chat_provider = ProviderConfiguration(
+        provider_id="chat-provider",
+        protocol="openai-compatible",
+        base_url="https://chat.example/v1",
+        api_key="chat-secret",
+        models=("chat-model",),
+    )
+    default_provider = ProviderConfiguration(
+        provider_id="default-provider",
+        protocol="anthropic",
+        base_url="https://default.example/v1",
+        api_key="default-secret",
+        models=("default-model",),
+    )
+
+    def route(provider_id: str, model: str, context_window: int) -> RouteConfiguration:
+        return RouteConfiguration(
+            provider_id=provider_id,
+            model=model,
+            context_window=context_window,
+            max_output=max_output,
+            temperature=0,
+            reasoning_effort="medium",
+            timeout=30,
+        )
+
+    return UserConfiguration(
+        runtime=RuntimeConfiguration(max_tool_result_chars=50_000),
+        memory=MemoryConfiguration(
+            compaction_message_threshold=40,
+            batch_size=10,
+            schedule="0 * * * *",
+        ),
+        models=ModelsConfiguration(
+            providers={
+                chat_provider.provider_id: chat_provider,
+                default_provider.provider_id: default_provider,
+            },
+            routes={
+                "chat": route("chat-provider", "chat-model", chat_context_window),
+                "default": route(
+                    "default-provider",
+                    "default-model",
+                    default_context_window,
+                ),
+            },
+        ),
+    )
 
 
 def _state(workspace: Path) -> WorkspaceState:
@@ -90,6 +160,27 @@ def _add_tool_run(session: Session, label: str, *, result_size: int = 240) -> No
 def _add_run(session: Session, label: str, *, size: int = 500) -> None:
     session.add_message("user", f"{label} user " + "u" * size)
     _add_assistant(session, f"{label} assistant " + "a" * size)
+
+
+def _react_cycle(label: str, *, size: int = 80) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "assistant",
+            "content": f"{label} assistant " + "a" * size,
+            "tool_calls": [{"id": f"{label}-call", "name": "read_file", "arguments": "{}"}],
+            "status": "completed",
+            "error": None,
+            "token_usage": _usage(),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": f"{label}-call",
+            "name": "read_file",
+            "status": "success",
+            "content": f"{label} result " + "r" * size,
+            "artifact": None,
+        },
+    ]
 
 
 def _controller(
@@ -355,6 +446,423 @@ async def test_single_completed_run_selects_its_entire_cursor_suffix(
 
     assert [message["role"] for message in result.selected_batch] == ["user", "assistant"]
     assert "only user" in str(provider.complete_requests[0].messages[1]["content"])
+
+
+@pytest.mark.asyncio
+async def test_react_current_run_at_exactly_fifty_percent_keeps_current_run_and_compacts_history(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    _add_run(session, "history", size=1_200)
+    provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
+    controller = _controller(workspace, session, provider)
+    current_user = {"role": "user", "content": "current request"}
+    increment = _react_cycle("current")
+    available = estimate_run_slice_tokens([current_user, *increment]) * 2
+
+    result = await controller.prepare_react(
+        project_messages=_project_messages,
+        increment=increment,
+        latest_cycle_start=0,
+        route_context_window=available + 100,
+        route_max_output=100,
+        current_user=current_user,
+        compact_ratio=0.5,
+        memory_route_status=_memory_status(context_window=10_000),
+    )
+
+    assert result.compacted is True
+    assert controller.current_user_compacted is False
+    assert [message["content"] for message in result.selected_batch] == [
+        message["content"] for message in session.messages
+    ]
+    assert "current request" not in str(result.selected_batch)
+    assert (
+        all(message.get("content") != "current request" for message in result.retained_messages)
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_sole_current_run_may_compact_at_or_below_fifty_percent(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    session.update_metadata(summary="previous action " + "x" * 300)
+    provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
+    controller = _controller(workspace, session, provider)
+    current_user = {"role": "user", "content": "current request"}
+    increment = _react_cycle("current", size=300)
+    available = estimate_run_slice_tokens([current_user, *increment]) * 2
+
+    result = await controller.prepare_react(
+        project_messages=_project_messages,
+        increment=increment,
+        latest_cycle_start=0,
+        route_context_window=available + 100,
+        route_max_output=100,
+        current_user=current_user,
+        compact_ratio=0.5,
+        memory_route_status=_memory_status(context_window=10_000),
+    )
+
+    assert result.compacted is True
+    assert controller.current_user_compacted is True
+    assert result.selected_batch[0] == current_user
+    assert result.retained_messages[-1]["content"].startswith("current result")
+
+
+@pytest.mark.asyncio
+async def test_react_current_run_just_above_fifty_percent_may_select_early_current_content(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    _add_run(session, "history", size=1_200)
+    provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
+    controller = _controller(workspace, session, provider)
+    current_user = {"role": "user", "content": "current request"}
+    increment = _react_cycle("current")
+    current_slice = estimate_run_slice_tokens([current_user, *increment])
+    available = current_slice * 2 - 1
+
+    result = await controller.prepare_react(
+        project_messages=_project_messages,
+        increment=increment,
+        latest_cycle_start=0,
+        route_context_window=available + 100,
+        route_max_output=100,
+        current_user=current_user,
+        compact_ratio=0.5,
+        memory_route_status=_memory_status(context_window=10_000),
+    )
+
+    assert result.compacted is True
+    assert controller.current_user_compacted is True
+    assert "current request" in str(result.selected_batch)
+    assert result.retained_messages[-1]["content"].startswith("current result")
+    assert (
+        sum(message.get("content") == "current request" for message in result.retained_messages)
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_compaction_consumes_only_new_batch_after_current_user_is_compacted(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    provider = ScriptedFakeProvider(
+        completions=(
+            _response("facts one"),
+            _response("action one"),
+            _response("facts two"),
+            _response("action two"),
+        )
+    )
+    controller = _controller(workspace, session, provider)
+    current_user = {"role": "user", "content": "current request"}
+    first_increment: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "early assistant " + "a" * 4_000,
+            "tool_calls": [{"id": "early-call", "name": "read_file", "arguments": "{}"}],
+            "status": "completed",
+            "error": None,
+            "token_usage": _usage(),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "early-call",
+            "name": "read_file",
+            "status": "success",
+            "content": "early result " + "r" * 4_000,
+            "artifact": None,
+        },
+        *_react_cycle("latest", size=700),
+    ]
+    kwargs: dict[str, Any] = {
+        "project_messages": _project_messages,
+        "route_context_window": 4_000,
+        "route_max_output": 100,
+        "current_user": current_user,
+        "compact_ratio": 0.5,
+        "memory_route_status": _memory_status(context_window=10_000),
+    }
+
+    first = await controller.prepare_react(
+        increment=first_increment,
+        latest_cycle_start=2,
+        **kwargs,
+    )
+    second_increment: list[dict[str, Any]] = [*first_increment, *_react_cycle("new", size=4_000)]
+    second = await controller.prepare_react(
+        increment=second_increment,
+        latest_cycle_start=4,
+        **kwargs,
+    )
+
+    assert first.compacted is True
+    assert second.compacted is True
+    assert controller.current_user_compacted is True
+    assert controller.pending_last_compacted == 5
+    second_fact = str(provider.complete_requests[2].messages[1]["content"])
+    second_action = str(provider.complete_requests[3].messages[1]["content"])
+    assert "early assistant" not in second_fact
+    assert "early result" not in second_fact
+    assert "current request" not in second_fact
+    assert "latest result" in second_fact
+    assert "current request" not in second_action
+    assert (
+        sum(message.get("content") == "current request" for message in second.retained_messages)
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_router_adapter_blocks_an_over_budget_attempt_before_provider() -> None:
+    provider = ScriptedFakeProvider(completions=(_response("unexpected"),))
+    router = ModelRouter(
+        configuration=_router_configuration(
+            chat_context_window=100,
+            default_context_window=100,
+        ),
+        provider_factory=lambda _: provider,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+    guarded = AgentRunContextRouterAdapter(router)
+
+    with pytest.raises(ModelCallError) as raised:
+        await guarded.complete(
+            "chat",
+            messages=[{"role": "user", "content": "x" * 1_000}],
+            tools=(),
+        )
+
+    assert raised.value.error.code == "model_context_overflow"
+    assert provider.complete_requests == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_router_adapter_preserves_retry_continuation_and_response() -> None:
+    continuation = ModelContinuation(provider_id="chat-provider", payload=object())
+    expected = _response("recovered", input_tokens=31, output_tokens=7)
+    provider = ScriptedFakeProvider(
+        completions=(
+            ModelCallError(ErrorInfo("provider_timeout", "retry", retryable=True)),
+            expected,
+        )
+    )
+    router = ModelRouter(
+        configuration=_router_configuration(
+            chat_context_window=4_000,
+            default_context_window=4_000,
+        ),
+        provider_factory=lambda _: provider,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+    guarded = AgentRunContextRouterAdapter(router)
+    messages = [{"role": "user", "content": "request"}]
+    tools = ({"type": "function", "function": {"name": "work"}},)
+
+    observed = await guarded.complete(
+        "chat",
+        messages=messages,
+        tools=tools,
+        continuation=continuation,
+    )
+
+    assert observed is expected
+    assert len(provider.complete_requests) == 2
+    assert all(request.continuation is continuation for request in provider.complete_requests)
+    assert all(request.messages == messages for request in provider.complete_requests)
+    assert all(request.tools == tools for request in provider.complete_requests)
+    assert router.current_call_status("chat") == router.route_status("chat")
+
+
+@pytest.mark.asyncio
+async def test_explicit_router_adapter_rechecks_smaller_fallback_before_provider() -> None:
+    chat_provider = ScriptedFakeProvider(
+        completions=(ModelCallError(ErrorInfo("provider_auth_error", "fallback")),)
+    )
+    default_provider = ScriptedFakeProvider(completions=(_response("unexpected"),))
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    router = ModelRouter(
+        configuration=_router_configuration(
+            chat_context_window=4_000,
+            default_context_window=100,
+        ),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+    guarded = AgentRunContextRouterAdapter(router)
+
+    with pytest.raises(ModelCallError) as raised:
+        await guarded.complete(
+            "chat",
+            messages=[{"role": "user", "content": "x" * 1_000}],
+            tools=(),
+        )
+
+    assert raised.value.error.code == "model_context_overflow"
+    assert len(chat_provider.complete_requests) == 1
+    assert default_provider.complete_requests == []
+    status = router.current_call_status("chat")
+    assert status is not None
+    assert status.selected_route == "default"
+
+
+@pytest.mark.asyncio
+async def test_controller_preparer_rebuilds_runner_requests_and_preserves_opaque_continuation(
+    workspace: Path,
+) -> None:
+    class Gateway:
+        schemas: tuple[dict[str, Any], ...] = ()
+
+        async def call(
+            self,
+            tool_call: ModelToolCall,
+            *,
+            confirmation: object = None,
+        ) -> ToolResult:
+            del confirmation
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                name=tool_call.name,
+                status="success",
+                content="tool result",
+            )
+
+        def is_micro_compression_eligible(self, tool_name: str) -> bool:
+            del tool_name
+            return False
+
+    continuation = ModelContinuation(provider_id="test-provider", payload=object())
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(
+                                content="First",
+                                tool_calls=(
+                                    ModelToolCall(id="call-1", name="work", arguments="{}"),
+                                ),
+                            ),
+                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                            finish_reason="tool_calls",
+                            continuation=continuation,
+                        )
+                    ),
+                )
+            ),
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Done"),
+                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    state = _state(workspace)
+    session = Session.create(state)
+    controller = _controller(workspace, session, provider)
+    preparer = controller.as_request_preparer(
+        project_messages=_project_messages,
+        current_user={"role": "user", "content": "canonical task"},
+        route_context_window=10_000,
+        route_max_output=100,
+    )
+
+    result = await AgentRunner(ScriptedFakeRouter(provider), preparer).run(
+        [{"role": "system", "content": "stale"}, {"role": "user", "content": "stale"}],
+        model="chat",
+        tool_gateway=Gateway(),  # type: ignore[arg-type]
+        on_output=None,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+    )
+
+    assert result.finish_reason == "completed"
+    assert provider.stream_requests[0].messages == [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "canonical task"},
+    ]
+    assert all(
+        message.get("content") != "stale" for message in provider.stream_requests[1].messages
+    )
+    assert (
+        sum(
+            message.get("content") == "canonical task"
+            for message in provider.stream_requests[1].messages
+        )
+        == 1
+    )
+    assert provider.stream_requests[1].continuation is continuation
+
+
+@pytest.mark.asyncio
+async def test_react_action_failure_keeps_fact_and_retries_only_the_pending_action(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    failure = ModelCallError(ErrorInfo("model_failed", "action failed"))
+    provider = ScriptedFakeProvider(
+        completions=(_response("facts"), failure, _response("recovered action"))
+    )
+    controller = _controller(workspace, session, provider)
+    current_user = {"role": "user", "content": "current request"}
+    increment = _react_cycle("current", size=4_000)
+    kwargs: dict[str, Any] = {
+        "project_messages": _project_messages,
+        "increment": increment,
+        "latest_cycle_start": 0,
+        "route_context_window": 4_000,
+        "route_max_output": 100,
+        "current_user": current_user,
+        "compact_ratio": 0.5,
+        "memory_route_status": _memory_status(context_window=10_000),
+    }
+
+    with pytest.raises(ModelCallError, match="action failed"):
+        await controller.prepare_react(**kwargs)
+    assert controller.pending_last_compacted == 0
+    assert controller.pending_action_summary is None
+    assert controller.current_user_compacted is False
+    assert controller.pending_compaction_usage["model_calls"] == 1
+    assert len(provider.complete_requests) == 2
+
+    with pytest.raises(ModelCallError, match="action failed"):
+        await controller.prepare_react(**kwargs)
+    assert len(provider.complete_requests) == 2
+
+    recovered = await controller.prepare_react(**kwargs, continuation_revision=1)
+    assert recovered.compacted is True
+    assert controller.pending_last_compacted == 1
+    assert controller.pending_action_summary == "recovered action"
+    assert controller.current_user_compacted is True
+    assert (state.memory_directory / "summary.jsonl").read_text(encoding="utf-8").count(
+        '"content":"facts"'
+    ) == 1
+    assert len(provider.complete_requests) == 3
 
 
 @pytest.mark.asyncio
@@ -810,6 +1318,344 @@ async def test_same_context_revision_is_a_noop_after_successful_staging(
     assert second.context_revision == first.context_revision
     assert controller.checked_context_revision == first.context_revision
     assert len(provider.complete_requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_request_preparer_reuses_run_start_revision_without_duplicate_summary(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    _add_run(session, "old", size=800)
+    provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
+    controller = _controller(workspace, session, provider)
+    preparer = controller.as_request_preparer(
+        project_messages=_project_messages,
+        current_user={"role": "user", "content": "current request"},
+        route_context_window=1_000,
+        route_max_output=200,
+        compact_ratio=0.5,
+        memory_route_status=_memory_status(context_window=4_000),
+    )
+
+    await controller.prepare_run_start(
+        project_messages=_project_messages,
+        current_user={"role": "user", "content": "current request"},
+        route_context_window=1_000,
+        route_max_output=200,
+        compact_ratio=0.5,
+        memory_route_status=_memory_status(context_window=4_000),
+    )
+    prepared = await preparer.prepare(
+        [{"role": "system", "content": "stale candidate"}],
+        increment=(),
+        latest_cycle_start=None,
+        tools=(),
+        continuation_revision=0,
+    )
+
+    assert len(provider.complete_requests) == 2
+    assert prepared[0] == {"role": "system", "content": "SYSTEM"}
+    assert all(message["content"] != "old user " + "u" * 800 for message in prepared)
+    assert sum(message.get("content") == "current request" for message in prepared) == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_final_projection_is_the_stable_checked_revision(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    controller = _controller(workspace, session, ScriptedFakeProvider())
+    preparer = controller.as_request_preparer(
+        project_messages=_project_messages,
+        current_user={"role": "user", "content": "current request"},
+        route_context_window=4_000,
+        route_max_output=100,
+    )
+
+    first = await preparer.prepare(
+        [],
+        increment=(),
+        latest_cycle_start=None,
+        tools=(),
+        continuation_revision=0,
+    )
+    preparation_revision = controller.checked_context_revision
+    provider_projection = deepcopy(first)
+    provider_projection[-1]["content"] = "[read_file result omitted from context]"
+    preparer.observe_request_projection(
+        provider_projection,
+        micro_compression_enabled=True,
+    )
+    finalized_revision = controller.checked_context_revision
+    second = await preparer.prepare(
+        [],
+        increment=(),
+        latest_cycle_start=None,
+        tools=(),
+        continuation_revision=0,
+    )
+    assert controller.checked_context_revision == finalized_revision
+    preparer.observe_request_projection(
+        provider_projection,
+        micro_compression_enabled=True,
+    )
+
+    assert finalized_revision != preparation_revision
+    assert second == first
+    assert controller.checked_context_revision == finalized_revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    ("message", "tools", "route", "capacity", "estimator", "continuation", "micro"),
+)
+async def test_react_revision_changes_for_each_model_visible_input_source(
+    workspace: Path,
+    change: str,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    controller = _controller(workspace, session, ScriptedFakeProvider())
+    base: dict[str, Any] = {
+        "project_messages": _project_messages,
+        "increment": (),
+        "latest_cycle_start": None,
+        "route_context_window": 4_000,
+        "route_max_output": 100,
+        "current_user": {"role": "user", "content": "current request"},
+        "tools": (),
+        "continuation_revision": 0,
+    }
+    await controller.prepare_react(**base)
+    first_revision = controller.checked_context_revision
+
+    changed = dict(base)
+    if change == "message":
+        changed["current_user"] = {"role": "user", "content": "changed request"}
+    elif change == "tools":
+        changed["tools"] = (
+            {"type": "function", "function": {"name": "new_tool", "parameters": {}}},
+        )
+    elif change == "route":
+        changed["route_status"] = ModelRouteStatus(
+            requested_route="chat",
+            selected_route="default",
+            provider_id="other-provider",
+            model="other-model",
+            context_window=4_000,
+            max_output=100,
+            used_default=True,
+        )
+    elif change == "capacity":
+        changed["route_status"] = ModelRouteStatus(
+            requested_route="chat",
+            selected_route="chat",
+            provider_id="provider",
+            model="model",
+            context_window=3_900,
+            max_output=100,
+            used_default=False,
+        )
+    elif change == "estimator":
+        changed["estimator_version"] = "another-estimator"
+    elif change == "continuation":
+        changed["continuation_revision"] = 1
+    else:
+        changed["micro_compression_enabled"] = True
+
+    await controller.prepare_react(**changed)
+
+    assert controller.checked_context_revision != first_revision
+
+
+@pytest.mark.asyncio
+async def test_request_preparer_refreshes_route_identity_for_each_request(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    controller = _controller(workspace, session, ScriptedFakeProvider())
+    statuses = iter(
+        (
+            ModelRouteStatus(
+                requested_route="chat",
+                selected_route="chat",
+                provider_id="provider-one",
+                model="model-one",
+                context_window=4_000,
+                max_output=100,
+                used_default=False,
+            ),
+            ModelRouteStatus(
+                requested_route="chat",
+                selected_route="default",
+                provider_id="provider-two",
+                model="model-two",
+                context_window=3_000,
+                max_output=200,
+                used_default=True,
+            ),
+        )
+    )
+    preparer = controller.as_request_preparer(
+        project_messages=_project_messages,
+        current_user={"role": "user", "content": "request"},
+        route_context_window=4_000,
+        route_max_output=100,
+        route_status=lambda: next(statuses),
+    )
+
+    await preparer.prepare(
+        [],
+        increment=(),
+        latest_cycle_start=None,
+        tools=(),
+        continuation_revision=0,
+    )
+    first_revision = controller.checked_context_revision
+    await preparer.prepare(
+        [],
+        increment=(),
+        latest_cycle_start=None,
+        tools=(),
+        continuation_revision=1,
+    )
+
+    assert controller.checked_context_revision != first_revision
+
+
+@pytest.mark.asyncio
+async def test_action_summary_is_part_of_the_model_visible_revision(workspace: Path) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    session.update_metadata(summary="first action")
+    first = _controller(workspace, session, ScriptedFakeProvider())
+    first_result = await first.prepare_react(
+        project_messages=_project_messages,
+        increment=(),
+        latest_cycle_start=None,
+        route_context_window=4_000,
+        route_max_output=100,
+        current_user={"role": "user", "content": "request"},
+    )
+
+    session.update_metadata(summary="second action")
+    second = _controller(workspace, session, ScriptedFakeProvider())
+    second_result = await second.prepare_react(
+        project_messages=_project_messages,
+        increment=(),
+        latest_cycle_start=None,
+        route_context_window=4_000,
+        route_max_output=100,
+        current_user={"role": "user", "content": "request"},
+    )
+
+    assert first_result.context_revision != second_result.context_revision
+
+
+@pytest.mark.asyncio
+async def test_react_preparer_compacts_early_sole_run_and_preserves_latest_cycle(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    session = Session.create(state)
+    provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
+    controller = _controller(workspace, session, provider)
+    current_user = {"role": "user", "content": "current instruction"}
+    increment: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "early assistant " + "a" * 4_000,
+            "tool_calls": [{"id": "early-call", "name": "read_file", "arguments": "{}"}],
+            "status": "completed",
+            "error": None,
+            "token_usage": _usage(),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "early-call",
+            "name": "read_file",
+            "status": "success",
+            "content": "complete early result " + "r" * 4_000,
+            "artifact": None,
+        },
+        {
+            "role": "assistant",
+            "content": "latest assistant",
+            "tool_calls": [{"id": "latest-call", "name": "read_file", "arguments": "{}"}],
+            "status": "completed",
+            "error": None,
+            "token_usage": _usage(),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "latest-call",
+            "name": "read_file",
+            "status": "success",
+            "content": "complete latest result " + "l" * 700,
+            "artifact": None,
+        },
+    ]
+
+    result = await controller.prepare_react(
+        project_messages=_project_messages,
+        increment=increment,
+        latest_cycle_start=2,
+        route_context_window=4_000,
+        route_max_output=100,
+        current_user=current_user,
+        compact_ratio=0.5,
+        memory_route_status=_memory_status(context_window=10_000),
+    )
+
+    assert result.compacted is True
+    assert controller.current_user_compacted is True
+    assert controller.pending_last_compacted == 3
+    assert [message["role"] for message in result.selected_batch] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+    fact_payload = str(provider.complete_requests[0].messages[1]["content"])
+    action_payload = str(provider.complete_requests[1].messages[1]["content"])
+    assert fact_payload.count("current instruction") == 1
+    assert fact_payload.count("complete early result") == 1
+    assert action_payload.count("complete early result") == 1
+    assert "complete latest result" not in fact_payload
+    assert "complete latest result" not in action_payload
+    assert (
+        sum(message.get("content") == "current instruction" for message in result.retained_messages)
+        == 1
+    )
+    assert any(
+        message.get("content", "").startswith("complete latest result")
+        for message in result.retained_messages
+        if message.get("role") == "tool"
+    )
+    repeated = await controller.prepare_react(
+        project_messages=_project_messages,
+        increment=increment,
+        latest_cycle_start=2,
+        route_context_window=4_000,
+        route_max_output=100,
+        current_user=current_user,
+        compact_ratio=0.5,
+        memory_route_status=_memory_status(context_window=10_000),
+    )
+    assert repeated.compacted is False
+    assert repeated.selected_batch == ()
+    assert repeated.context_revision == result.context_revision
+    assert len(provider.complete_requests) == 2
+    assert (
+        sum(
+            message.get("content") == "current instruction"
+            for message in repeated.retained_messages
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio

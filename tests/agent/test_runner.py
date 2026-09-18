@@ -225,6 +225,11 @@ class _RetryingRouter:
 class _RecordingRequestPreparer:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
+        self.observations: list[dict[str, Any]] = []
+
+    @property
+    def recounts_retained_tool_calls(self) -> bool:
+        return False
 
     async def prepare(
         self,
@@ -245,6 +250,19 @@ class _RecordingRequestPreparer:
             }
         )
         return deepcopy(list(candidate))
+
+    def observe_request_projection(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        micro_compression_enabled: bool,
+    ) -> None:
+        self.observations.append(
+            {
+                "messages": deepcopy(list(messages)),
+                "micro_compression_enabled": micro_compression_enabled,
+            }
+        )
 
 
 def _tool_iteration_scripts(count: int) -> tuple[StreamScript, ...]:
@@ -359,6 +377,7 @@ async def test_runner_prepares_each_logical_request_with_run_local_context() -> 
     assert [request["continuation_revision"] for request in preparer.requests] == [0, 1, 2]
     assert all(request["tools"] == tuple(gateway.schemas) for request in preparer.requests)
     assert [len(request["increment"]) for request in preparer.requests] == [0, 2, 4]
+    assert len(preparer.observations) == len(preparer.requests)
     assert all(
         message["role"] in {"assistant", "tool"}
         for request in preparer.requests
@@ -389,6 +408,10 @@ async def test_identity_request_preparation_is_detached_and_value_equivalent() -
 @pytest.mark.asyncio
 async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools() -> None:
     class MutatingPreparer:
+        @property
+        def recounts_retained_tool_calls(self) -> bool:
+            return False
+
         async def prepare(
             self,
             candidate: Sequence[dict[str, Any]],
@@ -402,6 +425,15 @@ async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools(
             candidate[0]["content"]["nested"].append("projected")
             tools[0]["parameters"]["enum"].append("mutated")
             return candidate
+
+        def observe_request_projection(
+            self,
+            messages: Sequence[dict[str, Any]],
+            *,
+            micro_compression_enabled: bool,
+        ) -> None:
+            del micro_compression_enabled
+            messages[0]["content"]["nested"].append("observed")
 
     provider = ScriptedFakeProvider(
         streams=(
@@ -439,6 +471,69 @@ async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools(
     assert provider.stream_requests[0].tools == tuple(gateway.schemas)
     assert gateway.schemas[0]["parameters"]["enum"] == ["original"]
     assert initial_messages[0]["content"] == {"nested": ["original"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", (RuntimeError, asyncio.CancelledError))
+async def test_request_projection_observer_failure_stops_before_provider(
+    failure_type: type[BaseException],
+) -> None:
+    class FailingObserverPreparer:
+        @property
+        def recounts_retained_tool_calls(self) -> bool:
+            return False
+
+        async def prepare(
+            self,
+            candidate: Sequence[dict[str, Any]],
+            *,
+            increment: Sequence[dict[str, Any]],
+            latest_cycle_start: int | None,
+            tools: Sequence[dict[str, Any]],
+            continuation_revision: int,
+        ) -> list[dict[str, Any]]:
+            del increment, latest_cycle_start, tools, continuation_revision
+            return deepcopy(list(candidate))
+
+        def observe_request_projection(
+            self,
+            messages: Sequence[dict[str, Any]],
+            *,
+            micro_compression_enabled: bool,
+        ) -> None:
+            del messages, micro_compression_enabled
+            raise failure_type("observer failed")
+
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="unexpected"),
+                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+
+    with pytest.raises(failure_type, match="observer failed"):
+        await AgentRunner(ScriptedFakeRouter(provider), FailingObserverPreparer()).run(
+            [{"role": "user", "content": "request"}],
+            model="chat",
+            tool_gateway=None,
+            on_output=_ignore_output,
+            confirmation=None,
+            externalize_result=None,
+            cancel_requested=None,
+            max_iterations=50,
+            propagate_unexpected_errors=True,
+        )
+
+    assert provider.stream_requests == []
 
 
 def test_result_validates_exact_usage_and_finish_invariants() -> None:
@@ -1464,8 +1559,101 @@ async def test_runner_micro_compression_includes_eligible_history_but_keeps_rece
 
 
 @pytest.mark.asyncio
+async def test_runner_micro_compression_recounts_retained_history_before_provider_request() -> None:
+    class RetainedProjectionPreparer:
+        @property
+        def recounts_retained_tool_calls(self) -> bool:
+            return True
+
+        async def prepare(
+            self,
+            candidate: Sequence[dict[str, Any]],
+            *,
+            increment: Sequence[dict[str, Any]],
+            latest_cycle_start: int | None,
+            tools: Sequence[dict[str, Any]],
+            continuation_revision: int,
+        ) -> list[dict[str, Any]]:
+            del increment, latest_cycle_start, tools, continuation_revision
+            return deepcopy(list(candidate))
+
+        def observe_request_projection(
+            self,
+            messages: Sequence[dict[str, Any]],
+            *,
+            micro_compression_enabled: bool,
+        ) -> None:
+            del messages, micro_compression_enabled
+
+    large_content = "h" * 513
+    history: list[dict[str, Any]] = [
+        {"role": "user", "content": "Previous request."},
+        *[
+            message
+            for number in range(11)
+            for message in (
+                {
+                    "role": "assistant",
+                    "content": f"history assistant {number}",
+                    "tool_calls": [
+                        {"id": f"history-call-{number}", "name": "read_file", "arguments": "{}"}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"history-call-{number}",
+                    "name": "read_file",
+                    "status": "success",
+                    "content": large_content,
+                    "artifact": None,
+                },
+            )
+        ],
+    ]
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Done"),
+                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    gateway = _MicroCompressionGateway([])
+
+    await AgentRunner(ScriptedFakeRouter(provider), RetainedProjectionPreparer()).run(
+        history,
+        model="chat",
+        tool_gateway=gateway,  # type: ignore[arg-type]
+        on_output=_ignore_output,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+    )
+
+    assert (
+        sum(
+            message.get("content") == "[read_file result omitted from context]"
+            for message in provider.stream_requests[0].messages
+        )
+        == 10
+    )
+
+
+@pytest.mark.asyncio
 async def test_runner_recomputes_latest_cycle_after_preparer_removes_history() -> None:
     class PrefixDroppingPreparer:
+        @property
+        def recounts_retained_tool_calls(self) -> bool:
+            return True
+
         async def prepare(
             self,
             candidate: Sequence[dict[str, Any]],
@@ -1477,6 +1665,14 @@ async def test_runner_recomputes_latest_cycle_after_preparer_removes_history() -
         ) -> list[dict[str, Any]]:
             del increment, latest_cycle_start, tools, continuation_revision
             return deepcopy(list(candidate[4:]))
+
+        def observe_request_projection(
+            self,
+            messages: Sequence[dict[str, Any]],
+            *,
+            micro_compression_enabled: bool,
+        ) -> None:
+            del messages, micro_compression_enabled
 
     large_content = "x" * 513
     history: list[dict[str, Any]] = [

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,13 +26,20 @@ from myclaw.logging.session import without_session_log
 from myclaw.management.service import RuntimeStatusInput, estimate_input_tokens
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelAttemptGuard, ModelRouteStatus
-from myclaw.provider.models import ModelMessages, ModelResponse, ModelRoute
+from myclaw.provider.models import (
+    ModelContinuation,
+    ModelMessages,
+    ModelResponse,
+    ModelRoute,
+    ModelStreamEvent,
+)
 from myclaw.templates import render_template
 
 type CompactionProjection = Callable[
     [Sequence[dict[str, Any]]],
     list[dict[str, Any]],
 ]
+type RouteStatusSource = ModelRouteStatus | Callable[[], ModelRouteStatus] | None
 
 _COMPACTION_JSON_TRANSLATION = str.maketrans({"`": r"\u0060"})
 
@@ -40,6 +47,8 @@ __all__ = [
     "AgentRunContextController",
     "AgentRunContextModelRouter",
     "AgentRunContextPreparation",
+    "AgentRunContextRequestPreparer",
+    "AgentRunContextRouterAdapter",
     "AgentRunContextSnapshot",
     "AgentRunStagedValues",
     "AgentRunTerminalCommitValues",
@@ -129,6 +138,7 @@ class AgentRunContextPreparation:
     projection_source: ProjectionSource
     context_revision: str
     compacted: bool
+    retained_messages: tuple[dict[str, Any], ...] = ()
 
     @property
     def selected_messages(self) -> tuple[dict[str, Any], ...]:
@@ -141,6 +151,20 @@ class _PendingFactBatch:
     batch: tuple[dict[str, Any], ...]
     cutoff: int
     selected_payload: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ReactRevisionObservation:
+    prepared_messages: tuple[dict[str, Any], ...]
+    current_user: dict[str, Any] | None
+    tools: tuple[dict[str, Any], ...]
+    route_values: _RouteProjectionValues
+    memory_route_status: ModelRouteStatus | None
+    compact_ratio: float
+    estimator_version: str
+    increment: tuple[dict[str, Any], ...]
+    latest_cycle_start: int | None
+    continuation_revision: int
 
 
 class AgentRunContextController:
@@ -175,6 +199,7 @@ class AgentRunContextController:
         self._usage_history = _main_agent_usage_history(snapshot.messages)
         self._latest_usage_context = self._usage_history[0][0] if self._usage_history else None
         self._base_context_revision: str | None = None
+        self._checked_preparation_revision: str | None = None
         self._checked_context_revision: str | None = None
         self._pending_fact: _PendingFactBatch | None = None
         self._failed_context_revision: str | None = None
@@ -195,6 +220,39 @@ class AgentRunContextController:
             provider=provider,
             memory_manager=memory_manager,
             now=now,
+        )
+
+    def as_request_preparer(
+        self,
+        *,
+        project_messages: CompactionProjection,
+        route_context_window: int,
+        route_max_output: int,
+        current_user: dict[str, Any] | None = None,
+        compact_ratio: float = 0.9,
+        memory_route_status: RouteStatusSource = None,
+        route_status: RouteStatusSource = None,
+        requested_route: str = "chat",
+        selected_route: str | None = None,
+        provider_id: str = "",
+        model: str = "",
+        estimator_version: str = CONTEXT_ESTIMATOR_VERSION,
+    ) -> AgentRunContextRequestPreparer:
+        """Compose this staged controller with the Runner request seam."""
+        return AgentRunContextRequestPreparer(
+            self,
+            project_messages=project_messages,
+            route_context_window=route_context_window,
+            route_max_output=route_max_output,
+            current_user=current_user,
+            compact_ratio=compact_ratio,
+            memory_route_status=memory_route_status,
+            route_status=route_status,
+            requested_route=requested_route,
+            selected_route=selected_route,
+            provider_id=provider_id,
+            model=model,
+            estimator_version=estimator_version,
         )
 
     @property
@@ -293,7 +351,6 @@ class AgentRunContextController:
         if compatible_context is not None:
             self._latest_usage_context = compatible_context
         revision = self._context_revision(
-            project_messages=project_messages,
             current_user=copied_user,
             tools=effective_tools,
             projected=projected,
@@ -309,13 +366,15 @@ class AgentRunContextController:
             raise self._failed_exception
         self._failed_context_revision = None
         self._failed_exception = None
-        if self._checked_context_revision == revision:
+        if self._checked_preparation_revision == revision:
+            assert self._checked_context_revision is not None
             return AgentRunContextPreparation(
                 selected_batch=(),
                 projected_tokens=projection.projected_tokens,
                 projection_source=projection.source,
-                context_revision=revision,
+                context_revision=self._checked_context_revision,
                 compacted=False,
+                retained_messages=tuple(deepcopy(projected)),
             )
 
         protected_projection = self._projected_tokens(
@@ -331,6 +390,7 @@ class AgentRunContextController:
             self._record_failure(revision, overflow_error)
             raise overflow_error
         if self._pending_fact is None and not budget.should_compact(projection.projected_tokens):
+            self._checked_preparation_revision = revision
             self._checked_context_revision = revision
             return AgentRunContextPreparation(
                 selected_batch=(),
@@ -338,6 +398,7 @@ class AgentRunContextController:
                 projection_source=projection.source,
                 context_revision=revision,
                 compacted=False,
+                retained_messages=tuple(deepcopy(projected)),
             )
 
         pending_fact = self._pending_fact
@@ -378,6 +439,7 @@ class AgentRunContextController:
                     raise overflow_error
         else:
             if not batch:
+                self._checked_preparation_revision = revision
                 self._checked_context_revision = revision
                 if projection.projected_tokens >= budget.available_context:
                     overflow_error = _model_context_overflow()
@@ -389,6 +451,7 @@ class AgentRunContextController:
                     projection_source=projection.source,
                     context_revision=revision,
                     compacted=False,
+                    retained_messages=tuple(deepcopy(projected)),
                 )
 
         selected_payload = (
@@ -487,7 +550,6 @@ class AgentRunContextController:
             estimator_version=estimator_version,
         )
         final_revision = self._context_revision(
-            project_messages=project_messages,
             current_user=copied_user,
             tools=effective_tools,
             projected=final_projected,
@@ -497,6 +559,7 @@ class AgentRunContextController:
             estimator_version=estimator_version,
         )
         self._base_context_revision = final_revision
+        self._checked_preparation_revision = final_revision
         self._checked_context_revision = final_revision
         if final_projection.projected_tokens >= budget.available_context:
             overflow_error = _model_context_overflow()
@@ -508,6 +571,417 @@ class AgentRunContextController:
             projection_source=final_projection.source,
             context_revision=final_revision,
             compacted=True,
+            retained_messages=tuple(deepcopy(final_projected)),
+        )
+
+    async def prepare_react(
+        self,
+        *,
+        project_messages: CompactionProjection,
+        increment: Sequence[dict[str, Any]],
+        latest_cycle_start: int | None,
+        route_context_window: int,
+        route_max_output: int,
+        tools: Sequence[dict[str, Any]] = (),
+        current_user: dict[str, Any] | None = None,
+        compact_ratio: float = 0.9,
+        route_status: ModelRouteStatus | None = None,
+        memory_route_status: ModelRouteStatus | None = None,
+        requested_route: str = "chat",
+        selected_route: str | None = None,
+        provider_id: str = "",
+        model: str = "",
+        estimator_version: str = CONTEXT_ESTIMATOR_VERSION,
+        continuation_revision: int = 0,
+        micro_compression_enabled: bool = False,
+    ) -> AgentRunContextPreparation:
+        """Prepare one ReAct request from the run's raw increment."""
+        route_values = _route_projection_values(
+            route_status=route_status,
+            requested_route=requested_route,
+            selected_route=selected_route,
+            provider_id=provider_id,
+            model=model,
+            context_window=route_context_window,
+            max_output=route_max_output,
+        )
+        budget = ContextBudget(
+            context_window=route_values.context_window,
+            max_output=route_values.max_output,
+            compact_ratio=compact_ratio,
+        )
+        effective_tools = tuple(deepcopy(list(tools)))
+        copied_user = None if current_user is None else deepcopy(current_user)
+        copied_increment = tuple(deepcopy(list(increment)))
+        _validate_react_increment(copied_increment)
+        _validate_latest_cycle_start(latest_cycle_start, copied_increment)
+        if (
+            isinstance(continuation_revision, bool)
+            or not isinstance(continuation_revision, int)
+            or continuation_revision < 0
+        ):
+            raise ValueError("continuation_revision must be a nonnegative integer")
+        if not isinstance(micro_compression_enabled, bool):
+            raise TypeError("micro_compression_enabled must be a boolean")
+        projected = self._react_project_candidate(
+            copied_increment,
+            current_user=copied_user,
+            project_messages=project_messages,
+        )
+        projection = self._projection_from_candidate(
+            projected,
+            tools=effective_tools,
+            route_values=route_values,
+            estimator_version=estimator_version,
+        )
+        compatible_context = self._compatible_usage_context(route_values, estimator_version)
+        if compatible_context is not None:
+            self._latest_usage_context = compatible_context
+        revision = self._context_revision(
+            current_user=copied_user,
+            tools=effective_tools,
+            projected=projected,
+            route_values=route_values,
+            memory_route_status=memory_route_status,
+            compact_ratio=compact_ratio,
+            estimator_version=estimator_version,
+            increment=copied_increment,
+            latest_cycle_start=latest_cycle_start,
+            continuation_revision=continuation_revision,
+            micro_compression_enabled=micro_compression_enabled,
+        )
+        if self._base_context_revision is None or self._base_context_revision != revision:
+            self._base_context_revision = revision
+        if self._failed_context_revision == revision:
+            assert self._failed_exception is not None
+            raise self._failed_exception
+        self._failed_context_revision = None
+        self._failed_exception = None
+        if self._checked_preparation_revision == revision:
+            assert self._checked_context_revision is not None
+            return AgentRunContextPreparation(
+                selected_batch=(),
+                projected_tokens=projection.projected_tokens,
+                projection_source=projection.source,
+                context_revision=self._checked_context_revision,
+                compacted=False,
+                retained_messages=tuple(deepcopy(projected)),
+            )
+
+        protected = self._react_protected_projection(
+            copied_increment,
+            current_user=copied_user,
+            latest_cycle_start=latest_cycle_start,
+            project_messages=project_messages,
+            tools=effective_tools,
+            route_values=route_values,
+            estimator_version=estimator_version,
+        )
+        if protected.projected_tokens >= budget.available_context:
+            overflow_error = _model_context_overflow()
+            self._record_failure(revision, overflow_error)
+            raise overflow_error
+        if self._pending_fact is None and not budget.should_compact(projection.projected_tokens):
+            self._checked_preparation_revision = revision
+            self._checked_context_revision = revision
+            return AgentRunContextPreparation(
+                selected_batch=(),
+                projected_tokens=projection.projected_tokens,
+                projection_source=projection.source,
+                context_revision=revision,
+                compacted=False,
+                retained_messages=tuple(deepcopy(projected)),
+            )
+
+        pending_fact = self._pending_fact
+        if pending_fact is None:
+            batch, cutoff = self._select_react_batch(
+                budget,
+                copied_increment,
+                current_user=copied_user,
+                latest_cycle_start=latest_cycle_start,
+            )
+        else:
+            batch = tuple(deepcopy(list(pending_fact.batch)))
+            cutoff = pending_fact.cutoff
+        if not batch:
+            self._checked_preparation_revision = revision
+            self._checked_context_revision = revision
+            return AgentRunContextPreparation(
+                selected_batch=(),
+                projected_tokens=projection.projected_tokens,
+                projection_source=projection.source,
+                context_revision=revision,
+                compacted=False,
+                retained_messages=tuple(deepcopy(projected)),
+            )
+
+        selected_user = (
+            copied_user is not None
+            and not self._current_user_compacted
+            and self._pending_last_compacted <= len(self._snapshot.messages) < cutoff
+        )
+        selected_payload = (
+            _compaction_user_context(list(batch))
+            if pending_fact is None
+            else pending_fact.selected_payload
+        )
+        memory_context_window, memory_max_output = _memory_budget_values(
+            memory_route_status=memory_route_status,
+            fallback_context_window=route_context_window,
+            fallback_max_output=route_max_output,
+        )
+        if pending_fact is None:
+            fact_messages = _summary_request_messages(
+                template_name="conversation-compaction-system-prompt.md",
+                selected_payload=selected_payload,
+            )
+            if estimate_request_tokens(fact_messages) >= memory_context_window - memory_max_output:
+                overflow_error = _model_context_overflow()
+                self._record_failure(revision, overflow_error)
+                raise overflow_error
+            try:
+                fact_response = await self._provider.complete(
+                    "memory",
+                    messages=fact_messages,
+                    tools=(),
+                    guard=_summary_hard_guard,
+                )
+            except Exception as provider_error:
+                self._record_failure(revision, provider_error)
+                raise
+            _add_pending_usage(self._pending_compaction_usage, fact_response)
+            response_error = _summary_response_error(fact_response)
+            if response_error is not None:
+                self._record_failure(revision, response_error)
+                raise response_error
+            try:
+                await self._memory_manager.append_summary(
+                    content=fact_response.message.content,
+                    timestamp=self._persisted_now(),
+                )
+            except (OSError, UnicodeError, ValueError) as persistence_cause:
+                persistence_error = ModelCallError(
+                    ErrorInfo(
+                        code="persistence_error",
+                        message="Conversation Summary could not be persisted.",
+                    )
+                )
+                self._record_failure(revision, persistence_error)
+                raise persistence_error from persistence_cause
+            self._pending_fact = _PendingFactBatch(
+                batch=tuple(deepcopy(list(batch))),
+                cutoff=cutoff,
+                selected_payload=selected_payload,
+            )
+
+        action_messages = _summary_request_messages(
+            template_name="conversation-summary-system-prompt.md",
+            selected_payload=_action_summary_user_context(
+                self._pending_action_summary,
+                selected_payload,
+            ),
+        )
+        if estimate_request_tokens(action_messages) >= memory_context_window - memory_max_output:
+            overflow_error = _model_context_overflow()
+            self._record_failure(revision, overflow_error)
+            raise overflow_error
+        try:
+            action_response = await self._provider.complete(
+                "memory",
+                messages=action_messages,
+                tools=(),
+                guard=_summary_hard_guard,
+            )
+        except Exception as provider_error:
+            self._record_failure(revision, provider_error)
+            raise
+        _add_pending_usage(self._pending_compaction_usage, action_response)
+        response_error = _summary_response_error(action_response)
+        if response_error is not None:
+            self._record_failure(revision, response_error)
+            raise response_error
+
+        self._pending_action_summary = _normalize_action_summary(action_response.message.content)
+        self._pending_last_compacted = cutoff
+        self._pending_fact = None
+        if selected_user:
+            self._current_user_compacted = True
+        final_projected = self._react_project_candidate(
+            copied_increment,
+            current_user=copied_user,
+            project_messages=project_messages,
+        )
+        final_projection = self._projection_from_candidate(
+            final_projected,
+            tools=effective_tools,
+            route_values=route_values,
+            estimator_version=estimator_version,
+        )
+        final_revision = self._context_revision(
+            current_user=copied_user,
+            tools=effective_tools,
+            projected=final_projected,
+            route_values=route_values,
+            memory_route_status=memory_route_status,
+            compact_ratio=compact_ratio,
+            estimator_version=estimator_version,
+            increment=copied_increment,
+            latest_cycle_start=latest_cycle_start,
+            continuation_revision=continuation_revision,
+            micro_compression_enabled=micro_compression_enabled,
+        )
+        self._base_context_revision = final_revision
+        self._checked_preparation_revision = final_revision
+        self._checked_context_revision = final_revision
+        return AgentRunContextPreparation(
+            selected_batch=tuple(deepcopy(list(batch))),
+            projected_tokens=final_projection.projected_tokens,
+            projection_source=final_projection.source,
+            context_revision=final_revision,
+            compacted=True,
+            retained_messages=tuple(deepcopy(final_projected)),
+        )
+
+    def observe_react_request_projection(
+        self,
+        observation: _ReactRevisionObservation,
+        messages: Sequence[dict[str, Any]],
+        *,
+        micro_compression_enabled: bool,
+    ) -> None:
+        """Record the final Runner-owned projection before the Provider call."""
+        if not isinstance(micro_compression_enabled, bool):
+            raise TypeError("micro_compression_enabled must be a boolean")
+        preparation_revision = self._context_revision(
+            current_user=observation.current_user,
+            tools=observation.tools,
+            projected=observation.prepared_messages,
+            route_values=observation.route_values,
+            memory_route_status=observation.memory_route_status,
+            compact_ratio=observation.compact_ratio,
+            estimator_version=observation.estimator_version,
+            increment=observation.increment,
+            latest_cycle_start=observation.latest_cycle_start,
+            continuation_revision=observation.continuation_revision,
+            micro_compression_enabled=micro_compression_enabled,
+        )
+        final_revision = _finalized_context_revision(
+            preparation_revision,
+            prepared_messages=observation.prepared_messages,
+            provider_messages=messages,
+        )
+        self._base_context_revision = final_revision
+        self._checked_preparation_revision = preparation_revision
+        self._checked_context_revision = final_revision
+
+    def _react_virtual_messages(
+        self,
+        increment: Sequence[dict[str, Any]],
+        *,
+        current_user: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        result = deepcopy(list(self._snapshot.messages))
+        if current_user is not None:
+            result.append(deepcopy(current_user))
+        result.extend(deepcopy(list(increment)))
+        return result
+
+    def _react_raw_projection(
+        self,
+        increment: Sequence[dict[str, Any]],
+        *,
+        current_user: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        snapshot_length = len(self._snapshot.messages)
+        user_offset = 1 if current_user is not None else 0
+        increment_start = max(
+            0,
+            self._pending_last_compacted - snapshot_length - user_offset,
+        )
+        source = list(
+            deepcopy(self._snapshot.messages[min(self._pending_last_compacted, snapshot_length) :])
+        )
+        if current_user is not None:
+            source.append(deepcopy(current_user))
+        source.extend(deepcopy(list(increment[increment_start:])))
+        return source
+
+    def _react_project_candidate(
+        self,
+        increment: Sequence[dict[str, Any]],
+        *,
+        current_user: dict[str, Any] | None,
+        project_messages: CompactionProjection,
+    ) -> list[dict[str, Any]]:
+        return _insert_action_summary(
+            project_messages(
+                self._react_raw_projection(
+                    increment,
+                    current_user=current_user,
+                )
+            ),
+            self._pending_action_summary,
+        )
+
+    def _react_protected_projection(
+        self,
+        increment: Sequence[dict[str, Any]],
+        *,
+        current_user: dict[str, Any] | None,
+        latest_cycle_start: int | None,
+        project_messages: CompactionProjection,
+        tools: Sequence[dict[str, Any]],
+        route_values: _RouteProjectionValues,
+        estimator_version: str,
+    ) -> ContextProjection:
+        if latest_cycle_start is None:
+            protected_increment: Sequence[dict[str, Any]] = ()
+        else:
+            increment_start = min(max(latest_cycle_start, 0), len(increment))
+            protected_increment = increment[increment_start:]
+        source = [] if current_user is None else [deepcopy(current_user)]
+        source.extend(deepcopy(list(protected_increment)))
+        projected = _insert_action_summary(project_messages(source), self._pending_action_summary)
+        return self._projection_from_candidate(
+            projected,
+            tools=tools,
+            route_values=route_values,
+            estimator_version=estimator_version,
+        )
+
+    def _select_react_batch(
+        self,
+        budget: ContextBudget,
+        increment: Sequence[dict[str, Any]],
+        *,
+        current_user: dict[str, Any] | None,
+        latest_cycle_start: int | None,
+    ) -> tuple[tuple[dict[str, Any], ...], int]:
+        virtual = self._react_virtual_messages(increment, current_user=current_user)
+        snapshot_length = len(self._snapshot.messages)
+        increment_base = snapshot_length + (1 if current_user is not None else 0)
+        current_start = (
+            increment_base
+            if self._current_user_compacted
+            else (snapshot_length if current_user is not None else increment_base)
+        )
+        current_start = max(current_start, self._pending_last_compacted)
+        current_slice = virtual[current_start:]
+        current_fits = budget.can_retain_run_slice(current_slice, percentage=50)
+        eligible = self._eligible_runs()
+        history_batch, history_cutoff = self._batch_from_runs(eligible)
+        if current_fits and history_batch:
+            return history_batch, history_cutoff
+        if latest_cycle_start is None:
+            return (), self._pending_last_compacted
+        cycle_start = increment_base + latest_cycle_start
+        cutoff = min(max(cycle_start, self._pending_last_compacted), len(virtual))
+        if cutoff <= self._pending_last_compacted:
+            return (), self._pending_last_compacted
+        return (
+            tuple(deepcopy(virtual[self._pending_last_compacted : cutoff])),
+            cutoff,
         )
 
     def _project_candidate(
@@ -569,6 +1043,7 @@ class AgentRunContextController:
 
     def _record_failure(self, revision: str, error: Exception) -> None:
         self._base_context_revision = revision
+        self._checked_preparation_revision = revision
         self._checked_context_revision = revision
         self._failed_context_revision = revision
         self._failed_exception = error
@@ -650,7 +1125,6 @@ class AgentRunContextController:
     def _context_revision(
         self,
         *,
-        project_messages: CompactionProjection,
         current_user: dict[str, Any] | None,
         tools: Sequence[dict[str, Any]],
         projected: Sequence[dict[str, Any]],
@@ -658,12 +1132,22 @@ class AgentRunContextController:
         memory_route_status: ModelRouteStatus | None,
         compact_ratio: float,
         estimator_version: str,
+        increment: Sequence[dict[str, Any]] = (),
+        latest_cycle_start: int | None = None,
+        continuation_revision: int = 0,
+        micro_compression_enabled: bool = False,
     ) -> str:
         value = {
             "transcript": self._snapshot.messages,
             "pending_last_compacted": self._pending_last_compacted,
             "pending_action_summary": self._pending_action_summary,
             "current_user": current_user,
+            "current_user_compacted": self._current_user_compacted,
+            "temporary_current_user": (current_user if self._current_user_compacted else None),
+            "increment": list(increment),
+            "latest_cycle_start": latest_cycle_start,
+            "continuation_revision": continuation_revision,
+            "micro_compression_enabled": micro_compression_enabled,
             "tools": list(tools),
             "projected": list(projected),
             "route": route_values.to_dict(),
@@ -682,12 +1166,200 @@ class AgentRunContextController:
             ),
             "estimator_version": estimator_version,
         }
-        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
         return sha256(encoded.encode("utf-8")).hexdigest()
 
     def _persisted_now(self) -> datetime:
         value = self._now()
         return value.replace(microsecond=value.microsecond // 1000 * 1000)
+
+
+class AgentRunContextRequestPreparer:
+    """Adapt one staged controller to the Agent Runner's narrow request seam."""
+
+    def __init__(
+        self,
+        controller: AgentRunContextController,
+        *,
+        project_messages: CompactionProjection,
+        route_context_window: int,
+        route_max_output: int,
+        current_user: dict[str, Any] | None = None,
+        compact_ratio: float = 0.9,
+        route_status: RouteStatusSource = None,
+        memory_route_status: RouteStatusSource = None,
+        requested_route: str = "chat",
+        selected_route: str | None = None,
+        provider_id: str = "",
+        model: str = "",
+        estimator_version: str = CONTEXT_ESTIMATOR_VERSION,
+    ) -> None:
+        if not isinstance(controller, AgentRunContextController):
+            raise TypeError("request preparer requires an Agent Run context controller")
+        if not callable(project_messages):
+            raise TypeError("request preparer requires a projection callback")
+        self._controller = controller
+        self._project_messages = project_messages
+        self._route_context_window = route_context_window
+        self._route_max_output = route_max_output
+        self._current_user = None if current_user is None else deepcopy(current_user)
+        self._compact_ratio = compact_ratio
+        self._route_status = route_status
+        self._memory_route_status = memory_route_status
+        self._requested_route = requested_route
+        self._selected_route = selected_route
+        self._provider_id = provider_id
+        self._model = model
+        self._estimator_version = estimator_version
+        self._micro_compression_enabled = False
+        self._pending_observation: _ReactRevisionObservation | None = None
+
+    @property
+    def recounts_retained_tool_calls(self) -> bool:
+        return True
+
+    async def prepare(
+        self,
+        candidate: Sequence[dict[str, Any]],
+        *,
+        increment: Sequence[dict[str, Any]],
+        latest_cycle_start: int | None,
+        tools: Sequence[dict[str, Any]],
+        continuation_revision: int,
+    ) -> list[dict[str, Any]]:
+        del candidate
+        self._pending_observation = None
+        route_status = _resolve_route_status(self._route_status)
+        memory_route_status = _resolve_route_status(self._memory_route_status)
+        route_values = _route_projection_values(
+            route_status=route_status,
+            requested_route=self._requested_route,
+            selected_route=self._selected_route,
+            provider_id=self._provider_id,
+            model=self._model,
+            context_window=self._route_context_window,
+            max_output=self._route_max_output,
+        )
+        preparation = await self._controller.prepare_react(
+            project_messages=self._project_messages,
+            increment=deepcopy(list(increment)),
+            latest_cycle_start=latest_cycle_start,
+            route_context_window=route_values.context_window,
+            route_max_output=route_values.max_output,
+            tools=deepcopy(list(tools)),
+            current_user=None if self._current_user is None else deepcopy(self._current_user),
+            compact_ratio=self._compact_ratio,
+            route_status=route_status,
+            memory_route_status=memory_route_status,
+            requested_route=self._requested_route,
+            selected_route=self._selected_route,
+            provider_id=self._provider_id,
+            model=self._model,
+            estimator_version=self._estimator_version,
+            continuation_revision=continuation_revision,
+            micro_compression_enabled=self._micro_compression_enabled,
+        )
+        prepared_messages = tuple(deepcopy(list(preparation.retained_messages)))
+        self._pending_observation = _ReactRevisionObservation(
+            prepared_messages=prepared_messages,
+            current_user=None if self._current_user is None else deepcopy(self._current_user),
+            tools=tuple(deepcopy(list(tools))),
+            route_values=route_values,
+            memory_route_status=memory_route_status,
+            compact_ratio=self._compact_ratio,
+            estimator_version=self._estimator_version,
+            increment=tuple(deepcopy(list(increment))),
+            latest_cycle_start=latest_cycle_start,
+            continuation_revision=continuation_revision,
+        )
+        return deepcopy(list(prepared_messages))
+
+    def observe_request_projection(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        micro_compression_enabled: bool,
+    ) -> None:
+        """Record Runner-owned request state for the next model-visible revision."""
+        if not isinstance(micro_compression_enabled, bool):
+            raise TypeError("micro_compression_enabled must be a boolean")
+        observation = self._pending_observation
+        if observation is None:
+            raise RuntimeError("request projection observation requires one completed preparation")
+        self._pending_observation = None
+        self._controller.observe_react_request_projection(
+            observation,
+            messages,
+            micro_compression_enabled=micro_compression_enabled,
+        )
+        self._micro_compression_enabled = micro_compression_enabled
+
+
+class _GuardedAgentRunRouter(Protocol):
+    def stream(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]: ...
+
+    def complete(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
+    ) -> Coroutine[Any, Any, ModelResponse]: ...
+
+
+class AgentRunContextRouterAdapter:
+    """Add the per-attempt hard budget guard in an explicit Agent Run composition."""
+
+    def __init__(self, router: _GuardedAgentRunRouter) -> None:
+        self._router = router
+
+    def stream(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        return self._router.stream(
+            route,
+            messages=messages,
+            tools=tools,
+            continuation=continuation,
+            guard=_agent_run_hard_guard,
+        )
+
+    def complete(
+        self,
+        route: ModelRoute,
+        *,
+        messages: ModelMessages,
+        tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None = None,
+    ) -> Coroutine[Any, Any, ModelResponse]:
+        return self._router.complete(
+            route,
+            messages=messages,
+            tools=tools,
+            continuation=continuation,
+            guard=_agent_run_hard_guard,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -708,6 +1380,14 @@ class _RouteProjectionValues:
             "context_window": self.context_window,
             "max_output": self.max_output,
         }
+
+
+def _resolve_route_status(source: RouteStatusSource) -> ModelRouteStatus | None:
+    if callable(source):
+        source = source()
+    if source is not None and not isinstance(source, ModelRouteStatus):
+        raise TypeError("route status source must return ModelRouteStatus or None")
+    return source
 
 
 def _route_projection_values(
@@ -756,6 +1436,28 @@ def _completed_run_ranges(messages: Sequence[dict[str, Any]]) -> list[tuple[int,
         (start, starts[index + 1] if index + 1 < len(starts) else len(messages))
         for index, start in enumerate(starts)
     ]
+
+
+def _validate_react_increment(messages: Sequence[dict[str, Any]]) -> None:
+    for index, message in enumerate(messages):
+        if message.get("role") not in {"assistant", "tool"}:
+            raise ValueError(f"ReAct increment message {index} must be assistant or tool")
+
+
+def _validate_latest_cycle_start(
+    latest_cycle_start: int | None,
+    increment: Sequence[dict[str, Any]],
+) -> None:
+    if latest_cycle_start is None:
+        return
+    if (
+        isinstance(latest_cycle_start, bool)
+        or not isinstance(latest_cycle_start, int)
+        or latest_cycle_start < 0
+        or latest_cycle_start >= len(increment)
+        or increment[latest_cycle_start].get("role") != "assistant"
+    ):
+        raise ValueError("latest_cycle_start must identify an assistant in the increment")
 
 
 def _normalized_staged_action_summary(value: object) -> str | None:
@@ -858,6 +1560,35 @@ def _summary_hard_guard(
 ) -> bool:
     available_context = status.context_window - status.max_output
     return estimate_request_tokens(messages, tools) < available_context
+
+
+def _agent_run_hard_guard(
+    status: ModelRouteStatus,
+    messages: ModelMessages,
+    tools: Sequence[dict[str, Any]],
+) -> bool:
+    return _summary_hard_guard(status, messages, tools)
+
+
+def _finalized_context_revision(
+    preparation_revision: str,
+    *,
+    prepared_messages: Sequence[dict[str, Any]],
+    provider_messages: Sequence[dict[str, Any]],
+) -> str:
+    if list(provider_messages) == list(prepared_messages):
+        return preparation_revision
+    encoded = json.dumps(
+        {
+            "preparation_revision": preparation_revision,
+            "provider_messages": list(provider_messages),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _normalize_action_summary(content: str) -> str | None:
