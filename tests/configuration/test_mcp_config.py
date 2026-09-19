@@ -7,7 +7,12 @@ from typing import Any, cast
 import pytest
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ConfigError, ConfigLoader, MCPServerConfiguration
+from myclaw.config.config import (
+    ConfigError,
+    ConfigLoader,
+    ConfigurationDiagnostic,
+    MCPServerConfiguration,
+)
 from myclaw.management.commands import ManagementCommandDispatcher
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
@@ -134,6 +139,7 @@ search = [" issues ", "issues", "github"]
     assert configuration.mcp["valid"].tool_keywords == {"search": ("issues", "github")}
     assert len(loader.diagnostics) == 1
     diagnostic = loader.diagnostics[0]
+    assert isinstance(diagnostic, ConfigurationDiagnostic)
     assert diagnostic.mcp_name == "invalid"
     assert "tool_keywords.search" in diagnostic.message
     assert unsafe_value not in diagnostic.message
@@ -480,6 +486,7 @@ command = "uvx"
     assert set(configuration.mcp) == {"valid"}
     assert len(loader.diagnostics) == 1
     diagnostic = loader.diagnostics[0]
+    assert isinstance(diagnostic, ConfigurationDiagnostic)
     assert diagnostic.mcp_name == "invalid"
     assert "env" in diagnostic.message
     assert "must-not-be-reported" not in diagnostic.message
@@ -526,7 +533,10 @@ User-Agent = "agent-header-secret"
     view = loader.view()
 
     assert view.error is None
-    assert [diagnostic.mcp_name for diagnostic in view.diagnostics] == ["invalid"]
+    assert len(view.diagnostics) == 1
+    diagnostic = view.diagnostics[0]
+    assert isinstance(diagnostic, ConfigurationDiagnostic)
+    assert diagnostic.mcp_name == "invalid"
     assert "MCP Server 'invalid' ignored" in view.diagnostics_text()
     assert all(secret not in view.redacted_content for secret in header_values)
     assert "Authorization" in view.redacted_content
@@ -1043,7 +1053,10 @@ Authorization = "array-table-header-secret"
     view = loader.view()
 
     assert view.error is None
-    assert [diagnostic.mcp_name for diagnostic in view.diagnostics] == ["http"]
+    assert len(view.diagnostics) == 1
+    diagnostic = view.diagnostics[0]
+    assert isinstance(diagnostic, ConfigurationDiagnostic)
+    assert diagnostic.mcp_name == "http"
     assert "array-table-header-secret" not in view.redacted_content
     assert "***REDACTED***" in view.redacted_content
 

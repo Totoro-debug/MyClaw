@@ -258,11 +258,6 @@ class RuntimeConfigurationDiagnostic:
     reason: str
 
     @property
-    def mcp_name(self) -> None:
-        """Preserve the optional diagnostic identity exposed by ConfigView consumers."""
-        return None
-
-    @property
     def message(self) -> str:
         return (
             f"Configuration field {self.field!r} is invalid or missing; "

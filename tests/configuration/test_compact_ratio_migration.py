@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ConfigError, ConfigLoader
+from myclaw.config.config import ConfigError, ConfigLoader, RuntimeConfigurationDiagnostic
 
 VALID_CONFIG = """[runtime]
 max_tool_result_chars = 4096
@@ -68,8 +68,14 @@ def test_invalid_compact_ratio_falls_back_once_with_safe_diagnostic(
 
     assert configuration.runtime.compact_ratio == 0.9
     assert len(loader.diagnostics) == 1
-    assert "runtime.compact_ratio" in loader.diagnostics[0].message
-    assert "0.9" in loader.diagnostics[0].message
+    diagnostic = loader.diagnostics[0]
+    assert isinstance(diagnostic, RuntimeConfigurationDiagnostic)
+    assert diagnostic.field == "runtime.compact_ratio"
+    assert diagnostic.reason == "must be a finite number from 0.5 to 0.95"
+    assert diagnostic.message == (
+        "Configuration field 'runtime.compact_ratio' is invalid or missing; using 0.9."
+    )
+    assert not hasattr(diagnostic, "mcp_name")
 
 
 def test_missing_compact_ratio_uses_default_and_one_diagnostic(tmp_path: Path) -> None:
