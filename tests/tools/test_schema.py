@@ -149,3 +149,13 @@ def test_schema_integer_multiple_of_is_exact() -> None:
     assert Schema.integer(multiple_of=2).validate(3) == [
         SchemaError("$", "must be a multiple of 2", "multipleOf")
     ]
+
+
+@pytest.mark.parametrize("field", ["min_length", "max_length"])
+@pytest.mark.parametrize("value", [True, -1, float("nan"), float("inf"), "1"])
+def test_schema_rejects_invalid_string_length_bounds(field: str, value: Any) -> None:
+    with pytest.raises(
+        ValueError,
+        match=rf"^Schema {field} must be a nonnegative integer$",
+    ):
+        Schema.string(**{field: value})

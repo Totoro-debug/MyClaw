@@ -1,8 +1,9 @@
 """Stable user-visible error values."""
 
 from dataclasses import dataclass
-from math import isfinite
 from typing import Literal
+
+from myclaw.utils.validation import require_nonnegative_number
 
 type ErrorCode = Literal[
     "config_missing",
@@ -82,14 +83,11 @@ class ErrorInfo:
         if not isinstance(self.retryable, bool):
             msg = "retryable must be a boolean"
             raise ValueError(msg)
-        if self.retry_after_seconds is not None and (
-            isinstance(self.retry_after_seconds, bool)
-            or not isinstance(self.retry_after_seconds, (int, float))
-            or self.retry_after_seconds < 0
-            or not isfinite(self.retry_after_seconds)
-        ):
-            msg = "retry_after_seconds must be a finite nonnegative number"
-            raise ValueError(msg)
+        if self.retry_after_seconds is not None:
+            require_nonnegative_number(
+                self.retry_after_seconds,
+                field="retry_after_seconds",
+            )
 
     def to_dict(self) -> dict[str, object]:
         return {

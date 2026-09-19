@@ -1,4 +1,4 @@
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -74,3 +74,21 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
     }
     with pytest.raises(ValueError, match="stable error code"):
         ErrorInfo(code=cast(ErrorCode, "new_unaccepted_code"), message="Not accepted.")
+
+
+@pytest.mark.parametrize(
+    "retry_after_seconds",
+    [True, -1, float("nan"), float("inf"), "1"],
+)
+def test_error_info_rejects_invalid_retry_after_seconds(
+    retry_after_seconds: Any,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"^retry_after_seconds must be a finite nonnegative number$",
+    ):
+        ErrorInfo(
+            code="provider_rate_limited",
+            message="Provider rate limit reached.",
+            retry_after_seconds=retry_after_seconds,
+        )

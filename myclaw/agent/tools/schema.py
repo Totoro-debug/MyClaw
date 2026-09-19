@@ -12,6 +12,8 @@ from fractions import Fraction
 from json import dumps
 from typing import Any, Literal, TypeGuard, cast
 
+from myclaw.utils.validation import require_nonnegative_int
+
 type SchemaKind = Literal["string", "integer", "boolean", "object"]
 
 _MISSING = object()
@@ -144,9 +146,9 @@ class Schema:
         else:
             enum_values = None
         if min_length is not None:
-            _require_nonnegative_int(min_length, "min_length")
+            require_nonnegative_int(min_length, field="Schema min_length")
         if max_length is not None:
-            _require_nonnegative_int(max_length, "max_length")
+            require_nonnegative_int(max_length, field="Schema max_length")
         if min_length is not None and max_length is not None and min_length > max_length:
             raise ValueError("Schema min_length cannot exceed max_length")
         if pattern is not None:
@@ -597,11 +599,6 @@ def _is_finite_number(value: int | float) -> bool:
 
 def _number_fraction(value: int | float) -> Fraction:
     return Fraction(value) if isinstance(value, int) else Fraction(str(value))
-
-
-def _require_nonnegative_int(value: int, name: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"Schema {name} must be a nonnegative integer")
 
 
 def _require_finite_number(value: int | float, name: str) -> None:
