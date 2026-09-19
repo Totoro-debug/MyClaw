@@ -225,31 +225,6 @@ class Session:
     def updated_at(self) -> datetime:
         return self._updated_at
 
-    def add_message(self, role: str, content: str, **fields: Any) -> None:
-        """Append one validated JSON-native user, assistant, or tool message."""
-        self._ensure_not_abandoned()
-        if role not in {"user", "assistant", "tool"}:
-            raise ValueError("role must be user, assistant, or tool")
-        if not isinstance(content, str):
-            raise TypeError("content must be a string")
-        reserved = {"role", "content", "timestamp"}
-        if reserved.intersection(fields):
-            raise ValueError("role, content, and timestamp are reserved message fields")
-        if "id" in fields:
-            raise ValueError("unsupported Session message identifiers")
-        copied_fields = _copy_json_object(fields, field="message")
-        message: dict[str, Any] = {
-            "role": role,
-            "content": content,
-            "timestamp": format_rfc3339_milliseconds(self._clock_now()),
-            **copied_fields,
-        }
-        _validate_message(message)
-        updated_usage = self._usage_after_assistant(message)
-        self.messages.append(message)
-        if updated_usage is not None:
-            self.metadata["token_usage"] = updated_usage
-
     def commit_agent_run(
         self,
         messages: list[dict[str, Any]],
@@ -497,11 +472,6 @@ class Session:
             )
         HOST_FILESYSTEM.atomic_replace_bytes(path, content)
         HOST_FILESYSTEM.require_owned_regular_file(path, within=sessions_directory)
-
-    def _usage_after_assistant(self, message: dict[str, Any]) -> dict[str, int] | None:
-        if message["role"] != "assistant" or "token_usage" not in message:
-            return None
-        return self._usage_after_delta(message["token_usage"])
 
     def _usage_after_delta(self, delta: Any) -> dict[str, int] | None:
         if delta is None:

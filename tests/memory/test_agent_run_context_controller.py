@@ -43,6 +43,7 @@ from myclaw.provider.models import (
     ModelUsage,
 )
 from tests.fixtures import FakeClock, ScriptedFakeProvider, ScriptedFakeRouter, StreamScript
+from tests.fixtures.session import seed_session_state
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 NOW = datetime(2026, 8, 4, 16, 0, 0, tzinfo=LOCAL_OFFSET)
@@ -244,39 +245,71 @@ def test_latest_main_agent_usage_anchor_stops_at_an_invalid_latest_assistant(
     assert latest_main_agent_usage_anchor(messages) is None
 
 
-def _add_assistant(session: Session, content: str) -> None:
-    session.add_message(
-        "assistant",
-        content,
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage=_usage(),
-    )
+def _assistant_history_message(
+    content: str,
+    *,
+    timestamp: str,
+    token_usage: dict[str, int],
+) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": content,
+        "timestamp": timestamp,
+        "tool_calls": [],
+        "status": "completed",
+        "error": None,
+        "token_usage": token_usage,
+    }
 
 
-def _add_tool_run(session: Session, label: str, *, result_size: int = 240) -> None:
-    session.add_message(
-        "assistant",
-        f"{label} tool call",
-        tool_calls=[{"id": f"call-{label}", "name": "read_file", "arguments": "{}"}],
-        status="completed",
-        error=None,
-        token_usage=_usage(),
-    )
-    session.add_message(
-        "tool",
-        f"{label} tool result " + "r" * result_size,
-        tool_call_id=f"call-{label}",
-        name="read_file",
-        status="success",
-        artifact=None,
-    )
+def _tool_run_history(
+    label: str,
+    *,
+    timestamp: str,
+    token_usage: dict[str, int],
+    result_size: int = 240,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "assistant",
+            "content": f"{label} tool call",
+            "timestamp": timestamp,
+            "tool_calls": [{"id": f"call-{label}", "name": "read_file", "arguments": "{}"}],
+            "status": "completed",
+            "error": None,
+            "token_usage": token_usage,
+        },
+        {
+            "role": "tool",
+            "content": f"{label} tool result " + "r" * result_size,
+            "timestamp": timestamp,
+            "tool_call_id": f"call-{label}",
+            "name": "read_file",
+            "status": "success",
+            "artifact": None,
+        },
+    ]
 
 
-def _add_run(session: Session, label: str, *, size: int = 500) -> None:
-    session.add_message("user", f"{label} user " + "u" * size)
-    _add_assistant(session, f"{label} assistant " + "a" * size)
+def _run_history(
+    label: str,
+    *,
+    timestamp: str,
+    token_usage: dict[str, int],
+    size: int = 500,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "user",
+            "content": f"{label} user " + "u" * size,
+            "timestamp": timestamp,
+        },
+        _assistant_history_message(
+            f"{label} assistant " + "a" * size,
+            timestamp=timestamp,
+            token_usage=token_usage,
+        ),
+    ]
 
 
 def _react_cycle(label: str, *, size: int = 80) -> list[dict[str, Any]]:
@@ -443,11 +476,43 @@ async def test_controller_stages_run_start_compaction_from_detached_snapshot(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    session.add_message("user", "Old user " + "u" * 500)
-    _add_assistant(session, "Old assistant " + "a" * 500)
-    session.add_message("user", "Current persisted history " + "h" * 500)
-    _add_assistant(session, "Current history assistant " + "c" * 500)
-    session.update_metadata(summary="Prior action")
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Old user " + "u" * 500,
+                "timestamp": timestamp,
+            },
+            _assistant_history_message(
+                "Old assistant " + "a" * 500,
+                timestamp=timestamp,
+                token_usage=_usage(),
+            ),
+            {
+                "role": "user",
+                "content": "Current persisted history " + "h" * 500,
+                "timestamp": timestamp,
+            },
+            _assistant_history_message(
+                "Current history assistant " + "c" * 500,
+                timestamp=timestamp,
+                token_usage=_usage(),
+            ),
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 2,
+                "input_tokens": 8,
+                "output_tokens": 4,
+                "total_tokens": 12,
+            },
+            "summary": "Prior action",
+        },
+        last_compacted=0,
+    )
     snapshot = AgentRunContextSnapshot.from_session(session)
     provider = ScriptedFakeProvider(
         completions=(_response("Facts"), _response("Updated action")),
@@ -491,10 +556,37 @@ def test_snapshot_copies_transcript_and_metadata_without_retaining_session(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "before", size=20)
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    initial_messages = _run_history(
+        "before",
+        size=20,
+        timestamp=timestamp,
+        token_usage=_usage(),
+    )
+    seed_session_state(
+        session,
+        messages=initial_messages,
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     snapshot = AgentRunContextSnapshot.from_session(session)
-    session.add_message("user", "after")
-    session.metadata["summary"] = "changed"
+    seed_session_state(
+        session,
+        messages=[
+            *initial_messages,
+            {"role": "user", "content": "after", "timestamp": timestamp},
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "changed",
+        },
+        last_compacted=0,
+    )
 
     assert len(snapshot.messages) == 2
     assert "after" not in str(snapshot.messages)
@@ -505,8 +597,21 @@ def test_snapshot_copies_transcript_and_metadata_without_retaining_session(
 async def test_controller_detaches_from_the_supplied_snapshot(workspace: Path) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "original", size=800)
-    session.update_metadata(summary="original action")
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "original",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "original action",
+        },
+        last_compacted=0,
+    )
     snapshot = AgentRunContextSnapshot.from_session(session)
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = AgentRunContextController(
@@ -536,7 +641,21 @@ async def test_controller_detaches_from_the_supplied_snapshot(workspace: Path) -
 async def test_prepare_run_start_returns_a_detached_message_tuple(workspace: Path) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_tool_run(session, "history", result_size=20)
+    seed_session_state(
+        session,
+        messages=_tool_run_history(
+            "history",
+            result_size=20,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider()
     controller = _controller(workspace, session, provider)
     kwargs: dict[str, Any] = {
@@ -598,9 +717,26 @@ async def test_multiple_runs_under_ten_percent_keep_latest_run(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=1_400)
-    _add_run(session, "middle", size=1_400)
-    _add_run(session, "latest", size=320)
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    seed_session_state(
+        session,
+        messages=[
+            *_run_history("old", size=1_400, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("middle", size=1_400, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("latest", size=320, timestamp=timestamp, token_usage=_usage()),
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 3,
+                "input_tokens": 12,
+                "output_tokens": 6,
+                "total_tokens": 18,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
     latest_tokens = _estimate_latest_run(session)
@@ -627,9 +763,26 @@ async def test_multiple_runs_at_ten_percent_keep_latest_run(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=1_400)
-    _add_run(session, "middle", size=1_400)
-    _add_run(session, "latest", size=320)
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    seed_session_state(
+        session,
+        messages=[
+            *_run_history("old", size=1_400, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("middle", size=1_400, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("latest", size=320, timestamp=timestamp, token_usage=_usage()),
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 3,
+                "input_tokens": 12,
+                "output_tokens": 6,
+                "total_tokens": 18,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
     latest_tokens = _estimate_latest_run(session)
@@ -651,9 +804,26 @@ async def test_multiple_runs_over_ten_percent_select_latest_run(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=1_400)
-    _add_run(session, "middle", size=1_400)
-    _add_run(session, "latest", size=320)
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    seed_session_state(
+        session,
+        messages=[
+            *_run_history("old", size=1_400, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("middle", size=1_400, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("latest", size=320, timestamp=timestamp, token_usage=_usage()),
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 3,
+                "input_tokens": 12,
+                "output_tokens": 6,
+                "total_tokens": 18,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
     latest_tokens = _estimate_latest_run(session)
@@ -676,7 +846,21 @@ async def test_single_completed_run_selects_its_entire_cursor_suffix(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "only", size=900)
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "only",
+            size=900,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
 
@@ -701,7 +885,21 @@ async def test_react_current_run_at_exactly_fifty_percent_keeps_current_run_and_
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "history", size=1_200)
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "history",
+            size=1_200,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
     current_user = {"role": "user", "content": "current request"}
@@ -779,7 +977,21 @@ async def test_react_current_run_just_above_fifty_percent_may_select_early_curre
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "history", size=1_200)
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "history",
+            size=1_200,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
     current_user = {"role": "user", "content": "current request"}
@@ -1133,13 +1345,38 @@ async def test_cursor_intersects_recovered_run_boundary_without_selecting_fragme
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
+    timestamp = NOW.isoformat(timespec="milliseconds")
     if case == "inside-tools":
-        session.add_message("user", "tool run user")
-        _add_tool_run(session, "tool")
+        history_messages = [
+            {"role": "user", "content": "tool run user", "timestamp": timestamp},
+            *_tool_run_history(
+                "tool",
+                timestamp=timestamp,
+                token_usage=_usage(),
+            ),
+        ]
+        history_usage = _usage()
     else:
-        _add_run(session, "first", size=1_000)
-        _add_run(session, "second", size=10)
-    session.last_compacted = cursor
+        history_messages = [
+            *_run_history("first", size=1_000, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("second", size=10, timestamp=timestamp, token_usage=_usage()),
+        ]
+        history_usage = {
+            "model_calls": 2,
+            "input_tokens": 8,
+            "output_tokens": 4,
+            "total_tokens": 12,
+        }
+    seed_session_state(
+        session,
+        messages=history_messages,
+        metadata={
+            "title": "Untitled session",
+            "token_usage": history_usage,
+            "summary": "",
+        },
+        last_compacted=cursor,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
 
@@ -1163,8 +1400,29 @@ async def test_fact_summary_contains_complete_tool_results_and_current_user_is_e
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    session.add_message("user", "old user " + "u" * 800)
-    _add_tool_run(session, "complete", result_size=900)
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "old user " + "u" * 800,
+                "timestamp": timestamp,
+            },
+            *_tool_run_history(
+                "complete",
+                result_size=900,
+                timestamp=timestamp,
+                token_usage=_usage(),
+            ),
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
 
@@ -1189,9 +1447,26 @@ async def test_consecutive_staging_consumes_only_new_batch_and_replaces_action_s
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "first", size=1_000)
-    _add_run(session, "second", size=1_000)
-    _add_run(session, "latest", size=50)
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    seed_session_state(
+        session,
+        messages=[
+            *_run_history("first", size=1_000, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("second", size=1_000, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("latest", size=50, timestamp=timestamp, token_usage=_usage()),
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 3,
+                "input_tokens": 12,
+                "output_tokens": 6,
+                "total_tokens": 18,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(
         completions=(
             _response("facts one"),
@@ -1233,8 +1508,21 @@ async def test_action_none_stages_removal_of_previous_action_summary(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=800)
-    session.update_metadata(summary="previous action")
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "old",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "previous action",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("None")))
     controller = _controller(workspace, session, provider)
 
@@ -1255,8 +1543,21 @@ async def test_fact_model_failure_does_not_stage_cursor_action_or_summary(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=800)
-    session.update_metadata(summary="previous action")
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "old",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "previous action",
+        },
+        last_compacted=0,
+    )
     failure = ModelCallError(ErrorInfo(code="model_failed", message="fact failed"))
     provider = ScriptedFakeProvider(completions=(failure,))
     controller = _controller(workspace, session, provider)
@@ -1292,8 +1593,21 @@ async def test_fact_persistence_failure_keeps_batch_uncommitted_but_stages_usage
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=800)
-    session.update_metadata(summary="previous action")
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "old",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "previous action",
+        },
+        last_compacted=0,
+    )
     (state.memory_directory / "summary.jsonl").mkdir()
     provider = ScriptedFakeProvider(
         completions=(_response("facts", input_tokens=7, output_tokens=3),)
@@ -1327,8 +1641,21 @@ async def test_action_failure_keeps_fact_and_earlier_staged_state_without_advanc
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=800)
-    session.update_metadata(summary="previous action")
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "old",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "previous action",
+        },
+        last_compacted=0,
+    )
     failure = ModelCallError(ErrorInfo(code="model_failed", message="action failed"))
     provider = ScriptedFakeProvider(
         completions=(_response("facts"), failure, _response("recovered action"))
@@ -1385,8 +1712,21 @@ async def test_action_finish_failure_keeps_orphan_fact_and_usage_without_advanci
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=800)
-    session.update_metadata(summary="previous action")
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "old",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "previous action",
+        },
+        last_compacted=0,
+    )
     action_response = ModelResponse(
         message=AssistantModelMessage(content="incomplete action"),
         usage=ModelUsage(input_tokens=8, output_tokens=3, total_tokens=11),
@@ -1423,7 +1763,21 @@ async def test_summary_hard_overflow_is_rejected_before_provider_call(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=800)
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "old",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider()
     controller = _controller(workspace, session, provider)
     kwargs: dict[str, Any] = {
@@ -1450,7 +1804,21 @@ async def test_action_replacement_is_checked_against_the_final_hard_limit(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=800)
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "old",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     oversized_action = "action " + "x" * 4_000
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response(oversized_action)))
     controller = _controller(workspace, session, provider)
@@ -1482,29 +1850,37 @@ async def test_compatible_main_agent_usage_changes_the_run_start_compaction_deci
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    session.add_message(
-        "user",
-        "old user",
-    )
-    session.add_message(
-        "assistant",
-        "old answer",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage=_usage(100, 10),
-        context_usage={
-            "requested_route": "chat",
-            "selected_route": "chat",
-            "provider_id": "provider",
-            "model": "model",
-            "context_window": 360,
-            "max_output": 200,
-            "anchor_estimated_tokens": 20,
-            "estimator_version": "utf8-bytes-div4-v1",
-            "run_projected_tokens": 80,
-            "run_projection_source": "estimated",
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    seed_session_state(
+        session,
+        messages=[
+            {"role": "user", "content": "old user", "timestamp": timestamp},
+            {
+                **_assistant_history_message(
+                    "old answer",
+                    timestamp=timestamp,
+                    token_usage=_usage(100, 10),
+                ),
+                "context_usage": {
+                    "requested_route": "chat",
+                    "selected_route": "chat",
+                    "provider_id": "provider",
+                    "model": "model",
+                    "context_window": 360,
+                    "max_output": 200,
+                    "anchor_estimated_tokens": 20,
+                    "estimator_version": "utf8-bytes-div4-v1",
+                    "run_projected_tokens": 80,
+                    "run_projection_source": "estimated",
+                },
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(100, 10),
+            "summary": "",
         },
+        last_compacted=0,
     )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
@@ -1532,24 +1908,37 @@ async def test_latest_assistant_without_provenance_forces_run_start_local_estima
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    session.add_message("user", "older user")
-    session.add_message(
-        "assistant",
-        "older answer",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage=_usage(100, 10),
-        context_usage=_context_usage(context_window=360),
-    )
-    session.add_message("user", "latest user")
-    session.add_message(
-        "assistant",
-        "latest answer without provenance",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage=_usage(20, 5),
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    seed_session_state(
+        session,
+        messages=[
+            {"role": "user", "content": "older user", "timestamp": timestamp},
+            {
+                **_assistant_history_message(
+                    "older answer",
+                    timestamp=timestamp,
+                    token_usage=_usage(100, 10),
+                ),
+                "context_usage": _context_usage(context_window=360),
+            },
+            {"role": "user", "content": "latest user", "timestamp": timestamp},
+            _assistant_history_message(
+                "latest answer without provenance",
+                timestamp=timestamp,
+                token_usage=_usage(20, 5),
+            ),
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 2,
+                "input_tokens": 120,
+                "output_tokens": 15,
+                "total_tokens": 135,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
     )
     provider = ScriptedFakeProvider()
     controller = _controller(workspace, session, provider)
@@ -1650,28 +2039,48 @@ async def test_incompatible_latest_main_usage_does_not_fall_back_to_an_older_anc
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    messages: list[dict[str, Any]] = []
     for label, provider_id in (("older", "provider"), ("latest", "other-provider")):
-        session.add_message("user", f"{label} user")
-        session.add_message(
-            "assistant",
-            f"{label} answer",
-            tool_calls=[],
-            status="completed",
-            error=None,
-            token_usage=_usage(100, 10),
-            context_usage={
-                "requested_route": "chat",
-                "selected_route": "chat",
-                "provider_id": provider_id,
-                "model": "model",
-                "context_window": 360,
-                "max_output": 200,
-                "anchor_estimated_tokens": 20,
-                "estimator_version": "utf8-bytes-div4-v1",
-                "run_projected_tokens": 80,
-                "run_projection_source": "estimated",
-            },
+        messages.extend(
+            [
+                {"role": "user", "content": f"{label} user", "timestamp": timestamp},
+                {
+                    **_assistant_history_message(
+                        f"{label} answer",
+                        timestamp=timestamp,
+                        token_usage=_usage(100, 10),
+                    ),
+                    "context_usage": {
+                        "requested_route": "chat",
+                        "selected_route": "chat",
+                        "provider_id": provider_id,
+                        "model": "model",
+                        "context_window": 360,
+                        "max_output": 200,
+                        "anchor_estimated_tokens": 20,
+                        "estimator_version": "utf8-bytes-div4-v1",
+                        "run_projected_tokens": 80,
+                        "run_projection_source": "estimated",
+                    },
+                },
+            ]
         )
+    seed_session_state(
+        session,
+        messages=messages,
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 2,
+                "input_tokens": 200,
+                "output_tokens": 20,
+                "total_tokens": 220,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider()
     controller = _controller(workspace, session, provider)
 
@@ -1698,7 +2107,21 @@ async def test_same_context_revision_is_a_noop_after_successful_staging(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=800)
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "old",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
     kwargs: dict[str, Any] = {
@@ -1722,7 +2145,21 @@ async def test_request_preparer_reuses_run_start_revision_without_duplicate_summ
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=800)
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "old",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
     route_status = _chat_status(context_window=1_000, max_output=200)
@@ -1822,7 +2259,21 @@ async def test_react_revision_changes_for_each_model_visible_input_source(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "old", size=800)
+    seed_session_state(
+        session,
+        messages=_run_history(
+            "old",
+            size=800,
+            timestamp=NOW.isoformat(timespec="milliseconds"),
+            token_usage=_usage(),
+        ),
+        metadata={
+            "title": "Untitled session",
+            "token_usage": _usage(),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     failure = ModelCallError(ErrorInfo("model_failed", "summary failed"))
     provider = ScriptedFakeProvider(completions=(failure, failure))
     controller = _controller(workspace, session, provider)
@@ -2085,9 +2536,26 @@ async def test_visible_tool_schema_change_rechecks_a_new_revision(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    _add_run(session, "first", size=800)
-    _add_run(session, "second", size=800)
-    _add_run(session, "latest", size=50)
+    timestamp = NOW.isoformat(timespec="milliseconds")
+    seed_session_state(
+        session,
+        messages=[
+            *_run_history("first", size=800, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("second", size=800, timestamp=timestamp, token_usage=_usage()),
+            *_run_history("latest", size=50, timestamp=timestamp, token_usage=_usage()),
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 3,
+                "input_tokens": 12,
+                "output_tokens": 6,
+                "total_tokens": 18,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     provider = ScriptedFakeProvider(
         completions=(
             _response("facts one"),

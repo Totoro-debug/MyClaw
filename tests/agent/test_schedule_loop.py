@@ -41,6 +41,7 @@ from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
 from myclaw.skills.catalog import SkillLoader
 from tests.configuration.test_config import MINIMAL_VALID_CONFIG
 from tests.fixtures import TaskFramingRouterAdapter, collect_foreground_outbound
+from tests.fixtures.session import seed_session_state
 
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
 JOB_ID = UUID("550e8400-e29b-41d4-a716-446655440000")
@@ -708,7 +709,27 @@ async def test_schedule_run_drains_session_persist_before_return(
     async def persist_only(session: Session, job: ScheduleJob) -> None:
         del job
         captured.append(session)
-        session.add_message("user", "queued persistence")
+        seed_session_state(
+            session,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "queued persistence",
+                    "timestamp": NOW.isoformat(timespec="milliseconds"),
+                }
+            ],
+            metadata={
+                "title": "Untitled session",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": "",
+            },
+            last_compacted=0,
+        )
         session.persist()
 
     monkeypatch.setattr(Session, "_persist_after", blocked_persist_after)

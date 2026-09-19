@@ -23,6 +23,7 @@ from myclaw.management.commands import (
 from myclaw.management.service import RuntimeStatusInput
 from myclaw.skills.catalog import SkillMetadata
 from tests.fixtures.diagnostic_capture import capture_diagnostics, configured_process_logging
+from tests.fixtures.session import seed_session_state
 from tests.management.factories import management_service
 
 if TYPE_CHECKING:
@@ -738,21 +739,41 @@ async def test_status_command_renders_actual_runtime_and_session_state(
         now=lambda: STATUS_CREATED_AT,
         new_uuid=iter((STATUS_SESSION_UUID,)).__next__,
     )
-    session.add_message("user", "Session state.")
-    session.add_message(
-        "assistant",
-        "Visible.",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 10,
-            "output_tokens": 3,
-            "total_tokens": 13,
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Session state.",
+                "timestamp": STATUS_CREATED_AT.isoformat(timespec="milliseconds"),
+            },
+            {
+                "role": "assistant",
+                "content": "Visible.",
+                "timestamp": STATUS_CREATED_AT.isoformat(timespec="milliseconds"),
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 10,
+                    "output_tokens": 3,
+                    "total_tokens": 13,
+                },
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 10,
+                "output_tokens": 3,
+                "total_tokens": 13,
+            },
+            "summary": "",
         },
+        last_compacted=1,
     )
-    session.last_compacted = 1
     dispatcher = ManagementCommandDispatcher(
         management_service(
             home,

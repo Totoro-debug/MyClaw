@@ -66,6 +66,7 @@ from tests.fixtures import (
     collect_foreground_outbound,
 )
 from tests.fixtures.diagnostic_capture import capture_diagnostics
+from tests.fixtures.session import seed_session_state
 from tests.management.factories import management_service
 
 
@@ -783,8 +784,27 @@ async def test_agent_loop_restores_empty_action_summary_for_foreground_status_an
 ) -> None:
     def prepare_session(state: WorkspaceState) -> str:
         restored = Session.create(state, now=_Clock().now, new_uuid=uuid4)
-        restored.add_message("user", "Persisted foreground history.")
-        restored.update_metadata(summary="")
+        seed_session_state(
+            restored,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Persisted foreground history.",
+                    "timestamp": "2026-08-21T12:00:00.000+00:00",
+                }
+            ],
+            metadata={
+                "title": "Untitled session",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": "",
+            },
+            last_compacted=0,
+        )
         restored.close()
         return restored.session_id
 
@@ -832,8 +852,27 @@ async def test_agent_loop_restores_action_summary_for_foreground_and_preflight_c
 
     def prepare_session(state: WorkspaceState) -> str:
         restored = Session.create(state, now=_Clock().now, new_uuid=uuid4)
-        restored.add_message("user", "Persisted foreground history.")
-        restored.update_metadata(summary=action_summary)
+        seed_session_state(
+            restored,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Persisted foreground history.",
+                    "timestamp": "2026-08-21T12:00:00.000+00:00",
+                }
+            ],
+            metadata={
+                "title": "Untitled session",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": action_summary,
+            },
+            last_compacted=0,
+        )
         restored.close()
         return restored.session_id
 
@@ -1010,7 +1049,27 @@ async def test_replacement_barrier_blocks_a_late_foreground_commit_until_release
     loop, session, _bus = _runtime(tmp_path, router)
     commit_gate = ObservableCommitLock()
     loop._foreground_commit_gate = commit_gate
-    session.add_message("user", "Existing turn suppresses title work.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing turn suppresses title work.",
+                "timestamp": "2026-08-21T12:00:00.000+00:00",
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     initial_messages = tuple(session.messages)
     await loop.start()
     await loop._bus.put_inbound(InboundMessage(content="late foreground"))
@@ -1041,14 +1100,31 @@ async def test_agent_loop_status_projection_is_one_read_immutable_and_side_effec
 ) -> None:
     router = _Router(())
     loop, session, _bus = _runtime(tmp_path, router)
-    session.add_message("user", "Status snapshot input")
-    session.update_metadata(
-        blackboard={
-            "goal": "Project the persisted task state.",
-            "completion_boundary": "The status request contains this Blackboard.",
-        }
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Status snapshot input",
+                "timestamp": "2026-08-21T12:00:00.000+00:00",
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+            "blackboard": {
+                "goal": "Project the persisted task state.",
+                "completion_boundary": "The status request contains this Blackboard.",
+            },
+        },
+        last_compacted=0,
     )
-    session.last_compacted = 0
 
     class SessionAccessSpy:
         def __init__(self) -> None:
@@ -1155,26 +1231,45 @@ async def test_status_treats_the_latest_assistant_as_the_usage_provenance_bounda
 ) -> None:
     router = _Router(())
     loop, session, _bus = _runtime(tmp_path, router)
-    session.add_message("user", "Older request")
-    session.add_message(
-        "assistant",
-        "Older response",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 100,
-            "output_tokens": 10,
-            "total_tokens": 110,
+    timestamp = "2026-08-21T12:00:00.000+00:00"
+    older_messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "Older request", "timestamp": timestamp},
+        {
+            "role": "assistant",
+            "content": "Older response",
+            "timestamp": timestamp,
+            "tool_calls": [],
+            "status": "completed",
+            "error": None,
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "total_tokens": 110,
+            },
+            "context_usage": _status_context_usage(
+                selected_route="default",
+                provider_id="primary",
+                model="small-model",
+                context_window=8192,
+                max_output=1024,
+            ),
         },
-        context_usage=_status_context_usage(
-            selected_route="default",
-            provider_id="primary",
-            model="small-model",
-            context_window=8192,
-            max_output=1024,
-        ),
+    ]
+    seed_session_state(
+        session,
+        messages=older_messages,
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "total_tokens": 110,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
     )
     management = management_service(
         AgentHome(tmp_path / "agent-home"),
@@ -1184,19 +1279,37 @@ async def test_status_treats_the_latest_assistant_as_the_usage_provenance_bounda
 
     reported = await management.status()
 
-    session.add_message("user", "New request")
-    session.add_message(
-        "assistant",
-        "New response without provenance",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 20,
-            "output_tokens": 5,
-            "total_tokens": 25,
+    seed_session_state(
+        session,
+        messages=[
+            *older_messages,
+            {"role": "user", "content": "New request", "timestamp": timestamp},
+            {
+                "role": "assistant",
+                "content": "New response without provenance",
+                "timestamp": timestamp,
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 20,
+                    "output_tokens": 5,
+                    "total_tokens": 25,
+                },
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 2,
+                "input_tokens": 120,
+                "output_tokens": 15,
+                "total_tokens": 135,
+            },
+            "summary": "",
         },
+        last_compacted=0,
     )
     estimated = await management.status()
 
@@ -3230,7 +3343,27 @@ async def test_abort_wins_before_normal_close_finalizes_the_session(
     tmp_path: Path,
 ) -> None:
     loop, session, _bus = _runtime(tmp_path, _Router(()))
-    session.add_message("user", "preserve this turn")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "preserve this turn",
+                "timestamp": "2026-08-21T12:00:00.000+00:00",
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     close_started = asyncio.Event()
     release_close = asyncio.Event()
 
@@ -3410,21 +3543,39 @@ async def test_foreground_frames_once_with_exact_session_inputs_and_atomic_proje
         router,
         task_framing_outcomes=None,
     )
-    session.update_metadata(
-        blackboard={"goal": previous.goal, "completion_boundary": previous.completion_boundary}
-    )
-    session.add_message(
-        "assistant",
-        "Latest complete assistant content",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "assistant",
+                "content": "Latest complete assistant content",
+                "timestamp": "2026-08-21T12:00:00.000+00:00",
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+            "blackboard": {
+                "goal": previous.goal,
+                "completion_boundary": previous.completion_boundary,
+            },
         },
+        last_compacted=0,
     )
 
     await loop.start()

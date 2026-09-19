@@ -7,7 +7,7 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Never, cast
 from uuid import UUID, uuid4
@@ -73,6 +73,7 @@ from tests.agent.test_fixed_catalog import _agent_loop as _direct_agent_loop
 from tests.agent.test_fixed_catalog import _FixedCatalogProvider, _response
 from tests.configuration.test_config import VALID_CONFIG
 from tests.fixtures import ProviderCall, TaskFramingRouterAdapter
+from tests.fixtures.session import seed_session_state
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 TURN_ID = UUID("0f8fad5b-d9cb-469f-a165-70867728950e")
@@ -1273,16 +1274,54 @@ async def test_resume_picker_orders_sessions_and_cancellation_preserves_display(
             now=lambda: NOW.replace(hour=10),
             new_uuid=lambda: UUID("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
         )
-        older.update_metadata(title="Older session")
-        older.add_message("user", "Older persisted question.")
+        seed_session_state(
+            older,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Older persisted question.",
+                    "timestamp": "2026-08-11T10:00:00.000+00:00",
+                }
+            ],
+            metadata={
+                "title": "Older session",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": "",
+            },
+            last_compacted=0,
+        )
         older.close()
         target = Session.create(
             initial.session.workspace_state,
             now=lambda: NOW,
             new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
         )
-        target.update_metadata(title="Target session")
-        target.add_message("user", "Persisted question.")
+        seed_session_state(
+            target,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Persisted question.",
+                    "timestamp": "2026-08-11T12:00:00.000+00:00",
+                }
+            ],
+            metadata={
+                "title": "Target session",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": "",
+            },
+            last_compacted=0,
+        )
         target.close()
 
         await pilot.press(*list("/status"), "enter", "ctrl+home")
@@ -1325,95 +1364,128 @@ async def test_resume_selection_rebinds_sanitized_session_projection(
             now=lambda: NOW,
             new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
         )
-        target.update_metadata(title="Restored session")
-        target.add_message("user", "Persisted question.")
-        target.add_message(
-            "assistant",
-            "Persisted **answer**.",
-            tool_calls=[],
-            status="completed",
-            error=None,
-            token_usage={
-                "model_calls": 1,
-                "input_tokens": 2,
-                "output_tokens": 3,
-                "total_tokens": 5,
-            },
-        )
-        target.add_message(
-            "assistant",
-            "",
-            tool_calls=[
+        timestamp = "2026-08-11T12:00:00.000+00:00"
+        seed_session_state(
+            target,
+            messages=[
+                {"role": "user", "content": "Persisted question.", "timestamp": timestamp},
                 {
-                    "id": "call-restored",
-                    "name": "read_file",
-                    "arguments": '{"api_key":"private"}',
+                    "role": "assistant",
+                    "content": "Persisted **answer**.",
+                    "timestamp": timestamp,
+                    "tool_calls": [],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 2,
+                        "output_tokens": 3,
+                        "total_tokens": 5,
+                    },
                 },
-                {"id": "call-error", "name": "exec", "arguments": '{"command":"private"}'},
                 {
-                    "id": "call-refused",
+                    "role": "assistant",
+                    "content": "",
+                    "timestamp": timestamp,
+                    "tool_calls": [
+                        {
+                            "id": "call-restored",
+                            "name": "read_file",
+                            "arguments": '{"api_key":"private"}',
+                        },
+                        {
+                            "id": "call-error",
+                            "name": "exec",
+                            "arguments": '{"command":"private"}',
+                        },
+                        {
+                            "id": "call-refused",
+                            "name": "web_fetch",
+                            "arguments": '{"url":"private"}',
+                        },
+                    ],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+                {
+                    "role": "tool",
+                    "content": "private tool result",
+                    "timestamp": timestamp,
+                    "tool_call_id": "call-restored",
+                    "name": "read_file",
+                    "status": "success",
+                    "artifact": None,
+                },
+                {
+                    "role": "tool",
+                    "content": "STDERR permission denied; STDOUT secret bytes",
+                    "timestamp": timestamp,
+                    "tool_call_id": "call-error",
+                    "name": "exec",
+                    "status": "error",
+                    "artifact": None,
+                },
+                {
+                    "role": "tool",
+                    "content": "private refusal detail",
+                    "timestamp": timestamp,
+                    "tool_call_id": "call-refused",
                     "name": "web_fetch",
-                    "arguments": '{"url":"private"}',
+                    "status": "refused",
+                    "artifact": None,
+                },
+                {
+                    "role": "assistant",
+                    "content": "Persisted partial answer.",
+                    "timestamp": timestamp,
+                    "tool_calls": [],
+                    "status": "interrupted",
+                    "error": {
+                        "code": "turn_cancelled",
+                        "message": "Turn interrupted by user.",
+                    },
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "timestamp": timestamp,
+                    "tool_calls": [],
+                    "status": "error",
+                    "error": {
+                        "code": "model_failed",
+                        "message": "Persisted model failure.",
+                    },
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "total_tokens": 1,
+                    },
                 },
             ],
-            status="completed",
-            error=None,
-            token_usage={
-                "model_calls": 1,
-                "input_tokens": 1,
-                "output_tokens": 1,
-                "total_tokens": 2,
+            metadata={
+                "title": "Restored session",
+                "token_usage": {
+                    "model_calls": 4,
+                    "input_tokens": 5,
+                    "output_tokens": 5,
+                    "total_tokens": 10,
+                },
+                "summary": "",
             },
-        )
-        target.add_message(
-            "tool",
-            "private tool result",
-            tool_call_id="call-restored",
-            name="read_file",
-            status="success",
-            artifact=None,
-        )
-        target.add_message(
-            "tool",
-            "STDERR permission denied; STDOUT secret bytes",
-            tool_call_id="call-error",
-            name="exec",
-            status="error",
-            artifact=None,
-        )
-        target.add_message(
-            "tool",
-            "private refusal detail",
-            tool_call_id="call-refused",
-            name="web_fetch",
-            status="refused",
-            artifact=None,
-        )
-        target.add_message(
-            "assistant",
-            "Persisted partial answer.",
-            tool_calls=[],
-            status="interrupted",
-            error={"code": "turn_cancelled", "message": "Turn interrupted by user."},
-            token_usage={
-                "model_calls": 1,
-                "input_tokens": 1,
-                "output_tokens": 1,
-                "total_tokens": 2,
-            },
-        )
-        target.add_message(
-            "assistant",
-            "",
-            tool_calls=[],
-            status="error",
-            error={"code": "model_failed", "message": "Persisted model failure."},
-            token_usage={
-                "model_calls": 1,
-                "input_tokens": 1,
-                "output_tokens": 0,
-                "total_tokens": 1,
-            },
+            last_compacted=0,
         )
         target.close()
 
@@ -1482,7 +1554,27 @@ async def test_active_resume_decline_then_force_rebinds_the_same_bus(
             now=lambda: datetime(2027, 1, 1, tzinfo=UTC),
             new_uuid=uuid4,
         )
-        target.add_message("user", "Approve target")
+        seed_session_state(
+            target,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Approve target",
+                    "timestamp": "2027-01-01T00:00:00.000+00:00",
+                }
+            ],
+            metadata={
+                "title": "Untitled session",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": "",
+            },
+            last_compacted=0,
+        )
         target.close()
 
         await pilot.press(*list("active work"), "enter")
@@ -1540,8 +1632,27 @@ async def test_resume_picker_mouse_selection_rebinds_the_clicked_session(
             now=lambda: datetime(2027, 1, 1, tzinfo=UTC),
             new_uuid=uuid4,
         )
-        target.update_metadata(title="Mouse target")
-        target.add_message("user", "Mouse-selected content.")
+        seed_session_state(
+            target,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Mouse-selected content.",
+                    "timestamp": "2027-01-01T00:00:00.000+00:00",
+                }
+            ],
+            metadata={
+                "title": "Mouse target",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": "",
+            },
+            last_compacted=0,
+        )
         target.close()
 
         await pilot.press(*list("/resume"), "enter")
@@ -1580,8 +1691,29 @@ async def test_resume_picker_scrolls_in_management_order_and_selects_by_keyboard
                 now=_constant_datetime(datetime(2027, 1, 1, 0, index, tzinfo=UTC)),
                 new_uuid=_constant_uuid(UUID(f"00000000-0000-4000-8000-{index + 1:012x}")),
             )
-            session.update_metadata(title=f"Session {index:02d}")
-            session.add_message("user", f"Content {index:02d}.")
+            seed_session_state(
+                session,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Content {index:02d}.",
+                        "timestamp": datetime(2027, 1, 1, 0, index, tzinfo=UTC).isoformat(
+                            timespec="milliseconds"
+                        ),
+                    }
+                ],
+                metadata={
+                    "title": f"Session {index:02d}",
+                    "token_usage": {
+                        "model_calls": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                    "summary": "",
+                },
+                last_compacted=0,
+            )
             session.close()
             sessions.append(session)
 
@@ -1627,8 +1759,27 @@ async def test_resume_serializes_input_until_cli_rebind_finishes(
             now=lambda: datetime(2027, 1, 1, tzinfo=UTC),
             new_uuid=uuid4,
         )
-        target.update_metadata(title="Delayed target")
-        target.add_message("user", "Delayed restored content.")
+        seed_session_state(
+            target,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Delayed restored content.",
+                    "timestamp": "2027-01-01T00:00:00.000+00:00",
+                }
+            ],
+            metadata={
+                "title": "Delayed target",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": "",
+            },
+            last_compacted=0,
+        )
         target.close()
         dispatcher = app._management_dispatcher
         original_resume = dispatcher.resume
@@ -1701,9 +1852,28 @@ async def test_resumed_long_history_starts_latest_and_preserves_input_history(
             now=lambda: datetime(2027, 1, 1, tzinfo=UTC),
             new_uuid=uuid4,
         )
-        target.update_metadata(title="Long target")
-        for index in range(60):
-            target.add_message("user", f"Restored line {index:02d} " + "x" * 40)
+        seed_session_state(
+            target,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Restored line {index:02d} " + "x" * 40,
+                    "timestamp": "2027-01-01T00:00:00.000+00:00",
+                }
+                for index in range(60)
+            ],
+            metadata={
+                "title": "Long target",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": "",
+            },
+            last_compacted=0,
+        )
         target.close()
 
         await pilot.press(*list("/resume"), "enter")
@@ -1749,77 +1919,98 @@ async def test_resume_projects_unknown_reversed_and_unclassifiable_history_safel
             now=lambda: datetime(2027, 1, 1, tzinfo=UTC),
             new_uuid=uuid4,
         )
-        target.update_metadata(title="Historical edge cases")
-        target.add_message(
-            "assistant",
-            "Before the first user message.",
-            tool_calls=[],
-            status="completed",
-            error=None,
-            token_usage={
-                "model_calls": 1,
-                "input_tokens": 1,
-                "output_tokens": 1,
-                "total_tokens": 2,
+        timestamp = "2027-01-01T00:00:00.000+00:00"
+        seed_session_state(
+            target,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": "Before the first user message.",
+                    "timestamp": timestamp,
+                    "tool_calls": [],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+                {
+                    "role": "tool",
+                    "content": "private pre-user result",
+                    "timestamp": timestamp,
+                    "tool_call_id": "orphan-pre-user",
+                    "name": "read_file",
+                    "status": "success",
+                    "artifact": None,
+                },
+                {
+                    "role": "user",
+                    "content": "Question with an orphan tool result.",
+                    "timestamp": timestamp,
+                },
+                {
+                    "role": "tool",
+                    "content": "private orphan result",
+                    "timestamp": timestamp,
+                    "tool_call_id": "orphan-in-run",
+                    "name": "read_file",
+                    "status": "success",
+                    "artifact": None,
+                },
+                {
+                    "role": "user",
+                    "content": "Wait for the operation.",
+                    "timestamp": timestamp,
+                },
+                {
+                    "role": "assistant",
+                    "content": "Still waiting for a result.",
+                    "timestamp": "2027-01-01T00:00:01.000+00:00",
+                    "tool_calls": [{"id": "call-pending", "name": "read_file", "arguments": "{}"}],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+                {
+                    "role": "user",
+                    "content": "Run with reversed timestamps.",
+                    "timestamp": "2027-01-01T00:00:10.000+00:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Historical activity.",
+                    "timestamp": "2027-01-01T00:00:05.000+00:00",
+                    "tool_calls": [{"id": "call-reversed", "name": "read_file", "arguments": "{}"}],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+            ],
+            metadata={
+                "title": "Historical edge cases",
+                "token_usage": {
+                    "model_calls": 3,
+                    "input_tokens": 3,
+                    "output_tokens": 3,
+                    "total_tokens": 6,
+                },
+                "summary": "",
             },
+            last_compacted=0,
         )
-        target.add_message(
-            "tool",
-            "private pre-user result",
-            tool_call_id="orphan-pre-user",
-            name="read_file",
-            status="success",
-            artifact=None,
-        )
-        target.add_message("user", "Question with an orphan tool result.")
-        target.add_message(
-            "tool",
-            "private orphan result",
-            tool_call_id="orphan-in-run",
-            name="read_file",
-            status="success",
-            artifact=None,
-        )
-        target.add_message("user", "Wait for the operation.")
-        target.add_message(
-            "assistant",
-            "Still waiting for a result.",
-            tool_calls=[{"id": "call-pending", "name": "read_file", "arguments": "{}"}],
-            status="completed",
-            error=None,
-            token_usage={
-                "model_calls": 1,
-                "input_tokens": 1,
-                "output_tokens": 1,
-                "total_tokens": 2,
-            },
-        )
-        target.add_message("user", "Run with reversed timestamps.")
-        target.add_message(
-            "assistant",
-            "Historical activity.",
-            tool_calls=[{"id": "call-reversed", "name": "read_file", "arguments": "{}"}],
-            status="completed",
-            error=None,
-            token_usage={
-                "model_calls": 1,
-                "input_tokens": 1,
-                "output_tokens": 1,
-                "total_tokens": 2,
-            },
-        )
-        target.messages[4]["timestamp"] = datetime(2027, 1, 1, tzinfo=UTC).isoformat(
-            timespec="milliseconds"
-        )
-        target.messages[5]["timestamp"] = (
-            datetime(2027, 1, 1, tzinfo=UTC) + timedelta(seconds=1)
-        ).isoformat(timespec="milliseconds")
-        target.messages[6]["timestamp"] = (
-            datetime(2027, 1, 1, tzinfo=UTC) + timedelta(seconds=10)
-        ).isoformat(timespec="milliseconds")
-        target.messages[7]["timestamp"] = (
-            datetime(2027, 1, 1, tzinfo=UTC) + timedelta(seconds=5)
-        ).isoformat(timespec="milliseconds")
         target.close()
 
         await pilot.press(*list("/resume"), "enter")
@@ -1870,8 +2061,27 @@ async def test_resume_stale_selection_preserves_current_display_and_interaction(
             now=lambda: NOW,
             new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
         )
-        target.update_metadata(title="Stale target")
-        target.add_message("user", "Should not be restored.")
+        seed_session_state(
+            target,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Should not be restored.",
+                    "timestamp": "2026-08-11T12:00:00.000+00:00",
+                }
+            ],
+            metadata={
+                "title": "Stale target",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": "",
+            },
+            last_compacted=0,
+        )
         target.close()
         target_path = target.workspace_state.sessions_directory / f"{target.session_id}.jsonl"
 
@@ -1920,8 +2130,27 @@ async def test_fatal_resume_failure_exits_without_rendering_private_error(
             now=lambda: NOW,
             new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
         )
-        target.update_metadata(title="Fatal target")
-        target.add_message("user", "Must not be rendered after fatal replacement failure.")
+        seed_session_state(
+            target,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Must not be rendered after fatal replacement failure.",
+                    "timestamp": "2026-08-11T12:00:00.000+00:00",
+                }
+            ],
+            metadata={
+                "title": "Fatal target",
+                "token_usage": {
+                    "model_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "summary": "",
+            },
+            last_compacted=0,
+        )
         target.close()
 
         await pilot.press(*list("/resume"), "enter")

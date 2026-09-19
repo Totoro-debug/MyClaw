@@ -18,6 +18,7 @@ from myclaw.management.service import (
 from myclaw.provider.models import ReasoningEffort
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
 from tests.fixtures.diagnostic_capture import capture_diagnostics
+from tests.fixtures.session import seed_session_state
 from tests.management.factories import management_service
 
 CONFIG_WITH_PLAINTEXT_KEYS = """# User Configuration remains source-preserved.
@@ -659,7 +660,27 @@ async def test_generation_sensitive_views_snapshot_each_current_provider_once(
         now=lambda: CREATED_AT,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
-    target.add_message("user", "Resume target")
+    seed_session_state(
+        target,
+        messages=[
+            {
+                "role": "user",
+                "content": "Resume target",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     target.close()
     loop = _StatusProjectionLoop(
         RuntimeStatusInput(
@@ -722,7 +743,27 @@ async def test_resume_prepares_before_loading_resumable_sessions(
         now=lambda: CREATED_AT,
         new_uuid=iter((SESSION_UUID,)).__next__,
     )
-    target.add_message("user", "Resume target")
+    seed_session_state(
+        target,
+        messages=[
+            {
+                "role": "user",
+                "content": "Resume target",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     loop = _StatusProjectionLoop(
         RuntimeStatusInput(
             projected_messages=({"role": "system", "content": "current"},),

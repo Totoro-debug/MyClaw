@@ -12,6 +12,7 @@ from myclaw.agent.context_budget import CONTEXT_ESTIMATOR_VERSION, ContextUsageS
 from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
+from tests.fixtures.session import seed_session_state
 
 LOCAL_OFFSET = timezone(timedelta(hours=8))
 CREATED_AT = datetime(2026, 7, 11, 15, 30, 12, 123000, tzinfo=LOCAL_OFFSET)
@@ -113,6 +114,74 @@ def test_create_starts_a_memory_only_session_with_private_identity_generation(
         Session()
 
 
+def test_seed_session_state_replaces_public_state_with_detached_explicit_values(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    state = _state(workspace, agent_home)
+    session = Session.create(state, now=lambda: CREATED_AT)
+    timestamp = CREATED_AT.isoformat(timespec="milliseconds")
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "Inspect the file.", "timestamp": timestamp},
+        {
+            "role": "assistant",
+            "content": "Reading it.",
+            "timestamp": timestamp,
+            "tool_calls": [{"id": "call-1", "name": "read_file", "arguments": "{}"}],
+            "status": "completed",
+            "error": None,
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "total_tokens": 3,
+            },
+        },
+        {
+            "role": "tool",
+            "content": "contents",
+            "timestamp": timestamp,
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "status": "success",
+            "artifact": {"path": "artifact.txt"},
+        },
+    ]
+    metadata: dict[str, Any] = {
+        "title": "Seeded session",
+        "token_usage": {
+            "model_calls": 1,
+            "input_tokens": 2,
+            "output_tokens": 1,
+            "total_tokens": 3,
+        },
+        "summary": "Known state",
+        "extension": {"values": ["before"]},
+    }
+    identity = (session.session_id, session.created_at, session.updated_at)
+
+    seed_session_state(
+        session,
+        messages=messages,
+        metadata=metadata,
+        last_compacted=2,
+    )
+    messages[0]["content"] = "changed"
+    messages[1]["token_usage"]["input_tokens"] = 999
+    messages[2]["artifact"]["path"] = "changed.txt"
+    metadata["token_usage"]["input_tokens"] = 999
+    metadata["extension"]["values"].append("after")
+
+    assert session.messages[0]["content"] == "Inspect the file."
+    assert session.messages[1]["token_usage"]["input_tokens"] == 2
+    assert session.messages[2]["artifact"] == {"path": "artifact.txt"}
+    assert session.metadata["token_usage"]["input_tokens"] == 2
+    assert session.metadata["extension"] == {"values": ["before"]}
+    assert session.last_compacted == 2
+    assert (session.session_id, session.created_at, session.updated_at) == identity
+    assert not (state.sessions_directory / f"{session.session_id}.jsonl").exists()
+
+
 def test_create_schedule_session_uses_a_lazy_isolated_storage_partition(
     agent_home: Path,
     workspace: Path,
@@ -129,7 +198,22 @@ def test_create_schedule_session_uses_a_lazy_isolated_storage_partition(
     assert session.session_id == f"schedule_{SCHEDULE_JOB_ID}"
     assert not state.schedule_sessions_directory.exists()
 
-    session.add_message("user", "Run the scheduled task.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Run the scheduled task.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     session.close()
 
     assert (state.schedule_sessions_directory / f"{session.session_id}.jsonl").exists()
@@ -175,8 +259,24 @@ async def test_persist_writes_one_complete_compact_utf8_snapshot_atomically(
         now=timestamps.__next__,
         new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
     )
-    session.add_message("user", "请读取 README。", extension={"nested": ["value"]})
-    session.update_metadata(summary="- Read the README.")
+    message_timestamp = next(timestamps)
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "请读取 README。",
+                "timestamp": message_timestamp.isoformat(timespec="milliseconds"),
+                "extension": {"nested": ["value"]},
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "- Read the README.",
+        },
+        last_compacted=0,
+    )
     replacements: list[tuple[Path, bytes]] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
 
@@ -222,7 +322,22 @@ async def test_persist_freezes_each_call_and_finishes_snapshots_in_call_order(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "Before mutation")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Before mutation",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     snapshots: list[list[dict[str, Any]]] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
 
@@ -253,7 +368,22 @@ async def test_persist_retries_a_transient_write_with_async_backoff(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "Retry this snapshot")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Retry this snapshot",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     attempts: list[bytes] = []
     delays: list[float] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
@@ -287,7 +417,21 @@ async def test_persist_retries_each_snapshot_before_starting_the_next_snapshot(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "First snapshot")
+    first_message = {
+        "role": "user",
+        "content": "First snapshot",
+        "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+    }
+    seed_session_state(
+        session,
+        messages=[first_message],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     snapshots: list[tuple[str, ...]] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
     yield_once = asyncio.sleep
@@ -306,7 +450,23 @@ async def test_persist_retries_each_snapshot_before_starting_the_next_snapshot(
     monkeypatch.setattr("myclaw.agent.session.session.asyncio.sleep", immediate_backoff)
 
     session.persist()
-    session.add_message("user", "Second snapshot")
+    seed_session_state(
+        session,
+        messages=[
+            first_message,
+            {
+                "role": "user",
+                "content": "Second snapshot",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     session.persist()
     await yield_once(0)
 
@@ -327,7 +487,22 @@ async def test_pending_persist_waiter_cancellation_does_not_cancel_snapshots(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "Keep this snapshot")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Keep this snapshot",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     first_write_failed = asyncio.Event()
     release_backoff = asyncio.Event()
     replace = HOST_FILESYSTEM.atomic_replace_bytes
@@ -398,7 +573,21 @@ async def test_pending_persist_wait_drains_snapshot_queued_while_waiting(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "First snapshot")
+    first_message = {
+        "role": "user",
+        "content": "First snapshot",
+        "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+    }
+    seed_session_state(
+        session,
+        messages=[first_message],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     first_write_failed = asyncio.Event()
     release_backoff = asyncio.Event()
     replace = HOST_FILESYSTEM.atomic_replace_bytes
@@ -423,7 +612,23 @@ async def test_pending_persist_wait_drains_snapshot_queued_while_waiting(
     await first_write_failed.wait()
     waiter = asyncio.create_task(session.wait_for_pending_persist())
     await yield_once(0)
-    session.add_message("user", "Second snapshot")
+    seed_session_state(
+        session,
+        messages=[
+            first_message,
+            {
+                "role": "user",
+                "content": "Second snapshot",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     session.persist()
     release_backoff.set()
 
@@ -441,7 +646,22 @@ async def test_pending_persist_wait_converges_with_concurrent_abandon(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "Abandoned snapshot")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Abandoned snapshot",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     backoff_started = asyncio.Event()
     yield_once = asyncio.sleep
 
@@ -475,7 +695,21 @@ async def test_abandon_cancels_every_pending_snapshot_when_latest_has_not_starte
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "First snapshot")
+    first_message = {
+        "role": "user",
+        "content": "First snapshot",
+        "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+    }
+    seed_session_state(
+        session,
+        messages=[first_message],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     writes: list[bytes] = []
     backoff_started = asyncio.Event()
     backoff_cancelled = asyncio.Event()
@@ -501,7 +735,23 @@ async def test_abandon_cancels_every_pending_snapshot_when_latest_has_not_starte
     await yield_once(0)
     assert backoff_started.is_set()
 
-    session.add_message("user", "Second snapshot")
+    seed_session_state(
+        session,
+        messages=[
+            first_message,
+            {
+                "role": "user",
+                "content": "Second snapshot",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     session.persist()
     session.abandon()
     await yield_once(0)
@@ -527,7 +777,21 @@ async def test_close_wins_against_an_old_async_snapshot_in_backoff(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "Old snapshot")
+    old_message = {
+        "role": "user",
+        "content": "Old snapshot",
+        "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+    }
+    seed_session_state(
+        session,
+        messages=[old_message],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     snapshots: list[tuple[str, ...]] = []
     backoff_started = asyncio.Event()
     release_backoff = asyncio.Event()
@@ -552,7 +816,23 @@ async def test_close_wins_against_an_old_async_snapshot_in_backoff(
     await yield_once(0)
     assert backoff_started.is_set()
 
-    session.add_message("user", "Final state")
+    seed_session_state(
+        session,
+        messages=[
+            old_message,
+            {
+                "role": "user",
+                "content": "Final state",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     session.close()
     assert snapshots == [("Old snapshot",), ("Old snapshot", "Final state")]
 
@@ -570,14 +850,27 @@ async def test_abandon_rejects_mutators_and_close_does_not_save(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "Before abandonment")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Before abandonment",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     original_messages = copy.deepcopy(session.messages)
     original_metadata = copy.deepcopy(session.metadata)
 
     session.abandon()
 
-    with pytest.raises(RuntimeError, match="Session has been abandoned"):
-        session.add_message("user", "Rejected")
     with pytest.raises(RuntimeError, match="Session has been abandoned"):
         session.commit_agent_run(
             [{"role": "user", "content": "Rejected"}],
@@ -586,8 +879,6 @@ async def test_abandon_rejects_mutators_and_close_does_not_save(
         )
     with pytest.raises(RuntimeError, match="Session has been abandoned"):
         session.update_metadata(title="Rejected")
-    with pytest.raises(RuntimeError, match="Session has been abandoned"):
-        session.add_message(123, None)  # type: ignore[arg-type]
     with pytest.raises(RuntimeError, match="Session has been abandoned"):
         session.commit_agent_run(
             None,  # type: ignore[arg-type]
@@ -611,15 +902,28 @@ def test_close_then_abandon_rejects_later_mutation_without_another_save(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "Saved before abandonment")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Saved before abandonment",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     session.close()
     path = state.sessions_directory / f"{session.session_id}.jsonl"
     saved = path.read_bytes()
 
     session.abandon()
 
-    with pytest.raises(RuntimeError, match="Session has been abandoned"):
-        session.add_message("user", "Rejected")
     with pytest.raises(RuntimeError, match="Session has been abandoned"):
         session.commit_agent_run(
             [{"role": "user", "content": "Rejected"}],
@@ -642,7 +946,21 @@ async def test_ordinary_persist_failure_is_silent_and_a_later_persist_is_indepen
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "First attempt")
+    first_message = {
+        "role": "user",
+        "content": "First attempt",
+        "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+    }
+    seed_session_state(
+        session,
+        messages=[first_message],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     attempts: list[bytes] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
     yield_once = asyncio.sleep
@@ -667,7 +985,23 @@ async def test_ordinary_persist_failure_is_silent_and_a_later_persist_is_indepen
         replace(target, content)
 
     monkeypatch.setattr(HOST_FILESYSTEM, "atomic_replace_bytes", record_later_replace)
-    session.add_message("user", "Second attempt")
+    seed_session_state(
+        session,
+        messages=[
+            first_message,
+            {
+                "role": "user",
+                "content": "Second attempt",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     session.persist()
     await yield_once(0)
 
@@ -700,7 +1034,22 @@ def test_close_retries_latest_snapshot_with_bounded_delays(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "Save during shutdown")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Save during shutdown",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     attempts: list[bytes] = []
     sleeps: list[float] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
@@ -728,7 +1077,22 @@ def test_close_swallows_failure_after_three_attempts(
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state)
-    session.add_message("user", "Best effort shutdown")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Best effort shutdown",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     attempts: list[bytes] = []
     sleeps: list[float] = []
 
@@ -767,7 +1131,23 @@ async def test_close_supersedes_queued_persist_and_refreshes_each_attempt_timest
         now=timestamps.__next__,
         new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
     )
-    session.add_message("user", "Final state")
+    message_timestamp = next(timestamps)
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Final state",
+                "timestamp": message_timestamp.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     replacements: list[dict[str, Any]] = []
     replace = HOST_FILESYSTEM.atomic_replace_bytes
 
@@ -806,7 +1186,7 @@ def test_session_identity_fields_are_read_only(
         session.updated_at = UPDATED_AT  # type: ignore[misc]
 
 
-def test_public_state_is_directly_mutable_and_message_inputs_are_deep_copied(
+def test_commit_agent_run_deep_copies_messages_before_publishing_public_state(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -820,14 +1200,24 @@ def test_public_state_is_directly_mutable_and_message_inputs_are_deep_copied(
         "total_tokens": 15,
     }
 
-    session.add_message("user", "Inspect this project.", extension=extension)
-    session.add_message(
-        "assistant",
-        "I will inspect it.",
-        tool_calls=tool_calls,
-        status="completed",
-        error=None,
-        token_usage=usage,
+    session.commit_agent_run(
+        [
+            {
+                "role": "user",
+                "content": "Inspect this project.",
+                "extension": extension,
+            },
+            {
+                "role": "assistant",
+                "content": "I will inspect it.",
+                "tool_calls": tool_calls,
+                "status": "completed",
+                "error": None,
+                "token_usage": usage,
+            },
+        ],
+        pending_last_compacted=0,
+        pending_action_summary="",
     )
 
     extension["nested"].append("after")
@@ -884,7 +1274,22 @@ def test_commit_agent_run_leaves_state_unchanged_when_a_middle_message_is_invali
     workspace: Path,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     before_messages = copy.deepcopy(session.messages)
     before_usage = copy.deepcopy(session.metadata["token_usage"])
 
@@ -908,7 +1313,22 @@ def test_commit_agent_run_leaves_state_unchanged_when_the_final_message_is_inval
     workspace: Path,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     before_messages = copy.deepcopy(session.messages)
     before_usage = copy.deepcopy(session.metadata["token_usage"])
 
@@ -1031,7 +1451,22 @@ def test_commit_agent_run_rejects_usage_shape_errors_without_state_changes(
     usage: dict[str, int],
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     before_messages = copy.deepcopy(session.messages)
     before_metadata = copy.deepcopy(session.metadata)
 
@@ -1156,18 +1591,24 @@ def test_tool_message_preserves_provider_fields_and_unknown_extensions(
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
 
-    session.add_message(
-        "tool",
-        "README.md",
-        tool_call_id="call-1",
-        name="read_file",
-        status="success",
-        artifact={
-            "path": ".myclaw/artifacts/session-1/call-1.txt",
-            "total_chars": 123,
-            "preview_chars": 80,
-        },
-        provider_extension={"trace": [1, 2]},
+    session.commit_agent_run(
+        [
+            {
+                "role": "tool",
+                "content": "README.md",
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "status": "success",
+                "artifact": {
+                    "path": ".myclaw/artifacts/session-1/call-1.txt",
+                    "total_chars": 123,
+                    "preview_chars": 80,
+                },
+                "provider_extension": {"trace": [1, 2]},
+            }
+        ],
+        pending_last_compacted=0,
+        pending_action_summary="",
     )
 
     message = session.messages[0]
@@ -1239,7 +1680,11 @@ def test_mutation_helpers_reject_non_json_values(
     session = Session.create(_state(workspace, agent_home))
 
     with pytest.raises((TypeError, ValueError), match="JSON"):
-        session.add_message("user", "Hello", extension=value)
+        session.commit_agent_run(
+            [{"role": "user", "content": "Hello", "extension": value}],
+            pending_last_compacted=0,
+            pending_action_summary="",
+        )
     with pytest.raises((TypeError, ValueError), match="JSON"):
         session.update_metadata(future=value)
 
@@ -1251,27 +1696,49 @@ def test_known_message_contracts_and_unsupported_legacy_fields_are_validated(
     session = Session.create(_state(workspace, agent_home))
 
     with pytest.raises(ValueError, match="role"):
-        session.add_message("system", "Unsupported")
-    with pytest.raises(ValueError, match="reserved"):
-        session.add_message("user", "Hello", timestamp="override")
+        session.commit_agent_run(
+            [{"role": "system", "content": "Unsupported"}],
+            pending_last_compacted=0,
+            pending_action_summary="",
+        )
+    with pytest.raises(ValueError, match="timestamp is reserved"):
+        session.commit_agent_run(
+            [{"role": "user", "content": "Hello", "timestamp": "override"}],
+            pending_last_compacted=0,
+            pending_action_summary="",
+        )
     with pytest.raises(ValueError, match="unsupported"):
-        session.add_message("user", "Hello", id="legacy-message-id")
+        session.commit_agent_run(
+            [{"role": "user", "content": "Hello", "id": "legacy-message-id"}],
+            pending_last_compacted=0,
+            pending_action_summary="",
+        )
     with pytest.raises(ValueError, match="status"):
-        session.add_message(
-            "assistant",
-            "Answer",
-            tool_calls=[],
-            status="unknown",
-            error=None,
-            token_usage={
-                "model_calls": 1,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-            },
+        session.commit_agent_run(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Answer",
+                    "tool_calls": [],
+                    "status": "unknown",
+                    "error": None,
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                }
+            ],
+            pending_last_compacted=0,
+            pending_action_summary="",
         )
     with pytest.raises(ValueError, match="tool_call_id"):
-        session.add_message("tool", "Result", name="read_file", status="success")
+        session.commit_agent_run(
+            [{"role": "tool", "content": "Result", "name": "read_file", "status": "success"}],
+            pending_last_compacted=0,
+            pending_action_summary="",
+        )
 
 
 @pytest.mark.parametrize("missing", ["tool_calls", "status", "error", "token_usage"])
@@ -1295,7 +1762,11 @@ def test_assistant_message_requires_every_provider_relevant_field(
     del fields[missing]
 
     with pytest.raises(ValueError, match=missing):
-        session.add_message("assistant", "Answer", **fields)
+        session.commit_agent_run(
+            [{"role": "assistant", "content": "Answer", **fields}],
+            pending_last_compacted=0,
+            pending_action_summary="",
+        )
 
 
 def test_assistant_status_error_content_and_model_call_contract_remains_coherent(
@@ -1306,57 +1777,86 @@ def test_assistant_status_error_content_and_model_call_contract_remains_coherent
     usage = {"model_calls": 1, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
     with pytest.raises(ValueError, match="completed assistant"):
-        session.add_message(
-            "assistant",
-            "Answer",
-            tool_calls=[],
-            status="completed",
-            error={"code": "model_failed", "message": "failed"},
-            token_usage=usage,
+        session.commit_agent_run(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Answer",
+                    "tool_calls": [],
+                    "status": "completed",
+                    "error": {"code": "model_failed", "message": "failed"},
+                    "token_usage": usage,
+                }
+            ],
+            pending_last_compacted=0,
+            pending_action_summary="",
         )
     with pytest.raises(ValueError, match="non-completed assistant"):
-        session.add_message(
-            "assistant",
-            "Partial",
-            tool_calls=[],
-            status="interrupted",
-            error=None,
-            token_usage=usage,
+        session.commit_agent_run(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Partial",
+                    "tool_calls": [],
+                    "status": "interrupted",
+                    "error": None,
+                    "token_usage": usage,
+                }
+            ],
+            pending_last_compacted=0,
+            pending_action_summary="",
         )
     with pytest.raises(ValueError, match="content or tool_calls"):
-        session.add_message(
-            "assistant",
-            "",
-            tool_calls=[],
-            status="interrupted",
-            error={"code": "turn_cancelled", "message": "interrupted"},
-            token_usage=usage,
+        session.commit_agent_run(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [],
+                    "status": "interrupted",
+                    "error": {"code": "turn_cancelled", "message": "interrupted"},
+                    "token_usage": usage,
+                }
+            ],
+            pending_last_compacted=0,
+            pending_action_summary="",
         )
     with pytest.raises(ValueError, match="model_calls"):
-        session.add_message(
-            "assistant",
-            "Answer",
-            tool_calls=[],
-            status="completed",
-            error=None,
-            token_usage=dict(ZERO_USAGE),
+        session.commit_agent_run(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Answer",
+                    "tool_calls": [],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": dict(ZERO_USAGE),
+                }
+            ],
+            pending_last_compacted=0,
+            pending_action_summary="",
         )
-    session.add_message(
-        "assistant",
-        "Failed before a Provider result",
-        tool_calls=[],
-        status="error",
-        error={"code": "model_failed", "message": "failed"},
-        token_usage=dict(ZERO_USAGE),
-    )
-
-    session.add_message(
-        "assistant",
-        "Iteration limit reached",
-        tool_calls=[],
-        status="error",
-        error={"code": "agent_iteration_limit", "message": "limit reached"},
-        token_usage=dict(ZERO_USAGE),
+    session.commit_agent_run(
+        [
+            {
+                "role": "assistant",
+                "content": "Failed before a Provider result",
+                "tool_calls": [],
+                "status": "error",
+                "error": {"code": "model_failed", "message": "failed"},
+                "token_usage": dict(ZERO_USAGE),
+            },
+            {
+                "role": "assistant",
+                "content": "Iteration limit reached",
+                "tool_calls": [],
+                "status": "error",
+                "error": {"code": "agent_iteration_limit", "message": "limit reached"},
+                "token_usage": dict(ZERO_USAGE),
+            },
+        ],
+        pending_last_compacted=0,
+        pending_action_summary="",
     )
 
     assert [message["error"]["code"] for message in session.messages] == [
@@ -1582,14 +2082,25 @@ def test_assistant_context_usage_is_optional_and_round_trips_through_jsonl(
         new_uuid=lambda: UUID("6fa459ea-ee8a-4ca4-894e-db77e160355e"),
     )
     provenance = _context_usage()
-    new_session.add_message(
-        "assistant",
-        "New response.",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={"model_calls": 1, "input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
-        context_usage=provenance,
+    new_session.commit_agent_run(
+        [
+            {
+                "role": "assistant",
+                "content": "New response.",
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 5,
+                    "output_tokens": 3,
+                    "total_tokens": 8,
+                },
+                "context_usage": provenance,
+            }
+        ],
+        pending_last_compacted=0,
+        pending_action_summary="",
     )
     new_session.close()
 
@@ -1611,7 +2122,11 @@ def test_context_usage_is_rejected_for_non_assistant_messages_at_construction(
         fields.update(tool_call_id="call-1", name="read_file", status="success")
 
     with pytest.raises(ValueError, match=r"context_usage.*assistant"):
-        session.add_message(role, "Message content.", **fields)
+        session.commit_agent_run(
+            [{"role": role, "content": "Message content.", **fields}],
+            pending_last_compacted=0,
+            pending_action_summary="",
+        )
 
 
 def test_context_usage_is_rejected_for_non_assistant_messages_at_load(
@@ -1651,19 +2166,25 @@ def test_assistant_context_usage_rejects_missing_or_unknown_fields_at_constructi
     session = Session.create(_state(workspace, agent_home))
 
     with pytest.raises(ValueError, match=r"context_usage.*shape"):
-        session.add_message(
-            "assistant",
-            "Invalid provenance.",
-            tool_calls=[],
-            status="completed",
-            error=None,
-            token_usage={
-                "model_calls": 1,
-                "input_tokens": 2,
-                "output_tokens": 1,
-                "total_tokens": 3,
-            },
-            context_usage=context_usage,
+        session.commit_agent_run(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Invalid provenance.",
+                    "tool_calls": [],
+                    "status": "completed",
+                    "error": None,
+                    "token_usage": {
+                        "model_calls": 1,
+                        "input_tokens": 2,
+                        "output_tokens": 1,
+                        "total_tokens": 3,
+                    },
+                    "context_usage": context_usage,
+                }
+            ],
+            pending_last_compacted=0,
+            pending_action_summary="",
         )
 
     assert session.messages == []
@@ -1677,14 +2198,23 @@ def test_context_usage_is_rejected_for_a_synthetic_zero_call_assistant(
     session = Session.create(_state(workspace, agent_home))
 
     with pytest.raises(ValueError, match="exactly one assistant model call"):
-        session.add_message(
-            "assistant",
-            "Iteration limit reached.",
-            tool_calls=[],
-            status="error",
-            error={"code": "agent_iteration_limit", "message": "Iteration limit reached."},
-            token_usage=dict(ZERO_USAGE),
-            context_usage=_context_usage(),
+        session.commit_agent_run(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Iteration limit reached.",
+                    "tool_calls": [],
+                    "status": "error",
+                    "error": {
+                        "code": "agent_iteration_limit",
+                        "message": "Iteration limit reached.",
+                    },
+                    "token_usage": dict(ZERO_USAGE),
+                    "context_usage": _context_usage(),
+                }
+            ],
+            pending_last_compacted=0,
+            pending_action_summary="",
         )
 
     assert session.messages == []
@@ -1697,11 +2227,23 @@ def test_commit_agent_run_publishes_messages_cursor_summary_usage_and_metadata_o
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history.")
-    session.update_metadata(
-        title="Concurrent title",
-        old_extension={"remove": True},
-        concurrent_extension={"version": 2},
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Concurrent title",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+            "old_extension": {"remove": True},
+            "concurrent_extension": {"version": 2},
+        },
+        last_compacted=0,
     )
     before_state = session.__dict__
     persist_calls: list[None] = []
@@ -1788,11 +2330,23 @@ async def test_commit_agent_run_persists_and_round_trips_the_complete_published_
 ) -> None:
     state = _state(workspace, agent_home)
     session = Session.create(state, now=lambda: CREATED_AT)
-    session.add_message("user", "Existing history.")
-    session.update_metadata(
-        title="Concurrent title",
-        old_extension={"remove": True},
-        preserved_extension={"version": 2},
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Concurrent title",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+            "old_extension": {"remove": True},
+            "preserved_extension": {"version": 2},
+        },
+        last_compacted=0,
     )
 
     session.commit_agent_run(
@@ -1887,7 +2441,22 @@ def test_commit_agent_run_rejects_ambiguous_or_protected_metadata_patches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     before_messages = copy.deepcopy(session.messages)
     before_metadata = copy.deepcopy(session.metadata)
     before_cursor = session.last_compacted
@@ -1943,7 +2512,22 @@ def test_commit_agent_run_candidate_failure_preserves_state_and_caller_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     messages: list[dict[str, Any]] = [{"role": "user", "content": "Candidate increment."}]
     original_messages = copy.deepcopy(messages)
     original_updates = copy.deepcopy(metadata_updates)
@@ -1996,7 +2580,22 @@ def test_commit_agent_run_rejects_invalid_optional_argument_containers_without_c
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     messages: list[dict[str, Any]] = [{"role": "user", "content": "Candidate increment."}]
     original_messages = copy.deepcopy(messages)
     original_updates = copy.deepcopy(metadata_updates)
@@ -2062,7 +2661,22 @@ def test_commit_agent_run_validation_failure_leaves_every_observable_field_uncha
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     before_messages = copy.deepcopy(session.messages)
     before_metadata = copy.deepcopy(session.metadata)
     before_cursor = session.last_compacted
@@ -2129,7 +2743,22 @@ def test_commit_agent_run_rejects_invalid_assistant_usage_without_state_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     before_messages = copy.deepcopy(session.messages)
     before_metadata = copy.deepcopy(session.metadata)
     before_cursor = session.last_compacted
@@ -2164,7 +2793,22 @@ def test_commit_agent_run_state_replacement_failure_does_not_publish_or_persist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     before_messages = copy.deepcopy(session.messages)
     before_metadata = copy.deepcopy(session.metadata)
     before_cursor = session.last_compacted
@@ -2257,7 +2901,22 @@ def test_commit_agent_run_rejects_a_cursor_past_the_final_message_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "Existing history.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Existing history.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     before_messages = copy.deepcopy(session.messages)
     before_metadata = copy.deepcopy(session.metadata)
     persist_calls: list[None] = []
@@ -2282,8 +2941,27 @@ def test_commit_agent_run_accepts_a_cursor_into_base_messages_plus_increment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = Session.create(_state(workspace, agent_home))
-    session.add_message("user", "First existing message.")
-    session.add_message("user", "Second existing message.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "First existing message.",
+                "timestamp": CREATED_AT.isoformat(timespec="milliseconds"),
+            },
+            {
+                "role": "user",
+                "content": "Second existing message.",
+                "timestamp": UPDATED_AT.isoformat(timespec="milliseconds"),
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": dict(ZERO_USAGE),
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     persist_calls: list[None] = []
     monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
 

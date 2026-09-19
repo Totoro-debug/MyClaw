@@ -11,6 +11,7 @@ from myclaw.agent.session.session import Session
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.management.service import ManagementError
+from tests.fixtures.session import seed_session_state
 from tests.management.factories import management_service
 
 NOW = datetime(2026, 8, 4, 14, 30, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
@@ -25,7 +26,27 @@ def _state(workspace: Path, agent_home: Path) -> WorkspaceState:
 
 def _session(state: WorkspaceState) -> Session:
     session = Session.create(state, now=lambda: NOW, new_uuid=lambda: SESSION_UUID)
-    session.add_message("user", "Owned Session history.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Owned Session history.",
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     return session
 
 
@@ -169,7 +190,32 @@ async def test_session_persist_normally_replaces_an_owned_regular_file(
 
     session.persist()
     await asyncio.sleep(0)
-    session.add_message("user", "Replacement snapshot.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Owned Session history.",
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+            },
+            {
+                "role": "user",
+                "content": "Replacement snapshot.",
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     session.persist()
     await asyncio.sleep(0)
 

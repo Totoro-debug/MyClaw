@@ -50,6 +50,7 @@ from tests.fixtures import (
     collect_foreground_outbound,
 )
 from tests.fixtures.diagnostic_capture import capture_diagnostics
+from tests.fixtures.session import seed_session_state
 from tests.management.factories import management_service
 
 NOW = datetime(2026, 8, 7, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
@@ -711,19 +712,40 @@ async def test_schedule_tool_loop_does_not_prepare_compaction_inside_agent_run(
         )
     )
     schedule_session = Session.create_schedule(state, JOB_UUID, now=lambda: NOW)
-    schedule_session.add_message("user", "Old scheduled request.")
-    schedule_session.add_message(
-        "assistant",
-        "Old scheduled answer.",
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
+    seed_session_state(
+        schedule_session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Old scheduled request.",
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+            },
+            {
+                "role": "assistant",
+                "content": "Old scheduled answer.",
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 1,
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+            "summary": "",
         },
+        last_compacted=0,
     )
     schedule_session.close()
     provider = _ScheduleProvider(
@@ -832,33 +854,59 @@ timeout = 120
         job_id=JOB_UUID,
     )
     history_padding = " previous schedule context" * 150
-    schedule_session.add_message("user", "Oldest scheduled request." + history_padding)
-    schedule_session.add_message(
-        "assistant",
-        "Oldest scheduled answer." + history_padding,
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
+    seed_session_state(
+        schedule_session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Oldest scheduled request." + history_padding,
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+            },
+            {
+                "role": "assistant",
+                "content": "Oldest scheduled answer." + history_padding,
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+            {
+                "role": "user",
+                "content": "Earlier scheduled request." + history_padding,
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+            },
+            {
+                "role": "assistant",
+                "content": "Earlier scheduled answer." + history_padding,
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+                "tool_calls": [],
+                "status": "completed",
+                "error": None,
+                "token_usage": {
+                    "model_calls": 1,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 2,
+                "input_tokens": 2,
+                "output_tokens": 2,
+                "total_tokens": 4,
+            },
+            "summary": "",
         },
-    )
-    schedule_session.add_message("user", "Earlier scheduled request." + history_padding)
-    schedule_session.add_message(
-        "assistant",
-        "Earlier scheduled answer." + history_padding,
-        tool_calls=[],
-        status="completed",
-        error=None,
-        token_usage={
-            "model_calls": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-        },
+        last_compacted=0,
     )
     schedule_session.close()
 
@@ -1027,8 +1075,27 @@ async def test_concurrent_runs_keep_summaries_and_micro_compression_state_isolat
         partition=SessionStoragePartition.SCHEDULE,
         job_id=JOB_UUID,
     )
-    schedule_session.add_message("user", "Earlier scheduled work.")
-    schedule_session.update_metadata(summary=schedule_summary)
+    seed_session_state(
+        schedule_session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Earlier scheduled work.",
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": schedule_summary,
+        },
+        last_compacted=0,
+    )
     schedule_session.close()
     (workspace / "large.txt").write_text("x" * 4_000, encoding="utf-8")
 

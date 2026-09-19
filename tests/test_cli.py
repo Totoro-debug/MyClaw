@@ -42,6 +42,7 @@ from tests.configuration.test_config import (
     REDACTION_CONFIG,
     VALID_CONFIG,
 )
+from tests.fixtures.session import seed_session_state
 
 
 def _fake_memory_route_status() -> ModelRouteStatus:
@@ -458,7 +459,27 @@ def _invoke_cli_resume_preparation_failure(
         now=local_now,
         new_uuid=lambda: UUID("550e8400-e29b-41d4-a716-446655440000"),
     )
-    target_session.add_message("user", "Target session")
+    seed_session_state(
+        target_session,
+        messages=[
+            {
+                "role": "user",
+                "content": "Target session",
+                "timestamp": target_session.created_at.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     target_session.close()
     target_id = target_session.session_id
 

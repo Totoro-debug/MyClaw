@@ -904,7 +904,6 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
 
         async def start(self) -> None:
             user_message = {"role": "user", "content": f"echo {self.value}"}
-            self.session.add_message("user", user_message["content"])
             gateway = ToolGateway._for_memory(cast(Any, self.mcp_tools))
             result = await AgentRunner(
                 cast(Any, FlowRouter(self.value)),
@@ -921,7 +920,7 @@ async def test_cli_real_mcp_flow_persists_result_reuses_connection_and_closes(
             )
             assert result.final_content == "done"
             self.session.commit_agent_run(
-                result.messages,
+                [user_message, *result.messages],
                 pending_last_compacted=self.session.last_compacted,
                 pending_action_summary=cast(str, self.session.metadata["summary"]),
             )

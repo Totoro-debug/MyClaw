@@ -68,8 +68,11 @@ class _CliContractApp:
 
     async def run_async(self) -> None:
         old = self._initial_loop
-        old.session.add_message("user", "Persisted before same-Session replacement.")
-        old.session.persist()
+        old.session.commit_agent_run(
+            [{"role": "user", "content": "Persisted before same-Session replacement."}],
+            pending_last_compacted=old.session.last_compacted,
+            pending_action_summary=cast(str, old.session.metadata["summary"]),
+        )
         await old.session.wait_for_pending_persist()
         old_session_id = old.session.session_id
         shared_bus = self._bus
@@ -302,8 +305,11 @@ async def test_cli_force_replacement_cancels_framing_without_old_session_late_wr
         async def run_async(self) -> None:
             assert blocker is not None
             old = cast(AgentLoop, self._control)
-            old.session.add_message("user", "Committed before blocked framing.")
-            old.session.persist()
+            old.session.commit_agent_run(
+                [{"role": "user", "content": "Committed before blocked framing."}],
+                pending_last_compacted=old.session.last_compacted,
+                pending_action_summary=cast(str, old.session.metadata["summary"]),
+            )
             await old.session.wait_for_pending_persist()
             before_messages = deepcopy(old.session.messages)
             before_metadata = deepcopy(old.session.metadata)

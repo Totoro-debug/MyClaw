@@ -8,6 +8,7 @@ import pytest
 from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
+from tests.fixtures.session import seed_session_state
 from tests.management.factories import management_service
 
 NOW = datetime(2026, 8, 1, 12, 0, 0, 123000, tzinfo=timezone(timedelta(hours=8)))
@@ -24,7 +25,27 @@ def _state(workspace: Path, agent_home: Path) -> WorkspaceState:
 def _session(state: WorkspaceState, session_uuid: UUID, title: str) -> Session:
     session = Session.create(state, now=lambda: NOW, new_uuid=lambda: session_uuid)
     session.update_metadata(title=title)
-    session.add_message("user", f"History for {title}.")
+    seed_session_state(
+        session,
+        messages=[
+            {
+                "role": "user",
+                "content": f"History for {title}.",
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": title,
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     return session
 
 
@@ -64,7 +85,27 @@ async def test_resume_listing_excludes_schedule_session_partition(
         job_id=str(FIRST_UUID),
         now=lambda: NOW,
     )
-    schedule.add_message("user", "Background work")
+    seed_session_state(
+        schedule,
+        messages=[
+            {
+                "role": "user",
+                "content": "Background work",
+                "timestamp": NOW.isoformat(timespec="milliseconds"),
+            }
+        ],
+        metadata={
+            "title": "Untitled session",
+            "token_usage": {
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "summary": "",
+        },
+        last_compacted=0,
+    )
     schedule.close()
 
     listing = await management_service(home, workspace_state=state).resumable_listing()
