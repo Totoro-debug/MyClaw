@@ -1118,6 +1118,7 @@ command = "uvx"
     loader.load()
     diagnostic = loader.diagnostics[0]
 
+    assert isinstance(diagnostic, ConfigurationDiagnostic)
     assert unsafe_field not in diagnostic.reason
     assert "\n" not in diagnostic.reason
     assert "\x1b" not in diagnostic.reason

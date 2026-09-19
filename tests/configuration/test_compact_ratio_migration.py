@@ -71,7 +71,6 @@ def test_invalid_compact_ratio_falls_back_once_with_safe_diagnostic(
     diagnostic = loader.diagnostics[0]
     assert isinstance(diagnostic, RuntimeConfigurationDiagnostic)
     assert diagnostic.field == "runtime.compact_ratio"
-    assert diagnostic.reason == "must be a finite number from 0.5 to 0.95"
     assert diagnostic.message == (
         "Configuration field 'runtime.compact_ratio' is invalid or missing; using 0.9."
     )

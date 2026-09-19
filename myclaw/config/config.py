@@ -255,7 +255,6 @@ class RuntimeConfigurationDiagnostic:
     """A safe diagnostic for a runtime field using its declared fallback."""
 
     field: str
-    reason: str
 
     @property
     def message(self) -> str:
@@ -582,7 +581,6 @@ def _parse_compact_ratio(
             diagnostics.append(
                 RuntimeConfigurationDiagnostic(
                     field="runtime.compact_ratio",
-                    reason="must be a finite number from 0.5 to 0.95",
                 )
             )
         return _DEFAULT_COMPACT_RATIO
